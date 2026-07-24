@@ -1292,7 +1292,84 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     reg.team_forced_quarantine_on_drift = policy_forces("forceQuarantineOnDrift");
     reg.team_forced_human_approval = policy_forces("forceHumanApproval");
 
+    // Org per-tool allowlists (SOU-167): each team server may carry `allowedTools` (an allow-
+    // list of ORIGINAL tool names). When present, every profile is narrowed to that list for
+    // that server via `tool_scope` (the existing FeatureSet gate). When absent, any prior
+    // team-driven scope entry is cleared so the org can unrestrict without a leave/rejoin.
+    // `disabledTools` is already applied on the ServerEntry itself (deny-list). Both layers
+    // compose: a tool must be allow-listed (if a list is set) AND not disabled.
+    apply_team_tool_scope(reg, team_cfg, &tag);
+
     outcome
+}
+
+/// Apply or clear per-server `allowedTools` from the team config onto every profile's
+/// `tool_scope`. Keys are the member-local team server ids (`team_<slug>`). Servers the
+/// org no longer lists, or lists without `allowedTools`, drop their tool_scope entry.
+fn apply_team_tool_scope(reg: &mut Registry, team_cfg: &Value, tag: &str) {
+    // Map member-local team server id -> optional allow-list (None = unrestricted).
+    let mut wanted: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    if let Some(arr) = team_cfg.get("servers").and_then(Value::as_array) {
+        for s in arr {
+            let str_field = |k: &str| s.get(k).and_then(Value::as_str).filter(|x| !x.is_empty());
+            let orig_id = str_field("id");
+            let name = match str_field("name").or(orig_id) {
+                Some(n) => n,
+                None => continue,
+            };
+            // Match the id classify_team_server would produce BEFORE unique_id dedup. When
+            // dedup added a suffix, fall through to the live registry match below.
+            let base_id = format!("team_{}", slugify_id(orig_id.unwrap_or(name)));
+            let allowed = match s.get("allowedTools") {
+                None => None,
+                Some(v) => Some(
+                    v.as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                ),
+            };
+            wanted.insert(base_id, allowed);
+        }
+    }
+    // Resolve actual local ids currently tagged for this team (handles unique_id suffixes).
+    let team_ids: Vec<String> = reg
+        .servers
+        .iter()
+        .filter(|s| is_team_server(s, tag))
+        .map(|s| s.id.clone())
+        .collect();
+    for p in &mut reg.profiles {
+        // Drop scope entries for team servers that are no longer present.
+        p.tool_scope
+            .retain(|sid, _| !sid.starts_with("team_") || team_ids.contains(sid));
+        for sid in &team_ids {
+            // Prefer exact base_id match; if the live id was deduped (team_github_2), look up
+            // by the longest matching wanted key prefix, else treat as unrestricted.
+            let allow = wanted
+                .get(sid)
+                .cloned()
+                .or_else(|| {
+                    // Deduped ids are `base`, `base_2`, `base_3`, ...
+                    wanted
+                        .iter()
+                        .find(|(base, _)| sid == *base || sid.starts_with(&format!("{base}_")))
+                        .map(|(_, a)| a.clone())
+                })
+                .unwrap_or(None);
+            match allow {
+                Some(list) => {
+                    p.tool_scope.insert(sid.clone(), list);
+                }
+                None => {
+                    p.tool_scope.remove(sid);
+                }
+            }
+        }
+    }
 }
 
 /// Classify one team-config server JSON for the member's machine. Env keeps only keys
@@ -1398,6 +1475,10 @@ pub fn remove_team(reg: &mut Registry, team_id: &str) {
     reg.servers.retain(|s| !is_team_server(s, &tag));
     for p in &mut reg.profiles {
         p.enabled_server_ids.retain(|id| !ids.contains(id));
+        // Drop org tool allowlists for the removed team servers (SOU-167).
+        for id in &ids {
+            p.tool_scope.remove(id);
+        }
     }
     // Release ALL of this team's forced safety locks: the member is no longer in the team, so
     // an org-forced policy (HITL, destructive-block, content defense, drift-quarantine) must not
@@ -1641,6 +1722,91 @@ mod tests {
         let team: Vec<_> = r.servers.iter().filter(|s| s.source.as_deref() == Some("team:t1")).collect();
         assert_eq!(team.len(), 1);
         assert_ne!(team[0].id, "team_github", "team server deduped away from the local id");
+    }
+
+    #[test]
+    fn org_allowed_tools_narrows_profile_tool_scope() {
+        // SOU-167: org `allowedTools` becomes profile tool_scope on the team server id.
+        let mut r = base_registry();
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({ "servers": [{
+                "id": "github",
+                "name": "GitHub",
+                "transport": "http",
+                "url": "https://1.2.3.4/mcp",
+                "allowedTools": ["list_issues", "create_issue"],
+                "disabledTools": ["delete_repo"]
+            }]}),
+        );
+        let sid = "team_github";
+        assert!(r.servers.iter().any(|s| s.id == sid));
+        let server = r.servers.iter().find(|s| s.id == sid).unwrap();
+        assert_eq!(
+            server.disabled_tools,
+            vec!["delete_repo".to_string()],
+            "deny-list lands on the ServerEntry"
+        );
+        assert!(
+            r.profile_allows_tool("default", sid, "list_issues"),
+            "allow-listed tool is exposed"
+        );
+        assert!(
+            !r.profile_allows_tool("default", sid, "create_pr"),
+            "tool outside the allow-list is hidden"
+        );
+        assert!(
+            !r.is_tool_enabled(sid, "delete_repo"),
+            "disabledTools still deny-lists even if someone allowed it"
+        );
+
+        // Org drops the allow-list (key absent) -> unrestricted again (still subject to deny).
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({ "servers": [{
+                "id": "github",
+                "name": "GitHub",
+                "transport": "http",
+                "url": "https://1.2.3.4/mcp",
+                "disabledTools": ["delete_repo"]
+            }]}),
+        );
+        assert!(
+            r.profile_allows_tool("default", sid, "create_pr"),
+            "clearing allowedTools removes tool_scope"
+        );
+        assert!(!r.is_tool_enabled(sid, "delete_repo"));
+
+        // Leave the team: tool_scope entry for the team server is gone.
+        remove_team(&mut r, "t1");
+        for p in &r.profiles {
+            assert!(
+                !p.tool_scope.contains_key(sid),
+                "leaving clears org tool_scope"
+            );
+        }
+    }
+
+    #[test]
+    fn org_empty_allowed_tools_blocks_every_tool_on_that_server() {
+        let mut r = base_registry();
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({ "servers": [{
+                "id": "github",
+                "name": "GitHub",
+                "transport": "http",
+                "url": "https://1.2.3.4/mcp",
+                "allowedTools": []
+            }]}),
+        );
+        assert!(
+            !r.profile_allows_tool("default", "team_github", "anything"),
+            "empty allow-list is a real block-all, not 'all tools'"
+        );
     }
 
     #[test]
