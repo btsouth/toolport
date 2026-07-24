@@ -48,8 +48,8 @@ If a client reports the gateway "was not found," you forgot this step.
 ### Running tests
 
 ```bash
-# Backend (Rust)
-cargo test --manifest-path src-tauri/Cargo.toml
+# Backend (Rust: library, binaries, and integration tests)
+npm run test:rust
 
 # Headless gateway smoke (Windows; build gateway first)
 powershell -ExecutionPolicy Bypass -File scripts/smoke-headless.ps1
@@ -62,10 +62,10 @@ npx tsc --noEmit && npm run build
 ```
 
 The Rust suite includes unit tests in each module (`clients`, `catalog`,
-`registry`, `router`, `oauth`, etc.) and an integration test
-(`tests/list_changed.rs`) that exercises the gateway's live tool-change
-notification path. Frontend tests use [Vitest](https://vitest.dev) and live
-alongside the code as `*.test.ts` files inside `src/`.
+`registry`, `router`, `oauth`, etc.), binary-target tests, and integration tests
+in `src-tauri/tests/`. Use the npm script above so your local target selection
+matches CI. Frontend tests use [Vitest](https://vitest.dev) and live alongside
+the code as `*.test.ts` files inside `src/`.
 
 ### Formatting
 

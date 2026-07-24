@@ -13,4 +13,4 @@ if ($resolvedGateway) {
     }
 }
 
-cargo test --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --lib --bins
+cargo test --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --lib --bins --tests
