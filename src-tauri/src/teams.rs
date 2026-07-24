@@ -454,6 +454,7 @@ fn post_usage_day(
     day: &str,
     rows: Vec<Value>,
     instructions_status: Option<&Value>,
+    policy_status: Option<&Value>,
 ) -> Result<bool, String> {
     require_secure_team_url(server_url)?;
     let url = format!("{}/teams/{}/usage", base(server_url), team_id);
@@ -462,6 +463,11 @@ fn post_usage_day(
     // key; a client without instructions omits it entirely.
     if let Some(status) = instructions_status {
         body["instructionsStatus"] = status.clone();
+    }
+    // Screening-policy apply receipt (SOU-339): as-enforced values of the four safety flags.
+    // Same ride-on-usage / ignore-if-unknown pattern as instructions.
+    if let Some(status) = policy_status {
+        body["policyStatus"] = status.clone();
     }
     match agent()
         .post(&url)
@@ -532,6 +538,7 @@ fn finish_connect(server_url: &str, member_name: Option<&str>, joined: Joined) -
         team_instructions_version: 0,
         team_instructions_targets: Vec::new(),
         team_instructions_reported: None,
+        team_policy_reported: None,
     };
     // Pull BEFORE loading the registry, then load a FRESH copy AFTER the (possibly
     // multi-second) network round trip and apply onto that — mirroring `sync_inner`.
@@ -680,6 +687,9 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
     // unchanged receipt isn't re-sent. Independent of the config change above, so a client
     // installed after the last edit is reflected as soon as it appears.
     report_instructions_status(&conn, &token);
+    // Report as-enforced screening-policy flags (SOU-339) so the org can prove cooperative
+    // enforcement took effect on this machine. Deduped like the instructions receipt.
+    report_policy_status(&conn, &token);
     Ok(SyncResult::Ok {
         role,
         role_changed,
@@ -763,7 +773,7 @@ fn report_usage(conn: &TeamConnection, token: &str) {
                 })
             })
             .collect();
-        match post_usage_day(&conn.server_url, &conn.team_id, token, &day, rows, None) {
+        match post_usage_day(&conn.server_url, &conn.team_id, token, &day, rows, None, None) {
             Ok(true) => {
                 new_state.insert(day, merged);
                 changed = true;
@@ -1002,6 +1012,7 @@ fn report_instructions_status(conn: &TeamConnection, token: &str) {
         &day,
         Vec::new(),
         Some(&receipt_json),
+        None,
     ) {
         Ok(true) => {
             let _ = crate::registry::update(|reg| {
@@ -1015,6 +1026,67 @@ fn report_instructions_status(conn: &TeamConnection, token: &str) {
         }
         // Old server without the endpoint, or a transient failure: leave `reported` unset so we
         // retry on a later cycle.
+        _ => {}
+    }
+}
+
+/// Build the screening-policy apply receipt (SOU-339): the four safety flags as currently
+/// enforced on this machine (member's own setting OR team force, whichever is stricter).
+fn build_policy_receipt(reg: &crate::registry::Registry) -> Value {
+    json!({
+        "denyDestructive": reg.deny_destructive_effective(),
+        "forceContentDefense": reg.content_defense_effective(),
+        "forceQuarantineOnDrift": reg.quarantine_on_drift_effective(),
+        "forceHumanApproval": reg.human_approval_effective(),
+    })
+}
+
+/// Report this member's as-enforced screening policy to the team server once per sync cycle.
+/// Deduped by receipt hash so an unchanged policy costs the server nothing. Best-effort.
+fn report_policy_status(conn: &TeamConnection, token: &str) {
+    use crate::instructions;
+    let (receipt_json, fingerprint, reported) = {
+        let Ok(reg) = crate::registry::load() else {
+            return;
+        };
+        match reg.team.as_ref() {
+            Some(t) if t.team_id == conn.team_id => {}
+            _ => return,
+        }
+        let receipt = build_policy_receipt(&reg);
+        let Ok(receipt_json) = serde_json::to_value(&receipt) else {
+            return;
+        };
+        let fingerprint = instructions::content_hash(&receipt_json.to_string());
+        let reported = reg
+            .team
+            .as_ref()
+            .and_then(|t| t.team_policy_reported.clone());
+        (receipt_json, fingerprint, reported)
+    };
+    if reported.as_deref() == Some(fingerprint.as_str()) {
+        return;
+    }
+    let day = usage_report::utc_day_back(0);
+    match post_usage_day(
+        &conn.server_url,
+        &conn.team_id,
+        token,
+        &day,
+        Vec::new(),
+        None,
+        Some(&receipt_json),
+    ) {
+        Ok(true) => {
+            let _ = crate::registry::update(|reg| {
+                if let Some(t) = reg.team.as_mut() {
+                    if t.team_id == conn.team_id {
+                        t.team_policy_reported = Some(fingerprint.clone());
+                    }
+                }
+                Ok(())
+            });
+        }
         _ => {}
     }
 }
@@ -1819,6 +1891,35 @@ mod tests {
         let body = push_body(&config, 42);
         assert_eq!(body["base_version"], 42);
         assert_eq!(body["config"], config);
+    }
+
+    #[test]
+    fn policy_receipt_reports_as_enforced_effective_flags() {
+        // SOU-339: the receipt mirrors *_effective(), not just the team-forced overlay, so an
+        // admin sees what is actually enforced on the member's machine.
+        let mut r = base_registry();
+        r.deny_destructive = true; // member's own on
+        r.content_defense = false;
+        r.quarantine_on_drift = false;
+        r.human_approval = false;
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({
+                "servers": [],
+                "denyDestructive": false,
+                "screeningPolicy": {
+                    "forceContentDefense": true,
+                    "forceQuarantineOnDrift": false,
+                    "forceHumanApproval": true
+                }
+            }),
+        );
+        let receipt = build_policy_receipt(&r);
+        assert_eq!(receipt["denyDestructive"], true, "member own deny still enforced");
+        assert_eq!(receipt["forceContentDefense"], true, "org force makes content defense effective");
+        assert_eq!(receipt["forceQuarantineOnDrift"], false);
+        assert_eq!(receipt["forceHumanApproval"], true);
     }
 
     #[test]

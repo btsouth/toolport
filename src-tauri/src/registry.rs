@@ -472,6 +472,10 @@ pub struct TeamConnection {
     /// receipt isn't re-POSTed every ~25s sync. `None` = nothing reported yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_instructions_reported: Option<String>,
+    /// Hash of the screening-policy apply receipt last successfully sent (SOU-339). Same
+    /// dedup role as `team_instructions_reported`. `None` = nothing reported yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_policy_reported: Option<String>,
 }
 
 /// Settings for embedding-based search re-ranking. The embedding API key, if the
