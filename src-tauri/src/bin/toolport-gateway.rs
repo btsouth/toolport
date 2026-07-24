@@ -18,7 +18,7 @@
 //!   model searches and calls on demand, keeping context flat.
 //! - Records every tool call to a local audit log.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -3445,6 +3445,28 @@ fn handle_request_with_cancel(
     }
 }
 
+/// Fail-closed merge of every profile's `tool_scope` for the shared HTTP-bridge router.
+/// Per server: intersection of all profiles that define an allow-list. Org SOU-167 writes
+/// the same list onto every profile, so HTTP clients honor it. Profiles that disagree
+/// produce the common subset (fewer tools). Servers with no tool_scope entry stay unrestricted.
+fn merge_tool_scopes_for_http(
+    reg: &Registry,
+) -> HashMap<String, HashSet<String>> {
+    let mut by_server: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for prof in &reg.profiles {
+        for (sid, tools) in &prof.tool_scope {
+            let set: HashSet<String> = tools.iter().cloned().collect();
+            if seen.insert(sid.clone()) {
+                by_server.insert(sid.clone(), set);
+            } else if let Some(cur) = by_server.get_mut(sid) {
+                *cur = cur.intersection(&set).cloned().collect();
+            }
+        }
+    }
+    by_server
+}
+
 /// Spawn and connect every enabled server into a router. With `profile` set, only
 /// that profile's servers are connected (per-client scoping); otherwise the
 /// active profile is used.
@@ -3485,13 +3507,16 @@ fn build_router(
             disabled.insert(s.id.clone(), s.disabled_tools.iter().cloned().collect());
         }
     }
-    // Tool-granular profile scope (SOU-189): the active profile's per-server tool allow-list.
-    // Baked into this per-profile router so tools/list, search, and the call guard all honor
-    // it with no per-request threading. Applies to the stdio (per-profile) router only; the
-    // shared HTTP-bridge router serves many profiles, so its tool-scope is a per-request
-    // follow-up (stdio-first, same line as folder routing).
-    let mut allow = std::collections::HashMap::new();
-    if !http_mode {
+    // Tool-granular profile scope (SOU-189 / SOU-167): per-server ORIGINAL tool allow-lists.
+    // Stdio: bake the single active (or requested) profile's tool_scope.
+    // HTTP: one shared router serves every registered client/profile. Bake a fail-closed
+    // merge across all profiles (intersection per server) so org allowlists applied to
+    // every profile by SOU-167 are enforced on tools/list and route_call — not fail-open.
+    // When profiles disagree on a server's list, fewer tools win (safer shared catalog).
+    let allow = if http_mode {
+        merge_tool_scopes_for_http(reg)
+    } else {
+        let mut allow = std::collections::HashMap::new();
         let pid = profile
             .map(|p| reg.resolve_profile_id(p))
             .unwrap_or_else(|| reg.active_profile_id());
@@ -3500,7 +3525,8 @@ fn build_router(
                 allow.insert(server_id.clone(), tools.iter().cloned().collect());
             }
         }
-    }
+        allow
+    };
     let policy = ToolPolicy {
         disabled,
         allow,
@@ -7402,6 +7428,57 @@ mod tests {
     // Test-only: the blend-ranking test builds these directly. Kept here rather than at
     // module scope so a non-test build doesn't warn about an unused import.
     use conduit_lib::semantic::SemanticConfig;
+
+    #[test]
+    fn http_tool_scope_merge_intersects_profiles_and_keeps_org_allowlist() {
+        // SOU-167 / HTTP fail-open fix: org allowlists land on every profile; HTTP router
+        // must bake them. When profiles disagree, intersection (fewer tools) wins.
+        let mut reg = Registry::default();
+        reg.profiles.clear();
+        reg.profiles.push(registry::Profile {
+            id: "a".into(),
+            name: "A".into(),
+            enabled_server_ids: vec!["team_gh".into()],
+            tool_scope: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "team_gh".into(),
+                    vec!["list_issues".into(), "create_issue".into()],
+                );
+                m
+            },
+        });
+        reg.profiles.push(registry::Profile {
+            id: "b".into(),
+            name: "B".into(),
+            enabled_server_ids: vec!["team_gh".into()],
+            tool_scope: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "team_gh".into(),
+                    vec!["list_issues".into(), "create_issue".into()],
+                );
+                m
+            },
+        });
+        let merged = merge_tool_scopes_for_http(&reg);
+        let set = merged.get("team_gh").expect("org scope present");
+        assert!(set.contains("list_issues"));
+        assert!(set.contains("create_issue"));
+        assert_eq!(set.len(), 2);
+
+        // Disagreement → intersection.
+        reg.profiles[1].tool_scope.insert(
+            "team_gh".into(),
+            vec!["list_issues".into(), "delete_repo".into()],
+        );
+        let merged = merge_tool_scopes_for_http(&reg);
+        let set = merged.get("team_gh").unwrap();
+        assert!(set.contains("list_issues"));
+        assert!(!set.contains("create_issue"));
+        assert!(!set.contains("delete_repo"));
+        assert_eq!(set.len(), 1);
+    }
 
     /// #421: a downstream error message is attacker-controllable, so the error path
     /// must run the same content-defense + shaping as a success. Before the fix the
