@@ -538,7 +538,9 @@ fn finish_connect(server_url: &str, member_name: Option<&str>, joined: Joined) -
         team_instructions_version: 0,
         team_instructions_targets: Vec::new(),
         team_instructions_reported: None,
+        team_instructions_reported_at: None,
         team_policy_reported: None,
+        team_policy_reported_at: None,
     };
     // Pull BEFORE loading the registry, then load a FRESH copy AFTER the (possibly
     // multi-second) network round trip and apply onto that — mirroring `sync_inner`.
@@ -974,13 +976,36 @@ pub fn instructions_status() -> Option<InstructionsStatusView> {
     })
 }
 
-/// Report this member's instructions coverage to the team server, once per sync cycle. Sends only
-/// when the receipt CHANGED since the last successful send (dedup by hash), so an unchanged
-/// coverage state costs the server nothing. Best-effort; a failure just retries next cycle. No-op
+/// Re-send an unchanged receipt at least this often so the server's `*_status_at` stamps
+/// stay fresh. Dashboard "stale" is 48h; 12h gives headroom under intermittent offline.
+const RECEIPT_HEARTBEAT_MS: i64 = 12 * 3600 * 1000;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// True when we already sent this fingerprint recently enough that a re-send is wasteful.
+fn receipt_fresh(reported: Option<&str>, reported_at: Option<i64>, fingerprint: &str) -> bool {
+    if reported != Some(fingerprint) {
+        return false;
+    }
+    match reported_at {
+        Some(at) if now_ms().saturating_sub(at) < RECEIPT_HEARTBEAT_MS => true,
+        _ => false,
+    }
+}
+
+/// Report this member's instructions coverage to the team server, once per sync cycle. Sends
+/// when the receipt CHANGED, or when the last successful send is older than
+/// [`RECEIPT_HEARTBEAT_MS`] (so the server's `instructions_status_at` does not go false-stale
+/// while the member keeps syncing). Best-effort; a failure just retries next cycle. No-op
 /// when the team has no active instructions.
 fn report_instructions_status(conn: &TeamConnection, token: &str) {
     use crate::instructions;
-    let (content, version, reported) = {
+    let (content, version, reported, reported_at) = {
         let Ok(reg) = crate::registry::load() else {
             return;
         };
@@ -989,6 +1014,7 @@ fn report_instructions_status(conn: &TeamConnection, token: &str) {
                 t.team_instructions_content.clone(),
                 t.team_instructions_version,
                 t.team_instructions_reported.clone(),
+                t.team_instructions_reported_at,
             ),
             _ => return,
         }
@@ -1001,8 +1027,8 @@ fn report_instructions_status(conn: &TeamConnection, token: &str) {
         return;
     };
     let fingerprint = instructions::content_hash(&receipt_json.to_string());
-    if reported.as_deref() == Some(fingerprint.as_str()) {
-        return; // unchanged since the last successful send
+    if receipt_fresh(reported.as_deref(), reported_at, &fingerprint) {
+        return;
     }
     let day = usage_report::utc_day_back(0);
     match post_usage_day(
@@ -1015,10 +1041,12 @@ fn report_instructions_status(conn: &TeamConnection, token: &str) {
         None,
     ) {
         Ok(true) => {
+            let at = now_ms();
             let _ = crate::registry::update(|reg| {
                 if let Some(t) = reg.team.as_mut() {
                     if t.team_id == conn.team_id {
                         t.team_instructions_reported = Some(fingerprint.clone());
+                        t.team_instructions_reported_at = Some(at);
                     }
                 }
                 Ok(())
@@ -1042,10 +1070,10 @@ fn build_policy_receipt(reg: &crate::registry::Registry) -> Value {
 }
 
 /// Report this member's as-enforced screening policy to the team server once per sync cycle.
-/// Deduped by receipt hash so an unchanged policy costs the server nothing. Best-effort.
+/// Deduped by receipt hash, with a 12h heartbeat so `policy_status_at` stays fresh. Best-effort.
 fn report_policy_status(conn: &TeamConnection, token: &str) {
     use crate::instructions;
-    let (receipt_json, fingerprint, reported) = {
+    let (receipt_json, fingerprint, reported, reported_at) = {
         let Ok(reg) = crate::registry::load() else {
             return;
         };
@@ -1058,13 +1086,14 @@ fn report_policy_status(conn: &TeamConnection, token: &str) {
             return;
         };
         let fingerprint = instructions::content_hash(&receipt_json.to_string());
-        let reported = reg
+        let (reported, reported_at) = reg
             .team
             .as_ref()
-            .and_then(|t| t.team_policy_reported.clone());
-        (receipt_json, fingerprint, reported)
+            .map(|t| (t.team_policy_reported.clone(), t.team_policy_reported_at))
+            .unwrap_or((None, None));
+        (receipt_json, fingerprint, reported, reported_at)
     };
-    if reported.as_deref() == Some(fingerprint.as_str()) {
+    if receipt_fresh(reported.as_deref(), reported_at, &fingerprint) {
         return;
     }
     let day = usage_report::utc_day_back(0);
@@ -1078,10 +1107,12 @@ fn report_policy_status(conn: &TeamConnection, token: &str) {
         Some(&receipt_json),
     ) {
         Ok(true) => {
+            let at = now_ms();
             let _ = crate::registry::update(|reg| {
                 if let Some(t) = reg.team.as_mut() {
                     if t.team_id == conn.team_id {
                         t.team_policy_reported = Some(fingerprint.clone());
+                        t.team_policy_reported_at = Some(at);
                     }
                 }
                 Ok(())
@@ -1296,13 +1327,18 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     let mut auto_enable: Vec<String> = Vec::new();
     let mut review_ids: Vec<String> = Vec::new();
     let mut used_ids: Vec<String> = reg.servers.iter().map(|s| s.id.clone()).collect();
+    // Final member-local server id -> optional allow-list (None = unrestricted). Built from
+    // the post-unique_id ids so a collision rename (team_github-2) never loses its org scope.
+    let mut tool_allows: HashMap<String, Option<Vec<String>>> = HashMap::new();
     let mut outcome = MergeOutcome::default();
     if let Some(arr) = team_cfg.get("servers").and_then(Value::as_array) {
         for s in arr {
+            let allowed = parse_allowed_tools(s);
             match classify_team_server(s, &tag) {
                 TeamClass::Ready(mut entry) => {
                     entry.id = crate::registry::unique_id(&entry.id, &used_ids);
                     used_ids.push(entry.id.clone());
+                    tool_allows.insert(entry.id.clone(), allowed);
                     auto_enable.push(entry.id.clone());
                     reg.servers.push(entry);
                     outcome.applied += 1;
@@ -1310,6 +1346,7 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
                 TeamClass::Review(mut entry) => {
                     entry.id = crate::registry::unique_id(&entry.id, &used_ids);
                     used_ids.push(entry.id.clone());
+                    tool_allows.insert(entry.id.clone(), allowed);
                     review_ids.push(entry.id.clone());
                     reg.servers.push(entry);
                     outcome.review += 1;
@@ -1370,44 +1407,37 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     // team-driven scope entry is cleared so the org can unrestrict without a leave/rejoin.
     // `disabledTools` is already applied on the ServerEntry itself (deny-list). Both layers
     // compose: a tool must be allow-listed (if a list is set) AND not disabled.
-    apply_team_tool_scope(reg, team_cfg, &tag);
+    apply_team_tool_scope(reg, &tool_allows, &tag);
 
     outcome
 }
 
-/// Apply or clear per-server `allowedTools` from the team config onto every profile's
-/// `tool_scope`. Keys are the member-local team server ids (`team_<slug>`). Servers the
-/// org no longer lists, or lists without `allowedTools`, drop their tool_scope entry.
-fn apply_team_tool_scope(reg: &mut Registry, team_cfg: &Value, tag: &str) {
-    // Map member-local team server id -> optional allow-list (None = unrestricted).
-    let mut wanted: HashMap<String, Option<Vec<String>>> = HashMap::new();
-    if let Some(arr) = team_cfg.get("servers").and_then(Value::as_array) {
-        for s in arr {
-            let str_field = |k: &str| s.get(k).and_then(Value::as_str).filter(|x| !x.is_empty());
-            let orig_id = str_field("id");
-            let name = match str_field("name").or(orig_id) {
-                Some(n) => n,
-                None => continue,
-            };
-            // Match the id classify_team_server would produce BEFORE unique_id dedup. When
-            // dedup added a suffix, fall through to the live registry match below.
-            let base_id = format!("team_{}", slugify_id(orig_id.unwrap_or(name)));
-            let allowed = match s.get("allowedTools") {
-                None => None,
-                Some(v) => Some(
-                    v.as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|x| x.as_str().map(String::from))
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default(),
-                ),
-            };
-            wanted.insert(base_id, allowed);
-        }
+/// `allowedTools` on a team-config server JSON: `None` = key absent (unrestricted),
+/// `Some(list)` = allow-list (empty list = block every tool on that server).
+fn parse_allowed_tools(s: &Value) -> Option<Vec<String>> {
+    match s.get("allowedTools") {
+        None => None,
+        Some(v) => Some(
+            v.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        ),
     }
-    // Resolve actual local ids currently tagged for this team (handles unique_id suffixes).
+}
+
+/// Apply or clear per-server allow-lists onto every profile's `tool_scope`.
+/// `tool_allows` is keyed by the FINAL member-local server id (after `unique_id`), so a
+/// collision rename never loses the org scope. Servers not in the map but still tagged for
+/// this team (shouldn't happen) become unrestricted.
+fn apply_team_tool_scope(
+    reg: &mut Registry,
+    tool_allows: &HashMap<String, Option<Vec<String>>>,
+    tag: &str,
+) {
     let team_ids: Vec<String> = reg
         .servers
         .iter()
@@ -1419,24 +1449,12 @@ fn apply_team_tool_scope(reg: &mut Registry, team_cfg: &Value, tag: &str) {
         p.tool_scope
             .retain(|sid, _| !sid.starts_with("team_") || team_ids.contains(sid));
         for sid in &team_ids {
-            // Prefer exact base_id match; if the live id was deduped (team_github_2), look up
-            // by the longest matching wanted key prefix, else treat as unrestricted.
-            let allow = wanted
-                .get(sid)
-                .cloned()
-                .or_else(|| {
-                    // Deduped ids are `base`, `base_2`, `base_3`, ...
-                    wanted
-                        .iter()
-                        .find(|(base, _)| sid == *base || sid.starts_with(&format!("{base}_")))
-                        .map(|(_, a)| a.clone())
-                })
-                .unwrap_or(None);
-            match allow {
-                Some(list) => {
-                    p.tool_scope.insert(sid.clone(), list);
+            match tool_allows.get(sid) {
+                Some(Some(list)) => {
+                    p.tool_scope.insert(sid.clone(), list.clone());
                 }
-                None => {
+                // Unrestricted (key absent on config) or unknown: clear any prior org scope.
+                Some(None) | None => {
                     p.tool_scope.remove(sid);
                 }
             }
@@ -1879,6 +1897,64 @@ mod tests {
             !r.profile_allows_tool("default", "team_github", "anything"),
             "empty allow-list is a real block-all, not 'all tools'"
         );
+    }
+
+    #[test]
+    fn org_allowed_tools_survives_unique_id_collision_rename() {
+        // Regression: unique_id renames collisions with `{base}-2` (hyphen). Fuzzy base_id
+        // matching used underscore and silently dropped the allow-list on the renamed server.
+        let mut r = base_registry();
+        // Occupy the natural team id so the team server is renamed to team_github-2.
+        r.servers.push(ServerEntry {
+            id: "team_github".into(),
+            name: "Local GitHub".into(),
+            transport: "stdio".into(),
+            command: Some("x".into()),
+            args: vec![],
+            env: vec![],
+            url: None,
+            source: Some("manual".into()),
+            disabled_tools: vec![],
+            cwd: None,
+            unknown_fields: serde_json::Map::new(),
+        });
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({ "servers": [{
+                "id": "github",
+                "name": "GitHub",
+                "transport": "http",
+                "url": "https://1.2.3.4/mcp",
+                "allowedTools": ["list_issues"]
+            }]}),
+        );
+        let team = r
+            .servers
+            .iter()
+            .find(|s| s.source.as_deref() == Some("team:t1"))
+            .expect("team server present");
+        assert_eq!(team.id, "team_github-2", "unique_id uses hyphen suffix");
+        assert!(
+            r.profile_allows_tool("default", &team.id, "list_issues"),
+            "allow-list must follow the post-unique_id server id"
+        );
+        assert!(
+            !r.profile_allows_tool("default", &team.id, "create_pr"),
+            "non-allow-listed tool stays blocked on the renamed id"
+        );
+    }
+
+    #[test]
+    fn receipt_fresh_requires_matching_fingerprint_and_recent_send() {
+        let fp = "abc";
+        assert!(!receipt_fresh(None, None, fp));
+        assert!(!receipt_fresh(Some(fp), None, fp), "no timestamp -> not fresh");
+        assert!(!receipt_fresh(Some("other"), Some(now_ms()), fp));
+        assert!(receipt_fresh(Some(fp), Some(now_ms()), fp), "just sent -> fresh");
+        // Older than heartbeat window -> not fresh (forces re-send to refresh server stamp).
+        let stale_at = now_ms().saturating_sub(RECEIPT_HEARTBEAT_MS + 1);
+        assert!(!receipt_fresh(Some(fp), Some(stale_at), fp));
     }
 
     #[test]

@@ -472,10 +472,18 @@ pub struct TeamConnection {
     /// receipt isn't re-POSTed every ~25s sync. `None` = nothing reported yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_instructions_reported: Option<String>,
+    /// Local ms-epoch of the last successful instructions-receipt POST. A matching fingerprint
+    /// still re-sends after ~12h so the server's `instructions_status_at` stays fresh and the
+    /// dashboard does not mark an actively-syncing member stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_instructions_reported_at: Option<i64>,
     /// Hash of the screening-policy apply receipt last successfully sent (SOU-339). Same
     /// dedup role as `team_instructions_reported`. `None` = nothing reported yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_policy_reported: Option<String>,
+    /// Local ms-epoch of the last successful policy-receipt POST (SOU-339 heartbeat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_policy_reported_at: Option<i64>,
 }
 
 /// Settings for embedding-based search re-ranking. The embedding API key, if the

@@ -7473,7 +7473,9 @@ mod tests {
             team_instructions_version: 0,
             team_instructions_targets: Vec::new(),
             team_instructions_reported: None,
+            team_instructions_reported_at: None,
             team_policy_reported: None,
+            team_policy_reported_at: None,
         });
         assert_eq!(
             router_relevant(&reg),
