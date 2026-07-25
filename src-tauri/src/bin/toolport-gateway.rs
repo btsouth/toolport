@@ -2544,18 +2544,39 @@ fn execute_call(
 
     let started = Instant::now();
     match router.route_call_with_cancel(name, arguments, cancel.clone()) {
-        Ok(mut result) => {
-            let ok = !result
+        Ok(result) => {
+            let ms = started.elapsed().as_millis() as u64;
+            // Downstream success flag (before content defense may flip isError on a
+            // high-confidence injection block — SOU-345). Live inspect keeps the RAW
+            // body + this flag so Activity shows what the server actually returned.
+            let raw_ok = !result
                 .get("isError")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let ms = started.elapsed().as_millis() as u64;
-            // Capture the failure message (the result's text) before shaping
-            // rewrites the content, so Activity can show why the call failed.
+            if let Some(req) = &inspect_args {
+                inspect::record(client, srv, tool, req, &result, raw_ok, ms);
+            }
+            // Content defense + shaping, shared with the error path (below) so a
+            // hostile server can't bypass the injection scanner by answering with an
+            // error instead of a result. A failed tool result (isError from the server)
+            // also gets the recovery hint, appended after both passes so it's never
+            // scanned as external data nor truncated. See defend_and_shape / issue #421.
+            let trailer = if raw_ok {
+                String::new()
+            } else {
+                recovery_hint(cached, srv)
+            };
+            let out = defend_and_shape(reg, srv, tool, client, result, &trailer);
+            // Audit the agent-facing outcome: a content-defense block is a failed call
+            // for governance / SOU-171 export even when the downstream returned ok.
+            let ok = !out
+                .get("isError")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let err = if ok {
                 None
             } else {
-                Some(content_text(&result))
+                Some(content_text(&out))
             };
             audit::record_timed_with_hash(
                 srv,
@@ -2566,25 +2587,7 @@ fn execute_call(
                 client,
                 Some(&call_args_hash),
             );
-            // Live inspection: capture the RAW result here, before content
-            // defense and shaping rewrite it, so the inspector shows exactly
-            // what the server returned. Only runs when live_inspect is on
-            // (inspect_args is Some only then). Attributed to the same client
-            // as the audit line.
-            if let Some(req) = &inspect_args {
-                inspect::record(client, srv, tool, req, &result, ok, ms);
-            }
-            // Content defense + shaping, shared with the error path (below) so a
-            // hostile server can't bypass the injection scanner by answering with an
-            // error instead of a result. A failed tool result (isError from the server)
-            // also gets the recovery hint, appended after both passes so it's never
-            // scanned as external data nor truncated. See defend_and_shape / issue #421.
-            let trailer = if ok {
-                String::new()
-            } else {
-                recovery_hint(cached, srv)
-            };
-            defend_and_shape(reg, srv, tool, client, result, &trailer)
+            out
         }
         Err(e) => {
             let ms = started.elapsed().as_millis() as u64;
@@ -2636,7 +2639,10 @@ fn defend_and_shape(
     trailer: &str,
 ) -> Value {
     // Scan untrusted output for injection; label always, optionally fail closed.
-    if reg.content_defense_effective() {
+    // Block mode alone must still run the scanner: an org forceBlockOnInjection (or a
+    // local blockOnInjection) with contentDefense off would otherwise silently do
+    // nothing (SOU-345).
+    if reg.content_defense_effective() || reg.block_on_injection_effective() {
         let block = reg.should_block_injection_for(srv);
         if let Some(msg) = integrity::defend_content(srv, tool, &mut result, block) {
             // Withhold the (labeled) body; surface a clear security error instead.
@@ -3418,8 +3424,9 @@ fn handle_request_with_cancel(
                 Ok(mut result) => {
                     // Content defense: a resource is as attacker-controllable as a tool
                     // result, so scan it for injection and label any flagged text as data.
-                    // Block mode (SOU-345) uses the owning server id for the exempt map.
-                    if reg.content_defense_effective() {
+                    // Block mode (SOU-345) uses the owning server id for the exempt map
+                    // and still runs when contentDefense is off but block is on.
+                    if reg.content_defense_effective() || reg.block_on_injection_effective() {
                         let srv = router.resource_server(uri).unwrap_or(uri);
                         let block = reg.should_block_injection_for(srv);
                         if let Some(msg) =
@@ -3480,8 +3487,9 @@ fn handle_request_with_cancel(
                 Ok(mut result) => {
                     // Content defense: a prompt's messages are attacker-controllable too;
                     // scan for injection and label any flagged text as data.
-                    // Block mode (SOU-345) uses the owning server id for the exempt map.
-                    if reg.content_defense_effective() {
+                    // Block mode (SOU-345) uses the owning server id for the exempt map
+                    // and still runs when contentDefense is off but block is on.
+                    if reg.content_defense_effective() || reg.block_on_injection_effective() {
                         let srv = router.prompt_server(name).unwrap_or(name);
                         let block = reg.should_block_injection_for(srv);
                         if let Some(msg) =
@@ -7671,6 +7679,27 @@ mod tests {
         );
         // Label mode does not set isError on a success that was only labeled.
         assert!(out.get("isError").is_none() || out["isError"] == false);
+
+        // Block on with contentDefense off must still scan and block (otherwise an org
+        // forceBlockOnInjection alone would be a no-op).
+        let mut reg = Registry::default();
+        reg.content_defense = false;
+        reg.team_forced_content_defense = false;
+        reg.block_on_injection = true;
+        assert!(!reg.content_defense_effective());
+        assert!(reg.block_on_injection_effective());
+        let result = json!({
+            "content": [{ "type": "text", "text": payload }],
+        });
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        assert_eq!(out["isError"], true);
+        assert!(
+            out["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Toolport: blocked"),
+            "block alone must still withhold high-confidence payload"
+        );
     }
 
     #[test]

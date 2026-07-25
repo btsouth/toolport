@@ -1634,9 +1634,10 @@ fn set_quarantine_on_drift(state: State<RegistryState>, on: bool) -> Result<Regi
     Ok(reg)
 }
 
-/// Toggle opt-in block-on-injection (SOU-345). When enabled (and content defense is on),
-/// a high-confidence injection hit fails the tool call instead of only labeling the
-/// content. Org force (`forceBlockOnInjection`) can still enable this via the team overlay.
+/// Toggle opt-in block-on-injection (SOU-345). When enabled, a high-confidence injection
+/// hit fails the tool call instead of only labeling the content (scanning runs even if
+/// the separate content-defense label toggle is off). Org force (`forceBlockOnInjection`)
+/// can still enable this via the team overlay.
 #[tauri::command]
 fn set_block_on_injection(state: State<RegistryState>, on: bool) -> Result<Registry, String> {
     let (reg, _) = write_registry(state.inner(), |reg| {
