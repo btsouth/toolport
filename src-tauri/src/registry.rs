@@ -484,6 +484,13 @@ pub struct TeamConnection {
     /// Local ms-epoch of the last successful policy-receipt POST (SOU-339 heartbeat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_policy_reported_at: Option<i64>,
+    /// Highest audit `ts` successfully uploaded for SOU-171 call-event export. `None` = never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_audit_export_cursor: Option<u64>,
+    /// Org opt-in: export per-call audit events to the team server (SOU-171). Set from the
+    /// last pulled team config's `callAuditExport` flag.
+    #[serde(default)]
+    pub call_audit_export: bool,
 }
 
 /// Settings for embedding-based search re-ranking. The embedding API key, if the

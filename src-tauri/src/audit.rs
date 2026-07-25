@@ -59,6 +59,20 @@ pub fn record_timed(
     error: Option<&str>,
     client: Option<&str>,
 ) {
+    record_timed_with_hash(server, tool, ok, duration_ms, error, client, None);
+}
+
+/// Same as [`record_timed`], optionally attaching a canonical args hash (SOU-171 export).
+/// Never stores the arguments themselves.
+pub fn record_timed_with_hash(
+    server: &str,
+    tool: &str,
+    ok: bool,
+    duration_ms: Option<u64>,
+    error: Option<&str>,
+    client: Option<&str>,
+    args_hash: Option<&str>,
+) {
     let mut entry = json!({
         "ts": epoch_millis() as u64,
         "server": server,
@@ -72,6 +86,9 @@ pub fn record_timed(
     // log answers "who invoked this?". Absent for the local stdio client / open tokens.
     if let Some(c) = client.filter(|c| !c.is_empty()) {
         entry["client"] = json!(c);
+    }
+    if let Some(h) = args_hash.filter(|h| !h.is_empty()) {
+        entry["argsHash"] = json!(h);
     }
     if !ok {
         if let Some(err) = error {

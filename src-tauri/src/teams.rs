@@ -541,6 +541,8 @@ fn finish_connect(server_url: &str, member_name: Option<&str>, joined: Joined) -
         team_instructions_reported_at: None,
         team_policy_reported: None,
         team_policy_reported_at: None,
+        call_audit_export_cursor: None,
+        call_audit_export: false,
     };
     // Pull BEFORE loading the registry, then load a FRESH copy AFTER the (possibly
     // multi-second) network round trip and apply onto that — mirroring `sync_inner`.
@@ -692,6 +694,8 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
     // Report as-enforced screening-policy flags (SOU-339) so the org can prove cooperative
     // enforcement took effect on this machine. Deduped like the instructions receipt.
     report_policy_status(&conn, &token);
+    // Opt-in per-call audit export (SOU-171): tool name/ts/duration/ok/argsHash only.
+    report_call_events(&conn, &token);
     Ok(SyncResult::Ok {
         role,
         role_changed,
@@ -1069,6 +1073,114 @@ fn build_policy_receipt(reg: &crate::registry::Registry) -> Value {
     })
 }
 
+/// Upload new local audit lines for team servers when org has `callAuditExport` on (SOU-171).
+/// Fields: ts, server, tool, ok, durationMs, argsHash, client — never args/results.
+fn report_call_events(conn: &TeamConnection, token: &str) {
+    let tag = tag_for(&conn.team_id);
+    let (enabled, cursor, team_servers) = {
+        let Ok(reg) = crate::registry::load() else {
+            return;
+        };
+        match reg.team.as_ref() {
+            Some(t) if t.team_id == conn.team_id && t.call_audit_export => {}
+            _ => return,
+        }
+        let team_servers: HashSet<String> = reg
+            .servers
+            .iter()
+            .filter(|s| s.source.as_deref() == Some(tag.as_str()))
+            .map(|s| s.id.clone())
+            .collect();
+        if team_servers.is_empty() {
+            return;
+        }
+        let cursor = reg
+            .team
+            .as_ref()
+            .and_then(|t| t.call_audit_export_cursor)
+            .unwrap_or(0);
+        (true, cursor, team_servers)
+    };
+    if !enabled {
+        return;
+    }
+    let lines = crate::audit::read_recent(usize::MAX);
+    let mut batch: Vec<Value> = Vec::new();
+    let mut max_ts = cursor;
+    for line in &lines {
+        let ts = line.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
+        if ts <= cursor {
+            continue;
+        }
+        let server = line.get("server").and_then(|v| v.as_str()).unwrap_or("");
+        if !team_servers.contains(server) {
+            continue;
+        }
+        // Skip governance-only held/approval rows that aren't real tool executions with ok/duration.
+        // Still export held=true ok rows if they have tool — org may want to see denials. Include all with tool.
+        let tool = line.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+        if tool.is_empty() {
+            continue;
+        }
+        let mut ev = json!({
+            "ts": ts,
+            "server": server,
+            "tool": tool,
+            "ok": line.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+        });
+        if let Some(ms) = line.get("durationMs").and_then(|v| v.as_u64()) {
+            ev["durationMs"] = json!(ms);
+        }
+        if let Some(h) = line.get("argsHash").and_then(|v| v.as_str()) {
+            ev["argsHash"] = json!(h);
+        }
+        if let Some(c) = line.get("client").and_then(|v| v.as_str()) {
+            ev["client"] = json!(c);
+        }
+        batch.push(ev);
+        max_ts = max_ts.max(ts);
+        if batch.len() >= 200 {
+            break;
+        }
+    }
+    if batch.is_empty() {
+        return;
+    }
+    match post_call_events(&conn.server_url, &conn.team_id, token, &batch) {
+        Ok(true) => {
+            let _ = crate::registry::update(|reg| {
+                if let Some(t) = reg.team.as_mut() {
+                    if t.team_id == conn.team_id {
+                        t.call_audit_export_cursor = Some(max_ts);
+                    }
+                }
+                Ok(())
+            });
+        }
+        _ => {}
+    }
+}
+
+fn post_call_events(
+    server_url: &str,
+    team_id: &str,
+    token: &str,
+    events: &[Value],
+) -> Result<bool, String> {
+    require_secure_team_url(server_url)?;
+    let url = format!("{}/teams/{}/call-events", base(server_url), team_id);
+    let body = json!({ "events": events });
+    match agent()
+        .post(&url)
+        .set("authorization", &format!("Bearer {token}"))
+        .send_json(body)
+    {
+        Ok(_) => Ok(true),
+        Err(ureq::Error::Status(404 | 405, _)) => Ok(false),
+        Err(e) => Err(stringify(e)),
+    }
+}
+
 /// Report this member's as-enforced screening policy to the team server once per sync cycle.
 /// Deduped by receipt hash, with a 12h heartbeat so `policy_status_at` stays fresh. Best-effort.
 fn report_policy_status(conn: &TeamConnection, token: &str) {
@@ -1401,6 +1513,14 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     reg.team_forced_quarantine_on_drift = policy_forces("forceQuarantineOnDrift");
     reg.team_forced_human_approval = policy_forces("forceHumanApproval");
 
+    // SOU-171: org opt-in for per-call audit export (member apps upload when true).
+    if let Some(t) = reg.team.as_mut() {
+        if t.team_id == team_id {
+            t.call_audit_export =
+                team_cfg.get("callAuditExport").and_then(Value::as_bool) == Some(true);
+        }
+    }
+
     // Org per-tool allowlists (SOU-167): each team server may carry `allowedTools` (an allow-
     // list of ORIGINAL tool names). When present, every profile is narrowed to that list for
     // that server via `tool_scope` (the existing FeatureSet gate). When absent, any prior
@@ -1577,6 +1697,7 @@ pub fn remove_team(reg: &mut Registry, team_id: &str) {
     reg.team_forced_deny_destructive = false;
     reg.team_forced_content_defense = false;
     reg.team_forced_quarantine_on_drift = false;
+    // Export flag lives on TeamConnection which is cleared on disconnect; no extra field.
 }
 
 #[cfg(test)]

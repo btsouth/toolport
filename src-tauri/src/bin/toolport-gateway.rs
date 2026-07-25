@@ -2521,6 +2521,8 @@ fn execute_call(
     } else {
         None
     };
+    // Hash args for the audit line (and SOU-171 org export) without storing them.
+    let call_args_hash = audit::args_hash(&arguments);
 
     let started = Instant::now();
     match router.route_call_with_cancel(name, arguments, cancel.clone()) {
@@ -2537,7 +2539,15 @@ fn execute_call(
             } else {
                 Some(content_text(&result))
             };
-            audit::record_timed(srv, tool, ok, Some(ms), err.as_deref(), client);
+            audit::record_timed_with_hash(
+                srv,
+                tool,
+                ok,
+                Some(ms),
+                err.as_deref(),
+                client,
+                Some(&call_args_hash),
+            );
             // Live inspection: capture the RAW result here, before content
             // defense and shaping rewrite it, so the inspector shows exactly
             // what the server returned. Only runs when live_inspect is on
@@ -2560,7 +2570,15 @@ fn execute_call(
         }
         Err(e) => {
             let ms = started.elapsed().as_millis() as u64;
-            audit::record_timed(srv, tool, false, Some(ms), Some(&e), client);
+            audit::record_timed_with_hash(
+                srv,
+                tool,
+                false,
+                Some(ms),
+                Some(&e),
+                client,
+                Some(&call_args_hash),
+            );
             // Live inspection: capture the failed call too, with the error
             // as the response body. Only when live_inspect is on.
             if let Some(req) = &inspect_args {
@@ -7553,6 +7571,8 @@ mod tests {
             team_instructions_reported_at: None,
             team_policy_reported: None,
             team_policy_reported_at: None,
+            call_audit_export_cursor: None,
+            call_audit_export: false,
         });
         assert_eq!(
             router_relevant(&reg),
