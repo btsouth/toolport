@@ -102,6 +102,12 @@ function fmtDollars(n: number): string {
 
 /** A badge describing one security event by kind. */
 function eventBadge(e: SecurityEvent): { label: string; cls: string } {
+  if (e.type === "result_injection_blocked") {
+    return {
+      label: "injection blocked",
+      cls: "bg-destructive/15 text-destructive",
+    };
+  }
   if (e.type === "result_injection") {
     return {
       label: "injected result",
@@ -136,6 +142,7 @@ function eventSeverity(e: SecurityEvent): "high" | "info" {
   if (
     e.type === "tool_poison_flag" ||
     e.type === "result_injection" ||
+    e.type === "result_injection_blocked" ||
     e.type === "pins_load_failed"
   ) {
     return "high";
@@ -1463,7 +1470,8 @@ export function ActivityView({
   const isNewTool = (e: SecurityEvent) =>
     e.change === "added" &&
     e.type !== "tool_poison_flag" &&
-    e.type !== "result_injection";
+    e.type !== "result_injection" &&
+    e.type !== "result_injection_blocked";
   const highSecurity = liveSecurity.filter(
     (e) => eventSeverity(e) === "high" && !isNewTool(e),
   );

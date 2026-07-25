@@ -283,6 +283,11 @@ export function setQuarantineOnDrift(on: boolean): Promise<Registry> {
   return invoke<Registry>("set_quarantine_on_drift", { on });
 }
 
+/** Toggle opt-in block-on-injection: fail high-confidence injection hits instead of only labeling. */
+export function setBlockOnInjection(on: boolean): Promise<Registry> {
+  return invoke<Registry>("set_block_on_injection", { on });
+}
+
 /** A tool blocked after a high-risk drift, awaiting re-approval. */
 export interface QuarantinedTool {
   server: string;

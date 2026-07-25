@@ -1634,6 +1634,18 @@ fn set_quarantine_on_drift(state: State<RegistryState>, on: bool) -> Result<Regi
     Ok(reg)
 }
 
+/// Toggle opt-in block-on-injection (SOU-345). When enabled (and content defense is on),
+/// a high-confidence injection hit fails the tool call instead of only labeling the
+/// content. Org force (`forceBlockOnInjection`) can still enable this via the team overlay.
+#[tauri::command]
+fn set_block_on_injection(state: State<RegistryState>, on: bool) -> Result<Registry, String> {
+    let (reg, _) = write_registry(state.inner(), |reg| {
+        reg.block_on_injection = on;
+        Ok(())
+    })?;
+    Ok(reg)
+}
+
 /// Tools currently quarantined (blocked after a high-risk drift), across all profiles.
 ///
 /// Also fires an OS notification when a **new** entry appears after the first baseline
@@ -2934,6 +2946,7 @@ pub fn run() {
             clear_activity_logs,
             list_tool_identities,
             set_quarantine_on_drift,
+            set_block_on_injection,
             list_quarantined,
             release_quarantine,
             set_lazy_discovery,

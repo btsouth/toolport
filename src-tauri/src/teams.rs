@@ -1063,7 +1063,7 @@ fn report_instructions_status(conn: &TeamConnection, token: &str) {
     }
 }
 
-/// Build the screening-policy apply receipt (SOU-339): the four safety flags as currently
+/// Build the screening-policy apply receipt (SOU-339 / SOU-345): safety flags as currently
 /// enforced on this machine (member's own setting OR team force, whichever is stricter).
 fn build_policy_receipt(reg: &crate::registry::Registry) -> Value {
     json!({
@@ -1071,6 +1071,7 @@ fn build_policy_receipt(reg: &crate::registry::Registry) -> Value {
         "forceContentDefense": reg.content_defense_effective(),
         "forceQuarantineOnDrift": reg.quarantine_on_drift_effective(),
         "forceHumanApproval": reg.human_approval_effective(),
+        "forceBlockOnInjection": reg.block_on_injection_effective(),
     })
 }
 
@@ -1513,6 +1514,7 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     reg.team_forced_content_defense = policy_forces("forceContentDefense");
     reg.team_forced_quarantine_on_drift = policy_forces("forceQuarantineOnDrift");
     reg.team_forced_human_approval = policy_forces("forceHumanApproval");
+    reg.team_forced_block_on_injection = policy_forces("forceBlockOnInjection");
 
     // SOU-171: org opt-in for per-call audit export (member apps upload when true).
     // SOU-340: resolved tool-call caps for this member (empty clears prior caps).
@@ -1694,12 +1696,13 @@ pub fn remove_team(reg: &mut Registry, team_id: &str) {
         }
     }
     // Release ALL of this team's forced safety locks: the member is no longer in the team, so
-    // an org-forced policy (HITL, destructive-block, content defense, drift-quarantine) must not
-    // keep applying. Their OWN settings are left untouched.
+    // an org-forced policy (HITL, destructive-block, content defense, drift-quarantine,
+    // block-on-injection) must not keep applying. Their OWN settings are left untouched.
     reg.team_forced_human_approval = false;
     reg.team_forced_deny_destructive = false;
     reg.team_forced_content_defense = false;
     reg.team_forced_quarantine_on_drift = false;
+    reg.team_forced_block_on_injection = false;
     // Export flag lives on TeamConnection which is cleared on disconnect; no extra field.
 }
 
@@ -2132,6 +2135,7 @@ mod tests {
         r.deny_destructive = false;
         r.content_defense = false;
         r.quarantine_on_drift = false;
+        r.block_on_injection = false;
         apply_team_config(
             &mut r,
             "t1",
@@ -2139,28 +2143,32 @@ mod tests {
                 "forceHumanApproval": true,
                 "forceContentDefense": true,
                 "forceQuarantineOnDrift": true,
+                "forceBlockOnInjection": true,
             }}),
         );
         assert!(
             r.human_approval_effective()
                 && r.deny_destructive_effective()
                 && r.content_defense_effective()
-                && r.quarantine_on_drift_effective(),
-            "all four enforced while in the team"
+                && r.quarantine_on_drift_effective()
+                && r.block_on_injection_effective(),
+            "all five enforced while in the team"
         );
         remove_team(&mut r, "t1");
         assert!(
             !r.team_forced_human_approval
                 && !r.team_forced_deny_destructive
                 && !r.team_forced_content_defense
-                && !r.team_forced_quarantine_on_drift,
+                && !r.team_forced_quarantine_on_drift
+                && !r.team_forced_block_on_injection,
             "leaving clears every org lock"
         );
         assert!(
             !r.human_approval_effective()
                 && !r.deny_destructive_effective()
                 && !r.content_defense_effective()
-                && !r.quarantine_on_drift_effective(),
+                && !r.quarantine_on_drift_effective()
+                && !r.block_on_injection_effective(),
             "no team -> every flag follows the member's own (off) settings"
         );
     }
@@ -2261,13 +2269,14 @@ mod tests {
 
     #[test]
     fn policy_receipt_reports_as_enforced_effective_flags() {
-        // SOU-339: the receipt mirrors *_effective(), not just the team-forced overlay, so an
-        // admin sees what is actually enforced on the member's machine.
+        // SOU-339 / SOU-345: the receipt mirrors *_effective(), not just the team-forced
+        // overlay, so an admin sees what is actually enforced on the member's machine.
         let mut r = base_registry();
         r.deny_destructive = true; // member's own on
         r.content_defense = false;
         r.quarantine_on_drift = false;
         r.human_approval = false;
+        r.block_on_injection = false;
         apply_team_config(
             &mut r,
             "t1",
@@ -2277,7 +2286,8 @@ mod tests {
                 "screeningPolicy": {
                     "forceContentDefense": true,
                     "forceQuarantineOnDrift": false,
-                    "forceHumanApproval": true
+                    "forceHumanApproval": true,
+                    "forceBlockOnInjection": true
                 }
             }),
         );
@@ -2286,6 +2296,25 @@ mod tests {
         assert_eq!(receipt["forceContentDefense"], true, "org force makes content defense effective");
         assert_eq!(receipt["forceQuarantineOnDrift"], false);
         assert_eq!(receipt["forceHumanApproval"], true);
+        assert_eq!(receipt["forceBlockOnInjection"], true, "org force makes block-on-injection effective");
+    }
+
+    #[test]
+    fn forced_block_on_injection_is_releasable_and_leaves_the_member_untouched() {
+        let mut r = base_registry();
+        r.block_on_injection = false;
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({ "servers": [], "screeningPolicy": { "forceBlockOnInjection": true }}),
+        );
+        assert!(r.team_forced_block_on_injection);
+        assert!(!r.block_on_injection, "member's own setting is untouched");
+        assert!(r.block_on_injection_effective());
+        apply_team_config(&mut r, "t1", &json!({ "servers": [] }));
+        assert!(!r.block_on_injection_effective(), "org released the lock");
+        remove_team(&mut r, "t1");
+        assert!(!r.team_forced_block_on_injection);
     }
 
     #[test]

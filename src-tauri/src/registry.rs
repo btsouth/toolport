@@ -293,15 +293,17 @@ pub struct Registry {
     pub team_forced_human_approval: bool,
     /// The same releasable org-lock treatment as [`team_forced_human_approval`] for the other
     /// tighten-only screening flags (`denyDestructive`, `forceContentDefense`,
-    /// `forceQuarantineOnDrift`). Set from the active team's policy, recomputed each sync and
-    /// cleared on leave, so an org lock never permanently overwrites the member's own setting.
-    /// Enforcement reads `*_effective()` (member's own OR team-forced).
+    /// `forceQuarantineOnDrift`, `forceBlockOnInjection`). Set from the active team's policy,
+    /// recomputed each sync and cleared on leave, so an org lock never permanently overwrites
+    /// the member's own setting. Enforcement reads `*_effective()` (member's own OR team-forced).
     #[serde(default)]
     pub team_forced_deny_destructive: bool,
     #[serde(default)]
     pub team_forced_content_defense: bool,
     #[serde(default)]
     pub team_forced_quarantine_on_drift: bool,
+    #[serde(default)]
+    pub team_forced_block_on_injection: bool,
     /// Per-tool exposure overrides, keyed by server id then ORIGINAL tool name (not the
     /// exposed name, so a rename or `_2` collision suffix can't misalign the key): rename or
     /// re-describe a tool as clients see it (e.g. neutralize a poisoned description). The
@@ -358,9 +360,21 @@ pub struct Registry {
     pub integrity_check: bool,
     /// Content defense (anti-agentjacking): scan untrusted tool RESULTS for injection
     /// and label flagged content as data, not instructions, before the agent sees it.
-    /// Detection + labeling, never blocks. On by default.
+    /// Detection + labeling. On by default. Pair with [`block_on_injection`] to fail closed
+    /// on high-confidence hits (SOU-345).
     #[serde(default = "default_true")]
     pub content_defense: bool,
+    /// Opt-in fail-closed content defense (SOU-345): when true (or team-forced), a
+    /// high-confidence injection hit fails the call instead of only labeling. Off by
+    /// default so v1 label-only behavior is preserved. Per-server exempt list:
+    /// [`injection_block_exempt`].
+    #[serde(default)]
+    pub block_on_injection: bool,
+    /// Server ids for which block-on-injection never applies (label only), even when
+    /// global/org block mode is on. For servers that legitimately return prompty text.
+    /// Key present with `true` = exempt. Same shape as other per-server maps.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub injection_block_exempt: HashMap<String, bool>,
     /// Live request/response inspection: when true, the gateway captures each tool
     /// call's arguments and result into a small, separate, ephemeral local ring
     /// (`inspect.jsonl`, last 50 calls, each body size-capped) so the Activity view
@@ -548,6 +562,7 @@ impl Default for Registry {
             team_forced_deny_destructive: false,
             team_forced_content_defense: false,
             team_forced_quarantine_on_drift: false,
+            team_forced_block_on_injection: false,
             tool_overrides: HashMap::new(),
             pinned_tools: HashMap::new(),
             quarantine_on_drift: false,
@@ -557,6 +572,8 @@ impl Default for Registry {
             allow_agent_control: false,
             integrity_check: true,
             content_defense: true,
+            block_on_injection: false,
+            injection_block_exempt: HashMap::new(),
             live_inspect: false,
             semantic_search: SemanticSettings::default(),
             team: None,
@@ -836,6 +853,23 @@ impl Registry {
     }
     pub fn quarantine_on_drift_effective(&self) -> bool {
         self.quarantine_on_drift || self.team_forced_quarantine_on_drift
+    }
+    /// Member's own OR team-forced fail-closed injection block (SOU-345).
+    pub fn block_on_injection_effective(&self) -> bool {
+        self.block_on_injection || self.team_forced_block_on_injection
+    }
+    /// Whether this server should fail closed on a high-confidence injection hit:
+    /// block mode effective, and the server is not on the exempt list.
+    pub fn should_block_injection_for(&self, server: &str) -> bool {
+        if !self.block_on_injection_effective() {
+            return false;
+        }
+        // Exempt only when the map explicitly sets the server to true.
+        !self
+            .injection_block_exempt
+            .get(server)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Add a `server/tool` key to the persistent "always allow" list, so the HITL gate

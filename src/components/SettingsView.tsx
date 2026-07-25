@@ -50,6 +50,7 @@ import {
   setLazyDiscovery,
   setFolderProfiles,
   setLiveInspect,
+  setBlockOnInjection,
   setQuarantineOnDrift,
   setToolPinned,
   startHttpBridge,
@@ -303,20 +304,23 @@ function PostureSummary({
   confirmDestructive,
   humanApproval,
   quarantineOnDrift,
+  blockOnInjection,
 }: {
   denyDestructive: boolean;
   confirmDestructive: boolean;
   humanApproval: boolean;
   quarantineOnDrift: boolean;
+  blockOnInjection: boolean;
 }) {
   const active = [
     humanApproval && "human approval required",
     denyDestructive && "destructive tools blocked",
     confirmDestructive && "destructive calls confirmed",
     quarantineOnDrift && "drifted tools quarantined",
+    blockOnInjection && "injection hits blocked",
   ].filter(Boolean) as string[];
   // A hard gate (block or human-approval) = guarded; softer measures alone = partial.
-  const gated = humanApproval || denyDestructive;
+  const gated = humanApproval || denyDestructive || blockOnInjection;
   const state = gated ? "guarded" : active.length > 0 ? "partial" : "open";
   const meta = {
     guarded: {
@@ -493,6 +497,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   const humanApproval = registry?.humanApproval ?? false;
   const allowAgentControl = registry?.allowAgentControl ?? false;
   const quarantineOnDrift = registry?.quarantineOnDrift ?? false;
+  const blockOnInjection = registry?.blockOnInjection ?? false;
   const liveInspect = registry?.liveInspect ?? false;
   const [busy, setBusy] = useState(false);
   // Profile cards collapse so a big Default profile doesn't dump every server (and its
@@ -863,6 +868,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           confirmDestructive={confirmDestructive}
           humanApproval={humanApproval}
           quarantineOnDrift={quarantineOnDrift}
+          blockOnInjection={blockOnInjection}
         />
         {toggle(
           ShieldAlert,
@@ -895,6 +901,14 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "Quarantine changed high-risk tools",
           "Block a destructive or poisoned tool that changes from its approved version, until you re-approve it",
           apply(setQuarantineOnDrift),
+        )}
+        {toggle(
+          ShieldAlert,
+          blockOnInjection,
+          "text-destructive",
+          "Block high-confidence injection",
+          "Fail a tool call when content defense finds a high-confidence prompt-injection hit, instead of only labeling the text. Off by default; medium-confidence hits still label only",
+          apply(setBlockOnInjection),
         )}
         {toggle(
           Bot,

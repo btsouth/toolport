@@ -426,6 +426,10 @@ export interface Registry {
   liveInspect?: boolean;
   /** Quarantine-on-drift: block a high-risk tool that changed until re-approved. */
   quarantineOnDrift?: boolean;
+  /** Opt-in fail-closed content defense: block high-confidence injection hits (SOU-345). */
+  blockOnInjection?: boolean;
+  /** Server ids exempt from block-on-injection (label only). */
+  injectionBlockExempt?: Record<string, boolean>;
   /** Global switch: expose 4 meta-tools instead of the full catalog. */
   lazyDiscovery?: boolean;
   /** Global discovery mode ("full" | "lazy" | "grouped"). Takes precedence over
