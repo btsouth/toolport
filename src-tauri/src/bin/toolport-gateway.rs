@@ -6004,15 +6004,37 @@ fn handle_http(
             "application/json",
             openapi_spec(state, allowed).to_string(),
         ),
-        ("GET", "/") | ("GET", "/docs") => HttpOut::new(
-            200,
-            "text/plain; charset=utf-8",
-            "Toolport gateway (HTTP mode).\n\
-             OpenAPI: GET /openapi.json, POST /{tool_name} with a JSON body.\n\
-             MCP streamable-HTTP: POST /mcp with JSON-RPC; GET /mcp for server→client SSE.\n\
-             Auth: Authorization: Bearer <CONDUIT_HTTP_TOKEN>."
-                .to_string(),
-        ),
+        ("GET", "/") | ("GET", "/docs") => {
+            let metrics_line = if conduit_lib::metrics::metrics_enabled() {
+                "Metrics: GET /metrics (Prometheus text; set CONDUIT_METRICS=1).\n"
+            } else {
+                "Metrics: off (set CONDUIT_METRICS=1 to enable GET /metrics).\n"
+            };
+            HttpOut::new(
+                200,
+                "text/plain; charset=utf-8",
+                format!(
+                    "Toolport gateway (HTTP mode).\n\
+                     OpenAPI: GET /openapi.json, POST /{{tool_name}} with a JSON body.\n\
+                     MCP streamable-HTTP: POST /mcp with JSON-RPC; GET /mcp for server→client SSE.\n\
+                     {metrics_line}\
+                     Auth: Authorization: Bearer <CONDUIT_HTTP_TOKEN>."
+                ),
+            )
+        }
+        ("GET", "/metrics") => {
+            if !conduit_lib::metrics::metrics_enabled() {
+                return HttpOut::json_err(
+                    404,
+                    "metrics disabled; set CONDUIT_METRICS=1 on the gateway to enable",
+                );
+            }
+            HttpOut::new(
+                200,
+                "text/plain; version=0.0.4; charset=utf-8",
+                conduit_lib::metrics::render(),
+            )
+        }
         ("POST", p) => {
             let name = p.trim_start_matches('/');
             if name.is_empty() {

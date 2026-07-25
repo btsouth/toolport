@@ -43,6 +43,19 @@ toolport-gateway --http 8765
 Point Open WebUI at `http://host:8765` with the bearer token as the API key.
 Point an MCP client at `http://host:8765/mcp` (streamable-HTTP).
 
+### Prometheus metrics (opt-in)
+
+Off by default. Set `CONDUIT_METRICS=1` on the gateway process, then scrape:
+
+```bash
+curl -s -H "Authorization: Bearer $CONDUIT_HTTP_TOKEN" \
+  http://127.0.0.1:8765/metrics
+```
+
+Emits counters for tool calls (`server`, `tool`, `client`, `ok`), held
+destructive calls, duration sum/count, lazy-discovery tokens saved, and a
+quarantine gauge. Labels are ids only (never arguments). Same auth as OpenAPI.
+
 ### MCP handshake (curl)
 
 ```bash
@@ -284,6 +297,7 @@ Toolport reads the following environment variables. This is the complete referen
 | `CONDUIT_HTTP_HOST`             | Host IP to bind for the HTTP endpoint.                                                             | `127.0.0.1`      | Gateway                   |
 | `CONDUIT_HTTP_PORT`             | Port for the HTTP endpoint (when `CONDUIT_HTTP` is a boolean).                                     | `8765`           | Gateway                   |
 | `CONDUIT_HTTP_TOKEN`            | Bearer token for HTTP authentication.                                                              | None             | Gateway                   |
+| `CONDUIT_METRICS`               | Opt-in Prometheus `GET /metrics` (`1` / `true` / `yes`). Off by default.                           | Off              | Gateway (HTTP mode)       |
 | `CONDUIT_PROFILE`               | Initial profile value for a scoped client install; live scope is resolved via `CONDUIT_CLIENT_ID`. | None             | Clients                   |
 | `CONDUIT_REGISTRY`              | Override the path to `registry.json`.                                                              | Config root      | Everywhere                |
 | `CONDUIT_RESULT_BUDGET`         | Byte budget before large tool results get shaped/truncated (0 to disable).                         | `49152`          | Everywhere                |
