@@ -95,11 +95,11 @@ Do **not** change Enterprise SSO/SCIM from “contact us / on your terms” into
 
 ### Page launch gate (process)
 
-- [ ] Comparison page draft uses only **Ship** / **Roadmap** / **N/A** from this matrix
-- [ ] Refresh `/teams` marketing bullets for rate limits, receipts, per-tool policy, 2FA, webhooks
-- [ ] Explicit cooperative-enforcement paragraph (no boundary cosplay)
-- [ ] SSO/SCIM rows marked Roadmap, not green checkmarks
-- [ ] Optional: SOU-343 language if tokens mentioned at all
+- [x] Comparison page draft uses only **Ship** / **Roadmap** / **N/A** from this matrix (`/compare/cloudflare/`)
+- [x] Refresh `/teams` marketing bullets for rate limits, receipts, per-tool policy, 2FA, webhooks
+- [x] Explicit cooperative-enforcement paragraph (no boundary cosplay)
+- [x] SSO/SCIM rows marked Roadmap, not green checkmarks
+- [x] SOU-343 language only in FAQ (no scoped-token claim)
 - [ ] After page: resume P2 (345–348) as lead-extension, not page deps
 
 ### Explicit non-goals for v1 comparison page
