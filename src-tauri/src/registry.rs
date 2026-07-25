@@ -491,6 +491,10 @@ pub struct TeamConnection {
     /// last pulled team config's `callAuditExport` flag.
     #[serde(default)]
     pub call_audit_export: bool,
+    /// Tool-call caps from the last config pull (SOU-340). Resolved for this member by
+    /// the team server; empty = no org caps. Enforced cooperatively in the local gateway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rate_limits: Vec<crate::rate_limits::Cap>,
 }
 
 /// Settings for embedding-based search re-ranking. The embedding API key, if the

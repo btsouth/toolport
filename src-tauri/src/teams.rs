@@ -543,6 +543,7 @@ fn finish_connect(server_url: &str, member_name: Option<&str>, joined: Joined) -
         team_policy_reported_at: None,
         call_audit_export_cursor: None,
         call_audit_export: false,
+        rate_limits: Vec::new(),
     };
     // Pull BEFORE loading the registry, then load a FRESH copy AFTER the (possibly
     // multi-second) network round trip and apply onto that — mirroring `sync_inner`.
@@ -1514,10 +1515,12 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     reg.team_forced_human_approval = policy_forces("forceHumanApproval");
 
     // SOU-171: org opt-in for per-call audit export (member apps upload when true).
+    // SOU-340: resolved tool-call caps for this member (empty clears prior caps).
     if let Some(t) = reg.team.as_mut() {
         if t.team_id == team_id {
             t.call_audit_export =
                 team_cfg.get("callAuditExport").and_then(Value::as_bool) == Some(true);
+            t.rate_limits = crate::rate_limits::parse_caps(team_cfg);
         }
     }
 

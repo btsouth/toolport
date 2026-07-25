@@ -13,6 +13,7 @@ pub mod inspect;
 pub mod instructions;
 pub mod integrity;
 pub mod oauth;
+pub mod rate_limits;
 pub mod registry;
 pub mod remote;
 pub mod router;

@@ -2370,6 +2370,24 @@ fn execute_call(
         return json!({ "content": [{ "type": "text", "text": msg }], "isError": true });
     }
 
+    // Org tool-call caps (SOU-340): cooperative local enforcement of Teams rate_limits.
+    // Runs before HITL/destructive gates so a hard cap does not queue for human approval.
+    // Denied calls do not increment counters (check_and_count is atomic for allow path).
+    if let Some(team) = reg.team.as_ref() {
+        if !team.rate_limits.is_empty() {
+            if let Err(msg) =
+                conduit_lib::rate_limits::check_and_count(&team.rate_limits, &server_id, tool)
+            {
+                // Count as a failed call with a clear reason so Activity / export show the block.
+                audit::record_timed(srv, tool, false, None, Some("rate_limit"), client);
+                return json!({
+                    "content": [{ "type": "text", "text": msg }],
+                    "isError": true
+                });
+            }
+        }
+    }
+
     // Human-in-the-loop approval: hold a gated call (destructive, or from an
     // untrusted-provenance server) until a person approves it in the Toolport app.
     // Takes precedence over the agent-facing confirm below, and is fail-closed
@@ -7034,6 +7052,11 @@ fn handle_connection(
 }
 
 fn main() {
+    // Persist org rate-limit counters across restarts (SOU-340). Safe if dir missing;
+    // counters then stay process-local until the first successful bind.
+    if let Some(dir) = registry::conduit_dir() {
+        conduit_lib::rate_limits::bind_data_dir(&dir);
+    }
     // Diagnostic: `toolport-gateway --selftest-secrets` reads every vaulted secret
     // from THIS (gateway) process and reports. Used to validate the macOS keychain
     // shared-access ACL: this runs as a separate process from the app, exactly the
@@ -7573,6 +7596,7 @@ mod tests {
             team_policy_reported_at: None,
             call_audit_export_cursor: None,
             call_audit_export: false,
+            rate_limits: Vec::new(),
         });
         assert_eq!(
             router_relevant(&reg),
