@@ -62,6 +62,24 @@ beforeEach(() => {
   toastError.mockReset();
 });
 
+describe("ClientDetail detection errors", () => {
+  it("shows the client error in the main panel", () => {
+    render(
+      <ClientDetail
+        client={client({ error: "Couldn't parse config: unexpected token" })}
+        registry={emptyRegistry()}
+        onChanged={() => {}}
+        onRegistryChange={() => {}}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Couldn't parse config: unexpected token",
+    );
+    expect(screen.getByRole("button", { name: /connect to toolport/i })).toBeEnabled();
+  });
+});
+
 describe("ClientDetail connect toast (SOU-317)", () => {
   it("tells the user to restart the client after a successful Connect", async () => {
     // Without this, the UI says "Connected" while Claude Desktop (and most peers)
