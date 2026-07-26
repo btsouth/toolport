@@ -18,6 +18,6 @@
     "maxSearchP95EstimatedTokens": 550,
     "minRecallAtK": 1,
     "minSchemaReadyAtK": 1,
-    "maxCallOverheadP95Milliseconds": 5
+    "maxCallOverheadP95Milliseconds": 3
   }
 }

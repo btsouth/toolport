@@ -2468,6 +2468,76 @@ fn refused_call_result(
     })
 }
 
+/// Opt-in stage timer for diagnosing Toolport's own routed-call overhead. Disabled
+/// by default and cached once per process; the normal call path pays only an
+/// `Option` branch. Timings go to stderr (never the MCP protocol stream) and contain
+/// no arguments or result data.
+struct RoutedCallProfiler {
+    tool: String,
+    started: Instant,
+    checkpoint: Instant,
+    preflight_us: u64,
+    downstream_us: u64,
+    postprocess_us: u64,
+}
+
+impl RoutedCallProfiler {
+    fn start(tool: &str) -> Option<Self> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            conduit_lib::brand::env_var("TOOLPORT_PROFILE_CALLS", "CONDUIT_PROFILE_CALLS")
+                .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+                .unwrap_or(false)
+        });
+        enabled.then(|| {
+            let now = Instant::now();
+            Self {
+                tool: tool.to_string(),
+                started: now,
+                checkpoint: now,
+                preflight_us: 0,
+                downstream_us: 0,
+                postprocess_us: 0,
+            }
+        })
+    }
+
+    fn elapsed_since_checkpoint(&mut self) -> u64 {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.checkpoint).as_micros() as u64;
+        self.checkpoint = now;
+        elapsed
+    }
+
+    fn mark_preflight(&mut self) {
+        self.preflight_us = self.elapsed_since_checkpoint();
+    }
+
+    fn mark_downstream(&mut self) {
+        self.downstream_us = self.elapsed_since_checkpoint();
+    }
+
+    fn mark_postprocess(&mut self) {
+        self.postprocess_us = self.elapsed_since_checkpoint();
+    }
+
+    fn finish(mut self) {
+        let audit_us = self.elapsed_since_checkpoint();
+        let total_us = self.started.elapsed().as_micros() as u64;
+        eprintln!(
+            "toolport-call-profile {}",
+            json!({
+                "tool": self.tool,
+                "preflightUs": self.preflight_us,
+                "downstreamUs": self.downstream_us,
+                "postprocessUs": self.postprocess_us,
+                "auditUs": audit_us,
+                "totalUs": total_us,
+            })
+        );
+    }
+}
+
 /// Execute ONE already-resolved tool call and return the MCP tool RESULT (the inner
 /// `{content, isError, structuredContent}`), NOT a JSON-RPC envelope. This is the single
 /// path both a direct `toolport_call_tool` dispatch and a code-mode script's
@@ -2495,6 +2565,7 @@ fn execute_call(
     arguments: Value,
     mut confirmed: bool,
 ) -> Value {
+    let mut call_profiler = RoutedCallProfiler::start(name);
     // Resolve the call's real (server, original tool) from the router's route map,
     // NOT by splitting the exposed name on `__`. A renamed tool (via a tool override)
     // or a server id containing `__` would otherwise mis-derive the server and
@@ -2710,10 +2781,16 @@ fn execute_call(
     };
     // Hash args for the audit line (and SOU-171 org export) without storing them.
     let call_args_hash = audit::args_hash(&arguments);
+    if let Some(profiler) = &mut call_profiler {
+        profiler.mark_preflight();
+    }
 
     let started = Instant::now();
     match router.route_call_with_cancel(name, arguments, cancel.clone()) {
         Ok(result) => {
+            if let Some(profiler) = &mut call_profiler {
+                profiler.mark_downstream();
+            }
             let ms = started.elapsed().as_millis() as u64;
             // Downstream success flag (before content defense may flip isError on a
             // high-confidence injection block — SOU-345). Live inspect keeps the RAW
@@ -2736,6 +2813,9 @@ fn execute_call(
                 recovery_hint(cached, srv)
             };
             let out = defend_and_shape(reg, srv, tool, client, result, &trailer);
+            if let Some(profiler) = &mut call_profiler {
+                profiler.mark_postprocess();
+            }
             // Audit the agent-facing outcome: a content-defense block is a failed call
             // for governance / SOU-171 export even when the downstream returned ok.
             let ok = !out
@@ -2756,6 +2836,9 @@ fn execute_call(
                 client,
                 Some(&call_args_hash),
             );
+            if let Some(profiler) = call_profiler {
+                profiler.finish();
+            }
             out
         }
         Err(e) => {

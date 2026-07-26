@@ -195,36 +195,76 @@ pub fn record_decision(
 pub fn args_hash(value: &Value) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(canonical_json(value).as_bytes());
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    {
+        let mut writer = DigestWriter(&mut hasher);
+        write_canonical_json(&mut writer, value);
+    }
+    let digest = hasher.finalize();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
-/// Serialize `value` to canonical JSON: object keys sorted recursively so the string (and
-/// therefore its hash) is independent of key insertion order. Scalars defer to serde's
-/// stringification; only object key ordering is normalized.
-fn canonical_json(value: &Value) -> String {
+struct DigestWriter<'a>(&'a mut sha2::Sha256);
+
+impl std::io::Write for DigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Stream canonical JSON into a writer instead of recursively allocating a
+/// `String` for every object, array, and scalar. Object keys remain sorted,
+/// preserving the exact stable hash contract used by approvals and audit export.
+fn write_canonical_json(writer: &mut impl std::io::Write, value: &Value) {
     match value {
         Value::Object(map) => {
+            let _ = writer.write_all(b"{");
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
-            let inner: Vec<String> = keys
-                .into_iter()
-                .map(|k| {
-                    format!(
-                        "{}:{}",
-                        serde_json::to_string(k).unwrap_or_default(),
-                        canonical_json(&map[k])
-                    )
-                })
-                .collect();
-            format!("{{{}}}", inner.join(","))
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    let _ = writer.write_all(b",");
+                }
+                write_json_scalar(writer, key);
+                let _ = writer.write_all(b":");
+                write_canonical_json(writer, &map[key]);
+            }
+            let _ = writer.write_all(b"}");
         }
         Value::Array(arr) => {
-            let inner: Vec<String> = arr.iter().map(canonical_json).collect();
-            format!("[{}]", inner.join(","))
+            let _ = writer.write_all(b"[");
+            for (index, item) in arr.iter().enumerate() {
+                if index > 0 {
+                    let _ = writer.write_all(b",");
+                }
+                write_canonical_json(writer, item);
+            }
+            let _ = writer.write_all(b"]");
         }
-        other => other.to_string(),
+        scalar => write_json_scalar(writer, scalar),
     }
+}
+
+fn write_json_scalar<T: serde::Serialize>(writer: &mut impl std::io::Write, value: &T) {
+    let _ = serde_json::to_writer(&mut *writer, value);
+}
+
+#[cfg(test)]
+fn canonical_json(value: &Value) -> String {
+    let mut bytes = Vec::new();
+    write_canonical_json(&mut bytes, value);
+    String::from_utf8(bytes).unwrap_or_default()
 }
 
 /// Build the audit entry for an agent-control server toggle. Pure (no I/O) so the
@@ -292,24 +332,48 @@ fn write_line(entry: &Value) {
     let Some(path) = audit_path() else {
         return;
     };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    write_line_at(&path, entry);
+}
+
+fn write_line_at(path: &Path, entry: &Value) {
+    let open = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+    };
+    // The registry normally created this directory before any call. Avoid a
+    // redundant create-directory syscall on every append, but retain the
+    // standalone/first-writer behavior by creating it and retrying on NotFound.
+    let mut file = match open() {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match open() {
+                Ok(file) => file,
+                Err(_) => return,
+            }
+        }
+        Err(_) => return,
+    };
+    let line = format!("{entry}\n");
+    if file.write_all(line.as_bytes()).is_err() {
+        return;
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = file.write_all(format!("{entry}\n").as_bytes());
-    }
-    rotate_if_large(&path);
+    // Query size through the handle we already opened instead of reopening the
+    // path for metadata. Drop it before rotation so Windows can atomically
+    // replace the log when the cap is crossed.
+    let size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    drop(file);
+    rotate_if_large(&path, size);
 }
 
 /// Trim the audit log to its most recent `KEEP_LINES` lines once it exceeds the
 /// size cap, so it stays bounded over months of use. Best-effort: a failure here
 /// never affects the call being logged.
-fn rotate_if_large(path: &Path) {
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+fn rotate_if_large(path: &Path, size: u64) {
     if size <= MAX_AUDIT_BYTES {
         return;
     }
@@ -704,6 +768,23 @@ mod tests {
     }
 
     #[test]
+    fn audit_append_creates_missing_parent_and_writes_one_json_line() {
+        let root = std::env::temp_dir().join(format!(
+            "toolport-audit-append-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        let path = root.join("nested").join("audit.jsonl");
+        write_line_at(&path, &json!({"server":"fixture","ok":true}));
+        let content = std::fs::read_to_string(&path).expect("audit line");
+        assert!(content.ends_with('\n'));
+        assert_eq!(content.lines().count(), 1);
+        let entry: Value = serde_json::from_str(content.trim()).expect("valid JSON");
+        assert_eq!(entry["server"], "fixture");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn decision_entry_records_outcome_and_never_stores_raw_args() {
         let e = decision_entry(
             "neon",
@@ -767,9 +848,13 @@ mod tests {
 
     #[test]
     fn canonical_json_sorts_object_keys_recursively() {
+        let value = json!({ "b": 1, "a": { "d": 4, "c": 3 } });
+        assert_eq!(canonical_json(&value), r#"{"a":{"c":3,"d":4},"b":1}"#);
+        // Regression guard: the streaming implementation must remain byte-for-byte
+        // compatible with hashes persisted by previous Toolport versions.
         assert_eq!(
-            canonical_json(&json!({ "b": 1, "a": { "d": 4, "c": 3 } })),
-            r#"{"a":{"c":3,"d":4},"b":1}"#,
+            args_hash(&value),
+            "943d56ce0b02b80a8afcd12d849426226b68f2d8cd2840af8f6f93067f14c360"
         );
     }
 }

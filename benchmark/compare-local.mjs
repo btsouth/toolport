@@ -58,6 +58,7 @@ const options = {
   topK: Math.max(1, Number(valueArg("top-k", CONFIG.defaults.topK))),
   json: argv.includes("--json"),
   check: argv.includes("--check"),
+  profileCalls: argv.includes("--profile-calls"),
   installRatel: argv.includes("--install-ratel"),
   out: optionalValueArg("out"),
 };
@@ -280,6 +281,7 @@ function toolDefinition(name, description) {
 class McpProcess {
   constructor(command, args, spawnOptions = {}) {
     this.stderr = "";
+    this.callProfiles = [];
     this.pending = new Map();
     this.nextId = 0;
     this.proc = spawn(command, args, {
@@ -287,8 +289,26 @@ class McpProcess {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
-    this.proc.stderr.on("data", (chunk) => {
-      this.stderr = `${this.stderr}${chunk}`.slice(-12_000);
+    const stderrLines = createInterface({ input: this.proc.stderr, crlfDelay: Infinity });
+    stderrLines.on("line", (line) => {
+      this.stderr = `${this.stderr}${line}\n`.slice(-12_000);
+      const prefix = "toolport-call-profile ";
+      if (!line.startsWith(prefix)) return;
+      try {
+        const profile = JSON.parse(line.slice(prefix.length));
+        const timingFields = [
+          "preflightUs",
+          "downstreamUs",
+          "postprocessUs",
+          "auditUs",
+          "totalUs",
+        ];
+        if (timingFields.every((field) => Number.isFinite(profile[field]))) {
+          this.callProfiles.push(profile);
+        }
+      } catch {
+        // A diagnostic line must never affect the benchmark transport.
+      }
     });
     const lines = createInterface({ input: this.proc.stdout, crlfDelay: Infinity });
     lines.on("line", (line) => {
@@ -376,6 +396,7 @@ function toolportAdapter(registryPath) {
       TOOLPORT_DATA_DIR: dirname(registryPath),
       TOOLPORT_PROFILE: "benchmark",
       TOOLPORT_DISCOVERY: "lazy",
+      ...(options.profileCalls ? { TOOLPORT_PROFILE_CALLS: "1" } : {}),
     },
     searchTool: "toolport_search_tools",
     invokeTool: "toolport_call_tool",
@@ -532,6 +553,7 @@ async function benchmarkProduct(
         arguments: adapter.invokeArgs(expectedToolId, { resourceId: "benchmark" }),
       });
     }
+    client.callProfiles.length = 0;
     const routedCall = await measure(
       () =>
         client.call("tools/call", {
@@ -540,6 +562,7 @@ async function benchmarkProduct(
         }),
       options.iterations,
     );
+    const callProfiles = client.callProfiles.splice(0);
 
     for (let i = 0; i < 10; i++) {
       await client.call("tools/call", {
@@ -652,6 +675,18 @@ async function benchmarkProduct(
         median: routedCall.median - direct.median,
         p95: routedCall.p95 - direct.p95,
       },
+      ...(callProfiles.length > 0
+        ? {
+            callStagesMicroseconds: Object.fromEntries(
+              ["preflight", "downstream", "postprocess", "audit", "total"].map(
+                (stage) => [
+                  stage,
+                  stats(callProfiles.map((profile) => profile[`${stage}Us`])),
+                ],
+              ),
+            ),
+          }
+        : {}),
     };
   } finally {
     client.stop();
@@ -895,6 +930,29 @@ function markdown(result) {
     "Interpretation: this measures local gateway mechanics and lexical retrieval over a shared fixture.",
     "It does not claim end-to-end agent accuracy; model-graded task runs remain a separate benchmark.",
   );
+  const profiled = result.runs.filter(
+    (run) => run.products.toolport?.callStagesMicroseconds,
+  );
+  if (profiled.length > 0) {
+    lines.push(
+      "",
+      "## Toolport routed-call stages",
+      "",
+      "Opt-in gateway stage timings in microseconds. Profiling output is emitted after the measured total.",
+      "",
+      "| Catalog | Stage | p50 / p95 µs |",
+      "| ---: | --- | ---: |",
+    );
+    for (const run of profiled) {
+      for (const [stage, values] of Object.entries(
+        run.products.toolport.callStagesMicroseconds,
+      )) {
+        lines.push(
+          `| ${run.catalogSize} | ${stage} | ${values.median.toFixed(0)} / ${values.p95.toFixed(0)} |`,
+        );
+      }
+    }
+  }
   return `${lines.join("\n")}\n`;
 }
 
@@ -926,6 +984,7 @@ async function main() {
       iterations: options.iterations,
       settleMilliseconds: options.settleMilliseconds,
       topK: options.topK,
+      profileCalls: options.profileCalls,
     },
     runs: [],
   };

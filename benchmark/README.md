@@ -91,6 +91,7 @@ npm run bench:compare -- --install-ratel
 npm run bench:compare
 npm run bench:compare -- --sizes=25,100,500 --iterations=200
 npm run bench:compare -- --products=toolport --check
+npm run bench:compare -- --products=toolport --profile-calls
 npm run bench:compare -- --settle-ms=1000
 npm run bench:compare -- --json --out=benchmark/local-compare.json
 
@@ -106,6 +107,13 @@ Toolport data directory, so existing audit logs, traces, caches, and result
 cursors cannot influence the timings. `--check` enforces the cross-machine
 regression ceilings in `compare-local.config.json`; it checks Toolport only,
 even when a competitor is included in the report.
+
+`--profile-calls` enables Toolport's opt-in routed-call stage timer and adds
+preflight, downstream, post-processing, audit, and total p50/p95 timings for
+successful routed calls to the report. The gateway writes those diagnostics to
+stderr, never the MCP protocol stream, and includes no arguments or result data.
+Keep it off for headline latency comparisons because emitting one diagnostic
+line per call adds its own measurement overhead.
 
 The report deliberately separates deterministic gateway mechanics from model-graded
 agent accuracy. Use `bench-sweep.mjs` for end-to-end model tasks; do not present this
