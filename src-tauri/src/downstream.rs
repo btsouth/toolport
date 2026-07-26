@@ -45,6 +45,11 @@ const STDERR_TAIL_CAP: usize = 4096;
 /// or broken server can't stream gigabytes to exhaust gateway memory. Generous: real
 /// MCP responses are tiny.
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+/// Bound paginated MCP catalog traversal so a malicious server cannot keep the
+/// gateway in an infinite cursor chain or grow its in-memory catalog without limit.
+const MAX_LIST_PAGES: usize = 1_000;
+const MAX_LIST_ITEMS: usize = 100_000;
+const MAX_LIST_DURATION: Duration = Duration::from_secs(30);
 
 /// Retry budget for transient HTTP failures that are SAFE to repeat: a connection
 /// that never reached the server, or an explicit 429 rate-limit. We deliberately
@@ -2253,8 +2258,12 @@ impl DownstreamServer {
         // handshake goes back to the tight budget - a server that comes up but then
         // hangs on `tools/list` should still fail in seconds.
         transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        let result = transport.request("tools/list", json!({})).map_err(|e| e.to_string())?;
-        let tools = extract_array(&result, "tools");
+        let listed = fetch_paginated_list(&mut *transport, "tools/list", "tools")
+            .map_err(|e| e.to_string())?;
+        if let Some(warning) = &listed.warning {
+            eprintln!("toolport: server '{id}' returned a partial tool catalog: {warning}");
+        }
+        let tools = listed.items;
 
         // Restore the longer timeout: actual tool calls can legitimately be slow.
         transport.set_read_timeout(STDIO_READ_TIMEOUT);
@@ -2278,8 +2287,17 @@ impl DownstreamServer {
     /// hung server can't stall the refresh; on error the previous list is kept.
     pub fn refresh_tools(&mut self) {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        if let Ok(result) = self.transport.request("tools/list", json!({})) {
-            self.tools = extract_array(&result, "tools");
+        match fetch_paginated_list(&mut *self.transport, "tools/list", "tools") {
+            Ok(listed) if listed.warning.is_none() => self.tools = listed.items,
+            Ok(listed) => eprintln!(
+                "toolport: keeping server '{}' previous tool catalog after an incomplete refresh: {}",
+                self.id,
+                listed.warning.unwrap_or_default()
+            ),
+            Err(error) => eprintln!(
+                "toolport: keeping server '{}' previous tool catalog after refresh failed: {error}",
+                self.id
+            ),
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
@@ -2293,8 +2311,17 @@ impl DownstreamServer {
             return;
         }
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        if let Ok(r) = self.transport.request("resources/list", json!({})) {
-            self.resources = extract_array(&r, "resources");
+        match fetch_paginated_list(&mut *self.transport, "resources/list", "resources") {
+            Ok(listed) if listed.warning.is_none() => self.resources = listed.items,
+            Ok(listed) => eprintln!(
+                "toolport: keeping server '{}' previous resource catalog after an incomplete refresh: {}",
+                self.id,
+                listed.warning.unwrap_or_default()
+            ),
+            Err(error) => eprintln!(
+                "toolport: keeping server '{}' previous resource catalog after refresh failed: {error}",
+                self.id
+            ),
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
@@ -2307,8 +2334,17 @@ impl DownstreamServer {
             return;
         }
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        if let Ok(r) = self.transport.request("prompts/list", json!({})) {
-            self.prompts = extract_array(&r, "prompts");
+        match fetch_paginated_list(&mut *self.transport, "prompts/list", "prompts") {
+            Ok(listed) if listed.warning.is_none() => self.prompts = listed.items,
+            Ok(listed) => eprintln!(
+                "toolport: keeping server '{}' previous prompt catalog after an incomplete refresh: {}",
+                self.id,
+                listed.warning.unwrap_or_default()
+            ),
+            Err(error) => eprintln!(
+                "toolport: keeping server '{}' previous prompt catalog after refresh failed: {error}",
+                self.id
+            ),
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
@@ -2318,13 +2354,29 @@ impl DownstreamServer {
     /// so only the gateway (which actually proxies these) pays the cost.
     pub fn load_resources_prompts(&mut self) {
         if self.caps_resources {
-            if let Ok(r) = self.transport.request("resources/list", json!({})) {
-                self.resources = extract_array(&r, "resources");
+            if let Ok(listed) =
+                fetch_paginated_list(&mut *self.transport, "resources/list", "resources")
+            {
+                if let Some(warning) = &listed.warning {
+                    eprintln!(
+                        "toolport: server '{}' returned a partial resource catalog: {warning}",
+                        self.id
+                    );
+                }
+                self.resources = listed.items;
             }
         }
         if self.caps_prompts {
-            if let Ok(r) = self.transport.request("prompts/list", json!({})) {
-                self.prompts = extract_array(&r, "prompts");
+            if let Ok(listed) =
+                fetch_paginated_list(&mut *self.transport, "prompts/list", "prompts")
+            {
+                if let Some(warning) = &listed.warning {
+                    eprintln!(
+                        "toolport: server '{}' returned a partial prompt catalog: {warning}",
+                        self.id
+                    );
+                }
+                self.prompts = listed.items;
             }
         }
     }
@@ -2393,15 +2445,207 @@ fn extract_array(result: &Value, key: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+struct PaginatedList {
+    items: Vec<Value>,
+    /// Present when at least one page succeeded but traversal could not finish.
+    /// Initial discovery may expose that useful prefix; refreshes keep the prior
+    /// complete snapshot instead of replacing it with a partial catalog.
+    warning: Option<String>,
+}
+
+/// Traverse one MCP list operation using its opaque `nextCursor`. The first page
+/// remains mandatory. Once at least one page has succeeded, a later failure is
+/// returned as a partial result so a server stays usable during initial discovery.
+/// Cursor loops and excessive page/item counts are bounded defensively.
+fn fetch_paginated_list(
+    transport: &mut dyn Transport,
+    method: &str,
+    key: &str,
+) -> Result<PaginatedList, TransportError> {
+    let mut items = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    let started = Instant::now();
+
+    for page_index in 0..MAX_LIST_PAGES {
+        if page_index > 0 && started.elapsed() >= MAX_LIST_DURATION {
+            return Ok(PaginatedList {
+                items,
+                warning: Some(format!(
+                    "catalog traversal exceeded the {}-second safety cap",
+                    MAX_LIST_DURATION.as_secs()
+                )),
+            });
+        }
+        let params = cursor
+            .as_ref()
+            .map_or_else(|| json!({}), |value| json!({ "cursor": value }));
+        let result = match transport.request(method, params) {
+            Ok(result) => result,
+            Err(error) if page_index > 0 => {
+                return Ok(PaginatedList {
+                    items,
+                    warning: Some(format!("page {} failed: {error}", page_index + 1)),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+
+        let page = extract_array(&result, key);
+        let remaining = MAX_LIST_ITEMS.saturating_sub(items.len());
+        if page.len() > remaining {
+            items.extend(page.into_iter().take(remaining));
+            return Ok(PaginatedList {
+                items,
+                warning: Some(format!("catalog exceeded the {MAX_LIST_ITEMS}-item safety cap")),
+            });
+        }
+        items.extend(page);
+
+        let Some(next_cursor) = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return Ok(PaginatedList {
+                items,
+                warning: None,
+            });
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Ok(PaginatedList {
+                items,
+                warning: Some("server repeated a pagination cursor".to_string()),
+            });
+        }
+        cursor = Some(next_cursor);
+    }
+
+    Ok(PaginatedList {
+        items,
+        warning: Some(format!("catalog exceeded the {MAX_LIST_PAGES}-page safety cap")),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         cwd_validation_error, empty_cwd_variables, expand_cwd, file_uri_to_path, resolve_command,
         resolve_root_token, screen_resolved_addrs, screen_spawn_command, screen_spawn_env,
-        validate_cwd, CancelRegistry,
+        validate_cwd, CancelRegistry, DownstreamServer, Transport, TransportError,
+        fetch_paginated_list,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
     use std::path::Path;
+
+    struct PaginationTransport {
+        responses: VecDeque<Result<Value, TransportError>>,
+        params: Vec<Value>,
+    }
+
+    impl PaginationTransport {
+        fn new(responses: Vec<Result<Value, TransportError>>) -> Self {
+            Self {
+                responses: responses.into(),
+                params: Vec::new(),
+            }
+        }
+    }
+
+    impl Transport for PaginationTransport {
+        fn request(&mut self, _method: &str, params: Value) -> Result<Value, TransportError> {
+            self.params.push(params);
+            self.responses
+                .pop_front()
+                .expect("pagination test supplied a response")
+        }
+
+        fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn paginated_list_collects_every_page_and_treats_empty_cursor_as_opaque() {
+        let mut transport = PaginationTransport::new(vec![
+            Ok(json!({"tools":[{"name":"a"}],"nextCursor":""})),
+            Ok(json!({"tools":[{"name":"b"}],"nextCursor":"page-3"})),
+            Ok(json!({"tools":[{"name":"c"}]})),
+        ]);
+        let listed = fetch_paginated_list(&mut transport, "tools/list", "tools").unwrap();
+        assert!(listed.warning.is_none());
+        assert_eq!(
+            listed
+                .items
+                .iter()
+                .filter_map(|item| item["name"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(
+            transport.params,
+            vec![json!({}), json!({"cursor":""}), json!({"cursor":"page-3"})]
+        );
+    }
+
+    #[test]
+    fn paginated_list_stops_on_a_repeated_cursor() {
+        let mut transport = PaginationTransport::new(vec![
+            Ok(json!({"resources":[{"uri":"one:"}],"nextCursor":"same"})),
+            Ok(json!({"resources":[{"uri":"two:"}],"nextCursor":"same"})),
+        ]);
+        let listed =
+            fetch_paginated_list(&mut transport, "resources/list", "resources").unwrap();
+        assert_eq!(listed.items.len(), 2);
+        assert_eq!(
+            listed.warning.as_deref(),
+            Some("server repeated a pagination cursor")
+        );
+    }
+
+    #[test]
+    fn downstream_server_loads_all_tool_resource_and_prompt_pages() {
+        let transport = PaginationTransport::new(vec![
+            Ok(json!({
+                "capabilities": { "resources": {}, "prompts": {} }
+            })),
+            Ok(json!({"tools":[{"name":"one"}],"nextCursor":"tools-2"})),
+            Ok(json!({"tools":[{"name":"two"}]})),
+            Ok(json!({"resources":[{"uri":"one:"}],"nextCursor":"resources-2"})),
+            Ok(json!({"resources":[{"uri":"two:"}]})),
+            Ok(json!({"prompts":[{"name":"one"}],"nextCursor":"prompts-2"})),
+            Ok(json!({"prompts":[{"name":"two"}]})),
+        ]);
+        let mut server =
+            DownstreamServer::connect("fixture".to_string(), Box::new(transport)).unwrap();
+        server.load_resources_prompts();
+        assert_eq!(server.tools.len(), 2);
+        assert_eq!(server.resources.len(), 2);
+        assert_eq!(server.prompts.len(), 2);
+        assert_eq!(server.tools[1]["name"], "two");
+        assert_eq!(server.resources[1]["uri"], "two:");
+        assert_eq!(server.prompts[1]["name"], "two");
+    }
+
+    #[test]
+    fn incomplete_refresh_keeps_the_previous_complete_catalog() {
+        let transport = PaginationTransport::new(vec![
+            Ok(json!({"tools":[{"name":"partial"}],"nextCursor":"two"})),
+            Err(TransportError::Unavailable("page two timed out".to_string())),
+        ]);
+        let mut server = DownstreamServer {
+            id: "fixture".to_string(),
+            transport: Box::new(transport),
+            tools: vec![json!({"name":"stable"})],
+            resources: Vec::new(),
+            prompts: Vec::new(),
+            caps_resources: false,
+            caps_prompts: false,
+        };
+        server.refresh_tools();
+        assert_eq!(server.tools, vec![json!({"name":"stable"})]);
+    }
 
     /// Minimal FFI for getpgrp (test-only, avoids adding libc as a dependency).
     #[cfg(unix)]

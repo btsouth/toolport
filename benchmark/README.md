@@ -64,6 +64,20 @@ node benchmark/latency.mjs 200 --check
 local gateways. `--check` enforces the deliberately generous regression ceilings in
 `latency-budget.json`; tighten them only with evidence from multiple machines.
 
+## Native MCP pagination regression (`mcp-native.mjs`)
+
+This end-to-end harness launches Toolport over stdio with a deterministic MCP
+fixture that paginates tools, resources, and prompts at two items per page. It
+verifies that Toolport discovers every downstream page, exposes the complete
+aggregated lists without forcing existing clients to paginate, and can invoke,
+read, and fetch entries that appeared only on the final page.
+
+```bash
+npm run build:gateway
+npm run bench:mcp-native
+npm run bench:mcp-native -- --json
+```
+
 ## Side-by-side local gateway comparison (`compare-local.mjs`)
 
 This is the competitive harness. It generates one deterministic MCP catalog, launches

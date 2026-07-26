@@ -23,6 +23,7 @@
     "bench:latency": "node benchmark/latency.mjs",
     "bench:latency:check": "node benchmark/latency.mjs --check",
     "bench:compare": "node benchmark/compare-local.mjs",
+    "bench:mcp-native": "node benchmark/mcp-native.mjs",
     "audit:prod": "npm audit --omit=dev",
     "prepare": "husky"
   },
