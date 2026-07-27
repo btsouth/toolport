@@ -1455,10 +1455,22 @@ fn parse_json_snippet(
     if let Some(mcp) = value.get("mcp") {
         let obj = mcp
             .as_object()
-            .ok_or_else(|| "OpenCode 'mcp' must be an object".to_string())?;
+            .ok_or_else(|| "'mcp' must be an object".to_string())?;
         let mut malformed = Vec::new();
         let mut servers = Vec::new();
         for (name, definition) in obj {
+            let command_is_string = definition
+                .get("command")
+                .map(|c| c.is_string())
+                .unwrap_or(false);
+
+            if command_is_string {
+                // Crush: `command` is a string, args live separately.
+                servers.push(json_server_with_values(name, definition));
+                continue;
+            }
+
+            // OpenCode: `command` is an argv array, or absent (remote/override-only).
             match opencode_server_with_values(name, definition) {
                 Ok(Some(server)) => servers.push(server),
                 Ok(None) => {}
@@ -1467,10 +1479,7 @@ fn parse_json_snippet(
         }
         if !malformed.is_empty() {
             malformed.sort();
-            return Err(format!(
-                "malformed OpenCode 'mcp' entry: {}",
-                malformed.join(", ")
-            ));
+            return Err(format!("malformed 'mcp' entry: {}", malformed.join(", ")));
         }
         if !servers.is_empty() {
             return Ok(servers);
@@ -4211,6 +4220,21 @@ mod tests {
         assert!(error.contains("broken"), "got: {error}");
         assert!(error.contains("array of strings"), "got: {error}");
     }
+
+    #[test]
+    fn parse_json_snippet_disambiguates_opencode_and_crush_mcp_shapes() {
+        // OpenCode shape: command is an argv array.
+        let opencode = r#"{"mcp":{"fs":{"type":"local","command":["npx","-y","pkg"]}}}"#;
+        let parsed = parse_json_snippet(opencode, "").unwrap();
+        assert_eq!(parsed[0].command.as_deref(), Some("npx"));
+        assert_eq!(parsed[0].args, vec!["-y", "pkg"]);
+
+        // Crush shape: command is a string, args separate.
+        let crush = r#"{"mcp":{"fs":{"type":"stdio","command":"npx","args":["-y","pkg"]}}}"#;
+        let parsed = parse_json_snippet(crush, "").unwrap();
+        assert_eq!(parsed[0].command.as_deref(), Some("npx"));
+        assert_eq!(parsed[0].args, vec!["-y", "pkg"]);
+    } 
 
     #[test]
     fn reads_windsurf_antigravity_server_url() {
