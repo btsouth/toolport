@@ -916,6 +916,32 @@ struct MigrateResult {
     moved: Vec<String>,
 }
 
+/// Import the servers a client directly manages before its config is replaced
+/// with the Toolport gateway. Gateway identities must be skipped before they
+/// reach `moved`, otherwise migration reports moving a server it never imported.
+fn import_client_servers_for_migration(
+    reg: &mut Registry,
+    client: &clients::DetectedClient,
+) -> (usize, Vec<String>) {
+    let mut imported = 0;
+    let mut moved = Vec::new();
+    for server in &client.servers {
+        if clients::detected_is_gateway(server) {
+            continue;
+        }
+        moved.push(server.name.clone());
+        let exists = reg
+            .servers
+            .iter()
+            .any(|e| e.name.eq_ignore_ascii_case(&server.name));
+        if !exists {
+            reg.add_server(server_from_detected(server, &client.id));
+            imported += 1;
+        }
+    }
+    (imported, moved)
+}
+
 /// Migrate a client to Toolport: import its directly-configured servers into the
 /// registry, then rewrite the client's config to contain only the Toolport
 /// gateway (optionally scoped to `profile`). The client is left managing nothing
@@ -947,23 +973,7 @@ async fn migrate_client(
 
     // Import the client's servers under the lock (a fresh load-modify-save).
     let (_, (imported, moved)) = write_registry(state.inner(), |reg| {
-        let mut imported = 0;
-        let mut moved = Vec::new();
-        for server in &client.servers {
-            if clients::detected_is_gateway(server) {
-                continue;
-            }
-            moved.push(server.name.clone());
-            let exists = reg
-                .servers
-                .iter()
-                .any(|e| e.name.eq_ignore_ascii_case(&server.name));
-            if !exists {
-                reg.add_server(server_from_detected(server, &client_id));
-                imported += 1;
-            }
-        }
-        Ok((imported, moved))
+        Ok(import_client_servers_for_migration(reg, &client))
     })?;
 
     // Rewrite the client to only the gateway (backs up first). Honor transport so
@@ -3687,6 +3697,29 @@ mod tests {
         let picked = servers_to_import(&[client], &reg);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].name.to_lowercase(), "linear");
+    }
+
+    #[test]
+    fn migration_filter_skips_gateway_identities_before_reporting_moved() {
+        let mut client = detected_client("test-client", vec![], vec![]);
+        client.servers = vec![
+            // Name-based identity: the legacy gateway name is not the current
+            // GATEWAY_ENTRY_NAME and must not regress to a current-name-only check.
+            detected_mcp_server_with_command("conduit", "manual-wrapper"),
+            // Command-based identity: an arbitrary slot name still points at the
+            // gateway binary and would recurse if imported as a downstream server.
+            detected_mcp_server_with_command(
+                "stale",
+                r"C:\Users\x\AppData\Local\Toolport\toolport-gateway.exe",
+            ),
+        ];
+        let mut reg = Registry::default();
+
+        let (imported, moved) = import_client_servers_for_migration(&mut reg, &client);
+
+        assert_eq!(imported, 0);
+        assert!(moved.is_empty());
+        assert!(reg.servers.is_empty());
     }
 
     #[test]
