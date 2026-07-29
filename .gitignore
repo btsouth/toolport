@@ -100,7 +100,3 @@ license-signing.keycd
 # Agent/session scratch (never commit)
 _poll_pr.py
 _cr*.txt
-
-# Local rate-limit counter files (SOU-340)
-rate_limit_counters*.json
-
