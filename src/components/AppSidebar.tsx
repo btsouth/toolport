@@ -199,7 +199,7 @@ function VersionFooter({
               await navigator.clipboard.writeText(await gatherDiagnostics());
               toast.success("Diagnostics copied, paste them into your bug report");
             } catch {
-              toastError("Could not copy diagnostics");
+              toastError("Couldn't copy diagnostics");
             }
           }}
           title="Copy diagnostics for a bug report"
