@@ -66,7 +66,8 @@ The Rust suite includes unit tests in each module (`clients`, `catalog`,
 `registry`, `router`, `oauth`, etc.), binary-target tests, and integration tests
 in `src-tauri/tests/`. Use the npm script above so your local target selection
 matches CI. Frontend tests use [Vitest](https://vitest.dev) and live alongside
-the code as `*.test.ts` files inside `src/`.
+the code as `*.test.ts` or `*.test.tsx` files inside `src/`, depending on whether
+the test contains JSX.
 
 ### Formatting
 
