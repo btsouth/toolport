@@ -79,6 +79,9 @@ pub struct DetectedClient {
 enum Format {
     /// JSON with a top-level `mcpServers` object (Claude Desktop, Cursor, Windsurf).
     JsonMcpServers,
+    /// Amp's shared settings file stores servers under the literal dotted
+    /// top-level key `amp.mcpServers` (not a nested `amp` object).
+    JsonAmpMcpServers,
     /// Qwen Code's top-level `mcpServers` object. Stdio entries use the standard
     /// command/args/env shape, while remote entries distinguish SSE (`url`) from
     /// streamable HTTP (`httpUrl`) and store credentials under `headers`.
@@ -246,6 +249,12 @@ fn resolve_client_config_path(
         "pi" => home.join(".pi").join("agent").join("mcp.json"),
         "omp" => home.join(".omp").join("agent").join("mcp.json"),
         "vscode" => config.join("Code").join("User").join("mcp.json"),
+        "amp" => match platform {
+            Platform::Windows => config.join("amp").join("settings.json"),
+            Platform::MacOs | Platform::Linux => {
+                home.join(".config").join("amp").join("settings.json")
+            }
+        },
         "windsurf" => home
             .join(".codeium")
             .join("windsurf")
@@ -350,6 +359,8 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "pi" => home.join(".pi").join("agent").join("mcp.json"),
         "omp" => home.join(".omp").join("agent").join("mcp.json"),
         "vscode" => config.join("Code").join("User").join("mcp.json"),
+        // Amp documents this literal home-relative location on Linux.
+        "amp" => home.join(".config").join("amp").join("settings.json"),
         "windsurf" => home
             .join(".codeium")
             .join("windsurf")
@@ -552,6 +563,13 @@ fn omp_path() -> Option<PathBuf> {
 
 fn vscode_path() -> Option<PathBuf> {
     client_config_path("vscode")
+}
+
+fn amp_path() -> Option<PathBuf> {
+    std::env::var_os("AMP_SETTINGS_FILE")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| client_config_path("amp"))
 }
 
 fn windsurf_path() -> Option<PathBuf> {
@@ -871,6 +889,14 @@ fn defs() -> Vec<ClientDef> {
             format: Format::JsonServers,
             uses_connectors: false,
             path: vscode_path,
+            plugin_scan: None,
+        },
+        ClientDef {
+            id: "amp",
+            name: "Amp",
+            format: Format::JsonAmpMcpServers,
+            uses_connectors: false,
+            path: amp_path,
             plugin_scan: None,
         },
         ClientDef {
@@ -2216,6 +2242,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
 
     let parsed = match def.format {
         Format::JsonMcpServers => parse_json(&content, "mcpServers"),
+        Format::JsonAmpMcpServers => parse_json(&content, "amp.mcpServers"),
         Format::JsonQwenMcpServers => parse_qwen_json(&content),
         Format::JsonServers => parse_json(&content, "servers"),
         Format::JsonOpenCodeMcp => parse_opencode_json(&content),
@@ -2641,6 +2668,21 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     crate::registry::atomic_write(path, contents)
 }
 
+fn validate_amp_settings_shape(root: &serde_json::Value) -> Result<(), String> {
+    let object = root
+        .as_object()
+        .ok_or("Amp settings root must be an object; leaving it untouched.")?;
+    if object
+        .get("amp.mcpServers")
+        .is_some_and(|servers| !servers.is_object())
+    {
+        return Err(
+            "'amp.mcpServers' must be an object; leaving Amp settings untouched.".into(),
+        );
+    }
+    Ok(())
+}
+
 fn write_json(
     path: &Path,
     key: &str,
@@ -2653,7 +2695,9 @@ fn write_json(
     } else {
         serde_json::Value::Object(serde_json::Map::new())
     };
-    if !root.is_object() {
+    if key == "amp.mcpServers" {
+        validate_amp_settings_shape(&root)?;
+    } else if !root.is_object() {
         root = serde_json::Value::Object(serde_json::Map::new());
     }
     let obj = root.as_object_mut().unwrap();
@@ -3342,6 +3386,7 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
     let lenient = config_is_whole_app_state(client_id);
     match def.format {
         Format::JsonMcpServers => write_json(&path, "mcpServers", servers, lenient)?,
+        Format::JsonAmpMcpServers => write_json(&path, "amp.mcpServers", servers, true)?,
         Format::JsonQwenMcpServers => write_qwen_json(&path, servers)?,
         Format::JsonServers => write_json(&path, "servers", servers, lenient)?,
         Format::JsonOpenCodeMcp => write_opencode_json(&path, servers)?,
@@ -3549,6 +3594,7 @@ pub fn client_uses_mcp_remote_bridge(client_id: &str) -> bool {
         | Format::YamlMcpServersList => false,
         // JsonMcpServers / TOML / Goose: bridge unless we know better later.
         Format::JsonMcpServers
+        | Format::JsonAmpMcpServers
         | Format::JsonContextServers
         | Format::TomlMcpServers
         | Format::YamlExtensions => true,
@@ -3631,7 +3677,9 @@ fn edit_json_gateway(
     } else {
         serde_json::Value::Object(serde_json::Map::new())
     };
-    if !root.is_object() {
+    if key == "amp.mcpServers" {
+        validate_amp_settings_shape(&root)?;
+    } else if !root.is_object() {
         root = serde_json::Value::Object(serde_json::Map::new());
     }
     let obj = root.as_object_mut().unwrap();
@@ -3729,15 +3777,15 @@ fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), Str
 /// these an unparseable file must ERROR rather than be silently replaced with a
 /// fresh object, so a transient parse failure can't wipe the user's whole config
 /// down to just our gateway entry. `~/.claude.json` (Claude Code),
-/// `~/.gemini/settings.json` (Gemini CLI) and `~/.qwen/settings.json` (Qwen Code)
-/// share the plain `mcpServers` JSON shape with single-purpose files (Claude
+/// `~/.gemini/settings.json` (Gemini CLI), `~/.qwen/settings.json` (Qwen Code),
+/// and Amp's shared `settings.json` contain server maps alongside unrelated app state. (Claude
 /// Desktop, VS Code's dedicated mcp.json, LM Studio, ...), which keep the harmless
 /// start-fresh behavior. (Zed's whole-editor settings.json is already lenient via
 /// its JsonContextServers format.)
 fn config_is_whole_app_state(client_id: &str) -> bool {
     matches!(
         client_id,
-        "claude-code" | "gemini-cli" | "qwen-code" | "opencode"
+        "claude-code" | "gemini-cli" | "qwen-code" | "opencode" | "amp"
     )
 }
 
@@ -3755,6 +3803,9 @@ fn install_or_remove(
     match def.format {
         Format::JsonMcpServers => {
             edit_json_gateway(&path, "mcpServers", entry, lenient)?
+        }
+        Format::JsonAmpMcpServers => {
+            edit_json_gateway(&path, "amp.mcpServers", entry, true)?
         }
         Format::JsonQwenMcpServers => edit_json_gateway(&path, "mcpServers", entry, true)?,
         Format::JsonServers => edit_json_gateway(&path, "servers", entry, lenient)?,
@@ -4318,6 +4369,107 @@ mod tests {
         assert_eq!(parsed[0].env_keys, vec!["TOKEN".to_string()]);
     }
 
+
+    #[test]
+    fn amp_literal_dotted_key_round_trips_and_preserves_shared_settings() {
+        let path = temp_path("amp-roundtrip");
+        std::fs::write(
+            &path,
+            r#"{"amp.theme":"dark","telemetry":false,"amp.mcpServers":{"old":{"command":"x"}}}"#,
+        ).unwrap();
+
+        write_json(&path, "amp.mcpServers", &[stdio("filesystem")], true).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let parsed = parse_json(&content, "amp.mcpServers").unwrap();
+
+        assert_eq!(root["amp.theme"], "dark");
+        assert_eq!(root["telemetry"], false);
+        assert!(root.get("amp").is_none(), "the dotted key must stay literal");
+        assert!(root["amp.mcpServers"].get("old").is_none());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "filesystem");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn amp_gateway_edit_and_uninstall_are_surgical() {
+        let path = temp_path("amp-surgical");
+        std::fs::write(
+            &path,
+            r#"{"amp.notifications":true,"amp.mcpServers":{"existing":{"command":"node","env":{"SECRET":"keepme"}},"conduit":{"command":"conduit-gateway"}}}"#,
+        ).unwrap();
+
+        let entry = sample_gateway(Some("Work"), "amp");
+        edit_json_gateway(&path, "amp.mcpServers", Some(&entry), true).unwrap();
+        let installed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(installed["amp.notifications"], true);
+        assert_eq!(installed["amp.mcpServers"]["existing"]["env"]["SECRET"], "keepme");
+        assert!(installed["amp.mcpServers"].get("conduit").is_none());
+        assert!(installed["amp.mcpServers"].get(GATEWAY_ENTRY_NAME).is_some());
+
+        edit_json_gateway(&path, "amp.mcpServers", None, true).unwrap();
+        let removed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(removed["amp.notifications"], true);
+        assert!(removed["amp.mcpServers"].get("existing").is_some());
+        assert!(removed["amp.mcpServers"].get(GATEWAY_ENTRY_NAME).is_none());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn amp_malformed_nonempty_shared_settings_are_never_overwritten() {
+        let path = temp_path("amp-malformed");
+        let malformed = r#"{"amp.theme":"dark","amp.mcpServers": {broken"#;
+        std::fs::write(&path, malformed).unwrap();
+        let error = edit_json_gateway(
+            &path,
+            "amp.mcpServers",
+            Some(&sample_gateway(None, "amp")),
+            true,
+        ).unwrap_err();
+        assert!(error.contains("leaving it untouched"), "got: {error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), malformed);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn amp_valid_non_object_root_is_never_overwritten() {
+        let path = temp_path("amp-non-object-root");
+        let original = r#"["shared", "settings"]"#;
+        std::fs::write(&path, original).unwrap();
+
+        assert!(write_json(&path, "amp.mcpServers", &[stdio("filesystem")], true).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(edit_json_gateway(
+            &path,
+            "amp.mcpServers",
+            Some(&sample_gateway(None, "amp")),
+            true,
+        )
+        .is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn amp_valid_non_object_server_key_is_never_overwritten() {
+        let path = temp_path("amp-non-object-key");
+        let original = r#"{"amp.theme":"dark","amp.mcpServers":["unexpected"]}"#;
+        std::fs::write(&path, original).unwrap();
+
+        assert!(write_json(&path, "amp.mcpServers", &[stdio("filesystem")], true).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(edit_json_gateway(
+            &path,
+            "amp.mcpServers",
+            Some(&sample_gateway(None, "amp")),
+            true,
+        )
+        .is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn qwen_json_parses_cli_generated_transports() {
         // Generated with Qwen Code 0.20.1 using `qwen mcp add --scope user`.
@@ -4656,6 +4808,7 @@ bad = "not-a-table"
         assert_eq!(rec.url.as_deref(), Some("http://127.0.0.1:8765/mcp"));
         assert!(!rec.args.iter().any(|a| a.contains("Bearer")));
         assert!(client_uses_mcp_remote_bridge("claude-desktop"));
+        assert!(client_uses_mcp_remote_bridge("amp"));
         assert!(!client_uses_mcp_remote_bridge("opencode"));
         assert!(!client_uses_mcp_remote_bridge("vscode"));
     }
@@ -6199,6 +6352,59 @@ command = "npx"
     /// which is exactly what made `client_config_paths_match_current_platform`
     /// flake on CI. Poison is recovered: a panic elsewhere shouldn't wedge these.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvRestore {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn amp_is_registered() {
+        let definition = defs().into_iter().find(|def| def.id == "amp").unwrap();
+        assert_eq!(definition.name, "Amp");
+        assert!(matches!(definition.format, Format::JsonAmpMcpServers));
+        assert!(!definition.uses_connectors);
+        assert!(definition.plugin_scan.is_none());
+        assert!((definition.path)().is_some());
+        assert!(config_is_whole_app_state("amp"));
+    }
+
+    #[test]
+    fn amp_default_config_paths_match_each_platform() {
+        for platform in Platform::ALL {
+            let home = mock_home(platform);
+            let expected = match platform {
+                Platform::Windows => home.join("AppData").join("Roaming").join("amp").join("settings.json"),
+                Platform::MacOs | Platform::Linux => home.join(".config").join("amp").join("settings.json"),
+            };
+            assert_eq!(resolve_client_config_path("amp", &home, platform), Some(expected), "Amp on {platform:?}");
+        }
+    }
+
+    #[test]
+    fn amp_settings_file_overrides_production_path() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let override_path = std::env::temp_dir().join("amp-custom-settings.json");
+        let _restore = EnvRestore::set("AMP_SETTINGS_FILE", &override_path);
+        assert_eq!(amp_path(), Some(override_path));
+    }
 
     #[test]
     fn client_config_paths_match_current_platform() {
