@@ -70,6 +70,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   // A generated share link (toolport.app/s/...), cleared when the export changes.
   const [shareLink, setShareLink] = useState("");
+  const [linkCopied, setLinkCopied] = useState(false);
   const [linking, setLinking] = useState(false);
 
   // Load the server list on open so the user can choose a subset to share.
@@ -153,6 +154,16 @@ export function ShareDialog({ trigger, onImported }: Props) {
       setTimeout(() => setCopied(false), 1500);
     } catch {
       toastError("Couldn't copy automatically. Select the text and copy it.");
+    }
+  }
+
+  async function copyLink() {
+    try {
+      await navigator.clipboard.writeText(shareLink);
+      setLinkCopied(true);
+      setTimeout(() => setLinkCopied(false), 1500);
+    } catch {
+      toastError("Couldn't copy automatically. Select the link and copy it.");
     }
   }
 
@@ -434,13 +445,15 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   <code className="min-w-0 flex-1 truncate text-xs">{shareLink}</code>
                   <button
                     type="button"
-                    title="Copy link"
-                    onClick={() => {
-                      navigator.clipboard.writeText(shareLink).catch(() => {});
-                    }}
+                    title={linkCopied ? "Copied" : "Copy link"}
+                    onClick={copyLink}
                     className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                   >
-                    <Copy className="size-3.5" />
+                    {linkCopied ? (
+                      <Check className="size-3.5 text-success" />
+                    ) : (
+                      <Copy className="size-3.5" />
+                    )}
                   </button>
                 </div>
               )}
