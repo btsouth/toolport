@@ -249,12 +249,7 @@ fn resolve_client_config_path(
         "pi" => home.join(".pi").join("agent").join("mcp.json"),
         "omp" => home.join(".omp").join("agent").join("mcp.json"),
         "vscode" => config.join("Code").join("User").join("mcp.json"),
-        "amp" => match platform {
-            Platform::Windows => config.join("amp").join("settings.json"),
-            Platform::MacOs | Platform::Linux => {
-                home.join(".config").join("amp").join("settings.json")
-            }
-        },
+        "amp" => home.join(".config").join("amp").join("settings.json"),
         "windsurf" => home
             .join(".codeium")
             .join("windsurf")
@@ -3778,10 +3773,10 @@ fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), Str
 /// fresh object, so a transient parse failure can't wipe the user's whole config
 /// down to just our gateway entry. `~/.claude.json` (Claude Code),
 /// `~/.gemini/settings.json` (Gemini CLI), `~/.qwen/settings.json` (Qwen Code),
-/// and Amp's shared `settings.json` contain server maps alongside unrelated app state. (Claude
-/// Desktop, VS Code's dedicated mcp.json, LM Studio, ...), which keep the harmless
-/// start-fresh behavior. (Zed's whole-editor settings.json is already lenient via
-/// its JsonContextServers format.)
+/// and Amp's shared `settings.json` contain server maps alongside unrelated app
+/// state. Single-purpose files (Claude Desktop, VS Code's dedicated `mcp.json`,
+/// LM Studio, ...) keep the harmless start-fresh behavior. (Zed's whole-editor
+/// `settings.json` is already lenient via its JsonContextServers format.)
 fn config_is_whole_app_state(client_id: &str) -> bool {
     matches!(
         client_id,
@@ -6390,10 +6385,10 @@ command = "npx"
     fn amp_default_config_paths_match_each_platform() {
         for platform in Platform::ALL {
             let home = mock_home(platform);
-            let expected = match platform {
-                Platform::Windows => home.join("AppData").join("Roaming").join("amp").join("settings.json"),
-                Platform::MacOs | Platform::Linux => home.join(".config").join("amp").join("settings.json"),
-            };
+            let expected = home
+                .join(".config")
+                .join("amp")
+                .join("settings.json");
             assert_eq!(resolve_client_config_path("amp", &home, platform), Some(expected), "Amp on {platform:?}");
         }
     }
