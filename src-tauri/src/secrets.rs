@@ -645,7 +645,8 @@ mod platform {
 }
 
 /// Encrypted-file secret backend for headless / no-keychain environments. It is
-/// activated by setting `CONDUIT_SECRET_KEY` to any non-empty string: a 32-byte key is
+/// activated by setting `TOOLPORT_SECRET_KEY` (legacy `CONDUIT_SECRET_KEY`) to any
+/// non-empty string: a 32-byte key is
 /// derived from it (SHA-256) and secrets live in `secrets.enc` as one XChaCha20-Poly1305
 /// sealed JSON map, re-sealed on every write. With the env var unset the OS keychain is
 /// used exactly as before, so desktop installs are untouched. The same env var must be
@@ -667,8 +668,8 @@ mod file {
     /// The 32-byte key that encrypts `secrets.enc`, or None when the file backend
     /// is inactive (the signal to use the OS keychain directly).
     ///
-    /// The file backend is **headless-only**: it activates IFF `CONDUIT_SECRET_KEY`
-    /// is set + non-empty (the key is SHA-256 of it; the app and gateway must agree
+    /// The file backend is **headless-only**: it activates IFF `TOOLPORT_SECRET_KEY`
+    /// (legacy `CONDUIT_SECRET_KEY`) is set + non-empty (the key is SHA-256 of it; the app and gateway must agree
     /// on the env var). On every desktop OS this returns None, so secrets live in
     /// the OS keychain — on macOS that is the *data-protection* keychain under the
     /// team-scoped shared access group (`platform`), which keeps keys off disk and
@@ -721,13 +722,15 @@ mod file {
         }
         let (nonce, ct) = blob.split_at(NONCE_LEN);
         let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|e| e.to_string())?;
-        cipher
-            .decrypt(XNonce::from_slice(nonce), ct)
-            .map_err(|_| "could not decrypt secrets.enc (wrong CONDUIT_SECRET_KEY?)".to_string())
+        cipher.decrypt(XNonce::from_slice(nonce), ct).map_err(|_| {
+            "could not decrypt secrets.enc (wrong TOOLPORT_SECRET_KEY/CONDUIT_SECRET_KEY?)"
+                .to_string()
+        })
     }
 
     fn load() -> Result<Store, String> {
-        let key = key_material().ok_or("CONDUIT_SECRET_KEY is not set")?;
+        let key =
+            key_material().ok_or("TOOLPORT_SECRET_KEY (legacy CONDUIT_SECRET_KEY) is not set")?;
         let encoded = match std::fs::read_to_string(path()?) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Store::new()),
@@ -737,7 +740,8 @@ mod file {
     }
 
     fn save(store: &Store) -> Result<(), String> {
-        let key = key_material().ok_or("CONDUIT_SECRET_KEY is not set")?;
+        let key =
+            key_material().ok_or("TOOLPORT_SECRET_KEY (legacy CONDUIT_SECRET_KEY) is not set")?;
         let plain = serde_json::to_vec(store).map_err(|e| e.to_string())?;
         crate::registry::atomic_write(&path()?, &seal(&key, &plain)?)
     }
@@ -784,10 +788,13 @@ pub fn get_secret(server_id: &str, key: &str) -> Option<String> {
 /// use this so a read failure isn't silently treated as "never saved".
 ///
 /// Resolution order for headless / container deploys:
-/// 1. Process env `CONDUIT_SECRET_<KEY>` (preferred; avoids colliding with
-///    unrelated host env vars that share a common name like `TOKEN`)
-/// 2. Process env `<KEY>` when `CONDUIT_ALLOW_BARE_SECRET_ENV=1` (opt-in)
-/// 3. Encrypted `secrets.enc` when `CONDUIT_SECRET_KEY` is set
+/// 1. Process env `TOOLPORT_SECRET_<KEY>` (legacy `CONDUIT_SECRET_<KEY>`; preferred
+///    over bare names, avoids colliding with unrelated host env vars that share a
+///    common name like `TOKEN`)
+/// 2. Process env `<KEY>` when `TOOLPORT_ALLOW_BARE_SECRET_ENV=1` (legacy
+///    `CONDUIT_ALLOW_BARE_SECRET_ENV=1`; opt-in)
+/// 3. Encrypted `secrets.enc` when `TOOLPORT_SECRET_KEY` (legacy
+///    `CONDUIT_SECRET_KEY`) is set
 /// 4. OS keychain / platform backend
 pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
     if let Some(v) = env_secret_override(key) {
@@ -800,8 +807,9 @@ pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, S
 }
 
 /// Look up a secret from the process environment for container / env-file deploys.
-/// Prefers `CONDUIT_SECRET_<KEY>`; falls back to the bare key name only when
-/// `CONDUIT_ALLOW_BARE_SECRET_ENV` is set. Empty values are treated as unset.
+/// Prefers `TOOLPORT_SECRET_<KEY>` (legacy `CONDUIT_SECRET_<KEY>`); falls back to the
+/// bare key name only when `TOOLPORT_ALLOW_BARE_SECRET_ENV` (legacy
+/// `CONDUIT_ALLOW_BARE_SECRET_ENV`) is set. Empty values are treated as unset.
 fn env_secret_override(key: &str) -> Option<String> {
     let toolport_prefixed = format!("TOOLPORT_SECRET_{key}");
     let conduit_prefixed = format!("CONDUIT_SECRET_{key}");
