@@ -167,7 +167,7 @@ below for you, so you never have to edit these by hand.
 | VS Code        | `<config>/Code/User/mcp.json`                                                              | JSON (`servers`)         |
 | Windsurf       | `~/.codeium/windsurf/mcp_config.json`                                                      | JSON (`mcpServers`)      |
 | OpenCode       | `~/.config/opencode/opencode.json`                                                         | JSON (`mcp`)             |
-| Kilo Code      | `~/.config/kilo/kilo.jsonc`                                                               | JSONC (`mcp`)            |
+| Kilo Code      | `~/.config/kilo/kilo.jsonc`                                                                | JSONC (`mcp`)            |
 | Codex          | `~/.codex/config.toml`                                                                     | TOML (`mcp_servers`)     |
 | Grok Build     | `~/.grok/config.toml`                                                                      | TOML (`mcp_servers`)     |
 | Continue       | `~/.continue/config.yaml`                                                                  | YAML (`mcpServers`)      |
