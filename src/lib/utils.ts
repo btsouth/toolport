@@ -44,6 +44,19 @@ export function stableListKeys<T>(items: T[], identity: (item: T) => string): st
   return keys;
 }
 
+/** Compact latency string: "180 ms" or "1.2 s", or a dash when unmeasured. */
+export function fmtMs(ms: number | null): string {
+  if (ms == null) return "-";
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`;
+}
+
+/** Dollar value of saved input tokens, scaled to the number's size. */
+export function fmtDollars(n: number): string {
+  if (n >= 1000) return `$${Math.round(n).toLocaleString()}`;
+  if (n >= 10) return `$${n.toFixed(0)}`;
+  return `$${n.toFixed(2)}`;
+}
+
 /**
  * Format a ratio as a percent with the same adaptive precision everywhere.
  * When `floorNonZero` is true, tiny positive rates render as "<0.1%" instead
