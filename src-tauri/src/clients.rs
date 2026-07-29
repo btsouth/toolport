@@ -85,9 +85,9 @@ enum Format {
     JsonQwenMcpServers,
     /// JSON with a top-level `servers` object (VS Code).
     JsonServers,
-    /// JSON/JSONC with a top-level `mcp` object (OpenCode). Local entries store
-    /// the full argv in `command` and env vars in `environment`; remote entries
-    /// use `type: "remote"` plus `url` and optional `headers`.
+    /// JSON/JSONC with a top-level `mcp` object (OpenCode, Kilo Code). Local
+    /// entries store the full argv in `command` and env vars in `environment`;
+    /// remote entries use `type: "remote"` plus `url` and optional `headers`.
     JsonOpenCodeMcp,
     /// JSONC with a top-level `context_servers` object (Zed). Same per-server shape
     /// as mcpServers; the file is read leniently (comments + trailing commas) and
@@ -251,6 +251,7 @@ fn resolve_client_config_path(
             .join("windsurf")
             .join("mcp_config.json"),
         "opencode" => home.join(".config").join("opencode").join("opencode.json"),
+        "kilo-code" => home.join(".config").join("kilo").join("kilo.jsonc"),
         "grok" => home.join(".grok").join("config.toml"),
         "codex" => home.join(".codex").join("config.toml"),
         "claude-code" => home.join(".claude.json"),
@@ -354,9 +355,10 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
             .join(".codeium")
             .join("windsurf")
             .join("mcp_config.json"),
-        // OpenCode documents this literal home-relative path on every platform;
-        // unlike most Linux clients it does not follow XDG_CONFIG_HOME here.
+        // OpenCode and Kilo Code document literal home-relative paths on every
+        // platform; unlike most Linux clients they do not follow XDG_CONFIG_HOME.
         "opencode" => home.join(".config").join("opencode").join("opencode.json"),
+        "kilo-code" => home.join(".config").join("kilo").join("kilo.jsonc"),
         "grok" => home.join(".grok").join("config.toml"),
         "codex" => home.join(".codex").join("config.toml"),
         "claude-code" => home.join(".claude.json"),
@@ -676,6 +678,12 @@ fn opencode_path() -> Option<PathBuf> {
     client_config_path("opencode")
 }
 
+/// Kilo Code stores its global JSONC config at the literal
+/// `~/.config/kilo/kilo.jsonc` on every supported OS.
+fn kilo_code_path() -> Option<PathBuf> {
+    client_config_path("kilo-code")
+}
+
 /// Warp reads file-based MCP servers from `~/.warp/.mcp.json` (keyed under
 /// `mcpServers`), alongside its in-app UI. The file is home-anchored on every OS.
 fn warp_path() -> Option<PathBuf> {
@@ -887,6 +895,14 @@ fn defs() -> Vec<ClientDef> {
             format: Format::JsonOpenCodeMcp,
             uses_connectors: false,
             path: opencode_path,
+            plugin_scan: None,
+        },
+        ClientDef {
+            id: "kilo-code",
+            name: "Kilo Code",
+            format: Format::JsonOpenCodeMcp,
+            uses_connectors: false,
+            path: kilo_code_path,
             plugin_scan: None,
         },
         ClientDef {
@@ -1893,9 +1909,9 @@ fn parse_qwen_json(content: &str) -> Result<Vec<McpServer>, String> {
     Ok(servers)
 }
 
-/// Parse one OpenCode `mcp` entry while retaining env/header values. OpenCode
-/// stores local commands as one argv array and uses `environment` instead of
-/// `env`; remote entries use `url` plus optional `headers`.
+/// Parse one OpenCode-compatible `mcp` entry while retaining env/header values.
+/// These clients store local commands as one argv array and use `environment`
+/// instead of `env`; remote entries use `url` plus optional `headers`.
 fn opencode_server_with_values(
     name: &str,
     def: &serde_json::Value,
@@ -2696,7 +2712,7 @@ fn opencode_mcp_mut(
     root: &mut serde_json::Value,
 ) -> Result<&mut serde_json::Map<String, serde_json::Value>, String> {
     if !root.is_object() {
-        return Err("OpenCode config root must be an object; leaving it untouched.".into());
+        return Err("Client config root must be an object; leaving it untouched.".into());
     }
     let object = root.as_object_mut().unwrap();
     if object
@@ -2704,7 +2720,7 @@ fn opencode_mcp_mut(
         .map(|value| !value.is_object())
         .unwrap_or(false)
     {
-        return Err("OpenCode 'mcp' must be an object; leaving the config untouched.".into());
+        return Err("'mcp' must be an object; leaving the client config untouched.".into());
     }
     if !object.contains_key("mcp") {
         object.insert(
@@ -3737,7 +3753,7 @@ fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), Str
 fn config_is_whole_app_state(client_id: &str) -> bool {
     matches!(
         client_id,
-        "claude-code" | "gemini-cli" | "qwen-code" | "opencode"
+        "claude-code" | "gemini-cli" | "qwen-code" | "opencode" | "kilo-code"
     )
 }
 
@@ -5446,6 +5462,7 @@ command = "npx"
         assert!(config_is_whole_app_state("gemini-cli"));
         assert!(config_is_whole_app_state("qwen-code"));
         assert!(config_is_whole_app_state("opencode"));
+        assert!(config_is_whole_app_state("kilo-code"));
         // Single-purpose mcpServers files keep the start-fresh behavior.
         assert!(!config_is_whole_app_state("claude-desktop"));
         assert!(!config_is_whole_app_state("vscode"));
@@ -5674,6 +5691,89 @@ command = "npx"
             .into_iter()
             .find(|definition| definition.id == "opencode")
             .unwrap();
+        assert!(matches!(definition.format, Format::JsonOpenCodeMcp));
+        assert!((definition.path)().is_some());
+    }
+
+    #[test]
+    fn kilo_code_jsonc_round_trip_preserves_other_settings() {
+        let path = temp_path("kilo.jsonc");
+        std::fs::write(
+            &path,
+            r#"// Kilo settings
+            {
+                "$schema": "https://app.kilo.ai/config.json",
+                "model": "anthropic/claude-sonnet-4-5",
+                "mcp": {
+                    "existing": {
+                        "type": "local",
+                        "command": ["node", "server.mjs"],
+                        "environment": {"SECRET": "keep-me"},
+                        "enabled": false,
+                    },
+                },
+            }"#,
+        )
+        .unwrap();
+
+        let parsed = parse_opencode_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "existing");
+        assert_eq!(parsed[0].command.as_deref(), Some("node"));
+
+        {
+            let entry = sample_gateway(Some("Work"), "kilo-code");
+            edit_opencode_gateway(&path, Some(&entry))
+        }
+        .unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            root.get("$schema").and_then(|value| value.as_str()),
+            Some("https://app.kilo.ai/config.json")
+        );
+        assert_eq!(root["model"], "anthropic/claude-sonnet-4-5");
+        assert_eq!(root["mcp"]["existing"]["environment"]["SECRET"], "keep-me");
+        assert_eq!(
+            root["mcp"][GATEWAY_ENTRY_NAME]["environment"][crate::brand::CLIENT_ID],
+            "kilo-code"
+        );
+        assert_eq!(
+            root["mcp"][GATEWAY_ENTRY_NAME]["environment"][crate::brand::PROFILE],
+            "Work"
+        );
+
+        edit_opencode_gateway(&path, None).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(after["mcp"].get(GATEWAY_ENTRY_NAME).is_none());
+        assert!(after["mcp"].get("existing").is_some());
+        assert_eq!(after["model"], "anthropic/claude-sonnet-4-5");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn kilo_code_edit_never_wipes_unparseable_config() {
+        let path = temp_path("kilo-bad.jsonc");
+        let garbage = r#"{"model":"keep-me","mcp":{"broken": not-json"#;
+        std::fs::write(&path, garbage).unwrap();
+
+        assert!({
+            let entry = sample_gateway(None, "kilo-code");
+            edit_opencode_gateway(&path, Some(&entry))
+        }
+        .is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn kilo_code_is_registered_with_the_shared_opencode_format() {
+        let definition = defs()
+            .into_iter()
+            .find(|definition| definition.id == "kilo-code")
+            .unwrap();
+        assert_eq!(definition.name, "Kilo Code");
         assert!(matches!(definition.format, Format::JsonOpenCodeMcp));
         assert!((definition.path)().is_some());
     }
@@ -6237,6 +6337,9 @@ command = "npx"
             ("opencode", |home, _| {
                 home.join(".config").join("opencode").join("opencode.json")
             }),
+            ("kilo-code", |home, _| {
+                home.join(".config").join("kilo").join("kilo.jsonc")
+            }),
             ("qwen-code", |home, _| {
                 home.join(".qwen").join("settings.json")
             }),
@@ -6344,6 +6447,7 @@ command = "npx"
         let vscode = client_config_path("vscode").unwrap();
         let jan = client_config_path("jan").unwrap();
         let opencode = client_config_path("opencode").unwrap();
+        let kilo_code = client_config_path("kilo-code").unwrap();
 
         std::env::remove_var("XDG_CONFIG_HOME");
         std::env::remove_var("XDG_DATA_HOME");
@@ -6360,6 +6464,10 @@ command = "npx"
         assert_eq!(
             opencode,
             home.join(".config").join("opencode").join("opencode.json")
+        );
+        assert_eq!(
+            kilo_code,
+            home.join(".config").join("kilo").join("kilo.jsonc")
         );
     }
 
