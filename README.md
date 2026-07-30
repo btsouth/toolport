@@ -155,7 +155,7 @@ and refreshes too.
 
 ## Supported clients
 
-Toolport auto-detects these **28 AI clients**, installs the gateway into each with one
+Toolport auto-detects these **29 AI clients**, installs the gateway into each with one
 click, and can import a client's existing servers. It writes the config file shown
 below for you, so you never have to edit these by hand.
 
@@ -189,6 +189,7 @@ below for you, so you never have to edit these by hand.
 | Hermes         | `~/.hermes/config.yaml`                                                                    | YAML (`mcp_servers`)     |
 | AnythingLLM    | `<config>/anythingllm-desktop/storage/plugins/anythingllm_mcp_servers.json`                | JSON (`mcpServers`)      |
 | Witsy          | `<config>/Witsy/settings.json`                                                             | JSON (`mcpServers`)      |
+| Amp            | `~/.config/amp/settings.json`                                                              | JSON (`amp.mcpServers`)  |
 
 `<config>` is your OS application-config dir (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `~/.config` on Linux); `<data>` is the data dir (`~/.local/share` on Linux, the same as `<config>` elsewhere). Zed and Goose paths vary slightly by OS; Toolport resolves the right one automatically.
 
