@@ -2371,10 +2371,13 @@ fn enabled_summary(
 
 /// Compact token count for status text: "1.2M", "541k", or the raw number.
 fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.0}k", n as f64 / 1_000.0)
+    if n >= 1_000 {
+        let thousands = (n as f64 / 1_000.0).round();
+        if thousands >= 1_000.0 {
+            format!("{:.1}M", n as f64 / 1_000_000.0)
+        } else {
+            format!("{thousands:.0}k")
+        }
     } else {
         n.to_string()
     }
@@ -9794,6 +9797,15 @@ mod tests {
     // Test-only: the blend-ranking test builds these directly. Kept here rather than at
     // module scope so a non-test build doesn't warn about an unused import.
     use conduit_lib::semantic::SemanticConfig;
+
+    #[test]
+    fn formats_compact_token_counts() {
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_000), "1k");
+        assert_eq!(fmt_tokens(999_950), "1.0M");
+        assert_eq!(fmt_tokens(1_000_000), "1.0M");
+        assert_eq!(fmt_tokens(1_250_000), "1.2M");
+    }
 
     #[test]
     fn http_tool_scope_merge_intersects_profiles_and_keeps_org_allowlist() {
