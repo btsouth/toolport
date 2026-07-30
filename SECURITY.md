@@ -58,7 +58,7 @@ written to logs. Where they live depends on the backend, selected by environment
   go to the platform keychain: the macOS data-protection keychain (under a
   team-scoped access group shared with the signed gateway), Windows Credential
   Manager, or the Linux Secret Service.
-- **Encrypted file backend (`CONDUIT_SECRET_KEY`).** Setting this env var switches
+- **Encrypted file backend (`TOOLPORT_SECRET_KEY`, legacy `CONDUIT_SECRET_KEY`).** Setting this env var switches
   storage to an encrypted `secrets.enc` file (XChaCha20-Poly1305) in Toolport's
   data directory, keyed from the passphrase. This is the backend for headless and
   containerized deployments where no OS keychain is available. The passphrase is
@@ -66,8 +66,8 @@ written to logs. Where they live depends on the backend, selected by environment
   image layers. If `secrets.enc` leaks together with a weak passphrase, the
   secrets are recoverable, so treat the file as sensitive.
 - **Environment injection (headless).** A secret can also be supplied directly as
-  `CONDUIT_SECRET_<KEY>`, or as a bare `<KEY>` only when
-  `CONDUIT_ALLOW_BARE_SECRET_ENV` is set. These are read from the process
+  `TOOLPORT_SECRET_<KEY>` (legacy `CONDUIT_SECRET_<KEY>`), or as a bare `<KEY>` only when
+  `TOOLPORT_ALLOW_BARE_SECRET_ENV` (legacy `CONDUIT_ALLOW_BARE_SECRET_ENV`) is set. These are read from the process
   environment in cleartext, so they are only as protected as the environment that
   holds them.
 
@@ -103,7 +103,7 @@ controls actively gate or block a call before it reaches an upstream server.
   or block it, so the model still receives it, clearly marked.
 
 Which of these are active depends on your settings and, for Teams, your org
-policy. Debug logging is off by default, gated behind `CONDUIT_DEBUG`, and never
+policy. Debug logging is off by default, gated behind `TOOLPORT_DEBUG` (legacy `CONDUIT_DEBUG`), and never
 records tokens or full authorization URLs.
 
 ## Telemetry and hosted services
@@ -125,8 +125,9 @@ machine only through features you explicitly turn on:
 
 ## What Toolport records locally, and how to clear it
 
-Everything below stays in Toolport's local data directory (`%APPDATA%\Conduit` on
-Windows, the platform config dir elsewhere; override with `CONDUIT_DATA_DIR`) and
+Everything below stays in Toolport's local data directory (`%APPDATA%\Toolport` on
+Windows, the platform config dir elsewhere; override with `TOOLPORT_DATA_DIR`, legacy
+`CONDUIT_DATA_DIR`) and
 never leaves your device on its own. Each log is capped and trims oldest-first:
 
 | Local record           | File                 | Retained                                | Contains                                                      |

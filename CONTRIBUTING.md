@@ -66,7 +66,8 @@ The Rust suite includes unit tests in each module (`clients`, `catalog`,
 `registry`, `router`, `oauth`, etc.), binary-target tests, and integration tests
 in `src-tauri/tests/`. Use the npm script above so your local target selection
 matches CI. Frontend tests use [Vitest](https://vitest.dev) and live alongside
-the code as `*.test.ts` files inside `src/`.
+the code as `*.test.ts` or `*.test.tsx` files inside `src/`, depending on whether
+the test contains JSX.
 
 ### Formatting
 
@@ -77,6 +78,23 @@ checks this on every PR, but you can fix issues locally before pushing:
 npm run format        # format all files in place
 npm run format:check  # check only (fails without writing — same as CI)
 ```
+
+**Do not run `cargo fmt`.** The Rust tree is deliberately not rustfmt-clean and
+there is no fmt gate in CI, so `cargo fmt` currently rewrites 725 places across
+33 files, which is effectively every Rust file in the project. That buries your
+actual change in unrelated reflow, and it conflicts with every other open PR
+touching the same file. Match the style of the code around you, and leave the
+rest alone.
+
+If your editor formats Rust on save, turn it off for this repo:
+
+```jsonc
+// .vscode/settings.json
+{ "[rust]": { "editor.formatOnSave": false } }
+```
+
+If a review asks you to drop a formatter run, `git checkout main -- <file>` and
+re-applying your change by hand is usually faster than unpicking the diff.
 
 ### Linting
 
@@ -235,7 +253,7 @@ Check the client's config file and match it to a `Format` variant:
 | `JsonMcpServers`     | `{"mcpServers": {...}}`                            | Claude Desktop, Cursor, Windsurf |
 | `JsonQwenMcpServers` | `{"mcpServers": {"name": {"httpUrl": "..."}}}`     | Qwen Code                        |
 | `JsonServers`        | `{"servers": {...}}`                               | VS Code                          |
-| `JsonOpenCodeMcp`    | `{"mcp": {"name": {"command": [...]}}}`            | OpenCode                         |
+| `JsonOpenCodeMcp`    | `{"mcp": {"name": {"command": [...]}}}`            | OpenCode, Kilo Code              |
 | `JsonContextServers` | `{"context_servers": {...}}` (JSONC)               | Zed                              |
 | `TomlMcpServers`     | `[mcp_servers.name]`                               | Codex, Grok Build                |
 | `YamlExtensions`     | `extensions:` map (Goose shape: `cmd`/`envs`)      | Goose                            |

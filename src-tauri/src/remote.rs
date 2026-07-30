@@ -10,8 +10,8 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::downstream::{
-    DownstreamServer, HttpTransport, RefreshFn, ResourceUpdatedSink, ServerRequestHandler,
-    Transport,
+    DownstreamServer, HttpTransport, ProgressSink, RefreshFn, ResourceUpdatedSink,
+    ServerRequestHandler, Transport,
 };
 use crate::registry::ServerEntry;
 use crate::{oauth, secrets};
@@ -179,10 +179,23 @@ fn refresh_token_if_needed(server_id: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// True when `code` appears in `s` as a standalone number rather than as a run of
+/// digits inside a longer one.
+///
+/// A bare substring test reads an auth failure out of an OS error number
+/// (`os error 10401`), a port (`127.0.0.1:4013`), or a duration (`4030ms`).
+fn mentions_status(s: &str, code: &str) -> bool {
+    s.match_indices(code).any(|(i, _)| {
+        let before = s[..i].chars().next_back();
+        let after = s[i + code.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_digit()) && !after.is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
 pub fn is_auth_error(e: &str) -> bool {
     let lower = e.to_lowercase();
-    e.contains("401")
-        || e.contains("403")
+    mentions_status(e, "401")
+        || mentions_status(e, "403")
         || lower.contains("unauthorized")
         || lower.contains("needs authentication")
 }
@@ -339,16 +352,19 @@ fn first_vaulted_secret(server: &ServerEntry) -> Option<String> {
 ///    OAuth. Without this fallback, "Manage secrets" tokens were silently ignored
 ///    for HTTP servers.
 pub fn connect_remote(server: &ServerEntry) -> Result<DownstreamServer, String> {
-    connect_remote_with_handler(server, None, None)
+    connect_remote_with_handler(server, None, None, None)
 }
 
 /// Like [`connect_remote`], but wires server-initiated JSON-RPC (sampling, roots, …)
 /// through `handler` when the downstream server asks mid-call, and optionally fans
-/// `notifications/resources/updated` from SSE response streams (SOU-394).
+/// `notifications/resources/updated` from SSE response streams (SOU-394), and
+/// routes `notifications/progress` back to the client that minted the token
+/// (SOU-444).
 pub fn connect_remote_with_handler(
     server: &ServerEntry,
     server_handler: Option<ServerRequestHandler>,
     resource_updated: Option<ResourceUpdatedSink>,
+    progress: Option<ProgressSink>,
 ) -> Result<DownstreamServer, String> {
     guard_connect_target(server)?;
     let url = server.url.as_deref().unwrap_or("");
@@ -362,13 +378,32 @@ pub fn connect_remote_with_handler(
         Some(fresh) => Some(fresh),
         None => stored_auth,
     };
+    // Remember exactly what we hand the transport. The transport force-refreshes
+    // internally on a 401/403 and vaults the result, so if the vaulted token
+    // differs from this afterwards, an exchange already happened during this
+    // connect (SOU-474).
+    let sent_auth = auth.clone();
     let mut transport = authed_transport(url, auth, server_id, block_private)?;
     if let Some(ref handler) = server_handler {
         transport.set_server_request_handler(handler.clone());
     }
     transport.set_resource_updated_sink(resource_updated.clone());
+    transport.set_progress_sink(progress.clone());
     match DownstreamServer::connect(server_id.to_string(), Box::new(transport)) {
         Ok(ds) => Ok(ds),
+        // The transport already gets one forced refresh per token on a 401/403.
+        // If it spent one during this connect, the vault now holds a token that
+        // has ALREADY been rejected, so minting yet another cannot help - and
+        // against a provider that rotates the refresh token on use, each needless
+        // exchange consumes a further link of the chain. Retry only when the
+        // transport had no refresh of its own to spend (SOU-474).
+        Err(e)
+            if is_auth_error(&e)
+                && secrets::get_secret(server_id, secrets::HTTP_AUTH_KEY)
+                    .is_some_and(|vaulted| Some(&vaulted) != sent_auth.as_ref()) =>
+        {
+            Err(e)
+        }
         Err(e) if is_auth_error(&e) => match refresh_token(server_id) {
             Ok(fresh) => {
                 let mut transport = authed_transport(url, Some(fresh), server_id, block_private)?;
@@ -376,6 +411,7 @@ pub fn connect_remote_with_handler(
                     transport.set_server_request_handler(handler);
                 }
                 transport.set_resource_updated_sink(resource_updated);
+                transport.set_progress_sink(progress);
                 DownstreamServer::connect(server_id.to_string(), Box::new(transport))
             }
             Err(_) => Err(e),
@@ -394,6 +430,20 @@ mod tests {
         assert!(is_auth_error("got 403 Forbidden"));
         assert!(!is_auth_error("HTTP 500: server error"));
         assert!(!is_auth_error("connection refused"));
+    }
+
+    #[test]
+    fn a_status_code_buried_in_a_longer_number_is_not_an_auth_error() {
+        // Misreading these as auth failures shows the user a "Needs sign-in"
+        // prompt for a network fault and burns an OAuth refresh exchange on it.
+        assert!(!is_auth_error("connection refused (os error 10401)"));
+        assert!(!is_auth_error("dial tcp 127.0.0.1:4013: refused"));
+        assert!(!is_auth_error("read timed out after 4030ms"));
+        assert!(!is_auth_error("HTTP 500: upstream returned 14012 bytes"));
+        // Still caught at a boundary, wherever it sits in the message.
+        assert!(is_auth_error("HTTP 401"));
+        assert!(is_auth_error("server said 403."));
+        assert!(is_auth_error("(403)"));
     }
 
     fn oauth_state(expires_at: Option<u64>, refresh_token: Option<&str>) -> OAuthState {

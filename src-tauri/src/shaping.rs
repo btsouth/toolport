@@ -1,7 +1,7 @@
 //! Result-shaping: keep oversized tool results from blowing the model's context
 //! WITHOUT losing data. When a downstream tool returns a result larger than the
 //! byte budget, the full body is cached in-process and the model gets a truncated
-//! head plus a Toolport-stamped marker carrying a cursor. `conduit_fetch_result`
+//! head plus a Toolport-stamped marker carrying a cursor. `toolport_fetch_result`
 //! pages through the cached full result. Lossless: nothing is dropped, only
 //! deferred, and the full data stays retrievable.
 //!
@@ -190,11 +190,35 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
     let structured = result.get("structuredContent").cloned();
 
     let total = body.chars().count();
+    // Envelope fields carried across (see below) are part of the shaped result, so
+    // they have to come out of the budget too. Without this, preserving a large
+    // `_meta` could push a "shaped" result back over the limit and `true` would no
+    // longer mean "fits" (#511 review).
+    let preserved_bytes: usize = result
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "content" | "structuredContent" | "isError"))
+                .map(|(key, value)| key.len() + value_size(value) + 4)
+                .sum()
+        })
+        .unwrap_or(0);
+    // If the preserved envelope alone meets the budget, no head size makes the
+    // shaped result fit. Leave it unshaped, as with the other cases where shaping
+    // cannot honour its contract.
+    if preserved_bytes >= budget {
+        return false;
+    }
     // Reserve room for the marker, then show as much of the body head as fits the
     // BYTE budget (not a char count, or multi-byte text would blow past it).
-    let head_byte_limit = budget.saturating_sub(512).max(256);
+    //
+    // No lower floor here. A `.max(256)` floor is what let a large envelope push
+    // a "shaped" result back over the budget while still returning `true`: the
+    // floor won whenever `budget - reserve - preserved` fell below it. The final
+    // fit-check below is what actually enforces the contract; this is only the
+    // starting estimate.
+    let mut head_byte_limit = budget.saturating_sub(512 + preserved_bytes);
     let head = head_within_bytes(&body, head_byte_limit).to_string();
-    let head_chars = head.chars().count();
     let is_error = result
         .get("isError")
         .and_then(|v| v.as_bool())
@@ -203,6 +227,67 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
     let cursor = next_cursor();
     let new_entry_size = body.len() + structured.as_ref().map(value_size).unwrap_or(0);
 
+    // Build the shaped result for a given head, then measure it. The marker's own
+    // length varies with the head length it reports, and the preserved envelope is
+    // whatever the server sent, so the only reliable way to honour the budget is
+    // to measure the finished value rather than predict it.
+    let build = |head: &str| -> Value {
+        let head_chars = head.chars().count();
+        let marker = format!(
+            "\n\n[Toolport shaped this result: it was ~{} KB, larger than the {} KB context \
+             budget. Showing the first {} of {} characters. The rest is held temporarily, call \
+             toolport_fetch_result with {{\"cursor\":\"{}\",\"offset\":{}}} to read it. If that \
+             later reports the cursor expired, just re-run this tool call for a fresh result.]",
+            size / 1024,
+            budget / 1024,
+            head_chars,
+            total,
+            cursor,
+            head_chars
+        );
+        // Shaping deliberately rewrites `content` and stashes `structuredContent`
+        // in the cache (both retrievable via the cursor). Every other top-level
+        // field belongs to the downstream server, not to us: `_meta`, and whatever
+        // a future revision or extension adds. Carry them across so shaping stays a
+        // truncation of the body rather than a rewrite of the envelope (SOU-444).
+        let mut shaped = text_result(format!("{head}{marker}"), is_error);
+        if let (Some(src), Some(dst)) = (result.as_object(), shaped.as_object_mut()) {
+            for (key, value) in src {
+                if matches!(key.as_str(), "content" | "structuredContent" | "isError") {
+                    continue;
+                }
+                dst.insert(key.clone(), value.clone());
+            }
+        }
+        shaped
+    };
+
+    let mut head = head;
+    let mut shaped = build(&head);
+    // Shrink until it fits. Each pass subtracts the exact overage, so this
+    // converges immediately in practice; the bound is a guard, not a search.
+    for _ in 0..4 {
+        let shaped_size = serde_json::to_string(&shaped).map(|s| s.len()).unwrap_or(0);
+        if shaped_size <= budget || head.is_empty() {
+            break;
+        }
+        let overage = shaped_size - budget;
+        head_byte_limit = head_byte_limit.saturating_sub(overage.max(1));
+        head = head_within_bytes(&body, head_byte_limit).to_string();
+        shaped = build(&head);
+    }
+
+    // An empty head that still overflows means the marker and envelope alone
+    // exceed the budget, so no truncation can honour the contract. Returning
+    // `true` there would be the same false claim the head floor used to make.
+    // Bail BEFORE caching, so a result we decline to shape leaves no orphaned
+    // cursor entry behind.
+    if serde_json::to_string(&shaped).map(|s| s.len()).unwrap_or(0) > budget {
+        return false;
+    }
+
+    // Only now stash the full body: the cursor in the marker above is live from
+    // here on.
     {
         let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
         sweep(&mut map);
@@ -232,19 +317,8 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
             },
         );
     }
-    let marker = format!(
-        "\n\n[Toolport shaped this result: it was ~{} KB, larger than the {} KB context \
-         budget. Showing the first {} of {} characters. The rest is held temporarily, call \
-         conduit_fetch_result with {{\"cursor\":\"{}\",\"offset\":{}}} to read it. If that \
-         later reports the cursor expired, just re-run this tool call for a fresh result.]",
-        size / 1024,
-        budget / 1024,
-        head_chars,
-        total,
-        cursor,
-        head_chars
-    );
-    *result = text_result(format!("{head}{marker}"), is_error);
+
+    *result = shaped;
     true
 }
 
@@ -342,7 +416,7 @@ pub fn fetch_result(cursor: &str, offset: usize, len: usize, requester: Option<&
     let footer = if remaining > 0 {
         format!(
             "\n\n[Toolport: characters {offset}..{end} of {total}. {remaining} remain, call \
-             conduit_fetch_result with offset={end} for the next slice.]"
+             toolport_fetch_result with offset={end} for the next slice.]"
         )
     } else {
         format!("\n\n[Toolport: end of result ({total} characters).]")
@@ -370,7 +444,7 @@ mod tests {
         let mut r = big_text_result(10_000);
         assert!(shape_result(&mut r, 2048, None));
         let text = r["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("conduit_fetch_result"));
+        assert!(text.contains("toolport_fetch_result"));
         assert!(text.len() < 10_000);
         // The marker carries a cursor that fetch_result can page.
         assert!(text.contains("\"cursor\":\"r"));
@@ -491,6 +565,159 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("end of result"));
+    }
+
+    #[test]
+    fn relayable_meta_keeps_unknown_and_drops_per_hop() {
+        use crate::downstream::{relayable_meta, sanitize_forwarded_meta};
+
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": { "name": "x" },
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "progressToken": "p-1",
+            "traceparent": "00-abc-def-01",
+            "com.example/unknown": { "a": 1 }
+        });
+        let kept = relayable_meta(Some(&meta)).expect("some keys survive");
+        assert_eq!(kept["traceparent"], "00-abc-def-01");
+        assert_eq!(kept["com.example/unknown"]["a"], 1);
+        assert!(kept.get("io.modelcontextprotocol/protocolVersion").is_none());
+        assert!(kept.get("io.modelcontextprotocol/clientInfo").is_none());
+        assert!(kept.get("io.modelcontextprotocol/clientCapabilities").is_none());
+        // Relayed since SOU-444 part 2: the gateway now routes the resulting
+        // `notifications/progress` back to the client that minted the token.
+        assert_eq!(kept["progressToken"], "p-1");
+
+        // Nothing relayable means no `_meta` at all, not an empty object, so the
+        // request stays byte-identical to what Toolport sent before SOU-444.
+        assert!(relayable_meta(Some(
+            &json!({ "io.modelcontextprotocol/clientInfo": { "name": "x" } })
+        ))
+        .is_none());
+        assert!(relayable_meta(None).is_none());
+
+        // The wholesale-forward path (completion/complete) strips the same keys.
+        let mut params = json!({
+            "ref": { "type": "ref/prompt", "name": "p" },
+            "_meta": { "io.modelcontextprotocol/clientInfo": { "name": "x" }, "keep": 1 }
+        });
+        sanitize_forwarded_meta(&mut params);
+        assert_eq!(params["_meta"]["keep"], 1);
+        assert!(params["_meta"].get("io.modelcontextprotocol/clientInfo").is_none());
+
+        // ...and removes `_meta` entirely when nothing survives.
+        let mut params = json!({
+            "ref": {}, "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" }
+        });
+        sanitize_forwarded_meta(&mut params);
+        assert!(params.get("_meta").is_none());
+    }
+
+    #[test]
+    fn shaped_results_fit_the_budget_across_envelope_sizes() {
+        // A SWEEP, not a single point. The previous version of this test hardcoded
+        // a 2 000-byte envelope, which sat inside the safe zone, while 3 600 B
+        // returned `true` at 4 269 bytes against a 4 096 budget. Any single-point
+        // test can land in a window like that; stepping across the range cannot.
+        // Size of the marker plus JSON skeleton, measured rather than guessed.
+        // Declining is legitimate only once the envelope plus this cannot fit.
+        //
+        // This bound is deliberately TIGHT. A generous one (600) let the test pass
+        // against a head-size floor that gave up at a 3 600-byte envelope and
+        // passed the whole 53 686-byte body through, where shrinking to fit
+        // produces 4 009. Picking the threshold by measuring both implementations
+        // is the only reason this catches it.
+        const MARKER_RESERVE: usize = 450;
+
+        let budget = 4096;
+        for meta_len in [0, 500, 1_000, 2_000, 3_000, 3_400, 3_600, 3_800, 4_000, 4_100] {
+            let mut r = json!({
+                "content": [{ "type": "text", "text": "x".repeat(50_000) }],
+                "isError": false,
+                "_meta": { "com.example/ctx": "m".repeat(meta_len) }
+            });
+            let shaped = shape_result(&mut r, budget, None);
+            let size = serde_json::to_string(&r).map(|s| s.len()).unwrap_or(0);
+
+            if shaped {
+                assert!(
+                    size <= budget,
+                    "`true` must mean it fits: {meta_len}B envelope produced {size} \
+                     bytes against a {budget} budget"
+                );
+                // The envelope has to survive, otherwise "fits" was bought by
+                // silently dropping the server's data.
+                assert_eq!(
+                    r["_meta"]["com.example/ctx"].as_str().map(str::len),
+                    Some(meta_len),
+                    "{meta_len}B envelope was dropped rather than preserved"
+                );
+            } else {
+                // Declining is allowed ONLY when the envelope plus the marker
+                // genuinely cannot fit. Otherwise declining is itself a
+                // regression: the full 50 KB body reaches the model instead of a
+                // shaped head. This is what catches a head-size floor that gives
+                // up early rather than shrinking to fit.
+                assert!(
+                    meta_len + MARKER_RESERVE >= budget,
+                    "{meta_len}B envelope leaves room for a head, so it should have \
+                     been shaped rather than passed through whole"
+                );
+                // ...and an unshaped result must be left completely untouched.
+                assert!(
+                    r["content"][0]["text"].as_str().map(str::len) == Some(50_000),
+                    "an unshaped result must be left alone, {meta_len}B case"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preserved_envelope_fields_do_not_push_a_shaped_result_over_budget() {
+        // Preserved fields are part of the shaped result, so they come out of the
+        // same budget. Before this, a large `_meta` was copied in AFTER the head
+        // was sized, so `true` could mean "shaped, and still oversized" (#511
+        // review). The guarantee is that a `true` return fits.
+        let budget = 4096;
+        let mut r = json!({
+            "content": [{ "type": "text", "text": "x".repeat(50_000) }],
+            "isError": false,
+            // Deliberately bulky: about half the budget on its own.
+            "_meta": { "com.example/ctx": "m".repeat(2_000) }
+        });
+        assert!(shape_result(&mut r, budget, None));
+
+        let size = serde_json::to_string(&r).map(|s| s.len()).unwrap_or(0);
+        assert!(
+            size <= budget,
+            "a shaped result must fit the budget, got {size} bytes against {budget}"
+        );
+        // ...and the bulky field really was preserved, not dropped to make it fit.
+        assert_eq!(r["_meta"]["com.example/ctx"].as_str().map(str::len), Some(2_000));
+    }
+
+    #[test]
+    fn shaping_preserves_meta_and_unknown_envelope_fields() {
+        // Shaping truncates the BODY. Everything else in the envelope belongs to
+        // the downstream server: `_meta`, and whatever a future revision or
+        // extension adds. Dropping it would make Toolport a lossy proxy in the
+        // result direction, the mirror of the request-side gap (SOU-444).
+        let mut r = json!({
+            "content": [{ "type": "text", "text": "x".repeat(5_000) }],
+            "isError": false,
+            "_meta": { "io.modelcontextprotocol/serverInfo": { "name": "srv", "version": "1" } },
+            "somethingAFutureSpecAdded": { "keep": true }
+        });
+        assert!(shape_result(&mut r, 1024, None));
+
+        assert_eq!(r["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "srv");
+        assert_eq!(r["somethingAFutureSpecAdded"]["keep"], true);
+        // ...while the body really was shaped.
+        assert!(r["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Toolport shaped this result"));
     }
 
     #[test]

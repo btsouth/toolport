@@ -1270,9 +1270,11 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             <span className="flex min-w-0 flex-1 flex-col leading-tight">
               <span className="font-medium">Stop old gateways</span>
               <span className="text-xs text-muted-foreground">
-                End leftover gateway processes from earlier installs. Agents that
-                auto-respawn MCP pick up the current binary on the next tool call; no full
-                app restart required for those hosts.
+                End leftover gateway processes from earlier installs. Where the gateway
+                path stays the same across upgrades, a host that respawns MCP picks up the
+                new binary on its own. Where the filename carries its version, or the old
+                one sits at a path an upgrade never touches, an app that was already
+                running keeps launching it until you restart that app.
               </span>
             </span>
             <button

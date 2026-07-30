@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { ImportReviewDialog } from "./ImportReviewDialog";
+import { ImportReviewDialog, runsShell, isPrivateHostUrl } from "./ImportReviewDialog";
 import type { ImportItem } from "@/lib/types";
 
 function items(): ImportItem[] {
@@ -101,5 +101,71 @@ describe("ImportReviewDialog", () => {
       />,
     );
     expect(container).toBeEmptyDOMElement();
+  });
+});
+
+describe("runsShell", () => {
+  it.each([
+    // Bare shell names.
+    ["sh", true],
+    ["bash", true],
+    ["zsh", true],
+    ["cmd", true],
+    ["powershell", true],
+    ["pwsh", true],
+    // Case-insensitive, and Windows .exe suffix is stripped.
+    ["BASH", true],
+    ["powershell.exe", true],
+    // Full paths, both separators; backslashes are normalized.
+    ["/bin/sh", true],
+    ["/usr/bin/env", false],
+    ["C:\\Windows\\System32\\cmd.exe", true],
+    ["C:\\Program Files\\PowerShell\\7\\pwsh.exe", true],
+    // Non-shell commands, including ones that merely contain a shell name.
+    ["npx", false],
+    ["node", false],
+    ["bash-language-server", false],
+    ["fish", false],
+    // Only a trailing .exe is stripped.
+    ["bash.exe.bak", false],
+    // Missing command.
+    [null, false],
+    ["", false],
+  ])("classifies %j as %s", (command, expected) => {
+    expect(runsShell(command)).toBe(expected);
+  });
+});
+
+describe("isPrivateHostUrl", () => {
+  it.each([
+    // Loopback names and addresses.
+    ["http://localhost:3000/mcp", true],
+    ["http://dev.localhost/mcp", true],
+    ["http://127.0.0.1/mcp", true],
+    ["http://[::1]:8080/mcp", true],
+    // RFC1918 ranges.
+    ["http://10.0.0.1/mcp", true],
+    ["http://192.168.1.10:8080/mcp", true],
+    ["http://172.16.0.1/mcp", true],
+    ["http://172.31.255.255/mcp", true],
+    // 172.x is only private for the second octet 16-31.
+    ["http://172.15.0.1/mcp", false],
+    ["http://172.32.0.1/mcp", false],
+    // Link-local and "this network".
+    ["http://169.254.169.254/latest/meta-data", true],
+    ["http://0.0.0.0:9000/mcp", true],
+    // Public hosts and addresses.
+    ["https://mcp.linear.app/mcp", false],
+    ["https://8.8.8.8/mcp", false],
+    // Hostnames merely containing "localhost" are not loopback.
+    ["http://localhost.example.com/mcp", false],
+    ["http://notlocalhost/mcp", false],
+    // Unparseable or missing URLs never warn.
+    ["not a url", false],
+    [null, false],
+    [undefined, false],
+    ["", false],
+  ])("classifies %j as %s", (url, expected) => {
+    expect(isPrivateHostUrl(url)).toBe(expected);
   });
 });

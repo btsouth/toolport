@@ -18,7 +18,14 @@ import {
   XCircle,
 } from "lucide-react";
 import { toast } from "sonner";
-import { fmtPercent, fmtTokens, fmtTs, stableListKeys } from "@/lib/utils";
+import {
+  fmtDollars,
+  fmtMs,
+  fmtPercent,
+  fmtTokens,
+  fmtTs,
+  stableListKeys,
+} from "@/lib/utils";
 import { toastError } from "@/lib/toast";
 import { save } from "@tauri-apps/plugin-dialog";
 import { Input } from "@/components/ui/input";
@@ -55,12 +62,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-/** Compact latency string: "180 ms" or "1.2 s", or a dash when unmeasured. */
-function fmtMs(ms: number | null): string {
-  if (ms == null) return "-";
-  return ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`;
-}
-
 /** Models for the dollar estimate, input-token list prices ($/1M), grouped by
  *  provider. Matches the public calculator at toolport.app/calculator. */
 const SAVINGS_MODELS = [
@@ -92,13 +93,6 @@ const SAVINGS_MODELS = [
 const SAVINGS_MODEL_PRICE = new Map(
   SAVINGS_MODELS.flatMap((g) => g.items).map((m) => [m.label, m.price]),
 );
-
-/** Dollar value of saved input tokens, scaled to the number's size. */
-function fmtDollars(n: number): string {
-  if (n >= 1000) return `$${Math.round(n).toLocaleString()}`;
-  if (n >= 10) return `$${n.toFixed(0)}`;
-  return `$${n.toFixed(2)}`;
-}
 
 /** A badge describing one security event by kind. */
 function eventBadge(e: SecurityEvent): { label: string; cls: string } {

@@ -155,7 +155,7 @@ and refreshes too.
 
 ## Supported clients
 
-Toolport auto-detects these **27 AI clients**, installs the gateway into each with one
+Toolport auto-detects these **28 AI clients**, installs the gateway into each with one
 click, and can import a client's existing servers. It writes the config file shown
 below for you, so you never have to edit these by hand.
 
@@ -167,6 +167,7 @@ below for you, so you never have to edit these by hand.
 | VS Code        | `<config>/Code/User/mcp.json`                                                              | JSON (`servers`)         |
 | Windsurf       | `~/.codeium/windsurf/mcp_config.json`                                                      | JSON (`mcpServers`)      |
 | OpenCode       | `~/.config/opencode/opencode.json`                                                         | JSON (`mcp`)             |
+| Kilo Code      | `~/.config/kilo/kilo.jsonc`                                                                | JSONC (`mcp`)            |
 | Codex          | `~/.codex/config.toml`                                                                     | TOML (`mcp_servers`)     |
 | Grok Build     | `~/.grok/config.toml`                                                                      | TOML (`mcp_servers`)     |
 | Continue       | `~/.continue/config.yaml`                                                                  | YAML (`mcpServers`)      |

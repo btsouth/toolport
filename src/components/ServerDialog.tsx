@@ -178,7 +178,7 @@ export function ServerDialog({
       setShowPaste(false);
       setPasteText("");
     } catch (e) {
-      toastError(`Could not parse: ${e}`);
+      toastError(`Couldn't parse: ${e}`);
     } finally {
       setParsing(false);
     }
@@ -241,7 +241,7 @@ export function ServerDialog({
           status: "fail",
           message: r.authRequired
             ? `Reachable, but needs credentials: ${r.error ?? "authentication required"}`
-            : (r.error ?? "Could not connect."),
+            : (r.error ?? "Couldn't connect."),
         });
       }
     } catch (e) {

@@ -1050,6 +1050,60 @@ mod tests {
     }
 
     #[test]
+    fn version_parsing_survives_a_two_digit_minor() {
+        // 1.9 -> 1.10 is the transition where a version parser usually bites, and
+        // every other case here stops at a single-digit minor. Nothing compares
+        // versions by ordering (a lexical compare would put "1.10.0" before
+        // "1.9.7"), so equality is all that has to hold, but it has to hold for
+        // the reaper to recognise its own image after the bump.
+        assert!(looks_like_version_suffix("1.10.0"));
+        assert!(looks_like_version_suffix("1.10.0-rc.1"));
+        assert!(is_versioned_gateway_basename("toolport-gateway-1.10.0.exe"));
+        assert!(is_versioned_gateway_basename("conduit-gateway-1.10.0"));
+
+        // The current image is kept and an older one is killed across the boundary,
+        // in both directions, so neither is mistaken for the other.
+        assert!(basename_matches_current_version(
+            "toolport-gateway-1.10.0.exe",
+            "1.10.0"
+        ));
+        assert!(!basename_matches_current_version(
+            "toolport-gateway-1.9.7.exe",
+            "1.10.0"
+        ));
+        assert!(!basename_matches_current_version(
+            "toolport-gateway-1.10.0.exe",
+            "1.9.7"
+        ));
+
+        let c = ctx("1.10.0", &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.10.0.exe"], false);
+        assert_eq!(
+            decide_reap(
+                &proc(
+                    1,
+                    "toolport-gateway-1.10.0.exe",
+                    Some(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.10.0.exe")
+                ),
+                &c
+            ),
+            ReapDecision::Keep,
+            "the current 1.10.0 image must survive its own reaper"
+        );
+        assert_eq!(
+            decide_reap(
+                &proc(
+                    2,
+                    "toolport-gateway-1.9.7.exe",
+                    Some(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.7.exe")
+                ),
+                &c
+            ),
+            ReapDecision::Kill,
+            "a pre-bump 1.9.7 image is obsolete once 1.10.0 is current"
+        );
+    }
+
+    #[test]
     fn decide_kill_all_kills_everything_gateway() {
         let c = ctx("1.9.6", &[r"C:\keep\toolport-gateway-1.9.6.exe"], true);
         assert_eq!(
@@ -1218,5 +1272,111 @@ mod tests {
         let json = serde_json::to_string(&m).unwrap();
         let back: GatewayManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(m, back);
+    }
+
+    /// Kills the child and removes the scratch directory even if an assertion
+    /// panics, so a failing run cannot leave a stray `sleep` behind.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    struct SpawnedGateway(std::process::Child, PathBuf);
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    impl Drop for SpawnedGateway {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+
+    /// Drives the real Linux enumerator against a real process.
+    ///
+    /// Linux is the one platform where detection has no margin. `/proc/<pid>/comm`
+    /// is capped at 15 usable characters and `toolport-gateway` is 16, so `comm`
+    /// can never match a Toolport-named gateway and detection depends *entirely*
+    /// on the `/proc/<pid>/exe` fallback. (macOS differs: `ucomm` allows 16, so the
+    /// name fits there exactly.) Every other test in this file is a pure fixture
+    /// over `is_gateway_basename` / `decide_reap`, and none of them can catch a
+    /// broken fallback, because the fallback is the part that reads the OS.
+    ///
+    /// That gap is not hypothetical: the sibling macOS path shipped with an argv
+    /// Apple's `ps` rejects, returning zero processes, and the fixture tests stayed
+    /// green throughout. CI runs ubuntu, so this path *can* be covered for real.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn linux_enumeration_finds_a_versioned_gateway_via_the_exe_fallback() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // into_iter, not iter().map(Path::new): the latter returns a &Path borrowed
+        // from the temporary array, which does not outlive the statement.
+        let src = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+            .expect("no sleep binary available to stand in for a gateway");
+
+        let dir = std::env::temp_dir().join(format!("toolport-reaper-enum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+
+        // Deliberately longer than comm's 15-char window so the truncation this
+        // test exists for actually happens.
+        let exe = dir.join("toolport-gateway-9.9.9");
+        std::fs::copy(src, &exe).expect("copy stand-in binary");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod +x");
+
+        let child = std::process::Command::new(&exe)
+            .arg("30")
+            .spawn()
+            .expect("spawn stand-in gateway");
+        let pid = child.id();
+        let guard = SpawnedGateway(child, dir.clone());
+
+        // spawn() returns before the exec completes, so /proc entries are not
+        // populated yet. Wait for the exe symlink to point at our copy.
+        let exe_link = PathBuf::from(format!("/proc/{pid}/exe"));
+        let mut execed = false;
+        for _ in 0..300 {
+            if std::fs::read_link(&exe_link).map(|p| p == exe).unwrap_or(false) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(execed, "child never exec'd into {}", exe.display());
+
+        // The premise: comm is truncated past recognition, so a hit below can only
+        // have come from the exe fallback. If a future kernel widens comm this
+        // assertion fires, which is the correct signal that the premise changed.
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .expect("read comm")
+            .trim()
+            .to_string();
+        assert!(
+            !is_gateway_basename(&comm),
+            "comm {comm:?} matched is_gateway_basename on its own, so this test no \
+             longer proves the /proc/<pid>/exe fallback works. Check whether comm's \
+             width changed before touching the fallback."
+        );
+
+        let found = linux_list_gateway_processes();
+        let hit = found.iter().find(|p| p.pid == pid).unwrap_or_else(|| {
+            panic!(
+                "linux_list_gateway_processes() missed pid {pid} running {}. comm was \
+                 {comm:?}, which cannot match, so the /proc/<pid>/exe fallback is broken \
+                 and no Toolport-named gateway would be reaped on Linux.",
+                exe.display()
+            )
+        });
+
+        assert_eq!(
+            hit.basename, "toolport-gateway-9.9.9",
+            "basename must come from the exe link, not truncated comm"
+        );
+        assert_eq!(
+            hit.path.as_deref(),
+            Some(exe.as_path()),
+            "path must be the resolved exe so keep-path comparisons work"
+        );
+
+        drop(guard);
     }
 }

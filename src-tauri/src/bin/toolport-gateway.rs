@@ -33,7 +33,7 @@ use conduit_lib::clients;
 use conduit_lib::codemode;
 use conduit_lib::downstream::{
     self, DownstreamServer, ResourceUpdatedSink, ServerRequestHandler, StdioTransport, Transport,
-    PROTOCOL_VERSION,
+    MODERN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use conduit_lib::inspect;
 use conduit_lib::integrity;
@@ -47,12 +47,152 @@ use conduit_lib::secrets;
 use conduit_lib::semantic;
 use conduit_lib::shaping;
 
+thread_local! {
+    /// Protocol version of the request currently being served, when the client is
+    /// modern (2026-07-28+). `None` means a legacy client.
+    ///
+    /// Request-scoped rather than connection-scoped on purpose: a modern client
+    /// declares its version on every request, so there is no connection-level
+    /// negotiation to cache. Mirrors `ACTIVE_MCP_SESSION` so [`success`] can
+    /// decorate every result without threading the era through each of the two
+    /// dozen dispatch arms - including the ones that return early (SOU-446).
+    static ACTIVE_UPSTREAM_VERSION: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Sets the serving era for one request and restores the previous value on drop,
+/// so a nested dispatch (code mode re-entering `execute_call`) cannot leak it.
+struct UpstreamEraGuard(Option<String>);
+
+impl UpstreamEraGuard {
+    fn enter(version: Option<String>) -> Self {
+        UpstreamEraGuard(ACTIVE_UPSTREAM_VERSION.with(|cell| cell.replace(version)))
+    }
+}
+
+impl Drop for UpstreamEraGuard {
+    fn drop(&mut self) {
+        ACTIVE_UPSTREAM_VERSION.with(|cell| *cell.borrow_mut() = self.0.take());
+    }
+}
+
+/// True when the request being served came from a modern client.
+fn serving_modern_client() -> bool {
+    ACTIVE_UPSTREAM_VERSION.with(|cell| cell.borrow().is_some())
+}
+
+/// Add the fields a modern client requires to a result.
+///
+/// No-op for legacy clients, so their responses stay byte-identical to what
+/// Toolport sent before 2026-07-28 support existed (SOU-446).
+fn decorate_for_upstream(mut result: Value) -> Value {
+    if !serving_modern_client() {
+        return result;
+    }
+    let Some(obj) = result.as_object_mut() else {
+        return result;
+    };
+    // Every result carries `resultType`. Ordinary results are "complete";
+    // MRTR sets "input_required" on its own path (SOU-449), so an existing value
+    // is never overwritten.
+    obj.entry("resultType").or_insert_with(|| json!("complete"));
+    let meta = obj.entry("_meta").or_insert_with(|| json!({}));
+    // A downstream server that returned a non-object `_meta` is malformed, but
+    // that must not make OUR envelope invalid by silently skipping the required
+    // serverInfo. There are no keys to preserve in a non-object, so replace it.
+    if !meta.is_object() {
+        *meta = json!({});
+    }
+    if let Some(meta) = meta.as_object_mut() {
+        // Toolport IS the server on this hop, so it identifies itself here,
+        // overwriting any downstream server's value. Symmetric with
+        // PER_HOP_META_KEYS on the request side: per-hop keys belong to the hop.
+        meta.insert(
+            "io.modelcontextprotocol/serverInfo".to_string(),
+            json!({ "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") }),
+        );
+    }
+    result
+}
+
 fn success(id: Value, result: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+    json!({ "jsonrpc": "2.0", "id": id, "result": decorate_for_upstream(result) })
 }
 
 fn error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+/// Protocol revisions Toolport serves to upstream clients, newest first.
+///
+/// ADVERTISED, not accepted-in-`_meta`: see [`MODERN_UPSTREAM_VERSIONS`] for that.
+/// This is what `server/discover` reports and what an `UnsupportedProtocolVersion`
+/// error names, so a client learns every revision it could reach Toolport on -
+/// including the legacy ones, which it reaches by handshaking with `initialize`
+/// rather than by declaring a version per request.
+///
+/// Every entry below `MODERN_PROTOCOL_VERSION` is legacy. The gateway's own
+/// behaviour does not vary across them (revision differences are additive and ride
+/// through from the downstream server), and the `initialize` arm echoes whatever
+/// the client asks for, so all of them genuinely are served. Listing only two
+/// under-reported that (SOU-474 #7).
+const SUPPORTED_UPSTREAM_VERSIONS: [&str; 5] = [
+    MODERN_PROTOCOL_VERSION,
+    "2025-11-25",
+    PROTOCOL_VERSION,
+    "2025-03-26",
+    "2024-11-05",
+];
+
+/// Revisions that may be declared in a request's `_meta`, newest first.
+///
+/// Deliberately NOT the same set as [`SUPPORTED_UPSTREAM_VERSIONS`]. The
+/// `io.modelcontextprotocol/protocolVersion` key was introduced BY 2026-07-28, so
+/// a request declaring a revision that predates the key is self-contradictory: no
+/// published legacy revision can produce it. Accepting one and then serving it in
+/// legacy shape produced a malformed answer to `server/discover` - the modern-only
+/// `ttlMs`/`cacheScope` fields present, the required `resultType`/`serverInfo`
+/// absent - in place of a clean, self-correcting `-32022` (#511 review).
+///
+/// Legacy clients are unaffected either way: they never send this key at all.
+const MODERN_UPSTREAM_VERSIONS: [&str; 1] = [MODERN_PROTOCOL_VERSION];
+
+/// The protocol version a modern client declared on this request.
+///
+/// Presence of this key is what distinguishes a modern request from a legacy
+/// one: legacy clients negotiate once via `initialize` and never repeat it.
+fn upstream_declared_version(req: &Value) -> Option<&str> {
+    req.get("params")?
+        .get("_meta")?
+        .get("io.modelcontextprotocol/protocolVersion")?
+        .as_str()
+}
+
+/// `UnsupportedProtocolVersionError`, listing what Toolport does serve so the
+/// client can retry with a mutually supported version.
+fn unsupported_version_error(id: Value, requested: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": downstream::UNSUPPORTED_PROTOCOL_VERSION,
+            "message": "Unsupported protocol version",
+            "data": { "supported": SUPPORTED_UPSTREAM_VERSIONS, "requested": requested }
+        }
+    })
+}
+
+/// What Toolport advertises to upstream clients, shared by `initialize` (legacy)
+/// and `server/discover` (modern) so the two can never drift.
+fn gateway_capabilities() -> Value {
+    json!({
+        "tools": { "listChanged": true },
+        // Always-on proxy for resource subscriptions (SOU-394): advertise
+        // subscribe, fail closed when no owner can.
+        "resources": { "listChanged": true, "subscribe": true },
+        "prompts": { "listChanged": true },
+        "completions": {}
+    })
 }
 
 const MAX_SEARCH_QUERY_CHARS: usize = 512;
@@ -431,6 +571,128 @@ impl ResourceSubscriptionTable {
 /// own (SOU-398). Bound per downstream at connect time into a
 /// [`ResourceUpdatedSink`] that closes over the producer id.
 type ResourceUpdatedDispatch = Arc<dyn Fn(String, String) + Send + Sync>;
+
+/// Shared `(producer, notification)` dispatch for `notifications/progress`,
+/// bound per downstream server so delivery can verify who emitted it (SOU-444).
+type ProgressDispatch = Arc<dyn Fn(String, Value) + Send + Sync>;
+
+/// Process-wide progress dispatch, installed once at startup.
+///
+/// The resource-updated dispatch is threaded through `build_router` because
+/// subscriptions are rebuilt alongside the router. Progress needs none of that:
+/// it depends only on singletons that live for the whole process (stdout, the
+/// HTTP session table, and the in-flight token map), and every downstream
+/// connection wants the same one. A set-once global keeps it out of four
+/// intermediate signatures that have nothing else to do with it.
+static PROGRESS_DISPATCH: std::sync::OnceLock<ProgressDispatch> = std::sync::OnceLock::new();
+
+/// In-flight `progressToken` routes, shared by every downstream connection.
+static PROGRESS_ROUTES: std::sync::OnceLock<Arc<Mutex<ProgressRoutes>>> =
+    std::sync::OnceLock::new();
+
+/// Whether this process serves a stdio MCP client, i.e. whether writing a
+/// server-to-client message to stdout reaches anybody.
+///
+/// False in HTTP bridge mode. Defaults to true when unset so direct unit-test
+/// callers keep the stdio behaviour they were written against.
+///
+/// Tri-state (`0` unset, `1` no stdio client, `2` stdio client) rather than a
+/// `OnceLock`: a write-once cell cannot be set by a test without pinning the
+/// value for every other test in the binary, so no test ever set it and every
+/// one of them silently resolved to the stdio branch - including the ones whose
+/// whole point was an HTTP gateway (SOU-474 #9).
+static HAS_STDIO_CLIENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn set_has_stdio_client(present: bool) {
+    HAS_STDIO_CLIENT.store(if present { 2 } else { 1 }, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn has_stdio_client() -> bool {
+    // Unset resolves to true: see the note above.
+    HAS_STDIO_CLIENT.load(std::sync::atomic::Ordering::SeqCst) != 1
+}
+
+/// Serializes tests that override [`HAS_STDIO_CLIENT`], which is process-global.
+///
+/// Only tests that take this lock are serialized. libtest runs tests on parallel
+/// threads, so a test that reaches `progress_target()` WITHOUT overriding can
+/// still observe another test's value. That is latent rather than live today
+/// (only the override-taking tests touch that path), but a new test on the
+/// progress path needs this guard even when it does not care about the value.
+#[cfg(test)]
+static STDIO_CLIENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Sets [`HAS_STDIO_CLIENT`] for the duration of a test and restores it on drop,
+/// holding the lock above for as long as the override is in effect.
+#[cfg(test)]
+struct StdioClientOverride {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    previous: u8,
+}
+
+#[cfg(test)]
+impl StdioClientOverride {
+    fn set(present: bool) -> Self {
+        let guard = STDIO_CLIENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = HAS_STDIO_CLIENT.load(std::sync::atomic::Ordering::SeqCst);
+        set_has_stdio_client(present);
+        Self { _guard: guard, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for StdioClientOverride {
+    fn drop(&mut self) {
+        HAS_STDIO_CLIENT.store(self.previous, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Where progress for the request being served should be delivered, or `None`
+/// when there is no channel to deliver it on.
+///
+/// A legacy HTTP client has a session with an outbound queue. The stdio client
+/// is reached on stdout. A *modern* HTTP client has neither: 2026-07-28 removed
+/// protocol-level sessions, and its replacement channel (`subscriptions/listen`,
+/// SOU-448) does not exist yet. Falling back to stdout there would emit protocol
+/// traffic nobody is reading, so it returns `None` and the caller declines to ask
+/// the server for progress at all (SOU-447).
+fn progress_target() -> Option<String> {
+    progress_target_for(
+        ACTIVE_MCP_SESSION.with(|cell| cell.borrow().clone()),
+        has_stdio_client(),
+    )
+}
+
+/// The decision behind [`progress_target`], separated from the globals it reads
+/// so every combination is directly testable.
+fn progress_target_for(session: Option<String>, has_stdio_client: bool) -> Option<String> {
+    match session {
+        // A legacy HTTP session: deliver on its outbound queue.
+        Some(session) => Some(session),
+        // No session. In stdio mode that is the single stdio client; in HTTP mode
+        // it is a modern client, which has no server-to-client channel yet.
+        None => has_stdio_client.then(|| RESOURCE_SUB_STDIO.to_string()),
+    }
+}
+
+/// A copy of `meta` without `progressToken`, for when there is nowhere to deliver
+/// progress. Same principle as `WITHHELD_META_KEYS`: never ask a server for
+/// traffic that would land in a black hole.
+fn without_progress_token(meta: &Value) -> Value {
+    let mut out = meta.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.remove("progressToken");
+    }
+    out
+}
+
+/// The live token table, created on first use so tests can exercise routing
+/// without standing up a full gateway.
+fn progress_routes() -> &'static Arc<Mutex<ProgressRoutes>> {
+    PROGRESS_ROUTES.get_or_init(|| Arc::new(Mutex::new(ProgressRoutes::default())))
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum BoundedLine {
@@ -3044,6 +3306,10 @@ fn execute_call(
     confirm: Option<&ConfirmGuard>,
     name: &str,
     arguments: Value,
+    // The upstream client's `params._meta`, relayed to the downstream server
+    // minus per-hop keys (SOU-444). `None` for calls Toolport originates
+    // itself: a code-mode script step has no client request behind it.
+    client_meta: Option<&Value>,
     opts: CallOpts,
     // Live swappable router slot (SOU-321). After HITL approval we re-clone this so
     // quarantine applied via `Arc::make_mut` during the hold is visible before execute.
@@ -3301,8 +3567,23 @@ fn execute_call(
         profiler.mark_preflight();
     }
 
+    // Route this call's progress notifications back to the client that minted the
+    // token, for exactly as long as the call is in flight (SOU-444). Registered
+    // against the raw server id, matching what the per-server sink binds, so the
+    // spoof check compares like with like. Held in a named binding so the RAII
+    // guard lives across the call rather than dropping immediately.
+    //
+    // The producer must come from the router that will actually execute the call,
+    // not the request snapshot `server_id` was resolved from. A rebuild during a
+    // HITL hold can re-route the tool to a different server, and a route
+    // registered against the pre-hold producer fails the spoof check on every
+    // notification the new one sends - silently dropping the whole stream (SOU-474).
+    let exec_server_id = exec_router.route_of(name).map_or(server_id, |(srv, _)| srv);
+    let (_progress_route, relay_owned) = prepare_progress(client_meta, exec_server_id);
+    let client_meta = relay_owned.as_ref().or(client_meta);
+
     let started = Instant::now();
-    match exec_router.route_call_with_cancel(name, arguments, cancel.clone()) {
+    match exec_router.route_call_with_cancel(name, arguments, cancel.clone(), client_meta) {
         Ok(result) => {
             if let Some(profiler) = &mut call_profiler {
                 profiler.mark_downstream();
@@ -3573,6 +3854,9 @@ fn run_script_dispatch(
                     None,
                     name,
                     args,
+                    // A script step is Toolport's own call, not a relay of a client
+                    // request, so there is no client `_meta` to carry.
+                    None,
                     CallOpts {
                         confirmed: false,
                         shape: false,
@@ -3712,7 +3996,44 @@ fn handle_request_with_cancel(
         _ => return None,
     };
 
+    // Determine the client's era for this request before dispatching (SOU-446).
+    // A modern client declares its version in `_meta` on every request and never
+    // sends `initialize`; a legacy client does the opposite. Toolport serves both
+    // concurrently on the same endpoint.
+    let declared = upstream_declared_version(req).map(str::to_string);
+    if let Some(version) = declared.as_deref() {
+        if !MODERN_UPSTREAM_VERSIONS.contains(&version) {
+            return Some(unsupported_version_error(id, version));
+        }
+    }
+    // Only 2026-07-28+ gets modern result decoration. A client that names an
+    // older version in `_meta` is still served, just in its own era's shape.
+    let _era = UpstreamEraGuard::enter(
+        declared.filter(|v| v.as_str() == MODERN_PROTOCOL_VERSION),
+    );
+
     match method {
+        // Modern clients open here instead of handshaking. Servers MUST implement
+        // it, and it is also the stdio backward-compatibility probe a dual-era
+        // client uses to decide which era Toolport speaks.
+        "server/discover" => Some(success(
+            id,
+            json!({
+                "supportedVersions": SUPPORTED_UPSTREAM_VERSIONS,
+                "capabilities": gateway_capabilities(),
+                "instructions": "Toolport aggregates every configured MCP server behind one \
+                                 endpoint. In lazy discovery mode the catalog is reached through \
+                                 the toolport_search_tools / toolport_call_tool meta-tools rather \
+                                 than a full tools/list.",
+                // server/discover is a cacheable operation. The list results grow
+                // these fields in SOU-454.
+                "ttlMs": 300_000,
+                // Toolport's advertised capabilities depend on the requesting
+                // client's scope and profile, so a shared intermediary must not
+                // reuse one client's answer for another.
+                "cacheScope": "private"
+            }),
+        )),
         "initialize" => {
             let proto = req
                 .get("params")
@@ -3723,14 +4044,7 @@ fn handle_request_with_cancel(
                 id,
                 json!({
                     "protocolVersion": proto,
-                    "capabilities": {
-                        "tools": { "listChanged": true },
-                        // Always-on proxy for resource subscriptions (SOU-394):
-                        // advertise subscribe, fail closed when no owner can.
-                        "resources": { "listChanged": true, "subscribe": true },
-                        "prompts": { "listChanged": true },
-                        "completions": {}
-                    },
+                    "capabilities": gateway_capabilities(),
                     "serverInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") }
                 }),
             ))
@@ -4307,6 +4621,8 @@ fn handle_request_with_cancel(
                     Some(confirm),
                     name.as_str(),
                     arguments,
+                    // Relay the client's request metadata downstream (SOU-444).
+                    req.get("params").and_then(|p| p.get("_meta")),
                     CallOpts {
                         confirmed,
                         shape: true,
@@ -4371,7 +4687,13 @@ fn handle_request_with_cancel(
                     return Some(error(id, -32602, &format!("Toolport: no server owns resource '{uri}'")));
                 }
             }
-            match router.read_resource_with_cancel(uri, cancel.clone()) {
+            let client_meta = req.get("params").and_then(|p| p.get("_meta")).cloned();
+            let (_progress_route, relay_owned) = match router.resource_server(uri) {
+                Some(owner) => prepare_progress(client_meta.as_ref(), owner),
+                None => (None, None),
+            };
+            let client_meta = relay_owned.or(client_meta);
+            match router.read_resource_with_cancel(uri, cancel.clone(), client_meta.as_ref()) {
                 Ok(mut result) => {
                     // Content defense: a resource is as attacker-controllable as a tool
                     // result, so scan it for injection and label any flagged text as data.
@@ -4435,7 +4757,14 @@ fn handle_request_with_cancel(
                     return Some(error(id, -32602, &format!("Toolport: no route for prompt '{name}'")));
                 }
             }
-            match router.get_prompt_with_cancel(name, arguments, cancel.clone()) {
+            let client_meta = params.and_then(|p| p.get("_meta")).cloned();
+            let (_progress_route, relay_owned) = match router.prompt_server(name) {
+                Some(owner) => prepare_progress(client_meta.as_ref(), owner),
+                None => (None, None),
+            };
+            let client_meta = relay_owned.or(client_meta);
+            match router.get_prompt_with_cancel(name, arguments, cancel.clone(), client_meta.as_ref())
+            {
                 Ok(mut result) => {
                     // Content defense: a prompt's messages are attacker-controllable too;
                     // scan for injection and label any flagged text as data.
@@ -4498,6 +4827,13 @@ fn handle_request_with_cancel(
                 )),
             }
         }
+        // `ping` was removed in 2026-07-28, so a modern client gets method-not-found
+        // rather than a misleading success. Legacy clients keep it (SOU-446).
+        "ping" if serving_modern_client() => Some(error(
+            id,
+            -32601,
+            "ping is not part of 2026-07-28",
+        )),
         "ping" => Some(success(id, json!({}))),
         other => Some(error(id, -32601, &format!("Method not found: {other}"))),
     }
@@ -4708,6 +5044,11 @@ fn connect_one(
     let resource_updated = resource_updated
         .as_ref()
         .map(|d| bind_resource_updated_sink(d, &server.id));
+    // Same, for progress routing (SOU-444). Read from the process-wide dispatch
+    // rather than a threaded parameter: see PROGRESS_DISPATCH.
+    let progress = PROGRESS_DISPATCH
+        .get()
+        .map(|d| bind_progress_sink(d, &server.id));
     let result = if let Some(command) = &server.command {
         let mut env: Vec<(String, String)> = Vec::new();
         for e in &server.env {
@@ -4748,6 +5089,7 @@ fn connect_one(
         ) {
             Ok(mut t) => {
                 t.set_server_request_handler(server_handler);
+                t.set_progress_sink(progress);
                 DownstreamServer::connect(server.id.clone(), Box::new(t))
             }
             Err(e) => Err(e),
@@ -4757,6 +5099,7 @@ fn connect_one(
             server,
             Some(Arc::clone(&server_handler)),
             resource_updated,
+            progress,
         )
     } else {
         Err("no command or url".to_string())
@@ -4909,6 +5252,245 @@ fn deliver_resource_updated(
             }
         }
     }
+}
+
+/// One in-flight `progressToken` Toolport relayed on a client's behalf.
+struct ProgressRoute {
+    /// Which upstream client minted the token: a real `Mcp-Session-Id`, or
+    /// [`RESOURCE_SUB_STDIO`] for the single stdio client.
+    session: String,
+    /// The downstream server the token was relayed to. Recorded so a different
+    /// server cannot emit progress for it.
+    producer: String,
+    /// The token the CLIENT chose, restored on the way back out.
+    ///
+    /// `progressToken` is client-chosen and small integers are common, so two
+    /// clients can easily pick the same one. Keying the table on it directly let
+    /// a second registration clobber the first, and against the same server that
+    /// delivered one client's progress to another. Toolport therefore mints its
+    /// own unique token downstream and translates back here, the same way it
+    /// namespaces tool names.
+    client_token: Value,
+}
+
+/// Depth of the stdio progress hand-off queue. Bounded so a client that stops
+/// reading costs dropped notifications rather than a stalled drain thread.
+const PROGRESS_STDIO_QUEUE: usize = 256;
+
+/// Source of gateway-minted progress tokens. Process-wide and monotonic, so a
+/// token is never reused while an earlier call is still in flight.
+static PROGRESS_TOKEN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Live `progressToken` -> originating client map (SOU-444).
+///
+/// Progress is request-scoped, so an entry lives exactly as long as the
+/// downstream call that carries the token. Tracking the producer is what stops a
+/// hostile or buggy server emitting progress for a token it was never given -
+/// the same cross-server spoof lesson as SOU-398, applied to a notification that
+/// carries a client-chosen correlator instead of a URI.
+#[derive(Default)]
+struct ProgressRoutes {
+    active: HashMap<String, ProgressRoute>,
+}
+
+/// RAII registration: the entry is removed when the call finishes, however it
+/// finishes. A leaked token would let a server keep pushing progress into a
+/// client's stream long after its request completed.
+struct ProgressRegistration {
+    table: Arc<Mutex<ProgressRoutes>>,
+    key: String,
+}
+
+impl Drop for ProgressRegistration {
+    fn drop(&mut self) {
+        self.table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .remove(&self.key);
+    }
+}
+
+/// Register the `progressToken` in `client_meta` (if any) for the duration of one
+/// downstream call. Returns `None` when the client asked for no progress, which
+/// is the common case.
+/// Returns the registration guard and the gateway-minted token to send
+/// downstream in place of the client's.
+fn register_progress(
+    table: &Arc<Mutex<ProgressRoutes>>,
+    client_meta: Option<&Value>,
+    producer: &str,
+    session: &str,
+) -> Option<(ProgressRegistration, String)> {
+    let client_token = client_meta?.get("progressToken")?.clone();
+    // Mint our own token rather than reusing the client's. Two clients picking
+    // the same value (integers are common) would otherwise share a table entry.
+    let key = format!(
+        "tp-{}",
+        PROGRESS_TOKEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    table
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .active
+        .insert(
+            key.clone(),
+            ProgressRoute {
+                session: session.to_string(),
+                producer: producer.to_string(),
+                client_token,
+            },
+        );
+    Some((
+        ProgressRegistration {
+            table: Arc::clone(table),
+            key: key.clone(),
+        },
+        key,
+    ))
+}
+
+/// Register progress routing for one downstream call and produce the `_meta` to
+/// relay in place of the client's.
+///
+/// Three call sites need this (`tools/call`, `resources/read`, `prompts/get`),
+/// so the token substitution and the "no channel, do not ask" rule live here
+/// rather than being repeated.
+fn prepare_progress(
+    client_meta: Option<&Value>,
+    producer: &str,
+) -> (Option<ProgressRegistration>, Option<Value>) {
+    let Some(meta) = client_meta else {
+        return (None, None);
+    };
+    if meta.get("progressToken").is_none() {
+        return (None, None);
+    }
+    match progress_target() {
+        Some(session) => {
+            match register_progress(progress_routes(), client_meta, producer, &session) {
+                Some((registration, token)) => {
+                    let mut relayed = meta.clone();
+                    if let Some(obj) = relayed.as_object_mut() {
+                        obj.insert("progressToken".to_string(), json!(token));
+                    }
+                    (Some(registration), Some(relayed))
+                }
+                None => (None, None),
+            }
+        }
+        // Nowhere to deliver it, so do not ask the server to produce it.
+        None => (None, Some(without_progress_token(meta))),
+    }
+}
+
+/// Deliver one `notifications/progress` to the client that minted its token,
+/// dropping anything unroutable or spoofed (SOU-444).
+fn deliver_progress(
+    stdio: &std::sync::mpsc::SyncSender<Value>,
+    mcp_sessions: &Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    routes: &Arc<Mutex<ProgressRoutes>>,
+    producer: &str,
+    note: &Value,
+) {
+    let Some(token) = note.get("params").and_then(|p| p.get("progressToken")) else {
+        return;
+    };
+    // The token on the wire is the one Toolport minted, not the client's.
+    let Some(key) = token.as_str().map(str::to_string) else {
+        return;
+    };
+    let (session, client_token) = {
+        let table = routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match table.active.get(&key) {
+            Some(route) if route.producer == producer => {
+                (route.session.clone(), route.client_token.clone())
+            }
+            Some(route) => {
+                eprintln!(
+                    "toolport: progress for token from '{producer}' dropped \
+                     (token belongs to '{}')",
+                    route.producer
+                );
+                return;
+            }
+            // No in-flight request owns this token: a late notification for a
+            // finished call, or one Toolport never relayed. Either way, drop it.
+            None => return,
+        }
+    };
+    // Hand the client back ITS token; ours is an internal correlator.
+    let mut note = note.clone();
+    if let Some(params) = note.get_mut("params").and_then(Value::as_object_mut) {
+        params.insert("progressToken".to_string(), client_token);
+    }
+    let note = &note;
+    if session == RESOURCE_SUB_STDIO {
+        // Hand off rather than write here. This runs on the downstream drain
+        // thread, BEFORE that thread forwards response lines to the request loop.
+        // A blocking flush to a client that stopped reading would stall the drain,
+        // so the in-flight call never completes while still holding the per-server
+        // slot mutex, wedging that server for every client. Bounded and dropping
+        // when full, exactly as the HTTP session queue already behaves (SOU-474).
+        if stdio.try_send(note.clone()).is_err() {
+            eprintln!("toolport: stdio progress queue full or closed; progress dropped");
+        }
+        return;
+    }
+    let Ok(json) = serde_json::to_string(note) else {
+        return;
+    };
+    let sessions = mcp_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(target) = sessions.get(&session) else {
+        return;
+    };
+    if target.is_expired() || target.closed.load(Ordering::SeqCst) {
+        return;
+    }
+    if !target.push_message(json, None) {
+        eprintln!("toolport: MCP session outbound queue full; progress dropped");
+    }
+}
+
+/// Build the shared dispatch that routes progress notifications to the client
+/// that minted the token. Bound per downstream via [`bind_progress_sink`].
+fn make_progress_sink(
+    stdout: Arc<Mutex<std::io::Stdout>>,
+    mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    routes: Arc<Mutex<ProgressRoutes>>,
+) -> ProgressDispatch {
+    // One writer thread owns the blocking write to the stdio client, fed by a
+    // bounded queue. Delivery runs on the downstream drain thread, which must
+    // never block (see `deliver_progress`).
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Value>(PROGRESS_STDIO_QUEUE);
+    std::thread::spawn(move || {
+        for note in rx {
+            let mut out = stdout
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if write_json_line(&mut *out, &note).is_err() {
+                // The stdio client is gone; nothing further will be readable.
+                break;
+            }
+        }
+    });
+    Arc::new(move |producer: String, note: Value| {
+        deliver_progress(&tx, &mcp_sessions, &routes, &producer, &note);
+    })
+}
+
+/// Bind a shared progress dispatch to one producer server id, so the
+/// transport-level sink only needs the notification (SOU-444).
+fn bind_progress_sink(dispatch: &ProgressDispatch, producer: &str) -> downstream::ProgressSink {
+    let dispatch = Arc::clone(dispatch);
+    let producer = producer.to_string();
+    Arc::new(move |note: Value| {
+        dispatch(producer.clone(), note);
+    })
 }
 
 /// Build the shared dispatch that fans resource-updated notifications to
@@ -6868,7 +7450,23 @@ fn process_request(
         .clone();
     // Resource subscriptions need the live GatewayState (session table + sink)
     // and the same ownership/scope path as resources/read (SOU-394).
+    //
+    // They return before `handle_request_with_cancel`, which is where the version
+    // check and the era guard live, so both have to be applied here or these two
+    // methods would disagree with every other method about what a valid request
+    // is: an unsupported version would be served, and a modern client's result
+    // would come back undecorated (SOU-474).
     if method == "resources/subscribe" || method == "resources/unsubscribe" {
+        let id = req.get("id").cloned().filter(|id| !id.is_null());
+        let declared = upstream_declared_version(req).map(str::to_string);
+        if let (Some(id), Some(version)) = (id, declared.as_deref()) {
+            if !MODERN_UPSTREAM_VERSIONS.contains(&version) {
+                return Some(unsupported_version_error(id, version));
+            }
+        }
+        let _era = UpstreamEraGuard::enter(
+            declared.filter(|v| v.as_str() == MODERN_PROTOCOL_VERSION),
+        );
         return handle_resource_subscription(state, &router, req, allowed, method);
     }
     handle_request_with_cancel(
@@ -7412,13 +8010,24 @@ fn mcp_sse_body(json: &str) -> String {
     format!("event: message\ndata: {json}\n\n")
 }
 
-fn mcp_rpc_response(status: u16, json_body: String, session_id: &str, prefer_sse: bool) -> HttpOut {
-    if prefer_sse {
+/// `session_id` is `None` for a modern (2026-07-28) client: the response must
+/// then carry no `Mcp-Session-Id`, since the header no longer exists and echoing
+/// one would invite the client to start replaying it (SOU-447).
+fn mcp_rpc_response(
+    status: u16,
+    json_body: String,
+    session_id: Option<&str>,
+    prefer_sse: bool,
+) -> HttpOut {
+    let out = if prefer_sse {
         HttpOut::new(status, "text/event-stream", mcp_sse_body(&json_body))
-            .with_header("Mcp-Session-Id", session_id)
             .with_header("Cache-Control", "no-cache")
     } else {
-        HttpOut::new(status, "application/json", json_body).with_header("Mcp-Session-Id", session_id)
+        HttpOut::new(status, "application/json", json_body)
+    };
+    match session_id {
+        Some(sid) => out.with_header("Mcp-Session-Id", sid),
+        None => out,
     }
 }
 
@@ -7438,6 +8047,13 @@ fn handle_mcp_http(
 ) -> HttpOut {
     let prefer_sse = mcp_prefers_sse(accept);
     match method {
+        // GET (listen stream) and DELETE (session teardown) are legacy-only: both
+        // were removed in 2026-07-28. A modern-ONLY server answers 405, but
+        // Toolport is dual-era, and neither verb carries a body, so there is no
+        // `_meta` to tell the eras apart. They stay available and keep requiring a
+        // live session, which is exactly the gate that turns a modern client's
+        // request away. They become 405 when legacy support is eventually dropped
+        // (SOU-447).
         "GET" => {
             if !mcp_prefers_sse(accept) {
                 return HttpOut::json_err(406, "Accept must include text/event-stream");
@@ -7491,49 +8107,71 @@ fn handle_mcp_http(
                 .unwrap_or("");
             let has_id = req_obj.contains_key("id");
             let is_initialize = method_name == "initialize";
-
-            // Session rules: initialize may omit (and gets a new id); everything
-            // else that carries a method must present a live session id.
-            let session_id = if is_initialize {
+            // 2026-07-28 removed protocol-level sessions (SOU-447). A modern
+            // request declares its own version, so it is served statelessly.
+            //
+            // Gate on the version VALUE, not merely on a version being present, so
+            // this matches the modern-era test in `handle_request_with_cancel`.
+            // Keying on presence alone would let a client that names a legacy
+            // version in `_meta` skip the session requirement here while still
+            // being served legacy-shaped results there.
+            // Toolport is dual-era on stdio and legacy-only over Streamable HTTP.
+            //
+            // A session-less modern path was implemented here and then withdrawn,
+            // because serving modern clients over HTTP needs more than skipping the
+            // session: `Mcp-Method`/`Mcp-Name` on outbound requests, inbound header
+            // validation, `400`/`404` statuses for protocol errors, and above all a
+            // server-to-client channel (`subscriptions/listen`) to replace the one
+            // sessions provided. Without that last piece, a session-less client
+            // collapsed into the shared `RESOURCE_SUB_STDIO` subscription bucket,
+            // where one client could tear down another's subscription.
+            //
+            // Requiring a session for every HTTP request is therefore the honest
+            // state: a dual-era client gets a `400` here with no recognized modern
+            // error, which the spec defines as the signal to fall back to
+            // `initialize`. Tracked for SOU-447/448/450.
+            let session_id: Option<String> = if is_initialize {
                 if let Some(existing) = session_hdr.map(str::trim).filter(|s| !s.is_empty()) {
                     // Client re-sent a session on initialize: accept if still live,
                     // otherwise mint a fresh one (spec: start over without the old id).
                     match mcp_require_session(state, Some(existing), session_owner) {
-                        Ok((sid, _)) => sid,
+                        Ok((sid, _)) => Some(sid),
                         Err(_) => match mint_mcp_session(state, session_owner) {
-                            Ok(sid) => sid,
+                            Ok(sid) => Some(sid),
                             Err(e) => return e,
                         },
                     }
                 } else {
                     match mint_mcp_session(state, session_owner) {
-                        Ok(sid) => sid,
+                        Ok(sid) => Some(sid),
                         Err(e) => return e,
                     }
                 }
             } else {
                 match mcp_require_session(state, session_hdr, session_owner) {
-                    Ok((sid, _)) => sid,
+                    Ok((sid, _)) => Some(sid),
                     Err(e) => return e,
                 }
             };
 
-            if is_initialize {
-                if let Ok(sessions) = state.mcp_sessions.lock() {
-                    if let Some(sess) = sessions.get(&session_id) {
-                        if let Ok(mut caps) = sess.client_upstream.lock() {
-                            capture_client_upstream_from_init(&mut caps, req.get("params"));
+            if let Some(session_id) = session_id.as_deref() {
+                if is_initialize {
+                    if let Ok(sessions) = state.mcp_sessions.lock() {
+                        if let Some(sess) = sessions.get(session_id) {
+                            if let Ok(mut caps) = sess.client_upstream.lock() {
+                                capture_client_upstream_from_init(&mut caps, req.get("params"));
+                            }
                         }
                     }
                 }
-            }
 
-            if is_jsonrpc_response(&req) {
-                if let Ok(sessions) = state.mcp_sessions.lock() {
-                    if let Some(sess) = sessions.get(&session_id) {
-                        if sess.try_deliver_upstream(&req) {
-                            return HttpOut::new(202, "text/plain", String::new())
-                                .with_header("Mcp-Session-Id", &session_id);
+                if is_jsonrpc_response(&req) {
+                    if let Ok(sessions) = state.mcp_sessions.lock() {
+                        if let Some(sess) = sessions.get(session_id) {
+                            if sess.try_deliver_upstream(&req) {
+                                return HttpOut::new(202, "text/plain", String::new())
+                                    .with_header("Mcp-Session-Id", session_id);
+                            }
                         }
                     }
                 }
@@ -7541,15 +8179,18 @@ fn handle_mcp_http(
 
             // Notifications / JSON-RPC responses: 202 with empty body.
             if !has_id {
-                ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = Some(session_id.clone()));
+                ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = session_id.clone());
                 let _ = process_request(state, &req, guard, confirm, allowed, None, client);
                 ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = None);
-                return HttpOut::new(202, "text/plain", String::new())
-                    .with_header("Mcp-Session-Id", &session_id);
+                let out = HttpOut::new(202, "text/plain", String::new());
+                return match session_id.as_deref() {
+                    Some(sid) => out.with_header("Mcp-Session-Id", sid),
+                    None => out,
+                };
             }
 
             let resp = ACTIVE_MCP_SESSION.with(|cell| {
-                *cell.borrow_mut() = Some(session_id.clone());
+                *cell.borrow_mut() = session_id.clone();
                 let out = process_request(state, &req, guard, confirm, allowed, None, client);
                 *cell.borrow_mut() = None;
                 out
@@ -7564,7 +8205,7 @@ fn handle_mcp_http(
                         })
                         .to_string()
                     });
-                    mcp_rpc_response(200, body, &session_id, prefer_sse)
+                    mcp_rpc_response(200, body, session_id.as_deref(), prefer_sse)
                 }
                 None => {
                     let body = json!({
@@ -7573,7 +8214,7 @@ fn handle_mcp_http(
                         "error": { "code": -32603, "message": "no response" }
                     })
                     .to_string();
-                    mcp_rpc_response(500, body, &session_id, prefer_sse)
+                    mcp_rpc_response(500, body, session_id.as_deref(), prefer_sse)
                 }
             }
         }
@@ -8894,6 +9535,17 @@ fn main() {
         Arc::clone(&mcp_sessions),
         Arc::clone(&resource_subs),
     ));
+    // Progress routing (SOU-444). Installed before any downstream connects, so
+    // every transport binds a sink; `connect_one` reads it from here rather than
+    // taking it as a parameter.
+    let _ = PROGRESS_DISPATCH.set(make_progress_sink(
+        Arc::clone(&stdout),
+        Arc::clone(&mcp_sessions),
+        Arc::clone(progress_routes()),
+    ));
+    // In HTTP bridge mode nothing reads this process's stdout, so it is not a
+    // delivery channel for server-to-client messages (SOU-447).
+    set_has_stdio_client(!http_mode);
     // Single-flight for every router build/swap (startup, watcher self-heal, and
     // ${ROOT} rebuilds). Created up front so the startup build can share it.
     let rebuild_lock = Arc::new(Mutex::new(()));
@@ -11627,18 +12279,120 @@ mod tests {
         assert_eq!(after.status, 404);
     }
 
+    /// A modern (2026-07-28) JSON-RPC body: version in `_meta`, no handshake.
+    fn modern_http_body(id: i64, method: &str, params: Value) -> String {
+        let mut p = json!({
+            "_meta": { "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION }
+        });
+        if let (Some(dst), Some(src)) = (p.as_object_mut(), params.as_object()) {
+            for (k, v) in src {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": p }).to_string()
+    }
+
+    fn test_caller(identity: &str, scope: Option<&[&str]>) -> HttpCaller {
+        HttpCaller {
+            audit_label: Some(identity.to_string()),
+            session_owner: McpSessionOwner {
+                identity: identity.to_string(),
+                scope: scope.map(|s| s.iter().map(|v| v.to_string()).collect()),
+            },
+        }
+    }
+
+    #[test]
+    fn legacy_http_client_still_requires_a_session() {
+        // The other half of dual-era: nothing about the legacy path changed.
+        let state = http_state(true);
+        let caller = test_caller("client:cursor", None);
+        let no_session = handle_http(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }).to_string(),
+            None,
+            None,
+            None,
+            Some(&caller),
+        );
+        assert_eq!(
+            no_session.status, 400,
+            "a legacy request without a session is still rejected, body={}",
+            no_session.body
+        );
+
+        // ...and initialize still mints one.
+        let init = handle_http(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": "2025-06-18", "capabilities": {} }
+            })
+            .to_string(),
+            None,
+            None,
+            None,
+            Some(&caller),
+        );
+        assert_eq!(init.status, 200);
+        assert!(!mcp_session_of(&init).is_empty(), "legacy initialize still mints a session");
+    }
+
+    #[test]
+    fn modern_http_client_is_not_served_and_gets_a_fallback_signal() {
+        // Toolport is dual-era on stdio and legacy-only over Streamable HTTP.
+        // Pins that boundary honestly rather than leaving it implicit: a modern
+        // client gets a 400 whose body is NOT a recognized modern error, which
+        // the spec defines as the signal for a dual-era client to fall back to
+        // `initialize`. Serving these properly is SOU-447/448/450.
+        let state = http_state(true);
+        let caller = test_caller("client:cursor", None);
+        let out = handle_http(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &modern_http_body(1, "tools/list", json!({})),
+            None,
+            None,
+            None,
+            Some(&caller),
+        );
+        assert_eq!(out.status, 400, "body={}", out.body);
+        // Asserting the body, not just the status: a bare status check would
+        // also pass on an unrelated 400, which is how one of these tests passed
+        // for the wrong reason before.
+        assert!(
+            out.body.contains("Mcp-Session-Id"),
+            "expected the session requirement to be what refused it, got {}",
+            out.body
+        );
+        // Crucially NOT a modern error code: -32020/-32021/-32022 would tell a
+        // dual-era client we are modern and stop it falling back.
+        for code in ["-32020", "-32021", "-32022"] {
+            assert!(
+                !out.body.contains(code),
+                "a legacy-only HTTP endpoint must not answer with {code}, got {}",
+                out.body
+            );
+        }
+    }
+
     #[test]
     fn mcp_http_session_is_bound_to_client_identity_and_scope() {
         let state = http_state(true);
         let search = SearchGuard::default();
         let confirm = ConfirmGuard::new();
-        let caller = |identity: &str, scope: &[&str]| HttpCaller {
-            audit_label: Some(identity.to_string()),
-            session_owner: McpSessionOwner {
-                identity: identity.to_string(),
-                scope: Some(scope.iter().map(|value| value.to_string()).collect()),
-            },
-        };
+        let caller = |identity: &str, scope: &[&str]| test_caller(identity, Some(scope));
         let owner = caller("client:cursor", &["github"]);
         let intruder = caller("client:webui", &["github"]);
         let rescoped_owner = caller("client:cursor", &["github", "stripe"]);
@@ -12478,6 +13232,628 @@ mod tests {
             "subscribed session missing update: {chunk1}"
         );
         assert!(chunk2.is_none(), "unsubscribed session must not receive update");
+    }
+
+    /// A stdio progress channel plus its receiver, so a test can assert what the
+    /// writer thread would have written.
+    fn stdio_progress_channel() -> (
+        std::sync::mpsc::SyncSender<Value>,
+        std::sync::mpsc::Receiver<Value>,
+    ) {
+        std::sync::mpsc::sync_channel(PROGRESS_STDIO_QUEUE)
+    }
+
+    fn progress_note(token: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": { "progressToken": token, "progress": 1, "total": 4 }
+        })
+    }
+
+    fn drain_session(state: &GatewayState, sid: &str) -> Vec<String> {
+        let sessions = state.mcp_sessions.lock().unwrap();
+        let sess = sessions.get(sid).unwrap();
+        let mut out = sess.outbound.lock().unwrap();
+        out.drain(..).map(|m| m.json).collect()
+    }
+
+    /// Dispatch one request with the default test rig.
+    fn dispatch(req: &Value) -> Value {
+        let reg = Registry::default();
+        let router = routed_router("s", "tool");
+        handle_request(
+            req,
+            &reg,
+            &router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .expect("a request with an id gets a response")
+    }
+
+    /// Build a modern (2026-07-28) request: version declared in `_meta`, no
+    /// handshake anywhere.
+    fn modern_req(id: i64, method: &str, extra: Value) -> Value {
+        let mut params = json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientInfo": { "name": "TestClient", "version": "1.0" },
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        });
+        if let (Some(p), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra {
+                p.insert(k.clone(), v.clone());
+            }
+        }
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+    }
+
+    #[test]
+    fn a_pre_modern_revision_in_meta_is_refused_but_told_what_to_use() {
+        // The `_meta` protocolVersion key was introduced BY 2026-07-28, so naming
+        // an older revision in it is self-contradictory - no published legacy
+        // revision can produce that request. Accepting it and serving in legacy
+        // shape made `server/discover` answer with the modern-only ttlMs and
+        // cacheScope but WITHOUT the required resultType: a malformed hybrid,
+        // where a refusal is both correct and self-correcting (#511 review).
+        for version in ["2025-11-25", "2025-03-26", "2024-11-05"] {
+            for method in ["tools/list", "server/discover"] {
+                let resp = dispatch(&json!({
+                    "jsonrpc": "2.0", "id": 1, "method": method,
+                    "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": version } }
+                }));
+                assert_eq!(
+                    resp["error"]["code"], downstream::UNSUPPORTED_PROTOCOL_VERSION,
+                    "{version} predates the _meta version key, so {method} must refuse it: {resp}"
+                );
+                // The refusal has to be actionable: it names every revision the
+                // client could actually reach Toolport on, including this one via
+                // `initialize`. Refusing without saying that is a dead end.
+                let supported = resp["error"]["data"]["supported"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("the error must name what IS served: {resp}"));
+                assert!(
+                    supported.iter().any(|v| v == version),
+                    "{version} IS served via initialize, so the refusal must say so: {resp}"
+                );
+                assert!(
+                    supported.iter().any(|v| v == MODERN_PROTOCOL_VERSION),
+                    "the refusal must name the revision this key belongs to: {resp}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_modern_declaration_is_still_served_and_decorated() {
+        // The other side of the refusal above: the one revision the `_meta` key
+        // belongs to is served, and served as modern.
+        let resp = dispatch(&modern_req(1, "tools/list", json!({})));
+        assert!(resp.get("error").is_none(), "2026-07-28 must be served: {resp}");
+        assert_eq!(resp["result"]["resultType"], "complete");
+        // And a legacy client, which sends no `_meta` at all, is untouched.
+        let legacy = dispatch(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+        }));
+        assert!(legacy.get("error").is_none(), "a legacy client is unaffected: {legacy}");
+        assert!(
+            legacy["result"].get("resultType").is_none(),
+            "legacy results carry no modern decoration: {legacy}"
+        );
+    }
+
+    #[test]
+    fn advertised_versions_cover_every_revision_initialize_accepts() {
+        // `server/discover` is how a modern client learns what to ask for. If it
+        // under-reports, a client picks a version Toolport serves but did not
+        // advertise - or worse, concludes it cannot talk to us at all.
+        //
+        // The revisions are written out rather than read from
+        // SUPPORTED_UPSTREAM_VERSIONS on purpose: iterating the constant under
+        // test only ever proves it agrees with itself, and stayed green against
+        // the two-entry list this test exists to catch.
+        const PUBLISHED_MCP_REVISIONS: [&str; 5] = [
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+            "2026-07-28",
+        ];
+        let advertised = dispatch(&modern_req(1, "server/discover", json!({})))["result"]
+            ["supportedVersions"]
+            .clone();
+
+        for version in PUBLISHED_MCP_REVISIONS {
+            assert!(
+                advertised.as_array().is_some_and(|a| a.iter().any(|v| v == version)),
+                "initialize serves {version} but server/discover does not advertise it: {advertised}"
+            );
+        }
+
+        // Deliberately NOT asserted per-revision above: `initialize` echoes any
+        // string, so "it echoed what I sent" is a tautology that holds for
+        // "garbage" too and proves nothing about which revisions are real. What
+        // the echo does establish is the shape of the claim - that no published
+        // revision is turned away - so assert it once, against a value that is
+        // NOT a published revision, to show the echo really is unconditional and
+        // this list is therefore a deliberate choice rather than a filter.
+        let nonsense = dispatch(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "1999-01-01" }
+        }));
+        assert_eq!(
+            nonsense["result"]["protocolVersion"], "1999-01-01",
+            "initialize validates nothing, so the advertised list is curated, not derived"
+        );
+        assert!(
+            !advertised.as_array().is_some_and(|a| a.iter().any(|v| v == "1999-01-01")),
+            "...and the curated list must not advertise something that isn't a real revision"
+        );
+    }
+
+    #[test]
+    fn server_discover_answers_modern_clients() {
+        // Servers MUST implement server/discover. It is also the stdio probe a
+        // dual-era client uses to decide which era Toolport speaks (SOU-446).
+        let resp = dispatch(&modern_req(1, "server/discover", json!({})));
+        let result = &resp["result"];
+
+        assert_eq!(result["supportedVersions"][0], MODERN_PROTOCOL_VERSION);
+        assert!(result["capabilities"]["tools"].is_object());
+        assert_eq!(result["capabilities"]["resources"]["subscribe"], true);
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "toolport-gateway"
+        );
+        // Scope- and profile-dependent, so a shared intermediary must not reuse
+        // one client's answer for another.
+        assert_eq!(result["cacheScope"], "private");
+    }
+
+    #[test]
+    fn modern_client_is_served_without_any_handshake() {
+        // The whole point of the stateless revision: no initialize, no session,
+        // just a request that declares its own version.
+        let resp = dispatch(&modern_req(2, "tools/list", json!({})));
+        assert!(resp["result"]["tools"].is_array());
+        assert_eq!(resp["result"]["resultType"], "complete");
+        assert_eq!(
+            resp["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "toolport-gateway"
+        );
+    }
+
+    #[test]
+    fn legacy_clients_see_no_modern_fields() {
+        // The no-regression guarantee for every client in the wild today: a
+        // request without `_meta` gets a byte-identical response to before.
+        let req = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {} });
+        let resp = dispatch(&req);
+        assert!(resp["result"]["tools"].is_array());
+        assert!(
+            resp["result"].get("resultType").is_none(),
+            "legacy results carry no resultType, got {}",
+            resp["result"]
+        );
+        assert!(
+            resp["result"].get("_meta").is_none(),
+            "legacy results carry no _meta, got {}",
+            resp["result"]
+        );
+
+        // ...and initialize still works, unchanged.
+        let init = dispatch(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "initialize",
+            "params": { "protocolVersion": PROTOCOL_VERSION, "capabilities": {} }
+        }));
+        assert_eq!(init["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(init["result"]["serverInfo"]["name"], "toolport-gateway");
+        assert!(init["result"].get("resultType").is_none());
+    }
+
+    #[test]
+    fn unknown_protocol_version_is_rejected_with_what_we_support() {
+        // The client needs the `supported` list to pick a mutually supported
+        // version and retry, so an opaque failure would be a dead end.
+        let req = json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/list",
+            "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": "1900-01-01" } }
+        });
+        let resp = dispatch(&req);
+        assert_eq!(resp["error"]["code"], downstream::UNSUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(resp["error"]["data"]["requested"], "1900-01-01");
+        assert_eq!(
+            resp["error"]["data"]["supported"][0],
+            MODERN_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn ping_is_legacy_only() {
+        // Removed in 2026-07-28. A modern client gets method-not-found rather
+        // than a misleading success; a legacy client is unaffected.
+        let modern = dispatch(&modern_req(8, "ping", json!({})));
+        assert_eq!(modern["error"]["code"], -32601);
+
+        let legacy = dispatch(&json!({
+            "jsonrpc": "2.0", "id": 9, "method": "ping", "params": {}
+        }));
+        assert!(legacy["result"].is_object(), "legacy ping still succeeds");
+        assert!(legacy.get("error").is_none());
+    }
+
+    #[test]
+    fn upstream_era_does_not_leak_between_requests() {
+        // Sequential case. Weak on its own: `UpstreamEraGuard::enter` replaces the
+        // thread-local unconditionally, so the second dispatch sets it correctly
+        // whether or not Drop ever restores anything. Kept for the plain
+        // regression, with the real check in the nested test below.
+        let modern = dispatch(&modern_req(6, "tools/list", json!({})));
+        assert_eq!(modern["result"]["resultType"], "complete");
+
+        let legacy = dispatch(&json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}
+        }));
+        assert!(
+            legacy["result"].get("resultType").is_none(),
+            "era leaked into the following legacy request"
+        );
+    }
+
+    #[test]
+    fn nested_modern_dispatch_does_not_decorate_the_outer_legacy_response() {
+        // THE test for the RAII guard, and the one that was missing: gutting
+        // `impl Drop for UpstreamEraGuard` left all 190 gateway tests green,
+        // because nothing exercised nesting.
+        //
+        // Code mode re-enters dispatch while an outer request is being served, so
+        // an inner modern request must restore the outer era on the way out
+        // rather than leaving it set.
+        let outer_is_modern = ACTIVE_UPSTREAM_VERSION.with(|cell| cell.borrow().is_some());
+        assert!(!outer_is_modern, "test starts with no era installed");
+
+        // Simulate the outer legacy request holding the thread-local, then a
+        // nested modern dispatch inside it.
+        let _outer = UpstreamEraGuard::enter(None);
+        let inner = dispatch(&modern_req(8, "tools/list", json!({})));
+        assert_eq!(inner["result"]["resultType"], "complete", "inner is modern");
+
+        // Back in the outer request: if Drop failed to restore, this reads as
+        // modern and the outer response would be wrongly decorated.
+        assert!(
+            !serving_modern_client(),
+            "the nested modern dispatch leaked its era into the outer request"
+        );
+        let outer = dispatch(&json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/list", "params": {}
+        }));
+        assert!(
+            outer["result"].get("resultType").is_none(),
+            "outer legacy response was decorated after a nested modern dispatch"
+        );
+    }
+
+    #[test]
+    fn prepare_progress_withholds_the_token_when_nothing_can_deliver_it() {
+        // The shipping function, not its pure helpers. `progress_target_for` was
+        // unit-tested in every combination while `prepare_progress` - which reads
+        // the real globals - had no coverage, so a global that silently resolved
+        // to the stdio branch in every test went unnoticed (SOU-474 #9).
+        let meta = json!({ "progressToken": "tok-1", "traceparent": "keep-me" });
+
+        // A modern HTTP client: no session, no stdio. Nothing can carry progress,
+        // so the server must not be asked to produce it.
+        let _no_stdio = StdioClientOverride::set(false);
+        // Thread-local, and libtest may reuse this thread for another test, so
+        // assert the default rather than assuming it and leaving it changed.
+        ACTIVE_MCP_SESSION.with(|cell| assert!(cell.borrow().is_none(), "no session on this thread"));
+        assert_eq!(progress_target(), None, "no session and no stdio: nowhere to deliver");
+
+        let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
+        assert!(registration.is_none(), "nothing to register against");
+        let relayed = relayed.expect("_meta is still relayed, minus the token");
+        assert!(
+            relayed.get("progressToken").is_none(),
+            "progressToken must be stripped when it cannot be delivered: {relayed}"
+        );
+        assert_eq!(
+            relayed.get("traceparent").and_then(|v| v.as_str()),
+            Some("keep-me"),
+            "unrelated _meta keys must survive: {relayed}"
+        );
+    }
+
+    #[test]
+    fn prepare_progress_registers_a_route_for_a_stdio_client() {
+        // The other side of the same decision: a stdio client IS a delivery
+        // channel, so the token is registered and rewritten rather than dropped.
+        let _stdio = StdioClientOverride::set(true);
+        // Thread-local, and libtest may reuse this thread for another test, so
+        // assert the default rather than assuming it and leaving it changed.
+        ACTIVE_MCP_SESSION.with(|cell| assert!(cell.borrow().is_none(), "no session on this thread"));
+        assert_eq!(
+            progress_target().as_deref(),
+            Some(RESOURCE_SUB_STDIO),
+            "a stdio client is reached on stdout"
+        );
+
+        let meta = json!({ "progressToken": 7 });
+        let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
+        assert!(registration.is_some(), "a deliverable token gets a live route");
+        let relayed = relayed.expect("relayed _meta");
+        let token = relayed.get("progressToken").expect("token is rewritten, not dropped");
+        assert_ne!(token, &json!(7), "the downstream token must be Toolport's own");
+    }
+
+    #[test]
+    fn progress_reaches_only_the_client_that_minted_the_token() {
+        // SOU-444: progress is request-scoped, so it must land on the one client
+        // whose request carried the token, never fan out like a subscription.
+        let state = http_state(false);
+        let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
+        let s2 = mint_mcp_session(&state, None).ok().expect("mint s2");
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio_tx, _stdio_rx) = stdio_progress_channel();
+
+        let (_registration, wire_token) =
+            register_progress(&routes, Some(&json!({ "progressToken": "tok-1" })), "alpha", &s1)
+                .expect("a token should register a route");
+        assert_ne!(
+            wire_token, "tok-1",
+            "the downstream token must be Toolport's, not the client's"
+        );
+
+        deliver_progress(
+            &stdio_tx,
+            &state.mcp_sessions,
+            &routes,
+            "alpha",
+            &progress_note(&wire_token),
+        );
+
+        let got = drain_session(&state, &s1);
+        assert_eq!(got.len(), 1, "the minting client gets the progress");
+        // The client is handed back ITS token; ours is an internal correlator.
+        assert!(got[0].contains("tok-1"), "got {}", got[0]);
+        assert!(
+            !got[0].contains(&wire_token),
+            "the gateway's internal token must not leak to the client, got {}",
+            got[0]
+        );
+        assert!(
+            drain_session(&state, &s2).is_empty(),
+            "another client must never see it"
+        );
+    }
+
+    #[test]
+    fn identical_client_tokens_from_two_clients_do_not_collide() {
+        // `progressToken` is client-chosen and small integers are common, so two
+        // clients picking the same value is likely. Keying the route table on it
+        // directly meant the second registration clobbered the first, and against
+        // the same server that delivered one client's progress to the other.
+        // Toolport mints its own token per call, so the two stay separate.
+        let state = http_state(false);
+        let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
+        let s2 = mint_mcp_session(&state, None).ok().expect("mint s2");
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio_tx, _stdio_rx) = stdio_progress_channel();
+
+        // Same client token, same downstream server, two different clients.
+        let (_r1, wire1) =
+            register_progress(&routes, Some(&json!({ "progressToken": 1 })), "alpha", &s1).unwrap();
+        let (_r2, wire2) =
+            register_progress(&routes, Some(&json!({ "progressToken": 1 })), "alpha", &s2).unwrap();
+        assert_ne!(wire1, wire2, "each call gets its own downstream token");
+        assert_eq!(
+            routes.lock().unwrap().active.len(),
+            2,
+            "the second registration must not clobber the first"
+        );
+
+        let note = progress_note(&wire1);
+        deliver_progress(&stdio_tx, &state.mcp_sessions, &routes, "alpha", &note);
+
+        let first = drain_session(&state, &s1);
+        assert_eq!(first.len(), 1, "progress goes to the client that asked");
+        assert!(first[0].contains("\"progressToken\":1"), "got {}", first[0]);
+        assert!(
+            drain_session(&state, &s2).is_empty(),
+            "the other client shares a token value but must see nothing"
+        );
+    }
+
+    #[test]
+    fn progress_drops_cross_server_spoof_and_stale_tokens() {
+        // Same lesson as SOU-398, on a notification whose correlator is chosen by
+        // the client: a server must not be able to push progress for a token it
+        // was never given, and a finished call must stop accepting progress.
+        let state = http_state(false);
+        let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio_tx, _stdio_rx) = stdio_progress_channel();
+
+        let (registration, wire_token) =
+            register_progress(&routes, Some(&json!({ "progressToken": "tok-1" })), "alpha", &s1)
+                .expect("registers");
+
+        // beta was never given this token.
+        deliver_progress(
+            &stdio_tx,
+            &state.mcp_sessions,
+            &routes,
+            "beta",
+            &progress_note(&wire_token),
+        );
+        assert!(
+            drain_session(&state, &s1).is_empty(),
+            "a server must not push progress for another server's token"
+        );
+
+        // A token nobody registered is dropped rather than broadcast.
+        deliver_progress(
+            &stdio_tx,
+            &state.mcp_sessions,
+            &routes,
+            "alpha",
+            &progress_note("never-issued"),
+        );
+        assert!(drain_session(&state, &s1).is_empty(), "unknown token dropped");
+
+        // The rightful owner still gets through...
+        deliver_progress(
+            &stdio_tx,
+            &state.mcp_sessions,
+            &routes,
+            "alpha",
+            &progress_note(&wire_token),
+        );
+        assert_eq!(drain_session(&state, &s1).len(), 1);
+
+        // ...until the call ends. Dropping the RAII guard unregisters the token, so
+        // a server cannot keep pushing into the client's stream afterwards.
+        drop(registration);
+        assert!(
+            routes.lock().unwrap().active.is_empty(),
+            "the route must not outlive the call"
+        );
+        deliver_progress(
+            &stdio_tx,
+            &state.mcp_sessions,
+            &routes,
+            "alpha",
+            &progress_note(&wire_token),
+        );
+        assert!(
+            drain_session(&state, &s1).is_empty(),
+            "progress after the call completed must be dropped"
+        );
+    }
+
+    #[test]
+    fn stdio_progress_is_handed_off_without_blocking_the_caller() {
+        // The stdio delivery branch had no test at all, and it is the primary
+        // Toolport deployment. It must also never block: this runs on the
+        // downstream drain thread, before that thread forwards response lines, so
+        // a blocking write to a client that stopped reading would wedge the server
+        // for every client (SOU-474).
+        let state = http_state(false);
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio_tx, stdio_rx) = stdio_progress_channel();
+
+        let (_reg, wire) = register_progress(
+            &routes,
+            Some(&json!({ "progressToken": "tok-1" })),
+            "alpha",
+            RESOURCE_SUB_STDIO,
+        )
+        .expect("registers");
+
+        deliver_progress(
+            &stdio_tx,
+            &state.mcp_sessions,
+            &routes,
+            "alpha",
+            &progress_note(&wire),
+        );
+
+        let delivered = stdio_rx
+            .try_recv()
+            .expect("the stdio client's progress must be queued");
+        // Translated back to the client's own token, same as the HTTP path.
+        assert_eq!(delivered["params"]["progressToken"], "tok-1");
+
+        // The producer check guards this branch too. It was only ever asserted on
+        // the HTTP session path, so a server pushing progress for a token it was
+        // never given would have been caught for HTTP clients and forwarded to the
+        // stdio one - the primary deployment (SOU-474).
+        deliver_progress(
+            &stdio_tx,
+            &state.mcp_sessions,
+            &routes,
+            "beta",
+            &progress_note(&wire),
+        );
+        assert!(
+            stdio_rx.try_recv().is_err(),
+            "a server must not push progress for another server's token"
+        );
+
+        // Fill the queue, then confirm a further send is DROPPED rather than
+        // blocking. Without the bound this call would hang forever.
+        for _ in 0..PROGRESS_STDIO_QUEUE {
+            let _ = stdio_tx.try_send(json!({}));
+        }
+        deliver_progress(
+            &stdio_tx,
+            &state.mcp_sessions,
+            &routes,
+            "alpha",
+            &progress_note(&wire),
+        );
+        // Reaching here at all is the assertion: a blocking send would never return.
+    }
+
+    #[test]
+    fn progress_has_no_target_for_a_modern_http_client() {
+        // A legacy HTTP session delivers on its outbound queue; stdio delivers on
+        // stdout. A modern HTTP client has neither until subscriptions/listen
+        // lands (SOU-448), so progress must resolve to no target rather than
+        // falling back to a stdout nobody in HTTP mode is reading.
+        assert_eq!(
+            progress_target_for(Some("sess-1".to_string()), false),
+            Some("sess-1".to_string()),
+            "legacy HTTP session"
+        );
+        assert_eq!(
+            progress_target_for(Some("sess-1".to_string()), true),
+            Some("sess-1".to_string()),
+            "session wins even in stdio mode"
+        );
+        assert_eq!(
+            progress_target_for(None, true),
+            Some(RESOURCE_SUB_STDIO.to_string()),
+            "stdio client"
+        );
+        assert_eq!(
+            progress_target_for(None, false),
+            None,
+            "modern HTTP client has no channel, so progress must not be requested"
+        );
+    }
+
+    #[test]
+    fn without_progress_token_keeps_everything_else() {
+        // Used when there is nowhere to deliver progress: drop only the token, so
+        // trace context and extension namespaces still reach the server.
+        let meta = json!({
+            "progressToken": "p-1",
+            "traceparent": "00-abc-def-01",
+            "com.example/keep": { "a": 1 }
+        });
+        let stripped = without_progress_token(&meta);
+        assert!(stripped.get("progressToken").is_none());
+        assert_eq!(stripped["traceparent"], "00-abc-def-01");
+        assert_eq!(stripped["com.example/keep"]["a"], 1);
+    }
+
+    #[test]
+    fn no_progress_token_registers_no_route() {
+        // The common case: clients that never ask for progress cost nothing and
+        // leave no state behind.
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio_tx, _stdio_rx) = stdio_progress_channel();
+        assert!(register_progress(&routes, None, "alpha", "stdio").is_none());
+        assert!(register_progress(&routes, Some(&json!({ "traceparent": "x" })), "alpha", "stdio").is_none());
+        assert!(routes.lock().unwrap().active.is_empty());
     }
 
     #[test]

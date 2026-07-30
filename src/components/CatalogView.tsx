@@ -254,9 +254,9 @@ export function CatalogView({ registry, onAdded }: Props) {
             className="flex flex-col items-center gap-3 py-20 text-center"
           >
             <div>
-              <p className="font-medium">Catalog could not load</p>
+              <p className="font-medium">Catalog couldn't load</p>
               <p className="max-w-md text-sm text-muted-foreground">
-                Toolport could not load the curated picks. Try again in a moment.
+                Toolport couldn't load the curated picks. Try again in a moment.
               </p>
             </div>
             <Button variant="outline" size="sm" onClick={reloadPopular}>

@@ -53,7 +53,7 @@ more tools you connect and the more calls a task takes, the wider the gap.
 
 ## Measured on a real 14-server catalog
 
-The 62-tool test above is deliberately small. Point [`benchmark/token-cost.mjs`](benchmark/token-cost.mjs)
+The 63-tool test above is deliberately small. Point [`benchmark/token-cost.mjs`](benchmark/token-cost.mjs)
 at a real Toolport catalog (no model needed, it just measures the tool definitions)
 and the gap widens fast. On a live 14-server setup of **415 tools**, the definitions
 an agent loads on **every request** measure:
@@ -86,7 +86,7 @@ Pro/Max, Cursor, and the like) you feel that directly as runway: cutting ~99% of
 always-on tool tokens is roughly that much more headroom for real work before you
 hit a limit, and prompt caching doesn't stretch a usage cap the way it discounts a
 bill. Toolport's meta-tools stay flat no matter how many servers you add, which is
-why the reduction _grows_ with your setup (90% at 62 tools, 99.6% at 415).
+why the reduction _grows_ with your setup (74% at 63 tools, 91% at 183, 99.5% at 415).
 
 The measured average here is ~397 tokens per tool, consistent with the ~387 the
 public [calculator](https://toolport.app/calculator) uses.
@@ -122,4 +122,4 @@ run it on yours: `node benchmark/latency.mjs`.)
 - **Lazy adds search round-trips.** The total-token figures are already net of that. The
   trade-off only pays off past a handful of tools; for a single tiny server it's overkill.
 - **Savings scale with your tool surface**, and that's the point: 74% at 63 tools, 91% at
-  183, 99.6% definition-overhead at 415. The more you connect, the wider the gap.
+  183, 99.5% definition-overhead at 415. The more you connect, the wider the gap.

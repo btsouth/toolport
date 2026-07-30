@@ -955,14 +955,18 @@ impl Router {
     /// server, so concurrent calls to different servers run in parallel while
     /// calls to the same server (one stdio pipe) serialize.
     pub fn route_call(&self, exposed_name: &str, arguments: Value) -> Result<Value, String> {
-        self.route_call_with_cancel(exposed_name, arguments, None)
+        self.route_call_with_cancel(exposed_name, arguments, None, None)
     }
 
+    /// `meta` carries the upstream client's `params._meta` through to the
+    /// downstream server (SOU-444). The router does not interpret it; the
+    /// downstream layer decides which keys are relayable.
     pub fn route_call_with_cancel(
         &self,
         exposed_name: &str,
         arguments: Value,
         cancel: Option<CancelContext>,
+        meta: Option<&Value>,
     ) -> Result<Value, String> {
         if let Some(reason) = self.blocked.get(exposed_name) {
             return Err(format!("tool '{exposed_name}' is {reason}"));
@@ -973,7 +977,7 @@ impl Router {
             .ok_or_else(|| format!("no route for tool '{exposed_name}'"))?;
         let slot = self.slot_for(server_id)?;
         self.call_with_retry(&slot, |server| {
-            server.call_with_cancel(tool, arguments.clone(), cancel.clone())
+            server.call_with_cancel(tool, arguments.clone(), cancel.clone(), meta)
         })
     }
 
@@ -1096,13 +1100,14 @@ impl Router {
     /// matching resource template). `&self`: locks only the owning server
     /// (see `route_call`).
     pub fn read_resource(&self, uri: &str) -> Result<Value, String> {
-        self.read_resource_with_cancel(uri, None)
+        self.read_resource_with_cancel(uri, None, None)
     }
 
     pub fn read_resource_with_cancel(
         &self,
         uri: &str,
         cancel: Option<CancelContext>,
+        meta: Option<&Value>,
     ) -> Result<Value, String> {
         let server_id = self
             .resource_server(uri)
@@ -1110,7 +1115,7 @@ impl Router {
             .to_string();
         let slot = self.slot_for(&server_id)?;
         self.call_with_retry(&slot, |server| {
-            server.read_resource_with_cancel(uri, cancel.clone())
+            server.read_resource_with_cancel(uri, cancel.clone(), meta)
         })
     }
 
@@ -1154,7 +1159,7 @@ impl Router {
     /// Get a prompt by its exposed name, forwarding the server's real name.
     /// `&self`: locks only the owning server (see `route_call`).
     pub fn get_prompt(&self, exposed_name: &str, arguments: Value) -> Result<Value, String> {
-        self.get_prompt_with_cancel(exposed_name, arguments, None)
+        self.get_prompt_with_cancel(exposed_name, arguments, None, None)
     }
 
     pub fn get_prompt_with_cancel(
@@ -1162,6 +1167,7 @@ impl Router {
         exposed_name: &str,
         arguments: Value,
         cancel: Option<CancelContext>,
+        meta: Option<&Value>,
     ) -> Result<Value, String> {
         let (server_id, name) = self
             .prompt_routes
@@ -1170,7 +1176,7 @@ impl Router {
             .ok_or_else(|| format!("no route for prompt '{exposed_name}'"))?;
         let slot = self.slot_for(&server_id)?;
         self.call_with_retry(&slot, |server| {
-            server.get_prompt_with_cancel(&name, arguments.clone(), cancel.clone())
+            server.get_prompt_with_cancel(&name, arguments.clone(), cancel.clone(), meta)
         })
     }
 
@@ -1185,7 +1191,10 @@ impl Router {
         params: Value,
         cancel: Option<CancelContext>,
     ) -> Result<Value, String> {
-        let (server_id, forwarded) = self.resolve_completion(&params)?;
+        let (server_id, mut forwarded) = self.resolve_completion(&params)?;
+        // This path forwards the client's params wholesale, so it needs the same
+        // per-hop `_meta` stripping the rebuilt paths get (SOU-444).
+        crate::downstream::sanitize_forwarded_meta(&mut forwarded);
         let slot = self.slot_for(&server_id)?;
         self.call_with_retry(&slot, |server| {
             server.complete_with_cancel(forwarded.clone(), cancel.clone())
@@ -2161,6 +2170,7 @@ mod tests {
                 "s__echo",
                 json!({}),
                 Some(registry.context("99".to_string())),
+                None,
             )
             .unwrap();
 

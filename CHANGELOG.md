@@ -6,8 +6,42 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
-Stale gateways actually stop after an upgrade, approvals stay bound to what you
-approved, and a batch of transport and code-mode hardening.
+### Added
+
+- **Kilo Code** is detected and configured, bringing the client count to 28. It
+  uses the same top-level `mcp` shape as OpenCode, so it reuses that adapter
+  rather than adding a parallel one, and `kilo.jsonc` is treated as whole-app
+  state: an unparseable file errors instead of being replaced, since it holds
+  much more than MCP servers. (#553)
+
+## [1.10.0] - 2026-07-29
+
+Toolport speaks the current MCP revision, stale gateways actually stop after an
+upgrade, approvals stay bound to what you approved, and a batch of transport and
+code-mode hardening.
+
+### Added
+
+**Toolport speaks MCP 2026-07-28 over stdio, in both directions.** A client on the
+new revision can talk to Toolport, and Toolport can talk to a server on it, with
+every existing client and server continuing to see byte-identical traffic. Both eras
+run on the same stdio endpoint and are detected per connection, so there is nothing
+to migrate and nothing to configure.
+
+Over Streamable HTTP, Toolport stays on the established revision for now. A modern
+client receives exactly the response the spec defines as the fall-back signal, so it
+negotiates down cleanly instead of failing. That half arrives with
+`subscriptions/listen`.
+
+Three things now work through the gateway that could not before:
+
+- **Progress notifications reach your client.** A server reporting progress during a
+  long call has it relayed back, routed to the client that asked for it.
+- **Large results keep their full envelope.** Shaping an oversized result preserves
+  `_meta` and any fields Toolport does not recognise, so nothing a server sends is
+  dropped in transit.
+- **Structured error codes survive the hop**, so a client can act on a
+  machine-readable code rather than parsing a message string.
 
 ### Security
 
@@ -33,10 +67,14 @@ process listing used an argv that Apple's `ps` rejects, so it saw zero gateways;
 Linux a binary replaced in place is now correctly treated as obsolete rather than
 protected. Settings gains a **Stop old gateways** action. (SOU-414)
 
-Note the limit: an AI client caches the gateway command when **it** starts, so a client
-that was already running when you upgraded will respawn the old binary even though
-Toolport has re-pointed its config. Restart the client app itself to pick up the new
-gateway. Clients started after the upgrade are unaffected.
+Note the limit: an AI client caches the gateway command when **it** starts, so whether
+stopping the old process is enough depends on the path that got cached. Where the binary
+is replaced in place, the same path already resolves to the new one and the next spawn
+picks it up. Where the path is one an upgrade never rewrites, it does not: on Windows the
+filename carries its version (so an upgrade never has to overwrite a locked file), and on
+any OS an app can still be pinned to an install location you have since moved away from.
+In those cases, restart the client app itself. Clients started after the upgrade are
+unaffected.
 
 **The Shared HTTP bridge comes back after the reaper stops it.** Reaping a bridge whose
 binary was replaced left HTTP and OpenAPI clients with nothing listening until someone
@@ -59,6 +97,38 @@ succeeding.
 **Code mode budget and isolation.** `fetchResult` shares the call and wall-clock budget
 rather than paging without limit, async workers reinstall the active session for host
 calls, and a corrupt registry no longer boots with code mode enabled.
+
+### Also in this release
+
+- Pasting a Crush config no longer fails as a malformed OpenCode one. Both use a
+  top-level `mcp` key, so the shape of `command` decides which it is. (#497)
+- Rate-limit counters stay in memory until a data directory is bound, instead of
+  writing a stray counter file into the working directory. (#543)
+- The share-link copy button confirms it copied, and says so when it could not.
+  (#549)
+- Coverage for the import-review shell and private-host classifiers, and for
+  gateway filtering during client migration. (#547, #510)
+- `fmtMs` and `fmtDollars` moved into `lib/utils` with tests. (#548)
+- Error strings, the benchmark write-up, the security notes, and CONTRIBUTING all
+  say what the code actually does. (#539, #545, #546, #540)
+
+### Thanks
+
+Patches this cycle came from:
+
+- **[AnayGarodia](https://github.com/AnayGarodia)** - benchmark and security docs, the
+  share-link copy fix, `fmtMs`/`fmtDollars` extraction, and tests for the
+  import-review classifiers (#545, #546, #547, #548, #549).
+- **[Vermitrude](https://github.com/Vermitrude)** - OpenCode/Crush paste
+  disambiguation (#497).
+- **[snowyukitty](https://github.com/snowyukitty)** - keeping unbound rate-limit
+  counters in memory (#543).
+- **[rohankumardubey](https://github.com/rohankumardubey)** - test coverage for
+  gateway filtering during client migration (#510).
+- **[cyforkk](https://github.com/cyforkk)** - normalised the error strings (#539).
+- **[HaimiyaWasn](https://github.com/HaimiyaWasn)** - CONTRIBUTING correction (#540).
+
+If we missed you, open an issue.
 
 ## [1.9.6] - 2026-07-27
 

@@ -153,7 +153,9 @@ export function ImportRow({ item, selected }: { item: ImportItem; selected?: boo
   );
 }
 
-function runsShell(command: string | null): boolean {
+// Exported for unit tests: security-relevant classifier behind the
+// "Runs a shell command" warning above.
+export function runsShell(command: string | null): boolean {
   if (!command) return false;
   const base = command
     .replace(/\\/g, "/")
@@ -164,7 +166,9 @@ function runsShell(command: string | null): boolean {
   return ["cmd", "sh", "bash", "zsh", "powershell", "pwsh"].includes(base);
 }
 
-function isPrivateHostUrl(url: string | null | undefined): boolean {
+// Exported for unit tests: security-relevant classifier behind the
+// "Connects to a private or internal address" warning above.
+export function isPrivateHostUrl(url: string | null | undefined): boolean {
   if (!url) return false;
   let host: string;
   try {

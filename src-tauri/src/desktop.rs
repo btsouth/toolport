@@ -3363,10 +3363,20 @@ pub fn run() {
                         repoint.customized.join(", ")
                     );
                 }
-                // Stop obsolete gateway processes so each client respawns the current binary
-                // on its next MCP request (no full agent restart required when the host
-                // auto-respawns). Path-based identity on all OS (SOU-414); not gated on
-                // repoint (SOU-306). Pass resolve_gateway_path so the nested macOS helper /
+                // Stop obsolete gateway processes. Path-based identity on all OS
+                // (SOU-414); not gated on repoint (SOU-306).
+                //
+                // Reaping alone does NOT always deliver new gateway code. A client reads
+                // its config once at its own startup and caches the spawn command. Where
+                // that cached path is replaced in place the next spawn picks up the new
+                // binary and the reap is sufficient. Where the path is one an upgrade
+                // never rewrites (a versioned filename, or an install location the app has
+                // since moved away from) the client relaunches the same obsolete binary
+                // and only restarting that application fixes it. Do not restate the old
+                // claim that no agent restart is needed; it was false for every client
+                // observed in the SOU-418 smoke pass (SOU-435).
+                //
+                // Pass resolve_gateway_path so the nested macOS helper /
                 // AppImage stable path is kept even when publish is Windows-only.
                 //
                 // Run once immediately, then again after a short delay so a client that
