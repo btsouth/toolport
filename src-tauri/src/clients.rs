@@ -1465,13 +1465,21 @@ fn parse_json_snippet(
         for (name, definition) in obj {
             let command = definition.get("command");
             let type_hint = definition.get("type").and_then(|t| t.as_str());
+            // Both clients use a top-level `mcp` key, so the entry shape decides which
+            // one wrote it. OpenCode types entries `local`/`remote`; Crush uses
+            // `http`/`sse`. Those vocabularies do not overlap, which is what makes the
+            // branches below decidable.
             let is_explicit_opencode_type = matches!(type_hint, Some("local") | Some("remote"));
 
             if command.map(|c| c.is_string()).unwrap_or(false) {
                 if is_explicit_opencode_type {
+                    // Typed as OpenCode, but `command` is a string where OpenCode
+                    // requires an array. A malformed OpenCode entry, not a Crush one,
+                    // so say so rather than silently importing it as Crush.
                     malformed.push(format!("{name} ('command' must be an array of strings)"));
                     continue;
                 }
+                // Crush stdio: `command` is a string, args live separately.
                 servers.push(json_server_with_values(name, definition));
                 continue;
             }
@@ -1480,11 +1488,18 @@ fn parse_json_snippet(
             let is_absent = command.is_none();
 
             if is_absent && matches!(type_hint, Some("http") | Some("sse")) {
+                // Crush remote: no `command`, transport comes from `type`, and env
+                // lives under `env`. Checked before the OpenCode branch below, which
+                // would otherwise claim it and hardcode http while reading
+                // `environment`. (Crush requires `type` on every entry, so a typeless
+                // remote is not a valid Crush config.)
                 servers.push(json_server_with_values(name, definition));
                 continue;
             }
 
             if is_array || is_absent {
+                // OpenCode: `command` is an argv array, or absent for remote and
+                // override-only entries, which carry env under `environment`.
                 match opencode_server_with_values(name, definition) {
                     Ok(Some(server)) => servers.push(server),
                     Ok(None) => {}
@@ -1492,6 +1507,10 @@ fn parse_json_snippet(
                 }
                 continue;
             }
+
+            // `command` is null, a number, or an object: not a shape either client
+            // writes. Skipped rather than reported, so the wrapper-key fallthrough
+            // below still runs when this was the only entry.
         }
         if !malformed.is_empty() {
             malformed.sort();
