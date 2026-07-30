@@ -1492,6 +1492,7 @@ fn parse_json_snippet(
     forced_name: &str,
 ) -> Result<Vec<ParsedSnippetServer>, String> {
     let value = parse_json_value(content)?;
+    let mut unusable_mcp = Vec::new();
 
     if let Some(mcp) = value.get("mcp") {
         let obj = mcp
@@ -1547,7 +1548,11 @@ fn parse_json_snippet(
 
             // `command` is null, a number, or an object: not a shape either client
             // writes. Skipped rather than reported, so the wrapper-key fallthrough
-            // below still runs when this was the only entry.
+            // below still runs. If no supported wrapper parses either, report the
+            // skipped entry instead of falling through to the generic error.
+            unusable_mcp.push(format!(
+                "{name} ('command' must be a string or array of strings)"
+            ));
         }
         if !malformed.is_empty() {
             malformed.sort();
@@ -1590,6 +1595,14 @@ fn parse_json_snippet(
             forced_name.to_string()
         };
         return Ok(vec![json_server_with_values(&name, &value)]);
+    }
+
+    if !unusable_mcp.is_empty() {
+        unusable_mcp.sort();
+        return Err(format!(
+            "unusable 'mcp' entry: {}",
+            unusable_mcp.join(", ")
+        ));
     }
 
     Err("JSON parsed but no server definition found (expected mcp, mcpServers, servers, context_servers, or a bare server object)".to_string())
@@ -4662,6 +4675,24 @@ mod tests {
         let parsed = parse_json_snippet(mixed, "").unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "fallback");
+    }
+
+    #[test]
+    fn parse_json_snippet_names_unusable_mcp_command() {
+        let content = r#"{"mcp":{"foo":{"command":null}}}"#;
+        let error = parse_json_snippet(content, "").unwrap_err();
+        assert!(error.contains("foo"), "got: {error}");
+        assert!(error.contains("string or array"), "got: {error}");
+        assert!(!error.contains("no server definition"), "got: {error}");
+    }
+
+    #[test]
+    fn parse_json_snippet_ignores_unusable_command_when_servers_parse() {
+        let content = r#"{"mcp":{"bad":{"command":null},"crush":{"command":"npx"},"opencode":{"command":["uvx","server"]}}}"#;
+        let parsed = parse_json_snippet(content, "").unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "crush");
+        assert_eq!(parsed[1].name, "opencode");
     }
 
     #[test]
