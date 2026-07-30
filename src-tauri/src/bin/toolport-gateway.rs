@@ -757,7 +757,7 @@ fn write_json_line<W: Write>(writer: &mut W, value: &Value) -> std::io::Result<(
 /// Validate the model-authored search query in one short-circuiting pass before
 /// it reaches lexical ranking or the optional embedding endpoint. The ranker
 /// splits on whitespace too, so this token bound matches the work it performs.
-fn validate_search_query(query: &str) -> Result<(), &'static str> {
+fn validate_search_query(query: &str) -> Result<(), String> {
     let mut chars = 0;
     let mut tokens = 0;
     let mut in_token = false;
@@ -765,7 +765,9 @@ fn validate_search_query(query: &str) -> Result<(), &'static str> {
     for ch in query.chars() {
         chars += 1;
         if chars > MAX_SEARCH_QUERY_CHARS {
-            return Err("Toolport: search query exceeds the 512-character limit.");
+            return Err(format!(
+                "Toolport: search query exceeds the {MAX_SEARCH_QUERY_CHARS}-character limit."
+            ));
         }
 
         if ch.is_whitespace() {
@@ -773,7 +775,9 @@ fn validate_search_query(query: &str) -> Result<(), &'static str> {
         } else if !in_token {
             tokens += 1;
             if tokens > MAX_SEARCH_QUERY_TOKENS {
-                return Err("Toolport: search query exceeds the 64-token limit.");
+                return Err(format!(
+                    "Toolport: search query exceeds the {MAX_SEARCH_QUERY_TOKENS}-token limit."
+                ));
             }
             in_token = true;
         }
@@ -14926,7 +14930,9 @@ mod tests {
     #[test]
     fn search_query_bounds_are_enforced_before_ranking() {
         assert!(validate_search_query(&"x".repeat(MAX_SEARCH_QUERY_CHARS)).is_ok());
-        assert!(validate_search_query(&"x".repeat(MAX_SEARCH_QUERY_CHARS + 1)).is_err());
+        let char_limit_error = validate_search_query(&"x".repeat(MAX_SEARCH_QUERY_CHARS + 1))
+            .unwrap_err();
+        assert!(char_limit_error.contains(&MAX_SEARCH_QUERY_CHARS.to_string()));
 
         let sixty_four_tokens = std::iter::repeat("x")
             .take(MAX_SEARCH_QUERY_TOKENS)
@@ -14934,7 +14940,8 @@ mod tests {
             .join(" ");
         assert!(validate_search_query(&sixty_four_tokens).is_ok());
         let sixty_five_tokens = format!("{sixty_four_tokens} x");
-        assert!(validate_search_query(&sixty_five_tokens).is_err());
+        let token_limit_error = validate_search_query(&sixty_five_tokens).unwrap_err();
+        assert!(token_limit_error.contains(&MAX_SEARCH_QUERY_TOKENS.to_string()));
 
         let call = |query: &str| {
             handle_request(
@@ -14957,14 +14964,14 @@ mod tests {
         assert!(char_limit_resp["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("512-character limit"));
+            .contains(&format!("{MAX_SEARCH_QUERY_CHARS}-character limit")));
 
         let token_limit_resp = call(&sixty_five_tokens);
         assert_eq!(token_limit_resp["result"]["isError"], true);
         assert!(token_limit_resp["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("64-token limit"));
+            .contains(&format!("{MAX_SEARCH_QUERY_TOKENS}-token limit")));
         assert_eq!(
             search_tool_def()["inputSchema"]["properties"]["query"]["maxLength"],
             MAX_SEARCH_QUERY_CHARS
