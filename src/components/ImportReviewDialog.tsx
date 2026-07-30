@@ -172,21 +172,64 @@ export function isPrivateHostUrl(url: string | null | undefined): boolean {
   if (!url) return false;
   let host: string;
   try {
-    host = new URL(url).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    // WHATWG keeps a trailing dot on named hosts (localhost.) but strips it on
+    // IPv4 literals — strip for both so loopback warnings stay consistent.
+    host = new URL(url).hostname
+      .toLowerCase()
+      .replace(/^\[|\]$/g, "")
+      .replace(/\.$/, "");
   } catch {
     return false;
   }
-  if (host === "localhost" || host.endsWith(".localhost") || host === "::1") return true;
-  const match = host.match(/^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host === "::1" ||
+    host === "0:0:0:0:0:0:0:1"
+  ) {
+    return true;
+  }
+  // IPv4-mapped IPv6 — WHATWG may emit dotted or hex form (::ffff:127.0.0.1 / ::ffff:7f00:1)
+  const v4MappedDotted = host.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
+  if (v4MappedDotted) {
+    return isPrivateIpv4(v4MappedDotted[1]);
+  }
+  const v4MappedHex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+  if (v4MappedHex) {
+    const hi = parseInt(v4MappedHex[1], 16);
+    const lo = parseInt(v4MappedHex[2], 16);
+    const dotted = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    return isPrivateIpv4(dotted);
+  }
+  // IPv6: loopback, unspecified, link-local fe80::/10, ULA fc00::/7
+  if (host.includes(":")) {
+    if (host === "::" || host === "0:0:0:0:0:0:0:0") return true;
+    const first = parseInt(host.split(":")[0] || "0", 16);
+    if (Number.isNaN(first)) return false;
+    if ((first & 0xffc0) === 0xfe80) return true; // link-local
+    if ((first & 0xfe00) === 0xfc00) return true; // unique-local
+    return false;
+  }
+  return isPrivateIpv4(host);
+}
+
+/** Mirror src-tauri/src/oauth.rs ip_is_private for IPv4. */
+function isPrivateIpv4(host: string): boolean {
+  const match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (!match) return false;
-  const first = Number(match[1]);
-  const second = Number(match[2]);
+  const a = Number(match[1]);
+  const b = Number(match[2]);
+  const c = Number(match[3]);
+  const d = Number(match[4]);
+  if ([a, b, c, d].some((n) => n > 255)) return false;
   return (
-    first === 127 ||
-    first === 10 ||
-    first === 0 ||
-    (first === 192 && second === 168) ||
-    (first === 172 && second >= 16 && second <= 31) ||
-    (first === 169 && second === 254)
+    a === 127 || // loopback
+    a === 10 || // RFC1918
+    a === 0 || // "this" network / unspecified
+    (a === 192 && b === 168) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 169 && b === 254) || // link-local
+    (a === 100 && (b & 0xc0) === 64) || // CGNAT 100.64/10
+    (a === 255 && b === 255 && c === 255 && d === 255) // broadcast
   );
 }

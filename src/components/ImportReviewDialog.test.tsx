@@ -160,6 +160,30 @@ describe("isPrivateHostUrl", () => {
     // Hostnames merely containing "localhost" are not loopback.
     ["http://localhost.example.com/mcp", false],
     ["http://notlocalhost/mcp", false],
+    // Trailing dots (WHATWG keeps them on names only).
+    ["http://localhost./mcp", true],
+    ["http://127.0.0.1./mcp", true],
+    // CGNAT 100.64.0.0/10
+    ["http://100.64.0.1/mcp", true],
+    ["http://100.127.255.255/mcp", true],
+    ["http://100.63.0.1/mcp", false],
+    ["http://100.128.0.1/mcp", false],
+    // IPv6 link-local / ULA / unspecified / v4-mapped loopback
+    ["http://[fe80::1]/", true],
+    ["http://[fd00::1]/", true],
+    ["http://[fc00::1]/", true],
+    ["http://[::]/", true],
+    ["http://[::ffff:127.0.0.1]/", true],
+    ["http://[2001:db8::1]/", false],
+    // Broadcast
+    ["http://255.255.255.255/", true],
+    // Obfuscated IPv4 encodings still warn via URL normalisation.
+    ["http://2130706433/", true],
+    ["http://0x7f000001/", true],
+    ["http://127.1/", true],
+    // userinfo: only the host after @ matters
+    ["http://evil.example.com@localhost/", true],
+    ["http://localhost@evil.example.com/", false],
     // Unparseable or missing URLs never warn.
     ["not a url", false],
     [null, false],
