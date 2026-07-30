@@ -138,8 +138,13 @@ export function ShareDialog({ trigger, onImported }: Props) {
     try {
       const url = await shareStack(exported);
       setShareLink(url);
-      navigator.clipboard.writeText(url).catch(() => {});
-      toast.success("Share link created and copied");
+      try {
+        await navigator.clipboard.writeText(url);
+        toast.success("Share link created and copied");
+      } catch {
+        toast.success("Share link created");
+        toastError("Couldn't copy automatically. Select the link and copy it.");
+      }
     } catch (e) {
       toastError(`Couldn't create a link: ${e}`);
     } finally {
