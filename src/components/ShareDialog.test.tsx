@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
@@ -39,6 +39,18 @@ describe("ShareDialog share links", () => {
     mocks.exportConfig.mockResolvedValue('{"servers":[]}');
     mocks.getRegistry.mockResolvedValue({ servers: [] });
     mocks.shareStack.mockResolvedValue("https://toolport.app/s/example");
+  });
+
+  // Both tests replace navigator.clipboard, so restore the real descriptor
+  // afterwards. Without this the second test's `undefined` sticks, which makes
+  // any later test in this file order-dependent.
+  const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  afterEach(() => {
+    if (originalClipboard) {
+      Object.defineProperty(navigator, "clipboard", originalClipboard);
+    } else {
+      delete (navigator as { clipboard?: unknown }).clipboard;
+    }
   });
 
   it("keeps the generated link visible when clipboard access fails", async () => {
