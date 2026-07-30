@@ -845,7 +845,10 @@ function InspectRow({ e }: { e: InspectEntry }) {
  * list of returned tool names. */
 function DiscoveryRow({ t }: { t: SearchTrace }) {
   const [open, setOpen] = useState(false);
-  const pct = t.flatTokens > 0 ? Math.round((t.savedTokens / t.flatTokens) * 100) : 0;
+  const pct =
+    t.flatTokens > 0
+      ? fmtPercent(t.savedTokens / t.flatTokens, { floorNonZero: t.savedTokens > 0 })
+      : "0%";
   const hit = t.returned > 0;
   const fallbackCount = t.fallbacks ?? t.ranking?.filter((r) => r.fallback).length ?? 0;
   const resultSummary = fallbackCount
@@ -959,7 +962,7 @@ function DiscoveryRow({ t }: { t: SearchTrace }) {
               ≈{fmtTokens(t.flatTokens)}
             </span>{" "}
             to load the whole catalog
-            {t.flatTokens > 0 ? <> ({pct}% less this turn).</> : "."}
+            {t.flatTokens > 0 ? <> ({pct} less this turn).</> : "."}
           </div>
         </div>
       )}
