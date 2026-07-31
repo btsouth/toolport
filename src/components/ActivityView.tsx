@@ -18,7 +18,14 @@ import {
   XCircle,
 } from "lucide-react";
 import { toast } from "sonner";
-import { fmtPercent, fmtTokens } from "@/lib/utils";
+import {
+  fmtDollars,
+  fmtMs,
+  fmtPercent,
+  fmtTokens,
+  fmtTs,
+  stableListKeys,
+} from "@/lib/utils";
 import { toastError } from "@/lib/toast";
 import { save } from "@tauri-apps/plugin-dialog";
 import { Input } from "@/components/ui/input";
@@ -55,12 +62,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-/** Compact latency string: "180 ms" or "1.2 s", or a dash when unmeasured. */
-function fmtMs(ms: number | null): string {
-  if (ms == null) return "-";
-  return ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`;
-}
-
 /** Models for the dollar estimate, input-token list prices ($/1M), grouped by
  *  provider. Matches the public calculator at toolport.app/calculator. */
 const SAVINGS_MODELS = [
@@ -93,15 +94,14 @@ const SAVINGS_MODEL_PRICE = new Map(
   SAVINGS_MODELS.flatMap((g) => g.items).map((m) => [m.label, m.price]),
 );
 
-/** Dollar value of saved input tokens, scaled to the number's size. */
-function fmtDollars(n: number): string {
-  if (n >= 1000) return `$${Math.round(n).toLocaleString()}`;
-  if (n >= 10) return `$${n.toFixed(0)}`;
-  return `$${n.toFixed(2)}`;
-}
-
 /** A badge describing one security event by kind. */
 function eventBadge(e: SecurityEvent): { label: string; cls: string } {
+  if (e.type === "result_injection_blocked") {
+    return {
+      label: "injection blocked",
+      cls: "bg-destructive/15 text-destructive",
+    };
+  }
   if (e.type === "result_injection") {
     return {
       label: "injected result",
@@ -126,7 +126,8 @@ function eventBadge(e: SecurityEvent): { label: string; cls: string } {
   return { label: "new tool", cls: "bg-owned/15 text-owned" };
 }
 
-const SECURITY_DISMISSED_KEY = "conduit.security.dismissed";
+const SECURITY_DISMISSED_KEY = "toolport.security.dismissed";
+const SECURITY_DISMISSED_KEY_LEGACY = "conduit.security.dismissed";
 
 /** High-signal, interrupting events vs benign, quiet-history churn. The backend now
  * tags a `severity`; for events written before that (no field) we classify by type:
@@ -136,6 +137,7 @@ function eventSeverity(e: SecurityEvent): "high" | "info" {
   if (
     e.type === "tool_poison_flag" ||
     e.type === "result_injection" ||
+    e.type === "result_injection_blocked" ||
     e.type === "pins_load_failed"
   ) {
     return "high";
@@ -212,7 +214,9 @@ function collapseByIdentity(
 
 function loadDismissed(): Set<string> {
   try {
-    const raw = localStorage.getItem(SECURITY_DISMISSED_KEY);
+    const raw =
+      localStorage.getItem(SECURITY_DISMISSED_KEY) ??
+      localStorage.getItem(SECURITY_DISMISSED_KEY_LEGACY);
     return new Set(raw ? (JSON.parse(raw) as string[]) : []);
   } catch {
     return new Set();
@@ -234,6 +238,7 @@ function addDismissed(prev: Set<string>, keys: string[]): Set<string> {
     arr.length > MAX_DISMISSED ? new Set(arr.slice(arr.length - MAX_DISMISSED)) : merged;
   try {
     localStorage.setItem(SECURITY_DISMISSED_KEY, JSON.stringify([...next]));
+    localStorage.removeItem(SECURITY_DISMISSED_KEY_LEGACY);
   } catch {
     // ignore storage failures; the dismissal just won't persist
   }
@@ -325,12 +330,7 @@ function SecurityNotices({
                     )}
                     <span className="ml-auto text-muted-foreground">
                       {count > 1 ? "last " : ""}
-                      {new Date(e.ts).toLocaleString(undefined, {
-                        month: "short",
-                        day: "numeric",
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      })}
+                      {fmtTs(e.ts)}
                     </span>
                     <button
                       onClick={() => onDismiss(e)}
@@ -414,14 +414,7 @@ function QuietDriftHistory({
                   {e.change === "added" ? "new tool" : "changed"}
                 </span>
                 <code className="font-mono text-muted-foreground">{e.tool}</code>
-                <span className="ml-auto text-muted-foreground/70">
-                  {new Date(e.ts).toLocaleString(undefined, {
-                    month: "short",
-                    day: "numeric",
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })}
-                </span>
+                <span className="ml-auto text-muted-foreground/70">{fmtTs(e.ts)}</span>
                 <button
                   onClick={() => onDismiss(e)}
                   aria-label="Dismiss this change"
@@ -444,13 +437,7 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
   const [modelLabel, setModelLabel] = useState("Claude Sonnet");
   const price = SAVINGS_MODEL_PRICE.get(modelLabel) ?? 3;
   const dollars = (savings.tokensSaved / 1_000_000) * price;
-  const since =
-    savings.sinceTs > 0
-      ? new Date(savings.sinceTs).toLocaleDateString(undefined, {
-          month: "short",
-          day: "numeric",
-        })
-      : null;
+  const since = savings.sinceTs > 0 ? fmtTs(savings.sinceTs, "monthDay") : null;
   const details = [
     `across ${savings.listLoads.toLocaleString()} tool-list load${savings.listLoads === 1 ? "" : "s"}`,
     savings.peakCatalog > 4
@@ -681,9 +668,7 @@ function CallRow({ e }: { e: AuditEntry }) {
         <span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">
           {fmtMs(e.durationMs ?? e.heldMs ?? null)}
         </span>
-        <span className="shrink-0 text-xs text-muted-foreground">
-          {new Date(e.ts).toLocaleString()}
-        </span>
+        <span className="shrink-0 text-xs text-muted-foreground">{fmtTs(e.ts)}</span>
       </div>
       {open && e.error && (
         <div className="border-t border-border/50 bg-destructive/5 px-3 py-2 pl-9">
@@ -832,7 +817,7 @@ function InspectRow({ e }: { e: InspectEntry }) {
           {fmtMs(e.durationMs ?? null)}
         </span>
         <span className="shrink-0 text-xs text-muted-foreground">
-          {new Date(e.ts).toLocaleTimeString()}
+          {fmtTs(e.ts, "time")}
         </span>
       </div>
       {open && (
@@ -860,7 +845,10 @@ function InspectRow({ e }: { e: InspectEntry }) {
  * list of returned tool names. */
 function DiscoveryRow({ t }: { t: SearchTrace }) {
   const [open, setOpen] = useState(false);
-  const pct = t.flatTokens > 0 ? Math.round((t.savedTokens / t.flatTokens) * 100) : 0;
+  const pct =
+    t.flatTokens > 0
+      ? fmtPercent(t.savedTokens / t.flatTokens, { floorNonZero: t.savedTokens > 0 })
+      : "0%";
   const hit = t.returned > 0;
   const fallbackCount = t.fallbacks ?? t.ranking?.filter((r) => r.fallback).length ?? 0;
   const resultSummary = fallbackCount
@@ -911,7 +899,7 @@ function DiscoveryRow({ t }: { t: SearchTrace }) {
           {resultSummary}
         </span>
         <span className="shrink-0 text-xs text-muted-foreground">
-          {new Date(t.ts).toLocaleTimeString()}
+          {fmtTs(t.ts, "time")}
         </span>
       </div>
       {open && (
@@ -974,7 +962,7 @@ function DiscoveryRow({ t }: { t: SearchTrace }) {
               ≈{fmtTokens(t.flatTokens)}
             </span>{" "}
             to load the whole catalog
-            {t.flatTokens > 0 ? <> ({pct}% less this turn).</> : "."}
+            {t.flatTokens > 0 ? <> ({pct} less this turn).</> : "."}
           </div>
         </div>
       )}
@@ -1042,8 +1030,8 @@ function DiscoveryTraces({ refreshKey }: { refreshKey: number }) {
             Local and bounded: tool names only, never arguments or results.
           </p>
           <div className="flex flex-col gap-1">
-            {entries.map((t, i) => (
-              <DiscoveryRow key={`${t.ts}-${i}`} t={t} />
+            {stableListKeys(entries, (t) => `${t.ts}-${t.query}`).map((key, i) => (
+              <DiscoveryRow key={key} t={entries[i]} />
             ))}
           </div>
         </>
@@ -1057,7 +1045,7 @@ function DiscoveryTraces({ refreshKey }: { refreshKey: number }) {
 function ToolIdentityRow({ t }: { t: ToolIdentity }) {
   const [open, setOpen] = useState(false);
   const fpShort = t.fingerprint.replace(/^v\d+:/, "").slice(0, 12) || "-";
-  const fmtDate = (ms: number) => (ms > 0 ? new Date(ms).toLocaleDateString() : "-");
+  const fmtDate = (ms: number) => (ms > 0 ? fmtTs(ms, "date") : "-");
   return (
     <div className="rounded-md border border-border/50 text-sm">
       <div
@@ -1351,9 +1339,11 @@ function LiveInspector({ refreshKey }: { refreshKey: number }) {
             </p>
           ) : (
             <div className="flex flex-col gap-1">
-              {entries.map((e, i) => (
-                <InspectRow key={`${e.ts}-${e.server}-${e.tool}-${i}`} e={e} />
-              ))}
+              {stableListKeys(entries, (e) => `${e.ts}-${e.server}-${e.tool}`).map(
+                (key, i) => (
+                  <InspectRow key={key} e={entries[i]} />
+                ),
+              )}
             </div>
           )}
         </>
@@ -1481,7 +1471,8 @@ export function ActivityView({
   const isNewTool = (e: SecurityEvent) =>
     e.change === "added" &&
     e.type !== "tool_poison_flag" &&
-    e.type !== "result_injection";
+    e.type !== "result_injection" &&
+    e.type !== "result_injection_blocked";
   const highSecurity = liveSecurity.filter(
     (e) => eventSeverity(e) === "high" && !isNewTool(e),
   );
@@ -1680,9 +1671,9 @@ export function ActivityView({
                 )}
               </div>
             ) : (
-              visible.map((e, i) => (
-                <CallRow key={`${e.ts}-${e.server}-${e.tool}-${i}`} e={e} />
-              ))
+              stableListKeys(visible, (e) => `${e.ts}-${e.server}-${e.tool}`).map(
+                (key, i) => <CallRow key={key} e={visible[i]} />,
+              )
             )}
           </div>
         </>

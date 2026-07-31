@@ -4,6 +4,8 @@
 #   image: ghcr.io/tsouth89/toolport-gateway:latest
 # Option B — build locally:
 #   build: .
+#
+# All TOOLPORT_* env names still accept pre-rename CONDUIT_* aliases.
 
 services:
   toolport-gateway:
@@ -17,22 +19,22 @@ services:
     env_file:
       - .env
     environment:
-      CONDUIT_HTTP_HOST: "0.0.0.0"
-      CONDUIT_HTTP: "8765"
-      CONDUIT_REGISTRY: /data/registry.json
+      TOOLPORT_HTTP_HOST: "0.0.0.0"
+      TOOLPORT_HTTP: "8765"
+      TOOLPORT_REGISTRY: /data/registry.json
       # Required when binding 0.0.0.0 — set in .env:
-      # CONDUIT_HTTP_TOKEN=...
+      # TOOLPORT_HTTP_TOKEN=...
       # Optional encrypted vault passphrase (if using secrets.enc):
-      # CONDUIT_SECRET_KEY=...
+      # TOOLPORT_SECRET_KEY=...
       # Or inject per-server secrets directly:
-      # CONDUIT_SECRET_STRIPE_SECRET_KEY=sk_...
-      # STRIPE_SECRET_KEY=sk_...  (requires CONDUIT_ALLOW_BARE_SECRET_ENV below)
-      CONDUIT_ALLOW_BARE_SECRET_ENV: "1"
+      # TOOLPORT_SECRET_STRIPE_SECRET_KEY=sk_...
+      # STRIPE_SECRET_KEY=sk_...  (requires TOOLPORT_ALLOW_BARE_SECRET_ENV below)
+      TOOLPORT_ALLOW_BARE_SECRET_ENV: "1"
     restart: unless-stopped
     healthcheck:
       test:
         - CMD-SHELL
-        - 'curl -fsS -H "Authorization: Bearer $$CONDUIT_HTTP_TOKEN" http://127.0.0.1:8765/'
+        - 'curl -fsS -H "Authorization: Bearer $$TOOLPORT_HTTP_TOKEN" http://127.0.0.1:8765/'
       interval: 30s
       timeout: 5s
       retries: 3

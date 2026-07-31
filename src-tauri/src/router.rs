@@ -43,6 +43,123 @@ pub fn sanitize_segment(s: &str) -> String {
         .collect()
 }
 
+/// Bound URI/template matching so a hostile client URI cannot blow the stack
+/// or dominate the request thread with pathological backtracking.
+const MAX_URI_MATCH_LEN: usize = 8_192;
+const MAX_TEMPLATE_MATCH_LEN: usize = 1_024;
+
+/// True when `uri` is an expansion of an RFC 6570 Level-1 URI template
+/// (`{var}` placeholders). Used to route `resources/read` for expanded
+/// template URIs that were never listed as concrete resources.
+pub fn uri_matches_template(uri: &str, template: &str) -> bool {
+    if uri.len() > MAX_URI_MATCH_LEN || template.len() > MAX_TEMPLATE_MATCH_LEN {
+        return false;
+    }
+    if !template.contains('{') {
+        return uri == template;
+    }
+    let mut pattern = String::from("^");
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let (literal, after_open) = rest.split_at(open);
+        for ch in literal.chars() {
+            if ".+*?^$()[]{}|\\".contains(ch) {
+                pattern.push('\\');
+            }
+            pattern.push(ch);
+        }
+        let Some(close) = after_open.find('}') else {
+            return false;
+        };
+        // Level-1 `{var}`: one path segment. `{+var}` / `{#var}` (Level 2) match
+        // the remainder, including slashes.
+        let expr = &after_open[1..close];
+        if expr.starts_with('+') || expr.starts_with('#') {
+            pattern.push_str(".+");
+        } else {
+            pattern.push_str("[^/]+");
+        }
+        rest = &after_open[close + 1..];
+    }
+    for ch in rest.chars() {
+        if ".+*?^$()[]{}|\\".contains(ch) {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('$');
+    regex_is_match(&pattern, uri)
+}
+
+/// Tiny anchored match helper so the router does not take a full regex crate
+/// dependency for Level-1 template matching. Only the character classes we emit
+/// above are recognized: literals, `[^/]+`, and `.+`.
+fn regex_is_match(pattern: &str, text: &str) -> bool {
+    // pattern is ^...$ from uri_matches_template.
+    let inner = pattern
+        .strip_prefix('^')
+        .and_then(|p| p.strip_suffix('$'))
+        .unwrap_or(pattern);
+    match_simple_pattern(inner, text)
+}
+
+fn match_simple_pattern(mut pattern: &str, mut text: &str) -> bool {
+    // Iterative literal consumption keeps recursion depth proportional to the
+    // number of placeholders, not the URI length. Variable branches still
+    // backtrack, but inputs are length-capped in uri_matches_template.
+    loop {
+        if pattern.is_empty() {
+            return text.is_empty();
+        }
+        if let Some(rest) = pattern.strip_prefix("[^/]+") {
+            // Match one or more non-slash chars (greedy, then backtrack).
+            if text.is_empty() || text.starts_with('/') {
+                return false;
+            }
+            let end = text.find('/').unwrap_or(text.len());
+            for take in (1..=end).rev() {
+                if match_simple_pattern(rest, &text[take..]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if let Some(rest) = pattern.strip_prefix(".+") {
+            if text.is_empty() {
+                return false;
+            }
+            for take in (1..=text.len()).rev() {
+                if match_simple_pattern(rest, &text[take..]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        // Consume a run of literal characters without recursing.
+        let (pat_ch, pat_rest) = if let Some(rest) = pattern.strip_prefix('\\') {
+            let mut chars = rest.chars();
+            match chars.next() {
+                Some(c) => (c, chars.as_str()),
+                None => return false,
+            }
+        } else {
+            let mut chars = pattern.chars();
+            match chars.next() {
+                Some(c) => (c, chars.as_str()),
+                None => return text.is_empty(),
+            }
+        };
+        let mut text_chars = text.chars();
+        match text_chars.next() {
+            Some(c) if c == pat_ch => {
+                pattern = pat_rest;
+                text = text_chars.as_str();
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// Inline local `$ref` pointers into a self-contained JSON Schema, so a downstream
 /// consumer that can't resolve refs gets a complete schema. Handles `#/$defs/X`,
 /// `#/definitions/X`, AND any in-document JSON Pointer (`#/properties/a/b`, which
@@ -336,7 +453,13 @@ pub struct Router {
     /// Aggregated resources, passed through as-is (uris are server-scoped).
     resources: Vec<Value>,
     /// Resource uri -> owning server id (for resources/read).
+    /// First writer in server add order wins; later collisions are refused
+    /// rather than last-writer-wins (SOU-325).
     resource_routes: HashMap<String, String>,
+    /// Aggregated resource templates (`uriTemplate` strings as advertised).
+    resource_templates: Vec<Value>,
+    /// Resource template uriTemplate -> owning server id. First writer wins.
+    template_routes: HashMap<String, String>,
     /// Aggregated prompts, names namespaced like tools.
     prompts: Vec<Value>,
     /// Exposed prompt name -> (server id, original prompt name).
@@ -370,50 +493,63 @@ impl Router {
         self.routes.get(exposed).map(|(s, t)| (s.as_str(), t.as_str()))
     }
 
-    /// Index one server's advertised tools/resources/prompts into the exposed
-    /// aggregation (names, routes, policy). Shared by `add` (a new server) and
-    /// `rebuild_aggregation` (after a refresh); the call order is the exposed-name
-    /// order, so `_2` collision suffixes stay stable.
+    /// Index one server's advertised tools/resources/templates/prompts into the
+    /// exposed aggregation (names, routes, policy). Shared by `add` (a new
+    /// server) and `rebuild_aggregation` (after a refresh). Within a server,
+    /// `_2` collision suffixes are allocated by raw name rather than list
+    /// position, so neither the call order nor a downstream reordering its own
+    /// catalog can move them (see [`allocate_exposed_names`](Self::allocate_exposed_names)).
     fn index_server(
         &mut self,
         server_id: &str,
         tools: &[Value],
         resources: &[Value],
+        resource_templates: &[Value],
         prompts: &[Value],
     ) {
-        for tool in tools {
+        // Allocate the exposed name regardless of policy so toggling one tool
+        // never renames its siblings (their `_2` suffixes stay put), and in an
+        // order that doesn't depend on how the server happened to list them.
+        let tool_names = self.allocate_exposed_names(server_id, tools);
+        for (idx, tool) in tools.iter().enumerate() {
             let Some(orig) = tool.get("name").and_then(|n| n.as_str()) else {
                 continue;
             };
-            // Allocate the exposed name regardless of policy so toggling one tool
-            // never renames its siblings (their `_2` suffixes stay put).
-            let exposed = self.exposed_name(server_id, orig);
-            if let Some(reason) = self.policy.blocked_reason(&exposed, server_id, orig, tool) {
-                self.blocked.insert(exposed, reason.to_string());
-                continue;
-            }
-            let mut t = tool.clone();
-            // Apply the user's exposure override (keyed by the ORIGINAL exposed name).
+            let base = tool_names[idx]
+                .clone()
+                .expect("a tool with a name always gets an allocated exposed name");
+            // Apply the user's exposure override (keyed by the ORIGINAL name) BEFORE
+            // evaluating policy, so the quarantine check (keyed by the client-facing
+            // name) sees the SAME name the client will call. Evaluating it on the
+            // pre-rename base name meant a renamed tool could never be quarantined, and
+            // the app would show it quarantined while the gateway kept routing it (#423).
             // Cloned to owned so we don't hold a borrow of `self.overrides` across the
-            // `self.seen` mutation below.
+            // `self.seen` mutation below. A rename that is empty or would collide with an
+            // existing exposed name is ignored (keep the base) so routing stays
+            // unambiguous. Both the base name (reserved by allocate_exposed_names) and the
+            // rename's own slot stay reserved in `seen`, even when the tool ends up
+            // blocked, so neither can be reused by a sibling's `_2` suffix.
             let ov = self.overrides.get(server_id).and_then(|m| m.get(orig));
             let ov_name = ov.and_then(|o| o.name.clone());
             let ov_desc = ov.and_then(|o| o.description.clone());
-            // Rename changes ONLY the client-facing name; the route below still points at
-            // the real downstream tool, so a call never goes anywhere new. A rename that is
-            // empty or would collide with an existing exposed name is ignored (keep the
-            // original) so routing stays unambiguous.
             let exposed = match ov_name {
                 Some(new) => {
                     let cand = sanitize_segment(&new);
                     if !cand.is_empty() && self.seen.insert(cand.clone()) {
                         cand
                     } else {
-                        exposed
+                        base
                     }
                 }
-                None => exposed,
+                None => base,
             };
+            // Policy: disabled / scope / destructive gate on the ORIGINAL downstream
+            // name (server_id + orig); quarantine gates on the final exposed name.
+            if let Some(reason) = self.policy.blocked_reason(&exposed, server_id, orig, tool) {
+                self.blocked.insert(exposed, reason.to_string());
+                continue;
+            }
+            let mut t = tool.clone();
             if let Some(desc) = ov_desc {
                 t["description"] = json!(desc);
             }
@@ -426,22 +562,60 @@ impl Router {
                 .insert(exposed, (server_id.to_string(), orig.to_string()));
         }
 
-        // Resources: pass uris through unchanged (they're already server-scoped)
-        // and remember which server owns each, so resources/read can reach it.
+        // Resources: pass uris through unchanged and remember which server owns
+        // each, so resources/read can reach it. First writer in server add order
+        // owns a colliding bare URI (SOU-325); later claims are refused so a
+        // hostile or overlapping registry entry cannot steal reads.
         for resource in resources {
             if let Some(uri) = resource.get("uri").and_then(|u| u.as_str()) {
-                self.resources.push(resource.clone());
-                self.resource_routes
-                    .insert(uri.to_string(), server_id.to_string());
+                match self.resource_routes.get(uri) {
+                    Some(owner) if owner != server_id => {
+                        eprintln!(
+                            "toolport: resource URI collision on '{uri}': keeping owner '{owner}', refusing claim from '{server_id}'"
+                        );
+                    }
+                    Some(_) => {
+                        // Same server re-advertising the URI (rebuild); keep one entry.
+                    }
+                    None => {
+                        self.resources.push(resource.clone());
+                        self.resource_routes
+                            .insert(uri.to_string(), server_id.to_string());
+                    }
+                }
             }
         }
 
-        // Prompts: namespace names like tools so two servers can't collide.
-        for prompt in prompts {
+        // Resource templates: same first-writer ownership on uriTemplate so
+        // completion and expanded-URI reads stay deterministic under collisions.
+        for template in resource_templates {
+            if let Some(uri_template) = template.get("uriTemplate").and_then(|u| u.as_str()) {
+                match self.template_routes.get(uri_template) {
+                    Some(owner) if owner != server_id => {
+                        eprintln!(
+                            "toolport: resource template collision on '{uri_template}': keeping owner '{owner}', refusing claim from '{server_id}'"
+                        );
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.resource_templates.push(template.clone());
+                        self.template_routes
+                            .insert(uri_template.to_string(), server_id.to_string());
+                    }
+                }
+            }
+        }
+
+        // Prompts: namespace names like tools so two servers can't collide, and
+        // allocate them in the same order-independent way.
+        let prompt_names = self.allocate_exposed_names(server_id, prompts);
+        for (idx, prompt) in prompts.iter().enumerate() {
             let Some(orig) = prompt.get("name").and_then(|n| n.as_str()) else {
                 continue;
             };
-            let exposed = self.exposed_name(server_id, orig);
+            let exposed = prompt_names[idx]
+                .clone()
+                .expect("a prompt with a name always gets an allocated exposed name");
             let mut p = prompt.clone();
             p["name"] = json!(exposed);
             self.prompts.push(p);
@@ -459,7 +633,13 @@ impl Router {
     /// non-reconnectable variant kept for tests and callers with no factory.
     pub fn add_with_reconnect(&mut self, server: DownstreamServer, reconnect: Option<Reconnect>) {
         let id = server.id.clone();
-        self.index_server(&id, &server.tools, &server.resources, &server.prompts);
+        self.index_server(
+            &id,
+            &server.tools,
+            &server.resources,
+            &server.resource_templates,
+            &server.prompts,
+        );
         let idx = self.servers.len();
         self.servers.push(Arc::new(ServerSlot {
             id: id.clone(),
@@ -472,6 +652,38 @@ impl Router {
 
     pub fn server_count(&self) -> usize {
         self.servers.len()
+    }
+
+    /// Allocate exposed names for one server's `items` (tools or prompts),
+    /// returned positionally so the caller keeps the server's own catalog order.
+    ///
+    /// Names are handed out in order of the item's RAW name rather than the order
+    /// the server listed them in. Two names that sanitize to the same string
+    /// (`get-user` and `get_user`) collide, and the loser takes a `_2` suffix;
+    /// allocating in list order meant a downstream that reordered its
+    /// `tools/list` across a refresh swapped that suffix between two real tools.
+    /// The client's cached name then pointed at the *other* tool, so calls kept
+    /// working and silently went somewhere new. Sorting on the raw name makes the
+    /// assignment a property of the tools themselves, so list order can't move it.
+    ///
+    /// Cross-server collisions can't arise here: server ids are slugified to
+    /// `[a-z0-9-]` and `sanitize_segment` only maps `-` to `_`, which is injective
+    /// over that alphabet. So the contested namespace is always within one server.
+    fn allocate_exposed_names(&mut self, server_id: &str, items: &[Value]) -> Vec<Option<String>> {
+        fn raw_name(item: &Value) -> Option<&str> {
+            item.get("name").and_then(|n| n.as_str())
+        }
+        let mut order: Vec<usize> = (0..items.len()).collect();
+        // Ties (a server listing the same raw name twice) fall back to list
+        // position, which keeps the sort total and the result reproducible.
+        order.sort_by(|&a, &b| raw_name(&items[a]).cmp(&raw_name(&items[b])).then(a.cmp(&b)));
+        let mut out = vec![None; items.len()];
+        for i in order {
+            if let Some(orig) = raw_name(&items[i]) {
+                out[i] = Some(self.exposed_name(server_id, orig));
+            }
+        }
+        out
     }
 
     /// Allocate a unique exposed name for `server_id`'s `tool`, sanitizing both
@@ -514,6 +726,8 @@ impl Router {
 
     /// Re-query every live server's resource list (a downstream announced a
     /// `resources/list_changed`) and rebuild the exposed aggregation in place.
+    /// Also refreshes resource templates: MCP has no separate templates
+    /// list-change notification, so this is the protocol-aligned trigger.
     /// Mirrors [`refresh_tools`].
     pub fn refresh_resources(&mut self) {
         for slot in &self.servers {
@@ -562,10 +776,18 @@ impl Router {
         &self.policy.quarantined
     }
 
-    /// Re-derive the exposed tool/resource/prompt aggregation from the current
-    /// servers' (possibly refreshed) lists, in the original add order so exposed
-    /// names and their `_2` collision suffixes stay stable. The server set itself
-    /// is unchanged, so `servers` and `by_id` are kept.
+    /// Why an exposed tool is hidden from the catalog / refused by [`Self::route_call`],
+    /// if it is. Same `blocked` map `route_call` consults — used by post-HITL revalidation
+    /// (SOU-321) so an approval held across a live `requarantine` can fail closed without
+    /// attempting the downstream call.
+    pub fn block_reason(&self, exposed_name: &str) -> Option<&str> {
+        self.blocked.get(exposed_name).map(String::as_str)
+    }
+
+    /// Re-derive the exposed tool/resource/template/prompt aggregation from the
+    /// current servers' (possibly refreshed) lists, in the original add order so
+    /// exposed names and their `_2` collision suffixes stay stable. The server
+    /// set itself is unchanged, so `servers` and `by_id` are kept.
     fn rebuild_aggregation(&mut self) {
         self.tools.clear();
         self.routes.clear();
@@ -573,6 +795,8 @@ impl Router {
         self.blocked.clear();
         self.resources.clear();
         self.resource_routes.clear();
+        self.resource_templates.clear();
+        self.template_routes.clear();
         self.prompts.clear();
         self.prompt_routes.clear();
         // Clone the Arcs (cheap) and snapshot each slot's lists under its lock, so
@@ -580,14 +804,25 @@ impl Router {
         // `&mut self` re-index.
         let slots: Vec<Arc<ServerSlot>> = self.servers.clone();
         for slot in &slots {
-            let (tools, resources, prompts) = {
+            let (tools, resources, resource_templates, prompts) = {
                 let s = slot
                     .inner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (s.tools.clone(), s.resources.clone(), s.prompts.clone())
+                (
+                    s.tools.clone(),
+                    s.resources.clone(),
+                    s.resource_templates.clone(),
+                    s.prompts.clone(),
+                )
             };
-            self.index_server(&slot.id, &tools, &resources, &prompts);
+            self.index_server(
+                &slot.id,
+                &tools,
+                &resources,
+                &resource_templates,
+                &prompts,
+            );
         }
     }
 
@@ -720,14 +955,18 @@ impl Router {
     /// server, so concurrent calls to different servers run in parallel while
     /// calls to the same server (one stdio pipe) serialize.
     pub fn route_call(&self, exposed_name: &str, arguments: Value) -> Result<Value, String> {
-        self.route_call_with_cancel(exposed_name, arguments, None)
+        self.route_call_with_cancel(exposed_name, arguments, None, None)
     }
 
+    /// `meta` carries the upstream client's `params._meta` through to the
+    /// downstream server (SOU-444). The router does not interpret it; the
+    /// downstream layer decides which keys are relayable.
     pub fn route_call_with_cancel(
         &self,
         exposed_name: &str,
         arguments: Value,
         cancel: Option<CancelContext>,
+        meta: Option<&Value>,
     ) -> Result<Value, String> {
         if let Some(reason) = self.blocked.get(exposed_name) {
             return Err(format!("tool '{exposed_name}' is {reason}"));
@@ -735,17 +974,21 @@ impl Router {
         let (server_id, tool) = self
             .routes
             .get(exposed_name)
-            .cloned()
             .ok_or_else(|| format!("no route for tool '{exposed_name}'"))?;
-        let slot = self.slot_for(&server_id)?;
+        let slot = self.slot_for(server_id)?;
         self.call_with_retry(&slot, |server| {
-            server.call_with_cancel(&tool, arguments.clone(), cancel.clone())
+            server.call_with_cancel(tool, arguments.clone(), cancel.clone(), meta)
         })
     }
 
     /// Every downstream resource, uris unchanged.
     pub fn aggregated_resources(&self) -> Vec<Value> {
         self.resources.clone()
+    }
+
+    /// Every downstream resource template, `uriTemplate` values unchanged.
+    pub fn aggregated_resource_templates(&self) -> Vec<Value> {
+        self.resource_templates.clone()
     }
 
     /// Every downstream prompt, with its exposed (namespaced) name.
@@ -755,8 +998,20 @@ impl Router {
 
     /// The server that advertised resource `uri`, if any. Used to scope a registered
     /// HTTP client's resource access to its allowed server set (see the gateway).
+    /// Falls back to template ownership when `uri` is an expansion of a known
+    /// resource template and was never listed as a concrete resource.
     pub fn resource_server(&self, uri: &str) -> Option<&str> {
-        self.resource_routes.get(uri).map(String::as_str)
+        if let Some(owner) = self.resource_routes.get(uri) {
+            return Some(owner.as_str());
+        }
+        self.template_owner_for_uri(uri)
+    }
+
+    /// The server that owns resource template `uri_template`, if any.
+    pub fn resource_template_server(&self, uri_template: &str) -> Option<&str> {
+        self.template_routes
+            .get(uri_template)
+            .map(String::as_str)
     }
 
     /// The server that owns the exposed prompt `name`, if any. Used to scope a
@@ -765,32 +1020,146 @@ impl Router {
         self.prompt_routes.get(exposed_name).map(|(s, _)| s.as_str())
     }
 
-    /// Read a resource by uri from whichever server advertised it. `&self`: locks
-    /// only the owning server (see `route_call`).
+    /// The original (downstream) prompt name for an exposed prompt, if any.
+    pub fn prompt_downstream_name(&self, exposed_name: &str) -> Option<&str> {
+        self.prompt_routes
+            .get(exposed_name)
+            .map(|(_, name)| name.as_str())
+    }
+
+    /// First-writer template whose `uriTemplate` expands to `uri`, if any.
+    fn template_owner_for_uri(&self, uri: &str) -> Option<&str> {
+        for template in &self.resource_templates {
+            let Some(uri_template) = template.get("uriTemplate").and_then(|u| u.as_str()) else {
+                continue;
+            };
+            if uri_matches_template(uri, uri_template) {
+                return self.template_routes.get(uri_template).map(String::as_str);
+            }
+        }
+        None
+    }
+
+    /// Resolve which server owns a `completion/complete` reference, and the
+    /// params to forward (prompt names un-namespaced). Returns
+    /// `(server_id, downstream_params)`.
+    pub fn resolve_completion(
+        &self,
+        params: &Value,
+    ) -> Result<(String, Value), String> {
+        let ref_obj = params
+            .get("ref")
+            .ok_or_else(|| "completion/complete requires params.ref".to_string())?;
+        let ref_type = ref_obj
+            .get("type")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| "completion/complete ref.type is required".to_string())?;
+        let mut forwarded = params.clone();
+        match ref_type {
+            "ref/prompt" => {
+                let exposed = ref_obj
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .ok_or_else(|| "completion/complete ref/prompt requires name".to_string())?;
+                let (server_id, original) = self
+                    .prompt_routes
+                    .get(exposed)
+                    .cloned()
+                    .ok_or_else(|| format!("no route for prompt '{exposed}'"))?;
+                if let Some(name_slot) = forwarded
+                    .get_mut("ref")
+                    .and_then(|r| r.as_object_mut())
+                    .and_then(|r| r.get_mut("name"))
+                {
+                    *name_slot = json!(original);
+                }
+                Ok((server_id, forwarded))
+            }
+            "ref/resource" => {
+                let uri = ref_obj
+                    .get("uri")
+                    .and_then(|u| u.as_str())
+                    .ok_or_else(|| "completion/complete ref/resource requires uri".to_string())?;
+                // Prefer exact template ownership; fall back to matching an
+                // expanded URI against known templates (and then concrete resources).
+                let server_id = self
+                    .template_routes
+                    .get(uri)
+                    .cloned()
+                    .or_else(|| self.resource_server(uri).map(str::to_string))
+                    .ok_or_else(|| {
+                        format!("no server owns resource template or uri '{uri}'")
+                    })?;
+                Ok((server_id, forwarded))
+            }
+            other => Err(format!("unsupported completion ref type '{other}'")),
+        }
+    }
+
+    /// Read a resource by uri from whichever server advertised it (or owns a
+    /// matching resource template). `&self`: locks only the owning server
+    /// (see `route_call`).
     pub fn read_resource(&self, uri: &str) -> Result<Value, String> {
-        self.read_resource_with_cancel(uri, None)
+        self.read_resource_with_cancel(uri, None, None)
     }
 
     pub fn read_resource_with_cancel(
         &self,
         uri: &str,
         cancel: Option<CancelContext>,
+        meta: Option<&Value>,
     ) -> Result<Value, String> {
         let server_id = self
-            .resource_routes
-            .get(uri)
-            .cloned()
-            .ok_or_else(|| format!("no server owns resource '{uri}'"))?;
+            .resource_server(uri)
+            .ok_or_else(|| format!("no server owns resource '{uri}'"))?
+            .to_string();
         let slot = self.slot_for(&server_id)?;
         self.call_with_retry(&slot, |server| {
-            server.read_resource_with_cancel(uri, cancel.clone())
+            server.read_resource_with_cancel(uri, cancel.clone(), meta)
         })
+    }
+
+    /// Subscribe to resource-updated notifications on the owning downstream
+    /// (concrete first-writer, then template expansion — same as
+    /// [`read_resource`]). SOU-394.
+    pub fn subscribe_resource(&self, uri: &str) -> Result<Value, String> {
+        let server_id = self
+            .resource_server(uri)
+            .ok_or_else(|| format!("no server owns resource '{uri}'"))?
+            .to_string();
+        let slot = self.slot_for(&server_id)?;
+        self.call_with_retry(&slot, |server| server.subscribe_resource(uri))
+    }
+
+    /// Unsubscribe from resource-updated notifications on the owning downstream
+    /// (resolved from current aggregation). Prefer
+    /// [`unsubscribe_resource_on_server`] when the original owner was recorded
+    /// at subscribe time so rebuild ownership drift cannot redirect the unsub.
+    pub fn unsubscribe_resource(&self, uri: &str) -> Result<Value, String> {
+        let server_id = self
+            .resource_server(uri)
+            .ok_or_else(|| format!("no server owns resource '{uri}'"))?
+            .to_string();
+        self.unsubscribe_resource_on_server(&server_id, uri)
+    }
+
+    /// Unsubscribe on a specific downstream server id (the owner recorded when
+    /// the first upstream client subscribed). Used for session cleanup and
+    /// last-holder unsub so a later ownership change cannot leave a live sub
+    /// on the original server or hit the wrong one.
+    pub fn unsubscribe_resource_on_server(
+        &self,
+        server_id: &str,
+        uri: &str,
+    ) -> Result<Value, String> {
+        let slot = self.slot_for(server_id)?;
+        self.call_with_retry(&slot, |server| server.unsubscribe_resource(uri))
     }
 
     /// Get a prompt by its exposed name, forwarding the server's real name.
     /// `&self`: locks only the owning server (see `route_call`).
     pub fn get_prompt(&self, exposed_name: &str, arguments: Value) -> Result<Value, String> {
-        self.get_prompt_with_cancel(exposed_name, arguments, None)
+        self.get_prompt_with_cancel(exposed_name, arguments, None, None)
     }
 
     pub fn get_prompt_with_cancel(
@@ -798,6 +1167,7 @@ impl Router {
         exposed_name: &str,
         arguments: Value,
         cancel: Option<CancelContext>,
+        meta: Option<&Value>,
     ) -> Result<Value, String> {
         let (server_id, name) = self
             .prompt_routes
@@ -806,7 +1176,28 @@ impl Router {
             .ok_or_else(|| format!("no route for prompt '{exposed_name}'"))?;
         let slot = self.slot_for(&server_id)?;
         self.call_with_retry(&slot, |server| {
-            server.get_prompt_with_cancel(&name, arguments.clone(), cancel.clone())
+            server.get_prompt_with_cancel(&name, arguments.clone(), cancel.clone(), meta)
+        })
+    }
+
+    /// Forward `completion/complete` to the owning downstream server, remapping
+    /// namespaced prompt names back to the server's original names.
+    pub fn complete(&self, params: Value) -> Result<Value, String> {
+        self.complete_with_cancel(params, None)
+    }
+
+    pub fn complete_with_cancel(
+        &self,
+        params: Value,
+        cancel: Option<CancelContext>,
+    ) -> Result<Value, String> {
+        let (server_id, mut forwarded) = self.resolve_completion(&params)?;
+        // This path forwards the client's params wholesale, so it needs the same
+        // per-hop `_meta` stripping the rebuilt paths get (SOU-444).
+        crate::downstream::sanitize_forwarded_meta(&mut forwarded);
+        let slot = self.slot_for(&server_id)?;
+        self.call_with_retry(&slot, |server| {
+            server.complete_with_cancel(forwarded.clone(), cancel.clone())
         })
     }
 }
@@ -942,7 +1333,7 @@ mod tests {
             match method {
                 "initialize" => Ok(json!({
                     "protocolVersion": "2025-06-18",
-                    "capabilities": { "resources": {}, "prompts": {} }
+                    "capabilities": { "resources": {}, "prompts": {}, "completions": {} }
                 })),
                 "tools/list" => Ok(json!({
                     "tools": [
@@ -962,9 +1353,22 @@ mod tests {
                         { "uri": format!("{}://readme", self.label), "name": "readme" }
                     ]
                 })),
+                "resources/templates/list" => Ok(json!({
+                    "resourceTemplates": [
+                        {
+                            "uriTemplate": format!("{}://item/{{id}}", self.label),
+                            "name": "item",
+                            "description": "An item by id"
+                        }
+                    ]
+                })),
                 "resources/read" => {
                     let uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
                     Ok(json!({ "contents": [{ "uri": uri, "text": format!("{}-body", self.label) }] }))
+                }
+                "resources/subscribe" | "resources/unsubscribe" => {
+                    let uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+                    Ok(json!({ "uri": uri, "via": self.label }))
                 }
                 "prompts/list" => Ok(json!({
                     "prompts": [{ "name": "greet", "description": "greeting" }]
@@ -972,6 +1376,40 @@ mod tests {
                 "prompts/get" => {
                     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     Ok(json!({ "messages": [{ "role": "user", "content": format!("{}:{}", self.label, name) }] }))
+                }
+                "completion/complete" => {
+                    let ref_type = params
+                        .pointer("/ref/type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+                    let arg = params
+                        .pointer("/argument/value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let label = match ref_type {
+                        "ref/prompt" => {
+                            let name = params
+                                .pointer("/ref/name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("");
+                            format!("{}:prompt:{name}:{arg}", self.label)
+                        }
+                        "ref/resource" => {
+                            let uri = params
+                                .pointer("/ref/uri")
+                                .and_then(|u| u.as_str())
+                                .unwrap_or("");
+                            format!("{}:resource:{uri}:{arg}", self.label)
+                        }
+                        other => format!("{}:unknown:{other}", self.label),
+                    };
+                    Ok(json!({
+                        "completion": {
+                            "values": [label],
+                            "total": 1,
+                            "hasMore": false
+                        }
+                    }))
                 }
                 other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
             }
@@ -1154,6 +1592,135 @@ mod tests {
         assert_eq!(out["content"][0]["text"], "srv:echo");
         let out = router.route_call("srv__add", json!({})).unwrap();
         assert_eq!(out["content"][0]["text"], "srv:add");
+    }
+
+    #[test]
+    fn quarantine_follows_a_renamed_tool_by_its_exposed_name() {
+        // #423: quarantine is keyed by the client-facing (exposed) name. A tool renamed
+        // via an override must be quarantined under its RENAMED name, and blocking must
+        // key on that same name. The old code evaluated the policy on the pre-rename base
+        // name, so a renamed tool could never be quarantined: the app showed it blocked
+        // while the gateway kept exposing and routing it.
+        let mut srv = HashMap::new();
+        srv.insert(
+            "echo".to_string(),
+            ToolOverride { name: Some("say".into()), description: None },
+        );
+        let policy = ToolPolicy {
+            quarantined: BTreeSet::from(["say".to_string()]),
+            ..Default::default()
+        };
+        let mut router = Router::with_policy(policy);
+        router.set_overrides(HashMap::from([("srv".to_string(), srv)]));
+        router.add(mock_server("srv"));
+
+        // The renamed tool is hidden from the catalog...
+        let names: Vec<String> = router
+            .aggregated_tools()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        assert!(!names.contains(&"say".to_string()), "quarantined rename must be hidden");
+        // ...and blocked on a direct call, with the quarantine reason.
+        let err = router.route_call("say", json!({})).unwrap_err();
+        assert!(err.contains("quarantine"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn a_stale_pre_rename_quarantine_entry_does_not_block_the_renamed_tool() {
+        // The mirror of the above: quarantining the OLD exposed name (srv__echo) must NOT
+        // block the tool now exposed as "say", so the fix doesn't just swap which name is
+        // wrong. A stale entry from before a rename is inert, not a silent block.
+        let mut srv = HashMap::new();
+        srv.insert(
+            "echo".to_string(),
+            ToolOverride { name: Some("say".into()), description: None },
+        );
+        let policy = ToolPolicy {
+            quarantined: BTreeSet::from(["srv__echo".to_string()]),
+            ..Default::default()
+        };
+        let mut router = Router::with_policy(policy);
+        router.set_overrides(HashMap::from([("srv".to_string(), srv)]));
+        router.add(mock_server("srv"));
+
+        assert_eq!(router.route_of("say"), Some(("srv", "echo")));
+        assert!(router.route_call("say", json!({})).is_ok(), "stale entry must not block");
+    }
+
+    #[test]
+    fn renamed_tool_quarantines_and_releases_end_to_end() {
+        // #423 end-to-end through REAL integrity persistence and a REAL router, beyond the
+        // unit tests that hand-set the quarantine set: a tool renamed to an exposed name
+        // with no `__` drifts, integrity quarantines that renamed name to disk, the router
+        // reads it back and blocks the call, then a re-approve restores it. This is the
+        // whole chain the app relies on.
+        use crate::integrity;
+        // Isolate persistence: hold the shared lock EVERY conduit_dir-resolving test takes
+        // (#409's invariant, since this touches integrity's on-disk store indirectly), and
+        // redirect the data dir to a scratch path so nothing hits the real one (#400).
+        let _lock = crate::registry::data_dir_test_lock();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-rename-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data_dir = crate::registry::DataDirOverride::set(&scratch);
+        let profile = Some("rename-e2e");
+
+        // Rename srv/echo -> "search" (an exposed name with NO `server__` prefix).
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "echo".to_string(),
+            ToolOverride { name: Some("search".into()), description: None },
+        );
+        let mut router = Router::new();
+        router.set_overrides(HashMap::from([("srv".to_string(), overrides)]));
+        router.add(mock_server("srv"));
+
+        // Sanity: exposed under the renamed name, routes to the real tool, callable.
+        assert_eq!(router.route_of("search"), Some(("srv", "echo")));
+        assert!(router.route_call("search", json!({})).is_ok());
+
+        // The server ships a poisoned redefinition. integrity quarantines the RENAMED
+        // exposed name - only reachable because #423 stopped skipping non-`__` tools.
+        let current = router.aggregated_tools();
+        let events = vec![json!({
+            "server": "srv", "tool": "search", "change": "poison", "severity": "high"
+        })];
+        assert!(
+            integrity::apply_quarantine(profile, &current, &events),
+            "a poison drift on a renamed tool must quarantine it"
+        );
+
+        // The persisted set the watcher reads carries the renamed name...
+        let persisted = integrity::quarantined(profile).expect("quarantine store readable");
+        assert!(persisted.contains("search"), "quarantine is keyed by the exposed name");
+
+        // ...and feeding it to the router hides and blocks the renamed tool.
+        router.requarantine(persisted);
+        let visible: Vec<String> = router
+            .aggregated_tools()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        assert!(!visible.contains(&"search".to_string()), "quarantined rename must be hidden");
+        let err = router.route_call("search", json!({})).unwrap_err();
+        assert!(err.contains("quarantine"), "a call to a quarantined rename must block: {err}");
+
+        // Re-approve: release clears the persisted set and the router restores the tool.
+        assert!(integrity::release(profile, "search"), "release must clear the entry");
+        let after = integrity::quarantined(profile).expect("quarantine store readable");
+        assert!(!after.contains("search"), "a released tool leaves the persisted set");
+        router.requarantine(after);
+        assert!(
+            router.route_call("search", json!({})).is_ok(),
+            "a re-approved renamed tool must work again"
+        );
+
+        // Clear the override before removing the scratch dir it points at; the lock is
+        // released at end of scope.
+        drop(_data_dir);
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[test]
@@ -1350,6 +1917,19 @@ mod tests {
     }
 
     #[test]
+    fn block_reason_matches_route_call_blocked_map() {
+        let mut policy = ToolPolicy::default();
+        policy.quarantined = ["github__echo".to_string()].into_iter().collect();
+        let mut router = Router::with_policy(policy);
+        router.add(mock_server("github"));
+
+        assert!(router.block_reason("github__add").is_none());
+        assert_eq!(router.block_reason("github__echo").map(|r| r.contains("quarantined")), Some(true));
+        let err = router.route_call("github__echo", json!({})).unwrap_err();
+        assert!(err.contains("quarantined"), "unexpected: {err}");
+    }
+
+    #[test]
     fn aggregates_and_routes_resources() {
         let mut router = Router::new();
         router.add(mock_server("github"));
@@ -1367,6 +1947,171 @@ mod tests {
         let result = router.read_resource("postgres://readme").unwrap();
         assert_eq!(result["contents"][0]["text"], "postgres-body");
         assert!(router.read_resource("nope://x").is_err());
+    }
+
+    #[test]
+    fn aggregates_and_routes_resource_templates() {
+        let mut router = Router::new();
+        router.add(mock_server("github"));
+        router.add(mock_server("postgres"));
+
+        let templates: Vec<String> = router
+            .aggregated_resource_templates()
+            .iter()
+            .filter_map(|t| {
+                t.get("uriTemplate")
+                    .and_then(|u| u.as_str())
+                    .map(String::from)
+            })
+            .collect();
+        assert_eq!(
+            templates,
+            vec!["github://item/{id}", "postgres://item/{id}"]
+        );
+        assert_eq!(
+            router.resource_template_server("github://item/{id}"),
+            Some("github")
+        );
+        // Expanded template URI routes to the owning server.
+        assert_eq!(
+            router.resource_server("postgres://item/42"),
+            Some("postgres")
+        );
+        let result = router.read_resource("postgres://item/42").unwrap();
+        assert_eq!(result["contents"][0]["text"], "postgres-body");
+        // Subscribe/unsubscribe use the same ownership path as read (SOU-394).
+        let sub = router.subscribe_resource("postgres://item/42").unwrap();
+        assert_eq!(sub["via"], "postgres");
+        let unsub = router.unsubscribe_resource("postgres://item/42").unwrap();
+        assert_eq!(unsub["via"], "postgres");
+        // Owner-pinned unsub (recorded at subscribe time) hits that server even
+        // without re-resolving the URI.
+        let unsub_on = router
+            .unsubscribe_resource_on_server("postgres", "postgres://item/42")
+            .unwrap();
+        assert_eq!(unsub_on["via"], "postgres");
+        // Unknown server id fails closed.
+        assert!(router
+            .unsubscribe_resource_on_server("no-such-server", "postgres://item/42")
+            .is_err());
+    }
+
+    #[test]
+    fn resource_uri_collision_keeps_first_writer() {
+        // Two servers advertise the same bare URI: first add order owns it
+        // (SOU-325). Later claims must not steal reads.
+        struct CollisionTransport {
+            label: String,
+        }
+        impl Transport for CollisionTransport {
+            fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
+                match method {
+                    "initialize" => Ok(json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": { "resources": {} }
+                    })),
+                    "tools/list" => Ok(json!({ "tools": [] })),
+                    "resources/list" => Ok(json!({
+                        "resources": [{ "uri": "shared://readme", "name": "readme" }]
+                    })),
+                    "resources/templates/list" => Ok(json!({
+                        "resourceTemplates": [{
+                            "uriTemplate": "shared://item/{id}",
+                            "name": "item"
+                        }]
+                    })),
+                    "resources/read" => {
+                        let uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+                        Ok(json!({
+                            "contents": [{ "uri": uri, "text": format!("{}-body", self.label) }]
+                        }))
+                    }
+                    "resources/subscribe" | "resources/unsubscribe" => {
+                        Ok(json!({ "via": self.label }))
+                    }
+                    other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
+                }
+            }
+            fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+        fn collision_server(id: &str) -> DownstreamServer {
+            let mut ds = DownstreamServer::connect(
+                id.to_string(),
+                Box::new(CollisionTransport {
+                    label: id.to_string(),
+                }),
+            )
+            .unwrap();
+            ds.load_resources_prompts();
+            ds
+        }
+
+        let mut router = Router::new();
+        router.add(collision_server("alpha"));
+        router.add(collision_server("beta"));
+
+        assert_eq!(router.resource_server("shared://readme"), Some("alpha"));
+        assert_eq!(
+            router.resource_template_server("shared://item/{id}"),
+            Some("alpha")
+        );
+        // Only the first writer's copy is listed.
+        assert_eq!(router.aggregated_resources().len(), 1);
+        assert_eq!(router.aggregated_resource_templates().len(), 1);
+        let result = router.read_resource("shared://readme").unwrap();
+        assert_eq!(result["contents"][0]["text"], "alpha-body");
+        let expanded = router.read_resource("shared://item/7").unwrap();
+        assert_eq!(expanded["contents"][0]["text"], "alpha-body");
+    }
+
+    #[test]
+    fn completion_forwards_prompt_and_resource_template_refs() {
+        let mut router = Router::new();
+        router.add(mock_server("github"));
+        router.add(mock_server("postgres"));
+
+        // Prompt completion: remaps namespaced name back to downstream "greet".
+        let prompt = router
+            .complete(json!({
+                "ref": { "type": "ref/prompt", "name": "github__greet" },
+                "argument": { "name": "topic", "value": "py" }
+            }))
+            .unwrap();
+        assert_eq!(
+            prompt["completion"]["values"][0],
+            "github:prompt:greet:py"
+        );
+
+        // Resource-template completion: routes by uriTemplate ownership.
+        let resource = router
+            .complete(json!({
+                "ref": { "type": "ref/resource", "uri": "postgres://item/{id}" },
+                "argument": { "name": "id", "value": "4" }
+            }))
+            .unwrap();
+        assert_eq!(
+            resource["completion"]["values"][0],
+            "postgres:resource:postgres://item/{id}:4"
+        );
+    }
+
+    #[test]
+    fn uri_template_matching_handles_level1_placeholders() {
+        assert!(uri_matches_template(
+            "fixture://item/06",
+            "fixture://item/{id}"
+        ));
+        assert!(!uri_matches_template(
+            "fixture://item/06/extra",
+            "fixture://item/{id}"
+        ));
+        assert!(uri_matches_template(
+            "file:///a/b/c.txt",
+            "file:///{+path}"
+        ));
+        assert!(!uri_matches_template("other://x", "fixture://item/{id}"));
     }
 
     #[test]
@@ -1425,6 +2170,7 @@ mod tests {
                 "s__echo",
                 json!({}),
                 Some(registry.context("99".to_string())),
+                None,
             )
             .unwrap();
 
@@ -1533,6 +2279,69 @@ mod tests {
         assert_eq!(before, vec!["s__a_b", "s__a_b_2"]);
         router.refresh_tools();
         assert_eq!(names(&router), before, "refresh shuffled the collision suffixes");
+    }
+
+    #[test]
+    fn reordered_tool_list_keeps_each_tool_its_own_exposed_name() {
+        // The dangerous variant of the test above: the server doesn't just get
+        // re-queried, it comes back listing the SAME two colliding tools in the
+        // opposite order. Allocating suffixes by list position swapped `_2`
+        // between them, so the client's cached `s__a_b` silently started routing
+        // to `a_b` instead of `a-b` — calls kept succeeding and went to the wrong
+        // tool. The exposed name must be a property of the tool, not its position.
+        struct ReorderMock {
+            calls: AtomicU32,
+        }
+        impl Transport for ReorderMock {
+            fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+                match method {
+                    "initialize" => Ok(json!({ "protocolVersion": "2025-06-18" })),
+                    "tools/list" => {
+                        let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+                        // Same two tools, flipped on the second listing.
+                        Ok(if first {
+                            json!({ "tools": [
+                                { "name": "a-b", "description": "one" },
+                                { "name": "a_b", "description": "two" }
+                            ] })
+                        } else {
+                            json!({ "tools": [
+                                { "name": "a_b", "description": "two" },
+                                { "name": "a-b", "description": "one" }
+                            ] })
+                        })
+                    }
+                    other => Err(TransportError::Fatal(format!("unexpected {other}"))),
+                }
+            }
+            fn notify(&mut self, _m: &str, _p: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let mut router = Router::new();
+        router.add(
+            DownstreamServer::connect(
+                "s".to_string(),
+                Box::new(ReorderMock {
+                    calls: AtomicU32::new(0),
+                }),
+            )
+            .unwrap(),
+        );
+        // Assert the ROUTE, not just the name set: both names exist either way,
+        // so only the mapping reveals the swap.
+        assert_eq!(router.route_of("s__a_b"), Some(("s", "a-b")));
+        assert_eq!(router.route_of("s__a_b_2"), Some(("s", "a_b")));
+
+        router.refresh_tools();
+
+        assert_eq!(
+            router.route_of("s__a_b"),
+            Some(("s", "a-b")),
+            "a reordered tools/list re-pointed a cached exposed name at a different tool"
+        );
+        assert_eq!(router.route_of("s__a_b_2"), Some(("s", "a_b")));
     }
 
     /// Shared retry-capable mock used to exercise the Router helper.

@@ -8,9 +8,11 @@
 //! Secrets are never stored here. Env vars marked `secret` keep their value in
 //! the OS keychain; this file only records that a secret exists.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::router::sanitize_segment;
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -293,15 +295,17 @@ pub struct Registry {
     pub team_forced_human_approval: bool,
     /// The same releasable org-lock treatment as [`team_forced_human_approval`] for the other
     /// tighten-only screening flags (`denyDestructive`, `forceContentDefense`,
-    /// `forceQuarantineOnDrift`). Set from the active team's policy, recomputed each sync and
-    /// cleared on leave, so an org lock never permanently overwrites the member's own setting.
-    /// Enforcement reads `*_effective()` (member's own OR team-forced).
+    /// `forceQuarantineOnDrift`, `forceBlockOnInjection`). Set from the active team's policy,
+    /// recomputed each sync and cleared on leave, so an org lock never permanently overwrites
+    /// the member's own setting. Enforcement reads `*_effective()` (member's own OR team-forced).
     #[serde(default)]
     pub team_forced_deny_destructive: bool,
     #[serde(default)]
     pub team_forced_content_defense: bool,
     #[serde(default)]
     pub team_forced_quarantine_on_drift: bool,
+    #[serde(default)]
+    pub team_forced_block_on_injection: bool,
     /// Per-tool exposure overrides, keyed by server id then ORIGINAL tool name (not the
     /// exposed name, so a rename or `_2` collision suffix can't misalign the key): rename or
     /// re-describe a tool as clients see it (e.g. neutralize a poisoned description). The
@@ -336,12 +340,15 @@ pub struct Registry {
     /// browse per-server instead of searching - instead of setting a per-client env var.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_mode: Option<String>,
-    /// Opt-in server-side "code mode": advertise the `toolport_run_script` meta-tool so an
+    /// Server-side "code mode": advertise the `toolport_run_script` meta-tool so an
     /// agent can orchestrate many downstream tool calls in one sandboxed JS script (a single
-    /// round-trip). Off by default, since agent-supplied server-side JS is a powerful surface.
-    /// The gateway reads this from the registry, so it applies to every client; an explicit
-    /// `CONDUIT_CODE_MODE=1` still force-enables regardless.
-    #[serde(default)]
+    /// round-trip). **On by default** (SOU-397): each in-script call still hits the same
+    /// scope / approval gates as `toolport_call_tool`, and Settings is the kill switch.
+    /// Code mode is not a security boundary (agent-supplied JS). Shared/HTTP multi-tenant
+    /// operators who do not want the surface can turn it off in Settings or set
+    /// `"codeMode": false` in the registry. `TOOLPORT_CODE_MODE=1` (legacy
+    /// `CONDUIT_CODE_MODE`) still force-enables regardless of the toggle.
+    #[serde(default = "default_true")]
     pub code_mode: bool,
     /// Opt-in agent control: when true, an agent may turn servers on or off via
     /// the gateway's `conduit_enable_server` / `conduit_disable_server` tools.
@@ -358,9 +365,21 @@ pub struct Registry {
     pub integrity_check: bool,
     /// Content defense (anti-agentjacking): scan untrusted tool RESULTS for injection
     /// and label flagged content as data, not instructions, before the agent sees it.
-    /// Detection + labeling, never blocks. On by default.
+    /// Detection + labeling. On by default. Pair with [`block_on_injection`] to fail closed
+    /// on high-confidence hits (SOU-345).
     #[serde(default = "default_true")]
     pub content_defense: bool,
+    /// Opt-in fail-closed content defense (SOU-345): when true (or team-forced), a
+    /// high-confidence injection hit fails the call instead of only labeling. Off by
+    /// default so v1 label-only behavior is preserved. Per-server exempt list:
+    /// [`injection_block_exempt`].
+    #[serde(default)]
+    pub block_on_injection: bool,
+    /// Server ids for which block-on-injection never applies (label only), even when
+    /// global/org block mode is on. For servers that legitimately return prompty text.
+    /// Key present with `true` = exempt. Same shape as other per-server maps.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub injection_block_exempt: HashMap<String, bool>,
     /// Live request/response inspection: when true, the gateway captures each tool
     /// call's arguments and result into a small, separate, ephemeral local ring
     /// (`inspect.jsonl`, last 50 calls, each body size-capped) so the Activity view
@@ -406,6 +425,12 @@ pub struct Registry {
     /// reinstalling the client (same mechanism as `client_scopes`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub client_discovery: HashMap<String, String>,
+    /// What Toolport last wrote into each client's config as its gateway entry
+    /// (command/args/env), keyed by client id. Used to distinguish a managed install
+    /// from a hand-edited entry under the same name (SOU-406 / #487). Absent = pre-
+    /// ownership install; fall back to the command-basename heuristic.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub client_managed_entries: HashMap<String, ManagedEntry>,
     /// Consumers registered to reach the gateway over the HTTP/OpenAPI bridge,
     /// each with its own hashed bearer token and scope. Empty = the bridge uses
     /// only the legacy single `CONDUIT_HTTP_TOKEN` (back-compat).
@@ -424,6 +449,101 @@ pub struct Registry {
     /// pass-through-safe.
     #[serde(flatten)]
     pub unknown_fields: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Snapshot of the gateway entry Toolport last wrote into a client config (SOU-406).
+/// Compared against the live entry on detect so a deliberate hand-edit is not treated
+/// as a stale install. Bearer tokens are never stored here (stripped from env/args).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedEntry {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Env key→value pairs we wrote (non-secret only: client id / profile).
+    /// `BTreeMap` keeps serde order stable for equality checks. Authorization is stripped.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// `"stdio"` (default) or `"sharedHttp"` (SOU-407).
+    #[serde(default = "managed_transport_stdio")]
+    pub transport: String,
+    /// Shared-HTTP MCP URL when `transport` is `sharedHttp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Unix epoch seconds when we last wrote this entry.
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+fn managed_transport_stdio() -> String {
+    "stdio".into()
+}
+
+impl ManagedEntry {
+    /// Build a record from the [`ServerEntry`] we are about to (or just did) write.
+    /// Strips bearer tokens so the registry never holds HTTP credentials.
+    pub fn from_gateway_entry(entry: &ServerEntry) -> Self {
+        let env = entry
+            .env
+            .iter()
+            .filter(|e| !e.key.eq_ignore_ascii_case("authorization"))
+            .filter_map(|e| {
+                e.value
+                    .as_ref()
+                    .map(|v| (e.key.clone(), v.clone()))
+            })
+            .collect();
+        let args = strip_auth_header_args(&entry.args);
+        let is_bridge = entry
+            .command
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case("npx"))
+            && entry.args.iter().any(|a| a == "mcp-remote");
+        let is_shared = entry.url.is_some() || is_bridge;
+        Self {
+            command: entry.command.clone().unwrap_or_default(),
+            args,
+            env,
+            transport: if is_shared {
+                "sharedHttp".into()
+            } else {
+                "stdio".into()
+            },
+            url: entry.url.clone().or_else(|| {
+                // Bridge form: URL is an mcp-remote arg.
+                entry
+                    .args
+                    .iter()
+                    .find(|a| a.starts_with("http://") || a.starts_with("https://"))
+                    .cloned()
+            }),
+            updated_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// Drop `--header` / `Authorization: …` pairs so ownership records stay non-secret.
+pub fn strip_auth_header_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--header" {
+            // Skip flag and its value (often `Authorization: Bearer …`).
+            i += 2;
+            continue;
+        }
+        if a.to_ascii_lowercase().starts_with("authorization:") {
+            i += 1;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    out
 }
 
 /// A joined Conduit Teams server. Holds only non-secret connection metadata; the
@@ -472,6 +592,29 @@ pub struct TeamConnection {
     /// receipt isn't re-POSTed every ~25s sync. `None` = nothing reported yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_instructions_reported: Option<String>,
+    /// Local ms-epoch of the last successful instructions-receipt POST. A matching fingerprint
+    /// still re-sends after ~12h so the server's `instructions_status_at` stays fresh and the
+    /// dashboard does not mark an actively-syncing member stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_instructions_reported_at: Option<i64>,
+    /// Hash of the screening-policy apply receipt last successfully sent (SOU-339). Same
+    /// dedup role as `team_instructions_reported`. `None` = nothing reported yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_policy_reported: Option<String>,
+    /// Local ms-epoch of the last successful policy-receipt POST (SOU-339 heartbeat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_policy_reported_at: Option<i64>,
+    /// Highest audit `ts` successfully uploaded for SOU-171 call-event export. `None` = never.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_audit_export_cursor: Option<u64>,
+    /// Org opt-in: export per-call audit events to the team server (SOU-171). Set from the
+    /// last pulled team config's `callAuditExport` flag.
+    #[serde(default)]
+    pub call_audit_export: bool,
+    /// Tool-call caps from the last config pull (SOU-340). Resolved for this member by
+    /// the team server; empty = no org caps. Enforced cooperatively in the local gateway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rate_limits: Vec<crate::rate_limits::Cap>,
 }
 
 /// Settings for embedding-based search re-ranking. The embedding API key, if the
@@ -525,15 +668,18 @@ impl Default for Registry {
             team_forced_deny_destructive: false,
             team_forced_content_defense: false,
             team_forced_quarantine_on_drift: false,
+            team_forced_block_on_injection: false,
             tool_overrides: HashMap::new(),
             pinned_tools: HashMap::new(),
             quarantine_on_drift: false,
             lazy_discovery: true,
             discovery_mode: None,
-            code_mode: false,
+            code_mode: true,
             allow_agent_control: false,
             integrity_check: true,
             content_defense: true,
+            block_on_injection: false,
+            injection_block_exempt: HashMap::new(),
             live_inspect: false,
             semantic_search: SemanticSettings::default(),
             team: None,
@@ -541,6 +687,7 @@ impl Default for Registry {
             client_scopes: HashMap::new(),
             folder_profiles: Vec::new(),
             client_discovery: HashMap::new(),
+            client_managed_entries: HashMap::new(),
             http_clients: Vec::new(),
             secrets_generation: 0,
             unknown_fields: serde_json::Map::new(),
@@ -616,6 +763,14 @@ impl Registry {
             // Drop any tool-scope allow-list for the removed server so it can't orphan.
             profile.tool_scope.remove(id);
         }
+        self.tool_overrides.remove(id);
+        self.pinned_tools.remove(id);
+
+        let sanitized_id = sanitize_segment(id);
+        let prefix = format!("{sanitized_id}/");
+        self.injection_block_exempt.remove(&sanitized_id);
+        self.result_budgets.remove(&sanitized_id);
+        self.human_approval_allow.retain(|k| !k.starts_with(&prefix));
         Ok(())
     }
 
@@ -813,6 +968,23 @@ impl Registry {
     }
     pub fn quarantine_on_drift_effective(&self) -> bool {
         self.quarantine_on_drift || self.team_forced_quarantine_on_drift
+    }
+    /// Member's own OR team-forced fail-closed injection block (SOU-345).
+    pub fn block_on_injection_effective(&self) -> bool {
+        self.block_on_injection || self.team_forced_block_on_injection
+    }
+    /// Whether this server should fail closed on a high-confidence injection hit:
+    /// block mode effective, and the server is not on the exempt list.
+    pub fn should_block_injection_for(&self, server: &str) -> bool {
+        if !self.block_on_injection_effective() {
+            return false;
+        }
+        // Exempt only when the map explicitly sets the server to true.
+        !self
+            .injection_block_exempt
+            .get(server)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Add a `server/tool` key to the persistent "always allow" list, so the HITL gate
@@ -1065,6 +1237,22 @@ impl Registry {
         self.client_discovery.get(client_id).map(String::as_str)
     }
 
+    /// Record what we just wrote into a client's gateway entry (SOU-406).
+    pub fn set_client_managed_entry(&mut self, client_id: &str, entry: ManagedEntry) {
+        self.client_managed_entries
+            .insert(client_id.to_string(), entry);
+    }
+
+    /// Clear the ownership record (uninstall or explicit forget).
+    pub fn clear_client_managed_entry(&mut self, client_id: &str) {
+        self.client_managed_entries.remove(client_id);
+    }
+
+    /// What we last wrote for this client, if anything.
+    pub fn client_managed_entry(&self, client_id: &str) -> Option<&ManagedEntry> {
+        self.client_managed_entries.get(client_id)
+    }
+
     /// Record that a client is *explicitly* unscoped: it follows the active
     /// profile (the full connected set), and we want that to apply live. This is
     /// deliberately distinct from having no entry at all: an empty-string marker
@@ -1089,14 +1277,12 @@ impl Registry {
     }
 }
 
-/// Leaf directory name under the OS config root (`Conduit` release, `Conduit-dev`
-/// for debug/`tauri dev` builds). Override the full path with `CONDUIT_DATA_DIR`.
+/// Leaf directory name under the OS config root (`Toolport` release, `Toolport-dev`
+/// for debug/`tauri dev` builds). Override the full path with `TOOLPORT_DATA_DIR`
+/// (legacy: `CONDUIT_DATA_DIR`). Existing `Conduit` / `Conduit-dev` dirs are migrated
+/// in place by [`crate::brand::resolve_data_dir_under`] when safe.
 pub(crate) fn data_dir_leaf_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "Conduit-dev"
-    } else {
-        "Conduit"
-    }
+    crate::brand::data_dir_leaf_name()
 }
 
 /// How [`conduit_dir`] was resolved, for startup diagnostics. Only Windows has
@@ -1115,31 +1301,32 @@ pub enum DirResolution {
     VirtualizedFallback,
 }
 
-/// Conduit's data dir, anchored so every process agrees regardless of launch
+/// Toolport's data dir, anchored so every process agrees regardless of launch
 /// context.
 ///
-/// On Windows this is `%USERPROFILE%\AppData\Roaming\Conduit`. Spelling the path
-/// out (instead of the APPDATA known folder) is NOT enough to agree across
-/// processes: a gateway spawned by an MSIX-packaged client (e.g. Claude Desktop)
-/// runs inside that app's container, whose filesystem filter redirects opens
-/// under `AppData\Roaming` - by ANY path spelling, home-derived or not - into
-/// the package's `LocalCache` shadow copy, which can be days stale. (Verified
-/// empirically 2026-07-05: a probe file written to `%APPDATA%` from inside the
-/// Claude container landed in the package `LocalCache`. An earlier version of
-/// this comment claimed home-derived paths escape the redirect; that is false.)
+/// On Windows this is `%USERPROFILE%\AppData\Roaming\Toolport` (migrated from the
+/// pre-rename `…\Conduit` leaf when safe). Spelling the path out (instead of the
+/// APPDATA known folder) is NOT enough to agree across processes: a gateway
+/// spawned by an MSIX-packaged client (e.g. Claude Desktop) runs inside that app's
+/// container, whose filesystem filter redirects opens under `AppData\Roaming` -
+/// by ANY path spelling, home-derived or not - into the package's `LocalCache`
+/// shadow copy, which can be days stale. (Verified empirically 2026-07-05: a
+/// probe file written to `%APPDATA%` from inside the Claude container landed in
+/// the package `LocalCache`. An earlier version of this comment claimed
+/// home-derived paths escape the redirect; that is false.)
 /// A shadowed gateway reads a frozen `registry.json` (server/profile edits never
 /// arrive) and a stale `approval-endpoint.json` (HITL approvals fail closed
 /// against a dead broker port).
 ///
 /// The fix: when this process has MSIX package identity - meaning it was spawned
-/// inside a packaged app's container, since Conduit's own binaries never ship as
+/// inside a packaged app's container, since Toolport's own binaries never ship as
 /// MSIX - address the SAME directory through its loopback-UNC twin
 /// (`\\localhost\C$\Users\...`). SMB serves those opens from the real filesystem,
 /// outside the virtualization filter's reach (verified on the same machine). If
 /// the UNC view is unreachable we fall back to the natural path, no worse than
 /// before; see [`DirResolution`] and [`conduit_dir_resolution`].
 ///
-/// Public so every Conduit file (registry, tool cache, audit log, approval
+/// Public so every Toolport file (registry, tool cache, audit log, approval
 /// endpoint, debug logs) derives from the same anchor - otherwise the app and a
 /// client-spawned gateway would read/write different dirs.
 pub fn conduit_dir() -> Option<PathBuf> {
@@ -1160,21 +1347,36 @@ pub fn conduit_dir_resolution() -> DirResolution {
 static DATA_DIR_OVERRIDE_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static DATA_DIR_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+#[cfg(test)]
+static DATA_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serialize tests that resolve [`conduit_dir`] with tests that override it.
+///
+/// The override is process-global, so this lock is required even for tests that only
+/// read the normal data directory; otherwise they can observe another test's scratch
+/// directory while that test holds a [`DataDirOverride`].
+#[cfg(test)]
+pub(crate) fn data_dir_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    DATA_DIR_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Points [`conduit_dir`] at a scratch directory until the guard drops. **Tests only.**
 ///
-/// Setting `CONDUIT_DATA_DIR` does NOT work from a test: [`resolve_conduit_dir`]
-/// memoizes in a `OnceLock`, so whichever test resolves the dir first wins and every
-/// later `set_var` is silently ignored, leaving the test reading and writing the
-/// developer's REAL data dir. That made suite results order-dependent and leaked
-/// fixture files into `Conduit-dev` (SOU-301).
+/// Setting `TOOLPORT_DATA_DIR` / `CONDUIT_DATA_DIR` does NOT work from a test:
+/// [`resolve_conduit_dir`] memoizes in a `OnceLock`, so whichever test resolves the
+/// dir first wins and every later `set_var` is silently ignored, leaving the test
+/// reading and writing the developer's REAL data dir. That made suite results
+/// order-dependent and leaked fixture files into the debug data dir (SOU-301).
 ///
 /// Deliberately not `#[cfg(test)]`-gated: the gateway binary's tests link this library
 /// compiled WITHOUT `cfg(test)`, so a cfg-gated hook would be invisible in exactly the
 /// place that needs it.
 ///
-/// The override is process-global, so tests that use it must serialize against each
-/// other (the gateway tests hold a shared `ENV_LOCK` for this).
+/// The override is process-global. Every test in the same test binary that resolves
+/// [`conduit_dir`] directly or indirectly must hold `data_dir_test_lock`, whether
+/// or not that test installs an override itself.
 #[doc(hidden)]
 #[must_use = "the override is reverted when the guard drops, so it must be bound"]
 pub struct DataDirOverride(());
@@ -1200,10 +1402,14 @@ impl Drop for DataDirOverride {
     }
 }
 
-/// Resolve the data dir once and cache it: the container check and the UNC
+/// Resolve the data dir and cache it: the container check and the UNC
 /// reachability probe should not run on every path lookup, and a stable answer
 /// keeps every consumer (registry, watcher, tool cache, approval endpoint) on
 /// one directory for the process lifetime.
+///
+/// Cache is an `RwLock` (not `OnceLock`) so a desktop-launch data-dir migration
+/// can [`invalidate_data_dir_cache`] after renaming `Conduit` → `Toolport`;
+/// otherwise a pre-migration resolution would keep pointing at the old path.
 fn resolve_conduit_dir() -> (Option<PathBuf>, DirResolution) {
     // Checked ahead of the memoized value so a test can redirect the dir even after
     // something else in the process has already resolved it.
@@ -1216,45 +1422,81 @@ fn resolve_conduit_dir() -> (Option<PathBuf>, DirResolution) {
             return (Some(p), DirResolution::Direct);
         }
     }
-    static RESOLVED: std::sync::OnceLock<(Option<PathBuf>, DirResolution)> =
-        std::sync::OnceLock::new();
-    RESOLVED
-        .get_or_init(|| {
-            if let Ok(dir) = std::env::var("CONDUIT_DATA_DIR") {
-                if !dir.trim().is_empty() {
-                    return (Some(PathBuf::from(dir)), DirResolution::Direct);
-                }
+    {
+        let cached = DATA_DIR_RESOLVED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((path, resolution)) = cached.as_ref() {
+            // Re-resolve when the cached path was removed (e.g. legacy leaf renamed).
+            let still_valid = path.as_ref().map(|p| p.exists()).unwrap_or(true);
+            if still_valid {
+                return (path.clone(), *resolution);
             }
-            let leaf = data_dir_leaf_name();
-            #[cfg(windows)]
-            {
-                let Some(home) = dirs::home_dir() else {
-                    return (None, DirResolution::Direct);
-                };
-                let conduit = |base: &Path| {
-                    base.join("AppData").join("Roaming").join(leaf)
-                };
-                if !msix::has_package_identity() {
-                    return (Some(conduit(&home)), DirResolution::Direct);
-                }
-                match msix::unc_twin(&home) {
-                    // The profile dir always exists, so a metadata success proves the
-                    // UNC view actually works before we commit every file to it.
-                    Some(unc_home) if std::fs::metadata(&unc_home).is_ok() => {
-                        (Some(conduit(&unc_home)), DirResolution::Devirtualized)
-                    }
-                    _ => (Some(conduit(&home)), DirResolution::VirtualizedFallback),
-                }
+        }
+    }
+    let fresh = compute_conduit_dir();
+    *DATA_DIR_RESOLVED
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fresh.clone());
+    fresh
+}
+
+static DATA_DIR_RESOLVED: std::sync::RwLock<Option<(Option<PathBuf>, DirResolution)>> =
+    std::sync::RwLock::new(None);
+
+/// Drop the memoized data-dir path so the next lookup re-runs resolution.
+/// Used after a successful Conduit → Toolport leaf rename on desktop launch.
+pub fn invalidate_data_dir_cache() {
+    *DATA_DIR_RESOLVED
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+fn compute_conduit_dir() -> (Option<PathBuf>, DirResolution) {
+    if let Some(dir) = crate::brand::env_var("TOOLPORT_DATA_DIR", "CONDUIT_DATA_DIR") {
+        return (Some(PathBuf::from(dir)), DirResolution::Direct);
+    }
+    #[cfg(windows)]
+    {
+        let Some(home) = dirs::home_dir() else {
+            return (None, DirResolution::Direct);
+        };
+        let under_roaming = |base: &Path| {
+            crate::brand::resolve_data_dir_under(&crate::brand::windows_roaming_base(base))
+        };
+        if !msix::has_package_identity() {
+            return (Some(under_roaming(&home)), DirResolution::Direct);
+        }
+        match msix::unc_twin(&home) {
+            // The profile dir always exists, so a metadata success proves the
+            // UNC view actually works before we commit every file to it.
+            Some(unc_home) if std::fs::metadata(&unc_home).is_ok() => {
+                (Some(under_roaming(&unc_home)), DirResolution::Devirtualized)
             }
-            #[cfg(not(windows))]
-            {
-                (
-                    dirs::config_dir().map(|d| d.join(leaf)),
-                    DirResolution::Direct,
-                )
-            }
-        })
-        .clone()
+            _ => (Some(under_roaming(&home)), DirResolution::VirtualizedFallback),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        (
+            dirs::config_dir().map(|d| crate::brand::resolve_data_dir_under(&d)),
+            DirResolution::Direct,
+        )
+    }
+}
+
+/// Best-effort desktop-launch migration of the legacy data-dir leaf (`Conduit`
+/// / `Conduit-dev`) to `Toolport` / `Toolport-dev`. Invalidates the path cache
+/// on success so subsequent lookups use the new leaf. Returns the new path when
+/// a rename happened.
+pub fn migrate_legacy_data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = dirs::home_dir().map(|h| crate::brand::windows_roaming_base(&h))?;
+    #[cfg(not(windows))]
+    let base = dirs::config_dir()?;
+    let migrated = crate::brand::migrate_legacy_data_dir_under(&base)?;
+    invalidate_data_dir_cache();
+    Some(migrated)
 }
 
 /// MSIX app-container detection and escape hatch (see [`conduit_dir`]).
@@ -1704,16 +1946,17 @@ pub fn update_at<T>(
     Ok((reg, out))
 }
 
-/// The path the registry actually resolves to, honoring `CONDUIT_REGISTRY`.
+/// The path the registry actually resolves to, honoring `TOOLPORT_REGISTRY`
+/// (legacy: `CONDUIT_REGISTRY`).
 pub fn resolved_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("CONDUIT_REGISTRY") {
+    if let Some(path) = crate::brand::env_var("TOOLPORT_REGISTRY", "CONDUIT_REGISTRY") {
         return Some(PathBuf::from(path));
     }
     registry_path()
 }
 
-/// Load honoring the `CONDUIT_REGISTRY` env override (used by the gateway and
-/// tests), falling back to the default path.
+/// Load honoring the `TOOLPORT_REGISTRY` / `CONDUIT_REGISTRY` env override (used
+/// by the gateway and tests), falling back to the default path.
 pub fn load_resolved() -> Result<Registry, String> {
     match resolved_path() {
         Some(path) => load_from(&path),
@@ -1767,6 +2010,7 @@ pub(crate) fn redact_url_userinfo(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::fingerprint_allow_key;
 
     fn sample_server(name: &str) -> ServerEntry {
         ServerEntry {
@@ -1872,6 +2116,94 @@ mod tests {
         assert_eq!(a, "file-system");
         assert_eq!(b, "file-system-2");
         assert_eq!(r.servers.len(), 2);
+    }
+
+    #[test]
+    fn remove_server_cleans_up_server_state() {
+        let mut r = Registry::default();
+        let id = r.add_server(sample_server("Github MCP"));
+        // `tool_overrides` / `pinned_tools` are keyed by the RAW registry id, while
+        // `injection_block_exempt` / `result_budgets` / the allow-list are keyed by
+        // `sanitize_segment(id)` because that is what the gateway looks them up with
+        // (`toolport-gateway.rs`: `let srv_owned = sanitize_segment(server_id)`).
+        // Cleaning the wrong one of the two is a silent no-op, so keep both shapes
+        // exercised here.
+        let sanitized_id = sanitize_segment(&id);
+        r.set_tool_override(
+            id.clone(),
+            "search".to_string(),
+            ToolOverride {
+                name: Some("repo-search".to_string()),
+                description: None,
+            },
+        );
+        r.set_tool_pinned(&id, "create_issue", true);
+        let key = fingerprint_allow_key(&sanitized_id, "create_issue", "v2:testfp");
+        r.allow_tool(key.clone());
+        r.injection_block_exempt.insert(sanitized_id.clone(), true);
+        r.result_budgets.insert(sanitized_id.clone(), 100);
+        // Block mode on, so `should_block_injection_for` reports the exemption
+        // instead of short-circuiting on the global flag.
+        r.block_on_injection = true;
+
+        // Assert setup
+        assert!(r.tool_overrides.get(&id).is_some());
+        assert!(r.is_tool_pinned(&id, "create_issue"));
+        assert!(r.is_tool_allowed(&key));
+        assert!(
+            !r.should_block_injection_for(&sanitized_id),
+            "an exempt server must not be blocked while it is registered"
+        );
+        assert!(r.result_budgets.contains_key(&sanitized_id));
+
+        // Act
+        r.remove_server(&id).unwrap();
+
+        // Assert cleanup
+        assert!(r.tool_overrides.get(&id).is_none());
+        assert!(!r.is_tool_pinned(&id, "create_issue"));
+        assert!(!r.is_tool_allowed(&key));
+        // Through the reader the gateway actually calls, not the raw map: a stale
+        // exemption surviving removal would silently disable injection blocking for
+        // whatever server next takes this id.
+        assert!(
+            r.should_block_injection_for(&sanitized_id),
+            "the injection exemption must not survive removing the server"
+        );
+        assert!(!r.result_budgets.contains_key(&sanitized_id));
+    }
+
+    #[test]
+    fn remove_server_does_not_restore_state_when_id_is_reused() {
+        let mut r = Registry::default();
+        let id = r.add_server(sample_server("Github MCP"));
+        let sanitized_id = sanitize_segment(&id);
+        r.set_tool_override(
+        id.clone(),
+        "search".to_string(),
+        ToolOverride {
+            name: Some("repo-search".to_string()),
+            description: None,
+          },
+        );
+        r.set_tool_pinned(&id, "create_issue", true);
+        let key = fingerprint_allow_key(&sanitized_id, "create_issue", "v2:testfp");
+        r.allow_tool(key.clone());
+        r.injection_block_exempt.insert(sanitized_id.clone(), true);
+        r.result_budgets.insert(sanitized_id.clone(), 100);
+
+        // Act
+        r.remove_server(&id).unwrap();
+
+        let new_id = r.add_server(sample_server("GitHub MCP"));
+        // Assert
+        assert_eq!(new_id, id);
+        assert!(r.tool_overrides.get(&new_id).is_none());
+        assert!(!r.is_tool_pinned(&new_id, "create_issue"));
+        let new_key = fingerprint_allow_key(&sanitize_segment(&new_id), "create_issue", "v2:testfp");
+        assert!(!r.is_tool_allowed(&new_key));
+        assert!(!r.injection_block_exempt.contains_key(&sanitized_id));
+        assert!(!r.result_budgets.contains_key(&sanitized_id));
     }
 
     #[test]
@@ -2074,6 +2406,26 @@ mod tests {
         r.set_client_scope("claude", Some("Work"));
         r.set_client_scope("claude", None);
         assert!(!r.client_scopes.contains_key("claude"));
+    }
+
+    #[test]
+    fn client_managed_entries_set_and_clear() {
+        let mut r = Registry::default();
+        assert!(r.client_managed_entry("claude-desktop").is_none());
+        let entry = ManagedEntry {
+            command: "/opt/toolport/toolport-gateway".into(),
+            args: vec![],
+            env: [("TOOLPORT_CLIENT_ID".into(), "claude-desktop".into())]
+                .into_iter()
+                .collect(),
+            transport: "stdio".into(),
+            url: None,
+            updated_at: 42,
+        };
+        r.set_client_managed_entry("claude-desktop", entry.clone());
+        assert_eq!(r.client_managed_entry("claude-desktop"), Some(&entry));
+        r.clear_client_managed_entry("claude-desktop");
+        assert!(r.client_managed_entry("claude-desktop").is_none());
     }
 
     #[test]
@@ -2347,10 +2699,21 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn conduit_dir_is_direct_outside_a_container() {
+        let _data_dir = data_dir_test_lock();
         assert_eq!(conduit_dir_resolution(), DirResolution::Direct);
         let dir = conduit_dir().expect("home dir resolves");
-        assert!(dir.ends_with(format!("AppData\\Roaming\\{}", data_dir_leaf_name())));
-        assert!(!dir.to_string_lossy().starts_with(r"\\"));
+        let s = dir.to_string_lossy();
+        // Prefer Toolport; existing installs may still resolve under the legacy leaf
+        // until desktop launch migrates it.
+        assert!(
+            s.ends_with(&format!("AppData\\Roaming\\{}", data_dir_leaf_name()))
+                || s.ends_with(&format!(
+                    "AppData\\Roaming\\{}",
+                    crate::brand::legacy_data_dir_leaf_name()
+                )),
+            "unexpected data dir: {s}"
+        );
+        assert!(!s.starts_with(r"\\"));
     }
 
     #[test]
@@ -2748,9 +3111,9 @@ mod tests {
         assert_eq!(
             data_dir_leaf_name(),
             if cfg!(debug_assertions) {
-                "Conduit-dev"
+                "Toolport-dev"
             } else {
-                "Conduit"
+                "Toolport"
             }
         );
     }

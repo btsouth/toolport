@@ -17,6 +17,7 @@ const client = {
   name: "Cursor",
   appPresent: true,
   gatewayInstalled: true,
+  entryState: "managed" as const,
   servers: [],
   pluginServers: [],
   configPath: "",

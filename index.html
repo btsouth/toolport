@@ -6,12 +6,16 @@
       // Set the theme class before first paint so there's no flash of the wrong theme.
       // Mirrors readStored() in src/lib/theme.tsx (same keys, same rule): with no explicit
       // choice, existing installs stay dark (don't flip a familiar app on upgrade) and fresh
-      // installs follow the OS. `conduit.onboarded` marks an existing user.
+      // installs follow the OS. `toolport.onboarded` (legacy `conduit.onboarded`)
+      // marks an existing user.
       (function () {
         try {
           var t = localStorage.getItem("toolport-theme");
           if (t !== "light" && t !== "dark" && t !== "system") {
-            t = localStorage.getItem("conduit.onboarded") === "1" ? "dark" : "system";
+            var onboarded =
+              localStorage.getItem("toolport.onboarded") === "1" ||
+              localStorage.getItem("conduit.onboarded") === "1";
+            t = onboarded ? "dark" : "system";
           }
           var dark =
             t === "dark" ||

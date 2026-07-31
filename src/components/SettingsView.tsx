@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import {
   Activity,
   Bot,
@@ -16,6 +16,7 @@ import {
   Moon,
   Pin,
   Power,
+  RefreshCw,
   ShieldAlert,
   ShieldCheck,
   ShieldX,
@@ -31,6 +32,7 @@ import {
 } from "@tauri-apps/plugin-autostart";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 import { toastError } from "@/lib/toast";
+import { Button } from "@/components/ui/button";
 import {
   addHttpClient,
   clearInspectLog,
@@ -50,10 +52,12 @@ import {
   setLazyDiscovery,
   setFolderProfiles,
   setLiveInspect,
+  setBlockOnInjection,
   setQuarantineOnDrift,
   setToolPinned,
   startHttpBridge,
   stopHttpBridge,
+  stopStaleGateways,
   type HttpBridgeStatus,
   type QuarantinedTool,
 } from "@/lib/api";
@@ -303,20 +307,23 @@ function PostureSummary({
   confirmDestructive,
   humanApproval,
   quarantineOnDrift,
+  blockOnInjection,
 }: {
   denyDestructive: boolean;
   confirmDestructive: boolean;
   humanApproval: boolean;
   quarantineOnDrift: boolean;
+  blockOnInjection: boolean;
 }) {
   const active = [
     humanApproval && "human approval required",
     denyDestructive && "destructive tools blocked",
     confirmDestructive && "destructive calls confirmed",
     quarantineOnDrift && "drifted tools quarantined",
+    blockOnInjection && "injection hits blocked",
   ].filter(Boolean) as string[];
   // A hard gate (block or human-approval) = guarded; softer measures alone = partial.
-  const gated = humanApproval || denyDestructive;
+  const gated = humanApproval || denyDestructive || blockOnInjection;
   const state = gated ? "guarded" : active.length > 0 ? "partial" : "open";
   const meta = {
     guarded: {
@@ -375,9 +382,46 @@ function ProfileToolScope({
   }, [registry.servers]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [toolsByServer, setToolsByServer] = useState<Record<string, string[]>>({});
-  const [loading, setLoading] = useState<string | null>(null);
+  const [errorByServer, setErrorByServer] = useState<Record<string, boolean>>({});
+  const [loadingByServer, setLoadingByServer] = useState<Record<string, boolean>>({});
+  const requestIdByServer = useRef<Record<string, number>>({});
   const [busy, setBusy] = useState(false);
   const scope = profile.toolScope ?? {};
+
+  async function loadTools(serverId: string) {
+    const requestId = (requestIdByServer.current[serverId] ?? 0) + 1;
+    requestIdByServer.current[serverId] = requestId;
+    setLoadingByServer((m) => ({
+      ...m,
+      [serverId]: true,
+    }));
+    try {
+      const tools = await listServerTools(serverId);
+      if (requestIdByServer.current[serverId] !== requestId) {
+        return;
+      }
+      setToolsByServer((m) => ({ ...m, [serverId]: tools.map((t) => t.name) }));
+      setErrorByServer((m) => {
+        const next = { ...m };
+        delete next[serverId];
+        return next;
+      });
+    } catch (e) {
+      // Ignore stale failures (a newer load for this server is in flight or done).
+      if (requestIdByServer.current[serverId] !== requestId) {
+        return;
+      }
+      toastError(`Couldn't load ${serverName.get(serverId) ?? serverId} tools: ${e}`);
+      setErrorByServer((m) => ({ ...m, [serverId]: true }));
+    } finally {
+      if (requestIdByServer.current[serverId] === requestId) {
+        setLoadingByServer((m) => ({
+          ...m,
+          [serverId]: false,
+        }));
+      }
+    }
+  }
 
   async function expand(serverId: string) {
     if (expanded === serverId) {
@@ -386,15 +430,7 @@ function ProfileToolScope({
     }
     setExpanded(serverId);
     if (!toolsByServer[serverId]) {
-      setLoading(serverId);
-      try {
-        const tools = await listServerTools(serverId);
-        setToolsByServer((m) => ({ ...m, [serverId]: tools.map((t) => t.name) }));
-      } catch (e) {
-        toastError(`Couldn't load ${serverName.get(serverId) ?? serverId} tools: ${e}`);
-      } finally {
-        setLoading(null);
-      }
+      await loadTools(serverId);
     }
   }
 
@@ -451,8 +487,24 @@ function ProfileToolScope({
             </button>
             {open && (
               <div className="border-t border-border/40 px-2 py-1.5">
-                {loading === serverId ? (
+                {loadingByServer[serverId] ? (
                   <p className="text-xs text-muted-foreground">Loading tools…</p>
+                ) : errorByServer[serverId] ? (
+                  <div
+                    role="status"
+                    aria-live="polite"
+                    className="flex flex-col gap-2 rounded-md border border-border p-3"
+                  >
+                    <p className="text-xs text-muted-foreground">Couldn't load tools</p>
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      className="w-fit"
+                      onClick={() => loadTools(serverId)}
+                    >
+                      Retry
+                    </Button>
+                  </div>
                 ) : allTools && allTools.length > 0 ? (
                   <div className="flex flex-col gap-1">
                     {allTools.map((tool) => (
@@ -470,7 +522,7 @@ function ProfileToolScope({
                   </div>
                 ) : (
                   <p className="text-xs text-muted-foreground">
-                    No tools, or the server isn&apos;t reachable right now.
+                    This server exposes no tools.
                   </p>
                 )}
               </div>
@@ -487,12 +539,15 @@ function ProfileToolScope({
 export function SettingsView({ registry, onRegistryChange }: Props) {
   const { theme, setTheme } = useTheme();
   const lazyDiscovery = registry?.lazyDiscovery ?? true;
-  const codeMode = registry?.codeMode ?? false;
+  // On by default (SOU-397); only treat explicit false as off when the field is missing
+  // during a partial load, match the registry serde default.
+  const codeMode = registry?.codeMode ?? true;
   const denyDestructive = registry?.denyDestructive ?? false;
   const confirmDestructive = registry?.confirmDestructive ?? false;
   const humanApproval = registry?.humanApproval ?? false;
   const allowAgentControl = registry?.allowAgentControl ?? false;
   const quarantineOnDrift = registry?.quarantineOnDrift ?? false;
+  const blockOnInjection = registry?.blockOnInjection ?? false;
   const liveInspect = registry?.liveInspect ?? false;
   const [busy, setBusy] = useState(false);
   // Profile cards collapse so a big Default profile doesn't dump every server (and its
@@ -513,6 +568,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   const [newProfile, setNewProfile] = useState("");
   const [newToken, setNewToken] = useState<string | null>(null);
   const [clientBusy, setClientBusy] = useState(false);
+  const [reapBusy, setReapBusy] = useState(false);
+  const [reapResult, setReapResult] = useState<string | null>(null);
   const [autostartOn, setAutostartOn] = useState(false);
 
   const httpClients = registry?.httpClients ?? [];
@@ -850,7 +907,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           codeMode,
           "text-info",
           "Code mode",
-          "Let agents run one server-side script that calls many tools in a single round-trip (sandboxed; each call still respects profile scope and human approval)",
+          "On by default: agents can run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary; turn off to hide toolport_run_script.",
           apply(setCodeMode),
         )}
       </section>
@@ -863,6 +920,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           confirmDestructive={confirmDestructive}
           humanApproval={humanApproval}
           quarantineOnDrift={quarantineOnDrift}
+          blockOnInjection={blockOnInjection}
         />
         {toggle(
           ShieldAlert,
@@ -895,6 +953,14 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "Quarantine changed high-risk tools",
           "Block a destructive or poisoned tool that changes from its approved version, until you re-approve it",
           apply(setQuarantineOnDrift),
+        )}
+        {toggle(
+          ShieldAlert,
+          blockOnInjection,
+          "text-destructive",
+          "Block high-confidence injection",
+          "Fail a tool call when content defense finds a high-confidence prompt-injection hit, instead of only labeling the text. Off by default; medium-confidence hits still label only",
+          apply(setBlockOnInjection),
         )}
         {toggle(
           Bot,
@@ -934,7 +1000,12 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   className="flex items-center gap-2 text-xs"
                 >
                   <span className="min-w-0 truncate font-mono">{q.tool}</span>
-                  <span className="shrink-0 text-muted-foreground">{q.reason}</span>
+                  <span
+                    className="min-w-0 truncate text-muted-foreground"
+                    title={q.detail || q.reason}
+                  >
+                    {q.detail ? q.detail : q.reason}
+                  </span>
                   <button
                     type="button"
                     onClick={() => reapprove(q)}
@@ -1190,6 +1261,47 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               </div>
             </>
           )}
+        </div>
+        <div className="flex flex-col gap-2 rounded-md border px-3 py-2.5">
+          <div className="flex items-center gap-2.5 text-sm">
+            <RefreshCw
+              className={`size-4 shrink-0 text-muted-foreground ${reapBusy ? "animate-spin" : ""}`}
+            />
+            <span className="flex min-w-0 flex-1 flex-col leading-tight">
+              <span className="font-medium">Stop old gateways</span>
+              <span className="text-xs text-muted-foreground">
+                End leftover gateway processes from earlier installs. Where the gateway
+                path stays the same across upgrades, a host that respawns MCP picks up the
+                new binary on its own. Where the filename carries its version, or the old
+                one sits at a path an upgrade never touches, an app that was already
+                running keeps launching it until you restart that app.
+              </span>
+            </span>
+            <button
+              type="button"
+              disabled={reapBusy}
+              onClick={async () => {
+                setReapBusy(true);
+                setReapResult(null);
+                try {
+                  const stopped = await stopStaleGateways();
+                  setReapResult(
+                    stopped.length === 0
+                      ? "No old gateway processes found."
+                      : `Stopped ${stopped.length}: ${stopped.join("; ")}`,
+                  );
+                } catch (e) {
+                  toastError(`Couldn't stop old gateways: ${e}`);
+                } finally {
+                  setReapBusy(false);
+                }
+              }}
+              className="h-8 shrink-0 rounded-md border bg-background px-2.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
+            >
+              {reapBusy ? "Working…" : "Run"}
+            </button>
+          </div>
+          {reapResult && <p className="text-xs text-muted-foreground">{reapResult}</p>}
         </div>
       </section>
     </div>

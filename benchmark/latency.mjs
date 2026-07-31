@@ -7,13 +7,15 @@
 // the mock directly, so the difference on the tool-call path is purely what Toolport
 // adds. Deterministic and offline: no model, no network, no API keys.
 //
-//   node benchmark/latency.mjs [iterations]      (default 200)
+//   node benchmark/latency.mjs [iterations]              (default 200)
+//   node benchmark/latency.mjs 200 --json                (machine-readable)
+//   node benchmark/latency.mjs 200 --check               (enforce latency-budget.json)
 //
 // Needs a debug build first:
 //   cargo build --manifest-path src-tauri/Cargo.toml --bins
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -23,7 +25,11 @@ const DEBUG = join(__dirname, "..", "src-tauri", "target", "debug");
 const exe = (n) => join(DEBUG, process.platform === "win32" ? `${n}.exe` : n);
 const GATEWAY = exe("toolport-gateway");
 const MOCK = exe("mock-mcp-server");
-const N = Math.max(20, Number(process.argv[2] || 200));
+const args = process.argv.slice(2);
+const N = Math.max(20, Number(args.find((arg) => /^\d+$/.test(arg)) || 200));
+const JSON_OUTPUT = args.includes("--json");
+const CHECK_BUDGET = args.includes("--check");
+const BUDGET_PATH = join(__dirname, "latency-budget.json");
 
 for (const [label, p] of [
   ["gateway", GATEWAY],
@@ -94,6 +100,15 @@ const loop = async (fn, n) => {
   return stats(xs);
 };
 
+async function waitUntil(fn, timeoutMs = 10_000) {
+  const started = now();
+  while (now() - started < timeoutMs) {
+    if (await fn()) return now() - started;
+    await sleep(25);
+  }
+  throw new Error(`gateway catalog was not ready after ${timeoutMs} ms`);
+}
+
 const INIT = {
   protocolVersion: "2025-06-18",
   capabilities: {},
@@ -139,6 +154,7 @@ async function main() {
   const direct = await loop(() => m.call("tools/call", { name: bare, arguments: {} }), N);
 
   // 2) Through the gateway.
+  const gatewayStarted = now();
   const gw = spawn(GATEWAY, [], {
     env: {
       ...process.env,
@@ -151,7 +167,14 @@ async function main() {
   const g = client(gw);
   const handshake = await timed(() => g.call("initialize", INIT));
   g.notify("notifications/initialized");
-  await sleep(1200); // let the mock connect so the catalog is populated
+  await waitUntil(async () => {
+    const response = await g.call("tools/call", {
+      name: "toolport_search_tools",
+      arguments: { query: bare, limit: 25 },
+    });
+    return JSON.stringify(response).includes(`mock__${bare}`);
+  });
+  const catalogReady = now() - gatewayStarted;
 
   for (let k = 0; k < 15; k++) await g.call("tools/list", {}); // warm up
   const list = await loop(() => g.call("tools/list", {}), N);
@@ -178,19 +201,69 @@ async function main() {
   gw.kill();
   rmSync(dir, { recursive: true, force: true });
 
+  const overhead = {
+    median: gwCall.median - direct.median,
+    p95: gwCall.p95 - direct.p95,
+  };
+  const result = {
+    schemaVersion: 1,
+    runtime: {
+      platform: process.platform,
+      arch: process.arch,
+      node: process.version,
+      iterations: N,
+    },
+    milliseconds: {
+      handshake,
+      catalogReady,
+      toolsList: list,
+      search,
+      routedCall: gwCall,
+      directCall: direct,
+      gatewayOverhead: overhead,
+    },
+  };
+
+  if (CHECK_BUDGET) {
+    if (!existsSync(BUDGET_PATH)) {
+      throw new Error(`missing latency budget: ${BUDGET_PATH}`);
+    }
+    const budget = JSON.parse(readFileSync(BUDGET_PATH, "utf8"));
+    const failures = [];
+    for (const [metric, limit] of Object.entries(budget.maximumMilliseconds || {})) {
+      const actual = metric
+        .split(".")
+        .reduce((value, key) => value?.[key], result.milliseconds);
+      if (typeof actual !== "number") {
+        failures.push(`${metric}: unknown metric`);
+      } else if (actual > limit) {
+        failures.push(`${metric}: ${actual.toFixed(2)} ms > ${limit} ms`);
+      }
+    }
+    result.budget = { path: BUDGET_PATH, passed: failures.length === 0, failures };
+    if (failures.length) process.exitCode = 1;
+  }
+
+  if (JSON_OUTPUT) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
   const row = (label, x) =>
     `  ${label.padEnd(28)}${x.median.toFixed(2).padStart(6)} ms   (p95 ${x.p95.toFixed(2)})`;
   console.log(`\nToolport gateway latency  (mock downstream, ${N} iterations, median)\n`);
   console.log(
     `  ${"handshake (one-time)".padEnd(28)}${handshake.toFixed(2).padStart(6)} ms`,
   );
+  console.log(
+    `  ${"catalog ready (cold start)".padEnd(28)}${catalogReady.toFixed(2).padStart(6)} ms`,
+  );
   console.log(row("tools/list (lazy, 4 core tools)", list));
   console.log(row("toolport_search_tools", search));
   console.log(row("toolport_call_tool -> mock", gwCall));
   console.log(row("mock tool call (direct)", direct));
-  const overhead = gwCall.median - direct.median;
   console.log(
-    `\n  => Toolport adds ~${overhead.toFixed(2)} ms per tool call vs calling the server directly.`,
+    `\n  => Toolport adds ~${overhead.median.toFixed(2)} ms per tool call vs calling the server directly.`,
   );
   console.log(
     `     Real servers take tens to hundreds of ms each, so that overhead is noise,`,
@@ -198,6 +271,13 @@ async function main() {
   console.log(
     `     and it buys ~90% fewer tokens. See BENCHMARK.md for the token numbers.\n`,
   );
+  if (result.budget) {
+    console.log(
+      result.budget.passed
+        ? "  Latency budget: PASS\n"
+        : `  Latency budget: FAIL\n    ${result.budget.failures.join("\n    ")}\n`,
+    );
+  }
 }
 
 main().catch((e) => {

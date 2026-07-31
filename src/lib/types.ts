@@ -24,6 +24,9 @@ export interface ParsedSnippetServer {
   env: { key: string; value: string | null }[];
 }
 
+/** Ownership of the gateway entry under our name in a client config (SOU-406). */
+export type GatewayEntryState = "managed" | "customized" | "absent";
+
 export interface DetectedClient {
   id: string;
   name: string;
@@ -37,6 +40,8 @@ export interface DetectedClient {
   /** Servers found outside the config file (e.g. Cursor plugins); read-only. */
   pluginServers: McpServer[];
   gatewayInstalled: boolean;
+  /** First-class ownership: managed by us, hand-customized, or absent (SOU-406). */
+  entryState: GatewayEntryState;
   error: string | null;
 }
 
@@ -426,13 +431,17 @@ export interface Registry {
   liveInspect?: boolean;
   /** Quarantine-on-drift: block a high-risk tool that changed until re-approved. */
   quarantineOnDrift?: boolean;
+  /** Opt-in fail-closed content defense: block high-confidence injection hits (SOU-345). */
+  blockOnInjection?: boolean;
+  /** Server ids exempt from block-on-injection (label only). */
+  injectionBlockExempt?: Record<string, boolean>;
   /** Global switch: expose 4 meta-tools instead of the full catalog. */
   lazyDiscovery?: boolean;
   /** Global discovery mode ("full" | "lazy" | "grouped"). Takes precedence over
    * `lazyDiscovery`; absent = fall back to the `lazyDiscovery` bool. */
   discoveryMode?: string | null;
-  /** Opt-in "code mode": advertise the `toolport_run_script` meta-tool so agents can
-   * orchestrate many tool calls in one server-side script. Off by default. */
+  /** Code mode: advertise `toolport_run_script` so agents can orchestrate many tool
+   * calls in one server-side script. On by default (SOU-397); Settings is the kill switch. */
   codeMode?: boolean;
   /** Per-client discovery-mode override, keyed by client id (e.g. "cursor" ->
    * "grouped"). Absent = that client inherits the global mode. */
@@ -447,9 +456,24 @@ export interface Registry {
   /** Which profile each client was connected with, keyed by client id (e.g.
    * "cursor" -> "Billing"). Absent = that client follows the active profile. */
   clientScopes?: Record<string, string>;
+  /** What Toolport last wrote into each client config as its gateway entry
+   * (SOU-406 ownership record). Absent key = pre-ownership install. */
+  clientManagedEntries?: Record<string, ManagedEntry>;
   /** Consumers registered to reach the gateway over the HTTP/OpenAPI bridge,
    * each with its own hashed token and scope (multi-tenant bridge). */
   httpClients?: HttpClient[];
+}
+
+/** Snapshot of the gateway entry Toolport last wrote (SOU-406/407). */
+export interface ManagedEntry {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  /** `"stdio"` (default) or `"sharedHttp"`. */
+  transport?: string;
+  /** Shared-HTTP MCP URL when transport is sharedHttp. */
+  url?: string | null;
+  updatedAt: number;
 }
 
 /** A consumer registered to reach the HTTP/OpenAPI bridge with its own token and
@@ -523,6 +547,13 @@ function isGatewayIdentity(id: string, name: string, command: string | null): bo
 
 export function isGatewayServer(server: ServerEntry): boolean {
   return isGatewayIdentity(server.id, server.name, server.command);
+}
+
+/** Whether a server read from a client's own config (a detected `McpServer`, which
+ * has no registry id) is Toolport's own gateway entry. Recognizes the pre-rename
+ * `conduit` name too. Mirrors `detected_is_gateway` in the Rust backend. */
+export function isGatewayDetected(server: McpServer): boolean {
+  return isGatewayIdentity(server.name, server.name, server.command);
 }
 
 /** Servers a client has (config + plugins) that Toolport doesn't manage yet.

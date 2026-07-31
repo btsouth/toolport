@@ -13,9 +13,13 @@ function readStored(): Theme {
     if (v === "light" || v === "dark" || v === "system") return v;
     // No explicit choice yet. Preserve dark for EXISTING installs (they never opted into a
     // theme, so an upgrade shouldn't flip their app under them); default NEW installs to
-    // `system`. `conduit.onboarded` is set once onboarding is done = an existing user. The
-    // inline bootstrap in index.html makes the same decision so there's no flash.
-    return localStorage.getItem("conduit.onboarded") === "1" ? "dark" : "system";
+    // `system`. `toolport.onboarded` (legacy `conduit.onboarded`) is set once onboarding
+    // is done = an existing user. The inline bootstrap in index.html makes the same
+    // decision so there's no flash.
+    return localStorage.getItem("toolport.onboarded") === "1" ||
+      localStorage.getItem("conduit.onboarded") === "1"
+      ? "dark"
+      : "system";
   } catch {
     // localStorage unavailable: dark matches the historical hardcoded app.
     return "dark";

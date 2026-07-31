@@ -4,6 +4,7 @@ mod approval_broker;
 #[cfg(feature = "desktop")]
 mod desktop;
 pub mod audit;
+pub mod brand;
 pub mod catalog;
 pub mod clients;
 pub mod codemode;
@@ -12,7 +13,9 @@ pub mod gateway_publish;
 pub mod inspect;
 pub mod instructions;
 pub mod integrity;
+pub mod metrics;
 pub mod oauth;
+pub mod rate_limits;
 pub mod registry;
 pub mod remote;
 pub mod router;

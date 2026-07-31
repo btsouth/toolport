@@ -16,9 +16,10 @@ every AI client, with far fewer tokens.
 ![Toolport: every tool from all your servers, collapsed to the handful your agent loads](docs/lazy-discovery.svg)
 
 Toolport is a local MCP (Model Context Protocol) gateway. You set up and
-authenticate each server once, and every AI client (Claude, Cursor, Codex, and
-the rest) points at Toolport and shares them, so you stop configuring the same
-servers separately in each app.
+authenticate each server once, and every AI client (Claude, Cursor, Codex,
+[Toolport Studio](https://github.com/tsouth89/toolport-studio), and the rest)
+points at Toolport and shares them, so you stop configuring the same servers
+separately in each app.
 
 ![Toolport demo: add a server once, connect every AI client, lazy tool discovery, and a destructive call blocked by human approval](docs/demo.gif)
 
@@ -154,7 +155,7 @@ and refreshes too.
 
 ## Supported clients
 
-Toolport auto-detects these **25 AI clients**, installs the gateway into each with one
+Toolport auto-detects these **30 AI clients**, installs the gateway into each with one
 click, and can import a client's existing servers. It writes the config file shown
 below for you, so you never have to edit these by hand.
 
@@ -163,13 +164,17 @@ below for you, so you never have to edit these by hand.
 | Claude Desktop | `<config>/Claude/claude_desktop_config.json`                                               | JSON (`mcpServers`)      |
 | Claude Code    | `~/.claude.json`                                                                           | JSON (`mcpServers`)      |
 | Cursor         | `~/.cursor/mcp.json`                                                                       | JSON (`mcpServers`)      |
-| Crush          | `~/.config/crush/crush.json`                                                               | JSON (`mcp`)             |
+| Crush          | `~/.config/crush/crush.json` (macOS/Linux); `%LOCALAPPDATA%\crush\crush.json` (Windows)     | JSON (`mcp`)             |
 | VS Code        | `<config>/Code/User/mcp.json`                                                              | JSON (`servers`)         |
 | Windsurf       | `~/.codeium/windsurf/mcp_config.json`                                                      | JSON (`mcpServers`)      |
+| OpenCode       | `~/.config/opencode/opencode.json`                                                         | JSON (`mcp`)             |
+| Kilo Code      | `~/.config/kilo/kilo.jsonc`                                                                | JSONC (`mcp`)            |
 | Codex          | `~/.codex/config.toml`                                                                     | TOML (`mcp_servers`)     |
+| Grok Build     | `~/.grok/config.toml`                                                                      | TOML (`mcp_servers`)     |
 | Continue       | `~/.continue/config.yaml`                                                                  | YAML (`mcpServers`)      |
 | Antigravity    | `~/.gemini/config/mcp_config.json`                                                         | JSON (`mcpServers`)      |
 | Gemini CLI     | `~/.gemini/settings.json`                                                                  | JSON (`mcpServers`)      |
+| Qwen Code      | `~/.qwen/settings.json`                                                                    | JSON (`mcpServers`)      |
 | Cline          | `<config>/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json` | JSON (`mcpServers`)      |
 | Roo Code       | `<config>/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json`   | JSON (`mcpServers`)      |
 | Warp           | `~/.warp/.mcp.json`                                                                        | JSON (`mcpServers`)      |
@@ -185,6 +190,7 @@ below for you, so you never have to edit these by hand.
 | Hermes         | `~/.hermes/config.yaml`                                                                    | YAML (`mcp_servers`)     |
 | AnythingLLM    | `<config>/anythingllm-desktop/storage/plugins/anythingllm_mcp_servers.json`                | JSON (`mcpServers`)      |
 | Witsy          | `<config>/Witsy/settings.json`                                                             | JSON (`mcpServers`)      |
+| Amp            | `~/.config/amp/settings.json`                                                              | JSON (`amp.mcpServers`)  |
 
 `<config>` is your OS application-config dir (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `~/.config` on Linux); `<data>` is the data dir (`~/.local/share` on Linux, the same as `<config>` elsewhere). Zed and Goose paths vary slightly by OS; Toolport resolves the right one automatically.
 
@@ -194,8 +200,8 @@ Use this when Codex has already created its `~/.codex/` directory.
 
 1. In Toolport, add or enable the MCP servers you want Codex to use.
 2. Open **Clients**, select **Codex**, optionally choose a profile, and click **Connect to Toolport**.
-3. Toolport updates `~/.codex/config.toml` with a single `[mcp_servers.conduit]` entry. That entry runs the resolved `toolport-gateway` binary; existing Codex TOML keys and other MCP servers are preserved, and an existing config is backed up before the write.
-4. Start a new Codex session so it re-reads the config. In Toolport, the Codex row changes to **connected to Toolport**; in Codex, Toolport-managed tools are served through the one `conduit` MCP server. With lazy discovery enabled, Codex gets Toolport's compact search tools instead of every downstream tool up front.
+3. Toolport updates `~/.codex/config.toml` with a single `[mcp_servers.toolport]` entry. That entry runs the resolved `toolport-gateway` binary; existing Codex TOML keys and other MCP servers are preserved, and an existing config is backed up before the write. (Older installs that still have `[mcp_servers.conduit]` are renamed to `toolport` on the next Toolport launch.)
+4. Start a new Codex session so it re-reads the config. In Toolport, the Codex row changes to **connected to Toolport**; in Codex, Toolport-managed tools are served through the one `toolport` MCP server. With lazy discovery enabled, Codex gets Toolport's compact search tools instead of every downstream tool up front.
 
 Gotcha: when running Toolport from source, build the gateway first with `npm run build:gateway`. The desktop dev server does not build the separate binary that Codex spawns, so Codex will report the gateway as missing until that binary exists.
 
@@ -204,7 +210,7 @@ Gotcha: when running Toolport from source, build the gateway first with `npm run
 The gateway speaks HTTP/OpenAPI natively, so Open WebUI (and any OpenAPI tool
 client) connects straight to Toolport, no bridge or proxy. Flip on **Settings ->
 Integrations -> Open WebUI / HTTP endpoint** in the app (or run
-`toolport-gateway --http 8765` after setting `CONDUIT_HTTP_TOKEN`), then add
+`toolport-gateway --http 8765` after setting `TOOLPORT_HTTP_TOKEN`), then add
 `http://localhost:8765` as an OpenAPI tool server. See
 [docs/openwebui.md](docs/openwebui.md). The same endpoint serves
 any HTTP/OpenAPI MCP consumer (n8n, LibreChat, custom agents).
@@ -224,33 +230,45 @@ stored in the registry and toggled in the app's Settings view, so they apply to 
 client (lazy discovery is on by default). Per-client behavior is set via env vars on the
 gateway entry, written for you when you connect a client:
 
-- `CONDUIT_PROFILE=<name>` - scope this client to one profile's servers. Unset =
-  the active profile.
-- `CONDUIT_DISCOVERY=lazy|full` - optional per-client override of the global lazy
-  setting. Rarely needed; the gateway reads the registry default otherwise.
-- `CONDUIT_REGISTRY=<path>` - override the registry file location. Defaults to a
+- `TOOLPORT_CLIENT_ID=<id>` - identifies this client for live profile resolution
+  (written automatically when you Connect a client).
+- `TOOLPORT_PROFILE=<name>` - initial profile scope for a scoped install. Unset =
+  follow the active profile (resolved live via `TOOLPORT_CLIENT_ID`).
+- `TOOLPORT_DISCOVERY=lazy|full|grouped` - optional per-client override of the global
+  discovery setting. Rarely needed; the gateway reads the registry default otherwise.
+- `TOOLPORT_REGISTRY=<path>` - override the registry file location. Defaults to a
   stable per-user path so packaged and unpackaged clients agree.
-- `CONDUIT_RESULT_BUDGET=<bytes>` - cap oversized tool results at this many bytes
-  (0 disables it). Optional; off by default.
-- `CONDUIT_HTTP=<port>` (with optional `CONDUIT_HTTP_HOST`, default `127.0.0.1`,
-  and `CONDUIT_HTTP_TOKEN` for the required bearer token) - run the gateway in
+- `TOOLPORT_DATA_DIR=<path>` - override the full Toolport data directory.
+- `TOOLPORT_RESULT_BUDGET=<bytes>` - cap oversized tool results at this many bytes
+  (0 disables it). Optional; default budget applies when unset.
+- `TOOLPORT_HTTP=<port>` (with optional `TOOLPORT_HTTP_HOST`, default `127.0.0.1`,
+  and `TOOLPORT_HTTP_TOKEN` for the required bearer token) - run the gateway in
   HTTP/OpenAPI mode instead of stdio, for Open WebUI and other OpenAPI clients (see
   above). The in-app Settings -> Integrations toggle sets these for you, and the
   gateway refuses to bind without a token or registered HTTP client. For isolated
   local development only, `--insecure-loopback` explicitly permits an unauthenticated
   loopback listener; it never permits an open non-loopback bind.
+- `TOOLPORT_METRICS=1` - opt-in Prometheus `GET /metrics` on the HTTP surface.
+- `TOOLPORT_DEBUG=1` - per-request gateway trace logging.
+- `TOOLPORT_CODE_MODE=1` - force-enable code mode (`toolport_run_script`) even if Settings
+  has it off. Code mode is **on by default** (Settings kill switch turns it off). Each
+  in-script tool call still respects profile scope and human approval; code mode is not a
+  security boundary.
+
+Every `TOOLPORT_*` name still accepts the pre-rename `CONDUIT_*` alias (for example
+`CONDUIT_HTTP_TOKEN` continues to work). Prefer `TOOLPORT_*` in new configs.
 
 **Semantic search (optional).** Lazy discovery ranks tools lexically by default. Point it
 at any `/v1/embeddings` endpoint (LM Studio, Ollama, or a cloud provider) to blend in
-embedding similarity for paraphrased queries: `CONDUIT_SEMANTIC=on`,
-`CONDUIT_EMBED_ENDPOINT`, `CONDUIT_EMBED_MODEL`, plus optional `CONDUIT_EMBED_KEY`
-(endpoint auth) and `CONDUIT_EMBED_BLEND`.
+embedding similarity for paraphrased queries: `TOOLPORT_SEMANTIC=on`,
+`TOOLPORT_EMBED_ENDPOINT`, `TOOLPORT_EMBED_MODEL`, plus optional `TOOLPORT_EMBED_KEY`
+(endpoint auth) and `TOOLPORT_EMBED_BLEND`.
 
 **Multiple accounts for the same service.** Credentials belong to a server, not a
 profile. To use, say, a work and a personal GitHub, add GitHub twice as two
 servers ("GitHub (work)", "GitHub (personal)"), authenticate each with its own
 account, and enable one in each profile. A client scoped to the work profile
-(`CONDUIT_PROFILE`) then only ever sees the work account. Tool names are
+(`TOOLPORT_PROFILE`) then only ever sees the work account. Tool names are
 namespaced per server, so the two never collide even in the same profile.
 
 ## Install
@@ -357,8 +375,8 @@ The frontend is typechecked with `npx tsc --noEmit`.
   gateway share a team-scoped keychain access group, so the gateway reads the
   secrets the app saved with no prompt, even across app updates. (Earlier releases
   showed a one-time "Always Allow" prompt; on current signed builds it's gone.)
-- **VS Code: the `conduit` server doesn't start automatically.** VS Code may require
-  you to click **Start Server** on the `conduit` MCP entry the first time, that's VS
+- **VS Code: the `toolport` server doesn't start automatically.** VS Code may require
+  you to click **Start Server** on the `toolport` MCP entry the first time, that's VS
   Code's own MCP handling, not Toolport. After that it reconnects on its own.
 - **Linux: the AppImage won't launch / no window (`EGL_BAD_PARAMETER`).** The
   AppImage bundles its own libraries, which can clash with a very new or

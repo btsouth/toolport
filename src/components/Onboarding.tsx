@@ -29,6 +29,7 @@ import {
   teamJoinPoll,
 } from "@/lib/api";
 import { ClientLogo } from "@/components/ClientLogo";
+import { clientRestartHint } from "@/lib/clientConnect";
 import { teamUrlError } from "@/lib/teamUrl";
 import { Input } from "@/components/ui/input";
 import {
@@ -710,7 +711,12 @@ function ConnectClients({
       await installGateway(client.id);
       setDone((prev) => new Set(prev).add(client.id));
       onConnected();
-      toast.success(`Connected Toolport to ${client.name}`);
+      // Same trap as ClientDetail (SOU-317): config is written now, but the client
+      // usually only loads it on restart. Verify step also says this; put it on the
+      // success toast so it is not delayed until that step.
+      toast.success(`Connected Toolport to ${client.name}`, {
+        description: clientRestartHint(client.name, client.id),
+      });
     } catch (e) {
       toastError(`Couldn't connect: ${e}`);
     } finally {
@@ -1019,15 +1025,15 @@ export function VerifyCall({
             <div className="flex items-start gap-2 text-xs text-muted-foreground">
               <Loader2 className="mt-0.5 size-3.5 shrink-0 animate-spin" />
               <span>
-                Waiting for the first call from {client.name}. Just connected it? Restart{" "}
-                {client.name} so it loads Toolport.
+                Waiting for the first call from {client.name}. Just connected it?{" "}
+                {clientRestartHint(client.name, client.id)}
               </span>
             </div>
           ) : (
             <div className="flex flex-col gap-1.5 rounded-md bg-warning/10 px-3 py-2 text-xs">
               <span className="font-medium text-warning">No call yet. Common fixes:</span>
               <ul className="ml-3 list-disc space-y-0.5 text-muted-foreground">
-                <li>Restart {client.name} so it picks up Toolport.</li>
+                <li>{clientRestartHint(client.name, client.id)}</li>
                 <li>Make sure it's scoped to a profile that has servers (Settings).</li>
                 <li>If a server needs sign-in, authenticate it first.</li>
                 <li>Check that each server started on the main screen.</li>

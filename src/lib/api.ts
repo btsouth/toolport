@@ -283,6 +283,11 @@ export function setQuarantineOnDrift(on: boolean): Promise<Registry> {
   return invoke<Registry>("set_quarantine_on_drift", { on });
 }
 
+/** Toggle opt-in block-on-injection: fail high-confidence injection hits instead of only labeling. */
+export function setBlockOnInjection(on: boolean): Promise<Registry> {
+  return invoke<Registry>("set_block_on_injection", { on });
+}
+
 /** A tool blocked after a high-risk drift, awaiting re-approval. */
 export interface QuarantinedTool {
   server: string;
@@ -290,6 +295,12 @@ export interface QuarantinedTool {
   reason: string;
   ts: number;
   profile: string;
+  /** Concrete annotation delta when known, e.g. `readOnlyHint: true → false` (SOU-305). */
+  detail?: string | null;
+  prev_ro?: boolean | null;
+  new_ro?: boolean | null;
+  prev_dh?: boolean | null;
+  new_dh?: boolean | null;
 }
 
 /** Tools currently quarantined (blocked after a high-risk drift), across profiles. */
@@ -347,6 +358,16 @@ export function stopHttpBridge(): Promise<HttpBridgeStatus> {
 /** Current HTTP/OpenAPI bridge status (reaps the child if it exited). */
 export function httpBridgeStatus(): Promise<HttpBridgeStatus> {
   return invoke<HttpBridgeStatus>("http_bridge_status");
+}
+
+/**
+ * Stop obsolete Toolport gateway processes (older versions / stale paths).
+ * Keeps the current resolved binary and the supervised HTTP bridge when they
+ * match. Clients that auto-respawn MCP pick up the current binary on the next
+ * tool call. Returns human-readable labels of processes that were stopped.
+ */
+export function stopStaleGateways(): Promise<string[]> {
+  return invoke<string[]>("stop_stale_gateways");
 }
 
 /**
@@ -456,14 +477,22 @@ export function detectClients(): Promise<DetectedClient[]> {
 }
 
 /** Install the Toolport gateway into a client's config, optionally scoped to a
- * profile (by name). Omit profile to expose all enabled servers. */
+ * profile (by name). Omit profile to expose all enabled servers.
+ * Pass `force: true` after the user confirms overwriting a custom entry (SOU-406).
+ * `transport` is `"stdio"` (default) or `"sharedHttp"` (SOU-407).
+ * Callers that already know the live transport (Apply scope) must pass it —
+ * omitting defaults to stdio and would silently downgrade Shared HTTP (WS3-2). */
 export function installGateway(
   clientId: string,
   profile?: string,
+  force?: boolean,
+  transport?: "stdio" | "sharedHttp",
 ): Promise<WriteOutcome> {
   return invoke<WriteOutcome>("install_gateway", {
     clientId,
     profile: profile ?? null,
+    force: force ?? false,
+    transport: transport ?? "stdio",
   });
 }
 
@@ -473,14 +502,20 @@ export function uninstallGateway(clientId: string): Promise<WriteOutcome> {
 }
 
 /** Import a client's servers into Toolport, then leave the client with only the
- * Toolport gateway (optionally scoped to a profile). Backs up the config first. */
+ * Toolport gateway (optionally scoped to a profile). Backs up the config first.
+ * Pass `force: true` after the user confirms overwriting a custom entry (SOU-406).
+ * Pass `transport` to preserve Shared HTTP on migrate (WS3-2). */
 export function migrateClient(
   clientId: string,
   profile?: string,
+  force?: boolean,
+  transport?: "stdio" | "sharedHttp",
 ): Promise<MigrateResult> {
   return invoke<MigrateResult>("migrate_client", {
     clientId,
     profile: profile ?? null,
+    force: force ?? false,
+    transport: transport ?? "stdio",
   });
 }
 
@@ -573,7 +608,7 @@ export function shareStack(setupJson: string): Promise<string> {
   return invoke<string>("share_stack", { setupJson });
 }
 
-/** Fetch a shared setup's JSON by id (resolving a conduit://import?s=<id> link). */
+/** Fetch a shared setup's JSON by id (resolving a toolport://import?s=<id> link). */
 export function fetchSharedSetup(id: string): Promise<string> {
   return invoke<string>("fetch_shared_setup", { id });
 }

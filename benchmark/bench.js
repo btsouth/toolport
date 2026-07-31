@@ -3,8 +3,8 @@
 // Quantifies the headline claim ("hundreds of tool defs collapse to 3, context
 // stays flat") by running the SAME agent tasks against your local LLM twice:
 //
-//   - flat: the gateway exposes every downstream tool directly (CONDUIT_DISCOVERY=full)
-//   - lazy: the gateway exposes its meta-tools and the agent searches (CONDUIT_DISCOVERY=lazy)
+//   - flat: the gateway exposes every downstream tool directly (TOOLPORT_DISCOVERY=full)
+//   - lazy: the gateway exposes its meta-tools and the agent searches (TOOLPORT_DISCOVERY=lazy)
 //
 // It reports total tokens, tool calls, and completion per task, so the trade-off
 // is honest: lazy makes MORE tool calls (search round-trips) but should use FAR
@@ -64,7 +64,7 @@ function defaultGateway() {
 class Gateway {
   constructor(discovery) {
     this.proc = spawn(GATEWAY, [], {
-      env: { ...process.env, CONDUIT_DISCOVERY: discovery },
+      env: { ...process.env, TOOLPORT_DISCOVERY: discovery },
       stdio: ["pipe", "pipe", "inherit"],
     });
     this.proc.on("error", (e) => {
@@ -102,7 +102,7 @@ class Gateway {
     await this.rpc("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "conduit-bench", version: "1" },
+      clientInfo: { name: "toolport-bench", version: "1" },
     });
     // Give downstream servers time to connect so flat-mode tools/list is populated.
     await new Promise((r) => setTimeout(r, CONNECT_WAIT_MS));

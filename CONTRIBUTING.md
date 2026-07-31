@@ -20,9 +20,10 @@ npm run tauri dev       # run the desktop app
 ```
 
 **Dev data directory:** debug builds (`tauri dev`, `cargo build` without `--release`)
-use a separate data dir — `%APPDATA%\\Roaming\\Conduit-dev` on Windows,
-`~/.config/Conduit-dev` on Linux/macOS — so development never touches your
-installed release data. Override with `CONDUIT_DATA_DIR` for headless tests.
+use a separate data dir — `%APPDATA%\\Roaming\\Toolport-dev` on Windows,
+`~/.config/Toolport-dev` on Linux/macOS — so development never touches your
+installed release data. Override with `TOOLPORT_DATA_DIR` (legacy: `CONDUIT_DATA_DIR`)
+for headless tests.
 
 On macOS/Linux, see the platform notes in the [README troubleshooting](README.md#troubleshooting).
 
@@ -48,8 +49,8 @@ If a client reports the gateway "was not found," you forgot this step.
 ### Running tests
 
 ```bash
-# Backend (Rust)
-cargo test --manifest-path src-tauri/Cargo.toml
+# Backend (Rust: library, binaries, and integration tests)
+npm run test:rust
 
 # Headless gateway smoke (Windows; build gateway first)
 powershell -ExecutionPolicy Bypass -File scripts/smoke-headless.ps1
@@ -62,10 +63,11 @@ npx tsc --noEmit && npm run build
 ```
 
 The Rust suite includes unit tests in each module (`clients`, `catalog`,
-`registry`, `router`, `oauth`, etc.) and an integration test
-(`tests/list_changed.rs`) that exercises the gateway's live tool-change
-notification path. Frontend tests use [Vitest](https://vitest.dev) and live
-alongside the code as `*.test.ts` files inside `src/`.
+`registry`, `router`, `oauth`, etc.), binary-target tests, and integration tests
+in `src-tauri/tests/`. Use the npm script above so your local target selection
+matches CI. Frontend tests use [Vitest](https://vitest.dev) and live alongside
+the code as `*.test.ts` or `*.test.tsx` files inside `src/`, depending on whether
+the test contains JSX.
 
 ### Formatting
 
@@ -76,6 +78,23 @@ checks this on every PR, but you can fix issues locally before pushing:
 npm run format        # format all files in place
 npm run format:check  # check only (fails without writing — same as CI)
 ```
+
+**Do not run `cargo fmt`.** The Rust tree is deliberately not rustfmt-clean and
+there is no fmt gate in CI, so `cargo fmt` currently rewrites 725 places across
+33 files, which is effectively every Rust file in the project. That buries your
+actual change in unrelated reflow, and it conflicts with every other open PR
+touching the same file. Match the style of the code around you, and leave the
+rest alone.
+
+If your editor formats Rust on save, turn it off for this repo:
+
+```jsonc
+// .vscode/settings.json
+{ "[rust]": { "editor.formatOnSave": false } }
+```
+
+If a review asks you to drop a formatter run, `git checkout main -- <file>` and
+re-applying your change by hand is usually faster than unpicking the diff.
 
 ### Linting
 
@@ -104,13 +123,13 @@ snapshot), use `git commit --no-verify` — but CI will still enforce all checks
 ### Debugging
 
 **Gateway verbose logging:** the gateway writes an always-on log (connection
-lifecycle events) to a file in Toolport's data directory. Set `CONDUIT_DEBUG=1`
-to also capture per-request traces (tool-call arguments, routing decisions,
-downstream responses). "Copy diagnostics" in the app bundles this log with
-version info and a registry summary for bug reports.
+lifecycle events) to a file in Toolport's data directory. Set `TOOLPORT_DEBUG=1`
+(legacy: `CONDUIT_DEBUG=1`) to also capture per-request traces (tool-call arguments,
+routing decisions, downstream responses). "Copy diagnostics" in the app bundles
+this log with version info and a registry summary for bug reports.
 
 ```bash
-CONDUIT_DEBUG=1 npm run tauri dev
+TOOLPORT_DEBUG=1 npm run tauri dev
 ```
 
 **Registry file:** stored at a stable per-user path (visible via "Open data dir"
@@ -232,9 +251,11 @@ Check the client's config file and match it to a `Format` variant:
 | Format               | Config shape                                       | Existing clients                 |
 | -------------------- | -------------------------------------------------- | -------------------------------- |
 | `JsonMcpServers`     | `{"mcpServers": {...}}`                            | Claude Desktop, Cursor, Windsurf |
+| `JsonQwenMcpServers` | `{"mcpServers": {"name": {"httpUrl": "..."}}}`     | Qwen Code                        |
 | `JsonServers`        | `{"servers": {...}}`                               | VS Code                          |
+| `JsonOpenCodeMcp`    | `{"mcp": {"name": {"command": [...]}}}`            | OpenCode, Kilo Code              |
 | `JsonContextServers` | `{"context_servers": {...}}` (JSONC)               | Zed                              |
-| `TomlMcpServers`     | `[mcp_servers.name]`                               | Codex                            |
+| `TomlMcpServers`     | `[mcp_servers.name]`                               | Codex, Grok Build                |
 | `YamlExtensions`     | `extensions:` map (Goose shape: `cmd`/`envs`)      | Goose                            |
 | `YamlMcpServers`     | `mcp_servers:` map (Hermes shape: `command`/`env`) | Hermes                           |
 | `YamlMcpServersList` | `mcpServers:` list                                 | Continue                         |

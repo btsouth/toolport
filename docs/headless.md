@@ -25,17 +25,17 @@ Current streamable-HTTP scope:
 - `GET /mcp` opens a long-lived SSE listen stream for server→client JSON-RPC (keepalive comments every 30s when idle).
 - **Server-initiated RPC passthrough** (#167): when the MCP client declares `roots`, `sampling`, or `elicitation` at `initialize`, downstream servers (stdio or HTTP/SSE) can call `roots/list`, `sampling/createMessage`, and `elicitation/create`; the gateway forwards those to the upstream MCP client over stdio or HTTP MCP (`GET /mcp` listen). Interactive calls use a 120s upstream timeout. `notifications/roots/list_changed` from the client is forwarded to all downstream servers. HTTP downstream answers inline during SSE `POST` responses (no separate downstream `GET /mcp` listener yet).
 
-Auth is the same bearer token as today (`CONDUIT_HTTP_TOKEN` or a registered
+Auth is the same bearer token as today (`TOOLPORT_HTTP_TOKEN` or a registered
 `httpClients[]` entry). Non-loopback binds **require** a token.
 
 ## Quick start (binary)
 
 ```bash
-export CONDUIT_HTTP_HOST=0.0.0.0
-export CONDUIT_HTTP_TOKEN="$(openssl rand -hex 24)"
-export CONDUIT_REGISTRY=/path/to/registry.json
+export TOOLPORT_HTTP_HOST=0.0.0.0
+export TOOLPORT_HTTP_TOKEN="$(openssl rand -hex 24)"
+export TOOLPORT_REGISTRY=/path/to/registry.json
 # optional: encrypted vault
-# export CONDUIT_SECRET_KEY=...
+# export TOOLPORT_SECRET_KEY=...
 
 toolport-gateway --http 8765
 ```
@@ -43,19 +43,32 @@ toolport-gateway --http 8765
 Point Open WebUI at `http://host:8765` with the bearer token as the API key.
 Point an MCP client at `http://host:8765/mcp` (streamable-HTTP).
 
+### Prometheus metrics (opt-in)
+
+Off by default. Set `TOOLPORT_METRICS=1` on the gateway process, then scrape:
+
+```bash
+curl -s -H "Authorization: Bearer $TOOLPORT_HTTP_TOKEN" \
+  http://127.0.0.1:8765/metrics
+```
+
+Emits counters for tool calls (`server`, `tool`, `client`, `ok`), held
+destructive calls, duration sum/count, lazy-discovery tokens saved, and a
+quarantine gauge. Labels are ids only (never arguments). Same auth as OpenAPI.
+
 ### MCP handshake (curl)
 
 ```bash
 # 1) initialize — capture Mcp-Session-Id from the response headers
 curl -sD - -o /tmp/init.json -X POST http://127.0.0.1:8765/mcp \
-  -H "Authorization: Bearer $CONDUIT_HTTP_TOKEN" \
+  -H "Authorization: Bearer $TOOLPORT_HTTP_TOKEN" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
 
 # 2) tools/list (reuse the session id)
 curl -s -X POST http://127.0.0.1:8765/mcp \
-  -H "Authorization: Bearer $CONDUIT_HTTP_TOKEN" \
+  -H "Authorization: Bearer $TOOLPORT_HTTP_TOKEN" \
   -H "Content-Type: application/json" \
   -H "Mcp-Session-Id: <session-from-step-1>" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
@@ -73,7 +86,7 @@ docker pull ghcr.io/tsouth89/toolport-gateway:latest
 mkdir -p data
 cp data/registry.json.example data/registry.json
 cp docker-compose.example.yml docker-compose.yml
-# create .env with at least CONDUIT_HTTP_TOKEN=...
+# create .env with at least TOOLPORT_HTTP_TOKEN=...
 docker compose up -d
 ```
 
@@ -95,8 +108,8 @@ docker build -t toolport-gateway .
 
 Image defaults:
 
-- `CONDUIT_HTTP_HOST=0.0.0.0`
-- `CONDUIT_REGISTRY=/data/registry.json`
+- `TOOLPORT_HTTP_HOST=0.0.0.0`
+- `TOOLPORT_REGISTRY=/data/registry.json`
 - port `8765`
 - volume `/data`
 
@@ -104,18 +117,18 @@ Image defaults:
 
 Resolution order when a server marks `env[].secret: true`:
 
-1. Process env `CONDUIT_SECRET_<KEY>` (preferred in compose)
-2. Process env `<KEY>` when `CONDUIT_ALLOW_BARE_SECRET_ENV=1` (opt-in; enabled in the compose example)
-3. Encrypted `secrets.enc` when `CONDUIT_SECRET_KEY` is set
+1. Process env `TOOLPORT_SECRET_<KEY>` (preferred in compose)
+2. Process env `<KEY>` when `TOOLPORT_ALLOW_BARE_SECRET_ENV=1` (opt-in; enabled in the compose example)
+3. Encrypted `secrets.enc` when `TOOLPORT_SECRET_KEY` is set
 4. OS keychain (desktop)
 
 Example `.env`:
 
 ```env
-CONDUIT_HTTP_TOKEN=replace-me
-CONDUIT_SECRET_STRIPE_SECRET_KEY=sk_live_...
+TOOLPORT_HTTP_TOKEN=replace-me
+TOOLPORT_SECRET_STRIPE_SECRET_KEY=sk_live_...
 # or bare name with explicit opt-in (set in compose example):
-# CONDUIT_ALLOW_BARE_SECRET_ENV=1
+# TOOLPORT_ALLOW_BARE_SECRET_ENV=1
 # STRIPE_SECRET_KEY=sk_live_...
 ```
 
@@ -164,7 +177,7 @@ Use this before exposing a headless gateway beyond a trusted host or LAN.
 
 ### Network and auth
 
-- [ ] **Bearer token set** — `CONDUIT_HTTP_TOKEN` with at least 24 bytes of
+- [ ] **Bearer token set** — `TOOLPORT_HTTP_TOKEN` with at least 24 bytes of
       entropy (`openssl rand -hex 24`), or a registered scoped HTTP client. The
       process refuses any bind without configured authentication unless an operator
       explicitly passes `--insecure-loopback` for isolated local development.
@@ -181,9 +194,9 @@ Use this before exposing a headless gateway beyond a trusted host or LAN.
 
 ### Secrets and registry
 
-- [ ] **Vault passphrase** — set `CONDUIT_SECRET_KEY` and use `secrets.enc`, or
-      inject via `CONDUIT_SECRET_<KEY>` env vars. Prefer prefixed names over bare
-      `STRIPE_SECRET_KEY` unless you understand `CONDUIT_ALLOW_BARE_SECRET_ENV`.
+- [ ] **Vault passphrase** — set `TOOLPORT_SECRET_KEY` and use `secrets.enc`, or
+      inject via `TOOLPORT_SECRET_<KEY>` env vars. Prefer prefixed names over bare
+      `STRIPE_SECRET_KEY` unless you understand `TOOLPORT_ALLOW_BARE_SECRET_ENV`.
 - [ ] **`.env` permissions** — mode `600`, never commit, rotate if leaked.
 - [ ] **Registry on a volume** — persist `/data/registry.json`; back up before
       upgrades. A corrupt file is quarantined, not silently wiped (#224).
@@ -198,7 +211,7 @@ Use this before exposing a headless gateway beyond a trusted host or LAN.
       pulls; otherwise configure registry auth.
 - [ ] **Pin the image** — use a digest or version tag in production, not only
       `:latest`, once you have a known-good deploy.
-- [ ] **Healthcheck token** — compose passes `CONDUIT_HTTP_TOKEN` into the
+- [ ] **Healthcheck token** — compose passes `TOOLPORT_HTTP_TOKEN` into the
       healthcheck; ensure logs don't echo env vars.
 
 ### Runtime expectations
@@ -228,7 +241,7 @@ the v1.5.1–1.5.2 audit batch (#203–#207).
 | **Network exposure**     | Anyone with token + network path can invoke all scoped tools         | Non-loopback requires token; scope via `httpClients[]` / profiles           |
 | **MCP streamable-HTTP**  | New `POST /mcp`, `GET /mcp` SSE, session ids                         | Random 128-bit session ids, 24h TTL, 4096 session cap, id format validation |
 | **Server-initiated RPC** | Downstream can prompt upstream client (sampling, elicitation, roots) | Gated on client capabilities declared at `initialize`; 120s timeout         |
-| **Container secrets**    | Env vars in process memory / compose files                           | `CONDUIT_SECRET_*` prefix; encrypted `secrets.enc` option                   |
+| **Container secrets**    | Env vars in process memory / compose files                           | `TOOLPORT_SECRET_*` prefix; encrypted `secrets.enc` option                  |
 | **Long-lived SSE**       | Idle connections, queue growth                                       | Keepalive comments; session cleanup on TTL                                  |
 
 **Known limitations (not bugs, but deploy constraints):**
@@ -269,28 +282,34 @@ works only on loopback when the local-development escape hatch is required.
 
 Toolport reads the following environment variables. This is the complete reference across all components.
 
-| Name                            | Purpose                                                                                            | Default          | Where it applies          |
-| ------------------------------- | -------------------------------------------------------------------------------------------------- | ---------------- | ------------------------- |
-| `CONDUIT_ALLOW_BARE_SECRET_ENV` | Opt-in to read bare secret keys (e.g. `STRIPE_KEY`) from the environment.                          | None             | Headless                  |
-| `CONDUIT_CLIENT_ID`             | Identifies the client to the gateway for live profile resolution.                                  | None             | Clients                   |
-| `CONDUIT_DATA_DIR`              | Override the full path to the Toolport config directory.                                           | OS config root   | Everywhere                |
-| `CONDUIT_DEBUG`                 | Enable trace and debug logging.                                                                    | None             | Everywhere                |
-| `CONDUIT_DISCOVERY`             | Override discovery mode (`lazy`, `grouped`, `full`).                                               | Registry setting | Everywhere                |
-| `CONDUIT_EMBED_BLEND`           | Semantic search embedding blend weight (float).                                                    | Registry setting | Gateway / semantic search |
-| `CONDUIT_EMBED_ENDPOINT`        | Semantic search embedding endpoint URL.                                                            | Registry setting | Gateway / semantic search |
-| `CONDUIT_EMBED_KEY`             | API key for the semantic search embedding endpoint.                                                | None             | Gateway / semantic search |
-| `CONDUIT_EMBED_MODEL`           | Semantic search embedding model name.                                                              | Registry setting | Gateway / semantic search |
-| `CONDUIT_HTTP`                  | Direct port override or boolean flag to enable HTTP.                                               | None             | Gateway                   |
-| `CONDUIT_HTTP_HOST`             | Host IP to bind for the HTTP endpoint.                                                             | `127.0.0.1`      | Gateway                   |
-| `CONDUIT_HTTP_PORT`             | Port for the HTTP endpoint (when `CONDUIT_HTTP` is a boolean).                                     | `8765`           | Gateway                   |
-| `CONDUIT_HTTP_TOKEN`            | Bearer token for HTTP authentication.                                                              | None             | Gateway                   |
-| `CONDUIT_PROFILE`               | Initial profile value for a scoped client install; live scope is resolved via `CONDUIT_CLIENT_ID`. | None             | Clients                   |
-| `CONDUIT_REGISTRY`              | Override the path to `registry.json`.                                                              | Config root      | Everywhere                |
-| `CONDUIT_RESULT_BUDGET`         | Byte budget before large tool results get shaped/truncated (0 to disable).                         | `49152`          | Everywhere                |
-| `CONDUIT_SECRET_<KEY>`          | Process env override for a specific scoped secret.                                                 | None             | Headless                  |
-| `CONDUIT_SECRET_KEY`            | Passphrase to activate the `secrets.enc` file backend.                                             | None             | Headless                  |
-| `CONDUIT_SEMANTIC`              | Toggle semantic search (`on` or `off`).                                                            | Registry setting | Gateway / semantic search |
-| `CONDUIT_TARGET_TRIPLE`         | Packaged fallback target architecture (internal use).                                              | None             | Desktop                   |
+Prefer the `TOOLPORT_*` names. Every name below still accepts the pre-rename
+`CONDUIT_*` alias (for example `CONDUIT_HTTP_TOKEN` continues to work) so existing
+headless and Docker configs do not break on upgrade.
+
+| Name                             | Purpose                                                                                             | Default          | Where it applies          |
+| -------------------------------- | --------------------------------------------------------------------------------------------------- | ---------------- | ------------------------- |
+| `TOOLPORT_ALLOW_BARE_SECRET_ENV` | Opt-in to read bare secret keys (e.g. `STRIPE_KEY`) from the environment.                           | None             | Headless                  |
+| `TOOLPORT_CLIENT_ID`             | Identifies the client to the gateway for live profile resolution.                                   | None             | Clients                   |
+| `TOOLPORT_DATA_DIR`              | Override the full path to the Toolport config directory.                                            | OS config root   | Everywhere                |
+| `TOOLPORT_DEBUG`                 | Enable trace and debug logging.                                                                     | None             | Everywhere                |
+| `TOOLPORT_CODE_MODE`             | Force-enable code mode (`toolport_run_script`) even if Settings/registry has it off.                | Off (force)      | Gateway                   |
+| `TOOLPORT_DISCOVERY`             | Override discovery mode (`lazy`, `grouped`, `full`).                                                | Registry setting | Everywhere                |
+| `TOOLPORT_EMBED_BLEND`           | Semantic search embedding blend weight (float).                                                     | Registry setting | Gateway / semantic search |
+| `TOOLPORT_EMBED_ENDPOINT`        | Semantic search embedding endpoint URL.                                                             | Registry setting | Gateway / semantic search |
+| `TOOLPORT_EMBED_KEY`             | API key for the semantic search embedding endpoint.                                                 | None             | Gateway / semantic search |
+| `TOOLPORT_EMBED_MODEL`           | Semantic search embedding model name.                                                               | Registry setting | Gateway / semantic search |
+| `TOOLPORT_HTTP`                  | Direct port override or boolean flag to enable HTTP.                                                | None             | Gateway                   |
+| `TOOLPORT_HTTP_HOST`             | Host IP to bind for the HTTP endpoint.                                                              | `127.0.0.1`      | Gateway                   |
+| `TOOLPORT_HTTP_PORT`             | Port for the HTTP endpoint (when `TOOLPORT_HTTP` is a boolean).                                     | `8765`           | Gateway                   |
+| `TOOLPORT_HTTP_TOKEN`            | Bearer token for HTTP authentication.                                                               | None             | Gateway                   |
+| `TOOLPORT_METRICS`               | Opt-in Prometheus `GET /metrics` (`1` / `true` / `yes`). Off by default.                            | Off              | Gateway (HTTP mode)       |
+| `TOOLPORT_PROFILE`               | Initial profile value for a scoped client install; live scope is resolved via `TOOLPORT_CLIENT_ID`. | None             | Clients                   |
+| `TOOLPORT_REGISTRY`              | Override the path to `registry.json`.                                                               | Config root      | Everywhere                |
+| `TOOLPORT_RESULT_BUDGET`         | Byte budget before large tool results get shaped/truncated (0 to disable).                          | `49152`          | Everywhere                |
+| `TOOLPORT_SECRET_<KEY>`          | Process env override for a specific scoped secret.                                                  | None             | Headless                  |
+| `TOOLPORT_SECRET_KEY`            | Passphrase to activate the `secrets.enc` file backend.                                              | None             | Headless                  |
+| `TOOLPORT_SEMANTIC`              | Toggle semantic search (`on` or `off`).                                                             | Registry setting | Gateway / semantic search |
+| `CONDUIT_TARGET_TRIPLE`          | Packaged fallback target architecture (internal build-time only).                                   | None             | Desktop                   |
 
 ## Notes
 
@@ -299,4 +318,9 @@ Toolport reads the following environment variables. This is the complete referen
 - **Client config writers** (Cursor/Claude local JSON) still need the desktop
   app or a one-time manual URL in the client config — which is what sandboxed
   setups usually want anyway.
+- **Code mode** (`toolport_run_script`) is **on by default** in the registry
+  (Settings kill switch / `"codeMode": false`). It is not a security boundary:
+  agents supply JS that can call many tools in one round-trip; each call still
+  hits the same scope and approval gates. Shared multi-tenant gateways that do
+  not want the surface should set `"codeMode": false` in the registry.
 - Open WebUI details: [openwebui.md](./openwebui.md).

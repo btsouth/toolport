@@ -6,10 +6,302 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Added
+
+- **Kilo Code** and **Amp** are detected and configured, taking the client count
+  to 29. Kilo Code uses the same top-level `mcp` shape as OpenCode, so it reuses
+  that adapter rather than adding a parallel one. Amp keeps its servers under the
+  literal dotted key `amp.mcpServers` and honours `AMP_SETTINGS_FILE`. Both files
+  hold far more than MCP servers, so both are treated as whole-app state: an
+  unparseable one errors rather than being replaced with a fresh object.
+  (#553, #538)
+
+### Fixed
+
+- **Removing a server no longer leaves its settings behind.** Tool overrides,
+  pins, the per-server result budget, the injection-block exemption and any
+  fingerprint-bound approvals are now dropped along with the server. Previously a
+  server added later under the same id could inherit a stale security exemption
+  from one you had deleted. (#509)
+- **A share link survives a failed copy.** Creating a link and then failing to
+  copy it reported the whole operation as failed, and where the Clipboard API is
+  unavailable the failure was thrown synchronously, so a link that had been
+  created fine was surfaced as `Couldn't create a link`. The link now stays
+  visible and only the copy is reported as failed. (#560)
+
+## [1.10.0] - 2026-07-29
+
+Toolport speaks the current MCP revision, stale gateways actually stop after an
+upgrade, approvals stay bound to what you approved, and a batch of transport and
+code-mode hardening.
+
+### Added
+
+**Toolport speaks MCP 2026-07-28 over stdio, in both directions.** A client on the
+new revision can talk to Toolport, and Toolport can talk to a server on it, with
+every existing client and server continuing to see byte-identical traffic. Both eras
+run on the same stdio endpoint and are detected per connection, so there is nothing
+to migrate and nothing to configure.
+
+Over Streamable HTTP, Toolport stays on the established revision for now. A modern
+client receives exactly the response the spec defines as the fall-back signal, so it
+negotiates down cleanly instead of failing. That half arrives with
+`subscriptions/listen`.
+
+Three things now work through the gateway that could not before:
+
+- **Progress notifications reach your client.** A server reporting progress during a
+  long call has it relayed back, routed to the client that asked for it.
+- **Large results keep their full envelope.** Shaping an oversized result preserves
+  `_meta` and any fields Toolport does not recognise, so nothing a server sends is
+  dropped in transit.
+- **Structured error codes survive the hop**, so a client can act on a
+  machine-readable code rather than parsing a message string.
+
+### Security
+
+**An approved tool call is re-checked against the live gateway before it runs.** A
+human approval was validated against a snapshot taken before the hold, so a tool that
+was quarantined, released, or had its definition changed during the approval window
+still executed against the pre-hold view. Approvals now rebind to the live router and
+fail closed if the definition fingerprint moved or the tool is blocked, with a clearer
+"this approval is stale" message. (SOU-321, SOU-322)
+
+**Vendor auth hints require an exact domain match.** Lookalike apex domains
+(`clerkauth.com`, `evilgithub.com`) could inherit a real vendor's auth hints and token
+URL through prefix/suffix matching on the second-level label. Matching is now exact,
+`api.githubcopilot.com` gets its own entry, and a trailing-dot FQDN still resolves.
+
+### Fixed
+
+**Old gateway processes are stopped after an upgrade, on every OS.** Upgrading left
+older versioned gateways (`toolport-gateway-1.9.4.exe` and friends) running, so
+security and policy fixes in the new binary never took effect for clients still talking
+to them. Identity is now path-based across Windows, macOS, and Linux. On macOS the
+process listing used an argv that Apple's `ps` rejects, so it saw zero gateways; on
+Linux a binary replaced in place is now correctly treated as obsolete rather than
+protected. Settings gains a **Stop old gateways** action. (SOU-414)
+
+Note the limit: an AI client caches the gateway command when **it** starts, so whether
+stopping the old process is enough depends on the path that got cached. Where the binary
+is replaced in place, the same path already resolves to the new one and the next spawn
+picks it up. Where the path is one an upgrade never rewrites, it does not: on Windows the
+filename carries its version (so an upgrade never has to overwrite a locked file), and on
+any OS an app can still be pinned to an install location you have since moved away from.
+In those cases, restart the client app itself. Clients started after the upgrade are
+unaffected.
+
+**The Shared HTTP bridge comes back after the reaper stops it.** Reaping a bridge whose
+binary was replaced left HTTP and OpenAPI clients with nothing listening until someone
+reopened Settings.
+
+**A Continue Shared HTTP bearer now reaches the wire.** The token was written under
+`env`, which Continue does not forward for remote servers, leaving a plaintext bearer
+on disk that never authenticated. It now goes under `requestOptions.headers`, matching
+Continue's contract. Ownership re-detection reads both.
+
+**Client config backups no longer accumulate live bearer tokens.** Every config write
+copied the previous file and nothing ever pruned them, so a Shared HTTP client's
+backups piled up carrying working credentials. Capped at five generations per file,
+matching the registry.
+
+**Resource subscriptions clean up when a session is replaced**, and a subscriber
+waiting on another client's open no longer gives up while that open is still
+succeeding.
+
+**Code mode budget and isolation.** `fetchResult` shares the call and wall-clock budget
+rather than paging without limit, async workers reinstall the active session for host
+calls, and a corrupt registry no longer boots with code mode enabled.
+
+### Also in this release
+
+- Pasting a Crush config no longer fails as a malformed OpenCode one. Both use a
+  top-level `mcp` key, so the shape of `command` decides which it is. (#497)
+- Rate-limit counters stay in memory until a data directory is bound, instead of
+  writing a stray counter file into the working directory. (#543)
+- The share-link copy button confirms it copied, and says so when it could not.
+  (#549)
+- Coverage for the import-review shell and private-host classifiers, and for
+  gateway filtering during client migration. (#547, #510)
+- `fmtMs` and `fmtDollars` moved into `lib/utils` with tests. (#548)
+- Error strings, the benchmark write-up, the security notes, and CONTRIBUTING all
+  say what the code actually does. (#539, #545, #546, #540)
+
+### Thanks
+
+Patches this cycle came from:
+
+- **[AnayGarodia](https://github.com/AnayGarodia)** - benchmark and security docs, the
+  share-link copy fix, `fmtMs`/`fmtDollars` extraction, and tests for the
+  import-review classifiers (#545, #546, #547, #548, #549).
+- **[Vermitrude](https://github.com/Vermitrude)** - OpenCode/Crush paste
+  disambiguation (#497).
+- **[snowyukitty](https://github.com/snowyukitty)** - keeping unbound rate-limit
+  counters in memory (#543).
+- **[rohankumardubey](https://github.com/rohankumardubey)** - test coverage for
+  gateway filtering during client migration (#510).
+- **[cyforkk](https://github.com/cyforkk)** - normalised the error strings (#539).
+- **[HaimiyaWasn](https://github.com/HaimiyaWasn)** - CONTRIBUTING correction (#540).
+
+If we missed you, open an issue.
+
+## [1.9.6] - 2026-07-27
+
+Client config ownership, Shared HTTP connect, code mode v2 (parallel + typed stubs),
+native resource subscriptions, gateway hardening, and safer vendor matching.
+
+### Discovery
+
+**Code mode on by default.** `toolport_run_script` is advertised unless you turn **Code
+mode** off in Settings (or set `"codeMode": false` in the registry). Each in-script call
+still hits the same scope and approval gates as `toolport_call_tool`. Code mode is not a
+security boundary (agent-supplied JS). `TOOLPORT_CODE_MODE=1` still force-enables.
+Existing registries that already store `"codeMode": false` stay off. (SOU-397)
+
+**Code mode parallel calls and typed stubs.** Scripts get `callAsync` / `Promise.all`
+with bounded host parallelism, scoped `servers.*` typed stubs, full intermediate
+results and `fetchResult` handoff. (#480–#483 / SOU-348)
+
+### Added
+
+**Per-client transport: Spawn (stdio) or Shared HTTP.** Integrations can connect a
+client to the supervised HTTP bridge instead of spawning its own gateway. Native
+remote shapes (VS Code, OpenCode, Qwen, Hermes, Continue) get a url + bearer entry;
+clients that only support stdio (Claude Desktop, etc.) get an opt-in `npx mcp-remote`
+bridge. Tokens are vaulted; ownership records never store bearers. (SOU-407)
+
+**Native MCP resource subscriptions.** Subscribe/unsubscribe and `resources/updated`
+fanout (with producer verification), resource templates + completions, paginated
+catalogs preserved. (#474–#479, #484)
+
+### Fixed
+
+**Client gateway ownership is now a first-class state (Managed / Customized /
+Absent).** Toolport records what it last wrote into each client's config and surfaces
+hand-edited entries as "custom configuration" in Integrations, with an explicit Reset
+to default (confirm before overwrite). Launch re-point and Connect no longer silently
+clobber a customized entry. Pre-ownership installs still use the command-basename
+heuristic. (SOU-406, follow-up to #487)
+
+**A hand-edited gateway entry is no longer reverted on every app launch.** The
+launch-time re-point recognized its own entry by _name_, so an entry still called
+`toolport` but pointed at something else - an `mcp-remote` bridge against the HTTP
+endpoint, a container, a wrapper script - was treated as a stale install and rewritten
+back to the default stdio command every time the app started. Re-pointing now requires
+the stored command to actually name a Toolport gateway binary; anything else is treated
+as user-managed and left exactly as written (and the skip is logged). Genuine
+migrations - an older version, the pre-rename `conduit-gateway`, the pre-rename data
+directory, an unversioned install path - are unaffected. (#487, #488)
+
+**A machine-wide `TOOLPORT_HTTP` / `CONDUIT_HTTP` no longer hijacks client-spawned
+gateways.** HTTP mode replaces the stdio transport, so an inherited value left every
+MCP client with a gateway that never answered its pipe, and every gateway after the
+first colliding on the shared port (`WSAEADDRINUSE`) - which some clients treat as
+fatal. The env forms are now ignored, with a warning, when stdin is a pipe. The
+desktop app, the Docker images, and the documented headless setup all pass `--http`
+explicitly and are unaffected; use the flag in scripts and services too. (#487)
+
+**Vendor auth hints match on domain-label boundaries only.** Bare needles like
+`clerk` / `github` no longer match attacker subdomains (`clerk.evil.com`), and full
+domain needles require a real host suffix. Spoofed hosts can no longer skip the live
+probe via `force_kind`. (#417, #492)
+
+**Headless `secrets.enc` set/delete is locked** against concurrent writers. (SOU-332)
+
+**Profile scope tool-fetch UI** shows failures, ignores stale errors after a newer
+load, and scopes loading state per server. (#468)
+
+**Search efficiency and routed-call audit overhead** improvements. (#472, #473)
+
+## [1.9.5] - 2026-07-25
+
+Finishes the Conduit → Toolport rename for what users and configs see, keeps
+legacy `CONDUIT_*` env aliases working, and ships security, Teams policy, quarantine,
+and client polish that landed after 1.9.4.
+
+### Branding and upgrade migration
+
+**Client configs write `toolport`, not `conduit`.** New connects and a launch
+migration rename the MCP entry, move the data directory leaf
+`Conduit` → `Toolport` when safe, and rewrite client env keys to
+`TOOLPORT_CLIENT_ID` / `TOOLPORT_PROFILE` while still accepting the old
+`CONDUIT_*` names. Downstream children no longer inherit `TOOLPORT_*` control-plane
+env (vault key / HTTP token). Deep links accept `toolport://` and still open
+legacy `conduit://` share links. (#445 and follow-ups)
+
+### Security and integrity
+
+**Opt-in block-on-injection, with org force.** Content-defense hits can refuse the
+tool result instead of only flagging it; Teams can force the policy on members.
+(#465)
+
+**Structured tool results are scanned more thoroughly**, including head/tail of
+large `structuredContent`, with redaction on hit. (#455)
+
+**Corrupt quarantine store fails closed** instead of treating the file as empty
+and unblocking tools. (#448)
+
+**Upstream MCP responses are shape-validated** before use. (#452)
+
+### Teams and gateway policy
+
+**Org `allowedTools` maps into local profile `tool_scope`**, with allowlist id
+mapping and apply receipts so admins can see policy land on the desktop.
+(#457, #458, #456)
+
+**Org rate limits enforced in the local gateway.** (#461)
+
+**Optional per-call audit export to the org.** (#460)
+
+**Profile `tool_scope` enforced on the HTTP bridge** as well as stdio. (#459)
+
+### Observability and clients
+
+**Opt-in Prometheus `/metrics`** on the gateway HTTP surface (`TOOLPORT_METRICS=1`).
+(#464)
+
+**Grok Build** (xAI terminal coding agent used with Toolport Studio) as a
+first-class client: detect, one-click connect, `~/.grok/config.toml`. (#433)
+
+**Toolport Studio** as a first-class client (`toolport-studio`): detect install
+markers, one-click connect to `~/.toolport-studio/mcp.json`, profile scope, and
+session-aware connect toasts. Studio still auto-discovers the gateway without
+Connect; Connect pins profile and Activity attribution.
+
+**Quarantine cards show annotation detail** and notify when new entries appear.
+(#439)
+
+**Client detection errors surface in the UI** instead of failing silently. (#466)
+
+**Restart toast after connecting a client** so users know to reload the AI client.
+(#317 / #442)
+
+**Client scope copy matches behavior** (active profile, not “all servers”). (#447)
+
+### Reliability and polish
+
+**Activity rows keep expansion across the 3s live refresh.** (#450)
+
+**Timestamps go through shared `fmtTs`.** (#451)
+
+**Quarantine.json re-parse skipped when mtime+len unchanged.** (#435)
+
+**Invalid discovery / HTTP / budget env values warn** instead of failing quietly.
+(#453)
+
+**CI runs Rust integration tests**; notarytool submit is time-bounded. (#454, #441)
+
+### Docs
+
+Headless, Open WebUI, Docker compose, README, and env reference prefer
+`TOOLPORT_*` names and document `CONDUIT_*` as still-accepted aliases.
+
 ## [1.9.4] - 2026-07-22
 
 Toolport blocks a tool when its definition changes in a risky way. This release fixes the
 part where un-blocking it didn't work, and makes the whole thing visible instead of buried.
+It also lands a security pass that closes several ways a malicious server could reach past
+the gateway, adds four new clients, and clears a batch of reliability and correctness bugs.
 
 ### Quarantine: blocked tools you can actually see and unblock
 
@@ -42,7 +334,13 @@ briefly opening console windows on Windows at startup. Harmless, but alarming. (
 
 ### Clients
 
-**Two new clients: Witsy and Oh My Pi.** Toolport now detects 24 clients. (#366, #365)
+**Four new clients: Witsy, Oh My Pi, OpenCode, and Qwen Code.** Toolport now detects 26
+clients. OpenCode and Qwen Code each use their own config shape - OpenCode stores a command
+as an argv array, and Qwen Code distinguishes streamable-HTTP from SSE servers - and Toolport
+reads and writes both correctly. (#366, #365, #411, #415)
+
+**Number and boolean values in a server's `args` are kept** when importing or pasting a
+config, instead of being silently dropped (which would shift every argument after them). (#416)
 
 **Pasting a Continue `config.yaml` block works.** "Paste from client config" rejected
 Continue's format with "Could not detect format", even though Toolport already reads and
@@ -52,6 +350,50 @@ block are preserved. (#403)
 **Downstream servers run in their own process group on macOS and Linux**, so a server
 starting up can't disturb the display of a terminal-based AI client. (#364)
 
+### Reliability
+
+**Tool name collisions get stable suffixes.** When two tools on a server would share the same
+exposed name, the loser gets a `_2` suffix - but that was assigned by list order, so a server
+reordering its own tool list could swap the suffix between two real tools, and a cached tool
+name would quietly start calling the wrong one. Suffixes are now assigned by tool name, so
+they don't move. (#408)
+
+**Downstream server processes are fully cleaned up on macOS and Linux.** Killing a server (a
+toggle, or a catalog rebuild) killed only the wrapper, leaving `npx`/`uvx` child processes
+running. Toolport now tears down the whole process group, so nothing is left behind. (#406)
+
+**A clear error when a server's working directory doesn't exist**, instead of a confusing
+spawn failure, including which configured path (and which unset variable) was the problem.
+(#410)
+
+### Security
+
+**Tool error messages are now scanned like tool results.** Content defense labels untrusted
+tool output as data so a server can't slip instructions into your agent - but it only covered
+successful results. A server could bypass it by returning an _error_ whose message carried the
+payload. Errors now go through the same scan and size cap. (#429)
+
+**A server that can't be resolved is no longer treated as local.** During sign-in (OAuth), an
+unresolvable server address was classified as "local" and had its network-safety checks
+switched off - a path a malicious server could use to aim the sign-in flow at your own
+network. A server now has to positively resolve to a private address to earn that trust.
+(#430)
+
+**Renaming a tool no longer disables its safety checks.** A tool you renamed couldn't be
+blocked and wasn't watched for risky changes, so a rename silently opted it out of the
+protection the rest of your tools get. Renamed tools are now blocked and watched like any
+other. (#431)
+
+**Vendor detection matches the server's host, not anywhere in its address**, so a path-based
+gateway (for example `.../github`) is no longer mistaken for the vendor named in the path -
+which could otherwise misjudge whether that server needs a token. (#413)
+
+Cleared seven advisories from the dependency tree: two high-severity in `brace-expansion` and
+`js-yaml`, then one high and four moderate reaching us through `fast-uri` and `hono`. The
+second batch arrived because `shadcn`, a code-generation CLI, was listed as a production
+dependency - moving it removed that whole subtree from the shipped app rather than patching
+versions one at a time. (#367, #396, #402)
+
 ### Polish
 
 **Activity no longer shows a red "0%"** for a server that does have errors. Small error rates
@@ -60,25 +402,19 @@ read as "0.2%" or "<0.1%" instead of rounding away to nothing. (#388)
 **The new-profile name box clears when you cancel**, so reopening it no longer offers to
 create a profile you had already abandoned. (#386)
 
-### Security
-
-Cleared seven advisories from the dependency tree: two high-severity in `brace-expansion` and
-`js-yaml`, then one high and four moderate reaching us through `fast-uri` and `hono`. The
-second batch arrived because `shadcn`, a code-generation CLI, was listed as a production
-dependency - moving it removed that whole subtree from the shipped app rather than patching
-versions one at a time. (#367, #396, #402)
-
 ### Thanks
 
 This release includes work from:
 
+- [@floze-the-genius](https://github.com/floze-the-genius) - OpenCode client support (#411), Qwen Code client support (#415), Continue YAML write-safety tests (#414)
 - [@bradhallett](https://github.com/bradhallett) - Oh My Pi client support (#365), process-group isolation on Unix (#364)
 - [@amitvijapur](https://github.com/amitvijapur) - Witsy client support (#366)
+- [@BharadwajKanneveti](https://github.com/BharadwajKanneveti) - discovery-ranker blend test (#394), non-string `args` handling (#416), Activity timestamp formatting (#412)
 - [@pollychen-lab](https://github.com/pollychen-lab) - Activity error-rate formatting (#388), new-profile field reset (#386)
+- [@Vermitrude](https://github.com/Vermitrude) - vendor detection host matching (#413)
+- [@AnayGarodia](https://github.com/AnayGarodia) - working-directory error reporting (#410), data-directory test isolation (#409)
 - [@manishchalla](https://github.com/manishchalla) - Continue snippet parsing (#403)
-- [@gxrey59-dev](https://github.com/gxrey59-dev) - contributor guide corrections (#385)
 - [@dubeyharshit0605](https://github.com/dubeyharshit0605) - ConfirmDialog test coverage (#393)
-- [@BharadwajKanneveti](https://github.com/BharadwajKanneveti) - discovery-ranker blend test (#394)
 
 ## [1.9.3] - 2026-07-18
 

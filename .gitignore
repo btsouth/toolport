@@ -71,6 +71,7 @@ dist-ssr
 .smoke-test/
 /benchmark/capable/
 /benchmark/local-*/
+/benchmark/local-compare*.json
 /benchmark/groq/
 /benchmark/gemini/
 # Local ground-truth for grading (your real account items) - never commit

@@ -7,9 +7,10 @@ Releases are built by CI on a version tag (`.github/workflows/release.yml`).
    - `src-tauri/Cargo.toml` (`version`)
    - `package.json` (`version`)
    - `package-lock.json` (root `version` fields)
-   - `src-tauri/Cargo.lock` (the `conduit` package `version` entry)
+   - `src-tauri/Cargo.lock` (the Cargo package is still named `conduit` for history;
+     update that package's `version` entry)
    - `CHANGELOG.md` — move `[Unreleased]` entries into a dated section
-   - `server.json` only when publishing a matching standalone `@tsouth89/conduit-gateway` package
+   - `server.json` only when publishing a matching standalone gateway package
 2. Draft user-facing notes in `docs/release-notes/vX.Y.Z.md` (paste into the GitHub
    release body when publishing the draft CI creates).
 3. Commit the bump (e.g. `chore(release): 1.6.0`).
@@ -28,6 +29,15 @@ release with auto-generated notes. Replace or augment the body with
 
 The **gateway container image** (`ghcr.io/tsouth89/toolport-gateway`) publishes
 separately on every push to `main` via `docker-publish.yml` — no tag required.
+
+## After users upgrade
+
+On each app launch Toolport **stops obsolete gateway processes** (older versioned
+binaries and stale paths), keeping the current published/resolved gateway. Clients
+that auto-respawn MCP pick up the new binary on the **next tool call** without a
+full agent restart. Settings → Integrations → **Stop old gateways** runs the same
+cleanup on demand. The in-app updater still kills **all** gateway processes before
+install so locked files can be replaced.
 
 ## Manual fallback
 

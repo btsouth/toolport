@@ -454,6 +454,7 @@ fn post_usage_day(
     day: &str,
     rows: Vec<Value>,
     instructions_status: Option<&Value>,
+    policy_status: Option<&Value>,
 ) -> Result<bool, String> {
     require_secure_team_url(server_url)?;
     let url = format!("{}/teams/{}/usage", base(server_url), team_id);
@@ -462,6 +463,11 @@ fn post_usage_day(
     // key; a client without instructions omits it entirely.
     if let Some(status) = instructions_status {
         body["instructionsStatus"] = status.clone();
+    }
+    // Screening-policy apply receipt (SOU-339): as-enforced values of the four safety flags.
+    // Same ride-on-usage / ignore-if-unknown pattern as instructions.
+    if let Some(status) = policy_status {
+        body["policyStatus"] = status.clone();
     }
     match agent()
         .post(&url)
@@ -532,6 +538,12 @@ fn finish_connect(server_url: &str, member_name: Option<&str>, joined: Joined) -
         team_instructions_version: 0,
         team_instructions_targets: Vec::new(),
         team_instructions_reported: None,
+        team_instructions_reported_at: None,
+        team_policy_reported: None,
+        team_policy_reported_at: None,
+        call_audit_export_cursor: None,
+        call_audit_export: false,
+        rate_limits: Vec::new(),
     };
     // Pull BEFORE loading the registry, then load a FRESH copy AFTER the (possibly
     // multi-second) network round trip and apply onto that — mirroring `sync_inner`.
@@ -680,6 +692,11 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
     // unchanged receipt isn't re-sent. Independent of the config change above, so a client
     // installed after the last edit is reflected as soon as it appears.
     report_instructions_status(&conn, &token);
+    // Report as-enforced screening-policy flags (SOU-339) so the org can prove cooperative
+    // enforcement took effect on this machine. Deduped like the instructions receipt.
+    report_policy_status(&conn, &token);
+    // Opt-in per-call audit export (SOU-171): tool name/ts/duration/ok/argsHash only.
+    report_call_events(&conn, &token);
     Ok(SyncResult::Ok {
         role,
         role_changed,
@@ -763,7 +780,7 @@ fn report_usage(conn: &TeamConnection, token: &str) {
                 })
             })
             .collect();
-        match post_usage_day(&conn.server_url, &conn.team_id, token, &day, rows, None) {
+        match post_usage_day(&conn.server_url, &conn.team_id, token, &day, rows, None, None) {
             Ok(true) => {
                 new_state.insert(day, merged);
                 changed = true;
@@ -964,13 +981,36 @@ pub fn instructions_status() -> Option<InstructionsStatusView> {
     })
 }
 
-/// Report this member's instructions coverage to the team server, once per sync cycle. Sends only
-/// when the receipt CHANGED since the last successful send (dedup by hash), so an unchanged
-/// coverage state costs the server nothing. Best-effort; a failure just retries next cycle. No-op
+/// Re-send an unchanged receipt at least this often so the server's `*_status_at` stamps
+/// stay fresh. Dashboard "stale" is 48h; 12h gives headroom under intermittent offline.
+const RECEIPT_HEARTBEAT_MS: i64 = 12 * 3600 * 1000;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// True when we already sent this fingerprint recently enough that a re-send is wasteful.
+fn receipt_fresh(reported: Option<&str>, reported_at: Option<i64>, fingerprint: &str) -> bool {
+    if reported != Some(fingerprint) {
+        return false;
+    }
+    match reported_at {
+        Some(at) if now_ms().saturating_sub(at) < RECEIPT_HEARTBEAT_MS => true,
+        _ => false,
+    }
+}
+
+/// Report this member's instructions coverage to the team server, once per sync cycle. Sends
+/// when the receipt CHANGED, or when the last successful send is older than
+/// [`RECEIPT_HEARTBEAT_MS`] (so the server's `instructions_status_at` does not go false-stale
+/// while the member keeps syncing). Best-effort; a failure just retries next cycle. No-op
 /// when the team has no active instructions.
 fn report_instructions_status(conn: &TeamConnection, token: &str) {
     use crate::instructions;
-    let (content, version, reported) = {
+    let (content, version, reported, reported_at) = {
         let Ok(reg) = crate::registry::load() else {
             return;
         };
@@ -979,6 +1019,7 @@ fn report_instructions_status(conn: &TeamConnection, token: &str) {
                 t.team_instructions_content.clone(),
                 t.team_instructions_version,
                 t.team_instructions_reported.clone(),
+                t.team_instructions_reported_at,
             ),
             _ => return,
         }
@@ -991,8 +1032,8 @@ fn report_instructions_status(conn: &TeamConnection, token: &str) {
         return;
     };
     let fingerprint = instructions::content_hash(&receipt_json.to_string());
-    if reported.as_deref() == Some(fingerprint.as_str()) {
-        return; // unchanged since the last successful send
+    if receipt_fresh(reported.as_deref(), reported_at, &fingerprint) {
+        return;
     }
     let day = usage_report::utc_day_back(0);
     match post_usage_day(
@@ -1002,12 +1043,15 @@ fn report_instructions_status(conn: &TeamConnection, token: &str) {
         &day,
         Vec::new(),
         Some(&receipt_json),
+        None,
     ) {
         Ok(true) => {
+            let at = now_ms();
             let _ = crate::registry::update(|reg| {
                 if let Some(t) = reg.team.as_mut() {
                     if t.team_id == conn.team_id {
                         t.team_instructions_reported = Some(fingerprint.clone());
+                        t.team_instructions_reported_at = Some(at);
                     }
                 }
                 Ok(())
@@ -1015,6 +1059,179 @@ fn report_instructions_status(conn: &TeamConnection, token: &str) {
         }
         // Old server without the endpoint, or a transient failure: leave `reported` unset so we
         // retry on a later cycle.
+        _ => {}
+    }
+}
+
+/// Build the screening-policy apply receipt (SOU-339 / SOU-345): safety flags as currently
+/// enforced on this machine (member's own setting OR team force, whichever is stricter).
+fn build_policy_receipt(reg: &crate::registry::Registry) -> Value {
+    json!({
+        "denyDestructive": reg.deny_destructive_effective(),
+        "forceContentDefense": reg.content_defense_effective(),
+        "forceQuarantineOnDrift": reg.quarantine_on_drift_effective(),
+        "forceHumanApproval": reg.human_approval_effective(),
+        "forceBlockOnInjection": reg.block_on_injection_effective(),
+    })
+}
+
+/// Upload new local audit lines for team servers when org has `callAuditExport` on (SOU-171).
+/// Fields: ts, server, tool, ok, durationMs, argsHash, client — never args/results.
+fn report_call_events(conn: &TeamConnection, token: &str) {
+    let tag = tag_for(&conn.team_id);
+    let (enabled, cursor, team_servers) = {
+        let Ok(reg) = crate::registry::load() else {
+            return;
+        };
+        match reg.team.as_ref() {
+            Some(t) if t.team_id == conn.team_id && t.call_audit_export => {}
+            _ => return,
+        }
+        let team_servers: HashSet<String> = reg
+            .servers
+            .iter()
+            .filter(|s| s.source.as_deref() == Some(tag.as_str()))
+            .map(|s| s.id.clone())
+            .collect();
+        if team_servers.is_empty() {
+            return;
+        }
+        let cursor = reg
+            .team
+            .as_ref()
+            .and_then(|t| t.call_audit_export_cursor)
+            .unwrap_or(0);
+        (true, cursor, team_servers)
+    };
+    if !enabled {
+        return;
+    }
+    let lines = crate::audit::read_recent(usize::MAX);
+    let mut batch: Vec<Value> = Vec::new();
+    let mut max_ts = cursor;
+    for line in &lines {
+        let ts = line.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
+        if ts <= cursor {
+            continue;
+        }
+        let server = line.get("server").and_then(|v| v.as_str()).unwrap_or("");
+        if !team_servers.contains(server) {
+            continue;
+        }
+        // Skip governance-only held/approval rows that aren't real tool executions with ok/duration.
+        // Still export held=true ok rows if they have tool — org may want to see denials. Include all with tool.
+        let tool = line.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+        if tool.is_empty() {
+            continue;
+        }
+        let mut ev = json!({
+            "ts": ts,
+            "server": server,
+            "tool": tool,
+            "ok": line.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+        });
+        if let Some(ms) = line.get("durationMs").and_then(|v| v.as_u64()) {
+            ev["durationMs"] = json!(ms);
+        }
+        if let Some(h) = line.get("argsHash").and_then(|v| v.as_str()) {
+            ev["argsHash"] = json!(h);
+        }
+        if let Some(c) = line.get("client").and_then(|v| v.as_str()) {
+            ev["client"] = json!(c);
+        }
+        batch.push(ev);
+        max_ts = max_ts.max(ts);
+        if batch.len() >= 200 {
+            break;
+        }
+    }
+    if batch.is_empty() {
+        return;
+    }
+    match post_call_events(&conn.server_url, &conn.team_id, token, &batch) {
+        Ok(true) => {
+            let _ = crate::registry::update(|reg| {
+                if let Some(t) = reg.team.as_mut() {
+                    if t.team_id == conn.team_id {
+                        t.call_audit_export_cursor = Some(max_ts);
+                    }
+                }
+                Ok(())
+            });
+        }
+        _ => {}
+    }
+}
+
+fn post_call_events(
+    server_url: &str,
+    team_id: &str,
+    token: &str,
+    events: &[Value],
+) -> Result<bool, String> {
+    require_secure_team_url(server_url)?;
+    let url = format!("{}/teams/{}/call-events", base(server_url), team_id);
+    let body = json!({ "events": events });
+    match agent()
+        .post(&url)
+        .set("authorization", &format!("Bearer {token}"))
+        .send_json(body)
+    {
+        Ok(_) => Ok(true),
+        Err(ureq::Error::Status(404 | 405, _)) => Ok(false),
+        Err(e) => Err(stringify(e)),
+    }
+}
+
+/// Report this member's as-enforced screening policy to the team server once per sync cycle.
+/// Deduped by receipt hash, with a 12h heartbeat so `policy_status_at` stays fresh. Best-effort.
+fn report_policy_status(conn: &TeamConnection, token: &str) {
+    use crate::instructions;
+    let (receipt_json, fingerprint, reported, reported_at) = {
+        let Ok(reg) = crate::registry::load() else {
+            return;
+        };
+        match reg.team.as_ref() {
+            Some(t) if t.team_id == conn.team_id => {}
+            _ => return,
+        }
+        let receipt = build_policy_receipt(&reg);
+        let Ok(receipt_json) = serde_json::to_value(&receipt) else {
+            return;
+        };
+        let fingerprint = instructions::content_hash(&receipt_json.to_string());
+        let (reported, reported_at) = reg
+            .team
+            .as_ref()
+            .map(|t| (t.team_policy_reported.clone(), t.team_policy_reported_at))
+            .unwrap_or((None, None));
+        (receipt_json, fingerprint, reported, reported_at)
+    };
+    if receipt_fresh(reported.as_deref(), reported_at, &fingerprint) {
+        return;
+    }
+    let day = usage_report::utc_day_back(0);
+    match post_usage_day(
+        &conn.server_url,
+        &conn.team_id,
+        token,
+        &day,
+        Vec::new(),
+        None,
+        Some(&receipt_json),
+    ) {
+        Ok(true) => {
+            let at = now_ms();
+            let _ = crate::registry::update(|reg| {
+                if let Some(t) = reg.team.as_mut() {
+                    if t.team_id == conn.team_id {
+                        t.team_policy_reported = Some(fingerprint.clone());
+                        t.team_policy_reported_at = Some(at);
+                    }
+                }
+                Ok(())
+            });
+        }
         _ => {}
     }
 }
@@ -1224,13 +1441,18 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     let mut auto_enable: Vec<String> = Vec::new();
     let mut review_ids: Vec<String> = Vec::new();
     let mut used_ids: Vec<String> = reg.servers.iter().map(|s| s.id.clone()).collect();
+    // Final member-local server id -> optional allow-list (None = unrestricted). Built from
+    // the post-unique_id ids so a collision rename (team_github-2) never loses its org scope.
+    let mut tool_allows: HashMap<String, Option<Vec<String>>> = HashMap::new();
     let mut outcome = MergeOutcome::default();
     if let Some(arr) = team_cfg.get("servers").and_then(Value::as_array) {
         for s in arr {
+            let allowed = parse_allowed_tools(s);
             match classify_team_server(s, &tag) {
                 TeamClass::Ready(mut entry) => {
                     entry.id = crate::registry::unique_id(&entry.id, &used_ids);
                     used_ids.push(entry.id.clone());
+                    tool_allows.insert(entry.id.clone(), allowed);
                     auto_enable.push(entry.id.clone());
                     reg.servers.push(entry);
                     outcome.applied += 1;
@@ -1238,6 +1460,7 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
                 TeamClass::Review(mut entry) => {
                     entry.id = crate::registry::unique_id(&entry.id, &used_ids);
                     used_ids.push(entry.id.clone());
+                    tool_allows.insert(entry.id.clone(), allowed);
                     review_ids.push(entry.id.clone());
                     reg.servers.push(entry);
                     outcome.review += 1;
@@ -1291,8 +1514,77 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     reg.team_forced_content_defense = policy_forces("forceContentDefense");
     reg.team_forced_quarantine_on_drift = policy_forces("forceQuarantineOnDrift");
     reg.team_forced_human_approval = policy_forces("forceHumanApproval");
+    reg.team_forced_block_on_injection = policy_forces("forceBlockOnInjection");
+
+    // SOU-171: org opt-in for per-call audit export (member apps upload when true).
+    // SOU-340: resolved tool-call caps for this member (empty clears prior caps).
+    if let Some(t) = reg.team.as_mut() {
+        if t.team_id == team_id {
+            t.call_audit_export =
+                team_cfg.get("callAuditExport").and_then(Value::as_bool) == Some(true);
+            t.rate_limits = crate::rate_limits::parse_caps(team_cfg);
+        }
+    }
+
+    // Org per-tool allowlists (SOU-167): each team server may carry `allowedTools` (an allow-
+    // list of ORIGINAL tool names). When present, every profile is narrowed to that list for
+    // that server via `tool_scope` (the existing FeatureSet gate). When absent, any prior
+    // team-driven scope entry is cleared so the org can unrestrict without a leave/rejoin.
+    // `disabledTools` is already applied on the ServerEntry itself (deny-list). Both layers
+    // compose: a tool must be allow-listed (if a list is set) AND not disabled.
+    apply_team_tool_scope(reg, &tool_allows, &tag);
 
     outcome
+}
+
+/// `allowedTools` on a team-config server JSON: `None` = key absent (unrestricted),
+/// `Some(list)` = allow-list (empty list = block every tool on that server).
+fn parse_allowed_tools(s: &Value) -> Option<Vec<String>> {
+    match s.get("allowedTools") {
+        None => None,
+        Some(v) => Some(
+            v.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+/// Apply or clear per-server allow-lists onto every profile's `tool_scope`.
+/// `tool_allows` is keyed by the FINAL member-local server id (after `unique_id`), so a
+/// collision rename never loses the org scope. Servers not in the map but still tagged for
+/// this team (shouldn't happen) become unrestricted.
+fn apply_team_tool_scope(
+    reg: &mut Registry,
+    tool_allows: &HashMap<String, Option<Vec<String>>>,
+    tag: &str,
+) {
+    let team_ids: Vec<String> = reg
+        .servers
+        .iter()
+        .filter(|s| is_team_server(s, tag))
+        .map(|s| s.id.clone())
+        .collect();
+    for p in &mut reg.profiles {
+        // Drop scope entries for team servers that are no longer present.
+        p.tool_scope
+            .retain(|sid, _| !sid.starts_with("team_") || team_ids.contains(sid));
+        for sid in &team_ids {
+            match tool_allows.get(sid) {
+                Some(Some(list)) => {
+                    p.tool_scope.insert(sid.clone(), list.clone());
+                }
+                // Unrestricted (key absent on config) or unknown: clear any prior org scope.
+                Some(None) | None => {
+                    p.tool_scope.remove(sid);
+                }
+            }
+        }
+    }
 }
 
 /// Classify one team-config server JSON for the member's machine. Env keeps only keys
@@ -1398,14 +1690,20 @@ pub fn remove_team(reg: &mut Registry, team_id: &str) {
     reg.servers.retain(|s| !is_team_server(s, &tag));
     for p in &mut reg.profiles {
         p.enabled_server_ids.retain(|id| !ids.contains(id));
+        // Drop org tool allowlists for the removed team servers (SOU-167).
+        for id in &ids {
+            p.tool_scope.remove(id);
+        }
     }
     // Release ALL of this team's forced safety locks: the member is no longer in the team, so
-    // an org-forced policy (HITL, destructive-block, content defense, drift-quarantine) must not
-    // keep applying. Their OWN settings are left untouched.
+    // an org-forced policy (HITL, destructive-block, content defense, drift-quarantine,
+    // block-on-injection) must not keep applying. Their OWN settings are left untouched.
     reg.team_forced_human_approval = false;
     reg.team_forced_deny_destructive = false;
     reg.team_forced_content_defense = false;
     reg.team_forced_quarantine_on_drift = false;
+    reg.team_forced_block_on_injection = false;
+    // Export flag lives on TeamConnection which is cleared on disconnect; no extra field.
 }
 
 #[cfg(test)]
@@ -1644,6 +1942,149 @@ mod tests {
     }
 
     #[test]
+    fn org_allowed_tools_narrows_profile_tool_scope() {
+        // SOU-167: org `allowedTools` becomes profile tool_scope on the team server id.
+        let mut r = base_registry();
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({ "servers": [{
+                "id": "github",
+                "name": "GitHub",
+                "transport": "http",
+                "url": "https://1.2.3.4/mcp",
+                "allowedTools": ["list_issues", "create_issue"],
+                "disabledTools": ["delete_repo"]
+            }]}),
+        );
+        let sid = "team_github";
+        assert!(r.servers.iter().any(|s| s.id == sid));
+        let server = r.servers.iter().find(|s| s.id == sid).unwrap();
+        assert_eq!(
+            server.disabled_tools,
+            vec!["delete_repo".to_string()],
+            "deny-list lands on the ServerEntry"
+        );
+        assert!(
+            r.profile_allows_tool("default", sid, "list_issues"),
+            "allow-listed tool is exposed"
+        );
+        assert!(
+            !r.profile_allows_tool("default", sid, "create_pr"),
+            "tool outside the allow-list is hidden"
+        );
+        assert!(
+            !r.is_tool_enabled(sid, "delete_repo"),
+            "disabledTools still deny-lists even if someone allowed it"
+        );
+
+        // Org drops the allow-list (key absent) -> unrestricted again (still subject to deny).
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({ "servers": [{
+                "id": "github",
+                "name": "GitHub",
+                "transport": "http",
+                "url": "https://1.2.3.4/mcp",
+                "disabledTools": ["delete_repo"]
+            }]}),
+        );
+        assert!(
+            r.profile_allows_tool("default", sid, "create_pr"),
+            "clearing allowedTools removes tool_scope"
+        );
+        assert!(!r.is_tool_enabled(sid, "delete_repo"));
+
+        // Leave the team: tool_scope entry for the team server is gone.
+        remove_team(&mut r, "t1");
+        for p in &r.profiles {
+            assert!(
+                !p.tool_scope.contains_key(sid),
+                "leaving clears org tool_scope"
+            );
+        }
+    }
+
+    #[test]
+    fn org_empty_allowed_tools_blocks_every_tool_on_that_server() {
+        let mut r = base_registry();
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({ "servers": [{
+                "id": "github",
+                "name": "GitHub",
+                "transport": "http",
+                "url": "https://1.2.3.4/mcp",
+                "allowedTools": []
+            }]}),
+        );
+        assert!(
+            !r.profile_allows_tool("default", "team_github", "anything"),
+            "empty allow-list is a real block-all, not 'all tools'"
+        );
+    }
+
+    #[test]
+    fn org_allowed_tools_survives_unique_id_collision_rename() {
+        // Regression: unique_id renames collisions with `{base}-2` (hyphen). Fuzzy base_id
+        // matching used underscore and silently dropped the allow-list on the renamed server.
+        let mut r = base_registry();
+        // Occupy the natural team id so the team server is renamed to team_github-2.
+        r.servers.push(ServerEntry {
+            id: "team_github".into(),
+            name: "Local GitHub".into(),
+            transport: "stdio".into(),
+            command: Some("x".into()),
+            args: vec![],
+            env: vec![],
+            url: None,
+            source: Some("manual".into()),
+            disabled_tools: vec![],
+            cwd: None,
+            unknown_fields: serde_json::Map::new(),
+        });
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({ "servers": [{
+                "id": "github",
+                "name": "GitHub",
+                "transport": "http",
+                "url": "https://1.2.3.4/mcp",
+                "allowedTools": ["list_issues"]
+            }]}),
+        );
+        let team = r
+            .servers
+            .iter()
+            .find(|s| s.source.as_deref() == Some("team:t1"))
+            .expect("team server present");
+        assert_eq!(team.id, "team_github-2", "unique_id uses hyphen suffix");
+        assert!(
+            r.profile_allows_tool("default", &team.id, "list_issues"),
+            "allow-list must follow the post-unique_id server id"
+        );
+        assert!(
+            !r.profile_allows_tool("default", &team.id, "create_pr"),
+            "non-allow-listed tool stays blocked on the renamed id"
+        );
+    }
+
+    #[test]
+    fn receipt_fresh_requires_matching_fingerprint_and_recent_send() {
+        let fp = "abc";
+        assert!(!receipt_fresh(None, None, fp));
+        assert!(!receipt_fresh(Some(fp), None, fp), "no timestamp -> not fresh");
+        assert!(!receipt_fresh(Some("other"), Some(now_ms()), fp));
+        assert!(receipt_fresh(Some(fp), Some(now_ms()), fp), "just sent -> fresh");
+        // Older than heartbeat window -> not fresh (forces re-send to refresh server stamp).
+        let stale_at = now_ms().saturating_sub(RECEIPT_HEARTBEAT_MS + 1);
+        assert!(!receipt_fresh(Some(fp), Some(stale_at), fp));
+    }
+
+    #[test]
     fn team_forced_deny_destructive_is_releasable_and_leaves_the_member_untouched() {
         let mut r = base_registry();
         r.deny_destructive = false; // member's own choice: off
@@ -1694,6 +2135,7 @@ mod tests {
         r.deny_destructive = false;
         r.content_defense = false;
         r.quarantine_on_drift = false;
+        r.block_on_injection = false;
         apply_team_config(
             &mut r,
             "t1",
@@ -1701,28 +2143,32 @@ mod tests {
                 "forceHumanApproval": true,
                 "forceContentDefense": true,
                 "forceQuarantineOnDrift": true,
+                "forceBlockOnInjection": true,
             }}),
         );
         assert!(
             r.human_approval_effective()
                 && r.deny_destructive_effective()
                 && r.content_defense_effective()
-                && r.quarantine_on_drift_effective(),
-            "all four enforced while in the team"
+                && r.quarantine_on_drift_effective()
+                && r.block_on_injection_effective(),
+            "all five enforced while in the team"
         );
         remove_team(&mut r, "t1");
         assert!(
             !r.team_forced_human_approval
                 && !r.team_forced_deny_destructive
                 && !r.team_forced_content_defense
-                && !r.team_forced_quarantine_on_drift,
+                && !r.team_forced_quarantine_on_drift
+                && !r.team_forced_block_on_injection,
             "leaving clears every org lock"
         );
         assert!(
             !r.human_approval_effective()
                 && !r.deny_destructive_effective()
                 && !r.content_defense_effective()
-                && !r.quarantine_on_drift_effective(),
+                && !r.quarantine_on_drift_effective()
+                && !r.block_on_injection_effective(),
             "no team -> every flag follows the member's own (off) settings"
         );
     }
@@ -1819,6 +2265,56 @@ mod tests {
         let body = push_body(&config, 42);
         assert_eq!(body["base_version"], 42);
         assert_eq!(body["config"], config);
+    }
+
+    #[test]
+    fn policy_receipt_reports_as_enforced_effective_flags() {
+        // SOU-339 / SOU-345: the receipt mirrors *_effective(), not just the team-forced
+        // overlay, so an admin sees what is actually enforced on the member's machine.
+        let mut r = base_registry();
+        r.deny_destructive = true; // member's own on
+        r.content_defense = false;
+        r.quarantine_on_drift = false;
+        r.human_approval = false;
+        r.block_on_injection = false;
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({
+                "servers": [],
+                "denyDestructive": false,
+                "screeningPolicy": {
+                    "forceContentDefense": true,
+                    "forceQuarantineOnDrift": false,
+                    "forceHumanApproval": true,
+                    "forceBlockOnInjection": true
+                }
+            }),
+        );
+        let receipt = build_policy_receipt(&r);
+        assert_eq!(receipt["denyDestructive"], true, "member own deny still enforced");
+        assert_eq!(receipt["forceContentDefense"], true, "org force makes content defense effective");
+        assert_eq!(receipt["forceQuarantineOnDrift"], false);
+        assert_eq!(receipt["forceHumanApproval"], true);
+        assert_eq!(receipt["forceBlockOnInjection"], true, "org force makes block-on-injection effective");
+    }
+
+    #[test]
+    fn forced_block_on_injection_is_releasable_and_leaves_the_member_untouched() {
+        let mut r = base_registry();
+        r.block_on_injection = false;
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({ "servers": [], "screeningPolicy": { "forceBlockOnInjection": true }}),
+        );
+        assert!(r.team_forced_block_on_injection);
+        assert!(!r.block_on_injection, "member's own setting is untouched");
+        assert!(r.block_on_injection_effective());
+        apply_team_config(&mut r, "t1", &json!({ "servers": [] }));
+        assert!(!r.block_on_injection_effective(), "org released the lock");
+        remove_team(&mut r, "t1");
+        assert!(!r.team_forced_block_on_injection);
     }
 
     #[test]

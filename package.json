@@ -1,7 +1,7 @@
 {
-  "name": "conduit",
+  "name": "toolport",
   "private": true,
-  "version": "1.9.4",
+  "version": "1.10.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -18,8 +18,12 @@
     "lint:fix": "eslint src/ --fix",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib --bins",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib --bins --tests",
     "test:rust:windows": "powershell -ExecutionPolicy Bypass -File scripts/test-rust-windows.ps1",
+    "bench:latency": "node benchmark/latency.mjs",
+    "bench:latency:check": "node benchmark/latency.mjs --check",
+    "bench:compare": "node benchmark/compare-local.mjs",
+    "bench:mcp-native": "node benchmark/mcp-native.mjs",
     "audit:prod": "npm audit --omit=dev",
     "prepare": "husky"
   },
@@ -75,7 +79,8 @@
     "@hono/node-server": "^2.0.5",
     "eslint-plugin-jsx-a11y": {
       "eslint": "$eslint"
-    }
+    },
+    "postcss": "8.5.23"
   },
   "lint-staged": {
     "*.{ts,tsx,css,mjs,json,md}": "prettier --write",

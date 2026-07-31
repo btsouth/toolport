@@ -37,18 +37,19 @@ inside the Claude container and finding it in the package `LocalCache`.
 ## The fix (`registry::conduit_dir`)
 
 - Detect containerization once per process via `GetCurrentPackageFamilyName`:
-  Conduit's own binaries never ship as MSIX, so package identity always means
+  Toolport's own binaries never ship as MSIX, so package identity always means
   "spawned inside another app's container".
 - When containerized, address the same directory through its loopback-UNC twin,
-  `\\localhost\C$\Users\<user>\AppData\Roaming\Conduit`. SMB serves those opens
-  from the real filesystem, outside the virtualization filter (verified on the
-  affected machine). Reachability is probed against the profile dir first; if
-  the UNC view is unavailable the natural path is kept (no worse than before)
-  and the gateway logs a loud warning plus a `dir_resolution=VirtualizedFallback`
-  line in `gateway.log`.
+  `\\localhost\C$\Users\<user>\AppData\Roaming\Toolport` (or the legacy
+  `...\Conduit` leaf until launch migrates it). SMB serves those opens from the
+  real filesystem, outside the virtualization filter (verified on the affected
+  machine). Reachability is probed against the profile dir first; if the UNC
+  view is unavailable the natural path is kept (no worse than before) and the
+  gateway logs a loud warning plus a `dir_resolution=VirtualizedFallback` line
+  in `gateway.log`.
 - Everything derives from `conduit_dir()` (registry + its watcher, tool cache,
   approval endpoint descriptor, audit/security logs, secrets file), so the
-  de-virtualization covers all of them. `CONDUIT_REGISTRY` still overrides the
+  de-virtualization covers all of them. `TOOLPORT_REGISTRY` still overrides the
   registry path explicitly.
 
 ## Manual test plan

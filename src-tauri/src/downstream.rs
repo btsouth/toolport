@@ -15,9 +15,191 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Called from a downstream stdout drain when an armed server emits
+/// `notifications/resources/updated` (SOU-394). The gateway fans the URI out to
+/// subscribed upstream clients only.
+pub type ResourceUpdatedSink = Arc<dyn Fn(String) + Send + Sync>;
+
+/// Called from a downstream drain when a server emits `notifications/progress`
+/// (SOU-444 part 2). Carries the whole notification, because routing it is the
+/// gateway's job: only the gateway knows which upstream client minted the
+/// `progressToken` it relayed on this server's behalf.
+pub type ProgressSink = Arc<dyn Fn(Value) + Send + Sync>;
+
 use serde_json::{json, Value};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Which protocol era a downstream connection settled on (SOU-445).
+///
+/// Replaces the single global [`PROTOCOL_VERSION`] for anything that needs to
+/// know how to talk to a *particular* server: Toolport can hold connections in
+/// both eras at once, and must translate between them when the upstream client's
+/// era differs from a downstream server's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Era {
+    /// Opened with an `initialize` handshake; the version was negotiated once for
+    /// the whole connection (2025-11-25 and earlier).
+    Legacy { version: String },
+    /// No handshake: version, identity, and capabilities ride on every request's
+    /// `_meta` (2026-07-28 and later).
+    Modern { version: String },
+}
+
+impl Era {
+    pub fn version(&self) -> &str {
+        match self {
+            Era::Legacy { version } | Era::Modern { version } => version,
+        }
+    }
+
+    pub fn is_modern(&self) -> bool {
+        matches!(self, Era::Modern { .. })
+    }
+}
+
+/// Pick a protocol version from a `DiscoverResult`, preferring the newest
+/// revision Toolport implements.
+fn choose_protocol_version(discovered: &Value) -> Option<String> {
+    let supported: Vec<&str> = discovered
+        .get("supportedVersions")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    supported
+        .iter()
+        .find(|v| **v == MODERN_PROTOCOL_VERSION)
+        .map(|v| (*v).to_string())
+}
+
+/// Every MCP revision Toolport can speak to a downstream server, newest first.
+///
+/// `2026-07-28` and later are "modern": no handshake, with version, identity and
+/// capabilities carried as per-request `_meta`. Everything earlier is "legacy"
+/// and opens with `initialize`. Toolport is dual-era, so it must drive both.
+pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// Error codes the 2026-07-28 allocation policy reserves for the specification
+/// (`-32020`..`-32099`). Their presence in a response is what identifies a modern
+/// server during the backward-compatibility probe.
+pub const HEADER_MISMATCH: i64 = -32020;
+pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i64 = -32021;
+pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// `_meta` keys that describe a single client-to-server hop and therefore must
+/// NOT be relayed onward (SOU-444).
+///
+/// Toolport is the *client* on the downstream hop, so it speaks for itself
+/// there: the version it negotiated with that particular server, its own
+/// identity, and the capabilities it can actually service. Relaying the upstream
+/// client's values would assert claims Toolport cannot honour - advertising a
+/// sampling capability, say, that the gateway would then have to service on the
+/// client's behalf. SOU-445/SOU-446 replace these with Toolport's own per-
+/// connection values rather than simply omitting them.
+pub const PER_HOP_META_KEYS: [&str; 3] = [
+    "io.modelcontextprotocol/protocolVersion",
+    "io.modelcontextprotocol/clientInfo",
+    "io.modelcontextprotocol/clientCapabilities",
+];
+
+/// Keys relayed only once Toolport can honour what they ask for.
+///
+/// `progressToken` lived here until the gateway learned to route
+/// `notifications/progress` back to the client that minted it (SOU-444 part 2);
+/// relaying a token whose notifications we then dropped would have invited that
+/// traffic into a black hole. Empty today, kept because the next revision brings
+/// more keys with the same "relay only when we can service it" shape.
+const WITHHELD_META_KEYS: [&str; 0] = [];
+
+/// The part of an upstream client's `_meta` that may travel downstream.
+///
+/// MCP's `_meta` is an open map: OpenTelemetry trace context, extension
+/// namespaces, and (from 2026-07-28) protocol version, client identity, and
+/// capabilities all ride here. Everything that is not per-hop or explicitly
+/// withheld is relayed untouched, including keys this build has never heard of -
+/// that is what keeps Toolport from silently breaking future extensions.
+///
+/// Returns `None` when nothing survives, so the outgoing params keep their
+/// historical shape byte-for-byte.
+pub fn relayable_meta(meta: Option<&Value>) -> Option<Value> {
+    let obj = meta?.as_object()?;
+    let kept: serde_json::Map<String, Value> = obj
+        .iter()
+        .filter(|(k, _)| {
+            !PER_HOP_META_KEYS.contains(&k.as_str()) && !WITHHELD_META_KEYS.contains(&k.as_str())
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    (!kept.is_empty()).then(|| Value::Object(kept))
+}
+
+/// Apply the same per-hop discipline to a params object that is forwarded
+/// wholesale rather than rebuilt.
+///
+/// `completion/complete` is the one request Toolport already relayed verbatim
+/// (`Router::resolve_completion` clones the client's params and rewrites only
+/// `ref`), so without this it would leak per-hop keys the rebuilt paths strip.
+pub fn sanitize_forwarded_meta(params: &mut Value) {
+    let Some(obj) = params.as_object_mut() else {
+        return;
+    };
+    if !obj.contains_key("_meta") {
+        return;
+    }
+    match relayable_meta(obj.get("_meta")) {
+        Some(kept) => obj.insert("_meta".to_string(), kept),
+        None => obj.remove("_meta"),
+    };
+}
+
+/// Attach relayed `_meta` to an outgoing params object.
+///
+/// A request carrying no relayable metadata is left exactly as Toolport built it
+/// before SOU-444, so existing downstream servers see no change whatsoever.
+fn with_meta(mut params: Value, meta: Option<&Value>) -> Value {
+    if let Some(relayed) = relayable_meta(meta) {
+        params["_meta"] = relayed;
+    }
+    params
+}
+
+/// Merge the connection's standard protocol `_meta` into an outgoing request.
+///
+/// Applied by the transport, so every request gets it regardless of which call
+/// site built the params. Protocol keys win over anything already present:
+/// they describe *this* hop, and Toolport owns them (SOU-445).
+fn merge_protocol_meta(params: &mut Value, protocol: &Value) {
+    let (Some(obj), Some(protocol)) = (params.as_object_mut(), protocol.as_object()) else {
+        return;
+    };
+    let slot = obj
+        .entry("_meta")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !slot.is_object() {
+        *slot = Value::Object(serde_json::Map::new());
+    }
+    if let Some(meta) = slot.as_object_mut() {
+        for (key, value) in protocol {
+            meta.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// The standard `_meta` a modern (2026-07-28+) connection puts on every request.
+fn protocol_meta_for(version: &str) -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": version,
+        "io.modelcontextprotocol/clientInfo": {
+            "name": "toolport-gateway",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        // Toolport speaks for itself on this hop. It advertises no client
+        // capabilities of its own yet; SOU-449 fills these in once MRTR lets the
+        // gateway service sampling/elicitation on a client's behalf.
+        "io.modelcontextprotocol/clientCapabilities": {}
+    })
+}
 
 /// Max time to wait for a single stdio response before giving up. Without this a
 /// server that never replies would block its thread (and the batch health probe)
@@ -28,6 +210,16 @@ const STDIO_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// so one hung server should fail in seconds, not stall everything for the full
 /// live-call timeout. Restored to STDIO_READ_TIMEOUT once connected.
 const STDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for the `server/discover` era probe, deliberately far tighter than any
+/// connect timeout.
+///
+/// The probe only runs after a server has already answered `initialize` with an
+/// error, so the process is alive and responsive; a server that implements
+/// `server/discover` answers it locally and immediately. A legacy server that
+/// does not implement it usually stays silent, and that silence is the signal to
+/// fall back. Charging the full connect budget for that silence would make every
+/// legacy misconfiguration take minutes to report.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 /// First-`initialize` budget for download-then-run launchers (npx, uvx, pnpm dlx,
 /// ...). On a cold cache these resolve and download the server package before the
 /// process can answer anything - easily 15-60s, far past the normal handshake
@@ -37,7 +229,14 @@ const STDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// still fails immediately because its stdout closing ends the wait. Batch
 /// connects run one thread per server, so several cold launchers install in
 /// parallel and a batch waits out this budget at most once, not per server.
-const LAUNCHER_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+const LAUNCHER_CONNECT_TIMEOUT: Duration = LEADER_OPEN_BUDGET;
+
+/// The longest a single legitimate downstream open can take: the launcher budget
+/// above, which is the slowest path (it exceeds the ~110s of three
+/// [`STDIO_READ_TIMEOUT`] attempts plus backoff). Exported so anything that waits on
+/// another caller's open - `OPEN_GATE_WAIT` in the gateway - derives its deadline from
+/// this instead of hardcoding a number the two can drift apart on (SOU-434).
+pub const LEADER_OPEN_BUDGET: Duration = Duration::from_secs(120);
 /// Keep at most this many bytes of a child's stderr tail for error reporting.
 const STDERR_TAIL_CAP: usize = 4096;
 
@@ -45,6 +244,11 @@ const STDERR_TAIL_CAP: usize = 4096;
 /// or broken server can't stream gigabytes to exhaust gateway memory. Generous: real
 /// MCP responses are tiny.
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+/// Bound paginated MCP catalog traversal so a malicious server cannot keep the
+/// gateway in an infinite cursor chain or grow its in-memory catalog without limit.
+const MAX_LIST_PAGES: usize = 1_000;
+const MAX_LIST_ITEMS: usize = 100_000;
+const MAX_LIST_DURATION: Duration = Duration::from_secs(30);
 
 /// Retry budget for transient HTTP failures that are SAFE to repeat: a connection
 /// that never reached the server, or an explicit 429 rate-limit. We deliberately
@@ -66,6 +270,13 @@ pub enum TransportError {
     /// responded with an error (or the response was structurally invalid). Does NOT
     /// count against server health - a bad tool call is not a dead server.
     Fatal(String),
+    /// The server returned a JSON-RPC *error object*, preserved structurally.
+    ///
+    /// Previously these were flattened with `Fatal(err.to_string())`, which threw
+    /// away the `code`. The 2026-07-28 era probe branches on exactly that code, so
+    /// it has to survive (SOU-445). Treated like `Fatal` everywhere else: an error
+    /// response is not a health failure.
+    Rpc(Value),
     /// The server is unreachable or unresponsive (a read timed out, or the connection
     /// died). Distinct from `Fatal` so the circuit breaker can trip on a genuinely
     /// dead/hung server without counting ordinary error responses against it.
@@ -276,8 +487,59 @@ impl TransportError {
     /// True if this reflects the server being unreachable/unhealthy (timeout, dead
     /// connection, or exhausted connection/rate-limit retries) rather than a normal
     /// protocol or application error. Only these trip the per-server circuit breaker.
+    ///
+    /// [`TransportError::Rpc`] is deliberately excluded, same as [`TransportError::Fatal`]:
+    /// a server that answers with an error response is alive and well-behaved.
     pub fn is_health_failure(&self) -> bool {
         matches!(self, TransportError::Unavailable(_) | TransportError::Retry { .. })
+    }
+
+    /// The JSON-RPC `code`, when the failure was an error *response* from the
+    /// server rather than a transport problem.
+    ///
+    /// The 2026-07-28 compatibility ladder is defined entirely in terms of this
+    /// code, which is why the error object is preserved structurally instead of
+    /// being flattened into a message string (SOU-445).
+    pub fn rpc_code(&self) -> Option<i64> {
+        match self {
+            TransportError::Rpc(err) => err.get("code").and_then(Value::as_i64),
+            _ => None,
+        }
+    }
+
+    /// True when the server answered with an error only a *modern* (2026-07-28 or
+    /// later) implementation produces.
+    ///
+    /// This is the pivot of the backward-compatibility probe: a recognized modern
+    /// error means the server IS modern and the client must correct the request
+    /// (usually by retrying with a mutually supported version) rather than
+    /// falling back to the legacy `initialize` handshake. Anything else - an
+    /// unrecognized error, or no response at all - identifies a legacy server.
+    pub fn is_modern_protocol_error(&self) -> bool {
+        matches!(
+            self.rpc_code(),
+            Some(HEADER_MISMATCH)
+                | Some(MISSING_REQUIRED_CLIENT_CAPABILITY)
+                | Some(UNSUPPORTED_PROTOCOL_VERSION)
+        )
+    }
+
+    /// Protocol versions a server advertised in an `UnsupportedProtocolVersionError`.
+    pub fn supported_versions(&self) -> Vec<String> {
+        let TransportError::Rpc(err) = self else {
+            return Vec::new();
+        };
+        err.get("data")
+            .and_then(|d| d.get("supported"))
+            .and_then(Value::as_array)
+            .map(|versions| {
+                versions
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -285,6 +547,9 @@ impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TransportError::Fatal(msg) => write!(f, "{msg}"),
+            // Rendered exactly as the flattened form was, so nothing user-facing
+            // changes now that the error is carried structurally.
+            TransportError::Rpc(err) => write!(f, "{err}"),
             TransportError::Unavailable(msg) => write!(f, "{msg}"),
             TransportError::Retry { message, .. } => write!(f, "{message}"),
         }
@@ -370,8 +635,8 @@ pub fn resolve_command(command: &str) -> String {
 /// A PATH that includes the user's real shell PATH plus common install dirs.
 /// Expand a per-server working directory string (issue #239): a leading `~`
 /// (or `~/`) becomes the home dir, and `${VAR}` is replaced with the environment
-/// value (unset vars expand to empty). Returns the expanded path; the caller sets
-/// it as the child's cwd, and the OS reports a clear error if it doesn't exist.
+/// value (unset vars expand to empty). Returns the expanded path; the caller
+/// validates it before setting the child's cwd.
 pub fn expand_cwd(dir: &str) -> std::path::PathBuf {
     // Env vars first, so `~` inside an expanded value is still honored below.
     let mut out = String::with_capacity(dir.len());
@@ -397,6 +662,47 @@ pub fn expand_cwd(dir: &str) -> std::path::PathBuf {
         }
     }
     std::path::PathBuf::from(out)
+}
+
+fn empty_cwd_variables(dir: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = dir;
+    while let Some(start) = rest.find("${") {
+        rest = &rest[start + 2..];
+        let Some(end) = rest.find('}') else { break };
+        let name = &rest[..end];
+        if name != "ROOT" && std::env::var_os(name).is_none_or(|value| value.is_empty()) {
+            names.push(name.to_string());
+        }
+        rest = &rest[end + 1..];
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn cwd_validation_error(dir: &str, expanded: &Path, empty_variables: &[String]) -> String {
+    let mut message = format!(
+        "configured working directory {dir:?} expanded to {:?}, but that directory does not exist",
+        expanded
+    );
+    if !empty_variables.is_empty() {
+        let variables = empty_variables
+            .iter()
+            .map(|name| format!("${{{name}}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        message.push_str(&format!("; expanded empty environment variables: {variables}"));
+    }
+    message
+}
+
+fn validate_cwd(dir: &str) -> Result<std::path::PathBuf, String> {
+    let expanded = expand_cwd(dir);
+    if expanded.is_dir() {
+        return Ok(expanded);
+    }
+    Err(cwd_validation_error(dir, &expanded, &empty_cwd_variables(dir)))
 }
 
 /// Resolve the reserved `${ROOT}` token in a per-server working directory
@@ -510,6 +816,15 @@ pub fn is_server_initiated_request(v: &Value) -> bool {
 /// A bidirectional JSON-RPC channel to one downstream server.
 pub trait Transport: Send {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError>;
+    /// Standard per-request `_meta` to merge into every outgoing request.
+    ///
+    /// From 2026-07-28 there is no handshake: each request carries its own
+    /// protocol version, client identity, and client capabilities. Setting it
+    /// once here means every call site - `fetch_paginated_list`, `tools/call`,
+    /// `resources/read`, and anything added later - gets it without repeating
+    /// the merge. Default no-op, so legacy connections send exactly what they
+    /// always did (SOU-445).
+    fn set_protocol_meta(&mut self, _meta: Option<Value>) {}
     fn request_with_cancel(
         &mut self,
         method: &str,
@@ -546,7 +861,7 @@ pub trait Transport: Send {
 }
 
 fn downstream_trace(msg: &str) {
-    if std::env::var_os("CONDUIT_DEBUG").is_none() {
+    if crate::brand::env_var_os("TOOLPORT_DEBUG", "CONDUIT_DEBUG").is_none() {
         return;
     }
     let Some(path) = crate::registry::gateway_log_path() else {
@@ -602,20 +917,79 @@ fn is_list_changed(line: &str) -> bool {
     list_changed_kind(line) == change::TOOLS
 }
 
+/// Extract the resource URI from a `notifications/resources/updated` line, or
+/// `None` when the line is not that notification. Distinct from list_changed
+/// (SOU-394): resource content changed, not the catalog membership.
+fn resource_updated_uri(line: &str) -> Option<String> {
+    // Cheap gate: skip JSON parse for ordinary request/response lines.
+    if !line.contains("resources/updated") {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("method").and_then(|m| m.as_str()) != Some("notifications/resources/updated") {
+        return None;
+    }
+    v.get("params")
+        .and_then(|p| p.get("uri"))
+        .and_then(|u| u.as_str())
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+}
+
+/// Parse a `notifications/progress` line, or `None` if it is anything else.
+///
+/// Progress relates to one in-flight request and is correlated by the
+/// `progressToken` the client minted, so the whole notification is handed to the
+/// gateway rather than a single extracted field.
+fn progress_notification(line: &str) -> Option<Value> {
+    // Cheap gate: skip the JSON parse for ordinary request/response lines.
+    if !line.contains("notifications/progress") {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("method").and_then(|m| m.as_str()) != Some("notifications/progress") {
+        return None;
+    }
+    // A token is what makes the notification routable; without one it can only be
+    // dropped, so filter it here rather than waking the gateway for nothing.
+    v.get("params").and_then(|p| p.get("progressToken"))?;
+    Some(v)
+}
+
 /// Forward one drained stdout line to the request loop, first flagging `dirty` if
-/// the server (once `armed`) announced a tool-list change. Returns false when the
+/// the server (once `armed`) announced a tool-list change, and invoking the
+/// resource-updated sink for `notifications/resources/updated` (SOU-394) and the
+/// progress sink for `notifications/progress` (SOU-444). Returns false when the
 /// receiver is gone (transport closed) so the drain loop can stop.
 fn forward_line(
     line: String,
     tx: &Sender<String>,
     dirty: &Option<Arc<AtomicU8>>,
     armed: &Arc<AtomicBool>,
+    resource_updated: &Option<ResourceUpdatedSink>,
+    progress: &Arc<Mutex<Option<ProgressSink>>>,
 ) -> bool {
-    if let Some(flag) = dirty {
-        if armed.load(Ordering::SeqCst) {
+    if armed.load(Ordering::SeqCst) {
+        if let Some(flag) = dirty {
             let kind = list_changed_kind(&line);
             if kind != 0 {
                 flag.fetch_or(kind, Ordering::SeqCst);
+            }
+        }
+        if let Some(sink) = resource_updated {
+            if let Some(uri) = resource_updated_uri(&line) {
+                sink(uri);
+            }
+        }
+        // Parse first: the cheap gate inside keeps this off the hot path, so the
+        // lock is only taken for lines that really are progress notifications.
+        if let Some(note) = progress_notification(&line) {
+            let sink = progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(sink) = sink {
+                sink(note);
             }
         }
     }
@@ -1106,6 +1480,13 @@ pub struct StdioTransport {
     /// Answers server-initiated JSON-RPC (e.g. `roots/list`) by forwarding to the
     /// upstream MCP client. Set by the gateway before the connect handshake.
     server_handler: Option<ServerRequestHandler>,
+    /// Routes `notifications/progress` back to the client that minted the token
+    /// (SOU-444). Shared with the stdout drain thread so the gateway can bind it
+    /// after the transport is spawned, keeping `spawn_watched`'s signature stable.
+    progress: Arc<Mutex<Option<ProgressSink>>>,
+    /// Standard per-request `_meta` for a modern (2026-07-28+) connection, merged
+    /// into every outgoing request. `None` on legacy connections (SOU-445).
+    protocol_meta: Option<Value>,
 }
 
 /// Owns a Windows Job Object configured to terminate every assigned process
@@ -1328,13 +1709,14 @@ pub fn stdio_connect_timeout(command: &str, args: &[String]) -> Duration {
     }
 }
 
-/// Strip the gateway's own `CONDUIT_*` control-plane environment from a spawned
-/// downstream server. A downstream MCP server is untrusted code, and a compromised
-/// package can read its own process environment; in the file-backend and `--http`
+/// Strip the gateway's own control-plane environment from a spawned downstream
+/// server. A downstream MCP server is untrusted code, and a compromised package
+/// can read its own process environment; in the file-backend and `--http`
 /// bridge deployments that inherited env carries the vault master key
-/// (`CONDUIT_SECRET_KEY`) or the local tool-bridge token (`CONDUIT_HTTP_TOKEN`).
-/// Neither is meant for a downstream server, so remove the whole inherited
-/// `CONDUIT_*` namespace (covers both, plus any future control var). A var the
+/// (`TOOLPORT_SECRET_KEY` / legacy `CONDUIT_SECRET_KEY`) or the local tool-bridge
+/// token (`TOOLPORT_HTTP_TOKEN` / legacy `CONDUIT_HTTP_TOKEN`). Neither is meant
+/// for a downstream server, so remove the whole inherited `TOOLPORT_*` and
+/// `CONDUIT_*` namespaces (covers both, plus any future control var). A var the
 /// server set for itself via its own `env` is exempt and left untouched.
 /// Put each spawned downstream server in its own process group so terminal
 /// job-control signals (SIGTTIN/SIGTTOU) generated by or directed at a child
@@ -1359,7 +1741,9 @@ fn apply_process_group_isolation(cmd: &mut Command) {
 fn strip_gateway_control_env(cmd: &mut Command, configured: &std::collections::HashSet<&str>) {
     for (key, _) in std::env::vars_os() {
         let Some(k) = key.to_str() else { continue };
-        if k.starts_with("CONDUIT_") && !configured.contains(k) {
+        let is_control =
+            k.starts_with("TOOLPORT_") || k.starts_with("CONDUIT_");
+        if is_control && !configured.contains(k) {
             cmd.env_remove(&key);
         }
     }
@@ -1375,7 +1759,7 @@ impl StdioTransport {
         env: &[(String, String)],
         cwd: Option<&str>,
     ) -> Result<Self, String> {
-        Self::spawn_inner(command, args, env, cwd, None)
+        Self::spawn_inner(command, args, env, cwd, None, None)
     }
 
     /// Like [`spawn`], but sets a [`change`] bit in `dirty` whenever the downstream
@@ -1383,14 +1767,19 @@ impl StdioTransport {
     /// (after `arm_tools_watch`). The gateway watches that flag and re-queries the
     /// affected list, so a server changing its own catalog mid-session reaches the
     /// client instead of being silently dropped.
+    ///
+    /// When `resource_updated` is set, armed `notifications/resources/updated`
+    /// lines invoke that sink with the resource URI (SOU-394) so the gateway can
+    /// fan out only to subscribed upstream clients.
     pub fn spawn_watched(
         command: &str,
         args: &[String],
         env: &[(String, String)],
         cwd: Option<&str>,
         dirty: Arc<AtomicU8>,
+        resource_updated: Option<ResourceUpdatedSink>,
     ) -> Result<Self, String> {
-        Self::spawn_inner(command, args, env, cwd, Some(dirty))
+        Self::spawn_inner(command, args, env, cwd, Some(dirty), resource_updated)
     }
 
     fn spawn_inner(
@@ -1399,6 +1788,7 @@ impl StdioTransport {
         env: &[(String, String)],
         cwd: Option<&str>,
         dirty: Option<Arc<AtomicU8>>,
+        resource_updated: Option<ResourceUpdatedSink>,
     ) -> Result<Self, String> {
         // Split a command that packed its args into the `command` string, so a
         // mis-shaped config spawns correctly instead of erroring cryptically.
@@ -1426,10 +1816,10 @@ impl StdioTransport {
         strip_gateway_control_env(&mut cmd, &configured);
         // Optional per-server working directory (issue #239). Unset (or blank)
         // means inherit the gateway's cwd, the previous behavior. `~` and `${VAR}`
-        // are expanded so a config can pin a server to a project dir. If the dir
-        // doesn't exist the spawn fails with a clear error, surfaced by the probe.
+        // are expanded so a config can pin a server to a project dir. Validate the
+        // expansion first so a missing dir reports the configured and expanded paths.
         if let Some(dir) = cwd.map(str::trim).filter(|d| !d.is_empty()) {
-            cmd.current_dir(expand_cwd(dir));
+            cmd.current_dir(validate_cwd(dir)?);
         }
         // Give the child the augmented PATH too, so e.g. `npx` can find `node`.
         #[cfg(not(windows))]
@@ -1472,6 +1862,8 @@ impl StdioTransport {
         let (tx, rx) = std::sync::mpsc::channel();
         let armed = Arc::new(AtomicBool::new(false));
         let drain_armed = Arc::clone(&armed);
+        let progress: Arc<Mutex<Option<ProgressSink>>> = Arc::new(Mutex::new(None));
+        let drain_progress = Arc::clone(&progress);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
@@ -1490,7 +1882,14 @@ impl StdioTransport {
                             );
                             break;
                         }
-                        if !forward_line(line, &tx, &dirty, &drain_armed) {
+                        if !forward_line(
+                            line,
+                            &tx,
+                            &dirty,
+                            &drain_armed,
+                            &resource_updated,
+                            &drain_progress,
+                        ) {
                             break;
                         }
                     }
@@ -1534,7 +1933,19 @@ impl StdioTransport {
             armed,
             launcher: is_download_launcher(command, args),
             server_handler: None,
+            progress,
+            protocol_meta: None,
         })
+    }
+
+    /// Bind the sink that routes this server's `notifications/progress` back to
+    /// the client that minted the token (SOU-444). Set by the gateway after
+    /// spawn, so the drain thread picks it up without a constructor change.
+    pub fn set_progress_sink(&mut self, sink: Option<ProgressSink>) {
+        *self
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = sink;
     }
 
     /// Build a useful error for when the child's stdout closed (it exited or
@@ -1577,6 +1988,10 @@ impl Transport for StdioTransport {
         let id = self.next_id;
         self.next_id += 1;
         let downstream_id = json!(id);
+        let mut params = params;
+        if let Some(protocol) = &self.protocol_meta {
+            merge_protocol_meta(&mut params, protocol);
+        }
         let msg = json!({ "jsonrpc": "2.0", "id": downstream_id.clone(), "method": method, "params": params });
 
         // A broken stdin pipe means the child is gone: a health failure, not a protocol error.
@@ -1668,7 +2083,7 @@ impl Transport for StdioTransport {
             }
             if ids_match(value.get("id"), Some(&json!(id))) {
                 if let Some(err) = value.get("error") {
-                    return Err(TransportError::Fatal(err.to_string()));
+                    return Err(TransportError::Rpc(err.clone()));
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
@@ -1676,6 +2091,12 @@ impl Transport for StdioTransport {
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
+        // Same as the request path: a modern connection stamps its protocol
+        // metadata on notifications too, so every message tells one story.
+        let mut params = params;
+        if let Some(protocol) = &self.protocol_meta {
+            merge_protocol_meta(&mut params, protocol);
+        }
         let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         let mut stdin = self
             .stdin
@@ -1704,14 +2125,63 @@ impl Transport for StdioTransport {
     fn set_server_request_handler(&mut self, handler: ServerRequestHandler) {
         self.server_handler = Some(handler);
     }
+
+    fn set_protocol_meta(&mut self, meta: Option<Value>) {
+        self.protocol_meta = meta;
+    }
+}
+
+/// Kill the whole process group a downstream server was spawned into, so
+/// `npx`->node (and `uvx`->python) grandchildren die with the wrapper instead of
+/// leaking on every server toggle and router rebuild. The Windows counterpart is
+/// the Job Object, which terminates descendants when its handle closes.
+///
+/// Signalling a process group is unforgiving if the target is wrong, so this is
+/// deliberately conservative and falls back to killing just the direct child:
+///
+/// * **Only while the child is unreaped.** `try_wait` elsewhere in this type can
+///   reap the child, after which its pid is free for the OS to reuse and a
+///   `killpg` could hit an unrelated group. An unreaped child is a zombie at
+///   worst, and a zombie's pid cannot be recycled.
+/// * **Only when the child leads its own group.** [`apply_process_group_isolation`]
+///   makes pgid == pid at spawn, so anything else means the isolation did not
+///   take. Without this check a child that stayed in *our* group would turn this
+///   into a `killpg` of the gateway and the AI client that spawned it.
+#[cfg(unix)]
+fn kill_process_group(child: &mut Child) {
+    // Minimal FFI, matching the extern-fn style used elsewhere here rather than
+    // taking on libc as a dependency for two calls.
+    extern "C" {
+        fn getpgid(pid: i32) -> i32;
+        fn killpg(pgid: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+
+    // Already exited AND reaped: the pid may belong to someone else now.
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    let pid = child.id() as i32;
+    // SAFETY: plain libc calls on an integer pid. `pid` is still unreaped, so it
+    // is either live or a zombie and cannot have been recycled.
+    let leads_own_group = unsafe { getpgid(pid) } == pid;
+    if leads_own_group {
+        // SAFETY: as above. Kills the wrapper and every descendant it spawned.
+        unsafe { killpg(pid, SIGKILL) };
+    } else {
+        // Isolation didn't take; kill only what we're certain we own.
+        let _ = child.kill();
+    }
 }
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
         #[cfg(windows)]
         drop(self.job.take());
-        #[cfg(not(windows))]
-        let _ = self.child.kill();
+        #[cfg(unix)]
+        kill_process_group(&mut self.child);
+        // Reaps the direct child. Grandchildren were signalled above but are not
+        // ours to reap; they are reparented to init, which reaps them.
         let _ = self.child.wait();
     }
 }
@@ -1820,7 +2290,34 @@ pub struct HttpTransport {
     /// `None` or error keeps the current token; a forced refresh must return a new
     /// raw token or the authentication failure is surfaced.
     refresh: Option<RefreshFn>,
+    /// The token a forced refresh produced and that has not yet been accepted by
+    /// the server, if any.
+    ///
+    /// The forced-refresh budget is per *token*, not per call. A 401 answered by
+    /// minting a fresh token, where that fresh token then 401s too, is not an
+    /// expiry problem, so refreshing again cannot help - and against a provider
+    /// that rotates the refresh token on use, each needless exchange consumes a
+    /// link in the chain. Connect alone posts twice (`initialize`, then the
+    /// `server/discover` era probe), so a per-call budget spends two (SOU-474).
+    ///
+    /// Cleared as soon as any request comes back 2xx, which is what makes this a
+    /// budget rather than a latch. Relying on a proactive refresh to clear it was
+    /// wrong: a provider that omits `expires_in` has no deadline, so
+    /// `refresh_before_send` never fires, and the connection would 401 forever
+    /// with a working refresh token in the vault - the exact case the reactive
+    /// fallback exists to serve. Only a token the server has never accepted keeps
+    /// the budget spent.
+    forced_refresh_token: Option<String>,
     server_handler: Option<ServerRequestHandler>,
+    /// Fan `notifications/resources/updated` seen mid-SSE to subscribed
+    /// upstream clients (SOU-394 follow-up for remote downstreams).
+    resource_updated: Option<ResourceUpdatedSink>,
+    /// Route `notifications/progress` seen mid-SSE back to the client that minted
+    /// the token (SOU-444).
+    progress: Option<ProgressSink>,
+    /// Standard per-request `_meta` for a modern (2026-07-28+) connection, merged
+    /// into every outgoing request. `None` on legacy connections (SOU-445).
+    protocol_meta: Option<Value>,
 }
 
 impl HttpTransport {
@@ -1863,8 +2360,42 @@ impl HttpTransport {
             next_id: 1,
             auth,
             refresh,
+            forced_refresh_token: None,
             server_handler: None,
+            resource_updated: None,
+            progress: None,
+            protocol_meta: None,
         }
+    }
+
+    /// Wire the gateway sink for `notifications/resources/updated` seen on SSE
+    /// response streams (SOU-394).
+    pub fn set_resource_updated_sink(&mut self, sink: Option<ResourceUpdatedSink>) {
+        self.resource_updated = sink;
+    }
+
+    /// Bind the sink that routes this server's `notifications/progress` back to
+    /// the client that minted the token (SOU-444).
+    pub fn set_progress_sink(&mut self, sink: Option<ProgressSink>) {
+        self.progress = sink;
+    }
+
+    /// The protocol version this connection declares in the `MCP-Protocol-Version`
+    /// header.
+    ///
+    /// From 2026-07-28 the header **MUST** equal the
+    /// `io.modelcontextprotocol/protocolVersion` carried in the body's `_meta`,
+    /// and a server that sees them disagree rejects the request with `400` and
+    /// `HeaderMismatch` (-32020). So this has to follow whatever the connection
+    /// negotiated, not a constant. Legacy connections have no protocol `_meta`
+    /// and keep sending [`PROTOCOL_VERSION`] exactly as before.
+    fn wire_protocol_version(&self) -> String {
+        self.protocol_meta
+            .as_ref()
+            .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
+            .and_then(Value::as_str)
+            .unwrap_or(PROTOCOL_VERSION)
+            .to_string()
     }
 
     /// Answer a server-initiated JSON-RPC request inline (SSE mid-stream or
@@ -1894,6 +2425,12 @@ impl HttpTransport {
         }
     }
 
+    /// True when the token currently in hand is one a forced refresh already
+    /// produced, so its one forced exchange is spent. See [`Self::forced_refresh_token`].
+    fn forced_refresh_spent(&self) -> bool {
+        self.auth.is_some() && self.auth == self.forced_refresh_token
+    }
+
     fn force_refresh_after_auth_error(&mut self, code: u16) -> Result<(), TransportError> {
         let Some(refresh) = self.refresh.as_ref() else {
             return Err(TransportError::Fatal(format!(
@@ -1902,7 +2439,10 @@ impl HttpTransport {
         };
         match refresh(true) {
             Ok(Some(token)) => {
-                self.auth = Some(token);
+                self.auth = Some(token.clone());
+                // Spend the budget for this token, so a later POST on the same
+                // connection does not force a second exchange for it (SOU-474).
+                self.forced_refresh_token = Some(token);
                 Ok(())
             }
             Ok(None) => Err(TransportError::Fatal(format!(
@@ -1918,14 +2458,15 @@ impl HttpTransport {
     fn send_post_no_response(&mut self, body: &Value) -> Result<(), TransportError> {
         let payload = body.to_string();
         self.refresh_before_send();
-        let mut refreshed = false;
+        let mut refreshed = self.forced_refresh_spent();
+        let wire_version = self.wire_protocol_version();
         let resp = loop {
             let mut req = self
                 .inline_agent
                 .post(&self.url)
                 .set("Content-Type", "application/json")
                 .set("Accept", "application/json, text/event-stream")
-                .set("MCP-Protocol-Version", PROTOCOL_VERSION);
+                .set("MCP-Protocol-Version", &wire_version);
             if let Some(sid) = &self.session_id {
                 req = req.set("Mcp-Session-Id", sid);
             }
@@ -1989,6 +2530,23 @@ impl HttpTransport {
                 let Ok(v) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
+                // Resource updates may arrive mid-stream alongside the response
+                // (SOU-394). Fan them out before treating the frame as a result.
+                if let Some(sink) = &self.resource_updated {
+                    if let Some(uri) = resource_updated_uri(data) {
+                        sink(uri);
+                        continue;
+                    }
+                }
+                // Progress for the request this stream belongs to (SOU-444).
+                // Routed by token, so it is consumed here rather than being
+                // mistaken for the response frame.
+                if let Some(sink) = &self.progress {
+                    if let Some(note) = progress_notification(data) {
+                        sink(note);
+                        continue;
+                    }
+                }
                 if self.handle_inline_server_request(&v)? {
                     continue;
                 }
@@ -2013,14 +2571,18 @@ impl HttpTransport {
         // Token refresh is handled internally (it doesn't sleep, so no lock
         // contention). Only 429 and transport-retry signals bubble up as
         // TransportError::Retry so the Router can sleep *outside* the lock.
-        let mut refreshed = false;
+        // Per-token, not per-call: connect alone posts twice (`initialize`, then
+        // the `server/discover` era probe) and must not spend two forced
+        // exchanges on one expired token (SOU-474).
+        let mut refreshed = self.forced_refresh_spent();
+        let wire_version = self.wire_protocol_version();
         let resp = loop {
             let mut req = self
                 .agent
                 .post(&self.url)
                 .set("Content-Type", "application/json")
                 .set("Accept", "application/json, text/event-stream")
-                .set("MCP-Protocol-Version", PROTOCOL_VERSION);
+                .set("MCP-Protocol-Version", &wire_version);
             if let Some(sid) = &self.session_id {
                 req = req.set("Mcp-Session-Id", sid);
             }
@@ -2071,6 +2633,9 @@ impl HttpTransport {
                 Err(e) => return Err(TransportError::Fatal(e.to_string())),
             }
         };
+        // The server accepted this token, so its forced-refresh budget is spent
+        // on nothing and must be returned. See [`Self::forced_refresh_token`].
+        self.forced_refresh_token = None;
 
         if let Some(sid) = resp.header("Mcp-Session-Id") {
             self.session_id = Some(sid.to_string());
@@ -2100,15 +2665,27 @@ impl Transport for HttpTransport {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
         let id = self.next_id;
         self.next_id += 1;
+        let mut params = params;
+        if let Some(protocol) = &self.protocol_meta {
+            merge_protocol_meta(&mut params, protocol);
+        }
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         let resp = self.post(&body, true)?.ok_or_else(|| TransportError::Fatal("empty response".to_string()))?;
         if let Some(err) = resp.get("error") {
-            return Err(TransportError::Fatal(err.to_string()));
+            return Err(TransportError::Rpc(err.clone()));
         }
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
+        // Notifications carry the connection's protocol metadata too, so a modern
+        // server sees a consistent story on every message rather than only on
+        // requests. (The revision leaves notification headers undefined, so this
+        // is consistency rather than a hard requirement.)
+        let mut params = params;
+        if let Some(protocol) = &self.protocol_meta {
+            merge_protocol_meta(&mut params, protocol);
+        }
         let body = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         self.post(&body, false)?;
         Ok(())
@@ -2117,20 +2694,32 @@ impl Transport for HttpTransport {
     fn set_server_request_handler(&mut self, handler: ServerRequestHandler) {
         self.server_handler = Some(handler);
     }
+
+    fn set_protocol_meta(&mut self, meta: Option<Value>) {
+        self.protocol_meta = meta;
+    }
 }
 
 /// One connected downstream server: its id, its transport, and its cached
-/// tools, resources, and prompts.
+/// tools, resources, resource templates, and prompts.
 pub struct DownstreamServer {
     pub id: String,
     transport: Box<dyn Transport>,
     pub tools: Vec<Value>,
     pub resources: Vec<Value>,
+    /// Parameterized resource URI templates (`resources/templates/list`).
+    /// Refreshed with concrete resources on `resources/list_changed` because
+    /// MCP defines no separate templates list-change notification.
+    pub resource_templates: Vec<Value>,
     pub prompts: Vec<Value>,
     /// Whether the server's `initialize` advertised resources / prompts. The
     /// actual lists are fetched lazily via `load_resources_prompts`.
     caps_resources: bool,
     caps_prompts: bool,
+    /// Whether the server's `initialize` advertised the completions utility.
+    caps_completions: bool,
+    /// The protocol era this connection settled on at handshake (SOU-445).
+    era: Era,
 }
 
 impl DownstreamServer {
@@ -2147,25 +2736,138 @@ impl DownstreamServer {
         // before the server can answer at all.
         let handshake_timeout = transport.connect_timeout();
         transport.set_read_timeout(handshake_timeout);
-        let init = transport.request(
+
+        // Era detection (SOU-445). Toolport is dual-era: it must drive both
+        // `initialize`-era servers and modern stateless ones.
+        //
+        // We try `initialize` FIRST and fall forward, rather than probing with
+        // `server/discover` first as the spec suggests. The spec's ordering is a
+        // SHOULD, and for Toolport it is the wrong trade today: essentially every
+        // installed server is legacy, and a legacy stdio server typically answers
+        // an unknown method with silence rather than an error - so a discover-first
+        // probe would charge every existing user a read-timeout on every connect.
+        // Going legacy-first costs the existing install base exactly nothing and
+        // costs a modern server one cheap rejected request. Worth revisiting once
+        // modern servers are common.
+        let (era, caps) = match transport.request(
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") }
             }),
-        ).map_err(|e| e.to_string())?;
-        let caps = init.get("capabilities");
+        ) {
+            Ok(init) => {
+                let version = init
+                    .get("protocolVersion")
+                    .and_then(Value::as_str)
+                    .unwrap_or(PROTOCOL_VERSION)
+                    .to_string();
+                let caps = init.get("capabilities").cloned();
+                transport
+                    .notify("notifications/initialized", json!({}))
+                    .map_err(|e| e.to_string())?;
+                (Era::Legacy { version }, caps)
+            }
+            // A dead or unresponsive server is not a modern server. Probing it
+            // again would just double the wait before reporting the same failure.
+            Err(err) if err.is_health_failure() => return Err(err.to_string()),
+            Err(init_err) => {
+                // The server answered, but refused `initialize`. A modern server
+                // has no such method. Confirm with `server/discover`, which every
+                // modern server MUST implement, rather than guessing from an
+                // error code the spec leaves implementation-defined.
+                // Bound the probe tightly, and restore the handshake budget after.
+                //
+                // A launcher-wrapped server (npx, uvx) carries a 120s connect
+                // budget so a cold package download can finish. Inheriting that
+                // here would turn "legacy server rejected initialize" - a missing
+                // API key, a bad config - from an instant failure into a two
+                // minute hang, and a batch probe or router rebuild waits on the
+                // slowest server. A server that implements `server/discover`
+                // answers it locally and immediately, so it needs none of that
+                // budget.
+                // The post-match `set_read_timeout(STDIO_CONNECT_TIMEOUT)` below
+                // restores a normal budget for the rest of the handshake.
+                transport.set_read_timeout(PROBE_TIMEOUT);
+
+                // Stamp the modern metadata BEFORE probing, not after. On HTTP the
+                // transport derives `MCP-Protocol-Version` from it, and that header
+                // MUST match the body's `_meta`; probing first would send a legacy
+                // header with a modern body and a strict server would reject the
+                // very request meant to detect it, with HeaderMismatch (-32020).
+                transport.set_protocol_meta(Some(protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+                let probe = transport.request("server/discover", json!({}));
+                let discovered = match probe {
+                    Ok(discovered) => discovered,
+                    // This is the pivot of the compatibility ladder. A RECOGNIZED
+                    // modern error means the server is modern and simply does not
+                    // speak the version we declared, so the honest outcome is a
+                    // version mismatch, not "legacy server". Reporting the
+                    // `initialize` refusal here would send someone chasing a
+                    // handshake bug on a perfectly reachable modern server.
+                    Err(probe_err) if probe_err.is_modern_protocol_error() => {
+                        let offered = probe_err.supported_versions();
+                        // Retry on a mutually supported version if there is one.
+                        // Today Toolport speaks exactly one modern revision, so
+                        // this is usually a clean incompatibility, but the ladder
+                        // is written to negotiate rather than to assume.
+                        match offered.iter().find(|v| v.as_str() == MODERN_PROTOCOL_VERSION) {
+                            Some(version) => {
+                                // Re-stamp before retrying so header and body agree
+                                // on the newly chosen version too.
+                                transport.set_protocol_meta(Some(protocol_meta_for(version)));
+                                transport
+                                    .request("server/discover", json!({}))
+                                    .map_err(|e| e.to_string())?
+                            }
+                            None => {
+                                return Err(format!(
+                                    "server speaks MCP {offered:?}; Toolport speaks \
+                                     {MODERN_PROTOCOL_VERSION} and cannot negotiate a \
+                                     common version ({probe_err})"
+                                ))
+                            }
+                        }
+                    }
+                    // Anything else (an unrecognized error, or silence) identifies
+                    // a legacy server, so the `initialize` refusal is the
+                    // actionable error. Carry the probe failure too: if discover
+                    // timed out rather than being refused, reporting only the
+                    // initialize error hides that connect paid a read timeout.
+                    Err(probe_err) => {
+                        return Err(format!(
+                            "{init_err} (server/discover probe also failed: {probe_err})"
+                        ))
+                    }
+                };
+                let version = choose_protocol_version(&discovered).ok_or_else(|| {
+                    format!(
+                        "server supports no protocol version Toolport speaks (offered {:?})",
+                        discovered.get("supportedVersions")
+                    )
+                })?;
+                // From here every request carries its own protocol metadata;
+                // there is no handshake and no `notifications/initialized`.
+                transport.set_protocol_meta(Some(protocol_meta_for(&version)));
+                (Era::Modern { version }, discovered.get("capabilities").cloned())
+            }
+        };
+        let caps = caps.as_ref();
         let caps_resources = caps.and_then(|c| c.get("resources")).is_some();
         let caps_prompts = caps.and_then(|c| c.get("prompts")).is_some();
-        transport.notify("notifications/initialized", json!({})).map_err(|e| e.to_string())?;
+        let caps_completions = caps.and_then(|c| c.get("completions")).is_some();
 
         // `initialize` answered, so any launcher download is done: the rest of the
         // handshake goes back to the tight budget - a server that comes up but then
         // hangs on `tools/list` should still fail in seconds.
         transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        let result = transport.request("tools/list", json!({})).map_err(|e| e.to_string())?;
-        let tools = extract_array(&result, "tools");
+        let listed = fetch_paginated_list(&mut *transport, "tools/list", "tools")
+            .map_err(|e| e.to_string())?;
+        if let Some(warning) = &listed.warning {
+            eprintln!("toolport: server '{id}' returned a partial tool catalog: {warning}");
+        }
+        let tools = listed.items;
 
         // Restore the longer timeout: actual tool calls can legitimately be slow.
         transport.set_read_timeout(STDIO_READ_TIMEOUT);
@@ -2178,9 +2880,12 @@ impl DownstreamServer {
             transport,
             tools,
             resources: Vec::new(),
+            resource_templates: Vec::new(),
             prompts: Vec::new(),
             caps_resources,
             caps_prompts,
+            caps_completions,
+            era,
         })
     }
 
@@ -2189,8 +2894,17 @@ impl DownstreamServer {
     /// hung server can't stall the refresh; on error the previous list is kept.
     pub fn refresh_tools(&mut self) {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        if let Ok(result) = self.transport.request("tools/list", json!({})) {
-            self.tools = extract_array(&result, "tools");
+        match fetch_paginated_list(&mut *self.transport, "tools/list", "tools") {
+            Ok(listed) if listed.warning.is_none() => self.tools = listed.items,
+            Ok(listed) => eprintln!(
+                "toolport: keeping server '{}' previous tool catalog after an incomplete refresh: {}",
+                self.id,
+                listed.warning.unwrap_or_default()
+            ),
+            Err(error) => eprintln!(
+                "toolport: keeping server '{}' previous tool catalog after refresh failed: {error}",
+                self.id
+            ),
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
@@ -2199,13 +2913,44 @@ impl DownstreamServer {
     /// announced a `resources/list_changed`. Mirrors [`refresh_tools`]; best-effort
     /// (an error keeps the previous list), and a no-op if the server never
     /// advertised resources.
+    ///
+    /// Also re-fetches resource templates on the same notification. MCP has no
+    /// separate `resources/templates/list_changed`; template catalogs change
+    /// under the resources capability, so this is the protocol-aligned trigger.
     pub fn refresh_resources(&mut self) {
         if !self.caps_resources {
             return;
         }
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        if let Ok(r) = self.transport.request("resources/list", json!({})) {
-            self.resources = extract_array(&r, "resources");
+        match fetch_paginated_list(&mut *self.transport, "resources/list", "resources") {
+            Ok(listed) if listed.warning.is_none() => self.resources = listed.items,
+            Ok(listed) => eprintln!(
+                "toolport: keeping server '{}' previous resource catalog after an incomplete refresh: {}",
+                self.id,
+                listed.warning.unwrap_or_default()
+            ),
+            Err(error) => eprintln!(
+                "toolport: keeping server '{}' previous resource catalog after refresh failed: {error}",
+                self.id
+            ),
+        }
+        // Templates share the resources capability and list-change signal.
+        // Incomplete/failed traversal keeps the previous complete snapshot.
+        match fetch_paginated_list(
+            &mut *self.transport,
+            "resources/templates/list",
+            "resourceTemplates",
+        ) {
+            Ok(listed) if listed.warning.is_none() => self.resource_templates = listed.items,
+            Ok(listed) => eprintln!(
+                "toolport: keeping server '{}' previous resource-template catalog after an incomplete refresh: {}",
+                self.id,
+                listed.warning.unwrap_or_default()
+            ),
+            Err(error) => eprintln!(
+                "toolport: keeping server '{}' previous resource-template catalog after refresh failed: {error}",
+                self.id
+            ),
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
@@ -2218,62 +2963,125 @@ impl DownstreamServer {
             return;
         }
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        if let Ok(r) = self.transport.request("prompts/list", json!({})) {
-            self.prompts = extract_array(&r, "prompts");
+        match fetch_paginated_list(&mut *self.transport, "prompts/list", "prompts") {
+            Ok(listed) if listed.warning.is_none() => self.prompts = listed.items,
+            Ok(listed) => eprintln!(
+                "toolport: keeping server '{}' previous prompt catalog after an incomplete refresh: {}",
+                self.id,
+                listed.warning.unwrap_or_default()
+            ),
+            Err(error) => eprintln!(
+                "toolport: keeping server '{}' previous prompt catalog after refresh failed: {error}",
+                self.id
+            ),
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
 
-    /// Fetch the resources and prompts the server advertised. Best-effort: an
-    /// error or empty response just leaves the list empty. Kept out of `connect`
-    /// so only the gateway (which actually proxies these) pays the cost.
+    /// Fetch the resources, resource templates, and prompts the server advertised.
+    /// Best-effort: an error or empty response just leaves the list empty. Kept
+    /// out of `connect` so only the gateway (which actually proxies these) pays
+    /// the cost. Templates are loaded whenever the server advertised resources;
+    /// a server that does not implement `resources/templates/list` simply leaves
+    /// the template catalog empty.
     pub fn load_resources_prompts(&mut self) {
         if self.caps_resources {
-            if let Ok(r) = self.transport.request("resources/list", json!({})) {
-                self.resources = extract_array(&r, "resources");
+            if let Ok(listed) =
+                fetch_paginated_list(&mut *self.transport, "resources/list", "resources")
+            {
+                if let Some(warning) = &listed.warning {
+                    eprintln!(
+                        "toolport: server '{}' returned a partial resource catalog: {warning}",
+                        self.id
+                    );
+                }
+                self.resources = listed.items;
+            }
+            if let Ok(listed) = fetch_paginated_list(
+                &mut *self.transport,
+                "resources/templates/list",
+                "resourceTemplates",
+            ) {
+                if let Some(warning) = &listed.warning {
+                    eprintln!(
+                        "toolport: server '{}' returned a partial resource-template catalog: {warning}",
+                        self.id
+                    );
+                }
+                self.resource_templates = listed.items;
             }
         }
         if self.caps_prompts {
-            if let Ok(r) = self.transport.request("prompts/list", json!({})) {
-                self.prompts = extract_array(&r, "prompts");
+            if let Ok(listed) =
+                fetch_paginated_list(&mut *self.transport, "prompts/list", "prompts")
+            {
+                if let Some(warning) = &listed.warning {
+                    eprintln!(
+                        "toolport: server '{}' returned a partial prompt catalog: {warning}",
+                        self.id
+                    );
+                }
+                self.prompts = listed.items;
             }
         }
     }
 
     pub fn call(&mut self, tool: &str, arguments: Value) -> Result<Value, TransportError> {
-        self.call_with_cancel(tool, arguments, None)
+        self.call_with_cancel(tool, arguments, None, None)
     }
 
+    /// `meta` is the upstream client's `params._meta`, relayed downstream minus
+    /// the per-hop keys (SOU-444). `None` for calls Toolport originates itself,
+    /// such as a code-mode script step, which have no client request behind them.
     pub fn call_with_cancel(
         &mut self,
         tool: &str,
         arguments: Value,
         cancel: Option<CancelContext>,
+        meta: Option<&Value>,
     ) -> Result<Value, TransportError> {
         self.transport.request_with_cancel(
             "tools/call",
-            json!({ "name": tool, "arguments": arguments }),
+            with_meta(json!({ "name": tool, "arguments": arguments }), meta),
             cancel,
         )
     }
 
     /// Read one resource by its (original, downstream) uri.
     pub fn read_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
-        self.read_resource_with_cancel(uri, None)
+        self.read_resource_with_cancel(uri, None, None)
     }
 
     pub fn read_resource_with_cancel(
         &mut self,
         uri: &str,
         cancel: Option<CancelContext>,
+        meta: Option<&Value>,
     ) -> Result<Value, TransportError> {
+        self.transport.request_with_cancel(
+            "resources/read",
+            with_meta(json!({ "uri": uri }), meta),
+            cancel,
+        )
+    }
+
+    /// Subscribe to `notifications/resources/updated` for one resource URI on
+    /// this downstream (SOU-394). The gateway only calls this when at least one
+    /// upstream client is subscribed to the same URI.
+    pub fn subscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
         self.transport
-            .request_with_cancel("resources/read", json!({ "uri": uri }), cancel)
+            .request("resources/subscribe", json!({ "uri": uri }))
+    }
+
+    /// Drop a previously established downstream resource subscription.
+    pub fn unsubscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
+        self.transport
+            .request("resources/unsubscribe", json!({ "uri": uri }))
     }
 
     /// Get one prompt by its (original, downstream) name.
     pub fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Value, TransportError> {
-        self.get_prompt_with_cancel(name, arguments, None)
+        self.get_prompt_with_cancel(name, arguments, None, None)
     }
 
     pub fn get_prompt_with_cancel(
@@ -2281,12 +3089,38 @@ impl DownstreamServer {
         name: &str,
         arguments: Value,
         cancel: Option<CancelContext>,
+        meta: Option<&Value>,
     ) -> Result<Value, TransportError> {
         self.transport.request_with_cancel(
             "prompts/get",
-            json!({ "name": name, "arguments": arguments }),
+            with_meta(json!({ "name": name, "arguments": arguments }), meta),
             cancel,
         )
+    }
+
+    /// Whether this server advertised the completions utility at initialize.
+    pub fn supports_completions(&self) -> bool {
+        self.caps_completions
+    }
+
+    /// The protocol era and version this connection negotiated (SOU-445).
+    pub fn era(&self) -> &Era {
+        &self.era
+    }
+
+    /// Forward a `completion/complete` request. `params` must already use the
+    /// downstream's native reference names (prompt names un-namespaced).
+    pub fn complete(&mut self, params: Value) -> Result<Value, TransportError> {
+        self.complete_with_cancel(params, None)
+    }
+
+    pub fn complete_with_cancel(
+        &mut self,
+        params: Value,
+        cancel: Option<CancelContext>,
+    ) -> Result<Value, TransportError> {
+        self.transport
+            .request_with_cancel("completion/complete", params, cancel)
     }
 
     /// Forward a JSON-RPC notification to this downstream server.
@@ -2304,13 +3138,244 @@ fn extract_array(result: &Value, key: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+struct PaginatedList {
+    items: Vec<Value>,
+    /// Present when at least one page succeeded but traversal could not finish.
+    /// Initial discovery may expose that useful prefix; refreshes keep the prior
+    /// complete snapshot instead of replacing it with a partial catalog.
+    warning: Option<String>,
+}
+
+/// Traverse one MCP list operation using its opaque `nextCursor`. The first page
+/// remains mandatory. Once at least one page has succeeded, a later failure is
+/// returned as a partial result so a server stays usable during initial discovery.
+/// Cursor loops and excessive page/item counts are bounded defensively.
+fn fetch_paginated_list(
+    transport: &mut dyn Transport,
+    method: &str,
+    key: &str,
+) -> Result<PaginatedList, TransportError> {
+    let mut items = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    let started = Instant::now();
+
+    for page_index in 0..MAX_LIST_PAGES {
+        if page_index > 0 && started.elapsed() >= MAX_LIST_DURATION {
+            return Ok(PaginatedList {
+                items,
+                warning: Some(format!(
+                    "catalog traversal exceeded the {}-second safety cap",
+                    MAX_LIST_DURATION.as_secs()
+                )),
+            });
+        }
+        let params = cursor
+            .as_ref()
+            .map_or_else(|| json!({}), |value| json!({ "cursor": value }));
+        let result = match transport.request(method, params) {
+            Ok(result) => result,
+            Err(error) if page_index > 0 => {
+                return Ok(PaginatedList {
+                    items,
+                    warning: Some(format!("page {} failed: {error}", page_index + 1)),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+
+        let page = extract_array(&result, key);
+        let remaining = MAX_LIST_ITEMS.saturating_sub(items.len());
+        if page.len() > remaining {
+            items.extend(page.into_iter().take(remaining));
+            return Ok(PaginatedList {
+                items,
+                warning: Some(format!("catalog exceeded the {MAX_LIST_ITEMS}-item safety cap")),
+            });
+        }
+        items.extend(page);
+
+        let Some(next_cursor) = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return Ok(PaginatedList {
+                items,
+                warning: None,
+            });
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Ok(PaginatedList {
+                items,
+                warning: Some("server repeated a pagination cursor".to_string()),
+            });
+        }
+        cursor = Some(next_cursor);
+    }
+
+    Ok(PaginatedList {
+        items,
+        warning: Some(format!("catalog exceeded the {MAX_LIST_PAGES}-page safety cap")),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_cwd, file_uri_to_path, resolve_command, resolve_root_token, screen_resolved_addrs,
-        screen_spawn_command, screen_spawn_env, CancelRegistry,
+        cwd_validation_error, empty_cwd_variables, expand_cwd, file_uri_to_path, resolve_command,
+        resolve_root_token, screen_resolved_addrs, screen_spawn_command, screen_spawn_env,
+        validate_cwd, CancelRegistry, DownstreamServer, Transport, TransportError,
+        fetch_paginated_list,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
+    use std::path::Path;
+
+    struct PaginationTransport {
+        responses: VecDeque<Result<Value, TransportError>>,
+        params: Vec<Value>,
+    }
+
+    impl PaginationTransport {
+        fn new(responses: Vec<Result<Value, TransportError>>) -> Self {
+            Self {
+                responses: responses.into(),
+                params: Vec::new(),
+            }
+        }
+    }
+
+    impl Transport for PaginationTransport {
+        fn request(&mut self, _method: &str, params: Value) -> Result<Value, TransportError> {
+            self.params.push(params);
+            self.responses
+                .pop_front()
+                .expect("pagination test supplied a response")
+        }
+
+        fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn paginated_list_collects_every_page_and_treats_empty_cursor_as_opaque() {
+        let mut transport = PaginationTransport::new(vec![
+            Ok(json!({"tools":[{"name":"a"}],"nextCursor":""})),
+            Ok(json!({"tools":[{"name":"b"}],"nextCursor":"page-3"})),
+            Ok(json!({"tools":[{"name":"c"}]})),
+        ]);
+        let listed = fetch_paginated_list(&mut transport, "tools/list", "tools").unwrap();
+        assert!(listed.warning.is_none());
+        assert_eq!(
+            listed
+                .items
+                .iter()
+                .filter_map(|item| item["name"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(
+            transport.params,
+            vec![json!({}), json!({"cursor":""}), json!({"cursor":"page-3"})]
+        );
+    }
+
+    #[test]
+    fn paginated_list_stops_on_a_repeated_cursor() {
+        let mut transport = PaginationTransport::new(vec![
+            Ok(json!({"resources":[{"uri":"one:"}],"nextCursor":"same"})),
+            Ok(json!({"resources":[{"uri":"two:"}],"nextCursor":"same"})),
+        ]);
+        let listed =
+            fetch_paginated_list(&mut transport, "resources/list", "resources").unwrap();
+        assert_eq!(listed.items.len(), 2);
+        assert_eq!(
+            listed.warning.as_deref(),
+            Some("server repeated a pagination cursor")
+        );
+    }
+
+    #[test]
+    fn downstream_server_loads_all_tool_resource_and_prompt_pages() {
+        let transport = PaginationTransport::new(vec![
+            Ok(json!({
+                "capabilities": { "resources": {}, "prompts": {}, "completions": {} }
+            })),
+            Ok(json!({"tools":[{"name":"one"}],"nextCursor":"tools-2"})),
+            Ok(json!({"tools":[{"name":"two"}]})),
+            Ok(json!({"resources":[{"uri":"one:"}],"nextCursor":"resources-2"})),
+            Ok(json!({"resources":[{"uri":"two:"}]})),
+            Ok(json!({"resourceTemplates":[{"uriTemplate":"one://{id}"}],"nextCursor":"templates-2"})),
+            Ok(json!({"resourceTemplates":[{"uriTemplate":"two://{id}"}]})),
+            Ok(json!({"prompts":[{"name":"one"}],"nextCursor":"prompts-2"})),
+            Ok(json!({"prompts":[{"name":"two"}]})),
+        ]);
+        let mut server =
+            DownstreamServer::connect("fixture".to_string(), Box::new(transport)).unwrap();
+        server.load_resources_prompts();
+        assert_eq!(server.tools.len(), 2);
+        assert_eq!(server.resources.len(), 2);
+        assert_eq!(server.resource_templates.len(), 2);
+        assert_eq!(server.prompts.len(), 2);
+        assert!(server.supports_completions());
+        assert_eq!(server.tools[1]["name"], "two");
+        assert_eq!(server.resources[1]["uri"], "two:");
+        assert_eq!(server.resource_templates[1]["uriTemplate"], "two://{id}");
+        assert_eq!(server.prompts[1]["name"], "two");
+    }
+
+    #[test]
+    fn incomplete_refresh_keeps_the_previous_complete_catalog() {
+        let transport = PaginationTransport::new(vec![
+            Ok(json!({"tools":[{"name":"partial"}],"nextCursor":"two"})),
+            Err(TransportError::Unavailable("page two timed out".to_string())),
+        ]);
+        let mut server = DownstreamServer {
+            id: "fixture".to_string(),
+            transport: Box::new(transport),
+            tools: vec![json!({"name":"stable"})],
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+            prompts: Vec::new(),
+            caps_resources: false,
+            caps_prompts: false,
+            caps_completions: false,
+            era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
+        };
+        server.refresh_tools();
+        assert_eq!(server.tools, vec![json!({"name":"stable"})]);
+    }
+
+    #[test]
+    fn incomplete_template_refresh_keeps_the_previous_complete_catalog() {
+        // resources/list succeeds fully, but templates pagination is incomplete:
+        // keep the prior template snapshot rather than replacing it with a partial.
+        let transport = PaginationTransport::new(vec![
+            Ok(json!({"resources":[{"uri":"r:"}]})),
+            Ok(json!({"resourceTemplates":[{"uriTemplate":"partial://{id}"}],"nextCursor":"two"})),
+            Err(TransportError::Unavailable("page two timed out".to_string())),
+        ]);
+        let mut server = DownstreamServer {
+            id: "fixture".to_string(),
+            transport: Box::new(transport),
+            tools: Vec::new(),
+            resources: vec![json!({"uri":"stable-r:"})],
+            resource_templates: vec![json!({"uriTemplate":"stable://{id}"})],
+            prompts: Vec::new(),
+            caps_resources: true,
+            caps_prompts: false,
+            caps_completions: false,
+            era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
+        };
+        server.refresh_resources();
+        assert_eq!(server.resources, vec![json!({"uri":"r:"})]);
+        assert_eq!(
+            server.resource_templates,
+            vec![json!({"uriTemplate":"stable://{id}"})]
+        );
+    }
 
     /// Minimal FFI for getpgrp (test-only, avoids adding libc as a dependency).
     #[cfg(unix)]
@@ -2413,6 +3478,84 @@ mod tests {
         let _ = std::fs::remove_file(script_file);
     }
 
+    /// The unix counterpart to `windows_job_terminates_launcher_grandchild`:
+    /// dropping the transport must kill the grandchild a launcher spawned, not
+    /// just the launcher itself. Without the process-group kill the grandchild
+    /// survives, which is the `npx`->node leak this guards against.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_transport_kills_launcher_grandchild() {
+        use super::StdioTransport;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        // Signal 0 probes for existence without delivering anything. A zombie
+        // still answers, but the grandchild is reparented to init rather than
+        // to us, so it is reaped promptly and never lingers as one here.
+        fn process_is_running(pid: i32) -> bool {
+            extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            // SAFETY: signal 0 performs the permission/existence check only.
+            unsafe { kill(pid, 0) == 0 }
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid_file = std::env::temp_dir().join(format!(
+            "toolport-pgroup-test-{}-{nonce}.pid",
+            std::process::id()
+        ));
+        // `sh` stands in for a launcher: it starts a long-lived descendant,
+        // records that pid, and then waits on it the way npx waits on node.
+        // The body goes in a file rather than `sh -c` because the spawn guard
+        // (correctly) refuses inline-eval flags.
+        let script_file = pid_file.with_extension("sh");
+        std::fs::write(
+            &script_file,
+            format!("sleep 60 &\necho $! > '{}'\nwait\n", pid_file.to_string_lossy()),
+        )
+        .expect("write launcher script");
+        let args = vec![script_file.to_string_lossy().into_owned()];
+        let transport =
+            StdioTransport::spawn("sh", &args, &[], None).expect("spawn launcher shell");
+
+        // Poll for parsable CONTENT, not mere existence: the shell's redirection
+        // creates the file before `echo` writes to it, so a read in between
+        // returns empty and would make this test flake.
+        let created_deadline = Instant::now() + Duration::from_secs(8);
+        let grandchild_pid: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < created_deadline,
+                "launcher should record its grandchild pid"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(
+            process_is_running(grandchild_pid),
+            "grandchild must be alive before the transport is dropped"
+        );
+
+        drop(transport);
+        let exit_deadline = Instant::now() + Duration::from_secs(5);
+        while process_is_running(grandchild_pid) && Instant::now() < exit_deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            !process_is_running(grandchild_pid),
+            "dropping the transport must kill launcher descendants, not just the launcher"
+        );
+        let _ = std::fs::remove_file(pid_file);
+        let _ = std::fs::remove_file(script_file);
+    }
+
     #[test]
     fn expand_cwd_handles_tilde_and_env() {
         use std::path::PathBuf;
@@ -2433,18 +3576,87 @@ mod tests {
     }
 
     #[test]
+    fn cwd_validation_error_names_config_expansion_and_empty_variables() {
+        let error = cwd_validation_error(
+            "${MISSING}/project",
+            Path::new("/project"),
+            &["MISSING".to_string()],
+        );
+
+        assert!(error.contains(r#"configured working directory "${MISSING}/project""#));
+        assert!(error.contains(r#"expanded to "/project""#));
+        assert!(error.contains("expanded empty environment variables: ${MISSING}"));
+    }
+
+    #[test]
+    fn validate_cwd_accepts_an_existing_directory() {
+        let dir = std::env::temp_dir().join(format!("toolport-cwd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(validate_cwd(dir.to_str().unwrap()).unwrap(), dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The two tests above cover the message shape and the happy path, and both
+    /// still pass if `validate_cwd` is reduced to `Ok(expand_cwd(dir))`. These
+    /// two pin the behaviour the change actually adds, so a later refactor can't
+    /// drop the check and stay green.
+    #[test]
+    fn validate_cwd_rejects_a_missing_directory() {
+        let missing = std::env::temp_dir()
+            .join(format!("toolport-cwd-absent-{}", std::process::id()))
+            .join("nope");
+        let error = validate_cwd(missing.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("does not exist"), "got: {error}");
+        // The message formats paths with `{:?}`, which escapes separators on
+        // Windows, so compare against the debug form rather than the raw path.
+        assert!(
+            error.contains(&format!("{missing:?}")),
+            "the error must name the expanded path; got: {error}"
+        );
+    }
+
+    #[test]
+    fn empty_cwd_variables_reports_only_unset_names() {
+        let set = format!("TP_TEST_CWD_SET_{}", std::process::id());
+        let unset = format!("TP_TEST_CWD_UNSET_{}", std::process::id());
+        std::env::set_var(&set, "value");
+        std::env::remove_var(&unset);
+
+        // An unset var is reported, a set one is not.
+        assert_eq!(
+            empty_cwd_variables(&format!("${{{unset}}}/project")),
+            vec![unset.clone()]
+        );
+        assert!(empty_cwd_variables(&format!("${{{set}}}/project")).is_empty());
+        // ROOT is resolved upstream by resolve_root_token, so it is never a
+        // "you forgot to set this" hint.
+        assert!(empty_cwd_variables("${ROOT}/project").is_empty());
+        // A var set to the empty string counts as empty.
+        std::env::set_var(&unset, "");
+        assert_eq!(
+            empty_cwd_variables(&format!("${{{unset}}}/p")),
+            vec![unset.clone()]
+        );
+
+        std::env::remove_var(&set);
+        std::env::remove_var(&unset);
+    }
+
+    #[test]
     fn strips_gateway_control_env_from_children() {
         use std::collections::HashSet;
         use std::ffi::OsStr;
         // pid-unique names so a parallel test's process-wide env set can't collide.
         let secret = format!("CONDUIT_TEST_SECRET_{}", std::process::id());
+        let secret_new = format!("TOOLPORT_TEST_SECRET_{}", std::process::id());
         let keep = format!("TP_KEEP_{}", std::process::id());
         std::env::set_var(&secret, "leak-me");
+        std::env::set_var(&secret_new, "leak-me-too");
         std::env::set_var(&keep, "ok");
 
-        // Nothing configured: the inherited CONDUIT_* var is marked for removal from
-        // the child (get_envs records a removal as value None), and an unrelated var
-        // is left untouched.
+        // Nothing configured: inherited TOOLPORT_*/CONDUIT_* vars are marked for
+        // removal from the child (get_envs records a removal as value None), and an
+        // unrelated var is left untouched.
         let empty: HashSet<&str> = HashSet::new();
         let mut cmd = std::process::Command::new("true");
         super::strip_gateway_control_env(&mut cmd, &empty);
@@ -2454,20 +3666,31 @@ mod tests {
             "a CONDUIT_* var must be stripped from the child"
         );
         assert!(
+            overrides
+                .iter()
+                .any(|(k, v)| *k == OsStr::new(&secret_new) && v.is_none()),
+            "a TOOLPORT_* var must be stripped from the child"
+        );
+        assert!(
             !overrides.iter().any(|(k, _)| *k == OsStr::new(&keep)),
             "an unrelated var must not be touched by the strip"
         );
 
-        // A server that sets a CONDUIT_ var for itself keeps it (exempt from the strip).
-        let configured: HashSet<&str> = [secret.as_str()].into_iter().collect();
+        // A server that sets a control-plane-prefixed var for itself keeps it.
+        let configured: HashSet<&str> = [secret.as_str(), secret_new.as_str()].into_iter().collect();
         let mut cmd2 = std::process::Command::new("true");
         super::strip_gateway_control_env(&mut cmd2, &configured);
         assert!(
             !cmd2.get_envs().any(|(k, _)| k == OsStr::new(&secret)),
             "a server-configured CONDUIT_ var must be exempt from the strip"
         );
+        assert!(
+            !cmd2.get_envs().any(|(k, _)| k == OsStr::new(&secret_new)),
+            "a server-configured TOOLPORT_ var must be exempt from the strip"
+        );
 
         std::env::remove_var(&secret);
+        std::env::remove_var(&secret_new);
         std::env::remove_var(&keep);
     }
 
@@ -3222,23 +4445,25 @@ mod tests {
         let dirty = Some(Arc::new(AtomicU8::new(0)));
         let armed = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
+        let no_sink = None;
+        let no_progress = Arc::new(std::sync::Mutex::new(None));
 
         // Unarmed (still in the handshake window): the line is forwarded but the
         // change is not acted on.
-        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed));
+        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink, &no_progress));
         assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), 0);
         assert_eq!(rx.recv().unwrap(), notif);
 
         // Armed: the same notification now sets the TOOLS bit.
         armed.store(true, Ordering::SeqCst);
-        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed));
+        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink, &no_progress));
         assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), change::TOOLS);
         assert_eq!(rx.recv().unwrap(), notif);
 
         // A resources/list_changed sets the RESOURCES bit alongside it (OR, not
         // overwrite), so distinct changes between watcher ticks aren't lost.
         let res_notif = r#"{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}"#;
-        assert!(forward_line(res_notif.to_string(), &tx, &dirty, &armed));
+        assert!(forward_line(res_notif.to_string(), &tx, &dirty, &armed, &no_sink, &no_progress));
         assert_eq!(
             dirty.as_ref().unwrap().load(Ordering::SeqCst),
             change::TOOLS | change::RESOURCES
@@ -3248,13 +4473,353 @@ mod tests {
         // An ordinary line is always forwarded and never flags a change.
         let resp = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
         let dirty2 = Some(Arc::new(AtomicU8::new(0)));
-        assert!(forward_line(resp.to_string(), &tx, &dirty2, &armed));
+        assert!(forward_line(resp.to_string(), &tx, &dirty2, &armed, &no_sink, &no_progress));
         assert_eq!(dirty2.as_ref().unwrap().load(Ordering::SeqCst), 0);
         assert_eq!(rx.recv().unwrap(), resp);
 
         // A closed receiver makes forward_line report "stop".
         drop(rx);
-        assert!(!forward_line(notif.to_string(), &tx, &dirty, &armed));
+        assert!(!forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink, &no_progress));
+    }
+
+    #[test]
+    fn resource_updated_uri_parses_only_updated_notifications() {
+        use super::resource_updated_uri;
+        assert_eq!(
+            resource_updated_uri(
+                r#"{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file://a"}}"#
+            )
+            .as_deref(),
+            Some("file://a")
+        );
+        // list_changed must not be treated as an updated notification.
+        assert_eq!(
+            resource_updated_uri(
+                r#"{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}"#
+            ),
+            None
+        );
+        assert_eq!(resource_updated_uri(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#), None);
+        assert_eq!(resource_updated_uri("not json"), None);
+    }
+
+    #[test]
+    fn an_rpc_error_is_not_a_health_failure() {
+        // Only unreachability trips the per-server circuit breaker. A server that
+        // answers with a JSON-RPC error is alive and well-behaved, and counting it
+        // as unhealthy would break a server for every client over one bad call.
+        use super::TransportError;
+        assert!(!TransportError::Rpc(json!({ "code": -32601 })).is_health_failure());
+        assert!(!TransportError::Fatal("HTTP 400".into()).is_health_failure());
+        assert!(TransportError::Unavailable("timed out".into()).is_health_failure());
+        assert!(TransportError::Retry { retry_after: None, message: "429".into() }
+            .is_health_failure());
+    }
+
+    #[test]
+    fn notifications_carry_the_connections_protocol_meta() {
+        // The request path stamps protocol `_meta`; `notify` has its own copy of
+        // that logic and had no coverage, so a modern connection could have sent
+        // notifications telling a different story than its requests.
+        //
+        // Driven through the real `HttpTransport::notify` and read back off the
+        // wire, rather than asserting on `merge_protocol_meta` in isolation: the
+        // helper being right is not the claim, the frame on the wire is.
+        use super::{HttpTransport, Transport, MODERN_PROTOCOL_VERSION};
+        use std::sync::{Arc, Mutex};
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let body = Arc::new(Mutex::new(String::new()));
+        let bc = Arc::clone(&body);
+        let handle = std::thread::spawn(move || {
+            if let Ok(mut req) = server.recv() {
+                let mut buf = String::new();
+                let _ = req.as_reader().read_to_string(&mut buf);
+                *bc.lock().unwrap() = buf;
+                let ct =
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .unwrap();
+                let _ = req.respond(tiny_http::Response::from_string("{}").with_header(ct));
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut t = HttpTransport::new(&url);
+        t.set_protocol_meta(Some(super::protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+        t.notify("notifications/cancelled", json!({ "requestId": 1 }))
+            .expect("notify should reach the server");
+        let _ = handle.join();
+
+        let sent: Value = serde_json::from_str(&body.lock().unwrap()).expect("a JSON frame");
+        assert_eq!(sent["method"], "notifications/cancelled");
+        assert_eq!(
+            sent["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            MODERN_PROTOCOL_VERSION,
+            "a modern connection stamps its version on notifications too, got {sent}"
+        );
+        assert_eq!(sent["params"]["requestId"], 1, "the caller's params survive");
+    }
+
+    #[test]
+    fn merge_protocol_meta_preserves_client_keys_and_survives_a_bogus_meta() {
+        use super::{merge_protocol_meta, protocol_meta_for, MODERN_PROTOCOL_VERSION};
+        const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+
+        // A pre-existing `_meta` is merged into, not replaced.
+        let mut params = json!({ "_meta": { "traceparent": "keep" } });
+        merge_protocol_meta(&mut params, &protocol_meta_for(MODERN_PROTOCOL_VERSION));
+        assert_eq!(params["_meta"]["traceparent"], "keep", "client keys survive");
+        assert_eq!(params["_meta"][VERSION_KEY], MODERN_PROTOCOL_VERSION);
+
+        // A non-object `_meta` is rebuilt rather than panicking or being ignored.
+        let mut params = json!({ "_meta": "nonsense" });
+        merge_protocol_meta(&mut params, &protocol_meta_for(MODERN_PROTOCOL_VERSION));
+        assert_eq!(params["_meta"][VERSION_KEY], MODERN_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn the_ladder_retries_discover_on_a_mutually_supported_version() {
+        // The negotiate branch: a modern server that rejects our declared version
+        // but names one we DO speak must be retried on that version and connect
+        // successfully. Only the give-up branch had coverage, so the retry could
+        // have been broken outright without a test noticing.
+        use super::{DownstreamServer, Transport, TransportError, MODERN_PROTOCOL_VERSION};
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        struct Ladder {
+            responses: VecDeque<Result<Value, TransportError>>,
+            /// Stamps AND requests, interleaved in call order.
+            ///
+            /// Counting stamps alone cannot express the claim. `connect` stamps
+            /// three times on this path (before the probe, for the retry, and
+            /// after `choose_protocol_version`), so a `len() >= 2` floor still
+            /// held with the retry stamp deleted - and since the negotiate branch
+            /// can only ever select `MODERN_PROTOCOL_VERSION`, asserting every
+            /// stamp equals it was a tautology. What matters is ORDER: a stamp
+            /// has to fall between the two `server/discover` sends (#511 review).
+            events: Arc<Mutex<Vec<String>>>,
+        }
+        impl Transport for Ladder {
+            fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+                self.events.lock().unwrap().push(format!("send:{method}"));
+                self.responses.pop_front().expect("a response per request")
+            }
+            fn notify(&mut self, _m: &str, _p: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn set_protocol_meta(&mut self, meta: Option<Value>) {
+                let version = meta
+                    .as_ref()
+                    .and_then(|m| m.get("io.modelcontextprotocol/protocolVersion"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("<none>")
+                    .to_string();
+                self.events.lock().unwrap().push(format!("stamp:{version}"));
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport = Ladder {
+            events: Arc::clone(&events),
+            responses: VecDeque::from(vec![
+                // initialize: refused, as a modern server must.
+                Err(TransportError::Rpc(json!({ "code": -32601, "message": "no initialize" }))),
+                // First server/discover: "not that version, but I speak ours too".
+                Err(TransportError::Rpc(json!({
+                    "code": super::UNSUPPORTED_PROTOCOL_VERSION,
+                    "message": "Unsupported protocol version",
+                    "data": { "supported": ["2027-05-01", MODERN_PROTOCOL_VERSION] }
+                }))),
+                // Retry on the mutually supported version: accepted.
+                Ok(json!({
+                    "supportedVersions": [MODERN_PROTOCOL_VERSION],
+                    "capabilities": { "tools": {} }
+                })),
+                // tools/list for the rest of the handshake.
+                Ok(json!({ "tools": [] })),
+            ]),
+        };
+
+        let server = DownstreamServer::connect("mock".to_string(), Box::new(transport))
+            .expect("the ladder must recover on a mutually supported version");
+        assert!(server.era().is_modern());
+        assert_eq!(server.era().version(), MODERN_PROTOCOL_VERSION);
+
+        // The retry must RE-stamp before sending, so the header and the body
+        // `_meta` still agree on the newly chosen version. Skipping that would
+        // send the rejected version again and draw the same error forever.
+        //
+        // Asserted positionally: find the two `server/discover` sends and require
+        // a stamp strictly between them. A count-based assertion cannot see this,
+        // because the stamps either side of the retry are made unconditionally.
+        let events = events.lock().unwrap();
+        let discovers: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.as_str() == "send:server/discover")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            discovers.len(),
+            2,
+            "expected the probe and one negotiated retry, got {events:?}"
+        );
+        let expected = format!("stamp:{MODERN_PROTOCOL_VERSION}");
+        assert!(
+            events[discovers[0] + 1..discovers[1]].iter().any(|e| *e == expected),
+            "the retry must re-stamp between the two sends, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn modern_server_offering_another_version_is_not_reported_as_legacy() {
+        // The compatibility ladder's pivot. A server that refuses `initialize`
+        // AND answers the probe with a recognized modern error IS modern, it just
+        // does not speak our version. Reporting the initialize refusal there sends
+        // someone chasing a handshake bug on a reachable server (#511 review).
+        use super::{DownstreamServer, Transport, TransportError};
+        use std::collections::VecDeque;
+
+        struct Probe {
+            responses: VecDeque<Result<Value, TransportError>>,
+        }
+        impl Transport for Probe {
+            fn request(&mut self, _method: &str, _params: Value) -> Result<Value, TransportError> {
+                self.responses.pop_front().expect("a response per request")
+            }
+            fn notify(&mut self, _m: &str, _p: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let transport = Probe {
+            responses: VecDeque::from(vec![
+                // initialize: refused, as a modern server must.
+                Err(TransportError::Rpc(json!({
+                    "code": -32601, "message": "initialize is not part of 2026-07-28"
+                }))),
+                // server/discover: recognized modern error naming what it speaks.
+                Err(TransportError::Rpc(json!({
+                    "code": super::UNSUPPORTED_PROTOCOL_VERSION,
+                    "message": "Unsupported protocol version",
+                    "data": { "supported": ["2027-05-01"], "requested": "2026-07-28" }
+                }))),
+            ]),
+        };
+
+        let err = match DownstreamServer::connect("mock".to_string(), Box::new(transport)) {
+            Err(err) => err,
+            Ok(_) => panic!("no mutually supported version, so connect must fail"),
+        };
+        assert!(
+            err.contains("2027-05-01") && err.contains(super::MODERN_PROTOCOL_VERSION),
+            "the error must name what each side speaks, got: {err}"
+        );
+        assert!(
+            !err.contains("initialize is not part of"),
+            "a modern server must not be reported via the initialize refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn http_protocol_header_follows_the_negotiated_version() {
+        // From 2026-07-28 the MCP-Protocol-Version header MUST equal the
+        // `_meta` version in the body. A hardcoded header would disagree with the
+        // `_meta` that `set_protocol_meta` stamps, and a modern server would
+        // answer 400 HeaderMismatch (-32020) to every request. Invisible to the
+        // stdio tests, which have no headers at all (#511 review).
+        use super::{HttpTransport, Transport, MODERN_PROTOCOL_VERSION, PROTOCOL_VERSION};
+
+        let mut t = HttpTransport::new("https://example.invalid/mcp");
+        assert_eq!(
+            t.wire_protocol_version(),
+            PROTOCOL_VERSION,
+            "a legacy connection declares exactly what it always did"
+        );
+
+        t.set_protocol_meta(Some(super::protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+        assert_eq!(
+            t.wire_protocol_version(),
+            MODERN_PROTOCOL_VERSION,
+            "the header must follow the negotiated version, not a constant"
+        );
+    }
+
+    #[test]
+    fn forward_line_invokes_progress_sink_when_armed() {
+        // Mirrors the resource-updated sink test. Every other `forward_line` test
+        // passes an empty progress sink, so without this nothing pins that
+        // `notifications/progress` actually reaches a bound sink, and a
+        // regression that silently stopped routing progress would stay green.
+        use super::{forward_line, ProgressSink};
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sink: ProgressSink = Arc::new(move |note| {
+            sink_seen.lock().unwrap().push(note);
+        });
+        let dirty = Some(Arc::new(AtomicU8::new(0)));
+        let armed = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let no_sink = None;
+        let progress = Arc::new(Mutex::new(Some(sink)));
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"tp-1","progress":1,"total":2}}"#;
+
+        // Unarmed (still in the handshake window): forwarded, but not routed.
+        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &no_sink, &progress));
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(rx.recv().unwrap(), line);
+
+        // Armed: the sink receives the whole notification, token included.
+        armed.store(true, Ordering::SeqCst);
+        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &no_sink, &progress));
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["params"]["progressToken"], "tp-1");
+        // Not a list change, so no dirty bit.
+        assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), 0);
+        assert_eq!(rx.recv().unwrap(), line);
+
+        // A progress notification with no token is unroutable and never reaches
+        // the sink, so the gateway is not woken for something it must drop.
+        let untokened = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}"#;
+        assert!(forward_line(untokened.to_string(), &tx, &dirty, &armed, &no_sink, &progress));
+        assert_eq!(seen.lock().unwrap().len(), 1, "still just the one");
+    }
+
+    #[test]
+    fn forward_line_invokes_resource_updated_sink_when_armed() {
+        use super::{forward_line, ResourceUpdatedSink};
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sink: ResourceUpdatedSink = Arc::new(move |uri| {
+            sink_seen.lock().unwrap().push(uri);
+        });
+        let dirty = Some(Arc::new(AtomicU8::new(0)));
+        let armed = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sink_opt = Some(sink);
+        let no_progress = Arc::new(Mutex::new(None));
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"fixture://r"}}"#;
+
+        // Unarmed: no sink call.
+        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &sink_opt, &no_progress));
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(rx.recv().unwrap(), line);
+
+        // Armed: sink receives the URI; dirty bits stay clear (not a list change).
+        armed.store(true, Ordering::SeqCst);
+        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &sink_opt, &no_progress));
+        assert_eq!(seen.lock().unwrap().as_slice(), &["fixture://r".to_string()]);
+        assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), 0);
+        assert_eq!(rx.recv().unwrap(), line);
     }
 
     #[test]
@@ -3480,6 +5045,237 @@ mod tests {
         assert!(res.is_some(), "got the 200 result after refreshing");
         assert_eq!(hits.load(Ordering::SeqCst), 2, "exactly one 401 then one retry");
         assert_eq!(*retry_auth.lock().unwrap(), "Bearer fresh", "retry used the new token");
+    }
+
+    #[test]
+    fn forced_refresh_is_budgeted_per_token_not_per_post() {
+        // Connect posts twice: `initialize`, then the `server/discover` era probe.
+        // With a per-call budget each POST ran its own 401 -> refresh -> retry
+        // cycle, so one expired token cost two refresh exchanges - and a provider
+        // that rotates the refresh token on use has that chain consumed twice
+        // (SOU-474 #5). The budget belongs to the token, not the call.
+        use super::{HttpTransport, RefreshFn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Always 401: the refreshed token is rejected too, so nothing can succeed
+        // and the only question is how many times we tried to mint a new one.
+        //
+        // Serve until told to stop rather than for a fixed number of requests: a
+        // regression makes MORE requests, and a fixed loop would leave the extra
+        // one unanswered and hang the client instead of failing the assertion.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (pc, sc) = (Arc::clone(&posts), Arc::clone(&stop));
+        let handle = std::thread::spawn(move || {
+            while !sc.load(Ordering::SeqCst) {
+                match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(Some(req)) => {
+                        pc.fetch_add(1, Ordering::SeqCst);
+                        let _ = req.respond(
+                            tiny_http::Response::from_string("nope").with_status_code(401),
+                        );
+                    }
+                    Ok(None) => continue,
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let forced = Arc::new(AtomicUsize::new(0));
+        let fc = Arc::clone(&forced);
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+            if force {
+                // Each forced call is a refresh-token exchange with the provider.
+                let n = fc.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(format!("minted-{n}")))
+            } else {
+                Ok(None)
+            }
+        }));
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut t = HttpTransport::with_auth_refresh(&url, Some("stale".to_string()), refresh);
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" });
+        assert!(t.post(&body, true).is_err(), "an always-401 server cannot succeed");
+        // The second POST is the era probe, on the same transport and the same
+        // (already once-refreshed) token.
+        assert!(t.post(&body, true).is_err(), "still 401");
+        drop(t);
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+
+        assert_eq!(
+            forced.load(Ordering::SeqCst),
+            1,
+            "one expired token must cost exactly one refresh exchange across both POSTs"
+        );
+        // 401, refresh, 401(retry) on the first post; the second post sends once
+        // and gives up without minting anything.
+        assert_eq!(posts.load(Ordering::SeqCst), 3, "no retry on the second POST");
+    }
+
+    #[test]
+    fn an_accepted_token_returns_its_forced_refresh_budget() {
+        // The per-token budget must be a budget, not a latch. A provider that
+        // omits `expires_in` has no deadline, so `refresh_before_send` never
+        // fires and `auth` can only ever change via a FORCED refresh. Keying the
+        // budget to the token and clearing it only on a proactive swap therefore
+        // wedged the connection: after one successful reactive refresh, the next
+        // expiry 401s forever with a working refresh token sitting in the vault.
+        //
+        // `Fatal` is not a health failure, so the breaker never trips and nothing
+        // reconnects - every later call to that server fails for the life of the
+        // process. Clearing on 2xx is what makes it recoverable (SOU-474 review).
+        use super::{HttpTransport, RefreshFn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Models a short-lived token: a freshly minted one works exactly once and
+        // is stale by the next request, so two successive expiries occur with no
+        // `expires_in` for the proactive path to act on.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sc = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let mut spent: std::collections::HashSet<String> = std::collections::HashSet::new();
+            while !sc.load(Ordering::SeqCst) {
+                let req = match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(Some(req)) => req,
+                    Ok(None) => continue,
+                    Err(_) => return,
+                };
+                let auth = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Authorization"))
+                    .map(|h| h.value.as_str().to_string())
+                    .unwrap_or_default();
+                if auth.starts_with("Bearer minted-") && spent.insert(auth.clone()) {
+                    let ct = tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"application/json"[..],
+                    )
+                    .unwrap();
+                    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+                    let _ = req.respond(tiny_http::Response::from_string(body).with_header(ct));
+                } else {
+                    let _ = req
+                        .respond(tiny_http::Response::from_string("nope").with_status_code(401));
+                }
+            }
+        });
+
+        let forced = Arc::new(AtomicUsize::new(0));
+        let fc = Arc::clone(&forced);
+        // No proactive deadline: the non-forced arm always declines, exactly like
+        // a provider that reported no `expires_in`.
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+            if force {
+                let n = fc.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(format!("minted-{n}")))
+            } else {
+                Ok(None)
+            }
+        }));
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut t = HttpTransport::with_auth_refresh(&url, Some("stale".to_string()), refresh);
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
+
+        // First expiry: 401, forced refresh to minted-0, retry accepted.
+        assert!(t.post(&body, true).is_ok(), "first reactive refresh recovers");
+        // The accepted token is now stale at the provider (it is not minted-1),
+        // so this 401s. The budget must be available again to recover.
+        assert!(
+            t.post(&body, true).is_ok(),
+            "a second expiry must still be recoverable; the budget latched shut"
+        );
+        drop(t);
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+
+        assert_eq!(
+            forced.load(Ordering::SeqCst),
+            2,
+            "one forced exchange per expiry, and the second must actually happen"
+        );
+    }
+
+    #[test]
+    fn proactive_refresh_restores_the_forced_budget() {
+        // The per-token budget must not become a permanent latch: once a proactive
+        // refresh swaps in a *different* token, a later 401 on that new token is a
+        // genuine expiry and must still be recoverable, or a long-lived session
+        // stops self-healing (SOU-474 #5).
+        use super::{HttpTransport, RefreshFn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (hc, sc) = (Arc::clone(&hits), Arc::clone(&stop));
+        let handle = std::thread::spawn(move || {
+            while !sc.load(Ordering::SeqCst) {
+                let req = match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(Some(req)) => req,
+                    Ok(None) => continue,
+                    Err(_) => return,
+                };
+                // 401 every request except the very last one we expect.
+                if hc.fetch_add(1, Ordering::SeqCst) == 3 {
+                    let ct = tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"application/json"[..],
+                    )
+                    .unwrap();
+                    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+                    let _ = req.respond(tiny_http::Response::from_string(body).with_header(ct));
+                } else {
+                    let _ = req
+                        .respond(tiny_http::Response::from_string("nope").with_status_code(401));
+                }
+            }
+        });
+
+        let forced = Arc::new(AtomicUsize::new(0));
+        let fc = Arc::clone(&forced);
+        let proactive = Arc::new(AtomicUsize::new(0));
+        let pc = Arc::clone(&proactive);
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+            if force {
+                let n = fc.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(format!("forced-{n}")))
+            } else if pc.fetch_add(1, Ordering::SeqCst) == 1 {
+                // Before the second POST, hand out a genuinely different token.
+                Ok(Some("proactive".to_string()))
+            } else {
+                Ok(None)
+            }
+        }));
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut t = HttpTransport::with_auth_refresh(&url, Some("stale".to_string()), refresh);
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
+        assert!(t.post(&body, true).is_err(), "first POST exhausts its budget");
+        assert!(
+            t.post(&body, true).is_ok(),
+            "a proactively-refreshed token gets its own forced-refresh budget"
+        );
+        drop(t);
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+
+        assert_eq!(
+            forced.load(Ordering::SeqCst),
+            2,
+            "one forced exchange per distinct token, not one for the whole connection"
+        );
     }
 
     #[test]

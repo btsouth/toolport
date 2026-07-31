@@ -35,7 +35,10 @@ RUN useradd --system --uid 10001 --home-dir /data toolport \
     && chown toolport:toolport /data
 
 USER toolport
-ENV CONDUIT_HTTP=8765
+# HTTP mode comes from the `--http` flag on the ENTRYPOINT below, not from the
+# environment: the gateway ignores TOOLPORT_HTTP/CONDUIT_HTTP when its stdin is a
+# pipe, so an inherited value can never turn a client-spawned gateway into a second
+# HTTP server racing for this port (issue #487).
 ENV CONDUIT_HTTP_HOST=0.0.0.0
 ENV CONDUIT_REGISTRY=/data/registry.json
 EXPOSE 8765

@@ -36,19 +36,22 @@ impl SemanticConfig {
 
     /// Build from registry settings, with env overrides so a benchmark (or a single
     /// client) can toggle semantic search without editing the registry:
-    ///   CONDUIT_SEMANTIC=on|off, CONDUIT_EMBED_ENDPOINT, CONDUIT_EMBED_MODEL,
-    ///   CONDUIT_EMBED_BLEND. (The API key, if needed, is CONDUIT_EMBED_KEY.)
+    ///   TOOLPORT_SEMANTIC=on|off (legacy CONDUIT_*), TOOLPORT_EMBED_ENDPOINT,
+    ///   TOOLPORT_EMBED_MODEL, TOOLPORT_EMBED_BLEND. (API key: TOOLPORT_EMBED_KEY.)
     pub fn resolve(enabled: bool, endpoint: String, model: String, blend: f32) -> Self {
-        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        let enabled = match env("CONDUIT_SEMANTIC") {
+        let env = |new_k: &str, legacy_k: &str| crate::brand::env_var(new_k, legacy_k);
+        let enabled = match env("TOOLPORT_SEMANTIC", "CONDUIT_SEMANTIC") {
             Some(v) => matches!(v.to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes"),
             None => enabled,
         };
         SemanticConfig {
             enabled,
-            endpoint: env("CONDUIT_EMBED_ENDPOINT").unwrap_or(endpoint),
-            model: env("CONDUIT_EMBED_MODEL").unwrap_or(model),
-            blend: env("CONDUIT_EMBED_BLEND").and_then(|v| v.parse().ok()).unwrap_or(blend),
+            endpoint: env("TOOLPORT_EMBED_ENDPOINT", "CONDUIT_EMBED_ENDPOINT")
+                .unwrap_or(endpoint),
+            model: env("TOOLPORT_EMBED_MODEL", "CONDUIT_EMBED_MODEL").unwrap_or(model),
+            blend: env("TOOLPORT_EMBED_BLEND", "CONDUIT_EMBED_BLEND")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(blend),
         }
     }
 }
@@ -130,7 +133,7 @@ fn embed_batch(cfg: &SemanticConfig, inputs: &[String]) -> Option<Vec<Vec<f32>>>
         std::time::Duration::from_secs(10),
     );
     let mut req = agent.post(&cfg.endpoint).set("Content-Type", "application/json");
-    if let Ok(key) = std::env::var("CONDUIT_EMBED_KEY") {
+    if let Some(key) = crate::brand::env_var("TOOLPORT_EMBED_KEY", "CONDUIT_EMBED_KEY") {
         if !key.is_empty() {
             req = req.set("Authorization", &format!("Bearer {key}"));
         }

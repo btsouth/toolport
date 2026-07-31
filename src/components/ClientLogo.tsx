@@ -48,6 +48,7 @@ const CLIENT_LOGO: Record<string, string> = {
   warp: "warp",
   zed: "zed",
   "amazon-q": "amazon-q",
+  "toolport-studio": "toolport-studio",
 };
 
 /** Initials for the monogram fallback: two letters for multi-word names, else two chars. */

@@ -1,7 +1,7 @@
 # Grouped discovery mode
 
 Toolport has three tool-discovery modes, selected per client by the
-`CONDUIT_DISCOVERY` environment variable (falling back to the registry's
+`TOOLPORT_DISCOVERY` environment variable (falling back to the registry's
 `lazy_discovery` setting when unset):
 
 | Mode             | `tools/list` advertises                                                                                      | Best for                                                                                 |
@@ -49,7 +49,7 @@ servers, where the per-server tools approach the full catalog.
 Per client, set the env in that client's MCP server config:
 
 ```
-CONDUIT_DISCOVERY=grouped
+TOOLPORT_DISCOVERY=grouped
 ```
 
 ## Roadmap

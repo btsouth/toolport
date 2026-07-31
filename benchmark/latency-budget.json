@@ -1,0 +1,9 @@
+{
+  "maximumMilliseconds": {
+    "handshake": 100,
+    "catalogReady": 1000,
+    "toolsList.p95": 5,
+    "search.p95": 10,
+    "gatewayOverhead.p95": 10
+  }
+}

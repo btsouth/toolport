@@ -3,6 +3,7 @@ import { ShieldAlert } from "lucide-react";
 import { listQuarantined, releaseQuarantine, type QuarantinedTool } from "@/lib/api";
 import { toastError } from "@/lib/toast";
 import { Button } from "@/components/ui/button";
+import { fmtTs } from "@/lib/utils";
 
 /** Matches the PendingApprovals cadence so the two attention surfaces feel equally live. */
 const POLL_MS = 2000;
@@ -34,7 +35,7 @@ function whenLabel(ts: number): string {
   if (mins < 60) return `${mins}m ago`;
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}h ago`;
-  return new Date(ts).toLocaleDateString();
+  return fmtTs(ts, "date");
 }
 
 /**
@@ -141,9 +142,15 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
               <li key={k} className="flex items-start gap-3 px-4 py-2.5">
                 <div className="min-w-0 flex-1">
                   <p className="truncate font-mono text-xs">{q.tool}</p>
-                  {/* The reason is the point of the card, so it stays prominent: it is
-                      what makes re-approving an informed decision instead of a reflex. */}
-                  <p className="mt-0.5 text-xs text-warning">{q.reason}</p>
+                  {/* The reason / detail is the point of the card, so it stays prominent:
+                      it is what makes re-approving an informed decision instead of a
+                      reflex. Prefer the concrete annotation delta when present (SOU-305). */}
+                  <p className="mt-0.5 text-xs text-warning">
+                    {q.detail ? q.detail : q.reason}
+                  </p>
+                  {q.detail ? (
+                    <p className="mt-0.5 text-[11px] text-muted-foreground">{q.reason}</p>
+                  ) : null}
                   <p className="mt-0.5 text-[11px] text-muted-foreground">
                     {q.server}
                     {q.profile ? ` · ${q.profile}` : ""} · {whenLabel(q.ts)}

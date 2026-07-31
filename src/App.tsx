@@ -94,6 +94,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/sonner";
 import { useTheme } from "@/lib/theme";
+import { fmtTs } from "@/lib/utils";
 
 /** Above this many servers, "Disable all" asks for confirmation first. */
 const BULK_DISABLE_CONFIRM_MIN = 3;
@@ -124,7 +125,9 @@ function App() {
   const [backendReachable, setBackendReachable] = useState(true);
   const [query, setQuery] = useState("");
   const [onboarded, setOnboarded] = useState(
-    () => localStorage.getItem("conduit.onboarded") === "1",
+    () =>
+      localStorage.getItem("toolport.onboarded") === "1" ||
+      localStorage.getItem("conduit.onboarded") === "1",
   );
   const [showOnboarding, setShowOnboarding] = useState(false);
   // Step the wizard opens at (0 = Welcome). Set to the Connect step when resuming
@@ -197,7 +200,7 @@ function App() {
         setRegistry(reg);
         setClients(dc);
         if (recovery) {
-          const when = new Date(recovery.recoveredAtMs).toLocaleString();
+          const when = fmtTs(recovery.recoveredAtMs);
           const detail =
             recovery.reason === "corrupt"
               ? `The registry file was damaged. Restored from backup (${when}).`
@@ -487,7 +490,9 @@ function App() {
   }, [resumeAtConnect, view, onboarded]);
 
   function finishOnboarding() {
-    localStorage.setItem("conduit.onboarded", "1");
+    localStorage.setItem("toolport.onboarded", "1");
+    // Drop the pre-rename key so brand remnants do not linger in DevTools.
+    localStorage.removeItem("conduit.onboarded");
     setOnboarded(true);
     setShowOnboarding(false);
     setResumeAtConnect(false);
@@ -964,9 +969,11 @@ function ServerGroup({
   defaultCollapsed?: boolean;
   children: ReactNode;
 }) {
-  const storageKey = `conduit.group.${title.toLowerCase().replace(/\s+/g, "-")}`;
+  const slug = title.toLowerCase().replace(/\s+/g, "-");
+  const storageKey = `toolport.group.${slug}`;
+  const legacyStorageKey = `conduit.group.${slug}`;
   const [collapsed, setCollapsed] = useState(() => {
-    const v = localStorage.getItem(storageKey);
+    const v = localStorage.getItem(storageKey) ?? localStorage.getItem(legacyStorageKey);
     return v === null ? defaultCollapsed : v === "1";
   });
   if (count === 0) return null;
@@ -974,6 +981,7 @@ function ServerGroup({
     setCollapsed((c) => {
       const next = !c;
       localStorage.setItem(storageKey, next ? "1" : "0");
+      localStorage.removeItem(legacyStorageKey);
       return next;
     });
   }
