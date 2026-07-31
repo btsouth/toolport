@@ -335,6 +335,7 @@ function ClientRow({ client, importCount, selected, onSelect }: RowProps) {
       <TooltipTrigger asChild>
         <button
           onClick={onSelect}
+          aria-current={selected ? "page" : undefined}
           className={`${NAV_ITEM} ${selected ? "bg-accent" : ""} ${
             missing ? "opacity-50" : ""
           }`}
@@ -573,7 +574,7 @@ export function AppSidebar({
           <div className="px-2.5 pb-1.5 text-xs font-medium tracking-wide text-muted-foreground uppercase">
             Clients
           </div>
-          <nav className="flex flex-col gap-0.5">
+          <nav aria-label="Clients" className="flex flex-col gap-0.5">
             {clients.length === 0 ? (
               <p className="px-2.5 py-1.5 text-xs text-muted-foreground">
                 No MCP clients found. Install Claude Desktop, Cursor, or another supported
@@ -594,6 +595,7 @@ export function AppSidebar({
                   <>
                     <button
                       onClick={() => setShowMissing((v) => !v)}
+                      aria-expanded={showMissing}
                       className={`mt-1 flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground ${FOCUS_RING}`}
                     >
                       <ChevronRight

@@ -60,6 +60,15 @@ describe("ImportReviewDialog", () => {
     expect(new Set(onConfirm.mock.calls[0][0])).toEqual(new Set(["a", "b", "c"]));
   });
 
+  it("exposes each server row as a pressed toggle", async () => {
+    renderDialog();
+    const stripe = screen.getByRole("button", { name: /stripe/i });
+
+    expect(stripe).toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(stripe);
+    expect(stripe).toHaveAttribute("aria-pressed", "false");
+  });
+
   it("excludes a server from the confirm payload after it's deselected", async () => {
     const { onConfirm } = renderDialog();
     // Toggle "linear" off by clicking its row.

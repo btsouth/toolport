@@ -73,6 +73,7 @@ function ImportReviewContent({
               <button
                 key={key}
                 type="button"
+                aria-pressed={isSelected}
                 className={`rounded-md text-left transition-colors ${
                   isSelected ? "ring-1 ring-success/60" : "opacity-60"
                 }`}

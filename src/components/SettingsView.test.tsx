@@ -94,11 +94,13 @@ describe("SettingsView tool loading", () => {
     );
 
     // Expand GitHub (request A starts).
-    await user.click(
-      screen.getByRole("button", {
-        name: /github/i,
-      }),
-    );
+    const githubToggle = screen.getByRole("button", {
+      name: /github/i,
+    });
+    expect(githubToggle).toHaveAttribute("type", "button");
+    expect(githubToggle).toHaveAttribute("aria-expanded", "false");
+    await user.click(githubToggle);
+    expect(githubToggle).toHaveAttribute("aria-expanded", "true");
 
     expect(screen.getByText("Loading tools…")).toBeInTheDocument();
 
