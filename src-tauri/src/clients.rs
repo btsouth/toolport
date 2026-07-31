@@ -265,6 +265,7 @@ fn resolve_client_config_path(
         "claude-code" => home.join(".claude.json"),
         "gemini-cli" => home.join(".gemini").join("settings.json"),
         "qwen-code" => home.join(".qwen").join("settings.json"),
+        "junie" => home.join(".junie").join("mcp").join("mcp.json"),
         "antigravity" => home.join(".gemini").join("config").join("mcp_config.json"),
         "cline" => config
             .join("Code")
@@ -375,6 +376,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "claude-code" => home.join(".claude.json"),
         "gemini-cli" => home.join(".gemini").join("settings.json"),
         "qwen-code" => home.join(".qwen").join("settings.json"),
+        "junie" => home.join(".junie").join("mcp").join("mcp.json"),
         "antigravity" => home.join(".gemini").join("config").join("mcp_config.json"),
         "cline" => config
             .join("Code")
@@ -673,6 +675,12 @@ fn gemini_cli_path() -> Option<PathBuf> {
 /// supported platform.
 fn qwen_code_path() -> Option<PathBuf> {
     client_config_path("qwen-code")
+}
+
+/// Junie stores user-scoped MCP servers at ~/.junie/mcp/mcp.json on every
+/// supported platform. Project-scoped configs are intentionally left untouched.
+fn junie_path() -> Option<PathBuf> {
+    client_config_path("junie")
 }
 
 /// Google Antigravity reads MCP servers from `mcp_config.json` under `~/.gemini`.
@@ -1010,6 +1018,14 @@ fn defs() -> Vec<ClientDef> {
             format: Format::JsonQwenMcpServers,
             uses_connectors: false,
             path: qwen_code_path,
+            plugin_scan: None,
+        },
+        ClientDef {
+            id: "junie",
+            name: "JetBrains Junie",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            path: junie_path,
             plugin_scan: None,
         },
         ClientDef {
@@ -2186,6 +2202,17 @@ fn app_present_for(config_path: &str, config_exists: bool) -> bool {
                 .unwrap_or(false))
 }
 
+fn app_present_with_override(
+    config_path: &str,
+    config_exists: bool,
+    install_marker: Option<&Path>,
+) -> bool {
+    match install_marker {
+        Some(marker) => config_exists || marker.exists(),
+        None => app_present_for(config_path, config_exists),
+    }
+}
+
 /// Warp keeps its state under the OS data dir, not next to its MCP config: it reads
 /// file-based servers from `~/.warp/.mcp.json` but only creates `~/.warp` on first
 /// file-based use, while the app itself lives under the data dir. So the
@@ -2231,6 +2258,9 @@ fn install_override(id: &str) -> Option<PathBuf> {
         // ~/.kiro/settings may not exist until something is configured; ~/.kiro is
         // created on install.
         "kiro" => Some(home()?.join(".kiro")),
+        // ~/.junie/mcp may not exist until MCP is configured; ~/.junie is the
+        // stable user-scope data root created by Junie.
+        "junie" => Some(home()?.join(".junie")),
         // MCP file lives under ~/.toolport-studio, but presence also includes
         // Electron userData and installer dirs (and the transitional t3code path).
         "toolport-studio" => toolport_studio_install_marker(),
@@ -2266,10 +2296,9 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         // Clients with an explicit install dir use it (and ignore the config-parent
         // heuristic, which for them is wrong); everyone else uses the parent of
         // their resolved config path (which is their data dir, e.g. ~/.codex).
-        let app_present = match install_override(def.id) {
-            Some(marker) => config_exists || marker.exists(),
-            None => app_present_for(&config_path, config_exists),
-        };
+        let install_marker = install_override(def.id);
+        let app_present =
+            app_present_with_override(&config_path, config_exists, install_marker.as_deref());
         DetectedClient {
             id: def.id.to_string(),
             name: def.name.to_string(),
@@ -5668,6 +5697,7 @@ command = "npx"
             "Claude Code must check ~/.claude, not the home dir its config sits in"
         );
         assert!(install_override("kiro").unwrap().ends_with(".kiro"));
+        assert!(install_override("junie").unwrap().ends_with(".junie"));
         let _ = install_override("warp"); // env-dependent; just ensure no panic.
         assert!(
             install_override("toolport-studio").is_some(),
@@ -5677,6 +5707,31 @@ command = "npx"
         assert!(install_override("cursor").is_none());
         assert!(install_override("codex").is_none());
         assert!(install_override("vscode").is_none());
+    }
+
+    #[test]
+    fn junie_install_marker_controls_detection_without_config() {
+        let marker = std::env::temp_dir().join(format!(
+            "toolport-junie-marker-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&marker).ok();
+        let config = marker.join("mcp").join("mcp.json");
+
+        assert!(!app_present_with_override(
+            &config.to_string_lossy(),
+            false,
+            Some(&marker)
+        ));
+
+        std::fs::create_dir_all(&marker).unwrap();
+        assert!(app_present_with_override(
+            &config.to_string_lossy(),
+            false,
+            Some(&marker)
+        ));
+
+        std::fs::remove_dir_all(&marker).ok();
     }
 
     #[test]
@@ -6168,10 +6223,9 @@ command = "npx"
 
     #[test]
     fn new_json_clients_are_registered() {
-        // Warp, Amazon Q, Kiro, LM Studio, Jan, AnythingLLM, and Witsy all use the
-        // standard mcpServers JSON shape, so a ClientDef + path is all they need.
-        // Lock in their registration, format, and that their config paths resolve
-        // on this OS.
+        // These clients all use the standard mcpServers JSON shape, so a ClientDef
+        // plus a path is all they need. Lock in their registration, format, and
+        // that their config paths resolve on this OS.
         for id in [
             "warp",
             "amazon-q",
@@ -6180,6 +6234,7 @@ command = "npx"
             "jan",
             "anythingllm",
             "witsy",
+            "junie",
         ] {
             let d = defs()
                 .into_iter()
@@ -6263,6 +6318,50 @@ command = "npx"
             replaced_json["mcpServers"]["replacement"]["tools"],
             serde_json::json!(["*"])
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn junie_mcp_config_round_trips() {
+        let path = temp_path("junie-mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"existing":{"command":"node","args":["server.js"],"env":{"TOKEN":"keep"}}}}"#,
+        )
+        .unwrap();
+
+        let original: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let original_existing = original["mcpServers"]["existing"].clone();
+
+        let before = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].name, "existing");
+
+        { let _e = sample_gateway(None, "junie"); edit_json_gateway(&path, "mcpServers", Some(&_e), false) }
+            .unwrap();
+        let installed =
+            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        assert_eq!(installed.len(), 2);
+        assert!(installed.iter().any(|server| server.name == "existing"));
+        assert!(installed
+            .iter()
+            .any(|server| server.name == GATEWAY_ENTRY_NAME));
+        let installed_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            installed_json["mcpServers"]["existing"],
+            original_existing
+        );
+
+        edit_json_gateway(&path, "mcpServers", None, false).unwrap();
+        let removed =
+            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].name, "existing");
+        let removed_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(removed_json["mcpServers"]["existing"], original_existing);
         std::fs::remove_file(&path).ok();
     }
 
@@ -6812,6 +6911,9 @@ command = "npx"
             }),
             ("qwen-code", |home, _| {
                 home.join(".qwen").join("settings.json")
+            }),
+            ("junie", |home, _| {
+                home.join(".junie").join("mcp").join("mcp.json")
             }),
             ("continue", |home, _| {
                 home.join(".continue").join("config.yaml")
