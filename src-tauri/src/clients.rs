@@ -2768,17 +2768,27 @@ fn validate_amp_settings_shape(root: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_crush_settings_shape(root: &serde_json::Value) -> Result<(), String> {
+    let object = root
+        .as_object()
+        .ok_or("Crush config root must be an object; leaving it untouched.")?;
+    if object.get("mcp").is_some_and(|servers| !servers.is_object()) {
+        return Err("'mcp' must be an object; leaving the Crush config untouched.".into());
+    }
+    Ok(())
+}
+
 fn write_json(
     path: &Path,
     key: &str,
     servers: &[ServerEntry],
     lenient: bool,
 ) -> Result<(), String> {
-    write_json_with(path, key, servers, lenient, entry_to_json)
+    write_json_with(path, key, servers, lenient, entry_to_json, false)
 }
 
 fn write_crush_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    write_json_with(path, "mcp", servers, true, entry_to_crush_json)
+    write_json_with(path, "mcp", servers, true, entry_to_crush_json, true)
 }
 
 fn write_json_with(
@@ -2787,6 +2797,7 @@ fn write_json_with(
     servers: &[ServerEntry],
     lenient: bool,
     entry_to_value: fn(&ServerEntry) -> serde_json::Value,
+    validate_crush_shape: bool,
 ) -> Result<(), String> {
     let mut root = if path.exists() {
         let content = read_config_file(path)?;
@@ -2794,7 +2805,9 @@ fn write_json_with(
     } else {
         serde_json::Value::Object(serde_json::Map::new())
     };
-    if key == "amp.mcpServers" {
+    if validate_crush_shape {
+        validate_crush_settings_shape(&root)?;
+    } else if key == "amp.mcpServers" {
         validate_amp_settings_shape(&root)?;
     } else if !root.is_object() {
         root = serde_json::Value::Object(serde_json::Map::new());
@@ -3759,11 +3772,18 @@ fn edit_json_gateway(
     entry: Option<&ServerEntry>,
     lenient: bool,
 ) -> Result<(), String> {
-    edit_json_gateway_with(path, key, entry, lenient, None)
+    edit_json_gateway_with(path, key, entry, lenient, None, false)
 }
 
 fn edit_crush_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    edit_json_gateway_with(path, "mcp", entry, true, Some(entry_to_crush_json))
+    edit_json_gateway_with(
+        path,
+        "mcp",
+        entry,
+        true,
+        Some(entry_to_crush_json),
+        true,
+    )
 }
 
 fn edit_json_gateway_with(
@@ -3772,6 +3792,7 @@ fn edit_json_gateway_with(
     entry: Option<&ServerEntry>,
     lenient: bool,
     entry_formatter: Option<fn(&ServerEntry) -> serde_json::Value>,
+    validate_crush_shape: bool,
 ) -> Result<(), String> {
     let mut root = if path.exists() {
         let content = read_config_file(path)?;
@@ -3779,7 +3800,9 @@ fn edit_json_gateway_with(
     } else {
         serde_json::Value::Object(serde_json::Map::new())
     };
-    if key == "amp.mcpServers" {
+    if validate_crush_shape {
+        validate_crush_settings_shape(&root)?;
+    } else if key == "amp.mcpServers" {
         validate_amp_settings_shape(&root)?;
     } else if !root.is_object() {
         root = serde_json::Value::Object(serde_json::Map::new());
@@ -4792,6 +4815,28 @@ mod tests {
             root["mcp"][GATEWAY_ENTRY_NAME]["type"].as_str(),
             Some("stdio")
         );
+    }
+
+    #[test]
+    fn crush_mutations_reject_unexpected_shapes_without_changing_the_file() {
+        let path = temp_path("crush-invalid-shape");
+        let gateway = sample_gateway(None, "crush");
+
+        for original in [r#"["valid","state"]"#, r#"{"theme":"dark","mcp":[]}"#] {
+            std::fs::write(&path, original).unwrap();
+            assert!(write_crush_json(&path, &[stdio("fresh")]).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+            std::fs::write(&path, original).unwrap();
+            assert!(edit_crush_gateway(&path, Some(&gateway)).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+            std::fs::write(&path, original).unwrap();
+            assert!(edit_crush_gateway(&path, None).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
