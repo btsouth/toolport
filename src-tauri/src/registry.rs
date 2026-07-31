@@ -1936,7 +1936,9 @@ pub fn update<T>(f: impl FnOnce(&mut Registry) -> Result<T, String>) -> Result<(
     let lock = lock_for(&path)?;
     let mut reg = load_from_locked(&path, &lock)?;
     let out = f(&mut reg)?;
-    save(&reg)?;
+    // Save to the exact path we locked and loaded. Re-resolving after `f` would let a
+    // runtime env override change redirect this write to a different, unlocked registry.
+    save_to(&path, &reg)?;
     Ok((reg, out))
 }
 
@@ -2026,6 +2028,8 @@ pub(crate) fn redact_url_userinfo(url: &str) -> String {
 mod tests {
     use super::*;
     use crate::approval::fingerprint_allow_key;
+
+    static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn sample_server(name: &str) -> ServerEntry {
         ServerEntry {
@@ -2651,8 +2655,7 @@ mod tests {
 
     #[test]
     fn load_and_save_resolved_honor_registry_override() {
-        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let _guard = ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+        let _guard = REGISTRY_ENV_LOCK.lock().unwrap();
 
         let mut path = std::env::temp_dir();
         path.push(format!("conduit-registry-override-{}.json", std::process::id()));
@@ -2680,6 +2683,46 @@ mod tests {
         assert_eq!(loaded.servers, r.servers);
         assert_eq!(loaded.profiles, r.profiles);
         assert_eq!(loaded.active_profile_id, r.active_profile_id);
+    }
+
+    #[test]
+    fn update_saves_to_the_same_resolved_path_it_locked() {
+        let _guard = REGISTRY_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-update-path-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let locked_path = dir.join("locked.json");
+        let redirected_path = dir.join("redirected.json");
+
+        let previous = std::env::var_os("TOOLPORT_REGISTRY");
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("TOOLPORT_REGISTRY", value),
+                    None => std::env::remove_var("TOOLPORT_REGISTRY"),
+                }
+            }
+        }
+        let _restore = RestoreEnv(previous);
+        std::env::set_var("TOOLPORT_REGISTRY", &locked_path);
+
+        update(|registry| {
+            registry.deny_destructive = true;
+            std::env::set_var("TOOLPORT_REGISTRY", &redirected_path);
+            Ok(())
+        })
+        .unwrap();
+
+        let persisted = load_from(&locked_path).unwrap();
+        assert!(persisted.deny_destructive);
+        assert!(
+            !redirected_path.exists(),
+            "update wrote to a path whose lock it never held"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
