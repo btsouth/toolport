@@ -1385,8 +1385,8 @@ fn set_server_enabled_via_agent(
     // app or team-sync write can't land between our read and our save and be reverted
     // (SOU-23). Held until this function returns. Also re-check the opt-in on the fresh copy
     // (the user may have just turned it off).
-    let _lock = registry::lock_at(path).map_err(|e| format!("Toolport: {e}"))?;
-    let mut fresh = registry::load_from(path)
+    let lock = registry::lock_at(path).map_err(|e| format!("Toolport: {e}"))?;
+    let mut fresh = registry::load_from_locked(path, &lock)
         .map_err(|e| format!("Toolport: could not read the registry ({e})."))?;
     if !fresh.allow_agent_control {
         audit::record_agent_toggle(
