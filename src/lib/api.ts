@@ -288,7 +288,8 @@ export function setBlockOnInjection(on: boolean): Promise<Registry> {
   return invoke<Registry>("set_block_on_injection", { on });
 }
 
-/** A tool blocked after a high-risk drift, awaiting re-approval. */
+/** A tool blocked after high-risk drift or loss of the integrity baseline,
+ * awaiting re-approval. */
 export interface QuarantinedTool {
   server: string;
   tool: string;
@@ -303,7 +304,8 @@ export interface QuarantinedTool {
   new_dh?: boolean | null;
 }
 
-/** Tools currently quarantined (blocked after a high-risk drift), across profiles. */
+/** Tools currently quarantined after high-risk drift or baseline loss,
+ * across profiles. */
 export function listQuarantined(): Promise<QuarantinedTool[]> {
   return invoke<QuarantinedTool[]>("list_quarantined");
 }

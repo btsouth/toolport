@@ -4955,8 +4955,15 @@ fn build_router(
         // On store failure, start with empty blocked and log loudly (SOU-320): there is
         // no prior live set yet. We deliberately do NOT rename/clear a corrupt file —
         // that would make the next reconcile install a permanent empty set.
-        quarantined: if reg.quarantine_on_drift_effective() {
-            match integrity::quarantined(profile) {
+        quarantined: {
+            let stored = if reg.quarantine_on_drift_effective() {
+                integrity::quarantined(profile)
+            } else {
+                // Baseline tamper invalidates the catalog's trust root, so those entries
+                // remain blocked even when optional high-risk drift quarantine is off.
+                integrity::mandatory_quarantined(profile)
+            };
+            match stored {
                 Ok(set) => set,
                 Err(e) => {
                     glog(&format!(
@@ -4967,8 +4974,6 @@ fn build_router(
                     Default::default()
                 }
             }
-        } else {
-            Default::default()
         },
     };
 
@@ -5783,9 +5788,10 @@ fn cleanup_resource_subs_for_session(state: &GatewayState, session: &str) {
 /// Run tool-definition integrity detection on a freshly built catalog (gated by
 /// the registry's `integrity_check`, on by default). Any drift is recorded to the
 /// security log inside `integrity::check`; here we also surface it in the gateway
-/// log so it's visible in "Copy diagnostics". Detection only, never blocks.
-/// Returns true if a high-risk drift was just quarantined (so the caller should
-/// re-filter the router this cycle).
+/// log so it's visible in "Copy diagnostics". Ordinary drift blocks only when its
+/// policy is enabled; baseline loss always blocks because the trust root is gone.
+/// Returns true if tools were just quarantined (so the caller should re-filter the
+/// router this cycle).
 fn maybe_check_integrity(
     registry: &Arc<Mutex<Registry>>,
     tools: &[Value],
@@ -5810,8 +5816,10 @@ fn maybe_check_integrity(
         ));
         eprintln!("toolport: SECURITY tool drift ({change}) {tool}");
     }
-    // Block high-risk drift (poisoned / destructive) until re-approved, when enabled.
-    quarantine_on && integrity::apply_quarantine(profile, tools, &events)
+    // Ordinary high-risk drift follows the user's setting. A lost baseline is mandatory:
+    // no setting may turn destruction of the trust root into a fail-open catalog.
+    (quarantine_on || integrity::baseline_tamper_detected(&events))
+        && integrity::apply_quarantine(profile, tools, &events)
 }
 
 /// Run integrity detection on a freshly built catalog; if a high-risk drift was just
@@ -5861,10 +5869,12 @@ fn effective_quarantine(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         r.quarantine_on_drift_effective()
     };
-    if !on {
-        return Some(BTreeSet::new());
-    }
-    match integrity::quarantined_checked(profile) {
+    let stored = if on {
+        integrity::quarantined_checked(profile)
+    } else {
+        integrity::mandatory_quarantined_checked(profile)
+    };
+    match stored {
         Ok(set) => {
             // Recovered: let a future failure warn again.
             QUARANTINE_READ_FAILED.store(false, Ordering::SeqCst);
@@ -14290,11 +14300,17 @@ mod tests {
     }
 
     #[test]
-    fn effective_quarantine_is_empty_while_the_feature_is_off() {
-        // Mirrors how the initial router build gates: the persisted set stays on disk so
-        // it can be restored when the feature is switched back on, but while
-        // quarantine-on-drift is OFF nothing may be enforced. The off branch returns
-        // without reading a profile file, so this stays independent of conduit_dir().
+    fn effective_quarantine_is_empty_without_mandatory_entries_while_feature_is_off() {
+        // Ordinary drift entries stay dormant while quarantine-on-drift is off. With no
+        // baseline-tamper entries persisted, the effective set is still known-empty.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-empty-mandatory-q-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
         let mut reg = Registry::default();
         reg.quarantine_on_drift = false;
         assert!(
@@ -14306,6 +14322,44 @@ mod tests {
             effective_quarantine(&registry, Some("unused-profile")),
             Some(BTreeSet::new()),
             "feature off is a known-empty set, not an unknown one"
+        );
+    }
+
+    #[test]
+    fn baseline_tamper_is_quarantined_while_optional_drift_policy_is_off() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-mandatory-q-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        let profile = Some("baseline-tamper");
+        std::fs::write(
+            dir.join("tool-pins-baseline-tamper.json"),
+            "{ corrupt baseline",
+        )
+        .unwrap();
+        let tools = vec![json!({
+            "name": "srv__read",
+            "description": "Read records.",
+            "inputSchema": {"type": "object"}
+        })];
+
+        let mut reg = Registry::default();
+        reg.integrity_check = true;
+        reg.quarantine_on_drift = false;
+        let registry = Arc::new(Mutex::new(reg));
+        assert!(
+            maybe_check_integrity(&registry, &tools, profile),
+            "lost baseline must create a quarantine even with optional drift blocking off"
+        );
+        assert_eq!(
+            effective_quarantine(&registry, profile),
+            Some(BTreeSet::from(["srv__read".to_string()])),
+            "baseline-tamper quarantine is mandatory"
         );
     }
 

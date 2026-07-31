@@ -1925,7 +1925,11 @@ fn release_quarantine(
     } else {
         Some(profile.as_str())
     };
-    integrity::release(prof, &tool);
+    if !integrity::release(prof, &tool) {
+        return Err(format!(
+            "Could not re-approve {tool}; its quarantine record or integrity pin could not be updated"
+        ));
+    }
     // The quarantine release lives in the separate tool-pins file; the former blind re-save
     // here was only a gateway mtime-nudge (which the no-op guard usually swallowed anyway)
     // and it could revert a concurrent gateway/team write (SOU-23). Refresh the cache
