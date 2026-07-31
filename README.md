@@ -155,7 +155,7 @@ and refreshes too.
 
 ## Supported clients
 
-Toolport auto-detects these **29 AI clients**, installs the gateway into each with one
+Toolport auto-detects these **30 AI clients**, installs the gateway into each with one
 click, and can import a client's existing servers. It writes the config file shown
 below for you, so you never have to edit these by hand.
 
@@ -169,6 +169,7 @@ below for you, so you never have to edit these by hand.
 | OpenCode       | `~/.config/opencode/opencode.json`                                                         | JSON (`mcp`)             |
 | Kilo Code      | `~/.config/kilo/kilo.jsonc`                                                                | JSONC (`mcp`)            |
 | Codex          | `~/.codex/config.toml`                                                                     | TOML (`mcp_servers`)     |
+| Copilot CLI    | `~/.copilot/mcp-config.json`                                                               | JSON (`mcpServers`)      |
 | Grok Build     | `~/.grok/config.toml`                                                                      | TOML (`mcp_servers`)     |
 | Continue       | `~/.continue/config.yaml`                                                                  | YAML (`mcpServers`)      |
 | Antigravity    | `~/.gemini/config/mcp_config.json`                                                         | JSON (`mcpServers`)      |
