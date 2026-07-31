@@ -245,6 +245,7 @@ fn resolve_client_config_path(
     let path = match client_id {
         "claude-desktop" => config.join("Claude").join("claude_desktop_config.json"),
         "cursor" => home.join(".cursor").join("mcp.json"),
+        "droid" => home.join(".factory").join("mcp.json"),
         "boltai" => home.join(".boltai").join("mcp.json"),
         "pi" => home.join(".pi").join("agent").join("mcp.json"),
         "omp" => home.join(".omp").join("agent").join("mcp.json"),
@@ -351,6 +352,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
     let path = match client_id {
         "claude-desktop" => config.join("Claude").join("claude_desktop_config.json"),
         "cursor" => home.join(".cursor").join("mcp.json"),
+        "droid" => home.join(".factory").join("mcp.json"),
         "boltai" => home.join(".boltai").join("mcp.json"),
         "pi" => home.join(".pi").join("agent").join("mcp.json"),
         "omp" => home.join(".omp").join("agent").join("mcp.json"),
@@ -535,6 +537,10 @@ fn claude_desktop_path() -> Option<PathBuf> {
 
 fn cursor_path() -> Option<PathBuf> {
     client_config_path("cursor")
+}
+
+fn droid_path() -> Option<PathBuf> {
+    client_config_path("droid")
 }
 
 fn anythingllm_path() -> Option<PathBuf> {
@@ -877,6 +883,14 @@ fn defs() -> Vec<ClientDef> {
             uses_connectors: false,
             path: cursor_path,
             plugin_scan: Some(scan_cursor_plugins),
+        },
+        ClientDef {
+            id: "droid",
+            name: "Factory Droid",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            path: droid_path,
+            plugin_scan: None,
         },
         ClientDef {
             id: "anythingllm",
@@ -6075,10 +6089,10 @@ command = "npx"
 
     #[test]
     fn new_json_clients_are_registered() {
-        // Warp, Amazon Q, Kiro, LM Studio, Jan, AnythingLLM, and Witsy all use the
-        // standard mcpServers JSON shape, so a ClientDef + path is all they need.
-        // Lock in their registration, format, and that their config paths resolve
-        // on this OS.
+        // Warp, Amazon Q, Kiro, LM Studio, Jan, AnythingLLM, Witsy, and Factory Droid
+        // all use the standard mcpServers JSON shape, so a ClientDef + path is all
+        // they need. Lock in their registration, format, and that their config
+        // paths resolve on this OS.
         for id in [
             "warp",
             "amazon-q",
@@ -6087,6 +6101,7 @@ command = "npx"
             "jan",
             "anythingllm",
             "witsy",
+            "droid",
         ] {
             let d = defs()
                 .into_iter()
@@ -6619,6 +6634,7 @@ command = "npx"
     fn client_config_paths_are_stable_across_platforms() {
         let cases: &[(&str, fn(&Path, Platform) -> PathBuf)] = &[
             ("cursor", |home, _| home.join(".cursor").join("mcp.json")),
+            ("droid", |home, _| home.join(".factory").join("mcp.json")),
             ("grok", |home, _| home.join(".grok").join("config.toml")),
             ("toolport-studio", |home, _| {
                 home.join(".toolport-studio").join("mcp.json")

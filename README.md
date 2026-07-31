@@ -164,6 +164,7 @@ below for you, so you never have to edit these by hand.
 | Claude Desktop | `<config>/Claude/claude_desktop_config.json`                                               | JSON (`mcpServers`)      |
 | Claude Code    | `~/.claude.json`                                                                           | JSON (`mcpServers`)      |
 | Cursor         | `~/.cursor/mcp.json`                                                                       | JSON (`mcpServers`)      |
+| Factory Droid  | `~/.factory/mcp.json`                                                                      | JSON (`mcpServers`)      |
 | VS Code        | `<config>/Code/User/mcp.json`                                                              | JSON (`servers`)         |
 | Windsurf       | `~/.codeium/windsurf/mcp_config.json`                                                      | JSON (`mcpServers`)      |
 | OpenCode       | `~/.config/opencode/opencode.json`                                                         | JSON (`mcp`)             |
