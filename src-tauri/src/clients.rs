@@ -2179,6 +2179,17 @@ fn app_present_for(config_path: &str, config_exists: bool) -> bool {
                 .unwrap_or(false))
 }
 
+fn app_present_with_override(
+    config_path: &str,
+    config_exists: bool,
+    install_marker: Option<&Path>,
+) -> bool {
+    match install_marker {
+        Some(marker) => config_exists || marker.exists(),
+        None => app_present_for(config_path, config_exists),
+    }
+}
+
 /// Warp keeps its state under the OS data dir, not next to its MCP config: it reads
 /// file-based servers from `~/.warp/.mcp.json` but only creates `~/.warp` on first
 /// file-based use, while the app itself lives under the data dir. So the
@@ -2262,10 +2273,9 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         // Clients with an explicit install dir use it (and ignore the config-parent
         // heuristic, which for them is wrong); everyone else uses the parent of
         // their resolved config path (which is their data dir, e.g. ~/.codex).
-        let app_present = match install_override(def.id) {
-            Some(marker) => config_exists || marker.exists(),
-            None => app_present_for(&config_path, config_exists),
-        };
+        let install_marker = install_override(def.id);
+        let app_present =
+            app_present_with_override(&config_path, config_exists, install_marker.as_deref());
         DetectedClient {
             id: def.id.to_string(),
             name: def.name.to_string(),
@@ -5607,6 +5617,31 @@ command = "npx"
     }
 
     #[test]
+    fn junie_install_marker_controls_detection_without_config() {
+        let marker = std::env::temp_dir().join(format!(
+            "toolport-junie-marker-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&marker).ok();
+        let config = marker.join("mcp").join("mcp.json");
+
+        assert!(!app_present_with_override(
+            &config.to_string_lossy(),
+            false,
+            Some(&marker)
+        ));
+
+        std::fs::create_dir_all(&marker).unwrap();
+        assert!(app_present_with_override(
+            &config.to_string_lossy(),
+            false,
+            Some(&marker)
+        ));
+
+        std::fs::remove_dir_all(&marker).ok();
+    }
+
+    #[test]
     fn toolport_studio_is_registered_with_session_client_id() {
         let d = defs()
             .into_iter()
@@ -6129,6 +6164,10 @@ command = "npx"
         )
         .unwrap();
 
+        let original: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let original_existing = original["mcpServers"]["existing"].clone();
+
         let before = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].name, "existing");
@@ -6142,12 +6181,21 @@ command = "npx"
         assert!(installed
             .iter()
             .any(|server| server.name == GATEWAY_ENTRY_NAME));
+        let installed_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            installed_json["mcpServers"]["existing"],
+            original_existing
+        );
 
         edit_json_gateway(&path, "mcpServers", None, false).unwrap();
         let removed =
             parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].name, "existing");
+        let removed_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(removed_json["mcpServers"]["existing"], original_existing);
         std::fs::remove_file(&path).ok();
     }
 
