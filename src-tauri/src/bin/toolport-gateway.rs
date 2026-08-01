@@ -10410,20 +10410,58 @@ fn respond_mcp_sse_listen(
         }
     }
 
-    let reader = match listen.cleanup {
+    let mut reader = match listen.cleanup {
         Some((state, key)) => McpSseReader::with_cleanup(listen.session, state, key),
         None => McpSseReader::new(listen.session),
     };
-    let response = tiny_http::Response::new(
-        tiny_http::StatusCode(200),
-        headers,
-        reader,
-        None,
-        None,
-    )
-    .with_chunked_threshold(0)
-    .boxed();
-    let _ = request.respond(response);
+    let version = request.http_version().clone();
+    let mut writer = request.into_writer();
+    let _ = write_mcp_sse_response(&mut writer, &version, &headers, &mut reader);
+}
+
+/// Write a long-lived SSE response directly so every event is flushed to the
+/// client. `tiny_http` otherwise buffers chunked response bodies until 8 KiB,
+/// which can hold the subscription acknowledgement indefinitely while the
+/// reader waits for the next event.
+fn write_mcp_sse_response<W: Write, R: Read>(
+    writer: &mut W,
+    version: &tiny_http::HTTPVersion,
+    headers: &[tiny_http::Header],
+    reader: &mut R,
+) -> std::io::Result<()> {
+    let chunked = *version >= (1, 1);
+    write!(writer, "HTTP/{version} 200 OK\r\n")?;
+    for header in headers {
+        write!(writer, "{header}\r\n")?;
+    }
+    if chunked {
+        writer.write_all(b"Transfer-Encoding: chunked\r\n")?;
+    } else {
+        writer.write_all(b"Connection: close\r\n")?;
+    }
+    writer.write_all(b"\r\n")?;
+    writer.flush()?;
+
+    let mut buf = [0_u8; 8192];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if chunked {
+            write!(writer, "{n:X}\r\n")?;
+        }
+        writer.write_all(&buf[..n])?;
+        if chunked {
+            writer.write_all(b"\r\n")?;
+        }
+        writer.flush()?;
+    }
+    if chunked {
+        writer.write_all(b"0\r\n\r\n")?;
+        writer.flush()?;
+    }
+    Ok(())
 }
 
 fn serve_http_loop(
@@ -11152,6 +11190,47 @@ mod tests {
         assert_eq!(fmt_tokens(999_950), "1.0M");
         assert_eq!(fmt_tokens(1_000_000), "1.0M");
         assert_eq!(fmt_tokens(1_250_000), "1.2M");
+    }
+
+    #[test]
+    fn mcp_sse_response_flushes_headers_and_each_chunk() {
+        #[derive(Default)]
+        struct RecordingWriter {
+            bytes: Vec<u8>,
+            flushes: usize,
+        }
+
+        impl Write for RecordingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        let headers = vec![
+            tiny_http::Header::from_bytes(b"Content-Type", b"text/event-stream").unwrap(),
+        ];
+        let mut body = std::io::Cursor::new(b"data: {\"ok\":true}\r\n\r\n".as_slice());
+        let mut writer = RecordingWriter::default();
+        write_mcp_sse_response(
+            &mut writer,
+            &tiny_http::HTTPVersion(1, 1),
+            &headers,
+            &mut body,
+        )
+        .unwrap();
+
+        let response = String::from_utf8(writer.bytes).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(response.contains("15\r\ndata: {\"ok\":true}\r\n\r\n\r\n"));
+        assert!(response.ends_with("0\r\n\r\n"));
+        assert_eq!(writer.flushes, 3, "headers, event, and terminator flush");
     }
 
     #[test]
