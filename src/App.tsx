@@ -19,6 +19,7 @@ import {
   Store,
   TriangleAlert,
   WifiOff,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
@@ -816,8 +817,18 @@ function App() {
                       onBrowseCatalog={() => selectView("catalog")}
                     />
                   ) : visible.length === 0 ? (
-                    <div className="py-16 text-center text-sm text-muted-foreground">
-                      No servers match "{query}".
+                    <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed px-3 py-6 text-center">
+                      <p className="text-sm text-muted-foreground">
+                        No servers match "{query}".
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => setQuery("")}
+                        className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                      >
+                        <X className="size-3.5" />
+                        Clear search
+                      </button>
                     </div>
                   ) : (
                     <div className="flex flex-col gap-5">

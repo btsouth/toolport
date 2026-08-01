@@ -1262,7 +1262,7 @@ function ToolIdentities({ refreshKey }: { refreshKey: number }) {
 
           {filtered.length === 0 ? (
             <p className="py-6 text-center text-xs text-muted-foreground">
-              No server or tool matches “{query}”.
+              No server or tool matches "{query}".
             </p>
           ) : (
             <>

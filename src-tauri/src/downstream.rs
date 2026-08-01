@@ -10,10 +10,12 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use base64::Engine as _;
 
 /// Called from a downstream stdout drain when an armed server emits
 /// `notifications/resources/updated` (SOU-394). The gateway fans the URI out to
@@ -26,7 +28,243 @@ pub type ResourceUpdatedSink = Arc<dyn Fn(String) + Send + Sync>;
 /// `progressToken` it relayed on this server's behalf.
 pub type ProgressSink = Arc<dyn Fn(Value) + Send + Sync>;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubscriptionFilter {
+    pub tools_list_changed: bool,
+    pub prompts_list_changed: bool,
+    pub resources_list_changed: bool,
+    pub resource_subscriptions: Vec<String>,
+}
+
+impl SubscriptionFilter {
+    fn params(&self) -> Value {
+        let mut notifications = serde_json::Map::new();
+        if self.tools_list_changed {
+            notifications.insert("toolsListChanged".to_string(), Value::Bool(true));
+        }
+        if self.prompts_list_changed {
+            notifications.insert("promptsListChanged".to_string(), Value::Bool(true));
+        }
+        if self.resources_list_changed {
+            notifications.insert("resourcesListChanged".to_string(), Value::Bool(true));
+        }
+        if !self.resource_subscriptions.is_empty() {
+            notifications.insert(
+                "resourceSubscriptions".to_string(),
+                json!(&self.resource_subscriptions),
+            );
+        }
+        json!({ "notifications": notifications })
+    }
+}
+
 use serde_json::{json, Value};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeaderParamSpec {
+    header_name: String,
+    path: Vec<String>,
+}
+
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-'
+                        | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+                )
+        })
+}
+
+fn encode_mcp_header_text(value: &str) -> String {
+    let safe_ascii = value
+        .bytes()
+        .all(|byte| matches!(byte, 0x20..=0x7e))
+        && value.trim() == value
+        && !(value.starts_with("=?base64?") && value.ends_with("?="));
+    if safe_ascii {
+        value.to_string()
+    } else {
+        format!(
+            "=?base64?{}?=",
+            base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
+        )
+    }
+}
+
+fn modern_standard_headers(body: &Value) -> Result<Vec<(String, String)>, TransportError> {
+    let Some(method) = body.get("method").and_then(Value::as_str) else {
+        return Ok(Vec::new());
+    };
+    let mut headers = vec![(
+        "Mcp-Method".to_string(),
+        encode_mcp_header_text(method),
+    )];
+    let name = match method {
+        "tools/call" | "prompts/get" => body
+            .get("params")
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str),
+        "resources/read" => body
+            .get("params")
+            .and_then(|params| params.get("uri"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    if matches!(method, "tools/call" | "prompts/get" | "resources/read") && name.is_none() {
+        return Err(TransportError::Fatal(format!(
+            "modern HTTP request '{method}' is missing its routing name"
+        )));
+    }
+    if let Some(name) = name {
+        headers.push(("Mcp-Name".to_string(), encode_mcp_header_text(name)));
+    }
+    Ok(headers)
+}
+
+fn contains_x_mcp_header(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.contains_key("x-mcp-header") || object.values().any(contains_x_mcp_header)
+        }
+        Value::Array(values) => values.iter().any(contains_x_mcp_header),
+        _ => false,
+    }
+}
+
+fn collect_header_param_specs(
+    schema: &Value,
+    path: &mut Vec<String>,
+    names: &mut HashSet<String>,
+    specs: &mut Vec<HeaderParamSpec>,
+) -> Result<(), String> {
+    let Some(object) = schema.as_object() else {
+        return Ok(());
+    };
+    if let Some(annotation) = object.get("x-mcp-header") {
+        let name = annotation
+            .as_str()
+            .ok_or_else(|| "x-mcp-header must be a string".to_string())?;
+        if path.is_empty() {
+            return Err("x-mcp-header must annotate an input property".to_string());
+        }
+        if !is_http_token(name) {
+            return Err(format!("x-mcp-header '{name}' is not a valid HTTP token"));
+        }
+        let property_type = object.get("type").and_then(Value::as_str).unwrap_or("");
+        if !matches!(property_type, "string" | "integer" | "boolean") {
+            return Err(format!(
+                "x-mcp-header '{name}' must annotate string, integer, or boolean"
+            ));
+        }
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err(format!("x-mcp-header '{name}' is not case-insensitively unique"));
+        }
+        specs.push(HeaderParamSpec {
+            header_name: format!("Mcp-Param-{name}"),
+            path: path.clone(),
+        });
+    }
+
+    for (key, value) in object {
+        if key != "properties" && key != "x-mcp-header" && contains_x_mcp_header(value) {
+            return Err(format!(
+                "x-mcp-header is not statically reachable through properties (found under '{key}')"
+            ));
+        }
+    }
+    if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+        for (property, child) in properties {
+            path.push(property.clone());
+            collect_header_param_specs(child, path, names, specs)?;
+            path.pop();
+        }
+    }
+    Ok(())
+}
+
+fn header_param_specs(tool: &Value) -> Result<Vec<HeaderParamSpec>, String> {
+    let Some(schema) = tool.get("inputSchema") else {
+        return Ok(Vec::new());
+    };
+    let mut specs = Vec::new();
+    collect_header_param_specs(
+        schema,
+        &mut Vec::new(),
+        &mut HashSet::new(),
+        &mut specs,
+    )?;
+    Ok(specs)
+}
+
+fn filter_modern_http_tools(server_id: &str, tools: Vec<Value>) -> Vec<Value> {
+    tools
+        .into_iter()
+        .filter(|tool| match header_param_specs(tool) {
+            Ok(_) => true,
+            Err(reason) => {
+                let name = tool.get("name").and_then(Value::as_str).unwrap_or("<unnamed>");
+                eprintln!(
+                    "toolport: excluding tool '{server_id}__{name}' from a modern HTTP catalog: {reason}"
+                );
+                false
+            }
+        })
+        .collect()
+}
+
+fn value_at_path<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
+    path.iter().try_fold(value, |current, part| current.get(part))
+}
+
+fn encode_header_param(value: &Value) -> Result<Option<String>, TransportError> {
+    const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+    match value {
+        Value::Null => Ok(None),
+        Value::String(value) => Ok(Some(encode_mcp_header_text(value))),
+        Value::Bool(value) => Ok(Some(value.to_string())),
+        Value::Number(value) => {
+            let integer = value.as_i64().ok_or_else(|| {
+                TransportError::Fatal("x-mcp-header value must be an integer".to_string())
+            })?;
+            if !(-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&integer) {
+                return Err(TransportError::Fatal(
+                    "x-mcp-header integer exceeds the JavaScript safe range".to_string(),
+                ));
+            }
+            Ok(Some(integer.to_string()))
+        }
+        _ => Err(TransportError::Fatal(
+            "x-mcp-header value must be string, integer, boolean, or null".to_string(),
+        )),
+    }
+}
+
+fn tool_request_headers(
+    tools: &[Value],
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<Vec<(String, String)>, TransportError> {
+    let Some(tool) = tools
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+    else {
+        return Ok(Vec::new());
+    };
+    let specs = header_param_specs(tool).map_err(TransportError::Fatal)?;
+    let mut headers = Vec::new();
+    for spec in specs {
+        if let Some(value) = value_at_path(arguments, &spec.path) {
+            if let Some(encoded) = encode_header_param(value)? {
+                headers.push((spec.header_name, encoded));
+            }
+        }
+    }
+    headers.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(headers)
+}
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -162,6 +400,66 @@ fn with_meta(mut params: Value, meta: Option<&Value>) -> Value {
         params["_meta"] = relayed;
     }
     params
+}
+
+/// Wire-only fields used when a 2026-07-28 client retries an incomplete request.
+///
+/// They are intentionally kept separate from tool arguments and `_meta`: all three
+/// live at different levels in MCP params, and collapsing them would either expose
+/// protocol bookkeeping to a tool or drop it at the gateway boundary (SOU-449).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MrtrRequest {
+    pub input_responses: Option<Value>,
+    pub request_state: Option<Value>,
+}
+
+impl MrtrRequest {
+    pub fn from_params(params: Option<&Value>) -> Self {
+        Self {
+            input_responses: params
+                .and_then(|p| p.get("inputResponses"))
+                .filter(|value| !value.is_null())
+                .cloned(),
+            request_state: params
+                .and_then(|p| p.get("requestState"))
+                .filter(|value| !value.is_null())
+                .cloned(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.input_responses.is_none() && self.request_state.is_none()
+    }
+
+    fn apply(&self, params: &mut Value) {
+        let Some(obj) = params.as_object_mut() else {
+            return;
+        };
+        if let Some(responses) = &self.input_responses {
+            obj.insert("inputResponses".to_string(), responses.clone());
+        }
+        if let Some(state) = &self.request_state {
+            obj.insert("requestState".to_string(), state.clone());
+        }
+    }
+}
+
+fn with_meta_and_mrtr(
+    params: Value,
+    meta: Option<&Value>,
+    mrtr: Option<&MrtrRequest>,
+) -> Value {
+    let mut params = with_meta(params, meta);
+    if let Some(mrtr) = mrtr {
+        mrtr.apply(&mut params);
+    }
+    params
+}
+
+fn upstream_is_modern(meta: Option<&Value>) -> bool {
+    meta.and_then(|m| m.get("io.modelcontextprotocol/protocolVersion"))
+        .and_then(Value::as_str)
+        == Some(MODERN_PROTOCOL_VERSION)
 }
 
 /// Merge the connection's standard protocol `_meta` into an outgoing request.
@@ -801,8 +1099,117 @@ pub fn resolve_command(command: &str) -> String {
     command.to_string()
 }
 
+/// What the gateway wants a transport to do with a legacy server-initiated
+/// request. Legacy upstream clients still answer immediately; modern clients
+/// end the current request with `input_required` and answer on a fresh retry.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ServerRequestAction {
+    Respond(Value),
+    InputRequired,
+}
+
 /// A bidirectional JSON-RPC channel to one downstream server.
-pub type ServerRequestHandler = Arc<dyn Fn(&Value) -> Option<Value> + Send + Sync>;
+pub type ServerRequestHandler =
+    Arc<dyn Fn(&Value) -> Option<ServerRequestAction> + Send + Sync>;
+
+#[derive(Clone, Debug)]
+struct PendingLegacyMrtr {
+    token: String,
+    input_key: String,
+    server_request: Value,
+    downstream_request_id: Value,
+    method: String,
+    base_params: Value,
+}
+
+static MRTR_BRIDGE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn mrtr_base_params(params: &Value) -> Value {
+    let mut params = params.clone();
+    if let Some(obj) = params.as_object_mut() {
+        obj.remove("_meta");
+        obj.remove("inputResponses");
+        obj.remove("requestState");
+    }
+    params
+}
+
+fn new_mrtr_bridge_token() -> Result<String, TransportError> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|_| {
+        TransportError::Fatal("secure randomness unavailable for MRTR requestState".to_string())
+    })?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+impl PendingLegacyMrtr {
+    fn new(
+        server_request: Value,
+        downstream_request_id: Value,
+        method: &str,
+        params: &Value,
+    ) -> Result<Self, TransportError> {
+        Ok(Self {
+            token: new_mrtr_bridge_token()?,
+            input_key: format!(
+                "toolport_input_{}",
+                MRTR_BRIDGE_ID.fetch_add(1, Ordering::Relaxed)
+            ),
+            server_request,
+            downstream_request_id,
+            method: method.to_string(),
+            base_params: mrtr_base_params(params),
+        })
+    }
+
+    fn input_required(&self) -> Value {
+        let mut input = serde_json::Map::new();
+        if let Some(method) = self.server_request.get("method") {
+            input.insert("method".to_string(), method.clone());
+        }
+        if let Some(params) = self.server_request.get("params") {
+            input.insert("params".to_string(), params.clone());
+        }
+        json!({
+            "resultType": "input_required",
+            "inputRequests": {
+                self.input_key.clone(): Value::Object(input)
+            },
+            "requestState": self.token
+        })
+    }
+
+    fn response_for_retry(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<Option<Value>, TransportError> {
+        if method != self.method || mrtr_base_params(params) != self.base_params {
+            return Err(TransportError::Rpc(json!({
+                "code": -32602,
+                "message": "requestState does not belong to this request"
+            })));
+        }
+        if params.get("requestState").and_then(Value::as_str) != Some(self.token.as_str()) {
+            return Err(TransportError::Rpc(json!({
+                "code": -32602,
+                "message": "unknown or expired requestState"
+            })));
+        }
+        let Some(result) = params
+            .get("inputResponses")
+            .and_then(|responses| responses.get(&self.input_key))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        Ok(Some(json!({
+            "jsonrpc": "2.0",
+            "id": self.server_request.get("id").cloned().unwrap_or(Value::Null),
+            "result": result
+        })))
+    }
+}
 
 /// True when a downstream line is a server-initiated JSON-RPC request (has method + id,
 /// no result/error). Such messages must be answered on the transport, not skipped.
@@ -825,6 +1232,15 @@ pub trait Transport: Send {
     /// the merge. Default no-op, so legacy connections send exactly what they
     /// always did (SOU-445).
     fn set_protocol_meta(&mut self, _meta: Option<Value>) {}
+    /// Replace the long-lived modern notification listener. Legacy transports
+    /// keep the default no-op; modern connections call this after discovery and
+    /// whenever their resource URI set changes.
+    fn set_subscription_listener(
+        &mut self,
+        _filter: SubscriptionFilter,
+    ) -> Result<(), TransportError> {
+        Ok(())
+    }
     fn request_with_cancel(
         &mut self,
         method: &str,
@@ -837,6 +1253,21 @@ pub trait Transport: Send {
             ));
         }
         self.request(method, params)
+    }
+    /// Send a request with transport-level routing headers. Only modern
+    /// Streamable HTTP consumes these; stdio and legacy transports deliberately
+    /// ignore them.
+    fn request_with_cancel_and_headers(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        _headers: &[(String, String)],
+    ) -> Result<Value, TransportError> {
+        self.request_with_cancel(method, params, cancel)
+    }
+    fn supports_request_headers(&self) -> bool {
+        false
     }
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError>;
     /// Bound how long a single `request` waits for its response. Used to fail the
@@ -1480,6 +1911,10 @@ pub struct StdioTransport {
     /// Answers server-initiated JSON-RPC (e.g. `roots/list`) by forwarding to the
     /// upstream MCP client. Set by the gateway before the connect handshake.
     server_handler: Option<ServerRequestHandler>,
+    /// A legacy server request suspended between two modern upstream round trips.
+    /// The child keeps processing the original request; the retry only supplies
+    /// the requested input and must not start a second downstream call.
+    pending_mrtr: Option<PendingLegacyMrtr>,
     /// Routes `notifications/progress` back to the client that minted the token
     /// (SOU-444). Shared with the stdout drain thread so the gateway can bind it
     /// after the transport is spawned, keeping `spawn_watched`'s signature stable.
@@ -1487,6 +1922,8 @@ pub struct StdioTransport {
     /// Standard per-request `_meta` for a modern (2026-07-28+) connection, merged
     /// into every outgoing request. `None` on legacy connections (SOU-445).
     protocol_meta: Option<Value>,
+    /// Request id of the current long-lived `subscriptions/listen` request.
+    subscription_listener_id: Option<i64>,
 }
 
 /// Owns a Windows Job Object configured to terminate every assigned process
@@ -1933,8 +2370,10 @@ impl StdioTransport {
             armed,
             launcher: is_download_launcher(command, args),
             server_handler: None,
+            pending_mrtr: None,
             progress,
             protocol_meta: None,
+            subscription_listener_id: None,
         })
     }
 
@@ -1985,14 +2424,36 @@ impl Transport for StdioTransport {
         params: Value,
         cancel: Option<CancelContext>,
     ) -> Result<Value, TransportError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let downstream_id = json!(id);
         let mut params = params;
         if let Some(protocol) = &self.protocol_meta {
             merge_protocol_meta(&mut params, protocol);
         }
-        let msg = json!({ "jsonrpc": "2.0", "id": downstream_id.clone(), "method": method, "params": params });
+        let (downstream_id, outbound) = if let Some(pending) = self.pending_mrtr.take() {
+            let input_required = pending.input_required();
+            let response = match pending.response_for_retry(method, &params) {
+                Err(error) => {
+                    self.pending_mrtr = Some(pending);
+                    return Err(error);
+                }
+                Ok(Some(response)) => response,
+                Ok(None) => {
+                    self.pending_mrtr = Some(pending);
+                    return Ok(input_required);
+                }
+            };
+            (pending.downstream_request_id.clone(), response)
+        } else {
+            let id = self.next_id;
+            self.next_id += 1;
+            let downstream_id = json!(id);
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": downstream_id.clone(),
+                "method": method,
+                "params": params
+            });
+            (downstream_id, request)
+        };
 
         // A broken stdin pipe means the child is gone: a health failure, not a protocol error.
         let mut cancel_after_write = None;
@@ -2006,14 +2467,18 @@ impl Transport for StdioTransport {
                 let registry = ctx.registry.clone();
                 let guard = registry.register(
                     client_request_id.clone(),
-                    CancelEntry { stdin: Arc::clone(&self.stdin), downstream_id },
+                    CancelEntry {
+                        stdin: Arc::clone(&self.stdin),
+                        downstream_id: downstream_id.clone(),
+                    },
                 );
                 cancel_after_write = Some((registry, client_request_id));
                 Some(guard)
             } else {
                 None
             };
-            writeln!(stdin, "{msg}").map_err(|e| TransportError::Unavailable(e.to_string()))?;
+            writeln!(stdin, "{outbound}")
+                .map_err(|e| TransportError::Unavailable(e.to_string()))?;
             stdin.flush().map_err(|e| TransportError::Unavailable(e.to_string()))?;
         }
         if let Some((registry, client_request_id)) = cancel_after_write {
@@ -2066,22 +2531,36 @@ impl Transport for StdioTransport {
             };
             if is_server_initiated_request(&value) {
                 if let Some(handler) = &self.server_handler {
-                    if let Some(resp) = handler(&value) {
-                        let line = serde_json::to_string(&resp)
-                            .map_err(|e| TransportError::Fatal(e.to_string()))?;
-                        let mut stdin = self.stdin.lock().map_err(|_| {
-                            TransportError::Unavailable("downstream stdin lock poisoned".into())
-                        })?;
-                        writeln!(stdin, "{line}")
-                            .map_err(|e| TransportError::Unavailable(e.to_string()))?;
-                        stdin
-                            .flush()
-                            .map_err(|e| TransportError::Unavailable(e.to_string()))?;
-                        continue;
+                    match handler(&value) {
+                        Some(ServerRequestAction::Respond(response)) => {
+                            let mut stdin = self.stdin.lock().map_err(|_| {
+                                TransportError::Unavailable(
+                                    "downstream stdin lock poisoned".into(),
+                                )
+                            })?;
+                            writeln!(stdin, "{response}")
+                                .map_err(|e| TransportError::Unavailable(e.to_string()))?;
+                            stdin
+                                .flush()
+                                .map_err(|e| TransportError::Unavailable(e.to_string()))?;
+                            continue;
+                        }
+                        Some(ServerRequestAction::InputRequired) => {
+                            let pending = PendingLegacyMrtr::new(
+                                value,
+                                downstream_id.clone(),
+                                method,
+                                &params,
+                            )?;
+                            let result = pending.input_required();
+                            self.pending_mrtr = Some(pending);
+                            return Ok(result);
+                        }
+                        None => {}
                     }
                 }
             }
-            if ids_match(value.get("id"), Some(&json!(id))) {
+            if ids_match(value.get("id"), Some(&downstream_id)) {
                 if let Some(err) = value.get("error") {
                     return Err(TransportError::Rpc(err.clone()));
                 }
@@ -2128,6 +2607,44 @@ impl Transport for StdioTransport {
 
     fn set_protocol_meta(&mut self, meta: Option<Value>) {
         self.protocol_meta = meta;
+    }
+
+    fn set_subscription_listener(
+        &mut self,
+        filter: SubscriptionFilter,
+    ) -> Result<(), TransportError> {
+        if let Some(previous) = self.subscription_listener_id.take() {
+            self.notify(
+                "notifications/cancelled",
+                json!({
+                    "requestId": previous,
+                    "reason": "Toolport replaced the subscription filter"
+                }),
+            )?;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut params = filter.params();
+        if let Some(protocol) = &self.protocol_meta {
+            merge_protocol_meta(&mut params, protocol);
+        }
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "subscriptions/listen",
+            "params": params,
+        });
+        let mut stdin = self
+            .stdin
+            .lock()
+            .map_err(|_| TransportError::Fatal("downstream stdin lock poisoned".into()))?;
+        writeln!(stdin, "{message}")
+            .map_err(|error| TransportError::Unavailable(error.to_string()))?;
+        stdin
+            .flush()
+            .map_err(|error| TransportError::Unavailable(error.to_string()))?;
+        self.subscription_listener_id = Some(id);
+        Ok(())
     }
 }
 
@@ -2284,12 +2801,12 @@ pub struct HttpTransport {
     session_id: Option<String>,
     next_id: i64,
     /// Raw bearer token (without the "Bearer " prefix), if the server needs auth.
-    auth: Option<String>,
+    auth: Arc<Mutex<Option<String>>>,
     /// Called before each POST to refresh a token nearing expiry, and forced once
     /// after a 401/403 to recover from an already-expired token. A proactive
     /// `None` or error keeps the current token; a forced refresh must return a new
     /// raw token or the authentication failure is surfaced.
-    refresh: Option<RefreshFn>,
+    refresh: Option<Arc<Mutex<RefreshFn>>>,
     /// The token a forced refresh produced and that has not yet been accepted by
     /// the server, if any.
     ///
@@ -2309,6 +2826,9 @@ pub struct HttpTransport {
     /// the budget spent.
     forced_refresh_token: Option<String>,
     server_handler: Option<ServerRequestHandler>,
+    /// Open legacy SSE response suspended while a modern upstream client
+    /// fulfills a server-initiated request in a separate round trip.
+    pending_mrtr: Option<PendingHttpMrtr>,
     /// Fan `notifications/resources/updated` seen mid-SSE to subscribed
     /// upstream clients (SOU-394 follow-up for remote downstreams).
     resource_updated: Option<ResourceUpdatedSink>,
@@ -2318,6 +2838,18 @@ pub struct HttpTransport {
     /// Standard per-request `_meta` for a modern (2026-07-28+) connection, merged
     /// into every outgoing request. `None` on legacy connections (SOU-445).
     protocol_meta: Option<Value>,
+    /// Catalog refresh signal used by the modern HTTP listen worker.
+    change_dirty: Option<Arc<AtomicU8>>,
+    /// Replacing a listener increments this generation. The superseded worker
+    /// drops its response on the next frame/keepalive, closing the old POST.
+    listener_generation: Arc<AtomicU64>,
+    subscription_listener_id: Option<i64>,
+}
+
+struct PendingHttpMrtr {
+    common: PendingLegacyMrtr,
+    reader: Box<dyn BufRead + Send>,
+    bytes_read: u64,
 }
 
 impl HttpTransport {
@@ -2358,13 +2890,17 @@ impl HttpTransport {
             inline_agent: guarded_agent(block_private),
             session_id: None,
             next_id: 1,
-            auth,
-            refresh,
+            auth: Arc::new(Mutex::new(auth)),
+            refresh: refresh.map(|refresh| Arc::new(Mutex::new(refresh))),
             forced_refresh_token: None,
             server_handler: None,
+            pending_mrtr: None,
             resource_updated: None,
             progress: None,
             protocol_meta: None,
+            change_dirty: None,
+            listener_generation: Arc::new(AtomicU64::new(0)),
+            subscription_listener_id: None,
         }
     }
 
@@ -2378,6 +2914,10 @@ impl HttpTransport {
     /// the client that minted the token (SOU-444).
     pub fn set_progress_sink(&mut self, sink: Option<ProgressSink>) {
         self.progress = sink;
+    }
+
+    pub fn set_change_sink(&mut self, dirty: Option<Arc<AtomicU8>>) {
+        self.change_dirty = dirty;
     }
 
     /// The protocol version this connection declares in the `MCP-Protocol-Version`
@@ -2398,20 +2938,67 @@ impl HttpTransport {
             .to_string()
     }
 
-    /// Answer a server-initiated JSON-RPC request inline (SSE mid-stream or
-    /// standalone). Returns true when the message was handled.
-    fn handle_inline_server_request(&mut self, v: &Value) -> Result<bool, TransportError> {
-        if !is_server_initiated_request(v) {
-            return Ok(false);
+    fn is_modern(&self) -> bool {
+        self.protocol_meta.is_some()
+    }
+
+    fn request_inner(
+        &mut self,
+        method: &str,
+        params: Value,
+        headers: &[(String, String)],
+    ) -> Result<Value, TransportError> {
+        let mut params = params;
+        if let Some(protocol) = &self.protocol_meta {
+            merge_protocol_meta(&mut params, protocol);
         }
-        let Some(handler) = &self.server_handler else {
-            return Ok(false);
-        };
-        let Some(resp) = handler(v) else {
-            return Ok(false);
-        };
-        self.send_post_no_response(&resp)?;
-        Ok(true)
+        if let Some(pending) = self.pending_mrtr.take() {
+            let input_required = pending.common.input_required();
+            let response = match pending.common.response_for_retry(method, &params) {
+                Err(error) => {
+                    self.pending_mrtr = Some(pending);
+                    return Err(error);
+                }
+                Ok(Some(response)) => response,
+                Ok(None) => {
+                    self.pending_mrtr = Some(pending);
+                    return Ok(input_required);
+                }
+            };
+            self.send_post_no_response(&response)?;
+            let resp = self.read_sse_stream(
+                pending.reader,
+                pending.common.downstream_request_id.clone(),
+                &pending.common.method,
+                &pending.common.base_params,
+                pending.bytes_read,
+            )?;
+            let resp = resp.ok_or_else(|| {
+                TransportError::Fatal("empty resumed SSE response".to_string())
+            })?;
+            if let Some(err) = resp.get("error") {
+                return Err(TransportError::Rpc(err.clone()));
+            }
+            return Ok(resp.get("result").cloned().unwrap_or(Value::Null));
+        }
+
+        let id = self.next_id;
+        self.next_id += 1;
+        let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        let resp = self
+            .post_with_headers(&body, true, headers)?
+            .ok_or_else(|| TransportError::Fatal("empty response".to_string()))?;
+        if let Some(err) = resp.get("error") {
+            return Err(TransportError::Rpc(err.clone()));
+        }
+        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    fn inline_server_action(&self, v: &Value) -> Option<ServerRequestAction> {
+        if !is_server_initiated_request(v) {
+            return None;
+        }
+        self.server_handler.as_ref().and_then(|handler| handler(v))
     }
 
     /// Try to replace a token nearing expiry. Failure here is non-fatal because
@@ -2419,8 +3006,13 @@ impl HttpTransport {
     /// 401/403 will force one refresh attempt below.
     fn refresh_before_send(&mut self) {
         if let Some(refresh) = &self.refresh {
-            if let Ok(Some(token)) = refresh(false) {
-                self.auth = Some(token);
+            if let Ok(refresh) = refresh.lock() {
+                if let Ok(Some(token)) = refresh(false) {
+                    *self
+                        .auth
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+                }
             }
         }
     }
@@ -2428,7 +3020,11 @@ impl HttpTransport {
     /// True when the token currently in hand is one a forced refresh already
     /// produced, so its one forced exchange is spent. See [`Self::forced_refresh_token`].
     fn forced_refresh_spent(&self) -> bool {
-        self.auth.is_some() && self.auth == self.forced_refresh_token
+        let auth = self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        auth.is_some() && *auth == self.forced_refresh_token
     }
 
     fn force_refresh_after_auth_error(&mut self, code: u16) -> Result<(), TransportError> {
@@ -2437,9 +3033,15 @@ impl HttpTransport {
                 "HTTP {code} (needs authentication): no refresh callback configured"
             )));
         };
+        let refresh = refresh
+            .lock()
+            .map_err(|_| TransportError::Fatal("OAuth refresh callback lock poisoned".into()))?;
         match refresh(true) {
             Ok(Some(token)) => {
-                self.auth = Some(token.clone());
+                *self
+                    .auth
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token.clone());
                 // Spend the budget for this token, so a later POST on the same
                 // connection does not force a second exchange for it (SOU-474).
                 self.forced_refresh_token = Some(token);
@@ -2467,10 +3069,22 @@ impl HttpTransport {
                 .set("Content-Type", "application/json")
                 .set("Accept", "application/json, text/event-stream")
                 .set("MCP-Protocol-Version", &wire_version);
-            if let Some(sid) = &self.session_id {
-                req = req.set("Mcp-Session-Id", sid);
+            if !self.is_modern() {
+                if let Some(sid) = &self.session_id {
+                    req = req.set("Mcp-Session-Id", sid);
+                }
             }
-            if let Some(token) = &self.auth {
+            if self.is_modern() {
+                for (name, value) in modern_standard_headers(body)? {
+                    req = req.set(&name, &value);
+                }
+            }
+            let auth = self
+                .auth
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(token) = auth.as_deref() {
                 req = req.set("Authorization", &bearer_header(token));
             }
             match req.send_string(&payload) {
@@ -2487,8 +3101,10 @@ impl HttpTransport {
                 Err(e) => return Err(TransportError::Fatal(e.to_string())),
             }
         };
-        if let Some(sid) = resp.header("Mcp-Session-Id") {
-            self.session_id = Some(sid.to_string());
+        if !self.is_modern() {
+            if let Some(sid) = resp.header("Mcp-Session-Id") {
+                self.session_id = Some(sid.to_string());
+            }
         }
         // Drain so the connection returns to the pool without leaving bytes unread.
         let _ = read_capped(resp, 64 * 1024);
@@ -2501,12 +3117,29 @@ impl HttpTransport {
     fn read_sse_response(
         &mut self,
         resp: ureq::Response,
-        wanted: Option<&Value>,
+        request: &Value,
     ) -> Result<Option<Value>, TransportError> {
-        use std::io::{BufRead, BufReader, Read};
-        let mut reader = BufReader::new(resp.into_reader().take(MAX_RESPONSE_BYTES + 1));
+        let wanted = request.get("id").cloned().unwrap_or(Value::Null);
+        let method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+        let reader: Box<dyn BufRead + Send> = Box::new(BufReader::new(
+            resp.into_reader().take(MAX_RESPONSE_BYTES + 1),
+        ));
+        self.read_sse_stream(reader, wanted, method, &params, 0)
+    }
+
+    fn read_sse_stream(
+        &mut self,
+        mut reader: Box<dyn BufRead + Send>,
+        wanted: Value,
+        method: &str,
+        params: &Value,
+        mut bytes_read: u64,
+    ) -> Result<Option<Value>, TransportError> {
         let mut line = String::new();
-        let mut bytes_read: u64 = 0;
         loop {
             line.clear();
             let n = reader
@@ -2547,10 +3180,29 @@ impl HttpTransport {
                         continue;
                     }
                 }
-                if self.handle_inline_server_request(&v)? {
-                    continue;
+                match self.inline_server_action(&v) {
+                    Some(ServerRequestAction::Respond(response)) => {
+                        self.send_post_no_response(&response)?;
+                        continue;
+                    }
+                    Some(ServerRequestAction::InputRequired) => {
+                        let common =
+                            PendingLegacyMrtr::new(v, wanted.clone(), method, params)?;
+                        let result = common.input_required();
+                        self.pending_mrtr = Some(PendingHttpMrtr {
+                            common,
+                            reader,
+                            bytes_read,
+                        });
+                        return Ok(Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": wanted,
+                            "result": result
+                        })));
+                    }
+                    None => {}
                 }
-                if ids_match(v.get("id"), wanted) {
+                if ids_match(v.get("id"), Some(&wanted)) {
                     return Ok(Some(v));
                 }
             }
@@ -2561,6 +3213,15 @@ impl HttpTransport {
     }
 
     fn post(&mut self, body: &Value, expect_response: bool) -> Result<Option<Value>, TransportError> {
+        self.post_with_headers(body, expect_response, &[])
+    }
+
+    fn post_with_headers(
+        &mut self,
+        body: &Value,
+        expect_response: bool,
+        extra_headers: &[(String, String)],
+    ) -> Result<Option<Value>, TransportError> {
         let payload = body.to_string();
 
         // Refresh shortly before the known expiry, including before initialize.
@@ -2583,10 +3244,25 @@ impl HttpTransport {
                 .set("Content-Type", "application/json")
                 .set("Accept", "application/json, text/event-stream")
                 .set("MCP-Protocol-Version", &wire_version);
-            if let Some(sid) = &self.session_id {
-                req = req.set("Mcp-Session-Id", sid);
+            if !self.is_modern() {
+                if let Some(sid) = &self.session_id {
+                    req = req.set("Mcp-Session-Id", sid);
+                }
             }
-            if let Some(token) = &self.auth {
+            if self.is_modern() {
+                for (name, value) in modern_standard_headers(body)? {
+                    req = req.set(&name, &value);
+                }
+                for (name, value) in extra_headers {
+                    req = req.set(name, value);
+                }
+            }
+            let auth = self
+                .auth
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(token) = auth.as_deref() {
                 req = req.set("Authorization", &bearer_header(token));
             }
 
@@ -2614,7 +3290,18 @@ impl HttpTransport {
                     continue;
                 }
                 Err(ureq::Error::Status(code, r)) => {
-                    let detail: String = read_capped(r, 64 * 1024).chars().take(200).collect();
+                    let detail = read_capped(r, 64 * 1024);
+                    if code == 400 && self.is_modern() && expect_response {
+                        if let Ok(response) = serde_json::from_str::<Value>(&detail) {
+                            let request_id = body.get("id");
+                            if ids_match(response.get("id"), request_id) {
+                                if let Some(error) = response.get("error") {
+                                    return Err(TransportError::Rpc(error.clone()));
+                                }
+                            }
+                        }
+                    }
+                    let detail: String = detail.chars().take(200).collect();
                     let hint = if code == 401 || code == 403 {
                         " (needs authentication)"
                     } else {
@@ -2637,8 +3324,10 @@ impl HttpTransport {
         // on nothing and must be returned. See [`Self::forced_refresh_token`].
         self.forced_refresh_token = None;
 
-        if let Some(sid) = resp.header("Mcp-Session-Id") {
-            self.session_id = Some(sid.to_string());
+        if !self.is_modern() {
+            if let Some(sid) = resp.header("Mcp-Session-Id") {
+                self.session_id = Some(sid.to_string());
+            }
         }
         if !expect_response {
             return Ok(None);
@@ -2648,10 +3337,8 @@ impl HttpTransport {
             .header("content-type")
             .map(|c| c.to_lowercase().contains("text/event-stream"))
             .unwrap_or(false);
-        let wanted = body.get("id").cloned();
-
         if is_sse {
-            return self.read_sse_response(resp, wanted.as_ref());
+            return self.read_sse_response(resp, body);
         }
 
         let text = read_capped(resp, MAX_RESPONSE_BYTES);
@@ -2663,18 +3350,26 @@ impl HttpTransport {
 
 impl Transport for HttpTransport {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let mut params = params;
-        if let Some(protocol) = &self.protocol_meta {
-            merge_protocol_meta(&mut params, protocol);
+        self.request_inner(method, params, &[])
+    }
+
+    fn request_with_cancel_and_headers(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        headers: &[(String, String)],
+    ) -> Result<Value, TransportError> {
+        if cancel.is_some() {
+            downstream_trace(&format!(
+                "cancellation closes the modern HTTP response stream for method {method}"
+            ));
         }
-        let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        let resp = self.post(&body, true)?.ok_or_else(|| TransportError::Fatal("empty response".to_string()))?;
-        if let Some(err) = resp.get("error") {
-            return Err(TransportError::Rpc(err.clone()));
-        }
-        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+        self.request_inner(method, params, headers)
+    }
+
+    fn supports_request_headers(&self) -> bool {
+        true
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
@@ -2697,6 +3392,200 @@ impl Transport for HttpTransport {
 
     fn set_protocol_meta(&mut self, meta: Option<Value>) {
         self.protocol_meta = meta;
+        if self.protocol_meta.is_some() {
+            self.session_id = None;
+        }
+    }
+
+    fn set_subscription_listener(
+        &mut self,
+        filter: SubscriptionFilter,
+    ) -> Result<(), TransportError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut params = filter.params();
+        if let Some(protocol) = &self.protocol_meta {
+            merge_protocol_meta(&mut params, protocol);
+        }
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "subscriptions/listen",
+            "params": params,
+        })
+        .to_string();
+        let generation = self.listener_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let live_generation = Arc::clone(&self.listener_generation);
+        let agent = self.agent.clone();
+        let url = self.url.clone();
+        let auth = Arc::clone(&self.auth);
+        let refresh = self.refresh.clone();
+        let wire_version = self.wire_protocol_version();
+        let dirty = self.change_dirty.clone();
+        let resource_updated = self.resource_updated.clone();
+        self.subscription_listener_id = Some(id);
+
+        std::thread::spawn(move || {
+            let mut retry_delay = Duration::from_millis(250);
+            while live_generation.load(Ordering::SeqCst) == generation {
+                if let Some(refresh) = &refresh {
+                    if let Ok(refresh) = refresh.lock() {
+                        if let Ok(Some(token)) = refresh(false) {
+                            *auth
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+                        }
+                    }
+                }
+                let mut forced_refresh = false;
+                let response = loop {
+                    let mut request = agent
+                        .post(&url)
+                        .set("Content-Type", "application/json")
+                        .set("Accept", "text/event-stream")
+                        .set("MCP-Protocol-Version", &wire_version)
+                        .set("Mcp-Method", "subscriptions/listen");
+                    let token = auth
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    if let Some(token) = token.as_deref() {
+                        request = request.set("Authorization", &bearer_header(token));
+                    }
+                    match request.send_string(&payload) {
+                        Ok(response) => break Some(response),
+                        Err(ureq::Error::Status(code, response))
+                            if (code == 401 || code == 403)
+                                && !forced_refresh
+                                && refresh.is_some() =>
+                        {
+                            let _ = read_capped(response, 8 * 1024);
+                            forced_refresh = true;
+                            let refreshed = refresh.as_ref().and_then(|refresh| {
+                                refresh
+                                    .lock()
+                                    .ok()
+                                    .and_then(|refresh| refresh(true).ok())
+                                    .flatten()
+                            });
+                            match refreshed {
+                                Some(token) => {
+                                    *auth
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Some(token);
+                                    continue;
+                                }
+                                None => break None,
+                            }
+                        }
+                        Err(error) => {
+                            downstream_trace(&format!(
+                                "subscriptions/listen HTTP open failed: {error}"
+                            ));
+                            break None;
+                        }
+                    }
+                };
+                let Some(response) = response else {
+                    std::thread::sleep(retry_delay);
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                    continue;
+                };
+                let is_sse = response.header("content-type").is_some_and(|value| {
+                    value.to_ascii_lowercase().contains("text/event-stream")
+                });
+                if !is_sse {
+                    let detail: String =
+                        read_capped(response, 64 * 1024).chars().take(200).collect();
+                    downstream_trace(&format!(
+                        "subscriptions/listen returned a non-SSE response: {detail}"
+                    ));
+                    std::thread::sleep(retry_delay);
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                    continue;
+                }
+
+                retry_delay = Duration::from_millis(250);
+                let mut reader = BufReader::new(response.into_reader());
+                loop {
+                    if live_generation.load(Ordering::SeqCst) != generation {
+                        return;
+                    }
+                    let mut line = String::new();
+                    let read = match (&mut reader)
+                        .take(MAX_RESPONSE_BYTES)
+                        .read_line(&mut line)
+                    {
+                        Ok(read) => read,
+                        Err(error) => {
+                            downstream_trace(&format!(
+                                "subscriptions/listen SSE read failed: {error}"
+                            ));
+                            break;
+                        }
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    if read as u64 >= MAX_RESPONSE_BYTES && !line.ends_with('\n') {
+                        downstream_trace("subscriptions/listen emitted an oversized SSE line");
+                        break;
+                    }
+                    if live_generation.load(Ordering::SeqCst) != generation {
+                        return;
+                    }
+                    let Some(data) = line.trim_start().strip_prefix("data:") else {
+                        continue;
+                    };
+                    let data = data.trim();
+                    let Ok(notification) = serde_json::from_str::<Value>(data) else {
+                        continue;
+                    };
+                    let subscription_id = notification
+                        .get("params")
+                        .and_then(|params| params.get("_meta"))
+                        .and_then(|meta| meta.get("io.modelcontextprotocol/subscriptionId"));
+                    if subscription_id != Some(&json!(id)) {
+                        continue;
+                    }
+                    let method = notification.get("method").and_then(Value::as_str);
+                    let kind = match method {
+                        Some("notifications/tools/list_changed") => change::TOOLS,
+                        Some("notifications/resources/list_changed") => change::RESOURCES,
+                        Some("notifications/prompts/list_changed") => change::PROMPTS,
+                        _ => 0,
+                    };
+                    if kind != 0 {
+                        if let Some(dirty) = &dirty {
+                            dirty.fetch_or(kind, Ordering::SeqCst);
+                        }
+                        continue;
+                    }
+                    if method == Some("notifications/resources/updated") {
+                        if let (Some(sink), Some(uri)) = (
+                            resource_updated.as_ref(),
+                            notification
+                                .get("params")
+                                .and_then(|params| params.get("uri"))
+                                .and_then(Value::as_str),
+                        ) {
+                            sink(uri.to_string());
+                        }
+                    }
+                }
+                if live_generation.load(Ordering::SeqCst) == generation {
+                    std::thread::sleep(retry_delay);
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+impl Drop for HttpTransport {
+    fn drop(&mut self) {
+        self.listener_generation.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -2720,7 +3609,23 @@ pub struct DownstreamServer {
     caps_completions: bool,
     /// The protocol era this connection settled on at handshake (SOU-445).
     era: Era,
+    /// Modern Streamable HTTP can mirror schema-annotated tool arguments into
+    /// routing headers. Modern stdio deliberately ignores those annotations.
+    modern_http: bool,
+    /// Desired per-resource notification set carried by the modern listener.
+    /// Legacy servers keep using resources/subscribe and resources/unsubscribe.
+    modern_resource_subscriptions: HashSet<String>,
+    /// Existing legacy server-to-client request bridge. Modern downstream
+    /// `input_required` results use it as a compatibility shim when the upstream
+    /// client predates MRTR.
+    server_handler: Option<ServerRequestHandler>,
 }
+
+/// The compatibility shim holds the originating legacy request open, so keep a
+/// tighter bound than the modern client driver's ten-round default.
+const MRTR_LEGACY_MAX_ROUNDS: usize = 8;
+const MRTR_STATE_ONLY_DELAY: Duration = Duration::from_millis(250);
+static MRTR_LEGACY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 impl DownstreamServer {
     /// Handshake with the server and fetch its tool list. Resources and prompts
@@ -2867,13 +3772,28 @@ impl DownstreamServer {
         if let Some(warning) = &listed.warning {
             eprintln!("toolport: server '{id}' returned a partial tool catalog: {warning}");
         }
-        let tools = listed.items;
+        let modern_http = matches!(era, Era::Modern { .. }) && transport.supports_request_headers();
+        let tools = if modern_http {
+            filter_modern_http_tools(&id, listed.items)
+        } else {
+            listed.items
+        };
 
         // Restore the longer timeout: actual tool calls can legitimately be slow.
         transport.set_read_timeout(STDIO_READ_TIMEOUT);
         // Handshake done: from here on, react to the server's own tool-list
         // changes (ignored until now so a startup announcement is a no-op).
         transport.arm_tools_watch();
+        if matches!(era, Era::Modern { .. }) {
+            transport
+                .set_subscription_listener(SubscriptionFilter {
+                    tools_list_changed: true,
+                    prompts_list_changed: caps_prompts,
+                    resources_list_changed: caps_resources,
+                    resource_subscriptions: Vec::new(),
+                })
+                .map_err(|error| error.to_string())?;
+        }
 
         Ok(DownstreamServer {
             id,
@@ -2886,7 +3806,148 @@ impl DownstreamServer {
             caps_prompts,
             caps_completions,
             era,
+            modern_http,
+            modern_resource_subscriptions: std::collections::HashSet::new(),
+            server_handler: None,
         })
+    }
+
+    /// Install the upstream request bridge on both this server wrapper and its
+    /// transport. The transport consumes real legacy server-initiated requests;
+    /// the wrapper consumes modern `input_required` results for legacy clients.
+    pub fn set_server_request_handler(&mut self, handler: ServerRequestHandler) {
+        self.transport.set_server_request_handler(Arc::clone(&handler));
+        self.server_handler = Some(handler);
+    }
+
+    fn fulfill_input_required(&self, result: &Value) -> Result<MrtrRequest, TransportError> {
+        let requests = match result.get("inputRequests") {
+            None => None,
+            Some(Value::Object(requests)) => Some(requests),
+            Some(_) => {
+                return Err(TransportError::Fatal(
+                    "modern server returned non-object inputRequests".to_string(),
+                ))
+            }
+        };
+        let request_state = match result.get("requestState") {
+            None => None,
+            Some(Value::String(state)) => Some(Value::String(state.clone())),
+            Some(_) => {
+                return Err(TransportError::Fatal(
+                    "modern server returned non-string requestState".to_string(),
+                ))
+            }
+        };
+        if requests.map_or(true, serde_json::Map::is_empty) && request_state.is_none() {
+            return Err(TransportError::Fatal(
+                "modern server returned input_required without inputRequests or requestState"
+                    .to_string(),
+            ));
+        }
+
+        let mut input_responses = serde_json::Map::new();
+        if let Some(requests) = requests {
+            let handler = self.server_handler.as_ref().ok_or_else(|| {
+                TransportError::Fatal(
+                    "upstream client cannot fulfill the server's input_required result"
+                        .to_string(),
+                )
+            })?;
+            for (key, input) in requests {
+                let method = input
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        TransportError::Fatal(format!(
+                            "input request '{key}' is missing a method"
+                        ))
+                    })?;
+                if !matches!(
+                    method,
+                    "roots/list" | "sampling/createMessage" | "elicitation/create"
+                ) {
+                    return Err(TransportError::Fatal(format!(
+                        "input request '{key}' uses unsupported method '{method}'"
+                    )));
+                }
+                let id = json!(format!(
+                    "toolport-mrtr-{}",
+                    MRTR_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+                ));
+                let request = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": input.get("params").cloned().unwrap_or_else(|| json!({}))
+                });
+                let response = match handler(&request) {
+                    Some(ServerRequestAction::Respond(response)) => response,
+                    Some(ServerRequestAction::InputRequired) => {
+                        return Err(TransportError::Fatal(
+                            "cannot nest an input_required bridge while fulfilling one"
+                                .to_string(),
+                        ))
+                    }
+                    None => {
+                        return Err(TransportError::Fatal(format!(
+                            "upstream client did not handle input request '{key}' ({method})"
+                        )))
+                    }
+                };
+                if let Some(error) = response.get("error") {
+                    return Err(TransportError::Rpc(error.clone()));
+                }
+                let response = response.get("result").cloned().ok_or_else(|| {
+                    TransportError::Fatal(format!(
+                        "upstream client returned no result for input request '{key}'"
+                    ))
+                })?;
+                input_responses.insert(key.clone(), response);
+            }
+        }
+
+        if input_responses.is_empty() {
+            std::thread::sleep(MRTR_STATE_ONLY_DELAY);
+        }
+        Ok(MrtrRequest {
+            input_responses: (!input_responses.is_empty()).then(|| Value::Object(input_responses)),
+            request_state,
+        })
+    }
+
+    fn request_with_mrtr(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+        headers: &[(String, String)],
+    ) -> Result<Value, TransportError> {
+        let modern_upstream = upstream_is_modern(meta);
+        let mut retry = mrtr.cloned().unwrap_or_default();
+        for round in 0..=MRTR_LEGACY_MAX_ROUNDS {
+            let params = with_meta_and_mrtr(params.clone(), meta, Some(&retry));
+            let result = self.transport.request_with_cancel_and_headers(
+                method,
+                params,
+                cancel.clone(),
+                headers,
+            )?;
+            if result.get("resultType").and_then(Value::as_str) != Some("input_required")
+                || modern_upstream
+            {
+                return Ok(result);
+            }
+            if round == MRTR_LEGACY_MAX_ROUNDS {
+                return Err(TransportError::Fatal(format!(
+                    "modern server exceeded the {MRTR_LEGACY_MAX_ROUNDS}-round input_required limit"
+                )));
+            }
+            retry = self.fulfill_input_required(&result)?;
+        }
+        unreachable!("bounded MRTR loop always returns")
     }
 
     /// Re-fetch the server's tool list on the existing connection, after it
@@ -2895,7 +3956,13 @@ impl DownstreamServer {
     pub fn refresh_tools(&mut self) {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         match fetch_paginated_list(&mut *self.transport, "tools/list", "tools") {
-            Ok(listed) if listed.warning.is_none() => self.tools = listed.items,
+            Ok(listed) if listed.warning.is_none() => {
+                self.tools = if self.modern_http {
+                    filter_modern_http_tools(&self.id, listed.items)
+                } else {
+                    listed.items
+                };
+            }
             Ok(listed) => eprintln!(
                 "toolport: keeping server '{}' previous tool catalog after an incomplete refresh: {}",
                 self.id,
@@ -3040,10 +4107,29 @@ impl DownstreamServer {
         cancel: Option<CancelContext>,
         meta: Option<&Value>,
     ) -> Result<Value, TransportError> {
-        self.transport.request_with_cancel(
+        self.call_with_cancel_and_mrtr(tool, arguments, cancel, meta, None)
+    }
+
+    pub fn call_with_cancel_and_mrtr(
+        &mut self,
+        tool: &str,
+        arguments: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, TransportError> {
+        let headers = if self.modern_http {
+            tool_request_headers(&self.tools, tool, &arguments)?
+        } else {
+            Vec::new()
+        };
+        self.request_with_mrtr(
             "tools/call",
-            with_meta(json!({ "name": tool, "arguments": arguments }), meta),
+            json!({ "name": tool, "arguments": arguments }),
             cancel,
+            meta,
+            mrtr,
+            &headers,
         )
     }
 
@@ -3058,10 +4144,23 @@ impl DownstreamServer {
         cancel: Option<CancelContext>,
         meta: Option<&Value>,
     ) -> Result<Value, TransportError> {
-        self.transport.request_with_cancel(
+        self.read_resource_with_cancel_and_mrtr(uri, cancel, meta, None)
+    }
+
+    pub fn read_resource_with_cancel_and_mrtr(
+        &mut self,
+        uri: &str,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, TransportError> {
+        self.request_with_mrtr(
             "resources/read",
-            with_meta(json!({ "uri": uri }), meta),
+            json!({ "uri": uri }),
             cancel,
+            meta,
+            mrtr,
+            &[],
         )
     }
 
@@ -3069,12 +4168,45 @@ impl DownstreamServer {
     /// this downstream (SOU-394). The gateway only calls this when at least one
     /// upstream client is subscribed to the same URI.
     pub fn subscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
-        self.transport
-            .request("resources/subscribe", json!({ "uri": uri }))
+        if matches!(self.era, Era::Modern { .. }) {
+            if self.modern_resource_subscriptions.insert(uri.to_string()) {
+                let mut resource_subscriptions: Vec<String> =
+                    self.modern_resource_subscriptions.iter().cloned().collect();
+                resource_subscriptions.sort();
+                if let Err(error) = self.transport.set_subscription_listener(SubscriptionFilter {
+                    tools_list_changed: true,
+                    prompts_list_changed: self.caps_prompts,
+                    resources_list_changed: self.caps_resources,
+                    resource_subscriptions,
+                }) {
+                    self.modern_resource_subscriptions.remove(uri);
+                    return Err(error);
+                }
+            }
+            return Ok(json!({}));
+        }
+        self.transport.request("resources/subscribe", json!({ "uri": uri }))
     }
 
     /// Drop a previously established downstream resource subscription.
     pub fn unsubscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
+        if matches!(self.era, Era::Modern { .. }) {
+            if self.modern_resource_subscriptions.remove(uri) {
+                let mut resource_subscriptions: Vec<String> =
+                    self.modern_resource_subscriptions.iter().cloned().collect();
+                resource_subscriptions.sort();
+                if let Err(error) = self.transport.set_subscription_listener(SubscriptionFilter {
+                    tools_list_changed: true,
+                    prompts_list_changed: self.caps_prompts,
+                    resources_list_changed: self.caps_resources,
+                    resource_subscriptions,
+                }) {
+                    self.modern_resource_subscriptions.insert(uri.to_string());
+                    return Err(error);
+                }
+            }
+            return Ok(json!({}));
+        }
         self.transport
             .request("resources/unsubscribe", json!({ "uri": uri }))
     }
@@ -3091,10 +4223,24 @@ impl DownstreamServer {
         cancel: Option<CancelContext>,
         meta: Option<&Value>,
     ) -> Result<Value, TransportError> {
-        self.transport.request_with_cancel(
+        self.get_prompt_with_cancel_and_mrtr(name, arguments, cancel, meta, None)
+    }
+
+    pub fn get_prompt_with_cancel_and_mrtr(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, TransportError> {
+        self.request_with_mrtr(
             "prompts/get",
-            with_meta(json!({ "name": name, "arguments": arguments }), meta),
+            json!({ "name": name, "arguments": arguments }),
             cancel,
+            meta,
+            mrtr,
+            &[],
         )
     }
 
@@ -3225,12 +4371,72 @@ mod tests {
     use super::{
         cwd_validation_error, empty_cwd_variables, expand_cwd, file_uri_to_path, resolve_command,
         resolve_root_token, screen_resolved_addrs, screen_spawn_command, screen_spawn_env,
-        validate_cwd, CancelRegistry, DownstreamServer, Transport, TransportError,
+        validate_cwd, CancelRegistry, DownstreamServer, MrtrRequest, ServerRequestAction,
+        ServerRequestHandler, Transport, TransportError, MODERN_PROTOCOL_VERSION,
         fetch_paginated_list,
     };
     use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    struct MrtrTransport {
+        responses: VecDeque<Result<Value, TransportError>>,
+        requests: Arc<Mutex<Vec<(String, Value)>>>,
+    }
+
+    impl MrtrTransport {
+        fn modern(
+            call_responses: Vec<Result<Value, TransportError>>,
+        ) -> (Self, Arc<Mutex<Vec<(String, Value)>>>) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let mut responses = VecDeque::from([
+                Err(TransportError::Rpc(json!({
+                    "code": -32601,
+                    "message": "initialize removed"
+                }))),
+                Ok(json!({
+                    "supportedVersions": [MODERN_PROTOCOL_VERSION],
+                    "capabilities": {}
+                })),
+                Ok(json!({
+                    "tools": [{
+                        "name": "echo",
+                        "description": "fixture",
+                        "inputSchema": { "type": "object" }
+                    }]
+                })),
+            ]);
+            responses.extend(call_responses);
+            (
+                Self {
+                    responses,
+                    requests: Arc::clone(&requests),
+                },
+                requests,
+            )
+        }
+    }
+
+    impl Transport for MrtrTransport {
+        fn request(
+            &mut self,
+            method: &str,
+            params: Value,
+        ) -> Result<Value, TransportError> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params));
+            self.responses
+                .pop_front()
+                .expect("scripted MRTR response")
+        }
+
+        fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
 
     struct PaginationTransport {
         responses: VecDeque<Result<Value, TransportError>>,
@@ -3343,6 +4549,9 @@ mod tests {
             caps_prompts: false,
             caps_completions: false,
             era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
+            modern_http: false,
+            modern_resource_subscriptions: std::collections::HashSet::new(),
+            server_handler: None,
         };
         server.refresh_tools();
         assert_eq!(server.tools, vec![json!({"name":"stable"})]);
@@ -3368,6 +4577,9 @@ mod tests {
             caps_prompts: false,
             caps_completions: false,
             era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
+            modern_http: false,
+            modern_resource_subscriptions: std::collections::HashSet::new(),
+            server_handler: None,
         };
         server.refresh_resources();
         assert_eq!(server.resources, vec![json!({"uri":"r:"})]);
@@ -3856,8 +5068,141 @@ mod tests {
     }
 
     #[test]
+    fn legacy_client_auto_fulfills_modern_input_required() {
+        let (transport, requests) = MrtrTransport::modern(vec![
+            Ok(json!({
+                "resultType": "input_required",
+                "inputRequests": {
+                    "confirm": {
+                        "method": "elicitation/create",
+                        "params": {
+                            "message": "Continue?",
+                            "requestedSchema": { "type": "object" }
+                        }
+                    },
+                    "workspace": { "method": "roots/list" }
+                },
+                "requestState": "opaque-state"
+            })),
+            Ok(json!({
+                "resultType": "complete",
+                "content": [{ "type": "text", "text": "done" }]
+            })),
+        ]);
+        let mut server = DownstreamServer::connect("modern".into(), Box::new(transport)).unwrap();
+        let handler: ServerRequestHandler = Arc::new(|request| {
+            let id = request["id"].clone();
+            match request["method"].as_str() {
+                Some("elicitation/create") => Some(ServerRequestAction::Respond(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "action": "accept", "content": { "approved": true } }
+                }))),
+                Some("roots/list") => Some(ServerRequestAction::Respond(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "roots": [{ "uri": "file:///workspace" }] }
+                }))),
+                _ => None,
+            }
+        });
+        server.set_server_request_handler(handler);
+
+        let result = server.call("echo", json!({ "text": "hi" })).unwrap();
+        assert_eq!(result["resultType"], "complete");
+
+        let requests = requests.lock().unwrap();
+        let calls: Vec<&Value> = requests
+            .iter()
+            .filter(|(method, _)| method == "tools/call")
+            .map(|(_, params)| params)
+            .collect();
+        assert_eq!(calls.len(), 2, "the retry is a new downstream request");
+        assert!(calls[0].get("inputResponses").is_none());
+        assert!(calls[0].get("requestState").is_none());
+        assert_eq!(calls[1]["requestState"], "opaque-state");
+        assert_eq!(calls[1]["inputResponses"]["confirm"]["action"], "accept");
+        assert_eq!(
+            calls[1]["inputResponses"]["workspace"]["roots"][0]["uri"],
+            "file:///workspace"
+        );
+    }
+
+    #[test]
+    fn mrtr_null_retry_fields_are_treated_as_absent() {
+        let retry = MrtrRequest::from_params(Some(&json!({
+            "inputResponses": null,
+            "requestState": null
+        })));
+
+        assert!(retry.is_empty());
+        let mut params = json!({ "name": "echo", "arguments": {} });
+        retry.apply(&mut params);
+        assert!(params.get("inputResponses").is_none());
+        assert!(params.get("requestState").is_none());
+    }
+
+    #[test]
+    fn modern_client_receives_input_required_and_controls_the_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (transport, requests) = MrtrTransport::modern(vec![
+            Ok(json!({
+                "resultType": "input_required",
+                "inputRequests": {
+                    "confirm": {
+                        "method": "elicitation/create",
+                        "params": { "message": "Continue?" }
+                    }
+                },
+                "requestState": "byte-exact-state"
+            })),
+            Ok(json!({ "resultType": "complete", "content": [] })),
+        ]);
+        let mut server = DownstreamServer::connect("modern".into(), Box::new(transport)).unwrap();
+        let handled = Arc::new(AtomicUsize::new(0));
+        let handled_by_bridge = Arc::clone(&handled);
+        server.set_server_request_handler(Arc::new(move |_| {
+            handled_by_bridge.fetch_add(1, Ordering::SeqCst);
+            None
+        }));
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION
+        });
+
+        let incomplete = server
+            .call_with_cancel_and_mrtr("echo", json!({}), None, Some(&meta), None)
+            .unwrap();
+        assert_eq!(incomplete["resultType"], "input_required");
+        assert_eq!(handled.load(Ordering::SeqCst), 0, "native MRTR is not shimmed");
+
+        let retry = MrtrRequest {
+            input_responses: Some(json!({
+                "confirm": { "action": "accept", "content": { "approved": true } }
+            })),
+            request_state: Some(json!("byte-exact-state")),
+        };
+        let complete = server
+            .call_with_cancel_and_mrtr("echo", json!({}), None, Some(&meta), Some(&retry))
+            .unwrap();
+        assert_eq!(complete["resultType"], "complete");
+
+        let requests = requests.lock().unwrap();
+        let calls: Vec<&Value> = requests
+            .iter()
+            .filter(|(method, _)| method == "tools/call")
+            .map(|(_, params)| params)
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1]["requestState"], "byte-exact-state");
+        assert_eq!(calls[1]["inputResponses"], retry.input_responses.unwrap());
+    }
+
+    #[test]
     fn http_sse_answers_inline_server_request_before_final_response() {
-        use super::{HttpTransport, RefreshFn, ServerRequestHandler, Transport};
+        use super::{
+            HttpTransport, RefreshFn, ServerRequestAction, ServerRequestHandler, Transport,
+        };
         use serde_json::Value;
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -3941,11 +5286,11 @@ mod tests {
 
         let handler: ServerRequestHandler = Arc::new(|req| {
             if req.get("method").and_then(|m| m.as_str()) == Some("roots/list") {
-                Some(json!({
+                Some(ServerRequestAction::Respond(json!({
                     "jsonrpc": "2.0",
                     "id": req.get("id").cloned().unwrap_or(Value::Null),
                     "result": { "roots": [] }
-                }))
+                })))
             } else {
                 None
             }
@@ -3978,6 +5323,104 @@ mod tests {
                 .unwrap_or(Value::Null),
             json!({"ok": true})
         );
+    }
+
+    #[test]
+    fn http_sse_mrtr_resumes_without_reposting_the_original_request() {
+        use super::{HttpTransport, ServerRequestAction, Transport};
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+
+        fn read_http_request(stream: &mut impl Read) -> String {
+            let mut headers = Vec::new();
+            let mut byte = [0u8; 1];
+            while stream.read(&mut byte).unwrap() > 0 {
+                headers.push(byte[0]);
+                if headers.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&headers);
+            let len = text
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length:")
+                        .or_else(|| line.strip_prefix("content-length:"))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            String::from_utf8(body).unwrap()
+        }
+
+        fn write_chunk(stream: &mut impl Write, data: &str) {
+            write!(stream, "{:x}\r\n{data}\r\n", data.len()).unwrap();
+            stream.flush().unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut original = listener.accept().unwrap().0;
+            let original_body = read_http_request(&mut original);
+            assert!(original_body.contains("\"method\":\"tools/call\""));
+            original
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            write_chunk(
+                &mut original,
+                "data: {\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"elicitation/create\",\"params\":{\"message\":\"Continue?\"}}\n",
+            );
+
+            let mut response = listener.accept().unwrap().0;
+            let response_body = read_http_request(&mut response);
+            assert!(response_body.contains("\"id\":99"));
+            assert!(response_body.contains("\"action\":\"accept\""));
+            response
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .unwrap();
+
+            write_chunk(
+                &mut original,
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n",
+            );
+            original.write_all(b"0\r\n\r\n").unwrap();
+        });
+
+        let mut transport = HttpTransport::new(&format!("http://127.0.0.1:{port}/"));
+        transport.set_server_request_handler(Arc::new(|request| {
+            (request["method"] == "elicitation/create")
+                .then_some(ServerRequestAction::InputRequired)
+        }));
+        let first = transport
+            .request("tools/call", json!({ "name": "interactive", "arguments": {} }))
+            .expect("first round");
+        assert_eq!(first["resultType"], "input_required");
+        let state = first["requestState"].clone();
+        let requests = first["inputRequests"].as_object().unwrap();
+        let key = requests.keys().next().unwrap().clone();
+
+        let final_result = transport
+            .request(
+                "tools/call",
+                json!({
+                    "name": "interactive",
+                    "arguments": {},
+                    "requestState": state,
+                    "inputResponses": {
+                        key: { "action": "accept", "content": { "approved": true } }
+                    }
+                }),
+            )
+            .expect("resumed round");
+        assert_eq!(final_result, json!({ "ok": true }));
+        server.join().unwrap();
     }
 
 
@@ -4562,6 +6005,157 @@ mod tests {
     }
 
     #[test]
+    fn modern_http_listener_routes_tagged_notifications() {
+        use super::{change, HttpTransport, SubscriptionFilter, Transport, MODERN_PROTOCOL_VERSION};
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let body = Arc::new(Mutex::new(String::new()));
+        let captured = Arc::clone(&body);
+        let handle = std::thread::spawn(move || {
+            let mut request = server.recv().unwrap();
+            let mut request_body = String::new();
+            request.as_reader().read_to_string(&mut request_body).unwrap();
+            *captured.lock().unwrap() = request_body;
+            let subscription = json!({
+                "io.modelcontextprotocol/subscriptionId": 1
+            });
+            let stream = format!(
+                "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/subscriptions/acknowledged",
+                    "params": { "_meta": subscription }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/tools/list_changed",
+                    "params": { "_meta": subscription }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/resources/updated",
+                    "params": { "uri": "fixture://one", "_meta": subscription }
+                })
+            );
+            let content_type = tiny_http::Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"text/event-stream"[..],
+            )
+            .unwrap();
+            request
+                .respond(tiny_http::Response::from_string(stream).with_header(content_type))
+                .unwrap();
+        });
+
+        let dirty = Arc::new(AtomicU8::new(0));
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let update_target = Arc::clone(&updates);
+        let mut transport = HttpTransport::new(&format!("http://127.0.0.1:{port}/"));
+        transport.set_protocol_meta(Some(super::protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+        transport.set_change_sink(Some(Arc::clone(&dirty)));
+        transport.set_resource_updated_sink(Some(Arc::new(move |uri| {
+            update_target.lock().unwrap().push(uri);
+        })));
+        transport
+            .set_subscription_listener(SubscriptionFilter {
+                tools_list_changed: true,
+                resources_list_changed: true,
+                resource_subscriptions: vec!["fixture://one".to_string()],
+                ..SubscriptionFilter::default()
+            })
+            .unwrap();
+        handle.join().unwrap();
+        for _ in 0..100 {
+            if dirty.load(Ordering::SeqCst) == change::TOOLS
+                && !updates.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(dirty.load(Ordering::SeqCst), change::TOOLS);
+        assert_eq!(&*updates.lock().unwrap(), &["fixture://one".to_string()]);
+        let sent: Value = serde_json::from_str(&body.lock().unwrap()).unwrap();
+        assert_eq!(sent["method"], "subscriptions/listen");
+        assert_eq!(
+            sent["params"]["notifications"]["resourceSubscriptions"][0],
+            "fixture://one"
+        );
+    }
+
+    #[test]
+    fn modern_resource_subscriptions_replace_the_listener_filter() {
+        use super::{DownstreamServer, SubscriptionFilter, Transport, TransportError};
+        use std::sync::{Arc, Mutex};
+
+        struct ModernProbe {
+            requests: Arc<Mutex<Vec<String>>>,
+            filters: Arc<Mutex<Vec<SubscriptionFilter>>>,
+        }
+        impl Transport for ModernProbe {
+            fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+                self.requests.lock().unwrap().push(method.to_string());
+                match method {
+                    "initialize" => Err(TransportError::Rpc(json!({
+                        "code": -32601,
+                        "message": "method not found"
+                    }))),
+                    "server/discover" => Ok(json!({
+                        "supportedVersions": [super::MODERN_PROTOCOL_VERSION],
+                        "capabilities": { "resources": {}, "prompts": {} }
+                    })),
+                    "tools/list" => Ok(json!({ "tools": [] })),
+                    _ => Ok(json!({})),
+                }
+            }
+            fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn set_subscription_listener(
+                &mut self,
+                filter: SubscriptionFilter,
+            ) -> Result<(), TransportError> {
+                self.filters.lock().unwrap().push(filter);
+                Ok(())
+            }
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let filters = Arc::new(Mutex::new(Vec::new()));
+        let mut server = DownstreamServer::connect(
+            "modern".to_string(),
+            Box::new(ModernProbe {
+                requests: Arc::clone(&requests),
+                filters: Arc::clone(&filters),
+            }),
+        )
+        .unwrap();
+        assert!(filters.lock().unwrap()[0].resource_subscriptions.is_empty());
+        server.subscribe_resource("fixture://z").unwrap();
+        server.subscribe_resource("fixture://a").unwrap();
+        assert_eq!(
+            filters.lock().unwrap().last().unwrap().resource_subscriptions,
+            vec!["fixture://a".to_string(), "fixture://z".to_string()]
+        );
+        server.unsubscribe_resource("fixture://z").unwrap();
+        assert_eq!(
+            filters.lock().unwrap().last().unwrap().resource_subscriptions,
+            vec!["fixture://a".to_string()]
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|method| method != "resources/subscribe" && method != "resources/unsubscribe"),
+            "modern resource subscriptions travel only through subscriptions/listen"
+        );
+    }
+
+    #[test]
     fn merge_protocol_meta_preserves_client_keys_and_survives_a_bogus_meta() {
         use super::{merge_protocol_meta, protocol_meta_for, MODERN_PROTOCOL_VERSION};
         const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
@@ -4576,6 +6170,163 @@ mod tests {
         let mut params = json!({ "_meta": "nonsense" });
         merge_protocol_meta(&mut params, &protocol_meta_for(MODERN_PROTOCOL_VERSION));
         assert_eq!(params["_meta"][VERSION_KEY], MODERN_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn modern_http_sends_routing_and_custom_headers_without_a_session() {
+        use super::{HttpTransport, Transport, MODERN_PROTOCOL_VERSION};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let captured = Arc::new(Mutex::new(HashMap::<String, String>::new()));
+        let target = Arc::clone(&captured);
+        let handle = std::thread::spawn(move || {
+            let mut request = server.recv().unwrap();
+            for header in request.headers() {
+                target.lock().unwrap().insert(
+                    header.field.as_str().to_ascii_lowercase().to_string(),
+                    header.value.as_str().to_string(),
+                );
+            }
+            let mut request_body = String::new();
+            request.as_reader().read_to_string(&mut request_body).unwrap();
+            let request_body: Value = serde_json::from_str(&request_body).unwrap();
+            assert_eq!(request_body["params"]["name"], "downstream_tool");
+            let content_type = tiny_http::Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"application/json"[..],
+            )
+            .unwrap();
+            let legacy_session = tiny_http::Header::from_bytes(
+                &b"Mcp-Session-Id"[..],
+                &b"must-be-ignored"[..],
+            )
+            .unwrap();
+            request
+                .respond(
+                    tiny_http::Response::from_string(
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#,
+                    )
+                    .with_header(content_type)
+                    .with_header(legacy_session),
+                )
+                .unwrap();
+        });
+
+        let mut transport = HttpTransport::new(&format!("http://127.0.0.1:{port}/"));
+        transport.session_id = Some("legacy-session".to_string());
+        transport.set_protocol_meta(Some(super::protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+        transport
+            .request_with_cancel_and_headers(
+                "tools/call",
+                json!({ "name": "downstream_tool", "arguments": { "region": "west" } }),
+                None,
+                &[("Mcp-Param-Region".to_string(), "west".to_string())],
+            )
+            .unwrap();
+        handle.join().unwrap();
+
+        let headers = captured.lock().unwrap();
+        assert_eq!(headers.get("mcp-method").map(String::as_str), Some("tools/call"));
+        assert_eq!(headers.get("mcp-name").map(String::as_str), Some("downstream_tool"));
+        assert_eq!(headers.get("mcp-param-region").map(String::as_str), Some("west"));
+        assert!(!headers.contains_key("mcp-session-id"));
+        assert!(transport.session_id.is_none(), "modern responses cannot restore a legacy session");
+    }
+
+    #[test]
+    fn modern_http_400_rpc_error_reaches_the_protocol_ladder() {
+        use super::{HttpTransport, Transport, TransportError, MODERN_PROTOCOL_VERSION};
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let request = server.recv().unwrap();
+            let content_type = tiny_http::Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"application/json"[..],
+            )
+            .unwrap();
+            request
+                .respond(
+                    tiny_http::Response::from_string(
+                        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32020,"message":"HeaderMismatch"}}"#,
+                    )
+                    .with_status_code(400)
+                    .with_header(content_type),
+                )
+                .unwrap();
+        });
+
+        let mut transport = HttpTransport::new(&format!("http://127.0.0.1:{port}/"));
+        transport.set_protocol_meta(Some(super::protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+        let error = transport.request("server/discover", json!({})).unwrap_err();
+        handle.join().unwrap();
+        assert!(matches!(error, TransportError::Rpc(_)));
+        assert!(error.is_modern_protocol_error());
+    }
+
+    #[test]
+    fn x_mcp_header_filters_only_the_malformed_tool_and_encodes_values() {
+        use super::{filter_modern_http_tools, tool_request_headers};
+
+        let valid = json!({
+            "name": "query",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "routing": {
+                        "type": "object",
+                        "properties": {
+                            "region": { "type": "string", "x-mcp-header": "Region" },
+                            "priority": { "type": "integer", "x-mcp-header": "Priority" },
+                            "dryRun": { "type": "boolean", "x-mcp-header": "Dry-Run" }
+                        }
+                    }
+                }
+            }
+        });
+        let duplicate = json!({
+            "name": "bad_duplicate",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "a": { "type": "string", "x-mcp-header": "Region" },
+                    "b": { "type": "string", "x-mcp-header": "REGION" }
+                }
+            }
+        });
+        let hidden = json!({
+            "name": "bad_ref",
+            "inputSchema": {
+                "type": "object",
+                "$defs": { "route": { "type": "string", "x-mcp-header": "Route" } }
+            }
+        });
+        let tools = filter_modern_http_tools(
+            "fixture",
+            vec![valid.clone(), duplicate, hidden],
+        );
+        assert_eq!(tools, vec![valid]);
+
+        let headers = tool_request_headers(
+            &tools,
+            "query",
+            &json!({
+                "routing": { "region": " 日本 ", "priority": 7, "dryRun": true }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            headers,
+            vec![
+                ("Mcp-Param-Dry-Run".to_string(), "true".to_string()),
+                ("Mcp-Param-Priority".to_string(), "7".to_string()),
+                ("Mcp-Param-Region".to_string(), "=?base64?IOaXpeacrCA=?=".to_string()),
+            ]
+        );
     }
 
     #[test]

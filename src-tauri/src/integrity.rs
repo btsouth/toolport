@@ -34,6 +34,7 @@ struct QuarantineReadCache {
     mtime: SystemTime,
     len: u64,
     set: BTreeSet<String>,
+    mandatory: BTreeSet<String>,
 }
 
 static QUARANTINE_READ_CACHE: Mutex<Option<QuarantineReadCache>> = Mutex::new(None);
@@ -330,12 +331,14 @@ fn load_pins(profile: Option<&str>) -> PinsLoad {
     PinsLoad::Corrupt
 }
 
-fn save_pins(profile: Option<&str>, pins: &Pins) {
-    if let Some(path) = pins_path(profile) {
-        if let Ok(s) = serde_json::to_string(pins) {
-            let _ = crate::registry::atomic_write(&path, &s);
-        }
-    }
+fn save_pins(profile: Option<&str>, pins: &Pins) -> bool {
+    let Some(path) = pins_path(profile) else {
+        return false;
+    };
+    let Ok(s) = serde_json::to_string(pins) else {
+        return false;
+    };
+    crate::registry::atomic_write(&path, &s).is_ok()
 }
 
 /// Run a load-modify-save of an on-disk integrity store while holding the cross-process lock
@@ -371,11 +374,12 @@ fn check_inner(profile: Option<&str>, current: &[Value]) -> Vec<Value> {
         PinsLoad::Loaded(p) => p,
         PinsLoad::Fresh => Pins::new(),
         PinsLoad::Corrupt => {
-            // The baseline existed but couldn't be loaded. Silently re-baselining
-            // would reset all drift detection, which is exactly what an attacker who
-            // can touch the config dir wants, so surface it loudly instead.
-            events.push(pins_tamper_event());
-            Pins::new()
+            // Freeze instead of treating a lost baseline as first run. The tamper event
+            // drives mandatory quarantine of the live catalog; re-approving a captured
+            // tool establishes its pin before the router exposes it again.
+            let event = pins_tamper_event();
+            record_event(&event);
+            return vec![event];
         }
     };
     // Servers we've already established a baseline for.
@@ -458,7 +462,7 @@ fn check_inner(profile: Option<&str>, current: &[Value]) -> Vec<Value> {
         );
     }
     if updated != pins {
-        save_pins(profile, &updated);
+        let _ = save_pins(profile, &updated);
     }
 
     for e in &events {
@@ -598,9 +602,10 @@ pub fn all_quarantined_names() -> BTreeSet<String> {
 
 // ===== Quarantine: block high-risk tools after a drift until re-approved =====
 //
-// `check` is detection-only and re-baselines as it goes, so quarantine keeps its own
-// persistent set of blocked tools (per profile, beside the pin baseline). The router's
-// tool-exposure policy hides anything in this set; re-approval removes it.
+// Ordinary drift checks re-baseline as they go, so quarantine keeps its own persistent
+// set of blocked tools (per profile, beside the pin baseline). Baseline loss is different:
+// `check` freezes, every live tool is quarantined, and re-approval pins the captured
+// definition before removing its block.
 
 /// Quarantine map: namespaced tool name (`server__tool`) -> a record of why it's
 /// blocked (server, tool, reason, ts), shown in the UI and persisted across restarts.
@@ -669,16 +674,44 @@ pub fn quarantined_checked(profile: Option<&str>) -> Result<BTreeSet<String>, St
     quarantined_checked_at(&path)
 }
 
+/// Tools quarantined because the integrity baseline itself was lost. Unlike ordinary
+/// high-risk drift quarantine, these entries are always enforced: disabling the optional
+/// drift policy must not turn a corrupt baseline into a fail-open catalog.
+pub fn mandatory_quarantined(profile: Option<&str>) -> Result<BTreeSet<String>, String> {
+    Ok(mandatory_quarantine_set(&load_quarantine(profile)?))
+}
+
+/// Cached enforcement read for [`mandatory_quarantined`], used by the gateway watcher.
+pub fn mandatory_quarantined_checked(profile: Option<&str>) -> Result<BTreeSet<String>, String> {
+    let Some(path) = quarantine_path(profile) else {
+        return Ok(BTreeSet::new());
+    };
+    Ok(quarantined_sets_checked_at(&path)?.1)
+}
+
+fn mandatory_quarantine_set(q: &Quarantine) -> BTreeSet<String> {
+    q.iter()
+        .filter(|(_, record)| record.get("change").and_then(Value::as_str) == Some("tamper"))
+        .map(|(tool, _)| tool.clone())
+        .collect()
+}
+
 /// Path-level read used by [`quarantined_checked`]. Separated so the mtime/len
 /// pre-filter (SOU-303) and fail-closed parse sit in one place.
 fn quarantined_checked_at(path: &Path) -> Result<BTreeSet<String>, String> {
+    Ok(quarantined_sets_checked_at(path)?.0)
+}
+
+fn quarantined_sets_checked_at(
+    path: &Path,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         // Missing is the normal first-run state: nothing quarantined yet.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Drop a stale hit for this path so a later recreate is re-parsed.
             clear_quarantine_read_cache_for(path);
-            return Ok(BTreeSet::new());
+            return Ok((BTreeSet::new(), BTreeSet::new()));
         }
         Err(e) => return Err(format!("quarantine store at {path:?} is unreadable: {e}")),
     };
@@ -698,7 +731,7 @@ fn quarantined_checked_at(path: &Path) -> Result<BTreeSet<String>, String> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(c) = cache.as_ref() {
             if c.path == path && c.mtime == mtime && c.len == len {
-                return Ok(c.set.clone());
+                return Ok((c.set.clone(), c.mandatory.clone()));
             }
         }
     }
@@ -711,12 +744,14 @@ fn quarantined_checked_at(path: &Path) -> Result<BTreeSet<String>, String> {
         // Race: file vanished between metadata and open — treat as empty.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             clear_quarantine_read_cache_for(path);
-            return Ok(BTreeSet::new());
+            return Ok((BTreeSet::new(), BTreeSet::new()));
         }
         Err(e) => return Err(format!("quarantine store at {path:?} is unreadable: {e}")),
     };
     // Fail closed: do not cache a corrupt parse, do not return empty, do not rename.
-    let set: BTreeSet<String> = parse_quarantine_raw(&raw, path)?.into_keys().collect();
+    let records = parse_quarantine_raw(&raw, path)?;
+    let mandatory = mandatory_quarantine_set(&records);
+    let set: BTreeSet<String> = records.into_keys().collect();
 
     *QUARANTINE_READ_CACHE
         .lock()
@@ -725,8 +760,9 @@ fn quarantined_checked_at(path: &Path) -> Result<BTreeSet<String>, String> {
         mtime,
         len,
         set: set.clone(),
+        mandatory: mandatory.clone(),
     });
-    Ok(set)
+    Ok((set, mandatory))
 }
 
 fn clear_quarantine_read_cache_for(path: &Path) {
@@ -789,8 +825,9 @@ pub fn all_quarantined() -> Vec<Value> {
 }
 
 /// Re-approve a quarantined tool: drop it so the gateway re-exposes it on the next
-/// rebuild. `check` has already re-baselined the current definition, so a re-approved
-/// tool won't immediately re-flag. Returns whether the tool was actually quarantined.
+/// rebuild. Ordinary drift was already re-baselined by `check`; after baseline tamper,
+/// this first saves the definition captured while the tool was blocked. Returns whether
+/// the tool was actually quarantined.
 pub fn release(profile: Option<&str>, tool: &str) -> bool {
     let Some(path) = quarantine_path(profile) else { return false };
     // Under the cross-process lock so a concurrent gateway's quarantine write can't clobber this
@@ -805,6 +842,48 @@ pub fn release(profile: Option<&str>, tool: &str) -> bool {
                 return false;
             }
         };
+        let Some(record) = q.get(tool).cloned() else {
+            return false;
+        };
+        if record.get("change").and_then(Value::as_str) == Some("tamper") {
+            // The baseline was deliberately left corrupt. Establish the exact definition
+            // captured when this tool was quarantined before removing the router block, so
+            // re-approval cannot create a window where an unpinned tool is exposed.
+            let Some(mut pending) = record
+                .get("pending_pin")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<Pin>(v).ok())
+            else {
+                eprintln!(
+                    "toolport: refusing to release {tool}; the tamper quarantine has no valid captured pin"
+                );
+                return false;
+            };
+            let stamp = epoch_millis();
+            if pending.first_seen == 0 {
+                pending.first_seen = stamp;
+            }
+            if pending.last_changed == 0 {
+                pending.last_changed = stamp;
+            }
+            let Some(pin_path) = pins_path(profile) else {
+                return false;
+            };
+            let saved = with_store_lock(&pin_path, || {
+                let mut pins = match load_pins(profile) {
+                    PinsLoad::Loaded(p) => p,
+                    PinsLoad::Fresh | PinsLoad::Corrupt => Pins::new(),
+                };
+                pins.insert(tool.to_string(), pending);
+                save_pins(profile, &pins)
+            });
+            if !saved {
+                eprintln!(
+                    "toolport: refusing to release {tool}; its accepted pin could not be saved"
+                );
+                return false;
+            }
+        }
         if q.remove(tool).is_some() {
             save_quarantine(profile, &q);
             return true;
@@ -837,6 +916,49 @@ fn apply_quarantine_inner(profile: Option<&str>, current: &[Value], events: &[Va
         }
     };
     let mut added = false;
+
+    // A corrupt baseline invalidates every trust decision in the current catalog. This
+    // path is mandatory (the gateway invokes it even when ordinary drift quarantine is
+    // disabled) and captures each definition so a later explicit re-approval can pin it
+    // before exposure. Existing ordinary quarantine records are upgraded to tamper records
+    // so their release cannot bypass baseline repair.
+    if baseline_tamper_detected(events) {
+        for tool in current {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let pending = pin_of(tool);
+            let already_current = q.get(name).is_some_and(|record| {
+                record.get("change").and_then(Value::as_str) == Some("tamper")
+                    && record
+                        .get("pending_pin")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value::<Pin>(v).ok())
+                        .as_ref()
+                        == Some(&pending)
+            });
+            if already_current {
+                continue;
+            }
+            q.insert(
+                name.to_string(),
+                json!({
+                    "ts": epoch_millis(),
+                    "server": server_of(name),
+                    "tool": name,
+                    "reason": "the integrity baseline was corrupt or tampered with",
+                    "change": "tamper",
+                    "pending_pin": pending,
+                }),
+            );
+            added = true;
+        }
+        if added {
+            save_quarantine(profile, &q);
+        }
+        return added;
+    }
+
     for e in events {
         let (Some(tool), Some(change)) = (
             e.get("tool").and_then(Value::as_str),
@@ -1664,6 +1786,16 @@ fn pins_tamper_event() -> Value {
     })
 }
 
+/// Whether integrity checking reported a lost pin baseline. The gateway uses this to
+/// enforce quarantine independently of the optional quarantine-on-drift setting.
+pub fn baseline_tamper_detected(events: &[Value]) -> bool {
+    events.iter().any(|event| {
+        event.get("type").and_then(Value::as_str) == Some("pins_load_failed")
+            && event.get("change").and_then(Value::as_str) == Some("tamper")
+            && event.get("severity").and_then(Value::as_str) == Some(SEV_HIGH)
+    })
+}
+
 /// A tool-definition drift event tagged with its `severity` (`high` = loud/actionable,
 /// `info` = benign churn for the quiet history). See `drift_severity`.
 fn event(server: &str, tool: &str, change: &str, severity: &str) -> Value {
@@ -2178,6 +2310,70 @@ mod tests {
         assert!(matches!(load_pins(profile), PinsLoad::Loaded(_)), "valid pins load");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn corrupt_pins_freeze_and_require_reapproval_before_exposure() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("corrupt-pins-fail-closed");
+        let profile = Some("corrupt-pins-fail-closed-unit");
+        let path = pins_path(profile).expect("profile path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ attacker truncated the baseline").unwrap();
+
+        let current = vec![
+            tool("alpha__read", "Read records."),
+            tool("beta__write", "Write records."),
+        ];
+        let events = check(profile, &current);
+        assert!(baseline_tamper_detected(&events));
+        assert_eq!(events.len(), 1, "drift checks freeze at the lost trust root");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ attacker truncated the baseline",
+            "check must not replace the corrupt baseline with the live catalog"
+        );
+
+        assert!(apply_quarantine(profile, &current, &events));
+        let blocked = quarantined(profile).expect("quarantine readable");
+        assert_eq!(
+            blocked,
+            BTreeSet::from(["alpha__read".to_string(), "beta__write".to_string()])
+        );
+        assert_eq!(mandatory_quarantined(profile).unwrap(), blocked);
+
+        let records = load_quarantine(profile).expect("quarantine records");
+        for name in ["alpha__read", "beta__write"] {
+            let record = &records[name];
+            assert_eq!(record["change"], "tamper");
+            assert!(record.get("pending_pin").is_some(), "{name} captured before approval");
+        }
+
+        // If the blocked catalog refreshes while the baseline is still frozen, approval
+        // must bind to the latest observed definition rather than the first stale capture.
+        let refreshed = vec![
+            tool("alpha__read", "Read records with filters."),
+            tool("beta__write", "Write records."),
+        ];
+        let refreshed_events = check(profile, &refreshed);
+        assert!(apply_quarantine(profile, &refreshed, &refreshed_events));
+
+        assert!(release(profile, "alpha__read"));
+        let PinsLoad::Loaded(repaired) = load_pins(profile) else {
+            panic!("re-approval must establish a readable baseline")
+        };
+        assert_eq!(
+            repaired["alpha__read"].fp,
+            pin_of(&refreshed[0]).fp,
+            "re-approval pins the latest definition observed while blocked"
+        );
+        assert!(
+            !repaired.contains_key("beta__write"),
+            "an unreleased tool is not accepted by the release operation"
+        );
+        let still_blocked = mandatory_quarantined(profile).unwrap();
+        assert!(!still_blocked.contains("alpha__read"));
+        assert!(still_blocked.contains("beta__write"));
     }
 
     #[test]

@@ -6,7 +6,8 @@
 //! access token.
 
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::atomic::AtomicU8;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::downstream::{
@@ -352,7 +353,7 @@ fn first_vaulted_secret(server: &ServerEntry) -> Option<String> {
 ///    OAuth. Without this fallback, "Manage secrets" tokens were silently ignored
 ///    for HTTP servers.
 pub fn connect_remote(server: &ServerEntry) -> Result<DownstreamServer, String> {
-    connect_remote_with_handler(server, None, None, None)
+    connect_remote_with_handler(server, None, None, None, None)
 }
 
 /// Like [`connect_remote`], but wires server-initiated JSON-RPC (sampling, roots, …)
@@ -365,6 +366,7 @@ pub fn connect_remote_with_handler(
     server_handler: Option<ServerRequestHandler>,
     resource_updated: Option<ResourceUpdatedSink>,
     progress: Option<ProgressSink>,
+    change_dirty: Option<Arc<AtomicU8>>,
 ) -> Result<DownstreamServer, String> {
     guard_connect_target(server)?;
     let url = server.url.as_deref().unwrap_or("");
@@ -389,6 +391,7 @@ pub fn connect_remote_with_handler(
     }
     transport.set_resource_updated_sink(resource_updated.clone());
     transport.set_progress_sink(progress.clone());
+    transport.set_change_sink(change_dirty.clone());
     match DownstreamServer::connect(server_id.to_string(), Box::new(transport)) {
         Ok(ds) => Ok(ds),
         // The transport already gets one forced refresh per token on a 401/403.
@@ -412,6 +415,7 @@ pub fn connect_remote_with_handler(
                 }
                 transport.set_resource_updated_sink(resource_updated);
                 transport.set_progress_sink(progress);
+                transport.set_change_sink(change_dirty);
                 DownstreamServer::connect(server_id.to_string(), Box::new(transport))
             }
             Err(_) => Err(e),

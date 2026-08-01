@@ -13,6 +13,7 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use crate::usage_report;
 
 /// One resolved cap from the team config pull (member-scoped on the server).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,17 +95,7 @@ fn utc_ymd() -> (i64, u32, u32) {
 }
 
 fn ymd_from_ms(ms: i64) -> (i64, u32, u32) {
-    let days = ms.div_euclid(86_400_000);
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+   usage_report::civil_from_days(ms.div_euclid(86_400_000))
 }
 
 fn window_key(window: &str) -> String {
@@ -602,5 +593,10 @@ mod tests {
         assert!(!tool_matches("github/list_issues", "linear", "list_issues"));
         assert!(tool_matches("list_issues", "linear", "list_issues"));
         assert!(!tool_matches("create_issue", "linear", "list_issues"));
+    }
+
+    #[test]
+    fn ymd_from_ms_handles_pre_epoch_dates() {
+       assert_eq!(ymd_from_ms(-86_400_000), (1969, 12, 31));
     }
 }

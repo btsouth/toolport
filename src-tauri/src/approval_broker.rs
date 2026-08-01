@@ -1,8 +1,9 @@
 //! App-side HITL approval broker.
 //!
-//! The Toolport app hosts this broker; every `toolport-gateway` process (one per stdio
-//! client, plus the app's `--http` bridge) dials OUT to it when it holds a gated tool
-//! call, and blocks reading for the decision. This is the counterpart to the gateway's
+//! The Toolport app hosts this broker for legacy clients and code-mode calls, whose wire
+//! shape cannot return Toolport's approval as a modern multi-round-trip result. Those
+//! paths dial OUT and block for the decision. Modern direct calls use MCP elicitation and
+//! do not hold a gateway request. This is the counterpart to the gateway's
 //! `request_human_decision` (see `bin/toolport-gateway.rs`).
 //!
 //! Protocol: the gateway connects over loopback TCP, sends one JSON line

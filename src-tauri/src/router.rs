@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::downstream::{
-    backoff_delay, CancelContext, DownstreamServer, TransportError, HTTP_MAX_RETRIES,
+    backoff_delay, CancelContext, DownstreamServer, MrtrRequest, TransportError, HTTP_MAX_RETRIES,
     HTTP_RETRY_CAP,
 };
 use crate::registry::ToolOverride;
@@ -968,6 +968,17 @@ impl Router {
         cancel: Option<CancelContext>,
         meta: Option<&Value>,
     ) -> Result<Value, String> {
+        self.route_call_with_cancel_and_mrtr(exposed_name, arguments, cancel, meta, None)
+    }
+
+    pub fn route_call_with_cancel_and_mrtr(
+        &self,
+        exposed_name: &str,
+        arguments: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, String> {
         if let Some(reason) = self.blocked.get(exposed_name) {
             return Err(format!("tool '{exposed_name}' is {reason}"));
         }
@@ -977,7 +988,13 @@ impl Router {
             .ok_or_else(|| format!("no route for tool '{exposed_name}'"))?;
         let slot = self.slot_for(server_id)?;
         self.call_with_retry(&slot, |server| {
-            server.call_with_cancel(tool, arguments.clone(), cancel.clone(), meta)
+            server.call_with_cancel_and_mrtr(
+                tool,
+                arguments.clone(),
+                cancel.clone(),
+                meta,
+                mrtr,
+            )
         })
     }
 
@@ -1109,13 +1126,23 @@ impl Router {
         cancel: Option<CancelContext>,
         meta: Option<&Value>,
     ) -> Result<Value, String> {
+        self.read_resource_with_cancel_and_mrtr(uri, cancel, meta, None)
+    }
+
+    pub fn read_resource_with_cancel_and_mrtr(
+        &self,
+        uri: &str,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, String> {
         let server_id = self
             .resource_server(uri)
             .ok_or_else(|| format!("no server owns resource '{uri}'"))?
             .to_string();
         let slot = self.slot_for(&server_id)?;
         self.call_with_retry(&slot, |server| {
-            server.read_resource_with_cancel(uri, cancel.clone(), meta)
+            server.read_resource_with_cancel_and_mrtr(uri, cancel.clone(), meta, mrtr)
         })
     }
 
@@ -1169,6 +1196,17 @@ impl Router {
         cancel: Option<CancelContext>,
         meta: Option<&Value>,
     ) -> Result<Value, String> {
+        self.get_prompt_with_cancel_and_mrtr(exposed_name, arguments, cancel, meta, None)
+    }
+
+    pub fn get_prompt_with_cancel_and_mrtr(
+        &self,
+        exposed_name: &str,
+        arguments: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, String> {
         let (server_id, name) = self
             .prompt_routes
             .get(exposed_name)
@@ -1176,7 +1214,13 @@ impl Router {
             .ok_or_else(|| format!("no route for prompt '{exposed_name}'"))?;
         let slot = self.slot_for(&server_id)?;
         self.call_with_retry(&slot, |server| {
-            server.get_prompt_with_cancel(&name, arguments.clone(), cancel.clone(), meta)
+            server.get_prompt_with_cancel_and_mrtr(
+                &name,
+                arguments.clone(),
+                cancel.clone(),
+                meta,
+                mrtr,
+            )
         })
     }
 
