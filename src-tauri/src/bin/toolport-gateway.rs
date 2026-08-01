@@ -8410,10 +8410,21 @@ fn process_request(
     if method == "resources/subscribe" || method == "resources/unsubscribe" {
         let id = req.get("id").cloned().filter(|id| !id.is_null());
         let declared = upstream_declared_version(req).map(str::to_string);
-        if let (Some(id), Some(version)) = (id, declared.as_deref()) {
+        if let (Some(id), Some(version)) = (id.as_ref(), declared.as_deref()) {
             if !MODERN_UPSTREAM_VERSIONS.contains(&version) {
-                return Some(unsupported_version_error(id, version));
+                return Some(unsupported_version_error(id.clone(), version));
             }
+        }
+        if declared.as_deref() == Some(MODERN_PROTOCOL_VERSION) {
+            return id.map(|id| {
+                error(
+                    id,
+                    -32601,
+                    &format!(
+                        "Method not found: {method}; use subscriptions/listen in 2026-07-28"
+                    ),
+                )
+            });
         }
         let _era = UpstreamEraGuard::enter(
             declared.filter(|v| v.as_str() == MODERN_PROTOCOL_VERSION),
@@ -8825,6 +8836,15 @@ struct HttpOut {
     mcp_listen: Option<McpListen>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct McpHttpRequestHeaders<'a> {
+    session_id: Option<&'a str>,
+    protocol_version: Option<&'a str>,
+    method: Option<&'a str>,
+    name: Option<&'a str>,
+    accept: Option<&'a str>,
+}
+
 struct McpListen {
     session: Arc<McpSession>,
     cleanup: Option<(GatewayState, String)>,
@@ -9023,6 +9043,105 @@ fn mcp_rpc_response(
     }
 }
 
+fn modern_http_request(req: &Value, headers: McpHttpRequestHeaders<'_>) -> bool {
+    upstream_declared_version(req).is_some()
+        || headers.protocol_version == Some(MODERN_PROTOCOL_VERSION)
+}
+
+fn modern_http_header_error(req: &Value, message: String) -> HttpOut {
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    HttpOut::new(
+        400,
+        "application/json",
+        error(id, downstream::HEADER_MISMATCH, &message).to_string(),
+    )
+}
+
+/// Validate the routing metadata required on modern Streamable HTTP POSTs.
+///
+/// A proxy is not allowed to route on one operation and execute another. Compare
+/// the transport headers to the JSON-RPC envelope before dispatch, including the
+/// encoded representation used for non-ASCII names (SOU-473 / SEP-2243).
+fn validate_modern_http_headers(
+    req: &Value,
+    headers: McpHttpRequestHeaders<'_>,
+) -> Result<(), HttpOut> {
+    let body_version = upstream_declared_version(req);
+    match (headers.protocol_version, body_version) {
+        (Some(header), Some(body)) if header == body => {}
+        (None, _) => {
+            return Err(modern_http_header_error(
+                req,
+                "missing required MCP-Protocol-Version header".to_string(),
+            ));
+        }
+        (Some(header), body) => {
+            return Err(modern_http_header_error(
+                req,
+                format!(
+                    "MCP-Protocol-Version header '{header}' does not match body _meta '{}'",
+                    body.unwrap_or("<absent>")
+                ),
+            ));
+        }
+    }
+
+    let body_method = req.get("method").and_then(Value::as_str);
+    let encoded_method = body_method.map(downstream::encode_mcp_header_text);
+    if headers.method != encoded_method.as_deref() {
+        return Err(modern_http_header_error(
+            req,
+            format!(
+                "Mcp-Method header '{}' does not match body method '{}'",
+                headers.method.unwrap_or("<absent>"),
+                body_method.unwrap_or("<absent>")
+            ),
+        ));
+    }
+
+    let body_name = match body_method {
+        Some("tools/call") | Some("prompts/get") => req
+            .get("params")
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str),
+        Some("resources/read") => req
+            .get("params")
+            .and_then(|params| params.get("uri"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    let requires_name = matches!(
+        body_method,
+        Some("tools/call") | Some("prompts/get") | Some("resources/read")
+    );
+    let encoded_name = body_name.map(downstream::encode_mcp_header_text);
+    if requires_name && headers.name != encoded_name.as_deref() {
+        return Err(modern_http_header_error(
+            req,
+            format!(
+                "Mcp-Name header '{}' does not match body name '{}'",
+                headers.name.unwrap_or("<absent>"),
+                body_name.unwrap_or("<absent>")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn modern_http_status(resp: &Value) -> u16 {
+    match resp
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_i64)
+    {
+        Some(-32601) => 404,
+        Some(downstream::HEADER_MISMATCH)
+        | Some(downstream::MISSING_REQUIRED_CLIENT_CAPABILITY)
+        | Some(downstream::UNSUPPORTED_PROTOCOL_VERSION) => 400,
+        _ => 200,
+    }
+}
+
 /// Handle one Streamable-HTTP MCP request at `/mcp`.
 #[allow(clippy::too_many_arguments)]
 fn handle_mcp_http(
@@ -9031,26 +9150,25 @@ fn handle_mcp_http(
     confirm: &ConfirmGuard,
     method: &str,
     body: &str,
-    session_hdr: Option<&str>,
-    accept: Option<&str>,
+    headers: McpHttpRequestHeaders<'_>,
     allowed: Option<&std::collections::HashSet<String>>,
     client: Option<&str>,
     session_owner: Option<&McpSessionOwner>,
 ) -> HttpOut {
-    let prefer_sse = mcp_prefers_sse(accept);
+    let prefer_sse = mcp_prefers_sse(headers.accept);
     match method {
-        // GET (listen stream) and DELETE (session teardown) are legacy-only: both
-        // were removed in 2026-07-28. A modern-ONLY server answers 405, but
-        // Toolport is dual-era, and neither verb carries a body, so there is no
-        // `_meta` to tell the eras apart. They stay available and keep requiring a
-        // live session, which is exactly the gate that turns a modern client's
-        // request away. They become 405 when legacy support is eventually dropped
-        // (SOU-447).
+        // GET (listen stream) and DELETE (session teardown) were removed in
+        // 2026-07-28. Their transport header is the era boundary because neither
+        // verb carries a JSON-RPC envelope. Legacy sessions remain unchanged.
         "GET" => {
-            if !mcp_prefers_sse(accept) {
+            if headers.protocol_version == Some(MODERN_PROTOCOL_VERSION) {
+                return HttpOut::json_err(405, "method not allowed on modern /mcp")
+                    .with_header("Allow", "POST");
+            }
+            if !mcp_prefers_sse(headers.accept) {
                 return HttpOut::json_err(406, "Accept must include text/event-stream");
             }
-            match mcp_require_session(state, session_hdr, session_owner) {
+            match mcp_require_session(state, headers.session_id, session_owner) {
                 Ok((sid, session)) => {
                     if !session.try_begin_listen() {
                         return HttpOut::json_err(
@@ -9063,7 +9181,11 @@ fn handle_mcp_http(
                 Err(e) => e,
             }
         }
-        "DELETE" => match mcp_require_session(state, session_hdr, session_owner) {
+        "DELETE" if headers.protocol_version == Some(MODERN_PROTOCOL_VERSION) => {
+            HttpOut::json_err(405, "method not allowed on modern /mcp")
+                .with_header("Allow", "POST")
+        }
+        "DELETE" => match mcp_require_session(state, headers.session_id, session_owner) {
             Ok((sid, session)) => {
                 session.close();
                 state
@@ -9099,10 +9221,16 @@ fn handle_mcp_http(
                 .unwrap_or("");
             let has_id = req_obj.contains_key("id");
             let is_initialize = method_name == "initialize";
+            let is_modern = modern_http_request(&req, headers);
+            if is_modern {
+                if let Err(out) = validate_modern_http_headers(&req, headers) {
+                    return out;
+                }
+            }
             if method_name == "subscriptions/listen"
                 && upstream_declared_version(&req) == Some(MODERN_PROTOCOL_VERSION)
             {
-                if !mcp_accepts_sse(accept) {
+                if !mcp_accepts_sse(headers.accept) {
                     return HttpOut::json_err(406, "Accept must include text/event-stream");
                 }
                 let router = state
@@ -9135,31 +9263,13 @@ fn handle_mcp_http(
                     ),
                 };
             }
-            // 2026-07-28 removed protocol-level sessions (SOU-447). A modern
-            // request declares its own version, so it is served statelessly.
-            //
-            // Gate on the version VALUE, not merely on a version being present, so
-            // this matches the modern-era test in `handle_request_with_cancel`.
-            // Keying on presence alone would let a client that names a legacy
-            // version in `_meta` skip the session requirement here while still
-            // being served legacy-shaped results there.
-            // Toolport is dual-era on stdio and legacy-only over Streamable HTTP.
-            //
-            // A session-less modern path was implemented here and then withdrawn,
-            // because serving modern clients over HTTP needs more than skipping the
-            // session: `Mcp-Method`/`Mcp-Name` on outbound requests, inbound header
-            // validation, `400`/`404` statuses for protocol errors, and above all a
-            // server-to-client channel (`subscriptions/listen`) to replace the one
-            // sessions provided. Without that last piece, a session-less client
-            // collapsed into the shared `RESOURCE_SUB_STDIO` subscription bucket,
-            // where one client could tear down another's subscription.
-            //
-            // Requiring a session for every HTTP request is therefore the honest
-            // state: a dual-era client gets a `400` here with no recognized modern
-            // error, which the spec defines as the signal to fall back to
-            // `initialize`. Tracked for SOU-447/448/450.
-            let session_id: Option<String> = if is_initialize {
-                if let Some(existing) = session_hdr.map(str::trim).filter(|s| !s.is_empty()) {
+            // Modern requests are self-contained. Inbound legacy session ids are
+            // deliberately ignored and never echoed; authenticated identity and
+            // scope are resolved afresh for every HTTP request (SOU-447).
+            let session_id: Option<String> = if is_modern {
+                None
+            } else if is_initialize {
+                if let Some(existing) = headers.session_id.map(str::trim).filter(|s| !s.is_empty()) {
                     // Client re-sent a session on initialize: accept if still live,
                     // otherwise mint a fresh one (spec: start over without the old id).
                     match mcp_require_session(state, Some(existing), session_owner) {
@@ -9176,7 +9286,7 @@ fn handle_mcp_http(
                     }
                 }
             } else {
-                match mcp_require_session(state, session_hdr, session_owner) {
+                match mcp_require_session(state, headers.session_id, session_owner) {
                     Ok((sid, _)) => Some(sid),
                     Err(e) => return e,
                 }
@@ -9225,15 +9335,8 @@ fn handle_mcp_http(
             });
             match resp {
                 Some(resp) => {
-                    let status = if upstream_declared_version(&req)
-                        == Some(MODERN_PROTOCOL_VERSION)
-                        && resp
-                            .get("error")
-                            .and_then(|error| error.get("code"))
-                            .and_then(Value::as_i64)
-                            == Some(downstream::MISSING_REQUIRED_CLIENT_CAPABILITY)
-                    {
-                        400
+                    let status = if is_modern {
+                        modern_http_status(&resp)
                     } else {
                         200
                     };
@@ -9264,15 +9367,14 @@ fn handle_mcp_http(
 
 /// Map one HTTP request to status / content-type / body / extra headers.
 #[allow(clippy::too_many_arguments)]
-fn handle_http(
+fn handle_http_with_headers(
     state: &GatewayState,
     guard: &SearchGuard,
     confirm: &ConfirmGuard,
     method: &str,
     path: &str,
     body: &str,
-    session_hdr: Option<&str>,
-    accept: Option<&str>,
+    headers: McpHttpRequestHeaders<'_>,
     allowed: Option<&std::collections::HashSet<String>>,
     caller: Option<&HttpCaller>,
 ) -> HttpOut {
@@ -9293,8 +9395,7 @@ fn handle_http(
             confirm,
             method,
             body,
-            session_hdr,
-            accept,
+            headers,
             allowed,
             client,
             session_owner,
@@ -9319,7 +9420,7 @@ fn handle_http(
                 format!(
                     "Toolport gateway (HTTP mode).\n\
                      OpenAPI: GET /openapi.json, POST /{{tool_name}} with a JSON body.\n\
-                     MCP streamable-HTTP: POST /mcp with JSON-RPC; GET /mcp for server→client SSE.\n\
+                     MCP streamable-HTTP: POST /mcp; modern subscriptions/listen and legacy GET /mcp SSE.\n\
                      {metrics_line}\
                      Auth: Authorization: Bearer <TOOLPORT_HTTP_TOKEN>."
                 ),
@@ -9351,8 +9452,7 @@ fn handle_http(
                     confirm,
                     method,
                     body,
-                    session_hdr,
-                    accept,
+                    headers,
                     allowed,
                     client,
                     session_owner,
@@ -9392,6 +9492,37 @@ fn handle_http(
         }
         _ => HttpOut::json_err(404, "not found"),
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn handle_http(
+    state: &GatewayState,
+    guard: &SearchGuard,
+    confirm: &ConfirmGuard,
+    method: &str,
+    path: &str,
+    body: &str,
+    session_hdr: Option<&str>,
+    accept: Option<&str>,
+    allowed: Option<&std::collections::HashSet<String>>,
+    caller: Option<&HttpCaller>,
+) -> HttpOut {
+    handle_http_with_headers(
+        state,
+        guard,
+        confirm,
+        method,
+        path,
+        body,
+        McpHttpRequestHeaders {
+            session_id: session_hdr,
+            accept,
+            ..McpHttpRequestHeaders::default()
+        },
+        allowed,
+        caller,
+    )
 }
 
 /// Run the blocking HTTP/OpenAPI server. Binds 127.0.0.1 by default (local
@@ -10247,13 +10378,35 @@ fn handle_connection(
             .map(|h| sanitize_header_value(h.value.as_str()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| {
-                "Content-Type, Authorization, Mcp-Session-Id, MCP-Protocol-Version".to_string()
+                "Content-Type, Authorization, Mcp-Session-Id, MCP-Protocol-Version, Mcp-Method, Mcp-Name"
+                    .to_string()
             });
 
         let session_hdr = request
             .headers()
             .iter()
             .find(|h| h.field.equiv("Mcp-Session-Id"))
+            .map(|h| sanitize_header_value(h.value.as_str()))
+            .filter(|s| !s.is_empty());
+
+        let protocol_version_hdr = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("MCP-Protocol-Version"))
+            .map(|h| sanitize_header_value(h.value.as_str()))
+            .filter(|s| !s.is_empty());
+
+        let mcp_method_hdr = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Mcp-Method"))
+            .map(|h| sanitize_header_value(h.value.as_str()))
+            .filter(|s| !s.is_empty());
+
+        let mcp_name_hdr = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Mcp-Name"))
             .map(|h| sanitize_header_value(h.value.as_str()))
             .filter(|s| !s.is_empty());
 
@@ -10327,15 +10480,20 @@ fn handle_connection(
                     }
                     // A panic in a handler must return 500, not kill the listener.
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        handle_http(
+                        handle_http_with_headers(
                             state,
                             search,
                             confirm,
                             &method,
                             &path,
                             &body,
-                            session_hdr.as_deref(),
-                            accept_hdr.as_deref(),
+                            McpHttpRequestHeaders {
+                                session_id: session_hdr.as_deref(),
+                                protocol_version: protocol_version_hdr.as_deref(),
+                                method: mcp_method_hdr.as_deref(),
+                                name: mcp_name_hdr.as_deref(),
+                                accept: accept_hdr.as_deref(),
+                            },
                             allowed.as_ref(),
                             caller.as_ref(),
                         )
@@ -12424,6 +12582,32 @@ mod tests {
         buf
     }
 
+    fn http_post_with_headers(
+        port: u16,
+        path: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let extra = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+             Content-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        response
+    }
+
     #[test]
     fn deadline_http_ingress_times_out_slow_headers_and_bodies() {
         let deadlines = HttpReadDeadlines {
@@ -13612,6 +13796,21 @@ mod tests {
         json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": p }).to_string()
     }
 
+    fn modern_http_headers<'a>(
+        method: &'a str,
+        name: Option<&'a str>,
+        session_id: Option<&'a str>,
+        accept: Option<&'a str>,
+    ) -> McpHttpRequestHeaders<'a> {
+        McpHttpRequestHeaders {
+            session_id,
+            protocol_version: Some(MODERN_PROTOCOL_VERSION),
+            method: Some(method),
+            name,
+            accept,
+        }
+    }
+
     fn test_caller(identity: &str, scope: Option<&[&str]>) -> HttpCaller {
         HttpCaller {
             audit_label: Some(identity.to_string()),
@@ -13667,44 +13866,266 @@ mod tests {
     }
 
     #[test]
-    fn modern_http_client_is_not_served_and_gets_a_fallback_signal() {
-        // Toolport is dual-era on stdio and legacy-only over Streamable HTTP.
-        // Pins that boundary honestly rather than leaving it implicit: a modern
-        // client gets a 400 whose body is NOT a recognized modern error, which
-        // the spec defines as the signal for a dual-era client to fall back to
-        // `initialize`. Serving these properly is SOU-447/448/450.
+    fn modern_http_request_is_sessionless_and_ignores_legacy_session_header() {
         let state = http_state(true);
         let caller = test_caller("client:cursor", None);
-        let out = handle_http(
+        let out = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
             &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &modern_http_body(1, "tools/list", json!({})),
-            None,
-            None,
+            modern_http_headers("tools/list", None, Some("belongs-to-someone-else"), None),
             None,
             Some(&caller),
         );
-        assert_eq!(out.status, 400, "body={}", out.body);
-        // Asserting the body, not just the status: a bare status check would
-        // also pass on an unrelated 400, which is how one of these tests passed
-        // for the wrong reason before.
+        assert_eq!(out.status, 200, "body={}", out.body);
+        let body: Value = serde_json::from_str(&out.body).unwrap();
+        assert!(body.get("result").is_some(), "body={body}");
         assert!(
-            out.body.contains("Mcp-Session-Id"),
-            "expected the session requirement to be what refused it, got {}",
-            out.body
+            out.extra
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("Mcp-Session-Id")),
+            "modern responses must not echo a legacy session id"
         );
-        // Crucially NOT a modern error code: -32020/-32021/-32022 would tell a
-        // dual-era client we are modern and stop it falling back.
-        for code in ["-32020", "-32021", "-32022"] {
-            assert!(
-                !out.body.contains(code),
-                "a legacy-only HTTP endpoint must not answer with {code}, got {}",
-                out.body
+        assert!(
+            state.mcp_sessions.lock().unwrap().is_empty(),
+            "an ordinary modern request must not create protocol session state"
+        );
+    }
+
+    #[test]
+    fn modern_http_headers_are_plumbed_through_the_real_listener() {
+        let state = http_state(true);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let search = Arc::new(SearchGuard::default());
+        let confirm = Arc::new(ConfirmGuard::new());
+        std::thread::spawn(move || serve_http_loop(server, state, None, search, confirm, true));
+
+        let body = modern_http_body(1, "tools/list", json!({}));
+        let response = http_post_with_headers(
+            port,
+            "/mcp",
+            &body,
+            &[
+                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                ("Mcp-Method", "tools/list"),
+                ("Mcp-Session-Id", "ignored-modern-id"),
+                ("Accept", "application/json"),
+            ],
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "response={response}");
+        let response_headers = response.split("\r\n\r\n").next().unwrap_or("");
+        assert!(
+            !response_headers.lines().any(|line| {
+                line.split_once(':')
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case("Mcp-Session-Id"))
+            }),
+            "modern response minted or echoed a session id: {response_headers}"
+        );
+        let lower = response_headers.to_ascii_lowercase();
+        assert!(lower.contains("mcp-method"), "CORS omitted Mcp-Method: {response_headers}");
+        assert!(lower.contains("mcp-name"), "CORS omitted Mcp-Name: {response_headers}");
+    }
+
+    #[test]
+    fn modern_http_transport_headers_gate_dispatch_and_map_protocol_statuses() {
+        let state = http_state(true);
+        let body = modern_http_body(1, "tools/list", json!({}));
+
+        let missing_headers = handle_http(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &body,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(missing_headers.status, 400);
+        let missing: Value = serde_json::from_str(&missing_headers.body).unwrap();
+        assert_eq!(missing["error"]["code"], downstream::HEADER_MISMATCH);
+
+        let wrong_method = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &body,
+            modern_http_headers("tools/call", None, None, None),
+            None,
+            None,
+        );
+        assert_eq!(wrong_method.status, 400);
+        let wrong: Value = serde_json::from_str(&wrong_method.body).unwrap();
+        assert_eq!(wrong["error"]["code"], downstream::HEADER_MISMATCH);
+
+        let named_body = modern_http_body(
+            2,
+            "tools/call",
+            json!({ "name": "weather__lookup", "arguments": {} }),
+        );
+        let wrong_name = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &named_body,
+            modern_http_headers("tools/call", Some("other__tool"), None, None),
+            None,
+            None,
+        );
+        assert_eq!(wrong_name.status, 400);
+        let wrong_name_body: Value = serde_json::from_str(&wrong_name.body).unwrap();
+        assert_eq!(wrong_name_body["error"]["code"], downstream::HEADER_MISMATCH);
+
+        let unsupported_body = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/list",
+            "params": {
+                "_meta": { "io.modelcontextprotocol/protocolVersion": "2099-01-01" }
+            }
+        })
+        .to_string();
+        let unsupported = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &unsupported_body,
+            McpHttpRequestHeaders {
+                protocol_version: Some("2099-01-01"),
+                method: Some("tools/list"),
+                ..McpHttpRequestHeaders::default()
+            },
+            None,
+            None,
+        );
+        assert_eq!(unsupported.status, 400, "body={}", unsupported.body);
+        let unsupported_json: Value = serde_json::from_str(&unsupported.body).unwrap();
+        assert_eq!(
+            unsupported_json["error"]["code"],
+            downstream::UNSUPPORTED_PROTOCOL_VERSION
+        );
+
+        let unknown = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &modern_http_body(4, "made/up", json!({})),
+            modern_http_headers("made/up", None, None, None),
+            None,
+            None,
+        );
+        assert_eq!(unknown.status, 404, "body={}", unknown.body);
+        let unknown_body: Value = serde_json::from_str(&unknown.body).unwrap();
+        assert_eq!(unknown_body["error"]["code"], -32601);
+
+        for method in ["GET", "DELETE"] {
+            let out = handle_http_with_headers(
+                &state,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                method,
+                "/mcp",
+                "",
+                McpHttpRequestHeaders {
+                    session_id: Some("legacy-looking-id"),
+                    protocol_version: Some(MODERN_PROTOCOL_VERSION),
+                    accept: Some("text/event-stream"),
+                    ..McpHttpRequestHeaders::default()
+                },
+                None,
+                None,
             );
+            assert_eq!(out.status, 405, "{method} body={}", out.body);
+            assert!(out.extra.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("Allow") && value == "POST"
+            }));
         }
+    }
+
+    #[test]
+    fn modern_http_scope_is_resolved_per_request_not_from_session_state() {
+        let state = http_state(false);
+        *state.cached_tools.lock().unwrap() = Arc::new(CatalogSnapshot::new(vec![
+            json!({ "name": "github__list_repos", "description": "github" }),
+            json!({ "name": "stripe__list_charges", "description": "stripe" }),
+        ]));
+        let github: HashSet<String> = ["github".to_string()].into_iter().collect();
+        let stripe: HashSet<String> = ["stripe".to_string()].into_iter().collect();
+        let github_caller = test_caller("client:github", Some(&["github"]));
+        let stripe_caller = test_caller("client:stripe", Some(&["stripe"]));
+        let request = modern_http_body(1, "tools/list", json!({}));
+
+        let call = |allowed: &HashSet<String>, caller: &HttpCaller| {
+            handle_http_with_headers(
+                &state,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                "POST",
+                "/mcp",
+                &request,
+                modern_http_headers("tools/list", None, Some("same-untrusted-id"), None),
+                Some(allowed),
+                Some(caller),
+            )
+        };
+        let github_out = call(&github, &github_caller);
+        let stripe_out = call(&stripe, &stripe_caller);
+        assert_eq!(github_out.status, 200, "body={}", github_out.body);
+        assert_eq!(stripe_out.status, 200, "body={}", stripe_out.body);
+
+        let names = |out: &HttpOut| {
+            let body: Value = serde_json::from_str(&out.body).unwrap();
+            body["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let github_names = names(&github_out);
+        let stripe_names = names(&stripe_out);
+        assert!(github_names.contains(&"github__list_repos".to_string()));
+        assert!(!github_names.contains(&"stripe__list_charges".to_string()));
+        assert!(stripe_names.contains(&"stripe__list_charges".to_string()));
+        assert!(!stripe_names.contains(&"github__list_repos".to_string()));
+        assert!(state.mcp_sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn modern_http_rejects_removed_resource_subscription_methods() {
+        let state = http_state(true);
+        let out = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &modern_http_body(
+                7,
+                "resources/subscribe",
+                json!({ "uri": "fixture://shared" }),
+            ),
+            modern_http_headers("resources/subscribe", None, None, None),
+            None,
+            None,
+        );
+        assert_eq!(out.status, 404, "body={}", out.body);
+        assert!(state.resource_subs.lock().unwrap().by_session.is_empty());
     }
 
     #[test]
@@ -13920,7 +14341,7 @@ mod tests {
         let search = SearchGuard::default();
         let confirm = ConfirmGuard::new();
         let caller = test_caller("client:modern", None);
-        let mut out = handle_http(
+        let mut out = handle_http_with_headers(
             &state,
             &search,
             &confirm,
@@ -13936,8 +14357,12 @@ mod tests {
                     }
                 }),
             ),
-            None,
-            Some("application/json, text/event-stream"),
+            modern_http_headers(
+                "subscriptions/listen",
+                None,
+                None,
+                Some("application/json, text/event-stream"),
+            ),
             None,
             Some(&caller),
         );
@@ -14017,7 +14442,7 @@ mod tests {
     #[test]
     fn modern_subscription_listen_rejects_bad_filters_without_a_session() {
         let state = http_state(true);
-        let out = handle_http(
+        let out = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
             &ConfirmGuard::new(),
@@ -14028,8 +14453,12 @@ mod tests {
                 "subscriptions/listen",
                 json!({ "notifications": { "toolsListChanged": "yes" } }),
             ),
-            None,
-            Some("text/event-stream"),
+            modern_http_headers(
+                "subscriptions/listen",
+                None,
+                None,
+                Some("text/event-stream"),
+            ),
             None,
             None,
         );
@@ -14047,27 +14476,35 @@ mod tests {
             "subscriptions/listen",
             json!({ "notifications": { "toolsListChanged": true } }),
         );
-        let first = handle_http(
+        let first = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
             &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &body,
-            None,
-            Some("text/event-stream"),
+            modern_http_headers(
+                "subscriptions/listen",
+                None,
+                None,
+                Some("text/event-stream"),
+            ),
             None,
             Some(&caller),
         );
-        let second = handle_http(
+        let second = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
             &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &body,
-            None,
-            Some("text/event-stream"),
+            modern_http_headers(
+                "subscriptions/listen",
+                None,
+                None,
+                Some("text/event-stream"),
+            ),
             None,
             Some(&caller),
         );

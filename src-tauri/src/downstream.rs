@@ -78,7 +78,9 @@ fn is_http_token(value: &str) -> bool {
         })
 }
 
-fn encode_mcp_header_text(value: &str) -> String {
+/// Encode a modern MCP routing/header value using the SEP-2243 sentinel form.
+#[doc(hidden)]
+pub fn encode_mcp_header_text(value: &str) -> String {
     let safe_ascii = value
         .bytes()
         .all(|byte| matches!(byte, 0x20..=0x7e))
