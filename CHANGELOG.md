@@ -20,6 +20,12 @@ Entries before the rename below shipped under the project's former name, Conduit
   Its settings report the active discovery, code-mode, agent-control, destructive
   confirmation, and human-approval state; existing meta-tools remain available as
   the core-protocol fallback for clients that ignore extensions. (SOU-453)
+- Modern downstream catalog fetches now negotiate MCP Apps' HTML MIME type, Apps
+  hosts receive UI-linked tools even in lazy or grouped discovery, and `ui://`
+  resources route through their owning tool when the server omits them from
+  `resources/list`. Negotiated app HTML stays byte-faithful for the host's sandbox
+  and CSP enforcement, while app-only tools stay out of model-facing search and
+  nested-call paths. (SOU-453)
 
 ### Security
 

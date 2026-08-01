@@ -130,6 +130,43 @@ fn modern_client_supports_extension(identifier: &str) -> bool {
     })
 }
 
+fn mcp_app_html_settings(settings: &Value) -> bool {
+    settings
+        .get("mimeTypes")
+        .and_then(Value::as_array)
+        .is_some_and(|mime_types| mime_types.iter().any(|mime| mime == MCP_APP_HTML_MIME))
+}
+
+fn active_client_supports_mcp_app_html() -> bool {
+    ACTIVE_UPSTREAM_CAPABILITIES.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|caps| caps.get("extensions"))
+            .and_then(|extensions| extensions.get(MCP_APPS_EXTENSION))
+            .is_some_and(mcp_app_html_settings)
+    })
+}
+
+fn server_supports_mcp_app_html(router: &Router, server: &str) -> bool {
+    router
+        .server_extension_settings(server, MCP_APPS_EXTENSION)
+        .as_ref()
+        .is_some_and(mcp_app_html_settings)
+}
+
+fn relays_mcp_app_html_to_active_client(
+    router: &Router,
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    active_client_supports_mcp_app_html()
+        && router
+            .aggregated_extensions(|server| {
+                allowed.is_none_or(|scope| server_in_allowed_scope(server, scope))
+            })
+            .get(MCP_APPS_EXTENSION)
+            .is_some_and(mcp_app_html_settings)
+}
+
 /// Add the fields a modern client requires to a result.
 ///
 /// No-op for legacy clients, so their responses stay byte-identical to what
@@ -238,6 +275,58 @@ const MODERN_UPSTREAM_VERSIONS: [&str; 1] = [MODERN_PROTOCOL_VERSION];
 /// Toolport's third-party MCP extension identifier. `toolport.app` is a domain
 /// we own, so its required reverse-domain vendor prefix is `app.toolport`.
 const TOOLPORT_GATEWAY_EXTENSION: &str = "app.toolport/gateway";
+/// Standard MCP Apps extension identifier (SEP-1865).
+const MCP_APPS_EXTENSION: &str = "io.modelcontextprotocol/ui";
+const MCP_APP_HTML_MIME: &str = "text/html;profile=mcp-app";
+
+fn mcp_app_resource_uri(tool: &Value) -> Option<&str> {
+    tool.pointer("/_meta/ui/resourceUri")
+        .or_else(|| tool.pointer("/_meta/ui~1resourceUri"))
+        .and_then(Value::as_str)
+        .filter(|uri| uri.starts_with("ui://"))
+}
+
+fn is_mcp_app_tool(tool: &Value) -> bool {
+    mcp_app_resource_uri(tool).is_some()
+}
+
+fn mcp_app_tool_is_model_visible(tool: &Value) -> bool {
+    match tool.pointer("/_meta/ui/visibility") {
+        None => true,
+        Some(Value::Array(visibility)) => visibility.iter().any(|audience| audience == "model"),
+        Some(_) => false,
+    }
+}
+
+fn named_tool_is_model_visible(name: &str, cached: &[Value], router: &Router) -> bool {
+    cached
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+        .map(mcp_app_tool_is_model_visible)
+        .or_else(|| {
+            router
+                .aggregated_tools()
+                .into_iter()
+                .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+                .map(|tool| mcp_app_tool_is_model_visible(&tool))
+        })
+        .unwrap_or(true)
+}
+
+fn is_mcp_app_resource_result(uri: &str, result: &Value) -> bool {
+    uri.starts_with("ui://")
+        && result
+            .get("contents")
+            .and_then(Value::as_array)
+            .is_some_and(|contents| {
+                !contents.is_empty()
+                    && contents.iter().all(|content| {
+                        content.get("uri").and_then(Value::as_str) == Some(uri)
+                            && content.get("mimeType").and_then(Value::as_str)
+                                == Some(MCP_APP_HTML_MIME)
+                    })
+            })
+}
 
 /// The protocol version a modern client declared on this request.
 ///
@@ -293,6 +382,20 @@ fn gateway_capabilities(
         // on the upstream hop. Remove the whole namespace, not only the one
         // extension known to this build, before adding Toolport's declaration.
         extensions.retain(|identifier, _| !identifier.starts_with("app.toolport/"));
+        // Toolport currently relays only the reserved MCP App HTML payload.
+        // Advertise the intersection rather than copying downstream MIME types
+        // that this gateway did not negotiate or validate.
+        if extensions
+            .get(MCP_APPS_EXTENSION)
+            .is_some_and(mcp_app_html_settings)
+        {
+            extensions.insert(
+                MCP_APPS_EXTENSION.to_string(),
+                json!({ "mimeTypes": [MCP_APP_HTML_MIME] }),
+            );
+        } else {
+            extensions.remove(MCP_APPS_EXTENSION);
+        }
         let discovery_mode = if lazy {
             DiscoveryMode::Lazy
         } else if grouped_discovery() {
@@ -2924,6 +3027,35 @@ fn scope_tools(
     }
 }
 
+/// UI-linked tools are part of MCP Apps discovery, not ordinary model-context
+/// discovery. An Apps-capable host must receive their `_meta.ui.resourceUri`
+/// even when Toolport is otherwise in lazy/grouped mode; hosts then apply the
+/// extension's model/app visibility rules themselves.
+fn mcp_app_tools_for_client(
+    catalog: &[Value],
+    allowed: Option<&std::collections::HashSet<String>>,
+    router: &Router,
+) -> Vec<Value> {
+    if !relays_mcp_app_html_to_active_client(router, allowed) {
+        return Vec::new();
+    }
+    scope_tools(catalog, allowed, |name| {
+        router.route_of(name).map(|(server, _)| server.to_string())
+    })
+    .into_iter()
+    .filter(|tool| {
+        is_mcp_app_tool(tool)
+            && tool
+                .get("name")
+                .and_then(Value::as_str)
+                .and_then(|name| router.route_of(name))
+                .is_some_and(|(server, _)| {
+                    server_supports_mcp_app_html(router, server)
+                })
+    })
+    .collect()
+}
+
 /// Whether a client scoped to `allowed` may see the exposed tool `name`. See
 /// [`scope_tools`] for how `route_of` is resolved and why the `server__` prefix is only a
 /// fallback.
@@ -3470,6 +3602,12 @@ fn execute_call(
 ) -> Value {
     let mut confirmed = opts.confirmed;
     let shape = opts.shape;
+    if !opts.allow_app_only && !named_tool_is_model_visible(name, cached, router) {
+        return json!({
+            "content": [{ "type": "text", "text": format!("Toolport: '{name}' is available only to its MCP App.") }],
+            "isError": true
+        });
+    }
     // Direct modern calls can use MRTR even on their first round, before any
     // requestState exists. Code-mode steps deliberately keep the legacy broker
     // because they cannot surface an intermediate result to the upstream client;
@@ -3997,6 +4135,9 @@ struct CallOpts {
     /// intermediate calls pass full bodies into the sandbox (they never enter model
     /// context); only the script's final aggregate is shaped for the client.
     shape: bool,
+    /// App-only tools bypass the model-facing visibility guard only for a
+    /// direct call from a host that negotiated the supported Apps MIME.
+    allow_app_only: bool,
 }
 
 /// Run untrusted tool-call output through content defense and result shaping, then
@@ -4172,6 +4313,7 @@ fn run_script_dispatch(
                     CallOpts {
                         confirmed: false,
                         shape: false,
+                        allow_app_only: false,
                     },
                     live_owned.as_ref(),
                 )
@@ -4408,6 +4550,11 @@ fn handle_request_with_cancel(
                 } else {
                     cached
                 };
+                // MCP Apps hosts discover the UI resource linkage only through
+                // tools/list. Preserve those few tools when the requesting host
+                // explicitly negotiated the UI extension; the rest of the
+                // downstream catalog remains behind lazy discovery.
+                tools.extend(mcp_app_tools_for_client(catalog, allowed, router));
                 let status = status_tool_def();
                 let full_tokens = savings::estimate_tokens(catalog)
                     + savings::estimate_tokens(std::slice::from_ref(&status));
@@ -4446,8 +4593,9 @@ fn handle_request_with_cancel(
                 let scoped = scope_tools(catalog, allowed, |n| {
                     router.route_of(n).map(|(s, _)| s.to_string())
                 });
-                let tools =
+                let mut tools =
                     grouped_tool_defs(reg.allow_agent_control, reg.confirm_destructive, &scoped);
+                tools.extend(mcp_app_tools_for_client(catalog, allowed, router));
                 // Savings vs. advertising the whole (scoped) catalog + status.
                 let status = status_tool_def();
                 let full_tokens = savings::estimate_tokens(&scoped)
@@ -4493,9 +4641,13 @@ fn handle_request_with_cancel(
             } else {
                 cached.to_vec()
             };
-            tools.extend(scope_tools(&catalog, allowed, |n| {
+            let mut scoped = scope_tools(&catalog, allowed, |n| {
                 router.route_of(n).map(|(s, _)| s.to_string())
-            }));
+            });
+            if !relays_mcp_app_html_to_active_client(router, allowed) {
+                scoped.retain(mcp_app_tool_is_model_visible);
+            }
+            tools.extend(scoped);
             gtrace(&format!(
                 "tools/list -> {} tools (cache={})",
                 tools.len(),
@@ -4651,6 +4803,20 @@ fn handle_request_with_cancel(
                     &live
                 } else {
                     cached
+                };
+                // This meta-tool feeds the model directly, so app-only tools
+                // must never appear in its results even for an Apps-capable
+                // host. Such tools are exposed separately for the host/view.
+                let model_visible;
+                let base = if base.iter().any(|tool| !mcp_app_tool_is_model_visible(tool)) {
+                    model_visible = base
+                        .iter()
+                        .filter(|tool| mcp_app_tool_is_model_visible(tool))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    model_visible.as_slice()
+                } else {
+                    base
                 };
                 // Avoid cloning the entire catalog for the normal local/unscoped path.
                 // Scoped HTTP callers still get a fail-closed filtered copy and a
@@ -4952,11 +5118,17 @@ fn handle_request_with_cancel(
             // toolport_call_tool dispatches a discovered tool: unwrap to its real
             // name + arguments, then run it through the shared execute path (scope,
             // approval, confirm, shaping) that a code-mode toolport.call() also uses.
-            let (name, arguments) = if name == "toolport_call_tool" {
+            let model_facing_meta_call = name == "toolport_call_tool";
+            let (name, arguments) = if model_facing_meta_call {
                 unwrap_call_tool(&arguments)
             } else {
                 (name, arguments)
             };
+            let allow_app_only = !model_facing_meta_call
+                && relays_mcp_app_html_to_active_client(router, allowed)
+                && router
+                    .route_of(&name)
+                    .is_some_and(|(server, _)| server_supports_mcp_app_html(router, server));
             let mrtr = MrtrRequest::from_params(params);
             let result = execute_call(
                 reg,
@@ -4974,6 +5146,7 @@ fn handle_request_with_cancel(
                 CallOpts {
                     confirmed,
                     shape: true,
+                    allow_app_only,
                 },
                 live_router,
             );
@@ -5085,11 +5258,26 @@ fn handle_request_with_cancel(
                 (!mrtr.is_empty()).then_some(&mrtr),
             ) {
                 Ok(mut result) => {
+                    // MCP App HTML is executable UI payload for the host's
+                    // sandbox, not model-facing resource text. The Apps spec
+                    // requires the raw document so the host can apply its CSP;
+                    // wrapping a scanner hit would corrupt the HTML. Only take
+                    // this path after the modern host explicitly negotiates UI
+                    // support and the response matches the reserved URI + MIME.
+                    let preserve_mcp_app =
+                        relays_mcp_app_html_to_active_client(router, allowed)
+                        && router.resource_server(uri).is_some_and(|server| {
+                            server_supports_mcp_app_html(router, server)
+                        })
+                        && is_mcp_app_resource_result(uri, &result);
                     // Content defense: a resource is as attacker-controllable as a tool
                     // result, so scan it for injection and label any flagged text as data.
                     // Block mode (SOU-345) uses the owning server id for the exempt map
                     // and still runs when contentDefense is off but block is on.
-                    if reg.content_defense_effective() || reg.block_on_injection_effective() {
+                    if !preserve_mcp_app
+                        && (reg.content_defense_effective()
+                            || reg.block_on_injection_effective())
+                    {
                         let srv = router.resource_server(uri).unwrap_or(uri);
                         let block = reg.should_block_injection_for(srv);
                         if let Some(msg) =
@@ -11780,6 +11968,7 @@ mod tests {
             CallOpts {
                 confirmed: false,
                 shape: true,
+                allow_app_only: false,
             },
             None,
         );
@@ -16066,6 +16255,409 @@ mod tests {
         assert!(scoped_extensions.contains_key(TOOLPORT_GATEWAY_EXTENSION));
         assert!(!scoped_extensions.contains_key("com.example/passive"));
         assert!(!scoped_extensions.contains_key("io.modelcontextprotocol/tasks"));
+    }
+
+    #[derive(Default)]
+    struct McpAppsServer {
+        protocol_meta: Option<Value>,
+    }
+
+    impl Transport for McpAppsServer {
+        fn request(
+            &mut self,
+            method: &str,
+            params: Value,
+        ) -> Result<Value, downstream::TransportError> {
+            match method {
+                "initialize" => Err(downstream::TransportError::Rpc(json!({
+                    "code": -32601,
+                    "message": "method not found"
+                }))),
+                "server/discover" => Ok(json!({
+                    "supportedVersions": [MODERN_PROTOCOL_VERSION],
+                    "capabilities": {
+                        "resources": {},
+                        "extensions": {
+                            "io.modelcontextprotocol/ui": {
+                                "mimeTypes": [
+                                    "text/html;profile=mcp-app",
+                                    "image/svg+xml"
+                                ]
+                            }
+                        }
+                    }
+                })),
+                "tools/list" => {
+                    let mut tools = vec![json!({
+                        "name": "plain",
+                        "inputSchema": { "type": "object" }
+                    })];
+                    let ui_negotiated = self
+                        .protocol_meta
+                        .as_ref()
+                        .and_then(|meta| {
+                            meta.pointer("/io.modelcontextprotocol~1clientCapabilities/extensions/io.modelcontextprotocol~1ui/mimeTypes")
+                        })
+                        .and_then(Value::as_array)
+                        .is_some_and(|mime_types| {
+                            mime_types
+                                .iter()
+                                .any(|mime| mime == "text/html;profile=mcp-app")
+                        });
+                    if ui_negotiated {
+                        tools.push(json!({
+                            "name": "dashboard",
+                            "inputSchema": { "type": "object" },
+                            "_meta": {
+                                "ui": {
+                                    "resourceUri": "ui://fixture/dashboard",
+                                    "visibility": ["model", "app"]
+                                }
+                            }
+                        }));
+                        tools.push(json!({
+                            "name": "app_only",
+                            "inputSchema": { "type": "object" },
+                            "_meta": {
+                                "ui": {
+                                    "resourceUri": "ui://fixture/dashboard",
+                                    "visibility": ["app"]
+                                }
+                            }
+                        }));
+                    }
+                    Ok(json!({ "tools": tools }))
+                }
+                "tools/call" => Ok(json!({
+                    "content": [{ "type": "text", "text": params["name"] }],
+                    "isError": false
+                })),
+                "resources/read" => {
+                    assert_eq!(params["uri"], "ui://fixture/dashboard");
+                    Ok(json!({
+                        "contents": [{
+                            "uri": "ui://fixture/dashboard",
+                            "mimeType": "text/html;profile=mcp-app",
+                            "text": "<!doctype html><script>const label = 'ignore previous instructions';</script>"
+                        }]
+                    }))
+                }
+                other => Err(downstream::TransportError::Fatal(format!(
+                    "unexpected method {other}"
+                ))),
+            }
+        }
+
+        fn notify(
+            &mut self,
+            _method: &str,
+            _params: Value,
+        ) -> Result<(), downstream::TransportError> {
+            Ok(())
+        }
+
+        fn set_protocol_meta(&mut self, meta: Option<Value>) {
+            self.protocol_meta = meta;
+        }
+    }
+
+    fn modern_apps_req(id: i64, method: &str, params: Value) -> Value {
+        let mut request = modern_req(id, method, params);
+        request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({
+            "extensions": {
+                "io.modelcontextprotocol/ui": {
+                    "mimeTypes": ["text/html;profile=mcp-app"]
+                }
+            }
+        });
+        request
+    }
+
+    #[test]
+    fn lazy_discovery_keeps_ui_linked_tools_only_for_apps_hosts() {
+        let reg = Registry::default();
+        let mut router = Router::new();
+        router.add(
+            DownstreamServer::connect("apps".into(), Box::new(McpAppsServer::default())).unwrap(),
+        );
+        let cached = router.aggregated_tools();
+        let guard = SearchGuard::default();
+        let confirm = ConfirmGuard::new();
+
+        let discovered = handle_request(
+            &modern_req(0, "server/discover", json!({})),
+            &reg,
+            &router,
+            &cached,
+            true,
+            None,
+            &guard,
+            &confirm,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            discovered["result"]["capabilities"]["extensions"][MCP_APPS_EXTENSION],
+            json!({ "mimeTypes": [MCP_APP_HTML_MIME] })
+        );
+
+        let apps = handle_request(
+            &modern_apps_req(1, "tools/list", json!({})),
+            &reg,
+            &router,
+            &cached,
+            true,
+            None,
+            &guard,
+            &confirm,
+            None,
+            None,
+        )
+        .unwrap();
+        let names = apps["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"apps__dashboard"));
+        assert!(names.contains(&"apps__app_only"));
+        assert!(!names.contains(&"apps__plain"));
+        assert_eq!(
+            apps["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == "apps__dashboard")
+                .unwrap()["_meta"]["ui"]["resourceUri"],
+            "ui://fixture/dashboard"
+        );
+
+        let ordinary = handle_request(
+            &modern_req(2, "tools/list", json!({})),
+            &reg,
+            &router,
+            &cached,
+            true,
+            None,
+            &guard,
+            &confirm,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(ordinary["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| !tool["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("apps__"))));
+
+        let mut wrong_mime = modern_req(3, "tools/list", json!({}));
+        wrong_mime["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({
+            "extensions": {
+                "io.modelcontextprotocol/ui": { "mimeTypes": ["image/svg+xml"] }
+            }
+        });
+        let wrong_mime = handle_request(
+            &wrong_mime,
+            &reg,
+            &router,
+            &cached,
+            true,
+            None,
+            &guard,
+            &confirm,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(wrong_mime["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| !tool["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("apps__"))));
+    }
+
+    #[test]
+    fn app_only_tools_stay_out_of_model_facing_gateway_paths() {
+        let reg = Registry::default();
+        let mut router = Router::new();
+        router.add(
+            DownstreamServer::connect("apps".into(), Box::new(McpAppsServer::default())).unwrap(),
+        );
+        let cached = router.aggregated_tools();
+        let guard = SearchGuard::default();
+        let confirm = ConfirmGuard::new();
+
+        let ordinary_full = handle_request(
+            &modern_req(10, "tools/list", json!({})),
+            &reg,
+            &router,
+            &cached,
+            false,
+            None,
+            &guard,
+            &confirm,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(ordinary_full["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["name"] != "apps__app_only"));
+
+        let apps_full = handle_request(
+            &modern_apps_req(11, "tools/list", json!({})),
+            &reg,
+            &router,
+            &cached,
+            false,
+            None,
+            &guard,
+            &confirm,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(apps_full["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "apps__app_only"));
+
+        let searched = handle_request(
+            &modern_apps_req(
+                12,
+                "tools/call",
+                json!({
+                    "name": "toolport_search_tools",
+                    "arguments": { "query": "app only" }
+                }),
+            ),
+            &reg,
+            &router,
+            &cached,
+            true,
+            None,
+            &guard,
+            &confirm,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!searched.to_string().contains("apps__app_only"));
+
+        let nested = handle_request(
+            &modern_apps_req(
+                13,
+                "tools/call",
+                json!({
+                    "name": "toolport_call_tool",
+                    "arguments": { "name": "apps__app_only", "arguments": {} }
+                }),
+            ),
+            &reg,
+            &router,
+            &cached,
+            true,
+            None,
+            &guard,
+            &confirm,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(nested["result"]["isError"], true);
+        assert!(nested["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("available only to its MCP App"));
+
+        let direct = handle_request(
+            &modern_apps_req(
+                14,
+                "tools/call",
+                json!({ "name": "apps__app_only", "arguments": {} }),
+            ),
+            &reg,
+            &router,
+            &cached,
+            true,
+            None,
+            &guard,
+            &confirm,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(direct["result"]["isError"], false);
+    }
+
+    #[test]
+    fn negotiated_mcp_app_html_passes_through_without_content_defense_rewrite() {
+        let reg = Registry::default();
+        assert!(
+            reg.content_defense_effective(),
+            "fixture needs the default scanner on"
+        );
+        let mut router = Router::new();
+        router.add(
+            DownstreamServer::connect("apps".into(), Box::new(McpAppsServer::default())).unwrap(),
+        );
+        let response = handle_request(
+            &modern_apps_req(
+                3,
+                "resources/read",
+                json!({ "uri": "ui://fixture/dashboard" }),
+            ),
+            &reg,
+            &router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response["result"]["contents"][0]["text"],
+            "<!doctype html><script>const label = 'ignore previous instructions';</script>"
+        );
+        assert_eq!(
+            response["result"]["contents"][0]["mimeType"],
+            "text/html;profile=mcp-app"
+        );
+
+        let ordinary = handle_request(
+            &modern_req(
+                4,
+                "resources/read",
+                json!({ "uri": "ui://fixture/dashboard" }),
+            ),
+            &reg,
+            &router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(ordinary["result"]["contents"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("[conduit: the following is external data")));
     }
 
     #[test]

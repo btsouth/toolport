@@ -29,6 +29,27 @@ use crate::registry::ToolOverride;
 
 const TASK_HANDLE_PREFIX: &str = "toolport-task:v1:";
 const TASK_HANDLE_NONCE_LEN: usize = 24;
+const MCP_APPS_EXTENSION: &str = "io.modelcontextprotocol/ui";
+const MCP_APP_HTML_MIME: &str = "text/html;profile=mcp-app";
+
+fn supports_mcp_app_html(extensions: &serde_json::Map<String, Value>) -> bool {
+    extensions
+        .get(MCP_APPS_EXTENSION)
+        .and_then(|settings| settings.get("mimeTypes"))
+        .and_then(Value::as_array)
+        .is_some_and(|mime_types| mime_types.iter().any(|mime| mime == MCP_APP_HTML_MIME))
+}
+
+/// MCP Apps resources are primarily discovered through tool metadata and MAY be
+/// omitted from `resources/list`. Keep both the current nested field and the
+/// pre-GA flat spelling so a transparent gateway can still route the host's
+/// subsequent `resources/read` to the tool's owning server.
+fn mcp_app_resource_uri(tool: &Value) -> Option<&str> {
+    tool.pointer("/_meta/ui/resourceUri")
+        .or_else(|| tool.pointer("/_meta/ui~1resourceUri"))
+        .and_then(Value::as_str)
+        .filter(|uri| uri.starts_with("ui://"))
+}
 
 /// Seal the owner and native task id into one opaque, unguessable handle. The
 /// installation-local key survives restarts; authenticated encryption prevents
@@ -572,6 +593,7 @@ impl Router {
         resources: &[Value],
         resource_templates: &[Value],
         prompts: &[Value],
+        route_mcp_apps: bool,
     ) {
         // Allocate the exposed name regardless of policy so toggling one tool
         // never renames its siblings (their `_2` suffixes stay put), and in an
@@ -626,6 +648,26 @@ impl Router {
             self.tools.push(t);
             self.routes
                 .insert(exposed, (server_id.to_string(), orig.to_string()));
+
+            // UI-only resources are allowed to stay out of resources/list. The
+            // tool linkage is therefore an authoritative route hint, subject to
+            // the same first-writer collision rule as ordinary resources below.
+            if route_mcp_apps {
+                if let Some(uri) = mcp_app_resource_uri(tool) {
+                    match self.resource_routes.get(uri) {
+                        Some(owner) if owner != server_id => {
+                            eprintln!(
+                                "toolport: MCP App resource URI collision on '{uri}': keeping owner '{owner}', refusing claim from '{server_id}'"
+                            );
+                        }
+                        Some(_) => {}
+                        None => {
+                            self.resource_routes
+                                .insert(uri.to_string(), server_id.to_string());
+                        }
+                    }
+                }
+            }
         }
 
         // Resources: pass uris through unchanged and remember which server owns
@@ -641,7 +683,14 @@ impl Router {
                         );
                     }
                     Some(_) => {
-                        // Same server re-advertising the URI (rebuild); keep one entry.
+                        // The route may already have come from this server's MCP
+                        // App tool metadata. Keep the explicit resource visible in
+                        // resources/list, while still deduplicating repeated rows.
+                        if !self.resources.iter().any(|listed| {
+                            listed.get("uri").and_then(Value::as_str) == Some(uri)
+                        }) {
+                            self.resources.push(resource.clone());
+                        }
                     }
                     None => {
                         self.resources.push(resource.clone());
@@ -699,12 +748,14 @@ impl Router {
     /// non-reconnectable variant kept for tests and callers with no factory.
     pub fn add_with_reconnect(&mut self, server: DownstreamServer, reconnect: Option<Reconnect>) {
         let id = server.id.clone();
+        let route_mcp_apps = supports_mcp_app_html(server.extensions());
         self.index_server(
             &id,
             &server.tools,
             &server.resources,
             &server.resource_templates,
             &server.prompts,
+            route_mcp_apps,
         );
         let idx = self.servers.len();
         self.servers.push(Arc::new(ServerSlot {
@@ -856,6 +907,20 @@ impl Router {
             .into_iter()
             .filter_map(|(identifier, settings)| settings.map(|settings| (identifier, settings)))
             .collect()
+    }
+
+    /// One connected server's settings for an extension. Callers that depend on
+    /// a particular setting (rather than mere identifier presence) must inspect
+    /// this server-local value instead of the aggregate.
+    pub fn server_extension_settings(&self, server_id: &str, identifier: &str) -> Option<Value> {
+        let &index = self.by_id.get(server_id)?;
+        self.servers[index]
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extensions()
+            .get(identifier)
+            .cloned()
     }
 
     /// Positive downstream TTLs schedule a refresh at their expiry. Zero/missing
@@ -1011,7 +1076,7 @@ impl Router {
         // `&mut self` re-index.
         let slots: Vec<Arc<ServerSlot>> = self.servers.clone();
         for slot in &slots {
-            let (tools, resources, resource_templates, prompts) = {
+            let (tools, resources, resource_templates, prompts, route_mcp_apps) = {
                 let s = slot
                     .inner
                     .lock()
@@ -1021,6 +1086,7 @@ impl Router {
                     s.resources.clone(),
                     s.resource_templates.clone(),
                     s.prompts.clone(),
+                    supports_mcp_app_html(s.extensions()),
                 )
             };
             self.index_server(
@@ -1029,6 +1095,7 @@ impl Router {
                 &resources,
                 &resource_templates,
                 &prompts,
+                route_mcp_apps,
             );
         }
     }
@@ -1785,6 +1852,105 @@ mod tests {
         .unwrap()
     }
 
+    struct AppTransport {
+        resource_uri: &'static str,
+        legacy_meta: bool,
+        protocol_meta: Option<Value>,
+    }
+
+    impl Transport for AppTransport {
+        fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
+            match method {
+                "initialize" => Err(TransportError::Rpc(json!({
+                    "code": -32601,
+                    "message": "method not found"
+                }))),
+                "server/discover" => Ok(json!({
+                    "supportedVersions": [crate::downstream::MODERN_PROTOCOL_VERSION],
+                    "capabilities": {
+                        "resources": {},
+                        "extensions": {
+                            "io.modelcontextprotocol/ui": {
+                                "mimeTypes": ["text/html;profile=mcp-app"]
+                            }
+                        }
+                    }
+                })),
+                "tools/list" => {
+                    let ui_negotiated = self
+                        .protocol_meta
+                        .as_ref()
+                        .and_then(|meta| {
+                            meta.pointer("/io.modelcontextprotocol~1clientCapabilities/extensions/io.modelcontextprotocol~1ui/mimeTypes")
+                        })
+                        .and_then(Value::as_array)
+                        .is_some_and(|mime_types| {
+                            mime_types
+                                .iter()
+                                .any(|mime| mime == "text/html;profile=mcp-app")
+                        });
+                    if !ui_negotiated {
+                        return Ok(json!({ "tools": [] }));
+                    }
+                    let meta = if self.legacy_meta {
+                        json!({ "ui/resourceUri": self.resource_uri })
+                    } else {
+                        json!({ "ui": { "resourceUri": self.resource_uri } })
+                    };
+                    Ok(json!({
+                        "tools": [{
+                            "name": "dashboard",
+                            "inputSchema": { "type": "object" },
+                            "_meta": meta
+                        }]
+                    }))
+                }
+                "resources/list" => Ok(json!({ "resources": [] })),
+                "resources/templates/list" => Ok(json!({ "resourceTemplates": [] })),
+                "resources/read" => {
+                    assert_eq!(params["uri"], self.resource_uri);
+                    assert!(
+                        self.protocol_meta
+                            .as_ref()
+                            .and_then(|meta| meta.pointer(
+                                "/io.modelcontextprotocol~1clientCapabilities/extensions/io.modelcontextprotocol~1ui"
+                            ))
+                            .is_none(),
+                        "catalog-only Apps capability leaked into resources/read"
+                    );
+                    Ok(json!({
+                        "contents": [{
+                            "uri": self.resource_uri,
+                            "mimeType": "text/html;profile=mcp-app",
+                            "text": "<!doctype html><title>Toolport App</title>"
+                        }]
+                    }))
+                }
+                other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
+            }
+        }
+
+        fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn set_protocol_meta(&mut self, meta: Option<Value>) {
+            self.protocol_meta = meta;
+        }
+    }
+
+    fn app_server(id: &str, uri: &'static str, legacy_meta: bool) -> DownstreamServer {
+        DownstreamServer::connect(
+            id.to_string(),
+            Box::new(AppTransport {
+                resource_uri: uri,
+                legacy_meta,
+                protocol_meta: None,
+            }),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn extension_aggregation_is_scoped_and_omits_conflicting_settings() {
         let mut router = Router::new();
@@ -1815,6 +1981,68 @@ mod tests {
         let alpha = router.aggregated_extensions(|server_id| server_id == "alpha");
         assert_eq!(alpha["com.example/mode"]["version"], 1);
         assert!(alpha.get("com.example/beta").is_none());
+    }
+
+    #[test]
+    fn mcp_app_tool_metadata_routes_unlisted_ui_resources() {
+        for (legacy_meta, uri) in [
+            (false, "ui://modern/dashboard"),
+            (true, "ui://legacy/dashboard"),
+        ] {
+            let mut router = Router::new();
+            router.add(app_server("apps", uri, legacy_meta));
+            router.refresh_tools();
+
+            assert_eq!(
+                router.aggregated_resources(),
+                Vec::<Value>::new(),
+                "the fixture intentionally omits its UI resource from resources/list"
+            );
+            assert_eq!(router.resource_server(uri), Some("apps"));
+            let result = router
+                .read_resource(uri)
+                .expect("UI resource routes through tool metadata");
+            assert_eq!(result["contents"][0]["uri"], uri);
+        }
+    }
+
+    #[test]
+    fn listed_mcp_app_resource_stays_visible_after_tool_route_hint() {
+        let uri = "ui://listed/dashboard";
+        let mut server = app_server("apps", uri, false);
+        server.resources.push(json!({
+            "uri": uri,
+            "name": "Dashboard",
+            "mimeType": "text/html;profile=mcp-app"
+        }));
+        let mut router = Router::new();
+        router.add(server);
+
+        assert_eq!(router.aggregated_resources().len(), 1);
+        assert_eq!(router.aggregated_resources()[0]["uri"], uri);
+        assert_eq!(router.resource_server(uri), Some("apps"));
+    }
+
+    #[test]
+    fn ui_route_hints_require_the_reserved_html_mime_capability() {
+        let uri = "ui://unsupported/dashboard";
+        let mut server = extension_server(
+            "unsupported",
+            json!({
+                "io.modelcontextprotocol/ui": {
+                    "mimeTypes": ["image/svg+xml"]
+                }
+            }),
+        );
+        server.tools.push(json!({
+            "name": "dashboard",
+            "inputSchema": { "type": "object" },
+            "_meta": { "ui": { "resourceUri": uri } }
+        }));
+        let mut router = Router::new();
+        router.add(server);
+
+        assert_eq!(router.resource_server(uri), None);
     }
 
     struct TaskTransport {

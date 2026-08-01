@@ -654,6 +654,37 @@ fn protocol_meta_for(version: &str) -> Value {
     })
 }
 
+const MCP_APPS_EXTENSION: &str = "io.modelcontextprotocol/ui";
+const MCP_APP_HTML_MIME: &str = "text/html;profile=mcp-app";
+
+/// Metadata used for Toolport's own modern catalog fetches.
+///
+/// MCP Apps servers may expose their UI linkage only after the client declares
+/// support. Toolport can faithfully relay that linkage and the reserved HTML
+/// resource to a capable upstream host, so it truthfully declares the one MIME
+/// type it supports here. Other extensions stay request-driven: claiming them
+/// without an originating client could invite callbacks or semantics the
+/// gateway cannot service.
+fn protocol_meta_for_catalog(version: &str, server_capabilities: Option<&Value>) -> Value {
+    let mut meta = protocol_meta_for(version);
+    let supports_mcp_apps = server_capabilities
+        .and_then(|capabilities| capabilities.get("extensions"))
+        .and_then(|extensions| extensions.get(MCP_APPS_EXTENSION))
+        .and_then(|settings| settings.get("mimeTypes"))
+        .and_then(Value::as_array)
+        .is_some_and(|mime_types| mime_types.iter().any(|mime| mime == MCP_APP_HTML_MIME));
+    if supports_mcp_apps {
+        meta["io.modelcontextprotocol/clientCapabilities"] = json!({
+            "extensions": {
+                (MCP_APPS_EXTENSION): {
+                    "mimeTypes": [MCP_APP_HTML_MIME]
+                }
+            }
+        });
+    }
+    meta
+}
+
 /// Max time to wait for a single stdio response before giving up. Without this a
 /// server that never replies would block its thread (and the batch health probe)
 /// forever.
@@ -4094,10 +4125,17 @@ impl DownstreamServer {
                         discovered.get("supportedVersions")
                     )
                 })?;
+                let capabilities = discovered.get("capabilities").cloned();
                 // From here every request carries its own protocol metadata;
                 // there is no handshake and no `notifications/initialized`.
-                transport.set_protocol_meta(Some(protocol_meta_for(&version)));
-                (Era::Modern { version }, discovered.get("capabilities").cloned())
+                // Catalog fetches additionally declare the MCP Apps MIME when
+                // this server offers it, so a capability-aware server includes
+                // its UI tool metadata in tools/list.
+                transport.set_protocol_meta(Some(protocol_meta_for_catalog(
+                    &version,
+                    capabilities.as_ref(),
+                )));
+                (Era::Modern { version }, capabilities)
             }
         };
         let caps = caps.as_ref();
@@ -4128,6 +4166,13 @@ impl DownstreamServer {
         } else {
             listed.items
         };
+
+        // MCP Apps is advertised only for capability-aware catalog fetches.
+        // Restore Toolport's ordinary per-request metadata before any live call
+        // so a non-Apps upstream client cannot inherit that capability.
+        if let Era::Modern { version } = &era {
+            transport.set_protocol_meta(Some(protocol_meta_for(version)));
+        }
 
         // Restore the longer timeout: actual tool calls can legitimately be slow.
         transport.set_read_timeout(STDIO_READ_TIMEOUT);
@@ -4327,7 +4372,23 @@ impl DownstreamServer {
 
     fn refresh_tools_inner(&mut self) {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        match fetch_paginated_list(&mut *self.transport, "tools/list", "tools") {
+        let modern_version = match &self.era {
+            Era::Modern { version } => Some(version.clone()),
+            Era::Legacy { .. } => None,
+        };
+        if let Some(version) = modern_version.as_deref() {
+            let capabilities = json!({ "extensions": self.caps_extensions.clone() });
+            self.transport.set_protocol_meta(Some(protocol_meta_for_catalog(
+                version,
+                Some(&capabilities),
+            )));
+        }
+        let listed = fetch_paginated_list(&mut *self.transport, "tools/list", "tools");
+        if let Some(version) = modern_version.as_deref() {
+            self.transport
+                .set_protocol_meta(Some(protocol_meta_for(version)));
+        }
+        match listed {
             Ok(listed) if listed.warning.is_none() => {
                 self.tool_cache_hint = listed.cache_hint;
                 self.tools = if self.modern_http {
