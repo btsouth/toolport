@@ -5005,6 +5005,50 @@ bad = "not-a-table"
     }
 
     #[test]
+    fn droid_install_preserves_existing_factory_server() {
+        let path = temp_path("droid-install-json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"filesystem":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem"],"env":{"HOME":"/home/user"}}}}"#,
+        )
+        .unwrap();
+
+        // Install: gateway entry added, existing Factory server untouched.
+        {
+            let entry = sample_gateway(Some("Work"), "droid");
+            edit_json_gateway(&path, "mcpServers", Some(&entry), false)
+        }
+        .unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let servers = root["mcpServers"].as_object().unwrap();
+        assert!(servers.contains_key(GATEWAY_ENTRY_NAME));
+        assert!(servers.contains_key("filesystem"));
+        assert_eq!(
+            servers["filesystem"]["env"]["HOME"],
+            "/home/user"
+        );
+        assert_eq!(
+            servers[GATEWAY_ENTRY_NAME]["env"][crate::brand::PROFILE],
+            "Work"
+        );
+
+        // Uninstall: gateway entry removed, existing Factory server still untouched.
+        edit_json_gateway(&path, "mcpServers", None, false).unwrap();
+        let root2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let servers2 = root2["mcpServers"].as_object().unwrap();
+        assert!(!servers2.contains_key(GATEWAY_ENTRY_NAME));
+        assert!(servers2.contains_key("filesystem"));
+        assert_eq!(
+            servers2["filesystem"]["args"],
+            serde_json::json!(["-y", "@modelcontextprotocol/server-filesystem"])
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn shared_http_bridge_entry_for_claude_desktop() {
         // Claude Desktop has no native remote MCP shape; Shared HTTP writes mcp-remote.
         let spec = SharedHttpSpec {
