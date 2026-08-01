@@ -5266,7 +5266,10 @@ fn deliver_resource_updated(
             session_ids.push(sid);
         }
     }
-    if need_stdio {
+    if should_write_legacy_stdio_resource_update(
+        need_stdio,
+        MODERN_STDIO_UPSTREAM.load(Ordering::SeqCst),
+    ) {
         let mut out = stdout
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6686,6 +6689,10 @@ impl StdioUpstream {
 
 thread_local! {
     static ACTIVE_MCP_SESSION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn should_write_legacy_stdio_resource_update(need_stdio: bool, modern_stdio: bool) -> bool {
+    need_stdio && !modern_stdio
 }
 
 fn modern_subscription_key(
@@ -14714,6 +14721,16 @@ mod tests {
         let sessions = state.mcp_sessions.lock().unwrap();
         let sess = sessions.get(&s1).unwrap();
         assert!(sess.outbound.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn modern_stdio_suppresses_legacy_untagged_resource_updates() {
+        assert!(should_write_legacy_stdio_resource_update(true, false));
+        assert!(
+            !should_write_legacy_stdio_resource_update(true, true),
+            "modern stdio notifications must travel only through the tagged listener"
+        );
+        assert!(!should_write_legacy_stdio_resource_update(false, false));
     }
 
     #[test]
