@@ -182,14 +182,19 @@ fn unsupported_version_error(id: Value, requested: &str) -> Value {
     })
 }
 
-/// What Toolport advertises to upstream clients, shared by `initialize` (legacy)
-/// and `server/discover` (modern) so the two can never drift.
+/// What Toolport advertises to upstream clients. The catalog capabilities stay
+/// aligned across eras, while the removed legacy `resources.subscribe` flag is
+/// omitted from modern discovery in favor of `subscriptions/listen`.
 fn gateway_capabilities() -> Value {
+    let resources = if serving_modern_client() {
+        json!({ "listChanged": true })
+    } else {
+        // Always-on legacy proxy: advertise subscribe, fail closed when no owner can.
+        json!({ "listChanged": true, "subscribe": true })
+    };
     json!({
         "tools": { "listChanged": true },
-        // Always-on proxy for resource subscriptions (SOU-394): advertise
-        // subscribe, fail closed when no owner can.
-        "resources": { "listChanged": true, "subscribe": true },
+        "resources": resources,
         "prompts": { "listChanged": true },
         "completions": {}
     })
@@ -602,6 +607,10 @@ static PROGRESS_ROUTES: std::sync::OnceLock<Arc<Mutex<ProgressRoutes>>> =
 /// one of them silently resolved to the stdio branch - including the ones whose
 /// whole point was an HTTP gateway (SOU-474 #9).
 static HAS_STDIO_CLIENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Once this stdio peer sends a 2026-07-28 request, unsolicited legacy
+/// notifications must stop. Modern notifications travel only through its
+/// explicit `subscriptions/listen` filter.
+static MODERN_STDIO_UPSTREAM: AtomicBool = AtomicBool::new(false);
 
 fn set_has_stdio_client(present: bool) {
     HAS_STDIO_CLIENT.store(if present { 2 } else { 1 }, std::sync::atomic::Ordering::SeqCst);
@@ -5118,6 +5127,7 @@ fn connect_one(
             Some(Arc::clone(&server_handler)),
             resource_updated,
             progress,
+            Some(Arc::clone(dirty)),
         )
     } else {
         Err("no command or url".to_string())
@@ -5164,12 +5174,14 @@ fn notify_list_changed(
     method: &str,
 ) {
     let msg = json!({ "jsonrpc": "2.0", "method": method });
-    let mut out = stdout
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = write_json_line(&mut *out, &msg);
+    if !MODERN_STDIO_UPSTREAM.load(Ordering::SeqCst) {
+        let mut out = stdout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = write_json_line(&mut *out, &msg);
+    }
     if let Some(sessions) = mcp_sessions {
-        fanout_mcp_notification(sessions, &msg);
+        fanout_mcp_notification(stdout, sessions, &msg);
     }
 }
 
@@ -5177,20 +5189,31 @@ fn notify_list_changed(
 /// session (SOU-328). Best-effort: a full outbound queue drops that session's
 /// copy and continues so one stuck client cannot block the others.
 fn fanout_mcp_notification(
+    stdout: &Arc<Mutex<std::io::Stdout>>,
     mcp_sessions: &Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
     msg: &Value,
 ) {
-    let Ok(json) = serde_json::to_string(msg) else {
-        return;
-    };
-    let sessions = mcp_sessions
+    let sessions: Vec<Arc<McpSession>> = mcp_sessions
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for session in sessions.values() {
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect();
+    for session in sessions {
         if session.is_expired() || session.closed.load(Ordering::SeqCst) {
             continue;
         }
-        if !session.push_message(json.clone(), request_id_key(msg)) {
+        let Some(json) = session.notification_json(msg) else {
+            continue;
+        };
+        if session.is_modern_stdio() {
+            if let Ok(value) = serde_json::from_str::<Value>(&json) {
+                let mut out = stdout
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = write_json_line(&mut *out, &value);
+            }
+        } else if !session.push_message(json, request_id_key(msg)) {
             eprintln!("toolport: MCP session outbound queue full; list_changed dropped");
         }
     }
@@ -5234,16 +5257,13 @@ fn deliver_resource_updated(
         "method": "notifications/resources/updated",
         "params": { "uri": uri }
     });
-    let Ok(json) = serde_json::to_string(&msg) else {
-        return;
-    };
     let mut need_stdio = false;
-    let mut http_ids: Vec<String> = Vec::new();
+    let mut session_ids: Vec<String> = Vec::new();
     for sid in targets {
         if sid == RESOURCE_SUB_STDIO {
             need_stdio = true;
         } else {
-            http_ids.push(sid);
+            session_ids.push(sid);
         }
     }
     if need_stdio {
@@ -5252,18 +5272,31 @@ fn deliver_resource_updated(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = write_json_line(&mut *out, &msg);
     }
-    if !http_ids.is_empty() {
-        let sessions = mcp_sessions
+    if !session_ids.is_empty() {
+        let targets: Vec<Arc<McpSession>> = {
+            let sessions = mcp_sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for sid in http_ids {
-            let Some(session) = sessions.get(&sid) else {
-                continue;
-            };
+            session_ids
+                .iter()
+                .filter_map(|sid| sessions.get(sid).cloned())
+                .collect()
+        };
+        for session in targets {
             if session.is_expired() || session.closed.load(Ordering::SeqCst) {
                 continue;
             }
-            if !session.push_message(json.clone(), None) {
+            let Some(json) = session.notification_json(&msg) else {
+                continue;
+            };
+            if session.is_modern_stdio() {
+                if let Ok(value) = serde_json::from_str::<Value>(&json) {
+                    let mut out = stdout
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let _ = write_json_line(&mut *out, &value);
+                }
+            } else if !session.push_message(json, None) {
                 eprintln!(
                     "toolport: MCP session outbound queue full; resources/updated dropped"
                 );
@@ -6655,6 +6688,319 @@ thread_local! {
     static ACTIVE_MCP_SESSION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
+fn modern_subscription_key(
+    owner: Option<&McpSessionOwner>,
+    id: &Value,
+    transport: ModernSubscriptionTransport,
+) -> String {
+    let is_http = transport == ModernSubscriptionTransport::Http;
+    let transport_name = match transport {
+        ModernSubscriptionTransport::Http => "http",
+        ModernSubscriptionTransport::Stdio => "stdio",
+    };
+    let owner = owner
+        .map(|owner| {
+            json!({
+                "identity": owner.identity,
+                "scope": owner.scope,
+            })
+        })
+        .unwrap_or_else(|| json!({ "identity": "stdio" }));
+    let nonce = is_http.then(new_mcp_session_id);
+    json!({
+        "kind": "subscriptions/listen",
+        "transport": transport_name,
+        "owner": owner,
+        "id": id,
+        "nonce": nonce,
+    })
+    .to_string()
+}
+
+fn parse_modern_subscription_filter(req: &Value) -> Result<ModernSubscriptionFilter, String> {
+    let notifications = req
+        .get("params")
+        .and_then(|params| params.get("notifications"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "Toolport: subscriptions/listen requires params.notifications".to_string()
+        })?;
+    let opt_in = |name: &str| -> Result<bool, String> {
+        match notifications.get(name) {
+            None => Ok(false),
+            Some(value) => value.as_bool().ok_or_else(|| {
+                format!("Toolport: params.notifications.{name} must be a boolean")
+            }),
+        }
+    };
+    let mut resource_subscriptions = Vec::new();
+    if let Some(value) = notifications.get("resourceSubscriptions") {
+        let uris = value.as_array().ok_or_else(|| {
+            "Toolport: params.notifications.resourceSubscriptions must be an array".to_string()
+        })?;
+        for value in uris {
+            let uri = value.as_str().map(str::trim).filter(|uri| !uri.is_empty()).ok_or_else(
+                || {
+                    "Toolport: resourceSubscriptions entries must be non-empty strings"
+                        .to_string()
+                },
+            )?;
+            if !resource_subscriptions.iter().any(|existing| existing == uri) {
+                resource_subscriptions.push(uri.to_string());
+            }
+        }
+    }
+    Ok(ModernSubscriptionFilter {
+        tools_list_changed: opt_in("toolsListChanged")?,
+        prompts_list_changed: opt_in("promptsListChanged")?,
+        resources_list_changed: opt_in("resourcesListChanged")?,
+        resource_subscriptions,
+    })
+}
+
+fn register_modern_subscription(
+    state: &GatewayState,
+    router: &Router,
+    req: &Value,
+    allowed: Option<&std::collections::HashSet<String>>,
+    owner: Option<&McpSessionOwner>,
+    transport: ModernSubscriptionTransport,
+) -> Result<(String, Arc<McpSession>), Value> {
+    let id = req
+        .get("id")
+        .cloned()
+        .filter(|id| !id.is_null())
+        .ok_or_else(|| error(Value::Null, -32600, "subscriptions/listen requires a request id"))?;
+    let response_id = id.clone();
+    let mut filter = parse_modern_subscription_filter(req)
+        .map_err(|message| error(id.clone(), -32602, &message))?;
+    let key = modern_subscription_key(owner, &id, transport);
+
+    // A stdio peer has one connection, so reusing a request id replaces its old
+    // listener. HTTP keys carry a per-request nonce: two client instances may
+    // share one bearer identity and both start ids at 1 without colliding.
+    if let Some(previous) = state
+        .mcp_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&key)
+    {
+        previous.close();
+        cleanup_resource_subs_for_session(state, &key);
+    }
+    if state
+        .mcp_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+        >= MCP_SESSION_MAX
+    {
+        return Err(error(
+            response_id,
+            -32000,
+            "Toolport: too many active subscription listeners; retry later",
+        ));
+    }
+
+    // Reuse the legacy subscription router so modern listeners inherit the same
+    // ownership, HTTP scope, single-flight, and global/per-client limits. The
+    // acknowledgement reports the subset that was actually granted.
+    let requested = std::mem::take(&mut filter.resource_subscriptions);
+    for uri in requested {
+        let subscribe = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "resources/subscribe",
+            "params": { "uri": uri }
+        });
+        ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = Some(key.clone()));
+        let response = handle_resource_subscription(
+            state,
+            router,
+            &subscribe,
+            allowed,
+            "resources/subscribe",
+        );
+        ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = None);
+        if response
+            .as_ref()
+            .is_some_and(|response| response.get("result").is_some())
+        {
+            filter.resource_subscriptions.push(uri);
+        }
+    }
+
+    let session = Arc::new(McpSession::new_modern(
+        owner.cloned(),
+        id,
+        filter,
+        transport,
+    ));
+    if transport == ModernSubscriptionTransport::Http {
+        let _ = session.try_begin_listen();
+    }
+    let acknowledgement = session
+        .modern_subscription
+        .as_ref()
+        .map(|subscription| subscription.filter.acknowledged())
+        .expect("modern session has subscription state");
+    let acknowledgement = session
+        .notification_json(&acknowledgement)
+        .ok_or_else(|| error(Value::Null, -32603, "failed to encode acknowledgement"))?;
+
+    let inserted = {
+        let mut sessions = state
+            .mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sessions.len() >= MCP_SESSION_MAX {
+            false
+        } else {
+            sessions.insert(key.clone(), Arc::clone(&session));
+            true
+        }
+    };
+    if !inserted {
+        cleanup_resource_subs_for_session(state, &key);
+        return Err(error(
+            response_id,
+            -32000,
+            "Toolport: too many active subscription listeners; retry later",
+        ));
+    }
+    match transport {
+        ModernSubscriptionTransport::Http => {
+            if !session.push_message(acknowledgement, None) {
+                state
+                    .mcp_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key);
+                cleanup_resource_subs_for_session(state, &key);
+                return Err(error(Value::Null, -32603, "subscription queue is full"));
+            }
+        }
+        ModernSubscriptionTransport::Stdio => {
+            let value = serde_json::from_str::<Value>(&acknowledgement)
+                .map_err(|_| error(Value::Null, -32603, "failed to encode acknowledgement"))?;
+            let mut out = state
+                .stdout
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if write_json_line(&mut *out, &value).is_err() {
+                drop(out);
+                state
+                    .mcp_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key);
+                cleanup_resource_subs_for_session(state, &key);
+                return Err(error(
+                    Value::Null,
+                    -32603,
+                    "failed to write acknowledgement",
+                ));
+            }
+        }
+    }
+    Ok((key, session))
+}
+
+fn cancel_modern_subscription(
+    state: &GatewayState,
+    request_id: &str,
+    transport: ModernSubscriptionTransport,
+) -> bool {
+    let keys: Vec<String> = state
+        .mcp_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(_, session)| {
+            session
+                .modern_subscription
+                .as_ref()
+                .is_some_and(|subscription| {
+                    subscription.transport == transport
+                        && session.modern_subscription_id_key().as_deref() == Some(request_id)
+                })
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    if keys.is_empty() {
+        return false;
+    }
+    for key in keys {
+        if let Some(session) = state
+            .mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key)
+        {
+            session.close();
+        }
+        cleanup_resource_subs_for_session(state, &key);
+    }
+    true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModernSubscriptionTransport {
+    Http,
+    Stdio,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ModernSubscriptionFilter {
+    tools_list_changed: bool,
+    prompts_list_changed: bool,
+    resources_list_changed: bool,
+    resource_subscriptions: Vec<String>,
+}
+
+impl ModernSubscriptionFilter {
+    fn allows(&self, method: &str) -> bool {
+        match method {
+            "notifications/tools/list_changed" => self.tools_list_changed,
+            "notifications/prompts/list_changed" => self.prompts_list_changed,
+            "notifications/resources/list_changed" => self.resources_list_changed,
+            "notifications/resources/updated" => true,
+            _ => false,
+        }
+    }
+
+    fn acknowledged(&self) -> Value {
+        let mut notifications = serde_json::Map::new();
+        if self.tools_list_changed {
+            notifications.insert("toolsListChanged".to_string(), Value::Bool(true));
+        }
+        if self.prompts_list_changed {
+            notifications.insert("promptsListChanged".to_string(), Value::Bool(true));
+        }
+        if self.resources_list_changed {
+            notifications.insert("resourcesListChanged".to_string(), Value::Bool(true));
+        }
+        if !self.resource_subscriptions.is_empty() {
+            notifications.insert(
+                "resourceSubscriptions".to_string(),
+                json!(self.resource_subscriptions),
+            );
+        }
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": { "notifications": notifications }
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ModernSubscription {
+    id: Value,
+    filter: ModernSubscriptionFilter,
+    transport: ModernSubscriptionTransport,
+}
+
 /// Per-session state for streamable-HTTP MCP (POST responses + GET listen stream).
 struct McpSession {
     /// The authenticated HTTP identity and effective scope that initialized this
@@ -6668,6 +7014,9 @@ struct McpSession {
     client_upstream: Mutex<ClientUpstreamCaps>,
     upstream_pending: Mutex<HashMap<String, std::sync::mpsc::Sender<Value>>>,
     next_upstream_id: AtomicI64,
+    /// Present only for a 2026-07-28 `subscriptions/listen` request. Legacy
+    /// Streamable-HTTP sessions keep this `None` and retain their existing fanout.
+    modern_subscription: Option<ModernSubscription>,
 }
 
 struct McpOutboundMessage {
@@ -6689,7 +7038,64 @@ impl McpSession {
             client_upstream: Mutex::new(ClientUpstreamCaps::default()),
             upstream_pending: Mutex::new(HashMap::new()),
             next_upstream_id: AtomicI64::new(1),
+            modern_subscription: None,
         }
+    }
+
+    fn new_modern(
+        owner: Option<McpSessionOwner>,
+        id: Value,
+        filter: ModernSubscriptionFilter,
+        transport: ModernSubscriptionTransport,
+    ) -> Self {
+        let mut session = Self::new(owner);
+        session.modern_subscription = Some(ModernSubscription {
+            id,
+            filter,
+            transport,
+        });
+        session
+    }
+
+    fn is_modern_stdio(&self) -> bool {
+        self.modern_subscription
+            .as_ref()
+            .is_some_and(|subscription| {
+                subscription.transport == ModernSubscriptionTransport::Stdio
+            })
+    }
+
+    fn modern_subscription_id_key(&self) -> Option<String> {
+        self.modern_subscription
+            .as_ref()
+            .and_then(|subscription| rpc_id_key(&subscription.id))
+    }
+
+    fn notification_json(&self, msg: &Value) -> Option<String> {
+        let Some(subscription) = &self.modern_subscription else {
+            return serde_json::to_string(msg).ok();
+        };
+        let method = msg.get("method").and_then(Value::as_str)?;
+        if method != "notifications/subscriptions/acknowledged"
+            && !subscription.filter.allows(method)
+        {
+            return None;
+        }
+        let mut tagged = msg.clone();
+        let tagged_obj = tagged.as_object_mut()?;
+        let params = tagged_obj
+            .entry("params")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()?;
+        let meta = params
+            .entry("_meta")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()?;
+        meta.insert(
+            "io.modelcontextprotocol/subscriptionId".to_string(),
+            subscription.id.clone(),
+        );
+        serde_json::to_string(&tagged).ok()
     }
 
     fn upstream_call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -6771,6 +7177,9 @@ impl McpSession {
     }
 
     fn is_expired(&self) -> bool {
+        if self.modern_subscription.is_some() {
+            return false;
+        }
         self.last_seen
             .lock()
             .map(|t| t.elapsed() >= MCP_SESSION_TTL)
@@ -6837,7 +7246,7 @@ impl McpSession {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard = result.0;
             if result.1.timed_out() {
-                return Some(b": keepalive\n\n".to_vec());
+                return Some(b":\r\n\r\n".to_vec());
             }
         }
     }
@@ -6846,6 +7255,7 @@ impl McpSession {
 /// Blocking `Read` adapter for a long-lived `GET /mcp` SSE listen stream.
 struct McpSseReader {
     session: Arc<McpSession>,
+    cleanup: Option<(GatewayState, String)>,
     buf: Vec<u8>,
     pos: usize,
 }
@@ -6854,6 +7264,16 @@ impl McpSseReader {
     fn new(session: Arc<McpSession>) -> Self {
         Self {
             session,
+            cleanup: None,
+            buf: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    fn with_cleanup(session: Arc<McpSession>, state: GatewayState, key: String) -> Self {
+        Self {
+            session,
+            cleanup: Some((state, key)),
             buf: Vec::new(),
             pos: 0,
         }
@@ -6886,6 +7306,15 @@ impl Read for McpSseReader {
 impl Drop for McpSseReader {
     fn drop(&mut self) {
         self.session.end_listen();
+        if let Some((state, key)) = self.cleanup.take() {
+            self.session.close();
+            state
+                .mcp_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
+            cleanup_resource_subs_for_session(&state, &key);
+        }
     }
 }
 
@@ -7325,6 +7754,9 @@ fn process_request(
     client: Option<&str>,
 ) -> Option<Value> {
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    if !state.http && upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
+        MODERN_STDIO_UPSTREAM.store(true, Ordering::SeqCst);
+    }
     let is_notification = !req.get("id").is_some_and(|id| !id.is_null());
     if is_notification {
         if handle_client_notification(state, req) {
@@ -7471,6 +7903,22 @@ fn process_request(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    if method == "subscriptions/listen"
+        && !state.http
+        && upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION)
+    {
+        return match register_modern_subscription(
+            state,
+            &router,
+            req,
+            allowed,
+            None,
+            ModernSubscriptionTransport::Stdio,
+        ) {
+            Ok(_) => None,
+            Err(response) => Some(response),
+        };
+    }
     // Resource subscriptions need the live GatewayState (session table + sink)
     // and the same ownership/scope path as resources/read (SOU-394).
     //
@@ -7893,8 +8341,13 @@ struct HttpOut {
     ctype: &'static str,
     body: String,
     extra: Vec<(String, String)>,
-    /// Long-lived `GET /mcp` SSE listen stream (chunked response).
-    mcp_listen: Option<Arc<McpSession>>,
+    /// Long-lived MCP SSE listen stream (chunked response).
+    mcp_listen: Option<McpListen>,
+}
+
+struct McpListen {
+    session: Arc<McpSession>,
+    cleanup: Option<(GatewayState, String)>,
 }
 
 impl HttpOut {
@@ -7914,7 +8367,23 @@ impl HttpOut {
             ctype: "text/event-stream",
             body: String::new(),
             extra: Vec::new(),
-            mcp_listen: Some(session),
+            mcp_listen: Some(McpListen {
+                session,
+                cleanup: None,
+            }),
+        }
+    }
+
+    fn modern_mcp_listen(state: GatewayState, key: String, session: Arc<McpSession>) -> Self {
+        Self {
+            status: 200,
+            ctype: "text/event-stream",
+            body: String::new(),
+            extra: Vec::new(),
+            mcp_listen: Some(McpListen {
+                session,
+                cleanup: Some((state, key)),
+            }),
         }
     }
 
@@ -8028,6 +8497,26 @@ fn mcp_prefers_sse(accept: Option<&str>) -> bool {
     }
 }
 
+fn mcp_accepts_sse(accept: Option<&str>) -> bool {
+    accept.is_some_and(|raw| {
+        raw.to_ascii_lowercase().split(',').any(|part| {
+            let mut fields = part.trim().split(';');
+            if fields.next().map(str::trim) != Some("text/event-stream") {
+                return false;
+            }
+            fields
+                .find_map(|field| {
+                    field
+                        .trim()
+                        .strip_prefix("q=")
+                        .and_then(|value| value.parse::<f32>().ok())
+                })
+                .unwrap_or(1.0)
+                > 0.0
+        })
+    })
+}
+
 /// Wrap a single JSON-RPC message as one SSE `message` event (stream closes after).
 fn mcp_sse_body(json: &str) -> String {
     format!("event: message\ndata: {json}\n\n")
@@ -8130,6 +8619,42 @@ fn handle_mcp_http(
                 .unwrap_or("");
             let has_id = req_obj.contains_key("id");
             let is_initialize = method_name == "initialize";
+            if method_name == "subscriptions/listen"
+                && upstream_declared_version(&req) == Some(MODERN_PROTOCOL_VERSION)
+            {
+                if !mcp_accepts_sse(accept) {
+                    return HttpOut::json_err(406, "Accept must include text/event-stream");
+                }
+                let router = state
+                    .router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                return match register_modern_subscription(
+                    state,
+                    &router,
+                    &req,
+                    allowed,
+                    session_owner,
+                    ModernSubscriptionTransport::Http,
+                ) {
+                    Ok((key, session)) => {
+                        HttpOut::modern_mcp_listen(state.clone(), key, session)
+                    }
+                    Err(response) => HttpOut::new(
+                        200,
+                        "application/json",
+                        serde_json::to_string(&response).unwrap_or_else(|_| {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": req.get("id").cloned().unwrap_or(Value::Null),
+                                "error": { "code": -32603, "message": "serialize failed" }
+                            })
+                            .to_string()
+                        }),
+                    ),
+                };
+            }
             // 2026-07-28 removed protocol-level sessions (SOU-447). A modern
             // request declares its own version, so it is served statelessly.
             //
@@ -9087,10 +9612,10 @@ fn reap_finished_workers(workers: &mut Vec<std::thread::JoinHandle<()>>) {
 
 fn respond_mcp_sse_listen(
     request: tiny_http::Request,
-    out: HttpOut,
+    mut out: HttpOut,
     allow_headers: String,
 ) {
-    let Some(session) = out.mcp_listen else {
+    let Some(listen) = out.mcp_listen.take() else {
         let mut response =
             tiny_http::Response::from_string(out.body).with_status_code(out.status);
         if let Ok(h) = tiny_http::Header::from_bytes(b"Content-Type", out.ctype.as_bytes()) {
@@ -9103,6 +9628,7 @@ fn respond_mcp_sse_listen(
     let mut headers = vec![
         tiny_http::Header::from_bytes(b"Content-Type", b"text/event-stream").unwrap(),
         tiny_http::Header::from_bytes(b"Cache-Control", b"no-cache").unwrap(),
+        tiny_http::Header::from_bytes(b"X-Accel-Buffering", b"no").unwrap(),
         tiny_http::Header::from_bytes(b"Access-Control-Allow-Origin", b"*").unwrap(),
         tiny_http::Header::from_bytes(
             b"Access-Control-Allow-Methods",
@@ -9120,7 +9646,10 @@ fn respond_mcp_sse_listen(
         }
     }
 
-    let reader = McpSseReader::new(session);
+    let reader = match listen.cleanup {
+        Some((state, key)) => McpSseReader::with_cleanup(listen.session, state, key),
+        None => McpSseReader::new(listen.session),
+    };
     let response = tiny_http::Response::new(
         tiny_http::StatusCode(200),
         headers,
@@ -9764,8 +10293,15 @@ fn main() {
             req.get("method").and_then(|m| m.as_str()).unwrap_or("")
         ));
         if let Some(cancel_id) = cancellation_request_id(&req) {
+            let subscription_cancelled = cancel_modern_subscription(
+                &state,
+                &cancel_id,
+                ModernSubscriptionTransport::Stdio,
+            );
             if cancel_registry.cancel(&cancel_id, cancellation_reason(&req)) {
                 glog(&format!("client cancelled in-flight request {cancel_id}"));
+            } else if subscription_cancelled {
+                glog(&format!("client closed subscription listener {cancel_id}"));
             } else {
                 gtrace(&format!("ignored cancellation for unknown request {cancel_id}"));
             }
@@ -12629,6 +13165,214 @@ mod tests {
     }
 
     #[test]
+    fn modern_http_subscription_listen_is_sessionless_tagged_and_filtered() {
+        let state = http_state(true);
+        let search = SearchGuard::default();
+        let confirm = ConfirmGuard::new();
+        let caller = test_caller("client:modern", None);
+        let mut out = handle_http(
+            &state,
+            &search,
+            &confirm,
+            "POST",
+            "/mcp",
+            &modern_http_body(
+                44,
+                "subscriptions/listen",
+                json!({
+                    "notifications": {
+                        "toolsListChanged": true,
+                        "promptsListChanged": false
+                    }
+                }),
+            ),
+            None,
+            Some("application/json, text/event-stream"),
+            None,
+            Some(&caller),
+        );
+        assert_eq!(out.status, 200, "body={}", out.body);
+        assert_eq!(out.ctype, "text/event-stream");
+        assert!(out.is_mcp_listen());
+        assert!(
+            out.extra
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("Mcp-Session-Id")),
+            "modern listeners must not receive a legacy session id"
+        );
+
+        let listen = out.mcp_listen.as_ref().unwrap();
+        let acknowledgement = listen
+            .session
+            .outbound
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("acknowledgement is the first event")
+            .json;
+        let acknowledgement: Value = serde_json::from_str(&acknowledgement).unwrap();
+        assert_eq!(
+            acknowledgement["method"],
+            "notifications/subscriptions/acknowledged"
+        );
+        assert_eq!(
+            acknowledgement["params"]["_meta"]
+                ["io.modelcontextprotocol/subscriptionId"],
+            44
+        );
+        assert_eq!(
+            acknowledgement["params"]["notifications"]["toolsListChanged"],
+            true
+        );
+        assert!(acknowledgement["params"]["notifications"]
+            .get("promptsListChanged")
+            .is_none());
+
+        fanout_mcp_notification(
+            &state.stdout,
+            &state.mcp_sessions,
+            &json!({ "jsonrpc": "2.0", "method": "notifications/prompts/list_changed" }),
+        );
+        fanout_mcp_notification(
+            &state.stdout,
+            &state.mcp_sessions,
+            &json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" }),
+        );
+        let queued: Vec<String> = listen
+            .session
+            .outbound
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(|message| message.json)
+            .collect();
+        assert_eq!(queued.len(), 1, "only opted-in notification is queued");
+        let tools: Value = serde_json::from_str(&queued[0]).unwrap();
+        assert_eq!(tools["method"], "notifications/tools/list_changed");
+        assert_eq!(
+            tools["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            44
+        );
+
+        let listen = out.mcp_listen.take().unwrap();
+        let (cleanup_state, cleanup_key) = listen.cleanup.unwrap();
+        let reader = McpSseReader::with_cleanup(listen.session, cleanup_state, cleanup_key);
+        drop(reader);
+        assert!(
+            state.mcp_sessions.lock().unwrap().is_empty(),
+            "closing the POST response removes the listener"
+        );
+    }
+
+    #[test]
+    fn modern_subscription_listen_rejects_bad_filters_without_a_session() {
+        let state = http_state(true);
+        let out = handle_http(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &modern_http_body(
+                45,
+                "subscriptions/listen",
+                json!({ "notifications": { "toolsListChanged": "yes" } }),
+            ),
+            None,
+            Some("text/event-stream"),
+            None,
+            None,
+        );
+        let body: Value = serde_json::from_str(&out.body).unwrap();
+        assert_eq!(body["error"]["code"], -32602);
+        assert!(state.mcp_sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn modern_http_listeners_do_not_collide_across_instances_of_one_client() {
+        let state = http_state(true);
+        let caller = test_caller("client:shared-token", None);
+        let body = modern_http_body(
+            1,
+            "subscriptions/listen",
+            json!({ "notifications": { "toolsListChanged": true } }),
+        );
+        let first = handle_http(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &body,
+            None,
+            Some("text/event-stream"),
+            None,
+            Some(&caller),
+        );
+        let second = handle_http(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &body,
+            None,
+            Some("text/event-stream"),
+            None,
+            Some(&caller),
+        );
+        assert!(first.is_mcp_listen() && second.is_mcp_listen());
+        assert_eq!(
+            state.mcp_sessions.lock().unwrap().len(),
+            2,
+            "request ids are scoped to each HTTP client instance, not only the bearer identity"
+        );
+    }
+
+    #[test]
+    fn cancelling_modern_stdio_listener_releases_its_resource_subscriptions() {
+        let state = http_state(true);
+        let id = json!("listen-1");
+        let key = modern_subscription_key(None, &id, ModernSubscriptionTransport::Stdio);
+        let session = Arc::new(McpSession::new_modern(
+            None,
+            id.clone(),
+            ModernSubscriptionFilter {
+                resource_subscriptions: vec!["fixture://one".to_string()],
+                ..ModernSubscriptionFilter::default()
+            },
+            ModernSubscriptionTransport::Stdio,
+        ));
+        state
+            .mcp_sessions
+            .lock()
+            .unwrap()
+            .insert(key.clone(), session);
+        state
+            .resource_subs
+            .lock()
+            .unwrap()
+            .add(&key, "fixture://one", "fixture-server")
+            .unwrap();
+
+        assert!(cancel_modern_subscription(
+            &state,
+            &rpc_id_key(&id).unwrap(),
+            ModernSubscriptionTransport::Stdio,
+        ));
+        assert!(state.mcp_sessions.lock().unwrap().is_empty());
+        assert!(
+            state
+                .resource_subs
+                .lock()
+                .unwrap()
+                .sessions_for_uri("fixture://one")
+                .is_empty(),
+            "cancelling the listener must release its resource holders"
+        );
+    }
+
+    #[test]
     fn mcp_push_server_message_queues_sse_payload() {
         let state = http_state(true);
         let sid = mint_mcp_session(&state, None).ok().unwrap();
@@ -12652,7 +13396,7 @@ mod tests {
         let sid_a = mint_mcp_session(&state, None).ok().unwrap();
         let sid_b = mint_mcp_session(&state, None).ok().unwrap();
         let msg = json!({"jsonrpc":"2.0","method":"notifications/resources/list_changed"});
-        fanout_mcp_notification(&state.mcp_sessions, &msg);
+        fanout_mcp_notification(&state.stdout, &state.mcp_sessions, &msg);
         for sid in [sid_a, sid_b] {
             let sessions = state.mcp_sessions.lock().unwrap();
             let session = sessions.get(&sid).unwrap();
@@ -12876,6 +13620,11 @@ mod tests {
             "application/json;q=1, text/event-stream;q=0.8"
         )));
         assert!(!mcp_prefers_sse(Some("text/event-stream;q=0")));
+        assert!(mcp_accepts_sse(Some(
+            "application/json, text/event-stream"
+        )));
+        assert!(!mcp_accepts_sse(Some("text/event-stream;q=0")));
+        assert!(!mcp_accepts_sse(Some("text/event-stream;q=0.0")));
     }
 
     #[test]
@@ -13441,7 +14190,12 @@ mod tests {
 
         assert_eq!(result["supportedVersions"][0], MODERN_PROTOCOL_VERSION);
         assert!(result["capabilities"]["tools"].is_object());
-        assert_eq!(result["capabilities"]["resources"]["subscribe"], true);
+        assert!(
+            result["capabilities"]["resources"]
+                .get("subscribe")
+                .is_none(),
+            "modern discovery must not advertise the removed resources.subscribe capability"
+        );
         assert_eq!(result["resultType"], "complete");
         assert_eq!(
             result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],

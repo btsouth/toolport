@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,6 +25,36 @@ pub type ResourceUpdatedSink = Arc<dyn Fn(String) + Send + Sync>;
 /// gateway's job: only the gateway knows which upstream client minted the
 /// `progressToken` it relayed on this server's behalf.
 pub type ProgressSink = Arc<dyn Fn(Value) + Send + Sync>;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubscriptionFilter {
+    pub tools_list_changed: bool,
+    pub prompts_list_changed: bool,
+    pub resources_list_changed: bool,
+    pub resource_subscriptions: Vec<String>,
+}
+
+impl SubscriptionFilter {
+    fn params(&self) -> Value {
+        let mut notifications = serde_json::Map::new();
+        if self.tools_list_changed {
+            notifications.insert("toolsListChanged".to_string(), Value::Bool(true));
+        }
+        if self.prompts_list_changed {
+            notifications.insert("promptsListChanged".to_string(), Value::Bool(true));
+        }
+        if self.resources_list_changed {
+            notifications.insert("resourcesListChanged".to_string(), Value::Bool(true));
+        }
+        if !self.resource_subscriptions.is_empty() {
+            notifications.insert(
+                "resourceSubscriptions".to_string(),
+                json!(&self.resource_subscriptions),
+            );
+        }
+        json!({ "notifications": notifications })
+    }
+}
 
 use serde_json::{json, Value};
 
@@ -825,6 +855,15 @@ pub trait Transport: Send {
     /// the merge. Default no-op, so legacy connections send exactly what they
     /// always did (SOU-445).
     fn set_protocol_meta(&mut self, _meta: Option<Value>) {}
+    /// Replace the long-lived modern notification listener. Legacy transports
+    /// keep the default no-op; modern connections call this after discovery and
+    /// whenever their resource URI set changes.
+    fn set_subscription_listener(
+        &mut self,
+        _filter: SubscriptionFilter,
+    ) -> Result<(), TransportError> {
+        Ok(())
+    }
     fn request_with_cancel(
         &mut self,
         method: &str,
@@ -1487,6 +1526,8 @@ pub struct StdioTransport {
     /// Standard per-request `_meta` for a modern (2026-07-28+) connection, merged
     /// into every outgoing request. `None` on legacy connections (SOU-445).
     protocol_meta: Option<Value>,
+    /// Request id of the current long-lived `subscriptions/listen` request.
+    subscription_listener_id: Option<i64>,
 }
 
 /// Owns a Windows Job Object configured to terminate every assigned process
@@ -1935,6 +1976,7 @@ impl StdioTransport {
             server_handler: None,
             progress,
             protocol_meta: None,
+            subscription_listener_id: None,
         })
     }
 
@@ -2129,6 +2171,44 @@ impl Transport for StdioTransport {
     fn set_protocol_meta(&mut self, meta: Option<Value>) {
         self.protocol_meta = meta;
     }
+
+    fn set_subscription_listener(
+        &mut self,
+        filter: SubscriptionFilter,
+    ) -> Result<(), TransportError> {
+        if let Some(previous) = self.subscription_listener_id.take() {
+            self.notify(
+                "notifications/cancelled",
+                json!({
+                    "requestId": previous,
+                    "reason": "Toolport replaced the subscription filter"
+                }),
+            )?;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut params = filter.params();
+        if let Some(protocol) = &self.protocol_meta {
+            merge_protocol_meta(&mut params, protocol);
+        }
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "subscriptions/listen",
+            "params": params,
+        });
+        let mut stdin = self
+            .stdin
+            .lock()
+            .map_err(|_| TransportError::Fatal("downstream stdin lock poisoned".into()))?;
+        writeln!(stdin, "{message}")
+            .map_err(|error| TransportError::Unavailable(error.to_string()))?;
+        stdin
+            .flush()
+            .map_err(|error| TransportError::Unavailable(error.to_string()))?;
+        self.subscription_listener_id = Some(id);
+        Ok(())
+    }
 }
 
 /// Kill the whole process group a downstream server was spawned into, so
@@ -2284,12 +2364,12 @@ pub struct HttpTransport {
     session_id: Option<String>,
     next_id: i64,
     /// Raw bearer token (without the "Bearer " prefix), if the server needs auth.
-    auth: Option<String>,
+    auth: Arc<Mutex<Option<String>>>,
     /// Called before each POST to refresh a token nearing expiry, and forced once
     /// after a 401/403 to recover from an already-expired token. A proactive
     /// `None` or error keeps the current token; a forced refresh must return a new
     /// raw token or the authentication failure is surfaced.
-    refresh: Option<RefreshFn>,
+    refresh: Option<Arc<Mutex<RefreshFn>>>,
     /// The token a forced refresh produced and that has not yet been accepted by
     /// the server, if any.
     ///
@@ -2318,6 +2398,12 @@ pub struct HttpTransport {
     /// Standard per-request `_meta` for a modern (2026-07-28+) connection, merged
     /// into every outgoing request. `None` on legacy connections (SOU-445).
     protocol_meta: Option<Value>,
+    /// Catalog refresh signal used by the modern HTTP listen worker.
+    change_dirty: Option<Arc<AtomicU8>>,
+    /// Replacing a listener increments this generation. The superseded worker
+    /// drops its response on the next frame/keepalive, closing the old POST.
+    listener_generation: Arc<AtomicU64>,
+    subscription_listener_id: Option<i64>,
 }
 
 impl HttpTransport {
@@ -2358,13 +2444,16 @@ impl HttpTransport {
             inline_agent: guarded_agent(block_private),
             session_id: None,
             next_id: 1,
-            auth,
-            refresh,
+            auth: Arc::new(Mutex::new(auth)),
+            refresh: refresh.map(|refresh| Arc::new(Mutex::new(refresh))),
             forced_refresh_token: None,
             server_handler: None,
             resource_updated: None,
             progress: None,
             protocol_meta: None,
+            change_dirty: None,
+            listener_generation: Arc::new(AtomicU64::new(0)),
+            subscription_listener_id: None,
         }
     }
 
@@ -2378,6 +2467,10 @@ impl HttpTransport {
     /// the client that minted the token (SOU-444).
     pub fn set_progress_sink(&mut self, sink: Option<ProgressSink>) {
         self.progress = sink;
+    }
+
+    pub fn set_change_sink(&mut self, dirty: Option<Arc<AtomicU8>>) {
+        self.change_dirty = dirty;
     }
 
     /// The protocol version this connection declares in the `MCP-Protocol-Version`
@@ -2419,8 +2512,13 @@ impl HttpTransport {
     /// 401/403 will force one refresh attempt below.
     fn refresh_before_send(&mut self) {
         if let Some(refresh) = &self.refresh {
-            if let Ok(Some(token)) = refresh(false) {
-                self.auth = Some(token);
+            if let Ok(refresh) = refresh.lock() {
+                if let Ok(Some(token)) = refresh(false) {
+                    *self
+                        .auth
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+                }
             }
         }
     }
@@ -2428,7 +2526,11 @@ impl HttpTransport {
     /// True when the token currently in hand is one a forced refresh already
     /// produced, so its one forced exchange is spent. See [`Self::forced_refresh_token`].
     fn forced_refresh_spent(&self) -> bool {
-        self.auth.is_some() && self.auth == self.forced_refresh_token
+        let auth = self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        auth.is_some() && *auth == self.forced_refresh_token
     }
 
     fn force_refresh_after_auth_error(&mut self, code: u16) -> Result<(), TransportError> {
@@ -2437,9 +2539,15 @@ impl HttpTransport {
                 "HTTP {code} (needs authentication): no refresh callback configured"
             )));
         };
+        let refresh = refresh
+            .lock()
+            .map_err(|_| TransportError::Fatal("OAuth refresh callback lock poisoned".into()))?;
         match refresh(true) {
             Ok(Some(token)) => {
-                self.auth = Some(token.clone());
+                *self
+                    .auth
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token.clone());
                 // Spend the budget for this token, so a later POST on the same
                 // connection does not force a second exchange for it (SOU-474).
                 self.forced_refresh_token = Some(token);
@@ -2470,7 +2578,12 @@ impl HttpTransport {
             if let Some(sid) = &self.session_id {
                 req = req.set("Mcp-Session-Id", sid);
             }
-            if let Some(token) = &self.auth {
+            let auth = self
+                .auth
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(token) = auth.as_deref() {
                 req = req.set("Authorization", &bearer_header(token));
             }
             match req.send_string(&payload) {
@@ -2586,7 +2699,12 @@ impl HttpTransport {
             if let Some(sid) = &self.session_id {
                 req = req.set("Mcp-Session-Id", sid);
             }
-            if let Some(token) = &self.auth {
+            let auth = self
+                .auth
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(token) = auth.as_deref() {
                 req = req.set("Authorization", &bearer_header(token));
             }
 
@@ -2698,6 +2816,196 @@ impl Transport for HttpTransport {
     fn set_protocol_meta(&mut self, meta: Option<Value>) {
         self.protocol_meta = meta;
     }
+
+    fn set_subscription_listener(
+        &mut self,
+        filter: SubscriptionFilter,
+    ) -> Result<(), TransportError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut params = filter.params();
+        if let Some(protocol) = &self.protocol_meta {
+            merge_protocol_meta(&mut params, protocol);
+        }
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "subscriptions/listen",
+            "params": params,
+        })
+        .to_string();
+        let generation = self.listener_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let live_generation = Arc::clone(&self.listener_generation);
+        let agent = self.agent.clone();
+        let url = self.url.clone();
+        let auth = Arc::clone(&self.auth);
+        let refresh = self.refresh.clone();
+        let wire_version = self.wire_protocol_version();
+        let dirty = self.change_dirty.clone();
+        let resource_updated = self.resource_updated.clone();
+        self.subscription_listener_id = Some(id);
+
+        std::thread::spawn(move || {
+            let mut retry_delay = Duration::from_millis(250);
+            while live_generation.load(Ordering::SeqCst) == generation {
+                if let Some(refresh) = &refresh {
+                    if let Ok(refresh) = refresh.lock() {
+                        if let Ok(Some(token)) = refresh(false) {
+                            *auth
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+                        }
+                    }
+                }
+                let mut forced_refresh = false;
+                let response = loop {
+                    let mut request = agent
+                        .post(&url)
+                        .set("Content-Type", "application/json")
+                        .set("Accept", "text/event-stream")
+                        .set("MCP-Protocol-Version", &wire_version);
+                    let token = auth
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    if let Some(token) = token.as_deref() {
+                        request = request.set("Authorization", &bearer_header(token));
+                    }
+                    match request.send_string(&payload) {
+                        Ok(response) => break Some(response),
+                        Err(ureq::Error::Status(code, response))
+                            if (code == 401 || code == 403)
+                                && !forced_refresh
+                                && refresh.is_some() =>
+                        {
+                            let _ = read_capped(response, 8 * 1024);
+                            forced_refresh = true;
+                            let refreshed = refresh.as_ref().and_then(|refresh| {
+                                refresh
+                                    .lock()
+                                    .ok()
+                                    .and_then(|refresh| refresh(true).ok())
+                                    .flatten()
+                            });
+                            match refreshed {
+                                Some(token) => {
+                                    *auth
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Some(token);
+                                    continue;
+                                }
+                                None => break None,
+                            }
+                        }
+                        Err(error) => {
+                            downstream_trace(&format!(
+                                "subscriptions/listen HTTP open failed: {error}"
+                            ));
+                            break None;
+                        }
+                    }
+                };
+                let Some(response) = response else {
+                    std::thread::sleep(retry_delay);
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                    continue;
+                };
+                let is_sse = response.header("content-type").is_some_and(|value| {
+                    value.to_ascii_lowercase().contains("text/event-stream")
+                });
+                if !is_sse {
+                    let detail: String =
+                        read_capped(response, 64 * 1024).chars().take(200).collect();
+                    downstream_trace(&format!(
+                        "subscriptions/listen returned a non-SSE response: {detail}"
+                    ));
+                    std::thread::sleep(retry_delay);
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                    continue;
+                }
+
+                retry_delay = Duration::from_millis(250);
+                let mut reader = BufReader::new(response.into_reader());
+                loop {
+                    if live_generation.load(Ordering::SeqCst) != generation {
+                        return;
+                    }
+                    let mut line = String::new();
+                    let read = match (&mut reader)
+                        .take(MAX_RESPONSE_BYTES)
+                        .read_line(&mut line)
+                    {
+                        Ok(read) => read,
+                        Err(error) => {
+                            downstream_trace(&format!(
+                                "subscriptions/listen SSE read failed: {error}"
+                            ));
+                            break;
+                        }
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    if read as u64 >= MAX_RESPONSE_BYTES && !line.ends_with('\n') {
+                        downstream_trace("subscriptions/listen emitted an oversized SSE line");
+                        break;
+                    }
+                    if live_generation.load(Ordering::SeqCst) != generation {
+                        return;
+                    }
+                    let Some(data) = line.trim_start().strip_prefix("data:") else {
+                        continue;
+                    };
+                    let data = data.trim();
+                    let Ok(notification) = serde_json::from_str::<Value>(data) else {
+                        continue;
+                    };
+                    let subscription_id = notification
+                        .get("params")
+                        .and_then(|params| params.get("_meta"))
+                        .and_then(|meta| meta.get("io.modelcontextprotocol/subscriptionId"));
+                    if subscription_id != Some(&json!(id)) {
+                        continue;
+                    }
+                    let method = notification.get("method").and_then(Value::as_str);
+                    let kind = match method {
+                        Some("notifications/tools/list_changed") => change::TOOLS,
+                        Some("notifications/resources/list_changed") => change::RESOURCES,
+                        Some("notifications/prompts/list_changed") => change::PROMPTS,
+                        _ => 0,
+                    };
+                    if kind != 0 {
+                        if let Some(dirty) = &dirty {
+                            dirty.fetch_or(kind, Ordering::SeqCst);
+                        }
+                        continue;
+                    }
+                    if method == Some("notifications/resources/updated") {
+                        if let (Some(sink), Some(uri)) = (
+                            resource_updated.as_ref(),
+                            notification
+                                .get("params")
+                                .and_then(|params| params.get("uri"))
+                                .and_then(Value::as_str),
+                        ) {
+                            sink(uri.to_string());
+                        }
+                    }
+                }
+                if live_generation.load(Ordering::SeqCst) == generation {
+                    std::thread::sleep(retry_delay);
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+impl Drop for HttpTransport {
+    fn drop(&mut self) {
+        self.listener_generation.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// One connected downstream server: its id, its transport, and its cached
@@ -2720,6 +3028,9 @@ pub struct DownstreamServer {
     caps_completions: bool,
     /// The protocol era this connection settled on at handshake (SOU-445).
     era: Era,
+    /// Desired per-resource notification set carried by the modern listener.
+    /// Legacy servers keep using resources/subscribe and resources/unsubscribe.
+    modern_resource_subscriptions: HashSet<String>,
 }
 
 impl DownstreamServer {
@@ -2874,6 +3185,16 @@ impl DownstreamServer {
         // Handshake done: from here on, react to the server's own tool-list
         // changes (ignored until now so a startup announcement is a no-op).
         transport.arm_tools_watch();
+        if matches!(era, Era::Modern { .. }) {
+            transport
+                .set_subscription_listener(SubscriptionFilter {
+                    tools_list_changed: true,
+                    prompts_list_changed: caps_prompts,
+                    resources_list_changed: caps_resources,
+                    resource_subscriptions: Vec::new(),
+                })
+                .map_err(|error| error.to_string())?;
+        }
 
         Ok(DownstreamServer {
             id,
@@ -2886,6 +3207,7 @@ impl DownstreamServer {
             caps_prompts,
             caps_completions,
             era,
+            modern_resource_subscriptions: std::collections::HashSet::new(),
         })
     }
 
@@ -3069,12 +3391,45 @@ impl DownstreamServer {
     /// this downstream (SOU-394). The gateway only calls this when at least one
     /// upstream client is subscribed to the same URI.
     pub fn subscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
-        self.transport
-            .request("resources/subscribe", json!({ "uri": uri }))
+        if matches!(self.era, Era::Modern { .. }) {
+            if self.modern_resource_subscriptions.insert(uri.to_string()) {
+                let mut resource_subscriptions: Vec<String> =
+                    self.modern_resource_subscriptions.iter().cloned().collect();
+                resource_subscriptions.sort();
+                if let Err(error) = self.transport.set_subscription_listener(SubscriptionFilter {
+                    tools_list_changed: true,
+                    prompts_list_changed: self.caps_prompts,
+                    resources_list_changed: self.caps_resources,
+                    resource_subscriptions,
+                }) {
+                    self.modern_resource_subscriptions.remove(uri);
+                    return Err(error);
+                }
+            }
+            return Ok(json!({}));
+        }
+        self.transport.request("resources/subscribe", json!({ "uri": uri }))
     }
 
     /// Drop a previously established downstream resource subscription.
     pub fn unsubscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
+        if matches!(self.era, Era::Modern { .. }) {
+            if self.modern_resource_subscriptions.remove(uri) {
+                let mut resource_subscriptions: Vec<String> =
+                    self.modern_resource_subscriptions.iter().cloned().collect();
+                resource_subscriptions.sort();
+                if let Err(error) = self.transport.set_subscription_listener(SubscriptionFilter {
+                    tools_list_changed: true,
+                    prompts_list_changed: self.caps_prompts,
+                    resources_list_changed: self.caps_resources,
+                    resource_subscriptions,
+                }) {
+                    self.modern_resource_subscriptions.insert(uri.to_string());
+                    return Err(error);
+                }
+            }
+            return Ok(json!({}));
+        }
         self.transport
             .request("resources/unsubscribe", json!({ "uri": uri }))
     }
@@ -3343,6 +3698,7 @@ mod tests {
             caps_prompts: false,
             caps_completions: false,
             era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
+            modern_resource_subscriptions: std::collections::HashSet::new(),
         };
         server.refresh_tools();
         assert_eq!(server.tools, vec![json!({"name":"stable"})]);
@@ -3368,6 +3724,7 @@ mod tests {
             caps_prompts: false,
             caps_completions: false,
             era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
+            modern_resource_subscriptions: std::collections::HashSet::new(),
         };
         server.refresh_resources();
         assert_eq!(server.resources, vec![json!({"uri":"r:"})]);
@@ -4559,6 +4916,157 @@ mod tests {
             "a modern connection stamps its version on notifications too, got {sent}"
         );
         assert_eq!(sent["params"]["requestId"], 1, "the caller's params survive");
+    }
+
+    #[test]
+    fn modern_http_listener_routes_tagged_notifications() {
+        use super::{change, HttpTransport, SubscriptionFilter, Transport, MODERN_PROTOCOL_VERSION};
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let body = Arc::new(Mutex::new(String::new()));
+        let captured = Arc::clone(&body);
+        let handle = std::thread::spawn(move || {
+            let mut request = server.recv().unwrap();
+            let mut request_body = String::new();
+            request.as_reader().read_to_string(&mut request_body).unwrap();
+            *captured.lock().unwrap() = request_body;
+            let subscription = json!({
+                "io.modelcontextprotocol/subscriptionId": 1
+            });
+            let stream = format!(
+                "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/subscriptions/acknowledged",
+                    "params": { "_meta": subscription }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/tools/list_changed",
+                    "params": { "_meta": subscription }
+                }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/resources/updated",
+                    "params": { "uri": "fixture://one", "_meta": subscription }
+                })
+            );
+            let content_type = tiny_http::Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"text/event-stream"[..],
+            )
+            .unwrap();
+            request
+                .respond(tiny_http::Response::from_string(stream).with_header(content_type))
+                .unwrap();
+        });
+
+        let dirty = Arc::new(AtomicU8::new(0));
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let update_target = Arc::clone(&updates);
+        let mut transport = HttpTransport::new(&format!("http://127.0.0.1:{port}/"));
+        transport.set_protocol_meta(Some(super::protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+        transport.set_change_sink(Some(Arc::clone(&dirty)));
+        transport.set_resource_updated_sink(Some(Arc::new(move |uri| {
+            update_target.lock().unwrap().push(uri);
+        })));
+        transport
+            .set_subscription_listener(SubscriptionFilter {
+                tools_list_changed: true,
+                resources_list_changed: true,
+                resource_subscriptions: vec!["fixture://one".to_string()],
+                ..SubscriptionFilter::default()
+            })
+            .unwrap();
+        handle.join().unwrap();
+        for _ in 0..100 {
+            if dirty.load(Ordering::SeqCst) == change::TOOLS
+                && !updates.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(dirty.load(Ordering::SeqCst), change::TOOLS);
+        assert_eq!(&*updates.lock().unwrap(), &["fixture://one".to_string()]);
+        let sent: Value = serde_json::from_str(&body.lock().unwrap()).unwrap();
+        assert_eq!(sent["method"], "subscriptions/listen");
+        assert_eq!(
+            sent["params"]["notifications"]["resourceSubscriptions"][0],
+            "fixture://one"
+        );
+    }
+
+    #[test]
+    fn modern_resource_subscriptions_replace_the_listener_filter() {
+        use super::{DownstreamServer, SubscriptionFilter, Transport, TransportError};
+        use std::sync::{Arc, Mutex};
+
+        struct ModernProbe {
+            requests: Arc<Mutex<Vec<String>>>,
+            filters: Arc<Mutex<Vec<SubscriptionFilter>>>,
+        }
+        impl Transport for ModernProbe {
+            fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+                self.requests.lock().unwrap().push(method.to_string());
+                match method {
+                    "initialize" => Err(TransportError::Rpc(json!({
+                        "code": -32601,
+                        "message": "method not found"
+                    }))),
+                    "server/discover" => Ok(json!({
+                        "supportedVersions": [super::MODERN_PROTOCOL_VERSION],
+                        "capabilities": { "resources": {}, "prompts": {} }
+                    })),
+                    "tools/list" => Ok(json!({ "tools": [] })),
+                    _ => Ok(json!({})),
+                }
+            }
+            fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn set_subscription_listener(
+                &mut self,
+                filter: SubscriptionFilter,
+            ) -> Result<(), TransportError> {
+                self.filters.lock().unwrap().push(filter);
+                Ok(())
+            }
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let filters = Arc::new(Mutex::new(Vec::new()));
+        let mut server = DownstreamServer::connect(
+            "modern".to_string(),
+            Box::new(ModernProbe {
+                requests: Arc::clone(&requests),
+                filters: Arc::clone(&filters),
+            }),
+        )
+        .unwrap();
+        assert!(filters.lock().unwrap()[0].resource_subscriptions.is_empty());
+        server.subscribe_resource("fixture://z").unwrap();
+        server.subscribe_resource("fixture://a").unwrap();
+        assert_eq!(
+            filters.lock().unwrap().last().unwrap().resource_subscriptions,
+            vec!["fixture://a".to_string(), "fixture://z".to_string()]
+        );
+        server.unsubscribe_resource("fixture://z").unwrap();
+        assert_eq!(
+            filters.lock().unwrap().last().unwrap().resource_subscriptions,
+            vec!["fixture://a".to_string()]
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|method| method != "resources/subscribe" && method != "resources/unsubscribe"),
+            "modern resource subscriptions travel only through subscriptions/listen"
+        );
     }
 
     #[test]
