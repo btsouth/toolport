@@ -6,28 +6,102 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-08-01
+
+Toolport's Streamable HTTP endpoint now speaks the modern MCP transport while
+keeping the legacy initialize/session flow on the same URL. This release also
+adds four clients, hardens registry recovery, and fixes a collection of routing,
+search, and import edge cases.
+
 ### Added
 
-- **Kilo Code** and **Amp** are detected and configured, taking the client count
-  to 29. Kilo Code uses the same top-level `mcp` shape as OpenCode, so it reuses
-  that adapter rather than adding a parallel one. Amp keeps its servers under the
-  literal dotted key `amp.mcpServers` and honours `AMP_SETTINGS_FILE`. Both files
-  hold far more than MCP servers, so both are treated as whole-app state: an
-  unparseable one errors rather than being replaced with a fresh object.
-  (#553, #538)
+**MCP 2026-07-28 over Streamable HTTP.** Modern clients can use `POST /mcp`
+without `initialize` or `Mcp-Session-Id`; every request carries its own protocol
+metadata and the required `MCP-Protocol-Version`, `Mcp-Method`, and optional
+`Mcp-Name` headers. Existing clients on the legacy initialize/session flow keep
+working on the same endpoint. (#584, #586)
+
+- **Multi-round-trip requests and stateless HITL.** Modern tool calls return
+  `resultType`, surface approval as `input_required`, and resume from opaque
+  `requestState` plus `inputResponses`. A denied call never reaches the server;
+  an accepted retry executes the bound call once. (#585)
+- **Modern subscriptions.** `subscriptions/listen` replaces the legacy GET
+  stream for 2026-07-28 clients, filters notifications per listener, tags them
+  with the subscription id, and flushes events promptly. (#583, #590)
+- **Modern downstream HTTP headers.** Toolport sends per-request protocol and
+  routing headers to modern HTTP servers, including schema-declared
+  `x-mcp-header` values, while legacy downstream servers keep their existing
+  wire format. (#584)
+- **Cacheable, deterministic catalog results.** Modern list/discovery results
+  carry `ttlMs` and `cacheScope`, and tools, prompts, resources, and templates
+  use stable ordering so caches do not churn between equivalent requests.
+  (#587)
+- **Four more clients.** Kilo Code, Amp, GitHub Copilot CLI, and JetBrains Junie
+  are detected and configured, taking the supported client count to 31. Kilo
+  Code reuses the OpenCode `mcp` shape; Amp keeps its literal dotted
+  `amp.mcpServers` key and honours `AMP_SETTINGS_FILE`. (#538, #553, #576, #578)
+
+### Security
+
+- **Registry recovery fails safe.** A corrupt primary registry is restored only
+  from a valid backup; Toolport no longer silently starts from an empty registry
+  that drops configured policy. (#582)
+- **Corrupt integrity pins fail closed.** A damaged pin store can no longer make
+  an existing tool definition look trusted. (#581)
+- **Removing a server clears its security state.** Tool overrides, pins,
+  per-server result budgets, injection-block exemptions, and fingerprint-bound
+  approvals are removed with the server, so a later server reusing the id cannot
+  inherit stale policy. (#509)
+- Import-time private-host detection now matches the OAuth SSRF guard's full
+  private-address ranges. (#564)
 
 ### Fixed
 
-- **Removing a server no longer leaves its settings behind.** Tool overrides,
-  pins, the per-server result budget, the injection-block exemption and any
-  fingerprint-bound approvals are now dropped along with the server. Previously a
-  server added later under the same id could inherit a stale security exemption
-  from one you had deleted. (#509)
+- Unsupported legacy `initialize` versions now return the supported versions so
+  clients can negotiate instead of failing ambiguously. (#588)
 - **A share link survives a failed copy.** Creating a link and then failing to
   copy it reported the whole operation as failed, and where the Clipboard API is
   unavailable the failure was thrown synchronously, so a link that had been
   created fine was surfaced as `Couldn't create a link`. The link now stays
   visible and only the copy is reported as failed. (#560)
+- Empty search states are clearer, unusable MCP commands are reported directly,
+  keyword parameters no longer trigger placeholder false positives, and
+  cross-server names no longer create false rate-limit matches. (#567, #568,
+  #572, #577)
+- Inspect skips corrupt lines before applying its result limit, tiny savings
+  percentages remain visible, token counts are rounded before unit selection,
+  and search-limit errors use the configured constants. (#569-#571, #573)
+- Remote Crush entries are no longer misclassified as OpenCode during import,
+  and the import-review copy now matches the behavior it describes. (#541,
+  #566)
+
+### Maintenance
+
+- Shared cost estimation and civil-date conversion replace duplicate local
+  implementations, and verified dead client/desktop types were removed.
+  (#574, #575, #589)
+
+### Thanks
+
+Patches this cycle came from:
+
+- **[BharadwajKanneveti](https://github.com/BharadwajKanneveti)** - server-state
+  cleanup, routing/search fixes, inspect recovery, and shared helper extraction
+  (#509, #567, #572-#575).
+- **[ColumbusLabs](https://github.com/ColumbusLabs)** - GitHub Copilot CLI and
+  JetBrains Junie support plus search, reporting, and display fixes
+  (#568-#571, #576-#578).
+- **[wenn-id](https://github.com/wenn-id)** - Amp support (#538).
+- **[rohankumardubey](https://github.com/rohankumardubey)** - Kilo Code support
+  (#553).
+- **[Vam-si-krish](https://github.com/Vam-si-krish)** - preserving share links
+  when clipboard copy fails (#560).
+- **[arimu1](https://github.com/arimu1)** - aligning import-time private-host
+  detection with the OAuth SSRF guard (#564).
+- **[Vermitrude](https://github.com/Vermitrude)** - Crush/OpenCode import
+  disambiguation and dead-code cleanup (#541, #589).
+
+If we missed you, open an issue.
 
 ## [1.10.0] - 2026-07-29
 
