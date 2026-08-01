@@ -100,3 +100,4 @@ license-signing.keycd
 # Agent/session scratch (never commit)
 _poll_pr.py
 _cr*.txt
+src-tauri/rate_limit_counters.test.json

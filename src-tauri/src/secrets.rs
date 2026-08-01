@@ -852,16 +852,11 @@ pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
 // once on upgrade so EXISTING secrets are rewritten WITH the shared-access ACL,
 // not just legacy keyring-API entries.
 
-/// Marker file name for the legacy ACL migration (keychain -> ACL-free keychain).
-/// Left untouched for backward compatibility, but the current macOS path migrates
-/// secrets into the file backend instead (see `FILE_MIGRATION_MARKER`).
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-const MIGRATION_MARKER: &str = ".keychain-acl-migrated";
-
 /// Marker file name for the keychain -> encrypted-file migration. A NEW name so
 /// the migration runs exactly once on upgrade to the file-backend-by-default
-/// build, even on installs that already ran the older ACL migration.
+/// build, even on installs that already ran the older ACL migration. An older
+/// `.keychain-acl-migrated` marker file may exist on disk from that legacy
+/// migration; it is intentionally ignored.
 #[cfg(target_os = "macos")]
 const FILE_MIGRATION_MARKER: &str = ".secrets-file-migrated";
 
