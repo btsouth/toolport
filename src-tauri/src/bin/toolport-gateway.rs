@@ -28,11 +28,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 
-use conduit_lib::audit;
+use conduit_lib::{audit, usage_report};
 use conduit_lib::clients;
 use conduit_lib::codemode;
 use conduit_lib::downstream::{
-    self, DownstreamServer, ResourceUpdatedSink, ServerRequestHandler, StdioTransport, Transport,
+    self, CacheHint, DownstreamServer, MrtrRequest, ResourceUpdatedSink, ServerRequestAction,
+    ServerRequestHandler, StdioTransport, Transport,
     MODERN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use conduit_lib::inspect;
@@ -58,6 +59,10 @@ thread_local! {
     /// dozen dispatch arms - including the ones that return early (SOU-446).
     static ACTIVE_UPSTREAM_VERSION: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// Per-request capabilities of a modern upstream client. These decide
+    /// whether a legacy downstream server request can be surfaced as MRTR.
+    static ACTIVE_UPSTREAM_CAPABILITIES: std::cell::RefCell<Option<Value>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Sets the serving era for one request and restores the previous value on drop,
@@ -79,6 +84,40 @@ impl Drop for UpstreamEraGuard {
 /// True when the request being served came from a modern client.
 fn serving_modern_client() -> bool {
     ACTIVE_UPSTREAM_VERSION.with(|cell| cell.borrow().is_some())
+}
+
+struct UpstreamCapabilitiesGuard(Option<Value>);
+
+impl UpstreamCapabilitiesGuard {
+    fn enter(req: &Value) -> Self {
+        let capabilities = req
+            .get("params")
+            .and_then(|params| params.get("_meta"))
+            .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"))
+            .cloned();
+        Self(ACTIVE_UPSTREAM_CAPABILITIES.with(|cell| cell.replace(capabilities)))
+    }
+}
+
+impl Drop for UpstreamCapabilitiesGuard {
+    fn drop(&mut self) {
+        ACTIVE_UPSTREAM_CAPABILITIES.with(|cell| *cell.borrow_mut() = self.0.take());
+    }
+}
+
+fn modern_client_supports_server_rpc(method: &str) -> bool {
+    let capability = match method {
+        "roots/list" => "roots",
+        "sampling/createMessage" => "sampling",
+        "elicitation/create" => "elicitation",
+        _ => return false,
+    };
+    ACTIVE_UPSTREAM_CAPABILITIES.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|caps| caps.get(capability))
+            .is_some()
+    })
 }
 
 /// Add the fields a modern client requires to a result.
@@ -115,6 +154,34 @@ fn decorate_for_upstream(mut result: Value) -> Value {
     result
 }
 
+/// Toolport-owned cacheable results stay fresh for at most five minutes. A
+/// shorter downstream TTL wins, while a missing/zero TTL disables caching for
+/// the aggregate. Registry and list-changed notifications still invalidate it.
+const LOCAL_CACHE_TTL_MS: u64 = 300_000;
+
+fn cacheable_for_upstream(mut result: Value, hint: CacheHint, scoped: bool) -> Value {
+    let Some(obj) = result.as_object_mut() else {
+        return result;
+    };
+    if !serving_modern_client() {
+        // A modern downstream may sit behind a legacy upstream. Keep the legacy
+        // result shape unchanged rather than leaking fields its revision lacks.
+        obj.remove("ttlMs");
+        obj.remove("cacheScope");
+        return result;
+    }
+    obj.insert("ttlMs".to_string(), json!(hint.remaining_ttl_ms()));
+    obj.insert(
+        "cacheScope".to_string(),
+        json!(if !scoped && hint.is_public() {
+            "public"
+        } else {
+            "private"
+        }),
+    );
+    result
+}
+
 fn success(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": decorate_for_upstream(result) })
 }
@@ -133,9 +200,10 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 ///
 /// Every entry below `MODERN_PROTOCOL_VERSION` is legacy. The gateway's own
 /// behaviour does not vary across them (revision differences are additive and ride
-/// through from the downstream server), and the `initialize` arm echoes whatever
-/// the client asks for, so all of them genuinely are served. Listing only two
-/// under-reported that (SOU-474 #7).
+/// through from the downstream server). `initialize` echoes listed revisions but
+/// negotiates unknown values down to [`PROTOCOL_VERSION`] rather than claiming to
+/// implement an arbitrary client string (SOU-482). Listing only two under-reported
+/// the revisions Toolport genuinely serves (SOU-474 #7).
 const SUPPORTED_UPSTREAM_VERSIONS: [&str; 5] = [
     MODERN_PROTOCOL_VERSION,
     "2025-11-25",
@@ -182,14 +250,19 @@ fn unsupported_version_error(id: Value, requested: &str) -> Value {
     })
 }
 
-/// What Toolport advertises to upstream clients, shared by `initialize` (legacy)
-/// and `server/discover` (modern) so the two can never drift.
+/// What Toolport advertises to upstream clients. The catalog capabilities stay
+/// aligned across eras, while the removed legacy `resources.subscribe` flag is
+/// omitted from modern discovery in favor of `subscriptions/listen`.
 fn gateway_capabilities() -> Value {
+    let resources = if serving_modern_client() {
+        json!({ "listChanged": true })
+    } else {
+        // Always-on legacy proxy: advertise subscribe, fail closed when no owner can.
+        json!({ "listChanged": true, "subscribe": true })
+    };
     json!({
         "tools": { "listChanged": true },
-        // Always-on proxy for resource subscriptions (SOU-394): advertise
-        // subscribe, fail closed when no owner can.
-        "resources": { "listChanged": true, "subscribe": true },
+        "resources": resources,
         "prompts": { "listChanged": true },
         "completions": {}
     })
@@ -602,6 +675,10 @@ static PROGRESS_ROUTES: std::sync::OnceLock<Arc<Mutex<ProgressRoutes>>> =
 /// one of them silently resolved to the stdio branch - including the ones whose
 /// whole point was an HTTP gateway (SOU-474 #9).
 static HAS_STDIO_CLIENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Once this stdio peer sends a 2026-07-28 request, unsolicited legacy
+/// notifications must stop. Modern notifications travel only through its
+/// explicit `subscriptions/listen` filter.
+static MODERN_STDIO_UPSTREAM: AtomicBool = AtomicBool::new(false);
 
 fn set_has_stdio_client(present: bool) {
     HAS_STDIO_CLIENT.store(if present { 2 } else { 1 }, std::sync::atomic::Ordering::SeqCst);
@@ -1385,8 +1462,8 @@ fn set_server_enabled_via_agent(
     // app or team-sync write can't land between our read and our save and be reverted
     // (SOU-23). Held until this function returns. Also re-check the opt-in on the fresh copy
     // (the user may have just turned it off).
-    let _lock = registry::lock_at(path).map_err(|e| format!("Toolport: {e}"))?;
-    let mut fresh = registry::load_from(path)
+    let lock = registry::lock_at(path).map_err(|e| format!("Toolport: {e}"))?;
+    let mut fresh = registry::load_from_locked(path, &lock)
         .map_err(|e| format!("Toolport: could not read the registry ({e})."))?;
     if !fresh.allow_agent_control {
         audit::record_agent_toggle(
@@ -1825,7 +1902,15 @@ struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
-    fn new(tools: Vec<Value>) -> Self {
+    fn new(mut tools: Vec<Value>) -> Self {
+        // Normalize both fresh and disk-cached catalogs. Without this, the first
+        // tools/list after restart could replay pre-SOU-454 incidental ordering
+        // until the background router build replaced it.
+        tools.sort_by(|left, right| {
+            left.get("name")
+                .and_then(Value::as_str)
+                .cmp(&right.get("name").and_then(Value::as_str))
+        });
         let search = CatalogSearchIndex::build(&tools);
         Self { tools, search }
     }
@@ -2401,7 +2486,7 @@ fn savings_line() -> String {
     if saved > 0 {
         let loads = s.get("listLoads").and_then(Value::as_u64).unwrap_or(0);
         let peak = s.get("peakCatalog").and_then(Value::as_u64).unwrap_or(0);
-        let dollars = (saved as f64 / 1_000_000.0) * 3.0; // Claude Sonnet input $/M
+        let dollars = usage_report::est_cost(saved); // Claude Sonnet input $/M
         line.push_str(&format!(
             "Lazy discovery has kept ~{} tokens of tool definitions out of your agent's \
              context so far (about ${:.2} at Claude Sonnet input rates) across {loads} \
@@ -3323,6 +3408,9 @@ fn execute_call(
     // minus per-hop keys (SOU-444). `None` for calls Toolport originates
     // itself: a code-mode script step has no client request behind it.
     client_meta: Option<&Value>,
+    // Wire-only 2026-07-28 retry fields. Kept out of `arguments`, then restored
+    // beside them on the downstream hop (SOU-449).
+    mrtr: Option<&MrtrRequest>,
     opts: CallOpts,
     // Live swappable router slot (SOU-321). After HITL approval we re-clone this so
     // quarantine applied via `Arc::make_mut` during the hold is visible before execute.
@@ -3331,6 +3419,16 @@ fn execute_call(
 ) -> Value {
     let mut confirmed = opts.confirmed;
     let shape = opts.shape;
+    // Direct modern calls can use MRTR even on their first round, before any
+    // requestState exists. Code-mode steps deliberately keep the legacy broker
+    // because they cannot surface an intermediate result to the upstream client;
+    // `confirm` is present only on the direct call path.
+    let modern_direct_call = serving_modern_client() && confirm.is_some();
+    let resuming_modern_hitl = modern_direct_call
+        && mrtr
+            .and_then(|retry| retry.request_state.as_ref())
+            .and_then(Value::as_str)
+            .is_some_and(|state| state.starts_with("toolport-hitl-"));
     let mut call_profiler = RoutedCallProfiler::start(name);
     // Resolve the call's real (server, original tool) from the router's route map,
     // NOT by splitting the exposed name on `__`. A renamed tool (via a tool override)
@@ -3379,17 +3477,19 @@ fn execute_call(
     // Org tool-call caps (SOU-340): cooperative local enforcement of Teams rate_limits.
     // Runs before HITL/destructive gates so a hard cap does not queue for human approval.
     // Denied calls do not increment counters (check_and_count is atomic for allow path).
-    if let Some(team) = reg.team.as_ref() {
-        if !team.rate_limits.is_empty() {
-            if let Err(msg) =
-                conduit_lib::rate_limits::check_and_count(&team.rate_limits, server_id, tool)
-            {
-                // Count as a failed call with a clear reason so Activity / export show the block.
-                audit::record_timed(srv, tool, false, None, Some("rate_limit"), client);
-                return json!({
-                    "content": [{ "type": "text", "text": msg }],
-                    "isError": true
-                });
+    if !resuming_modern_hitl {
+        if let Some(team) = reg.team.as_ref() {
+            if !team.rate_limits.is_empty() {
+                if let Err(msg) =
+                    conduit_lib::rate_limits::check_and_count(&team.rate_limits, server_id, tool)
+                {
+                    // Count as a failed call with a clear reason so Activity / export show the block.
+                    audit::record_timed(srv, tool, false, None, Some("rate_limit"), client);
+                    return json!({
+                        "content": [{ "type": "text", "text": msg }],
+                        "isError": true
+                    });
+                }
             }
         }
     }
@@ -3397,12 +3497,15 @@ fn execute_call(
     // After HITL approval we may swap to a freshly cloned live Arc so quarantine applied
     // during the hold is enforced (SOU-321). Non-HITL calls keep the request snapshot.
     let mut exec_router_owned: Option<Arc<Router>> = None;
+    let mut active_modern_hitl: Option<String> = None;
+    let mut routed_mrtr: Option<MrtrRequest> = None;
 
-    // Human-in-the-loop approval: hold a gated call (destructive, or from an
-    // untrusted-provenance server) until a person approves it in the Toolport app.
+    // Human-in-the-loop approval: gate a destructive or untrusted call until a
+    // person approves it in the Toolport app. Legacy clients hold this request;
+    // modern clients receive input_required and re-enter on a fresh request.
     // Takes precedence over the agent-facing confirm below, and is fail-closed
     // (no broker / no answer / timeout all deny). Skipped once `confirmed`.
-    if reg.human_approval_effective() && !confirmed {
+    if (reg.human_approval_effective() || resuming_modern_hitl) && !confirmed {
         // Resolve destructiveness robustly: cache, then live router, else
         // fail-closed (an unknown tool must not skip the human gate).
         let is_dest = tool_is_destructive_fail_closed(name, cached, router);
@@ -3416,24 +3519,35 @@ fn execute_call(
             .find(|s| s.id == server_id)
             .map(|s| matches!(s.source.as_deref(), Some("shared") | Some("registry")))
             .unwrap_or(false);
-        if let Some(reason) = approval::gate_reason(true, is_dest, untrusted) {
-            // The gate reason names WHY a human was asked; shared by the audit record
-            // and the agent-facing envelope on every outcome (approved included).
-            let reason_str = match reason {
-                approval::ApprovalReason::Destructive => "destructive",
-                approval::ApprovalReason::UntrustedSource => "untrusted_source",
-                approval::ApprovalReason::DestructiveAndUntrusted => {
-                    "destructive_and_untrusted"
-                }
-            };
+        let gate_fp = tool_fingerprint_for(name, cached, router);
+        let modern_always_allowed = serving_modern_client()
+            && !resuming_modern_hitl
+            && gate_fp.as_deref().is_some_and(|fingerprint| {
+                reg.is_tool_allowed(&approval::fingerprint_allow_key(srv, tool, fingerprint))
+            });
+        if modern_always_allowed {
+            confirmed = true;
+        }
+        let gate_reason = (!confirmed)
+            .then(|| approval::gate_reason(true, is_dest, untrusted))
+            .flatten()
+            .or_else(|| {
+            resuming_modern_hitl
+                .then(|| {
+                    mrtr.and_then(|retry| retry.request_state.as_ref())
+                        .and_then(Value::as_str)
+                        .and_then(modern_hitl_reason)
+                })
+                .flatten()
+            });
+        if let Some(reason) = gate_reason {
             // The exact call being approved, content-bound: the bytes that RUN must
-            // hash-match these. Captured before the (blocking) human decision.
+            // hash-match these. Modern clients park the decision behind an opaque
+            // requestState and re-enter after elicitation; legacy clients retain the
+            // original blocking broker behavior.
             let approved_args_hash = audit::args_hash(&arguments);
-            // Definition fingerprint the human is approving (SOU-322): rebound against
-            // the live router after approve, before execute.
-            let approved_fp = tool_fingerprint_for(name, cached, router);
-            let t0 = std::time::Instant::now();
-            let decision = request_human_decision(approval::ApprovalRequest {
+            let current_fp = gate_fp;
+            let approval_request = || approval::ApprovalRequest {
                 token: String::new(),
                 id: new_correlation_id(),
                 client: client.map(str::to_string),
@@ -3441,9 +3555,113 @@ fn execute_call(
                 tool: tool.to_string(),
                 reason,
                 arguments: arguments.clone(),
-                tool_fingerprint: approved_fp.clone(),
-            });
-            let held_ms = t0.elapsed().as_millis() as u64;
+                tool_fingerprint: current_fp.clone(),
+            };
+            let mut approval_reason = reason;
+            let (decision, held_ms, approved_fp, audit_approval) =
+                if modern_direct_call {
+                let incoming = mrtr.cloned().unwrap_or_default();
+                let state = incoming.request_state.as_ref().and_then(Value::as_str);
+                let polled = state.map(|token| {
+                    (
+                        token,
+                        poll_modern_hitl(
+                            token,
+                            name,
+                            &approved_args_hash,
+                            client,
+                            incoming.input_responses.clone(),
+                        ),
+                    )
+                });
+                match polled {
+                    Some((token, ModernHitlPoll::Pending)) => {
+                        return modern_hitl_input_required(token)
+                    }
+                    Some((_, ModernHitlPoll::Stale)) => {
+                        (
+                            approval::ApprovalDecision::StaleState,
+                            0,
+                            current_fp.clone(),
+                            false,
+                        )
+                    }
+                    Some((_, ModernHitlPoll::Decided(decision, held_ms, stored_reason))) => {
+                        approval_reason = stored_reason;
+                        (decision, held_ms, current_fp.clone(), false)
+                    }
+                    Some((token, ModernHitlPoll::Approved {
+                        approved_fingerprint,
+                        reason: stored_reason,
+                        held_ms,
+                        downstream,
+                        newly_approved,
+                    })) => {
+                        approval_reason = stored_reason;
+                        active_modern_hitl = Some(token.to_string());
+                        routed_mrtr = Some(downstream);
+                        (
+                            approval::ApprovalDecision::Approved,
+                            held_ms,
+                            approved_fingerprint,
+                            newly_approved,
+                        )
+                    }
+                    Some((token, ModernHitlPoll::Missing))
+                        if token.starts_with("toolport-hitl-") =>
+                    {
+                        (
+                            approval::ApprovalDecision::StaleState,
+                            0,
+                            current_fp.clone(),
+                            false,
+                        )
+                    }
+                    Some((_, ModernHitlPoll::Missing)) | None => {
+                        if !modern_client_supports_server_rpc("elicitation/create") {
+                            return json!({
+                                "_toolportProtocolError": {
+                                    "code": downstream::MISSING_REQUIRED_CLIENT_CAPABILITY,
+                                    "message": "human approval requires the modern client's elicitation capability",
+                                    "requiredCapability": "elicitation"
+                                }
+                            });
+                        }
+                        match start_modern_hitl(
+                            name,
+                            approved_args_hash.clone(),
+                            current_fp.clone(),
+                            reason,
+                            client,
+                            srv,
+                            tool,
+                            &arguments,
+                            incoming,
+                        ) {
+                            Ok(token) => return modern_hitl_input_required(&token),
+                            Err(decision) => (decision, 0, current_fp.clone(), false),
+                        }
+                    }
+                }
+            } else {
+                let t0 = Instant::now();
+                let decision = request_human_decision(approval_request());
+                (
+                    decision,
+                    t0.elapsed().as_millis() as u64,
+                    current_fp.clone(),
+                    true,
+                )
+            };
+            // The gate reason names WHY a human was asked; shared by the audit record
+            // and the agent-facing envelope on every outcome (approved included).
+            let reason_str = match approval_reason {
+                approval::ApprovalReason::Destructive => "destructive",
+                approval::ApprovalReason::UntrustedSource => "untrusted_source",
+                approval::ApprovalReason::DestructiveAndUntrusted => {
+                    "destructive_and_untrusted"
+                }
+            };
             if !decision.is_approved() {
                 // Governance audit: the gate reason and which non-approval outcome
                 // (denied / no-response / unreachable), plus a content hash of the
@@ -3464,6 +3682,7 @@ fn execute_call(
             // was mutated after approval, reject the stale approval (fail-closed)
             // rather than run bytes a human never actually saw.
             if let Some(stale) = content_binding_decision(&approved_args_hash, &arguments) {
+                finish_modern_hitl(active_modern_hitl.as_deref());
                 audit::record_decision(
                     srv,
                     tool,
@@ -3482,6 +3701,7 @@ fn execute_call(
                 if let Some(stale) =
                     post_hitl_revalidation(approved_fp.as_deref(), name, &live)
                 {
+                    finish_modern_hitl(active_modern_hitl.as_deref());
                     audit::record_decision(
                         srv,
                         tool,
@@ -3497,17 +3717,29 @@ fn execute_call(
             }
             // Approved calls are audited too, so the trail shows what actually ran,
             // not only what was blocked.
-            audit::record_decision(
-                srv,
-                tool,
-                client,
-                reason_str,
-                "approved",
-                &arguments,
-                Some(held_ms),
-            );
+            if audit_approval {
+                audit::record_decision(
+                    srv,
+                    tool,
+                    client,
+                    reason_str,
+                    "approved",
+                    &arguments,
+                    Some(held_ms),
+                );
+            }
             // Skip the agent-confirm step and route the call.
             confirmed = true;
+        } else if resuming_modern_hitl {
+            let token = mrtr
+                .and_then(|retry| retry.request_state.as_ref())
+                .and_then(Value::as_str);
+            finish_modern_hitl(token);
+            return refused_call_result(
+                name,
+                approval::ApprovalDecision::StaleState,
+                "stale_state",
+            );
         }
     }
 
@@ -3596,11 +3828,25 @@ fn execute_call(
     let client_meta = relay_owned.as_ref().or(client_meta);
 
     let started = Instant::now();
-    match exec_router.route_call_with_cancel(name, arguments, cancel.clone(), client_meta) {
-        Ok(result) => {
+    let effective_mrtr = routed_mrtr.as_ref().or(mrtr);
+    match exec_router.route_call_with_cancel_and_mrtr(
+        name,
+        arguments,
+        cancel.clone(),
+        client_meta,
+        effective_mrtr,
+    ) {
+        Ok(mut result) => {
             if let Some(profiler) = &mut call_profiler {
                 profiler.mark_downstream();
             }
+            if result.get("resultType").and_then(Value::as_str) == Some("input_required") {
+                if let Some(token) = active_modern_hitl.as_deref() {
+                    update_modern_hitl_downstream(token, &mut result);
+                }
+                return result;
+            }
+            finish_modern_hitl(active_modern_hitl.as_deref());
             let ms = started.elapsed().as_millis() as u64;
             // Downstream success flag (before content defense may flip isError on a
             // high-confidence injection block — SOU-345). Live inspect keeps the RAW
@@ -3652,6 +3898,7 @@ fn execute_call(
             out
         }
         Err(e) => {
+            finish_modern_hitl(active_modern_hitl.as_deref());
             let ms = started.elapsed().as_millis() as u64;
             audit::record_timed_with_hash(
                 srv,
@@ -3870,6 +4117,7 @@ fn run_script_dispatch(
                     // A script step is Toolport's own call, not a relay of a client
                     // request, so there is no client `_meta` to carry.
                     None,
+                    None,
                     CallOpts {
                         confirmed: false,
                         shape: false,
@@ -4024,6 +4272,10 @@ fn handle_request_with_cancel(
     let _era = UpstreamEraGuard::enter(
         declared.filter(|v| v.as_str() == MODERN_PROTOCOL_VERSION),
     );
+    let _capabilities = UpstreamCapabilitiesGuard::enter(req);
+    // A profile-selected or per-client filtered catalog must never be shared
+    // across authorization contexts, even when every downstream says public.
+    let cache_scoped = profile.is_some() || allowed.is_some();
 
     match method {
         // Modern clients open here instead of handshaking. Servers MUST implement
@@ -4048,11 +4300,16 @@ fn handle_request_with_cancel(
             }),
         )),
         "initialize" => {
-            let proto = req
+            let requested = req
                 .get("params")
                 .and_then(|p| p.get("protocolVersion"))
                 .and_then(|v| v.as_str())
                 .unwrap_or(PROTOCOL_VERSION);
+            let proto = if SUPPORTED_UPSTREAM_VERSIONS.contains(&requested) {
+                requested
+            } else {
+                PROTOCOL_VERSION
+            };
             Some(success(
                 id,
                 json!({
@@ -4115,7 +4372,14 @@ fn handle_request_with_cancel(
                     "tools/list -> {} meta-tools (lazy discovery)",
                     tools.len()
                 ));
-                return Some(success(id, json!({ "tools": tools })));
+                return Some(success(
+                    id,
+                    cacheable_for_upstream(
+                        json!({ "tools": tools }),
+                        CacheHint::local(LOCAL_CACHE_TTL_MS),
+                        cache_scoped,
+                    ),
+                ));
             }
             // Grouped mode: the lazy meta-tools plus a per-server help_<server> browse
             // tool, so a weak model can pick a server by name instead of inventing a
@@ -4150,7 +4414,17 @@ fn handle_request_with_cancel(
                     tools.len(),
                     distinct_server_prefixes(&scoped).len()
                 ));
-                return Some(success(id, json!({ "tools": tools })));
+                return Some(success(
+                    id,
+                    cacheable_for_upstream(
+                        json!({ "tools": tools }),
+                        router
+                            .tools_cache_hint()
+                            .map(|hint| CacheHint::local(LOCAL_CACHE_TTL_MS).merge(hint))
+                            .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS)),
+                        cache_scoped,
+                    ),
+                ));
             }
             let mut tools = vec![status_tool_def(), fetch_result_tool_def()];
             if code_mode_enabled() {
@@ -4176,7 +4450,17 @@ fn handle_request_with_cancel(
                 tools.len(),
                 !cached.is_empty()
             ));
-            Some(success(id, json!({ "tools": tools })))
+            Some(success(
+                id,
+                cacheable_for_upstream(
+                    json!({ "tools": tools }),
+                    router
+                        .tools_cache_hint()
+                        .map(|hint| CacheHint::local(LOCAL_CACHE_TTL_MS).merge(hint))
+                        .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS)),
+                    cache_scoped,
+                ),
+            ))
         }
         "tools/call" => {
             let params = req.get("params");
@@ -4622,26 +4906,44 @@ fn handle_request_with_cancel(
             } else {
                 (name, arguments)
             };
+            let mrtr = MrtrRequest::from_params(params);
+            let result = execute_call(
+                reg,
+                router,
+                cached,
+                client,
+                allowed,
+                cancel,
+                Some(confirm),
+                name.as_str(),
+                arguments,
+                // Relay the client's request metadata downstream (SOU-444).
+                req.get("params").and_then(|p| p.get("_meta")),
+                (!mrtr.is_empty()).then_some(&mrtr),
+                CallOpts {
+                    confirmed,
+                    shape: true,
+                },
+                live_router,
+            );
+            if let Some(protocol_error) = result.get("_toolportProtocolError") {
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": protocol_error.get("code").cloned().unwrap_or(json!(-32603)),
+                        "message": protocol_error.get("message").cloned().unwrap_or(json!("protocol error")),
+                        "data": {
+                            "requiredCapabilities": [
+                                protocol_error.get("requiredCapability").cloned().unwrap_or(Value::Null)
+                            ]
+                        }
+                    }
+                }));
+            }
             Some(success(
                 id,
-                execute_call(
-                    reg,
-                    router,
-                    cached,
-                    client,
-                    allowed,
-                    cancel,
-                    Some(confirm),
-                    name.as_str(),
-                    arguments,
-                    // Relay the client's request metadata downstream (SOU-444).
-                    req.get("params").and_then(|p| p.get("_meta")),
-                    CallOpts {
-                        confirmed,
-                        shape: true,
-                    },
-                    live_router,
-                ),
+                result,
             ))
         }
         "resources/list" => {
@@ -4660,7 +4962,16 @@ fn handle_request_with_cancel(
                 });
             }
             gtrace(&format!("resources/list -> {} resources", resources.len()));
-            Some(success(id, json!({ "resources": resources })))
+            Some(success(
+                id,
+                cacheable_for_upstream(
+                    json!({ "resources": resources }),
+                    router
+                        .resources_cache_hint()
+                        .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS)),
+                    cache_scoped,
+                ),
+            ))
         }
         "resources/templates/list" => {
             let mut templates = router.aggregated_resource_templates();
@@ -4680,11 +4991,20 @@ fn handle_request_with_cancel(
             ));
             // Backward compatible: full aggregated list in one response (no
             // nextCursor), matching tools/resources/prompts list behavior.
-            Some(success(id, json!({ "resourceTemplates": templates })))
+            Some(success(
+                id,
+                cacheable_for_upstream(
+                    json!({ "resourceTemplates": templates }),
+                    router
+                        .resource_templates_cache_hint()
+                        .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS)),
+                    cache_scoped,
+                ),
+            ))
         }
         "resources/read" => {
-            let uri = req
-                .get("params")
+            let params = req.get("params");
+            let uri = params
                 .and_then(|p| p.get("uri"))
                 .and_then(|u| u.as_str())
                 .unwrap_or("");
@@ -4700,13 +5020,19 @@ fn handle_request_with_cancel(
                     return Some(error(id, -32602, &format!("Toolport: no server owns resource '{uri}'")));
                 }
             }
-            let client_meta = req.get("params").and_then(|p| p.get("_meta")).cloned();
+            let client_meta = params.and_then(|p| p.get("_meta")).cloned();
+            let mrtr = MrtrRequest::from_params(params);
             let (_progress_route, relay_owned) = match router.resource_server(uri) {
                 Some(owner) => prepare_progress(client_meta.as_ref(), owner),
                 None => (None, None),
             };
             let client_meta = relay_owned.or(client_meta);
-            match router.read_resource_with_cancel(uri, cancel.clone(), client_meta.as_ref()) {
+            match router.read_resource_with_cancel_and_mrtr(
+                uri,
+                cancel.clone(),
+                client_meta.as_ref(),
+                (!mrtr.is_empty()).then_some(&mrtr),
+            ) {
                 Ok(mut result) => {
                     // Content defense: a resource is as attacker-controllable as a tool
                     // result, so scan it for injection and label any flagged text as data.
@@ -4721,7 +5047,11 @@ fn handle_request_with_cancel(
                             return Some(error(id, -32602, &msg));
                         }
                     }
-                    Some(success(id, result))
+                    let hint = CacheHint::from_result(&result);
+                    Some(success(
+                        id,
+                        cacheable_for_upstream(result, hint, cache_scoped),
+                    ))
                 }
                 // The error message is downstream-controlled and does not pass through
                 // inspect_result (it's a JSON-RPC error, not a content block), so
@@ -4747,7 +5077,16 @@ fn handle_request_with_cancel(
                 });
             }
             gtrace(&format!("prompts/list -> {} prompts", prompts.len()));
-            Some(success(id, json!({ "prompts": prompts })))
+            Some(success(
+                id,
+                cacheable_for_upstream(
+                    json!({ "prompts": prompts }),
+                    router
+                        .prompts_cache_hint()
+                        .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS)),
+                    cache_scoped,
+                ),
+            ))
         }
         "prompts/get" => {
             let params = req.get("params");
@@ -4771,13 +5110,19 @@ fn handle_request_with_cancel(
                 }
             }
             let client_meta = params.and_then(|p| p.get("_meta")).cloned();
+            let mrtr = MrtrRequest::from_params(params);
             let (_progress_route, relay_owned) = match router.prompt_server(name) {
                 Some(owner) => prepare_progress(client_meta.as_ref(), owner),
                 None => (None, None),
             };
             let client_meta = relay_owned.or(client_meta);
-            match router.get_prompt_with_cancel(name, arguments, cancel.clone(), client_meta.as_ref())
-            {
+            match router.get_prompt_with_cancel_and_mrtr(
+                name,
+                arguments,
+                cancel.clone(),
+                client_meta.as_ref(),
+                (!mrtr.is_empty()).then_some(&mrtr),
+            ) {
                 Ok(mut result) => {
                     // Content defense: a prompt's messages are attacker-controllable too;
                     // scan for injection and label any flagged text as data.
@@ -4955,8 +5300,15 @@ fn build_router(
         // On store failure, start with empty blocked and log loudly (SOU-320): there is
         // no prior live set yet. We deliberately do NOT rename/clear a corrupt file —
         // that would make the next reconcile install a permanent empty set.
-        quarantined: if reg.quarantine_on_drift_effective() {
-            match integrity::quarantined(profile) {
+        quarantined: {
+            let stored = if reg.quarantine_on_drift_effective() {
+                integrity::quarantined(profile)
+            } else {
+                // Baseline tamper invalidates the catalog's trust root, so those entries
+                // remain blocked even when optional high-risk drift quarantine is off.
+                integrity::mandatory_quarantined(profile)
+            };
+            match stored {
                 Ok(set) => set,
                 Err(e) => {
                     glog(&format!(
@@ -4967,8 +5319,6 @@ fn build_router(
                     Default::default()
                 }
             }
-        } else {
-            Default::default()
         },
     };
 
@@ -5101,7 +5451,7 @@ fn connect_one(
             resource_updated,
         ) {
             Ok(mut t) => {
-                t.set_server_request_handler(server_handler);
+                t.set_server_request_handler(Arc::clone(&server_handler));
                 t.set_progress_sink(progress);
                 DownstreamServer::connect(server.id.clone(), Box::new(t))
             }
@@ -5113,6 +5463,7 @@ fn connect_one(
             Some(Arc::clone(&server_handler)),
             resource_updated,
             progress,
+            Some(Arc::clone(dirty)),
         )
     } else {
         Err("no command or url".to_string())
@@ -5120,6 +5471,7 @@ fn connect_one(
 
     match result {
         Ok(mut ds) => {
+            ds.set_server_request_handler(server_handler);
             // Only the gateway needs resources/prompts (to proxy them); fetch
             // them here, off the health-probe path.
             ds.load_resources_prompts();
@@ -5159,12 +5511,14 @@ fn notify_list_changed(
     method: &str,
 ) {
     let msg = json!({ "jsonrpc": "2.0", "method": method });
-    let mut out = stdout
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = write_json_line(&mut *out, &msg);
+    if !MODERN_STDIO_UPSTREAM.load(Ordering::SeqCst) {
+        let mut out = stdout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = write_json_line(&mut *out, &msg);
+    }
     if let Some(sessions) = mcp_sessions {
-        fanout_mcp_notification(sessions, &msg);
+        fanout_mcp_notification(stdout, sessions, &msg);
     }
 }
 
@@ -5172,20 +5526,31 @@ fn notify_list_changed(
 /// session (SOU-328). Best-effort: a full outbound queue drops that session's
 /// copy and continues so one stuck client cannot block the others.
 fn fanout_mcp_notification(
+    stdout: &Arc<Mutex<std::io::Stdout>>,
     mcp_sessions: &Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
     msg: &Value,
 ) {
-    let Ok(json) = serde_json::to_string(msg) else {
-        return;
-    };
-    let sessions = mcp_sessions
+    let sessions: Vec<Arc<McpSession>> = mcp_sessions
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for session in sessions.values() {
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect();
+    for session in sessions {
         if session.is_expired() || session.closed.load(Ordering::SeqCst) {
             continue;
         }
-        if !session.push_message(json.clone(), request_id_key(msg)) {
+        let Some(json) = session.notification_json(msg) else {
+            continue;
+        };
+        if session.is_modern_stdio() {
+            if let Ok(value) = serde_json::from_str::<Value>(&json) {
+                let mut out = stdout
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = write_json_line(&mut *out, &value);
+            }
+        } else if !session.push_message(json, request_id_key(msg)) {
             eprintln!("toolport: MCP session outbound queue full; list_changed dropped");
         }
     }
@@ -5229,36 +5594,49 @@ fn deliver_resource_updated(
         "method": "notifications/resources/updated",
         "params": { "uri": uri }
     });
-    let Ok(json) = serde_json::to_string(&msg) else {
-        return;
-    };
     let mut need_stdio = false;
-    let mut http_ids: Vec<String> = Vec::new();
+    let mut session_ids: Vec<String> = Vec::new();
     for sid in targets {
         if sid == RESOURCE_SUB_STDIO {
             need_stdio = true;
         } else {
-            http_ids.push(sid);
+            session_ids.push(sid);
         }
     }
-    if need_stdio {
+    if should_write_legacy_stdio_resource_update(
+        need_stdio,
+        MODERN_STDIO_UPSTREAM.load(Ordering::SeqCst),
+    ) {
         let mut out = stdout
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = write_json_line(&mut *out, &msg);
     }
-    if !http_ids.is_empty() {
-        let sessions = mcp_sessions
+    if !session_ids.is_empty() {
+        let targets: Vec<Arc<McpSession>> = {
+            let sessions = mcp_sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for sid in http_ids {
-            let Some(session) = sessions.get(&sid) else {
-                continue;
-            };
+            session_ids
+                .iter()
+                .filter_map(|sid| sessions.get(sid).cloned())
+                .collect()
+        };
+        for session in targets {
             if session.is_expired() || session.closed.load(Ordering::SeqCst) {
                 continue;
             }
-            if !session.push_message(json.clone(), None) {
+            let Some(json) = session.notification_json(&msg) else {
+                continue;
+            };
+            if session.is_modern_stdio() {
+                if let Ok(value) = serde_json::from_str::<Value>(&json) {
+                    let mut out = stdout
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let _ = write_json_line(&mut *out, &value);
+                }
+            } else if !session.push_message(json, None) {
                 eprintln!(
                     "toolport: MCP session outbound queue full; resources/updated dropped"
                 );
@@ -5783,9 +6161,10 @@ fn cleanup_resource_subs_for_session(state: &GatewayState, session: &str) {
 /// Run tool-definition integrity detection on a freshly built catalog (gated by
 /// the registry's `integrity_check`, on by default). Any drift is recorded to the
 /// security log inside `integrity::check`; here we also surface it in the gateway
-/// log so it's visible in "Copy diagnostics". Detection only, never blocks.
-/// Returns true if a high-risk drift was just quarantined (so the caller should
-/// re-filter the router this cycle).
+/// log so it's visible in "Copy diagnostics". Ordinary drift blocks only when its
+/// policy is enabled; baseline loss always blocks because the trust root is gone.
+/// Returns true if tools were just quarantined (so the caller should re-filter the
+/// router this cycle).
 fn maybe_check_integrity(
     registry: &Arc<Mutex<Registry>>,
     tools: &[Value],
@@ -5810,8 +6189,10 @@ fn maybe_check_integrity(
         ));
         eprintln!("toolport: SECURITY tool drift ({change}) {tool}");
     }
-    // Block high-risk drift (poisoned / destructive) until re-approved, when enabled.
-    quarantine_on && integrity::apply_quarantine(profile, tools, &events)
+    // Ordinary high-risk drift follows the user's setting. A lost baseline is mandatory:
+    // no setting may turn destruction of the trust root into a fail-open catalog.
+    (quarantine_on || integrity::baseline_tamper_detected(&events))
+        && integrity::apply_quarantine(profile, tools, &events)
 }
 
 /// Run integrity detection on a freshly built catalog; if a high-risk drift was just
@@ -5861,10 +6242,12 @@ fn effective_quarantine(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         r.quarantine_on_drift_effective()
     };
-    if !on {
-        return Some(BTreeSet::new());
-    }
-    match integrity::quarantined_checked(profile) {
+    let stored = if on {
+        integrity::quarantined_checked(profile)
+    } else {
+        integrity::mandatory_quarantined_checked(profile)
+    };
+    match stored {
         Ok(set) => {
             // Recovered: let a future failure warn again.
             QUARANTINE_READ_FAILED.store(false, Ordering::SeqCst);
@@ -6272,7 +6655,15 @@ fn watch_tick(
     // A live downstream server that changed its own tool set (sent
     // tools/list_changed) sets this. Swap before acting so a notification
     // arriving mid-refresh is caught on the next tick rather than lost.
-    let downstream_changed = downstream_dirty.swap(0, Ordering::SeqCst);
+    let downstream_notified = downstream_dirty.swap(0, Ordering::SeqCst);
+    let cache_expired = {
+        let live = router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        live.expired_cache_kinds()
+    };
+    let downstream_changed = downstream_notified | cache_expired;
     let current = mtime(path);
     let file_changed = current != state.last_mtime;
     if !file_changed && downstream_changed == 0 {
@@ -6424,7 +6815,11 @@ fn watch_tick(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (**guard).clone()
             };
-            next.refresh_tools();
+            if downstream_notified & downstream::change::TOOLS != 0 {
+                next.refresh_tools();
+            } else {
+                next.refresh_stale_tools();
+            }
             let tools = next.aggregated_tools();
             *router
                 .lock()
@@ -6448,7 +6843,11 @@ fn watch_tick(
             };
             // Also refreshes resource templates (MCP has no separate templates
             // list_changed; they ride on resources/list_changed).
-            next.refresh_resources();
+            if downstream_notified & downstream::change::RESOURCES != 0 {
+                next.refresh_resources();
+            } else {
+                next.refresh_stale_resources();
+            }
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
@@ -6466,7 +6865,11 @@ fn watch_tick(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (**guard).clone()
             };
-            next.refresh_prompts();
+            if downstream_notified & downstream::change::PROMPTS != 0 {
+                next.refresh_prompts();
+            } else {
+                next.refresh_stale_prompts();
+            }
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
@@ -6645,6 +7048,323 @@ thread_local! {
     static ACTIVE_MCP_SESSION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
+fn should_write_legacy_stdio_resource_update(need_stdio: bool, modern_stdio: bool) -> bool {
+    need_stdio && !modern_stdio
+}
+
+fn modern_subscription_key(
+    owner: Option<&McpSessionOwner>,
+    id: &Value,
+    transport: ModernSubscriptionTransport,
+) -> String {
+    let is_http = transport == ModernSubscriptionTransport::Http;
+    let transport_name = match transport {
+        ModernSubscriptionTransport::Http => "http",
+        ModernSubscriptionTransport::Stdio => "stdio",
+    };
+    let owner = owner
+        .map(|owner| {
+            json!({
+                "identity": owner.identity,
+                "scope": owner.scope,
+            })
+        })
+        .unwrap_or_else(|| json!({ "identity": "stdio" }));
+    let nonce = is_http.then(new_mcp_session_id);
+    json!({
+        "kind": "subscriptions/listen",
+        "transport": transport_name,
+        "owner": owner,
+        "id": id,
+        "nonce": nonce,
+    })
+    .to_string()
+}
+
+fn parse_modern_subscription_filter(req: &Value) -> Result<ModernSubscriptionFilter, String> {
+    let notifications = req
+        .get("params")
+        .and_then(|params| params.get("notifications"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "Toolport: subscriptions/listen requires params.notifications".to_string()
+        })?;
+    let opt_in = |name: &str| -> Result<bool, String> {
+        match notifications.get(name) {
+            None => Ok(false),
+            Some(value) => value.as_bool().ok_or_else(|| {
+                format!("Toolport: params.notifications.{name} must be a boolean")
+            }),
+        }
+    };
+    let mut resource_subscriptions = Vec::new();
+    if let Some(value) = notifications.get("resourceSubscriptions") {
+        let uris = value.as_array().ok_or_else(|| {
+            "Toolport: params.notifications.resourceSubscriptions must be an array".to_string()
+        })?;
+        for value in uris {
+            let uri = value.as_str().map(str::trim).filter(|uri| !uri.is_empty()).ok_or_else(
+                || {
+                    "Toolport: resourceSubscriptions entries must be non-empty strings"
+                        .to_string()
+                },
+            )?;
+            if !resource_subscriptions.iter().any(|existing| existing == uri) {
+                resource_subscriptions.push(uri.to_string());
+            }
+        }
+    }
+    Ok(ModernSubscriptionFilter {
+        tools_list_changed: opt_in("toolsListChanged")?,
+        prompts_list_changed: opt_in("promptsListChanged")?,
+        resources_list_changed: opt_in("resourcesListChanged")?,
+        resource_subscriptions,
+    })
+}
+
+fn register_modern_subscription(
+    state: &GatewayState,
+    router: &Router,
+    req: &Value,
+    allowed: Option<&std::collections::HashSet<String>>,
+    owner: Option<&McpSessionOwner>,
+    transport: ModernSubscriptionTransport,
+) -> Result<(String, Arc<McpSession>), Value> {
+    let id = req
+        .get("id")
+        .cloned()
+        .filter(|id| !id.is_null())
+        .ok_or_else(|| error(Value::Null, -32600, "subscriptions/listen requires a request id"))?;
+    let response_id = id.clone();
+    let mut filter = parse_modern_subscription_filter(req)
+        .map_err(|message| error(id.clone(), -32602, &message))?;
+    let key = modern_subscription_key(owner, &id, transport);
+
+    // A stdio peer has one connection, so reusing a request id replaces its old
+    // listener. HTTP keys carry a per-request nonce: two client instances may
+    // share one bearer identity and both start ids at 1 without colliding.
+    if let Some(previous) = state
+        .mcp_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&key)
+    {
+        previous.close();
+        cleanup_resource_subs_for_session(state, &key);
+    }
+    if state
+        .mcp_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+        >= MCP_SESSION_MAX
+    {
+        return Err(error(
+            response_id,
+            -32000,
+            "Toolport: too many active subscription listeners; retry later",
+        ));
+    }
+
+    // Reuse the legacy subscription router so modern listeners inherit the same
+    // ownership, HTTP scope, single-flight, and global/per-client limits. The
+    // acknowledgement reports the subset that was actually granted.
+    let requested = std::mem::take(&mut filter.resource_subscriptions);
+    for uri in requested {
+        let subscribe = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "resources/subscribe",
+            "params": { "uri": uri }
+        });
+        ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = Some(key.clone()));
+        let response = handle_resource_subscription(
+            state,
+            router,
+            &subscribe,
+            allowed,
+            "resources/subscribe",
+        );
+        ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = None);
+        if response
+            .as_ref()
+            .is_some_and(|response| response.get("result").is_some())
+        {
+            filter.resource_subscriptions.push(uri);
+        }
+    }
+
+    let session = Arc::new(McpSession::new_modern(
+        owner.cloned(),
+        id,
+        filter,
+        transport,
+    ));
+    if transport == ModernSubscriptionTransport::Http {
+        let _ = session.try_begin_listen();
+    }
+    let acknowledgement = session
+        .modern_subscription
+        .as_ref()
+        .map(|subscription| subscription.filter.acknowledged())
+        .expect("modern session has subscription state");
+    let acknowledgement = session
+        .notification_json(&acknowledgement)
+        .ok_or_else(|| error(Value::Null, -32603, "failed to encode acknowledgement"))?;
+
+    let inserted = {
+        let mut sessions = state
+            .mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sessions.len() >= MCP_SESSION_MAX {
+            false
+        } else {
+            sessions.insert(key.clone(), Arc::clone(&session));
+            true
+        }
+    };
+    if !inserted {
+        cleanup_resource_subs_for_session(state, &key);
+        return Err(error(
+            response_id,
+            -32000,
+            "Toolport: too many active subscription listeners; retry later",
+        ));
+    }
+    match transport {
+        ModernSubscriptionTransport::Http => {
+            if !session.push_message(acknowledgement, None) {
+                state
+                    .mcp_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key);
+                cleanup_resource_subs_for_session(state, &key);
+                return Err(error(Value::Null, -32603, "subscription queue is full"));
+            }
+        }
+        ModernSubscriptionTransport::Stdio => {
+            let value = serde_json::from_str::<Value>(&acknowledgement)
+                .map_err(|_| error(Value::Null, -32603, "failed to encode acknowledgement"))?;
+            let mut out = state
+                .stdout
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if write_json_line(&mut *out, &value).is_err() {
+                drop(out);
+                state
+                    .mcp_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key);
+                cleanup_resource_subs_for_session(state, &key);
+                return Err(error(
+                    Value::Null,
+                    -32603,
+                    "failed to write acknowledgement",
+                ));
+            }
+        }
+    }
+    Ok((key, session))
+}
+
+fn cancel_modern_subscription(
+    state: &GatewayState,
+    request_id: &str,
+    transport: ModernSubscriptionTransport,
+) -> bool {
+    let keys: Vec<String> = state
+        .mcp_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(_, session)| {
+            session
+                .modern_subscription
+                .as_ref()
+                .is_some_and(|subscription| {
+                    subscription.transport == transport
+                        && session.modern_subscription_id_key().as_deref() == Some(request_id)
+                })
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    if keys.is_empty() {
+        return false;
+    }
+    for key in keys {
+        if let Some(session) = state
+            .mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key)
+        {
+            session.close();
+        }
+        cleanup_resource_subs_for_session(state, &key);
+    }
+    true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModernSubscriptionTransport {
+    Http,
+    Stdio,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ModernSubscriptionFilter {
+    tools_list_changed: bool,
+    prompts_list_changed: bool,
+    resources_list_changed: bool,
+    resource_subscriptions: Vec<String>,
+}
+
+impl ModernSubscriptionFilter {
+    fn allows(&self, method: &str) -> bool {
+        match method {
+            "notifications/tools/list_changed" => self.tools_list_changed,
+            "notifications/prompts/list_changed" => self.prompts_list_changed,
+            "notifications/resources/list_changed" => self.resources_list_changed,
+            "notifications/resources/updated" => true,
+            _ => false,
+        }
+    }
+
+    fn acknowledged(&self) -> Value {
+        let mut notifications = serde_json::Map::new();
+        if self.tools_list_changed {
+            notifications.insert("toolsListChanged".to_string(), Value::Bool(true));
+        }
+        if self.prompts_list_changed {
+            notifications.insert("promptsListChanged".to_string(), Value::Bool(true));
+        }
+        if self.resources_list_changed {
+            notifications.insert("resourcesListChanged".to_string(), Value::Bool(true));
+        }
+        if !self.resource_subscriptions.is_empty() {
+            notifications.insert(
+                "resourceSubscriptions".to_string(),
+                json!(self.resource_subscriptions),
+            );
+        }
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": { "notifications": notifications }
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ModernSubscription {
+    id: Value,
+    filter: ModernSubscriptionFilter,
+    transport: ModernSubscriptionTransport,
+}
+
 /// Per-session state for streamable-HTTP MCP (POST responses + GET listen stream).
 struct McpSession {
     /// The authenticated HTTP identity and effective scope that initialized this
@@ -6658,6 +7378,9 @@ struct McpSession {
     client_upstream: Mutex<ClientUpstreamCaps>,
     upstream_pending: Mutex<HashMap<String, std::sync::mpsc::Sender<Value>>>,
     next_upstream_id: AtomicI64,
+    /// Present only for a 2026-07-28 `subscriptions/listen` request. Legacy
+    /// Streamable-HTTP sessions keep this `None` and retain their existing fanout.
+    modern_subscription: Option<ModernSubscription>,
 }
 
 struct McpOutboundMessage {
@@ -6679,7 +7402,64 @@ impl McpSession {
             client_upstream: Mutex::new(ClientUpstreamCaps::default()),
             upstream_pending: Mutex::new(HashMap::new()),
             next_upstream_id: AtomicI64::new(1),
+            modern_subscription: None,
         }
+    }
+
+    fn new_modern(
+        owner: Option<McpSessionOwner>,
+        id: Value,
+        filter: ModernSubscriptionFilter,
+        transport: ModernSubscriptionTransport,
+    ) -> Self {
+        let mut session = Self::new(owner);
+        session.modern_subscription = Some(ModernSubscription {
+            id,
+            filter,
+            transport,
+        });
+        session
+    }
+
+    fn is_modern_stdio(&self) -> bool {
+        self.modern_subscription
+            .as_ref()
+            .is_some_and(|subscription| {
+                subscription.transport == ModernSubscriptionTransport::Stdio
+            })
+    }
+
+    fn modern_subscription_id_key(&self) -> Option<String> {
+        self.modern_subscription
+            .as_ref()
+            .and_then(|subscription| rpc_id_key(&subscription.id))
+    }
+
+    fn notification_json(&self, msg: &Value) -> Option<String> {
+        let Some(subscription) = &self.modern_subscription else {
+            return serde_json::to_string(msg).ok();
+        };
+        let method = msg.get("method").and_then(Value::as_str)?;
+        if method != "notifications/subscriptions/acknowledged"
+            && !subscription.filter.allows(method)
+        {
+            return None;
+        }
+        let mut tagged = msg.clone();
+        let tagged_obj = tagged.as_object_mut()?;
+        let params = tagged_obj
+            .entry("params")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()?;
+        let meta = params
+            .entry("_meta")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()?;
+        meta.insert(
+            "io.modelcontextprotocol/subscriptionId".to_string(),
+            subscription.id.clone(),
+        );
+        serde_json::to_string(&tagged).ok()
     }
 
     fn upstream_call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -6761,6 +7541,9 @@ impl McpSession {
     }
 
     fn is_expired(&self) -> bool {
+        if self.modern_subscription.is_some() {
+            return false;
+        }
         self.last_seen
             .lock()
             .map(|t| t.elapsed() >= MCP_SESSION_TTL)
@@ -6827,7 +7610,7 @@ impl McpSession {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard = result.0;
             if result.1.timed_out() {
-                return Some(b": keepalive\n\n".to_vec());
+                return Some(b":\r\n\r\n".to_vec());
             }
         }
     }
@@ -6836,6 +7619,7 @@ impl McpSession {
 /// Blocking `Read` adapter for a long-lived `GET /mcp` SSE listen stream.
 struct McpSseReader {
     session: Arc<McpSession>,
+    cleanup: Option<(GatewayState, String)>,
     buf: Vec<u8>,
     pos: usize,
 }
@@ -6844,6 +7628,16 @@ impl McpSseReader {
     fn new(session: Arc<McpSession>) -> Self {
         Self {
             session,
+            cleanup: None,
+            buf: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    fn with_cleanup(session: Arc<McpSession>, state: GatewayState, key: String) -> Self {
+        Self {
+            session,
+            cleanup: Some((state, key)),
             buf: Vec::new(),
             pos: 0,
         }
@@ -6876,6 +7670,15 @@ impl Read for McpSseReader {
 impl Drop for McpSseReader {
     fn drop(&mut self) {
         self.session.end_listen();
+        if let Some((state, key)) = self.cleanup.take() {
+            self.session.close();
+            state
+                .mcp_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
+            cleanup_resource_subs_for_session(&state, &key);
+        }
     }
 }
 
@@ -7069,6 +7872,232 @@ fn upstream_client_unsupported(id: Value, method: &str) -> Value {
     })
 }
 
+enum ModernHitlStatus {
+    AwaitingClient,
+    Approved,
+}
+
+struct ModernHitlApproval {
+    name: String,
+    args_hash: String,
+    client: Option<String>,
+    approved_fingerprint: Option<String>,
+    reason: approval::ApprovalReason,
+    started: Instant,
+    downstream: MrtrRequest,
+    input_request: Value,
+    status: ModernHitlStatus,
+}
+
+enum ModernHitlPoll {
+    Missing,
+    Pending,
+    Stale,
+    Decided(approval::ApprovalDecision, u64, approval::ApprovalReason),
+    Approved {
+        approved_fingerprint: Option<String>,
+        reason: approval::ApprovalReason,
+        held_ms: u64,
+        downstream: MrtrRequest,
+        newly_approved: bool,
+    },
+}
+
+const MODERN_HITL_MAX_PENDING: usize = 64;
+const MODERN_HITL_RETENTION: Duration =
+    Duration::from_secs(approval::DEFAULT_TIMEOUT_SECS + 30);
+
+fn modern_hitl_approvals() -> &'static Mutex<HashMap<String, ModernHitlApproval>> {
+    static STORE: std::sync::OnceLock<Mutex<HashMap<String, ModernHitlApproval>>> =
+        std::sync::OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn modern_hitl_input_required(token: &str) -> Value {
+    let input_request = modern_hitl_approvals()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(token)
+        .map(|pending| pending.input_request.clone());
+    json!({
+        "resultType": "input_required",
+        "inputRequests": input_request.map(|request| json!({
+            "toolport_approval": request
+        })),
+        "requestState": token,
+    })
+}
+
+fn modern_hitl_reason(token: &str) -> Option<approval::ApprovalReason> {
+    modern_hitl_approvals()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(token)
+        .map(|pending| pending.reason)
+}
+
+fn downstream_input_responses(input_responses: Option<Value>) -> Option<Value> {
+    match input_responses {
+        Some(Value::Object(mut responses)) => {
+            responses.remove("toolport_approval");
+            (!responses.is_empty()).then_some(Value::Object(responses))
+        }
+        other => other,
+    }
+}
+
+fn start_modern_hitl(
+    name: &str,
+    args_hash: String,
+    approved_fingerprint: Option<String>,
+    reason: approval::ApprovalReason,
+    client: Option<&str>,
+    server: &str,
+    tool: &str,
+    arguments: &Value,
+    downstream: MrtrRequest,
+) -> Result<String, approval::ApprovalDecision> {
+    let token = format!("toolport-hitl-{}", new_correlation_id());
+    {
+        let mut approvals = modern_hitl_approvals()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        approvals.retain(|_, pending| pending.started.elapsed() <= MODERN_HITL_RETENTION);
+        if approvals.len() >= MODERN_HITL_MAX_PENDING {
+            return Err(approval::ApprovalDecision::Unreachable);
+        }
+        approvals.insert(
+            token.clone(),
+            ModernHitlApproval {
+                name: name.to_string(),
+                args_hash,
+                client: client.map(str::to_string),
+                approved_fingerprint,
+                reason,
+                started: Instant::now(),
+                downstream,
+                input_request: json!({
+                    "method": "elicitation/create",
+                    "params": {
+                        "mode": "form",
+                        "message": format!(
+                            "Toolport requires approval to run {server}/{tool}. Review the exact arguments before approving: {}",
+                            serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string())
+                        ),
+                        "requestedSchema": {
+                            "type": "object",
+                            "properties": {
+                                "approved": {
+                                    "type": "boolean",
+                                    "title": "Approve this tool call"
+                                }
+                            },
+                            "required": ["approved"]
+                        }
+                    }
+                }),
+                status: ModernHitlStatus::AwaitingClient,
+            },
+        );
+    }
+    Ok(token)
+}
+
+fn poll_modern_hitl(
+    token: &str,
+    name: &str,
+    args_hash: &str,
+    client: Option<&str>,
+    input_responses: Option<Value>,
+) -> ModernHitlPoll {
+    let mut approvals = modern_hitl_approvals()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    approvals.retain(|_, pending| pending.started.elapsed() <= MODERN_HITL_RETENTION);
+    let Some(pending) = approvals.get_mut(token) else {
+        return ModernHitlPoll::Missing;
+    };
+    if pending.name != name
+        || pending.args_hash != args_hash
+        || pending.client.as_deref() != client
+    {
+        return ModernHitlPoll::Stale;
+    }
+    let decision = match &pending.status {
+        ModernHitlStatus::AwaitingClient => {
+            let response = input_responses
+                .as_ref()
+                .and_then(|responses| responses.get("toolport_approval"));
+            let Some(response) = response else {
+                return ModernHitlPoll::Pending;
+            };
+            let accepted = response.get("action").and_then(Value::as_str) == Some("accept")
+                && response
+                    .get("content")
+                    .and_then(|content| content.get("approved"))
+                    .and_then(Value::as_bool)
+                    == Some(true);
+            Some(if accepted {
+                approval::ApprovalDecision::Approved
+            } else {
+                approval::ApprovalDecision::Denied
+            })
+        }
+        ModernHitlStatus::Approved => None,
+    };
+    let newly_approved = decision.is_some();
+    if let Some(decision) = decision {
+        if !decision.is_approved() {
+            let held_ms = pending.started.elapsed().as_millis() as u64;
+            let reason = pending.reason;
+            approvals.remove(token);
+            return ModernHitlPoll::Decided(decision, held_ms, reason);
+        }
+        pending.status = ModernHitlStatus::Approved;
+    }
+    pending.downstream.input_responses = downstream_input_responses(input_responses);
+    ModernHitlPoll::Approved {
+        approved_fingerprint: pending.approved_fingerprint.clone(),
+        reason: pending.reason,
+        held_ms: pending.started.elapsed().as_millis() as u64,
+        downstream: pending.downstream.clone(),
+        newly_approved,
+    }
+}
+
+fn update_modern_hitl_downstream(token: &str, result: &mut Value) {
+    let mut approvals = modern_hitl_approvals()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(pending) = approvals.get_mut(token) {
+        pending.downstream = MrtrRequest {
+            input_responses: None,
+            request_state: result.get("requestState").cloned(),
+        };
+        result["requestState"] = json!(token);
+    }
+}
+
+fn finish_modern_hitl(token: Option<&str>) {
+    if let Some(token) = token {
+        modern_hitl_approvals()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(token);
+    }
+}
+
+fn missing_modern_client_capability(id: Value, method: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": downstream::MISSING_REQUIRED_CLIENT_CAPABILITY,
+            "message": format!("client capability required for {method}")
+        }
+    })
+}
+
 fn make_server_request_handler(
     client_upstream: Arc<Mutex<ClientUpstreamCaps>>,
     stdio_upstream: Arc<StdioUpstream>,
@@ -7084,6 +8113,13 @@ fn make_server_request_handler(
             return None;
         }
         let id = req.get("id")?.clone();
+        if serving_modern_client() {
+            return Some(if modern_client_supports_server_rpc(method) {
+                ServerRequestAction::InputRequired
+            } else {
+                ServerRequestAction::Respond(missing_modern_client_capability(id, method))
+            });
+        }
         let params = upstream_rpc_params(method, req);
         let timeout = upstream_rpc_timeout(method);
         let result = if http {
@@ -7098,7 +8134,9 @@ fn make_server_request_handler(
                 .map(|caps| client_supports_server_rpc(&caps, method))
                 .unwrap_or(false);
             if !supported {
-                return Some(upstream_client_unsupported(id, method));
+                return Some(ServerRequestAction::Respond(upstream_client_unsupported(
+                    id, method,
+                )));
             }
             session.upstream_call_timeout(method, params, timeout)
         } else {
@@ -7107,11 +8145,15 @@ fn make_server_request_handler(
                 .map(|caps| client_supports_server_rpc(&caps, method))
                 .unwrap_or(false);
             if !supported {
-                return Some(upstream_client_unsupported(id, method));
+                return Some(ServerRequestAction::Respond(upstream_client_unsupported(
+                    id, method,
+                )));
             }
             stdio_upstream.call_timeout(method, params, timeout)
         };
-        Some(upstream_json_rpc_response(id, result))
+        Some(ServerRequestAction::Respond(upstream_json_rpc_response(
+            id, result,
+        )))
     })
 }
 
@@ -7315,6 +8357,9 @@ fn process_request(
     client: Option<&str>,
 ) -> Option<Value> {
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    if !state.http && upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
+        MODERN_STDIO_UPSTREAM.store(true, Ordering::SeqCst);
+    }
     let is_notification = !req.get("id").is_some_and(|id| !id.is_null());
     if is_notification {
         if handle_client_notification(state, req) {
@@ -7461,6 +8506,22 @@ fn process_request(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    if method == "subscriptions/listen"
+        && !state.http
+        && upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION)
+    {
+        return match register_modern_subscription(
+            state,
+            &router,
+            req,
+            allowed,
+            None,
+            ModernSubscriptionTransport::Stdio,
+        ) {
+            Ok(_) => None,
+            Err(response) => Some(response),
+        };
+    }
     // Resource subscriptions need the live GatewayState (session table + sink)
     // and the same ownership/scope path as resources/read (SOU-394).
     //
@@ -7472,10 +8533,21 @@ fn process_request(
     if method == "resources/subscribe" || method == "resources/unsubscribe" {
         let id = req.get("id").cloned().filter(|id| !id.is_null());
         let declared = upstream_declared_version(req).map(str::to_string);
-        if let (Some(id), Some(version)) = (id, declared.as_deref()) {
+        if let (Some(id), Some(version)) = (id.as_ref(), declared.as_deref()) {
             if !MODERN_UPSTREAM_VERSIONS.contains(&version) {
-                return Some(unsupported_version_error(id, version));
+                return Some(unsupported_version_error(id.clone(), version));
             }
+        }
+        if declared.as_deref() == Some(MODERN_PROTOCOL_VERSION) {
+            return id.map(|id| {
+                error(
+                    id,
+                    -32601,
+                    &format!(
+                        "Method not found: {method}; use subscriptions/listen in 2026-07-28"
+                    ),
+                )
+            });
         }
         let _era = UpstreamEraGuard::enter(
             declared.filter(|v| v.as_str() == MODERN_PROTOCOL_VERSION),
@@ -7883,8 +8955,22 @@ struct HttpOut {
     ctype: &'static str,
     body: String,
     extra: Vec<(String, String)>,
-    /// Long-lived `GET /mcp` SSE listen stream (chunked response).
-    mcp_listen: Option<Arc<McpSession>>,
+    /// Long-lived MCP SSE listen stream (chunked response).
+    mcp_listen: Option<McpListen>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct McpHttpRequestHeaders<'a> {
+    session_id: Option<&'a str>,
+    protocol_version: Option<&'a str>,
+    method: Option<&'a str>,
+    name: Option<&'a str>,
+    accept: Option<&'a str>,
+}
+
+struct McpListen {
+    session: Arc<McpSession>,
+    cleanup: Option<(GatewayState, String)>,
 }
 
 impl HttpOut {
@@ -7904,7 +8990,23 @@ impl HttpOut {
             ctype: "text/event-stream",
             body: String::new(),
             extra: Vec::new(),
-            mcp_listen: Some(session),
+            mcp_listen: Some(McpListen {
+                session,
+                cleanup: None,
+            }),
+        }
+    }
+
+    fn modern_mcp_listen(state: GatewayState, key: String, session: Arc<McpSession>) -> Self {
+        Self {
+            status: 200,
+            ctype: "text/event-stream",
+            body: String::new(),
+            extra: Vec::new(),
+            mcp_listen: Some(McpListen {
+                session,
+                cleanup: Some((state, key)),
+            }),
         }
     }
 
@@ -8018,6 +9120,26 @@ fn mcp_prefers_sse(accept: Option<&str>) -> bool {
     }
 }
 
+fn mcp_accepts_sse(accept: Option<&str>) -> bool {
+    accept.is_some_and(|raw| {
+        raw.to_ascii_lowercase().split(',').any(|part| {
+            let mut fields = part.trim().split(';');
+            if fields.next().map(str::trim) != Some("text/event-stream") {
+                return false;
+            }
+            fields
+                .find_map(|field| {
+                    field
+                        .trim()
+                        .strip_prefix("q=")
+                        .and_then(|value| value.parse::<f32>().ok())
+                })
+                .unwrap_or(1.0)
+                > 0.0
+        })
+    })
+}
+
 /// Wrap a single JSON-RPC message as one SSE `message` event (stream closes after).
 fn mcp_sse_body(json: &str) -> String {
     format!("event: message\ndata: {json}\n\n")
@@ -8044,6 +9166,123 @@ fn mcp_rpc_response(
     }
 }
 
+fn modern_http_request(req: &Value, headers: McpHttpRequestHeaders<'_>) -> bool {
+    upstream_declared_version(req).is_some()
+        || headers.protocol_version == Some(MODERN_PROTOCOL_VERSION)
+}
+
+fn modern_http_header_error(req: &Value, message: String) -> HttpOut {
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    HttpOut::new(
+        400,
+        "application/json",
+        error(id, downstream::HEADER_MISMATCH, &message).to_string(),
+    )
+}
+
+/// Validate the routing metadata required on modern Streamable HTTP POSTs.
+///
+/// A proxy is not allowed to route on one operation and execute another. Compare
+/// the transport headers to the JSON-RPC envelope before dispatch, including the
+/// encoded representation used for non-ASCII names (SOU-473 / SEP-2243).
+fn validate_modern_http_headers(
+    req: &Value,
+    headers: McpHttpRequestHeaders<'_>,
+) -> Result<(), HttpOut> {
+    let body_version = upstream_declared_version(req);
+    match (headers.protocol_version, body_version) {
+        (Some(header), Some(body)) if header == body => {}
+        (None, _) => {
+            return Err(modern_http_header_error(
+                req,
+                "missing required MCP-Protocol-Version header".to_string(),
+            ));
+        }
+        (Some(header), body) => {
+            return Err(modern_http_header_error(
+                req,
+                format!(
+                    "MCP-Protocol-Version header '{header}' does not match body _meta '{}'",
+                    body.unwrap_or("<absent>")
+                ),
+            ));
+        }
+    }
+
+    let Some(body_method) = req.get("method").and_then(Value::as_str) else {
+        return Err(modern_http_header_error(
+            req,
+            "modern HTTP request is missing a JSON-RPC method".to_string(),
+        ));
+    };
+    let encoded_method = downstream::encode_mcp_header_text(body_method);
+    if headers.method != Some(encoded_method.as_str()) {
+        return Err(modern_http_header_error(
+            req,
+            format!(
+                "Mcp-Method header '{}' does not match body method '{}'",
+                headers.method.unwrap_or("<absent>"),
+                body_method
+            ),
+        ));
+    }
+
+    let body_name = match body_method {
+        "tools/call" | "prompts/get" => req
+            .get("params")
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str),
+        "resources/read" => req
+            .get("params")
+            .and_then(|params| params.get("uri"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    let requires_name = matches!(
+        body_method,
+        "tools/call" | "prompts/get" | "resources/read"
+    );
+    let encoded_name = body_name.map(downstream::encode_mcp_header_text);
+    if requires_name && (body_name.is_none() || headers.name != encoded_name.as_deref()) {
+        return Err(modern_http_header_error(
+            req,
+            format!(
+                "Mcp-Name header '{}' does not match body name '{}'",
+                headers.name.unwrap_or("<absent>"),
+                body_name.unwrap_or("<absent>")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn non_post_http_era_gate(protocol_version: Option<&str>) -> Option<HttpOut> {
+    match protocol_version {
+        Some(MODERN_PROTOCOL_VERSION) => Some(
+            HttpOut::json_err(405, "method not allowed on modern /mcp")
+                .with_header("Allow", "POST"),
+        ),
+        Some(version) if !SUPPORTED_UPSTREAM_VERSIONS[1..].contains(&version) => Some(
+            HttpOut::json_err(400, &format!("unsupported MCP-Protocol-Version: {version}")),
+        ),
+        _ => None,
+    }
+}
+
+fn modern_http_status(resp: &Value) -> u16 {
+    match resp
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_i64)
+    {
+        Some(-32601) => 404,
+        Some(downstream::HEADER_MISMATCH)
+        | Some(downstream::MISSING_REQUIRED_CLIENT_CAPABILITY)
+        | Some(downstream::UNSUPPORTED_PROTOCOL_VERSION) => 400,
+        _ => 200,
+    }
+}
+
 /// Handle one Streamable-HTTP MCP request at `/mcp`.
 #[allow(clippy::too_many_arguments)]
 fn handle_mcp_http(
@@ -8052,26 +9291,24 @@ fn handle_mcp_http(
     confirm: &ConfirmGuard,
     method: &str,
     body: &str,
-    session_hdr: Option<&str>,
-    accept: Option<&str>,
+    headers: McpHttpRequestHeaders<'_>,
     allowed: Option<&std::collections::HashSet<String>>,
     client: Option<&str>,
     session_owner: Option<&McpSessionOwner>,
 ) -> HttpOut {
-    let prefer_sse = mcp_prefers_sse(accept);
+    let prefer_sse = mcp_prefers_sse(headers.accept);
     match method {
-        // GET (listen stream) and DELETE (session teardown) are legacy-only: both
-        // were removed in 2026-07-28. A modern-ONLY server answers 405, but
-        // Toolport is dual-era, and neither verb carries a body, so there is no
-        // `_meta` to tell the eras apart. They stay available and keep requiring a
-        // live session, which is exactly the gate that turns a modern client's
-        // request away. They become 405 when legacy support is eventually dropped
-        // (SOU-447).
+        // GET (listen stream) and DELETE (session teardown) were removed in
+        // 2026-07-28. Their transport header is the era boundary because neither
+        // verb carries a JSON-RPC envelope. Legacy sessions remain unchanged.
         "GET" => {
-            if !mcp_prefers_sse(accept) {
+            if let Some(out) = non_post_http_era_gate(headers.protocol_version) {
+                return out;
+            }
+            if !mcp_prefers_sse(headers.accept) {
                 return HttpOut::json_err(406, "Accept must include text/event-stream");
             }
-            match mcp_require_session(state, session_hdr, session_owner) {
+            match mcp_require_session(state, headers.session_id, session_owner) {
                 Ok((sid, session)) => {
                     if !session.try_begin_listen() {
                         return HttpOut::json_err(
@@ -8084,21 +9321,26 @@ fn handle_mcp_http(
                 Err(e) => e,
             }
         }
-        "DELETE" => match mcp_require_session(state, session_hdr, session_owner) {
-            Ok((sid, session)) => {
-                session.close();
-                state
-                    .mcp_sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&sid);
-                // Drop resource subscriptions for this HTTP session and release
-                // any last-holder downstream subs (SOU-394).
-                cleanup_resource_subs_for_session(state, &sid);
-                HttpOut::new(204, "text/plain", String::new())
+        "DELETE" => {
+            if let Some(out) = non_post_http_era_gate(headers.protocol_version) {
+                return out;
             }
-            Err(e) => e,
-        },
+            match mcp_require_session(state, headers.session_id, session_owner) {
+                Ok((sid, session)) => {
+                    session.close();
+                    state
+                        .mcp_sessions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&sid);
+                    // Drop resource subscriptions for this HTTP session and release
+                    // any last-holder downstream subs (SOU-394).
+                    cleanup_resource_subs_for_session(state, &sid);
+                    HttpOut::new(204, "text/plain", String::new())
+                }
+                Err(e) => e,
+            }
+        }
         "POST" => {
             let req: Value = if body.trim().is_empty() {
                 return HttpOut::json_err(400, "empty JSON-RPC body");
@@ -8120,31 +9362,55 @@ fn handle_mcp_http(
                 .unwrap_or("");
             let has_id = req_obj.contains_key("id");
             let is_initialize = method_name == "initialize";
-            // 2026-07-28 removed protocol-level sessions (SOU-447). A modern
-            // request declares its own version, so it is served statelessly.
-            //
-            // Gate on the version VALUE, not merely on a version being present, so
-            // this matches the modern-era test in `handle_request_with_cancel`.
-            // Keying on presence alone would let a client that names a legacy
-            // version in `_meta` skip the session requirement here while still
-            // being served legacy-shaped results there.
-            // Toolport is dual-era on stdio and legacy-only over Streamable HTTP.
-            //
-            // A session-less modern path was implemented here and then withdrawn,
-            // because serving modern clients over HTTP needs more than skipping the
-            // session: `Mcp-Method`/`Mcp-Name` on outbound requests, inbound header
-            // validation, `400`/`404` statuses for protocol errors, and above all a
-            // server-to-client channel (`subscriptions/listen`) to replace the one
-            // sessions provided. Without that last piece, a session-less client
-            // collapsed into the shared `RESOURCE_SUB_STDIO` subscription bucket,
-            // where one client could tear down another's subscription.
-            //
-            // Requiring a session for every HTTP request is therefore the honest
-            // state: a dual-era client gets a `400` here with no recognized modern
-            // error, which the spec defines as the signal to fall back to
-            // `initialize`. Tracked for SOU-447/448/450.
-            let session_id: Option<String> = if is_initialize {
-                if let Some(existing) = session_hdr.map(str::trim).filter(|s| !s.is_empty()) {
+            let is_modern = modern_http_request(&req, headers);
+            if is_modern {
+                if let Err(out) = validate_modern_http_headers(&req, headers) {
+                    return out;
+                }
+            }
+            if method_name == "subscriptions/listen"
+                && upstream_declared_version(&req) == Some(MODERN_PROTOCOL_VERSION)
+            {
+                if !mcp_accepts_sse(headers.accept) {
+                    return HttpOut::json_err(406, "Accept must include text/event-stream");
+                }
+                let router = state
+                    .router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                return match register_modern_subscription(
+                    state,
+                    &router,
+                    &req,
+                    allowed,
+                    session_owner,
+                    ModernSubscriptionTransport::Http,
+                ) {
+                    Ok((key, session)) => {
+                        HttpOut::modern_mcp_listen(state.clone(), key, session)
+                    }
+                    Err(response) => HttpOut::new(
+                        200,
+                        "application/json",
+                        serde_json::to_string(&response).unwrap_or_else(|_| {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": req.get("id").cloned().unwrap_or(Value::Null),
+                                "error": { "code": -32603, "message": "serialize failed" }
+                            })
+                            .to_string()
+                        }),
+                    ),
+                };
+            }
+            // Modern requests are self-contained. Inbound legacy session ids are
+            // deliberately ignored and never echoed; authenticated identity and
+            // scope are resolved afresh for every HTTP request (SOU-447).
+            let session_id: Option<String> = if is_modern {
+                None
+            } else if is_initialize {
+                if let Some(existing) = headers.session_id.map(str::trim).filter(|s| !s.is_empty()) {
                     // Client re-sent a session on initialize: accept if still live,
                     // otherwise mint a fresh one (spec: start over without the old id).
                     match mcp_require_session(state, Some(existing), session_owner) {
@@ -8161,7 +9427,7 @@ fn handle_mcp_http(
                     }
                 }
             } else {
-                match mcp_require_session(state, session_hdr, session_owner) {
+                match mcp_require_session(state, headers.session_id, session_owner) {
                     Ok((sid, _)) => Some(sid),
                     Err(e) => return e,
                 }
@@ -8210,6 +9476,11 @@ fn handle_mcp_http(
             });
             match resp {
                 Some(resp) => {
+                    let status = if is_modern {
+                        modern_http_status(&resp)
+                    } else {
+                        200
+                    };
                     let body = serde_json::to_string(&resp).unwrap_or_else(|_| {
                         json!({
                             "jsonrpc": "2.0",
@@ -8218,7 +9489,7 @@ fn handle_mcp_http(
                         })
                         .to_string()
                     });
-                    mcp_rpc_response(200, body, session_id.as_deref(), prefer_sse)
+                    mcp_rpc_response(status, body, session_id.as_deref(), prefer_sse)
                 }
                 None => {
                     let body = json!({
@@ -8237,15 +9508,14 @@ fn handle_mcp_http(
 
 /// Map one HTTP request to status / content-type / body / extra headers.
 #[allow(clippy::too_many_arguments)]
-fn handle_http(
+fn handle_http_with_headers(
     state: &GatewayState,
     guard: &SearchGuard,
     confirm: &ConfirmGuard,
     method: &str,
     path: &str,
     body: &str,
-    session_hdr: Option<&str>,
-    accept: Option<&str>,
+    headers: McpHttpRequestHeaders<'_>,
     allowed: Option<&std::collections::HashSet<String>>,
     caller: Option<&HttpCaller>,
 ) -> HttpOut {
@@ -8266,8 +9536,7 @@ fn handle_http(
             confirm,
             method,
             body,
-            session_hdr,
-            accept,
+            headers,
             allowed,
             client,
             session_owner,
@@ -8292,7 +9561,7 @@ fn handle_http(
                 format!(
                     "Toolport gateway (HTTP mode).\n\
                      OpenAPI: GET /openapi.json, POST /{{tool_name}} with a JSON body.\n\
-                     MCP streamable-HTTP: POST /mcp with JSON-RPC; GET /mcp for server→client SSE.\n\
+                     MCP streamable-HTTP: POST /mcp; modern subscriptions/listen and legacy GET /mcp SSE.\n\
                      {metrics_line}\
                      Auth: Authorization: Bearer <TOOLPORT_HTTP_TOKEN>."
                 ),
@@ -8324,8 +9593,7 @@ fn handle_http(
                     confirm,
                     method,
                     body,
-                    session_hdr,
-                    accept,
+                    headers,
                     allowed,
                     client,
                     session_owner,
@@ -8365,6 +9633,37 @@ fn handle_http(
         }
         _ => HttpOut::json_err(404, "not found"),
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn handle_http(
+    state: &GatewayState,
+    guard: &SearchGuard,
+    confirm: &ConfirmGuard,
+    method: &str,
+    path: &str,
+    body: &str,
+    session_hdr: Option<&str>,
+    accept: Option<&str>,
+    allowed: Option<&std::collections::HashSet<String>>,
+    caller: Option<&HttpCaller>,
+) -> HttpOut {
+    handle_http_with_headers(
+        state,
+        guard,
+        confirm,
+        method,
+        path,
+        body,
+        McpHttpRequestHeaders {
+            session_id: session_hdr,
+            accept,
+            ..McpHttpRequestHeaders::default()
+        },
+        allowed,
+        caller,
+    )
 }
 
 /// Run the blocking HTTP/OpenAPI server. Binds 127.0.0.1 by default (local
@@ -9077,10 +10376,10 @@ fn reap_finished_workers(workers: &mut Vec<std::thread::JoinHandle<()>>) {
 
 fn respond_mcp_sse_listen(
     request: tiny_http::Request,
-    out: HttpOut,
+    mut out: HttpOut,
     allow_headers: String,
 ) {
-    let Some(session) = out.mcp_listen else {
+    let Some(listen) = out.mcp_listen.take() else {
         let mut response =
             tiny_http::Response::from_string(out.body).with_status_code(out.status);
         if let Ok(h) = tiny_http::Header::from_bytes(b"Content-Type", out.ctype.as_bytes()) {
@@ -9093,6 +10392,7 @@ fn respond_mcp_sse_listen(
     let mut headers = vec![
         tiny_http::Header::from_bytes(b"Content-Type", b"text/event-stream").unwrap(),
         tiny_http::Header::from_bytes(b"Cache-Control", b"no-cache").unwrap(),
+        tiny_http::Header::from_bytes(b"X-Accel-Buffering", b"no").unwrap(),
         tiny_http::Header::from_bytes(b"Access-Control-Allow-Origin", b"*").unwrap(),
         tiny_http::Header::from_bytes(
             b"Access-Control-Allow-Methods",
@@ -9110,17 +10410,58 @@ fn respond_mcp_sse_listen(
         }
     }
 
-    let reader = McpSseReader::new(session);
-    let response = tiny_http::Response::new(
-        tiny_http::StatusCode(200),
-        headers,
-        reader,
-        None,
-        None,
-    )
-    .with_chunked_threshold(0)
-    .boxed();
-    let _ = request.respond(response);
+    let mut reader = match listen.cleanup {
+        Some((state, key)) => McpSseReader::with_cleanup(listen.session, state, key),
+        None => McpSseReader::new(listen.session),
+    };
+    let version = request.http_version().clone();
+    let mut writer = request.into_writer();
+    let _ = write_mcp_sse_response(&mut writer, &version, &headers, &mut reader);
+}
+
+/// Write a long-lived SSE response directly so every event is flushed to the
+/// client. `tiny_http` otherwise buffers chunked response bodies until 8 KiB,
+/// which can hold the subscription acknowledgement indefinitely while the
+/// reader waits for the next event.
+fn write_mcp_sse_response<W: Write, R: Read>(
+    writer: &mut W,
+    version: &tiny_http::HTTPVersion,
+    headers: &[tiny_http::Header],
+    reader: &mut R,
+) -> std::io::Result<()> {
+    let chunked = *version >= (1, 1);
+    write!(writer, "HTTP/{version} 200 OK\r\n")?;
+    for header in headers {
+        write!(writer, "{header}\r\n")?;
+    }
+    if chunked {
+        writer.write_all(b"Transfer-Encoding: chunked\r\n")?;
+    } else {
+        writer.write_all(b"Connection: close\r\n")?;
+    }
+    writer.write_all(b"\r\n")?;
+    writer.flush()?;
+
+    let mut buf = [0_u8; 8192];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if chunked {
+            write!(writer, "{n:X}\r\n")?;
+        }
+        writer.write_all(&buf[..n])?;
+        if chunked {
+            writer.write_all(b"\r\n")?;
+        }
+        writer.flush()?;
+    }
+    if chunked {
+        writer.write_all(b"0\r\n\r\n")?;
+        writer.flush()?;
+    }
+    Ok(())
 }
 
 fn serve_http_loop(
@@ -9216,13 +10557,35 @@ fn handle_connection(
             .map(|h| sanitize_header_value(h.value.as_str()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| {
-                "Content-Type, Authorization, Mcp-Session-Id, MCP-Protocol-Version".to_string()
+                "Content-Type, Authorization, Mcp-Session-Id, MCP-Protocol-Version, Mcp-Method, Mcp-Name"
+                    .to_string()
             });
 
         let session_hdr = request
             .headers()
             .iter()
             .find(|h| h.field.equiv("Mcp-Session-Id"))
+            .map(|h| sanitize_header_value(h.value.as_str()))
+            .filter(|s| !s.is_empty());
+
+        let protocol_version_hdr = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("MCP-Protocol-Version"))
+            .map(|h| sanitize_header_value(h.value.as_str()))
+            .filter(|s| !s.is_empty());
+
+        let mcp_method_hdr = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Mcp-Method"))
+            .map(|h| sanitize_header_value(h.value.as_str()))
+            .filter(|s| !s.is_empty());
+
+        let mcp_name_hdr = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Mcp-Name"))
             .map(|h| sanitize_header_value(h.value.as_str()))
             .filter(|s| !s.is_empty());
 
@@ -9296,15 +10659,20 @@ fn handle_connection(
                     }
                     // A panic in a handler must return 500, not kill the listener.
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        handle_http(
+                        handle_http_with_headers(
                             state,
                             search,
                             confirm,
                             &method,
                             &path,
                             &body,
-                            session_hdr.as_deref(),
-                            accept_hdr.as_deref(),
+                            McpHttpRequestHeaders {
+                                session_id: session_hdr.as_deref(),
+                                protocol_version: protocol_version_hdr.as_deref(),
+                                method: mcp_method_hdr.as_deref(),
+                                name: mcp_name_hdr.as_deref(),
+                                accept: accept_hdr.as_deref(),
+                            },
                             allowed.as_ref(),
                             caller.as_ref(),
                         )
@@ -9754,8 +11122,15 @@ fn main() {
             req.get("method").and_then(|m| m.as_str()).unwrap_or("")
         ));
         if let Some(cancel_id) = cancellation_request_id(&req) {
+            let subscription_cancelled = cancel_modern_subscription(
+                &state,
+                &cancel_id,
+                ModernSubscriptionTransport::Stdio,
+            );
             if cancel_registry.cancel(&cancel_id, cancellation_reason(&req)) {
                 glog(&format!("client cancelled in-flight request {cancel_id}"));
+            } else if subscription_cancelled {
+                glog(&format!("client closed subscription listener {cancel_id}"));
             } else {
                 gtrace(&format!("ignored cancellation for unknown request {cancel_id}"));
             }
@@ -9815,6 +11190,47 @@ mod tests {
         assert_eq!(fmt_tokens(999_950), "1.0M");
         assert_eq!(fmt_tokens(1_000_000), "1.0M");
         assert_eq!(fmt_tokens(1_250_000), "1.2M");
+    }
+
+    #[test]
+    fn mcp_sse_response_flushes_headers_and_each_chunk() {
+        #[derive(Default)]
+        struct RecordingWriter {
+            bytes: Vec<u8>,
+            flushes: usize,
+        }
+
+        impl Write for RecordingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        let headers = vec![
+            tiny_http::Header::from_bytes(b"Content-Type", b"text/event-stream").unwrap(),
+        ];
+        let mut body = std::io::Cursor::new(b"data: {\"ok\":true}\r\n\r\n".as_slice());
+        let mut writer = RecordingWriter::default();
+        write_mcp_sse_response(
+            &mut writer,
+            &tiny_http::HTTPVersion(1, 1),
+            &headers,
+            &mut body,
+        )
+        .unwrap();
+
+        let response = String::from_utf8(writer.bytes).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(response.contains("15\r\ndata: {\"ok\":true}\r\n\r\n\r\n"));
+        assert!(response.ends_with("0\r\n\r\n"));
+        assert_eq!(writer.flushes, 3, "headers, event, and terminator flush");
     }
 
     #[test]
@@ -10164,6 +11580,264 @@ mod tests {
         assert!(client_supports_server_rpc(&caps, "roots/list"));
         assert!(client_supports_server_rpc(&caps, "sampling/createMessage"));
         assert!(!client_supports_server_rpc(&caps, "elicitation/create"));
+    }
+
+    #[test]
+    fn modern_server_requests_become_mrtr_only_with_the_required_capability() {
+        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let handler = make_server_request_handler(
+            Arc::new(Mutex::new(ClientUpstreamCaps::default())),
+            Arc::new(StdioUpstream::new(stdout)),
+            Arc::new(Mutex::new(HashMap::new())),
+            false,
+        );
+        let _era = UpstreamEraGuard::enter(Some(MODERN_PROTOCOL_VERSION.to_string()));
+        let capable = json!({
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+                }
+            }
+        });
+        let _caps = UpstreamCapabilitiesGuard::enter(&capable);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "elicitation/create",
+            "params": { "message": "Continue?" }
+        });
+        assert_eq!(handler(&request), Some(ServerRequestAction::InputRequired));
+    }
+
+    #[test]
+    fn modern_server_request_without_capability_returns_reserved_error() {
+        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let handler = make_server_request_handler(
+            Arc::new(Mutex::new(ClientUpstreamCaps::default())),
+            Arc::new(StdioUpstream::new(stdout)),
+            Arc::new(Mutex::new(HashMap::new())),
+            false,
+        );
+        let _era = UpstreamEraGuard::enter(Some(MODERN_PROTOCOL_VERSION.to_string()));
+        let incapable = json!({
+            "params": {
+                "_meta": { "io.modelcontextprotocol/clientCapabilities": {} }
+            }
+        });
+        let _caps = UpstreamCapabilitiesGuard::enter(&incapable);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "sampling/createMessage",
+            "params": {}
+        });
+        let Some(ServerRequestAction::Respond(response)) = handler(&request) else {
+            panic!("missing capability should produce an inline error")
+        };
+        assert_eq!(
+            response["error"]["code"],
+            downstream::MISSING_REQUIRED_CLIENT_CAPABILITY
+        );
+    }
+
+    #[test]
+    fn initial_modern_hitl_call_starts_mrtr_without_retry_fields() {
+        modern_hitl_approvals()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let request = json!({
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "elicitation": {}
+                    }
+                }
+            }
+        });
+        let _era = UpstreamEraGuard::enter(Some(MODERN_PROTOCOL_VERSION.to_string()));
+        let _capabilities = UpstreamCapabilitiesGuard::enter(&request);
+        let mut reg = Registry::default();
+        reg.set_human_approval(true);
+        let router = routed_router("s", "delete");
+        let cached = router.aggregated_tools();
+
+        let result = execute_call(
+            &reg,
+            &router,
+            &cached,
+            Some("cursor"),
+            None,
+            None,
+            Some(&ConfirmGuard::new()),
+            "s__delete",
+            json!({ "id": 7 }),
+            None,
+            None,
+            CallOpts {
+                confirmed: false,
+                shape: true,
+            },
+            None,
+        );
+
+        assert_eq!(result["resultType"], "input_required");
+        assert_eq!(
+            result["inputRequests"]["toolport_approval"]["method"],
+            "elicitation/create"
+        );
+        let token = result["requestState"]
+            .as_str()
+            .expect("initial HITL response has requestState");
+        assert!(token.starts_with("toolport-hitl-"));
+        finish_modern_hitl(Some(token));
+    }
+
+    #[test]
+    fn modern_hitl_state_polls_then_carries_downstream_mrtr() {
+        let arguments = json!({ "target": "x" });
+        let hash = audit::args_hash(&arguments);
+        let token = start_modern_hitl(
+            "s__wipe",
+            hash.clone(),
+            Some("v2:approved".into()),
+            approval::ApprovalReason::Destructive,
+            Some("cursor"),
+            "s",
+            "wipe",
+            &arguments,
+            MrtrRequest::default(),
+        )
+        .unwrap();
+        let incomplete = modern_hitl_input_required(&token);
+        assert_eq!(
+            incomplete["inputRequests"]["toolport_approval"]["method"],
+            "elicitation/create"
+        );
+        assert!(matches!(
+            poll_modern_hitl(&token, "s__wipe", &hash, Some("cursor"), None),
+            ModernHitlPoll::Pending
+        ));
+        let first = poll_modern_hitl(
+            &token,
+            "s__wipe",
+            &hash,
+            Some("cursor"),
+            Some(json!({
+                "toolport_approval": {
+                    "action": "accept",
+                    "content": { "approved": true }
+                }
+            })),
+        );
+        let ModernHitlPoll::Approved {
+            downstream,
+            newly_approved,
+            ..
+        } = first
+        else {
+            panic!("accepted approval should resume")
+        };
+        assert!(newly_approved);
+        assert!(
+            downstream.input_responses.is_none(),
+            "Toolport's local approval response must not leak downstream"
+        );
+
+        let mut incomplete = json!({
+            "resultType": "input_required",
+            "inputRequests": { "confirm": { "method": "elicitation/create" } },
+            "requestState": "downstream-byte-exact"
+        });
+        update_modern_hitl_downstream(&token, &mut incomplete);
+        assert_eq!(incomplete["requestState"], token);
+
+        let responses = json!({ "confirm": { "action": "accept" } });
+        let resumed = poll_modern_hitl(
+            incomplete["requestState"].as_str().unwrap(),
+            "s__wipe",
+            &hash,
+            Some("cursor"),
+            Some(responses.clone()),
+        );
+        let ModernHitlPoll::Approved {
+            downstream,
+            newly_approved,
+            ..
+        } = resumed
+        else {
+            panic!("approved MRTR state should resume")
+        };
+        assert!(!newly_approved);
+        assert_eq!(downstream.request_state, Some(json!("downstream-byte-exact")));
+        assert_eq!(downstream.input_responses, Some(responses));
+        finish_modern_hitl(Some(&token));
+    }
+
+    #[test]
+    fn modern_hitl_state_is_bound_to_the_exact_call() {
+        let token = format!("test-{}", new_correlation_id());
+        modern_hitl_approvals()
+            .lock()
+            .unwrap()
+            .insert(
+                token.clone(),
+                ModernHitlApproval {
+                    name: "s__wipe".into(),
+                    args_hash: audit::args_hash(&json!({ "target": "x" })),
+                    client: Some("cursor".into()),
+                    approved_fingerprint: None,
+                    reason: approval::ApprovalReason::Destructive,
+                    started: Instant::now(),
+                    downstream: MrtrRequest::default(),
+                    input_request: json!({ "method": "elicitation/create" }),
+                    status: ModernHitlStatus::AwaitingClient,
+                },
+            );
+        assert!(matches!(
+            poll_modern_hitl(
+                &token,
+                "s__wipe",
+                &audit::args_hash(&json!({ "target": "different" })),
+                Some("cursor"),
+                None,
+            ),
+            ModernHitlPoll::Stale
+        ));
+        finish_modern_hitl(Some(&token));
+    }
+
+    #[test]
+    fn modern_hitl_decline_fails_closed_and_consumes_state() {
+        let arguments = json!({ "target": "x" });
+        let hash = audit::args_hash(&arguments);
+        let token = start_modern_hitl(
+            "s__wipe",
+            hash.clone(),
+            None,
+            approval::ApprovalReason::Destructive,
+            Some("cursor"),
+            "s",
+            "wipe",
+            &arguments,
+            MrtrRequest::default(),
+        )
+        .unwrap();
+        let declined = poll_modern_hitl(
+            &token,
+            "s__wipe",
+            &hash,
+            Some("cursor"),
+            Some(json!({ "toolport_approval": { "action": "decline" } })),
+        );
+        assert!(matches!(
+            declined,
+            ModernHitlPoll::Decided(approval::ApprovalDecision::Denied, _, _)
+        ));
+        assert!(matches!(
+            poll_modern_hitl(&token, "s__wipe", &hash, Some("cursor"), None),
+            ModernHitlPoll::Missing
+        ));
     }
 
     /// The security-critical guarantee: the human-approval broker denies (never
@@ -10988,6 +12662,65 @@ mod tests {
             Ok(())
         }
     }
+
+    struct CacheRoute;
+
+    impl conduit_lib::downstream::Transport for CacheRoute {
+        fn request(
+            &mut self,
+            method: &str,
+            params: Value,
+        ) -> Result<Value, conduit_lib::downstream::TransportError> {
+            let cached = |mut result: Value, ttl_ms: u64| {
+                result["ttlMs"] = json!(ttl_ms);
+                result["cacheScope"] = json!("public");
+                result
+            };
+            match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": { "resources": {}, "prompts": {} }
+                })),
+                "tools/list" => Ok(cached(json!({ "tools": [{ "name": "cached" }] }), 50_000)),
+                "resources/list" => Ok(cached(
+                    json!({ "resources": [{ "uri": "fixture://cached", "name": "cached" }] }),
+                    40_000,
+                )),
+                "resources/templates/list" => Ok(cached(
+                    json!({ "resourceTemplates": [{ "uriTemplate": "fixture://{id}" }] }),
+                    30_000,
+                )),
+                "resources/read" => Ok(cached(
+                    json!({ "contents": [{ "uri": params["uri"], "text": "cached" }] }),
+                    20_000,
+                )),
+                "prompts/list" => Ok(cached(
+                    json!({ "prompts": [{ "name": "cached" }] }),
+                    10_000,
+                )),
+                other => Err(conduit_lib::downstream::TransportError::Fatal(format!(
+                    "unexpected {other}"
+                ))),
+            }
+        }
+
+        fn notify(
+            &mut self,
+            _method: &str,
+            _params: Value,
+        ) -> Result<(), conduit_lib::downstream::TransportError> {
+            Ok(())
+        }
+    }
+
+    fn cache_router() -> Router {
+        let mut server = DownstreamServer::connect("cache".to_string(), Box::new(CacheRoute))
+            .unwrap();
+        server.load_resources_prompts();
+        let mut router = Router::new();
+        router.add(server);
+        router
+    }
     struct PagingRoute {
     body: String,
     }
@@ -11126,6 +12859,32 @@ mod tests {
         let mut buf = String::new();
         let _ = s.read_to_string(&mut buf);
         buf
+    }
+
+    fn http_post_with_headers(
+        port: u16,
+        path: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let extra = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+             Content-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        response
     }
 
     #[test]
@@ -12316,6 +14075,21 @@ mod tests {
         json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": p }).to_string()
     }
 
+    fn modern_http_headers<'a>(
+        method: &'a str,
+        name: Option<&'a str>,
+        session_id: Option<&'a str>,
+        accept: Option<&'a str>,
+    ) -> McpHttpRequestHeaders<'a> {
+        McpHttpRequestHeaders {
+            session_id,
+            protocol_version: Some(MODERN_PROTOCOL_VERSION),
+            method: Some(method),
+            name,
+            accept,
+        }
+    }
+
     fn test_caller(identity: &str, scope: Option<&[&str]>) -> HttpCaller {
         HttpCaller {
             audit_label: Some(identity.to_string()),
@@ -12371,44 +14145,351 @@ mod tests {
     }
 
     #[test]
-    fn modern_http_client_is_not_served_and_gets_a_fallback_signal() {
-        // Toolport is dual-era on stdio and legacy-only over Streamable HTTP.
-        // Pins that boundary honestly rather than leaving it implicit: a modern
-        // client gets a 400 whose body is NOT a recognized modern error, which
-        // the spec defines as the signal for a dual-era client to fall back to
-        // `initialize`. Serving these properly is SOU-447/448/450.
+    fn modern_http_request_is_sessionless_and_ignores_legacy_session_header() {
         let state = http_state(true);
         let caller = test_caller("client:cursor", None);
-        let out = handle_http(
+        let out = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
             &ConfirmGuard::new(),
             "POST",
             "/mcp",
             &modern_http_body(1, "tools/list", json!({})),
-            None,
-            None,
+            modern_http_headers("tools/list", None, Some("belongs-to-someone-else"), None),
             None,
             Some(&caller),
         );
-        assert_eq!(out.status, 400, "body={}", out.body);
-        // Asserting the body, not just the status: a bare status check would
-        // also pass on an unrelated 400, which is how one of these tests passed
-        // for the wrong reason before.
+        assert_eq!(out.status, 200, "body={}", out.body);
+        let body: Value = serde_json::from_str(&out.body).unwrap();
+        assert!(body.get("result").is_some(), "body={body}");
         assert!(
-            out.body.contains("Mcp-Session-Id"),
-            "expected the session requirement to be what refused it, got {}",
-            out.body
+            out.extra
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("Mcp-Session-Id")),
+            "modern responses must not echo a legacy session id"
         );
-        // Crucially NOT a modern error code: -32020/-32021/-32022 would tell a
-        // dual-era client we are modern and stop it falling back.
-        for code in ["-32020", "-32021", "-32022"] {
-            assert!(
-                !out.body.contains(code),
-                "a legacy-only HTTP endpoint must not answer with {code}, got {}",
-                out.body
+        assert!(
+            state.mcp_sessions.lock().unwrap().is_empty(),
+            "an ordinary modern request must not create protocol session state"
+        );
+    }
+
+    #[test]
+    fn modern_http_headers_are_plumbed_through_the_real_listener() {
+        let state = http_state(true);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let search = Arc::new(SearchGuard::default());
+        let confirm = Arc::new(ConfirmGuard::new());
+        std::thread::spawn(move || serve_http_loop(server, state, None, search, confirm, true));
+
+        let body = modern_http_body(1, "tools/list", json!({}));
+        let response = http_post_with_headers(
+            port,
+            "/mcp",
+            &body,
+            &[
+                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                ("Mcp-Method", "tools/list"),
+                ("Mcp-Session-Id", "ignored-modern-id"),
+                ("Accept", "application/json"),
+            ],
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "response={response}");
+        let response_headers = response.split("\r\n\r\n").next().unwrap_or("");
+        assert!(
+            !response_headers.lines().any(|line| {
+                line.split_once(':')
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case("Mcp-Session-Id"))
+            }),
+            "modern response minted or echoed a session id: {response_headers}"
+        );
+        let lower = response_headers.to_ascii_lowercase();
+        assert!(lower.contains("mcp-method"), "CORS omitted Mcp-Method: {response_headers}");
+        assert!(lower.contains("mcp-name"), "CORS omitted Mcp-Name: {response_headers}");
+    }
+
+    #[test]
+    fn modern_http_transport_headers_gate_dispatch_and_map_protocol_statuses() {
+        let state = http_state(true);
+        let body = modern_http_body(1, "tools/list", json!({}));
+
+        let missing_headers = handle_http(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &body,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(missing_headers.status, 400);
+        let missing: Value = serde_json::from_str(&missing_headers.body).unwrap();
+        assert_eq!(missing["error"]["code"], downstream::HEADER_MISMATCH);
+
+        let missing_method_body = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION
+                }
+            }
+        })
+        .to_string();
+        let missing_method = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &missing_method_body,
+            McpHttpRequestHeaders {
+                protocol_version: Some(MODERN_PROTOCOL_VERSION),
+                ..McpHttpRequestHeaders::default()
+            },
+            None,
+            None,
+        );
+        assert_eq!(missing_method.status, 400);
+        let missing_method_json: Value = serde_json::from_str(&missing_method.body).unwrap();
+        assert_eq!(
+            missing_method_json["error"]["code"],
+            downstream::HEADER_MISMATCH
+        );
+
+        let wrong_method = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &body,
+            modern_http_headers("tools/call", None, None, None),
+            None,
+            None,
+        );
+        assert_eq!(wrong_method.status, 400);
+        let wrong: Value = serde_json::from_str(&wrong_method.body).unwrap();
+        assert_eq!(wrong["error"]["code"], downstream::HEADER_MISMATCH);
+
+        let named_body = modern_http_body(
+            2,
+            "tools/call",
+            json!({ "name": "weather__lookup", "arguments": {} }),
+        );
+        let wrong_name = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &named_body,
+            modern_http_headers("tools/call", Some("other__tool"), None, None),
+            None,
+            None,
+        );
+        assert_eq!(wrong_name.status, 400);
+        let wrong_name_body: Value = serde_json::from_str(&wrong_name.body).unwrap();
+        assert_eq!(wrong_name_body["error"]["code"], downstream::HEADER_MISMATCH);
+
+        let absent_name = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &modern_http_body(3, "tools/call", json!({ "arguments": {} })),
+            modern_http_headers("tools/call", None, None, None),
+            None,
+            None,
+        );
+        assert_eq!(absent_name.status, 400);
+        let absent_name_json: Value = serde_json::from_str(&absent_name.body).unwrap();
+        assert_eq!(
+            absent_name_json["error"]["code"],
+            downstream::HEADER_MISMATCH
+        );
+
+        let unsupported_body = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/list",
+            "params": {
+                "_meta": { "io.modelcontextprotocol/protocolVersion": "2099-01-01" }
+            }
+        })
+        .to_string();
+        let unsupported = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &unsupported_body,
+            McpHttpRequestHeaders {
+                protocol_version: Some("2099-01-01"),
+                method: Some("tools/list"),
+                ..McpHttpRequestHeaders::default()
+            },
+            None,
+            None,
+        );
+        assert_eq!(unsupported.status, 400, "body={}", unsupported.body);
+        let unsupported_json: Value = serde_json::from_str(&unsupported.body).unwrap();
+        assert_eq!(
+            unsupported_json["error"]["code"],
+            downstream::UNSUPPORTED_PROTOCOL_VERSION
+        );
+
+        let unknown = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &modern_http_body(4, "made/up", json!({})),
+            modern_http_headers("made/up", None, None, None),
+            None,
+            None,
+        );
+        assert_eq!(unknown.status, 404, "body={}", unknown.body);
+        let unknown_body: Value = serde_json::from_str(&unknown.body).unwrap();
+        assert_eq!(unknown_body["error"]["code"], -32601);
+
+        for method in ["GET", "DELETE"] {
+            let out = handle_http_with_headers(
+                &state,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                method,
+                "/mcp",
+                "",
+                McpHttpRequestHeaders {
+                    session_id: Some("legacy-looking-id"),
+                    protocol_version: Some(MODERN_PROTOCOL_VERSION),
+                    accept: Some("text/event-stream"),
+                    ..McpHttpRequestHeaders::default()
+                },
+                None,
+                None,
             );
+            assert_eq!(out.status, 405, "{method} body={}", out.body);
+            assert!(out.extra.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("Allow") && value == "POST"
+            }));
+
+            let unsupported_verb = handle_http_with_headers(
+                &state,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                method,
+                "/mcp",
+                "",
+                McpHttpRequestHeaders {
+                    session_id: Some("legacy-looking-id"),
+                    protocol_version: Some("2099-01-01"),
+                    accept: Some("text/event-stream"),
+                    ..McpHttpRequestHeaders::default()
+                },
+                None,
+                None,
+            );
+            assert_eq!(unsupported_verb.status, 400);
+
+            let legacy_verb = handle_http_with_headers(
+                &state,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                method,
+                "/mcp",
+                "",
+                McpHttpRequestHeaders {
+                    session_id: Some("legacy-looking-id"),
+                    protocol_version: Some("2025-06-18"),
+                    accept: Some("text/event-stream"),
+                    ..McpHttpRequestHeaders::default()
+                },
+                None,
+                None,
+            );
+            assert_eq!(legacy_verb.status, 404);
         }
+    }
+
+    #[test]
+    fn modern_http_scope_is_resolved_per_request_not_from_session_state() {
+        let state = http_state(false);
+        *state.cached_tools.lock().unwrap() = Arc::new(CatalogSnapshot::new(vec![
+            json!({ "name": "github__list_repos", "description": "github" }),
+            json!({ "name": "stripe__list_charges", "description": "stripe" }),
+        ]));
+        let github: HashSet<String> = ["github".to_string()].into_iter().collect();
+        let stripe: HashSet<String> = ["stripe".to_string()].into_iter().collect();
+        let github_caller = test_caller("client:github", Some(&["github"]));
+        let stripe_caller = test_caller("client:stripe", Some(&["stripe"]));
+        let request = modern_http_body(1, "tools/list", json!({}));
+
+        let call = |allowed: &HashSet<String>, caller: &HttpCaller| {
+            handle_http_with_headers(
+                &state,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                "POST",
+                "/mcp",
+                &request,
+                modern_http_headers("tools/list", None, Some("same-untrusted-id"), None),
+                Some(allowed),
+                Some(caller),
+            )
+        };
+        let github_out = call(&github, &github_caller);
+        let stripe_out = call(&stripe, &stripe_caller);
+        assert_eq!(github_out.status, 200, "body={}", github_out.body);
+        assert_eq!(stripe_out.status, 200, "body={}", stripe_out.body);
+
+        let names = |out: &HttpOut| {
+            let body: Value = serde_json::from_str(&out.body).unwrap();
+            body["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let github_names = names(&github_out);
+        let stripe_names = names(&stripe_out);
+        assert!(github_names.contains(&"github__list_repos".to_string()));
+        assert!(!github_names.contains(&"stripe__list_charges".to_string()));
+        assert!(stripe_names.contains(&"stripe__list_charges".to_string()));
+        assert!(!stripe_names.contains(&"github__list_repos".to_string()));
+        assert!(state.mcp_sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn modern_http_rejects_removed_resource_subscription_methods() {
+        let state = http_state(true);
+        let out = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &modern_http_body(
+                7,
+                "resources/subscribe",
+                json!({ "uri": "fixture://shared" }),
+            ),
+            modern_http_headers("resources/subscribe", None, None, None),
+            None,
+            None,
+        );
+        assert_eq!(out.status, 404, "body={}", out.body);
+        assert!(state.resource_subs.lock().unwrap().by_session.is_empty());
     }
 
     #[test]
@@ -12619,6 +14700,230 @@ mod tests {
     }
 
     #[test]
+    fn modern_http_subscription_listen_is_sessionless_tagged_and_filtered() {
+        let state = http_state(true);
+        let search = SearchGuard::default();
+        let confirm = ConfirmGuard::new();
+        let caller = test_caller("client:modern", None);
+        let mut out = handle_http_with_headers(
+            &state,
+            &search,
+            &confirm,
+            "POST",
+            "/mcp",
+            &modern_http_body(
+                44,
+                "subscriptions/listen",
+                json!({
+                    "notifications": {
+                        "toolsListChanged": true,
+                        "promptsListChanged": false
+                    }
+                }),
+            ),
+            modern_http_headers(
+                "subscriptions/listen",
+                None,
+                None,
+                Some("application/json, text/event-stream"),
+            ),
+            None,
+            Some(&caller),
+        );
+        assert_eq!(out.status, 200, "body={}", out.body);
+        assert_eq!(out.ctype, "text/event-stream");
+        assert!(out.is_mcp_listen());
+        assert!(
+            out.extra
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("Mcp-Session-Id")),
+            "modern listeners must not receive a legacy session id"
+        );
+
+        let listen = out.mcp_listen.as_ref().unwrap();
+        let acknowledgement = listen
+            .session
+            .outbound
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("acknowledgement is the first event")
+            .json;
+        let acknowledgement: Value = serde_json::from_str(&acknowledgement).unwrap();
+        assert_eq!(
+            acknowledgement["method"],
+            "notifications/subscriptions/acknowledged"
+        );
+        assert_eq!(
+            acknowledgement["params"]["_meta"]
+                ["io.modelcontextprotocol/subscriptionId"],
+            44
+        );
+        assert_eq!(
+            acknowledgement["params"]["notifications"]["toolsListChanged"],
+            true
+        );
+        assert!(acknowledgement["params"]["notifications"]
+            .get("promptsListChanged")
+            .is_none());
+
+        fanout_mcp_notification(
+            &state.stdout,
+            &state.mcp_sessions,
+            &json!({ "jsonrpc": "2.0", "method": "notifications/prompts/list_changed" }),
+        );
+        fanout_mcp_notification(
+            &state.stdout,
+            &state.mcp_sessions,
+            &json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" }),
+        );
+        let queued: Vec<String> = listen
+            .session
+            .outbound
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(|message| message.json)
+            .collect();
+        assert_eq!(queued.len(), 1, "only opted-in notification is queued");
+        let tools: Value = serde_json::from_str(&queued[0]).unwrap();
+        assert_eq!(tools["method"], "notifications/tools/list_changed");
+        assert_eq!(
+            tools["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            44
+        );
+
+        let listen = out.mcp_listen.take().unwrap();
+        let (cleanup_state, cleanup_key) = listen.cleanup.unwrap();
+        let reader = McpSseReader::with_cleanup(listen.session, cleanup_state, cleanup_key);
+        drop(reader);
+        assert!(
+            state.mcp_sessions.lock().unwrap().is_empty(),
+            "closing the POST response removes the listener"
+        );
+    }
+
+    #[test]
+    fn modern_subscription_listen_rejects_bad_filters_without_a_session() {
+        let state = http_state(true);
+        let out = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &modern_http_body(
+                45,
+                "subscriptions/listen",
+                json!({ "notifications": { "toolsListChanged": "yes" } }),
+            ),
+            modern_http_headers(
+                "subscriptions/listen",
+                None,
+                None,
+                Some("text/event-stream"),
+            ),
+            None,
+            None,
+        );
+        let body: Value = serde_json::from_str(&out.body).unwrap();
+        assert_eq!(body["error"]["code"], -32602);
+        assert!(state.mcp_sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn modern_http_listeners_do_not_collide_across_instances_of_one_client() {
+        let state = http_state(true);
+        let caller = test_caller("client:shared-token", None);
+        let body = modern_http_body(
+            1,
+            "subscriptions/listen",
+            json!({ "notifications": { "toolsListChanged": true } }),
+        );
+        let first = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &body,
+            modern_http_headers(
+                "subscriptions/listen",
+                None,
+                None,
+                Some("text/event-stream"),
+            ),
+            None,
+            Some(&caller),
+        );
+        let second = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &body,
+            modern_http_headers(
+                "subscriptions/listen",
+                None,
+                None,
+                Some("text/event-stream"),
+            ),
+            None,
+            Some(&caller),
+        );
+        assert!(first.is_mcp_listen() && second.is_mcp_listen());
+        assert_eq!(
+            state.mcp_sessions.lock().unwrap().len(),
+            2,
+            "request ids are scoped to each HTTP client instance, not only the bearer identity"
+        );
+    }
+
+    #[test]
+    fn cancelling_modern_stdio_listener_releases_its_resource_subscriptions() {
+        let state = http_state(true);
+        let id = json!("listen-1");
+        let key = modern_subscription_key(None, &id, ModernSubscriptionTransport::Stdio);
+        let session = Arc::new(McpSession::new_modern(
+            None,
+            id.clone(),
+            ModernSubscriptionFilter {
+                resource_subscriptions: vec!["fixture://one".to_string()],
+                ..ModernSubscriptionFilter::default()
+            },
+            ModernSubscriptionTransport::Stdio,
+        ));
+        state
+            .mcp_sessions
+            .lock()
+            .unwrap()
+            .insert(key.clone(), session);
+        state
+            .resource_subs
+            .lock()
+            .unwrap()
+            .add(&key, "fixture://one", "fixture-server")
+            .unwrap();
+
+        assert!(cancel_modern_subscription(
+            &state,
+            &rpc_id_key(&id).unwrap(),
+            ModernSubscriptionTransport::Stdio,
+        ));
+        assert!(state.mcp_sessions.lock().unwrap().is_empty());
+        assert!(
+            state
+                .resource_subs
+                .lock()
+                .unwrap()
+                .sessions_for_uri("fixture://one")
+                .is_empty(),
+            "cancelling the listener must release its resource holders"
+        );
+    }
+
+    #[test]
     fn mcp_push_server_message_queues_sse_payload() {
         let state = http_state(true);
         let sid = mint_mcp_session(&state, None).ok().unwrap();
@@ -12642,7 +14947,7 @@ mod tests {
         let sid_a = mint_mcp_session(&state, None).ok().unwrap();
         let sid_b = mint_mcp_session(&state, None).ok().unwrap();
         let msg = json!({"jsonrpc":"2.0","method":"notifications/resources/list_changed"});
-        fanout_mcp_notification(&state.mcp_sessions, &msg);
+        fanout_mcp_notification(&state.stdout, &state.mcp_sessions, &msg);
         for sid in [sid_a, sid_b] {
             let sessions = state.mcp_sessions.lock().unwrap();
             let session = sessions.get(&sid).unwrap();
@@ -12866,6 +15171,11 @@ mod tests {
             "application/json;q=1, text/event-stream;q=0.8"
         )));
         assert!(!mcp_prefers_sse(Some("text/event-stream;q=0")));
+        assert!(mcp_accepts_sse(Some(
+            "application/json, text/event-stream"
+        )));
+        assert!(!mcp_accepts_sse(Some("text/event-stream;q=0")));
+        assert!(!mcp_accepts_sse(Some("text/event-stream;q=0.0")));
     }
 
     #[test]
@@ -13374,7 +15684,7 @@ mod tests {
     }
 
     #[test]
-    fn advertised_versions_cover_every_revision_initialize_accepts() {
+    fn initialize_echoes_supported_versions_and_negotiates_unknown_versions() {
         // `server/discover` is how a modern client learns what to ask for. If it
         // under-reports, a client picks a version Toolport serves but did not
         // advertise - or worse, concludes it cannot talk to us at all.
@@ -13399,22 +15709,25 @@ mod tests {
                 advertised.as_array().is_some_and(|a| a.iter().any(|v| v == version)),
                 "initialize serves {version} but server/discover does not advertise it: {advertised}"
             );
+            let initialized = dispatch(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": version }
+            }));
+            assert_eq!(
+                initialized["result"]["protocolVersion"], version,
+                "a supported version must still be negotiated exactly"
+            );
         }
 
-        // Deliberately NOT asserted per-revision above: `initialize` echoes any
-        // string, so "it echoed what I sent" is a tautology that holds for
-        // "garbage" too and proves nothing about which revisions are real. What
-        // the echo does establish is the shape of the claim - that no published
-        // revision is turned away - so assert it once, against a value that is
-        // NOT a published revision, to show the echo really is unconditional and
-        // this list is therefore a deliberate choice rather than a filter.
+        // An unknown revision must receive one Toolport actually implements so
+        // the client can decide whether to continue at that negotiated version.
         let nonsense = dispatch(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": { "protocolVersion": "1999-01-01" }
         }));
         assert_eq!(
-            nonsense["result"]["protocolVersion"], "1999-01-01",
-            "initialize validates nothing, so the advertised list is curated, not derived"
+            nonsense["result"]["protocolVersion"], PROTOCOL_VERSION,
+            "initialize must not claim support for an unknown revision"
         );
         assert!(
             !advertised.as_array().is_some_and(|a| a.iter().any(|v| v == "1999-01-01")),
@@ -13431,7 +15744,12 @@ mod tests {
 
         assert_eq!(result["supportedVersions"][0], MODERN_PROTOCOL_VERSION);
         assert!(result["capabilities"]["tools"].is_object());
-        assert_eq!(result["capabilities"]["resources"]["subscribe"], true);
+        assert!(
+            result["capabilities"]["resources"]
+                .get("subscribe")
+                .is_none(),
+            "modern discovery must not advertise the removed resources.subscribe capability"
+        );
         assert_eq!(result["resultType"], "complete");
         assert_eq!(
             result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
@@ -13456,6 +15774,77 @@ mod tests {
     }
 
     #[test]
+    fn modern_cacheable_results_preserve_hints_and_scoping_fails_private() {
+        let reg = Registry::default();
+        let router = cache_router();
+        let guard = SearchGuard::default();
+        let confirm = ConfirmGuard::new();
+        let cases = [
+            ("tools/list", json!({}), 50_000_u64),
+            ("resources/list", json!({}), 40_000),
+            ("resources/templates/list", json!({}), 30_000),
+            ("resources/read", json!({ "uri": "fixture://cached" }), 20_000),
+            ("prompts/list", json!({}), 10_000),
+        ];
+
+        for (index, (method, params, max_ttl)) in cases.into_iter().enumerate() {
+            let response = handle_request(
+                &modern_req(index as i64 + 10, method, params),
+                &reg,
+                &router,
+                &[],
+                false,
+                None,
+                &guard,
+                &confirm,
+                None,
+                None,
+            )
+            .unwrap();
+            let result = &response["result"];
+            let ttl = result["ttlMs"].as_u64().unwrap_or_default();
+            assert!(ttl > 0 && ttl <= max_ttl, "{method} must preserve remaining TTL: {result}");
+            assert_eq!(result["cacheScope"], "public", "{method}: {result}");
+        }
+
+        let scoped = handle_request(
+            &modern_req(20, "tools/list", json!({})),
+            &reg,
+            &router,
+            &[],
+            false,
+            Some("client-profile"),
+            &guard,
+            &confirm,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(scoped["result"]["cacheScope"], "private");
+
+        let legacy = handle_request(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "resources/read",
+                "params": { "uri": "fixture://cached" }
+            }),
+            &reg,
+            &router,
+            &[],
+            false,
+            None,
+            &guard,
+            &confirm,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(legacy["result"].get("ttlMs").is_none());
+        assert!(legacy["result"].get("cacheScope").is_none());
+    }
+
+    #[test]
     fn legacy_clients_see_no_modern_fields() {
         // The no-regression guarantee for every client in the wild today: a
         // request without `_meta` gets a byte-identical response to before.
@@ -13472,6 +15861,8 @@ mod tests {
             "legacy results carry no _meta, got {}",
             resp["result"]
         );
+        assert!(resp["result"].get("ttlMs").is_none());
+        assert!(resp["result"].get("cacheScope").is_none());
 
         // ...and initialize still works, unchanged.
         let init = dispatch(&json!({
@@ -13953,6 +16344,16 @@ mod tests {
     }
 
     #[test]
+    fn modern_stdio_suppresses_legacy_untagged_resource_updates() {
+        assert!(should_write_legacy_stdio_resource_update(true, false));
+        assert!(
+            !should_write_legacy_stdio_resource_update(true, true),
+            "modern stdio notifications must travel only through the tagged listener"
+        );
+        assert!(!should_write_legacy_stdio_resource_update(false, false));
+    }
+
+    #[test]
     fn resource_subscription_owner_for_matches_first_writer() {
         let mut table = ResourceSubscriptionTable::default();
         table.add("s1", "file://a", "alpha").unwrap();
@@ -14290,11 +16691,17 @@ mod tests {
     }
 
     #[test]
-    fn effective_quarantine_is_empty_while_the_feature_is_off() {
-        // Mirrors how the initial router build gates: the persisted set stays on disk so
-        // it can be restored when the feature is switched back on, but while
-        // quarantine-on-drift is OFF nothing may be enforced. The off branch returns
-        // without reading a profile file, so this stays independent of conduit_dir().
+    fn effective_quarantine_is_empty_without_mandatory_entries_while_feature_is_off() {
+        // Ordinary drift entries stay dormant while quarantine-on-drift is off. With no
+        // baseline-tamper entries persisted, the effective set is still known-empty.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-empty-mandatory-q-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
         let mut reg = Registry::default();
         reg.quarantine_on_drift = false;
         assert!(
@@ -14306,6 +16713,44 @@ mod tests {
             effective_quarantine(&registry, Some("unused-profile")),
             Some(BTreeSet::new()),
             "feature off is a known-empty set, not an unknown one"
+        );
+    }
+
+    #[test]
+    fn baseline_tamper_is_quarantined_while_optional_drift_policy_is_off() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-mandatory-q-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        let profile = Some("baseline-tamper");
+        std::fs::write(
+            dir.join("tool-pins-baseline-tamper.json"),
+            "{ corrupt baseline",
+        )
+        .unwrap();
+        let tools = vec![json!({
+            "name": "srv__read",
+            "description": "Read records.",
+            "inputSchema": {"type": "object"}
+        })];
+
+        let mut reg = Registry::default();
+        reg.integrity_check = true;
+        reg.quarantine_on_drift = false;
+        let registry = Arc::new(Mutex::new(reg));
+        assert!(
+            maybe_check_integrity(&registry, &tools, profile),
+            "lost baseline must create a quarantine even with optional drift blocking off"
+        );
+        assert_eq!(
+            effective_quarantine(&registry, profile),
+            Some(BTreeSet::from(["srv__read".to_string()])),
+            "baseline-tamper quarantine is mandatory"
         );
     }
 

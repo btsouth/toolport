@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Listener, Manager, State};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_notification::NotificationExt;
 use sha2::{Digest, Sha256};
 
@@ -1925,7 +1926,19 @@ fn release_quarantine(
     } else {
         Some(profile.as_str())
     };
-    integrity::release(prof, &tool);
+    if !integrity::release(prof, &tool) {
+        // Idempotent across app/gateway instances: another process may have released the
+        // same tool after this UI last polled. Only report failure when the persisted store
+        // still says it is blocked (or cannot be read), which also preserves the useful
+        // error for a tamper release whose accepted pin could not be saved.
+        let still_blocked = integrity::quarantined(prof)
+            .map_err(|e| format!("Could not verify re-approval for {tool}: {e}"))?;
+        if still_blocked.contains(&tool) {
+            return Err(format!(
+                "Could not re-approve {tool}; its quarantine record or integrity pin could not be updated"
+            ));
+        }
+    }
     // The quarantine release lives in the separate tool-pins file; the former blind re-save
     // here was only a gateway mtime-nudge (which the no-op guard usually swallowed anyway)
     // and it could revert a concurrent gateway/team write (SOU-23). Refresh the cache
@@ -3088,7 +3101,13 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let registry = registry::load().unwrap_or_default();
+    let registry = match registry::load() {
+        Ok(registry) => registry,
+        Err(error) => {
+            run_registry_startup_failure(error);
+            return;
+        }
+    };
 
     // Migrate legacy keychain secrets into the data-protection keychain (the
     // team-scoped shared access group) in the background. On macOS, older versions
@@ -3480,11 +3499,55 @@ pub fn run() {
         });
 }
 
+/// Start only the native recovery dialog when the registry cannot be loaded safely. The
+/// normal app (and therefore every mutating command) is never initialized with an invented
+/// empty registry. Closing the dialog exits; the user can then resolve a stuck lock or restore
+/// one of the preserved backup/unreadable files before relaunching (SOU-331).
+fn run_registry_startup_failure(error: String) {
+    let message = registry_startup_failure_message(
+        registry::resolved_path().as_deref(),
+        &error,
+    );
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .setup(move |app| {
+            let handle = app.handle().clone();
+            app.dialog()
+                .message(message)
+                .title("Toolport could not start safely")
+                .kind(MessageDialogKind::Error)
+                .buttons(MessageDialogButtons::OkCustom("Close Toolport".to_string()))
+                .show(move |_| handle.exit(1));
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while showing the Toolport registry recovery dialog");
+}
+
+fn registry_startup_failure_message(path: Option<&std::path::Path>, error: &str) -> String {
+    let path = path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "the Toolport data directory".to_string());
+    format!(
+        "Toolport could not safely load its registry, so it stopped before showing or saving an empty configuration. Your registry was not replaced.\n\nClose any other Toolport processes and try again. If the problem continues, restore a registry backup or move the unreadable registry aside, then reopen Toolport.\n\nRegistry: {path}\n\nError: {error}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{arg_looks_secret, redact_url_userinfo};
     use registry::EnvVar;
+
+    #[test]
+    fn registry_startup_failure_is_blocking_and_preserves_the_real_path_and_error() {
+        let path = std::path::Path::new(r"C:\Toolport\registry.json");
+        let message = registry_startup_failure_message(Some(path), "Corrupt registry: bad json");
+        assert!(message.contains("stopped before showing or saving an empty configuration"));
+        assert!(message.contains(r"C:\Toolport\registry.json"));
+        assert!(message.contains("Corrupt registry: bad json"));
+        assert!(message.contains("Your registry was not replaced"));
+    }
 
     fn github_with_secret() -> ServerEntry {
         ServerEntry {

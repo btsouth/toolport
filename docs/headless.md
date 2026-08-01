@@ -16,14 +16,22 @@ with HTTP enabled.
 | ------------------------------------ | -------------------------------------------------------------------- |
 | `GET /openapi.json` + `POST /{tool}` | Open WebUI, n8n, LibreChat (OpenAPI)                                 |
 | `POST /mcp`                          | MCP clients over streamable-HTTP (Claude Code, Cursor remote, Pi, …) |
+| `GET /mcp`                           | Legacy MCP session listen stream                                     |
 | `GET /`                              | Short help text                                                      |
 
 Current streamable-HTTP scope:
 
+- Modern MCP `2026-07-28` requests are sessionless: every `POST /mcp` carries its
+  protocol `_meta`, `MCP-Protocol-Version`, and `Mcp-Method`/`Mcp-Name` routing headers.
+- Modern list-change and resource-update notifications use `subscriptions/listen` over POST.
+- Legacy clients still initialize, receive `Mcp-Session-Id`, and reuse it on later requests.
+- `GET /mcp` and `DELETE /mcp` remain available for valid legacy sessions; modern requests
+  receive `405 Method Not Allowed`.
 - `POST /mcp` returns JSON-RPC responses as JSON by default.
 - If `Accept` prefers `text/event-stream`, `POST /mcp` returns a single SSE `message` event and closes.
-- `GET /mcp` opens a long-lived SSE listen stream for server→client JSON-RPC (keepalive comments every 30s when idle).
-- **Server-initiated RPC passthrough** (#167): when the MCP client declares `roots`, `sampling`, or `elicitation` at `initialize`, downstream servers (stdio or HTTP/SSE) can call `roots/list`, `sampling/createMessage`, and `elicitation/create`; the gateway forwards those to the upstream MCP client over stdio or HTTP MCP (`GET /mcp` listen). Interactive calls use a 120s upstream timeout. `notifications/roots/list_changed` from the client is forwarded to all downstream servers. HTTP downstream answers inline during SSE `POST` responses (no separate downstream `GET /mcp` listener yet).
+- **Server-initiated RPC passthrough** (#167): legacy clients use the session listen stream;
+  modern clients receive input requests through MRTR `input_required` results and retry with
+  `inputResponses` plus `requestState`.
 
 Auth is the same bearer token as today (`TOOLPORT_HTTP_TOKEN` or a registered
 `httpClients[]` entry). Non-loopback binds **require** a token.
@@ -56,7 +64,22 @@ Emits counters for tool calls (`server`, `tool`, `client`, `ok`), held
 destructive calls, duration sum/count, lazy-discovery tokens saved, and a
 quarantine gauge. Labels are ids only (never arguments). Same auth as OpenAPI.
 
-### MCP handshake (curl)
+### Modern MCP request (curl)
+
+```bash
+curl -s -X POST http://127.0.0.1:8765/mcp \
+  -H "Authorization: Bearer $TOOLPORT_HTTP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/list" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"curl","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
+```
+
+No initialize request or session header is used. `Mcp-Session-Id`, if sent by an old
+intermediary, is ignored on this modern path.
+
+### Legacy MCP handshake (curl)
 
 ```bash
 # 1) initialize — capture Mcp-Session-Id from the response headers

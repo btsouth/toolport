@@ -132,13 +132,12 @@ pub fn read_recent(limit: usize) -> Vec<Value> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let mut entries: Vec<Value> = content
+    let entries: Vec<Value> = content
         .lines()
         .rev()
-        .take(limit)
         .filter_map(|line| serde_json::from_str(line).ok())
+        .take(limit)
         .collect();
-    entries.truncate(limit);
     entries
 }
 
@@ -254,5 +253,29 @@ mod tests {
     fn cap_json_keeps_small_bodies() {
         let v = json!({ "a": 1 });
         assert_eq!(cap_json(&v, MAX_BODY_BYTES), v);
+    }
+
+    #[test]
+    fn read_recent_skips_corrupt_lines_without_shrinking_page() {
+        let _data_dir = crate::registry::data_dir_test_lock();
+        reset();
+
+        let path = inspect_path().unwrap();
+
+        std::fs::write(
+            &path,
+            r#"{"i":1}
+        {"i":2}
+        not json
+        {"i":3}
+        {"i":4}"#,
+        )
+        .unwrap();
+        let recent = read_recent(3);
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0]["i"], 4);
+        assert_eq!(recent[1]["i"], 3);
+        assert_eq!(recent[2]["i"], 2);
+        reset();
     }
 }

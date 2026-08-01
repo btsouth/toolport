@@ -155,8 +155,16 @@ try {
 # --- Test 6: HITL fail-closed (unit test) ---
 Write-Host "Running approval_broker_fails_closed unit test..."
 Push-Location $repoRoot
-cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --bin toolport-gateway approval_broker_fails_closed 2>&1 | Out-Null
-if ($LASTEXITCODE -eq 0) { Pass "HITL fail-closed when broker missing (unit test)" } else { Fail "approval_broker_fails_closed test failed" }
+$previousErrorActionPreference = $ErrorActionPreference
+$cargoExitCode = 1
+try {
+    $ErrorActionPreference = "Continue"
+    cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --bin toolport-gateway approval_broker_fails_closed 2>&1 | Out-Null
+    if ($null -ne $LASTEXITCODE) { $cargoExitCode = $LASTEXITCODE }
+} finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
+if ($cargoExitCode -eq 0) { Pass "HITL fail-closed when broker missing (unit test)" } else { Fail "approval_broker_fails_closed test failed" }
 Pop-Location
 
 Write-Host ""

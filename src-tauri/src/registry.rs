@@ -1768,7 +1768,7 @@ fn quarantine_unreadable(path: &Path, content: &str) -> Option<PathBuf> {
     Some(dest)
 }
 
-pub fn load_from(path: &Path) -> Result<Registry, String> {
+fn load_from_inner(path: &Path) -> Result<Registry, String> {
     match read_registry_file(path) {
         // Genuinely missing or empty (not a rename race - read_registry_file
         // already waited that out): recover the last-known-good from the .bak
@@ -1798,6 +1798,21 @@ pub fn load_from(path: &Path) -> Result<Registry, String> {
             }
         },
     }
+}
+
+/// Load an explicit registry while holding its cross-process lock across the full
+/// read/recovery path. Recovery can rewrite the primary from a backup, so even a caller
+/// that only intends to read must serialize with writers (SOU-330).
+pub fn load_from(path: &Path) -> Result<Registry, String> {
+    let lock = lock_for(path)?;
+    load_from_locked(path, &lock)
+}
+
+/// Load while the caller already holds a registry lock. Requiring the guard by reference
+/// prevents nested acquisition in read-modify-write paths while making the lock requirement
+/// explicit at call sites that need to keep it through a later save.
+pub fn load_from_locked(path: &Path, _lock: &FileLock) -> Result<Registry, String> {
+    load_from_inner(path)
 }
 
 pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
@@ -1918,10 +1933,12 @@ fn lock_for(path: &Path) -> Result<FileLock, String> {
 /// through this or [`update_at`] — that is what makes the lock effective.
 pub fn update<T>(f: impl FnOnce(&mut Registry) -> Result<T, String>) -> Result<(Registry, T), String> {
     let path = resolved_path().ok_or("Could not resolve registry path")?;
-    let _lock = lock_for(&path)?;
-    let mut reg = load()?;
+    let lock = lock_for(&path)?;
+    let mut reg = load_from_locked(&path, &lock)?;
     let out = f(&mut reg)?;
-    save(&reg)?;
+    // Save to the exact path we locked and loaded. Re-resolving after `f` would let a
+    // runtime env override change redirect this write to a different, unlocked registry.
+    save_to(&path, &reg)?;
     Ok((reg, out))
 }
 
@@ -1939,8 +1956,8 @@ pub fn update_at<T>(
     path: &Path,
     f: impl FnOnce(&mut Registry) -> Result<T, String>,
 ) -> Result<(Registry, T), String> {
-    let _lock = lock_for(path)?;
-    let mut reg = load_from(path)?;
+    let lock = lock_for(path)?;
+    let mut reg = load_from_locked(path, &lock)?;
     let out = f(&mut reg)?;
     save_to(path, &reg)?;
     Ok((reg, out))
@@ -2011,6 +2028,8 @@ pub(crate) fn redact_url_userinfo(url: &str) -> String {
 mod tests {
     use super::*;
     use crate::approval::fingerprint_allow_key;
+
+    static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn sample_server(name: &str) -> ServerEntry {
         ServerEntry {
@@ -2636,8 +2655,7 @@ mod tests {
 
     #[test]
     fn load_and_save_resolved_honor_registry_override() {
-        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let _guard = ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+        let _guard = REGISTRY_ENV_LOCK.lock().unwrap();
 
         let mut path = std::env::temp_dir();
         path.push(format!("conduit-registry-override-{}.json", std::process::id()));
@@ -2665,6 +2683,46 @@ mod tests {
         assert_eq!(loaded.servers, r.servers);
         assert_eq!(loaded.profiles, r.profiles);
         assert_eq!(loaded.active_profile_id, r.active_profile_id);
+    }
+
+    #[test]
+    fn update_saves_to_the_same_resolved_path_it_locked() {
+        let _guard = REGISTRY_ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-update-path-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let locked_path = dir.join("locked.json");
+        let redirected_path = dir.join("redirected.json");
+
+        let previous = std::env::var_os("TOOLPORT_REGISTRY");
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("TOOLPORT_REGISTRY", value),
+                    None => std::env::remove_var("TOOLPORT_REGISTRY"),
+                }
+            }
+        }
+        let _restore = RestoreEnv(previous);
+        std::env::set_var("TOOLPORT_REGISTRY", &locked_path);
+
+        update(|registry| {
+            registry.deny_destructive = true;
+            std::env::set_var("TOOLPORT_REGISTRY", &redirected_path);
+            Ok(())
+        })
+        .unwrap();
+
+        let persisted = load_from(&locked_path).unwrap();
+        assert!(persisted.deny_destructive);
+        assert!(
+            !redirected_path.exists(),
+            "update wrote to a path whose lock it never held"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -2760,6 +2818,64 @@ mod tests {
         );
         let _ = second.unlock();
         std::fs::remove_file(lock_path(&path)).ok();
+    }
+
+    #[test]
+    fn recovery_waits_for_the_registry_lock_before_rewriting_primary() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-locked-recovery-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+
+        let mut stale = Registry::default();
+        stale.allow_agent_control = false;
+        let mut latest = Registry::default();
+        latest.allow_agent_control = true;
+        atomic_write(
+            &backup_path(&path),
+            &serde_json::to_string_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+        atomic_write(&path, "{ corrupt primary").unwrap();
+
+        // Simulate a writer that already owns the registry lock. A concurrent reader must
+        // wait rather than restoring the stale backup over the writer's newer primary.
+        let guard = lock_at(&path).expect("writer acquires registry lock");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let reader_barrier = std::sync::Arc::clone(&barrier);
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            reader_barrier.wait();
+            load_from(&reader_path)
+        });
+        barrier.wait();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !reader.is_finished(),
+            "reader must remain blocked while the writer owns the registry lock"
+        );
+        atomic_write(
+            &path,
+            &serde_json::to_string_pretty(&latest).unwrap(),
+        )
+        .unwrap();
+        drop(guard);
+
+        let loaded = reader.join().unwrap().expect("reader loads newest primary");
+        assert!(loaded.allow_agent_control, "reader must not return the stale backup");
+        let persisted: Registry =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            persisted.allow_agent_control,
+            "recovery must not overwrite the newer primary after the writer releases"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]

@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::downstream::{
-    backoff_delay, CancelContext, DownstreamServer, TransportError, HTTP_MAX_RETRIES,
-    HTTP_RETRY_CAP,
+    backoff_delay, CacheHint, CancelContext, DownstreamServer, MrtrRequest, TransportError,
+    HTTP_MAX_RETRIES, HTTP_RETRY_CAP,
 };
 use crate::registry::ToolOverride;
 
@@ -705,7 +705,81 @@ impl Router {
 
     /// Every downstream tool, with its exposed (sanitized) name.
     pub fn aggregated_tools(&self) -> Vec<Value> {
-        self.tools.clone()
+        let mut tools = self.tools.clone();
+        // MCP 2026-07-28 recommends deterministic tool ordering so both response
+        // caches and LLM prompt caches survive incidental downstream reorderings.
+        // Exposed names are unique, making them a stable total key across refreshes
+        // and gateway restarts without changing routing ownership.
+        tools.sort_by(|left, right| {
+            left.get("name")
+                .and_then(Value::as_str)
+                .cmp(&right.get("name").and_then(Value::as_str))
+        });
+        tools
+    }
+
+    fn aggregate_cache_hints(
+        &self,
+        select: impl Fn(&DownstreamServer) -> Option<CacheHint>,
+    ) -> Option<CacheHint> {
+        let mut aggregate: Option<CacheHint> = None;
+        for slot in &self.servers {
+            let server = slot
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(hint) = select(&server) else {
+                continue;
+            };
+            aggregate = Some(match aggregate {
+                Some(current) => current.merge(hint),
+                None => hint,
+            });
+        }
+        aggregate
+    }
+
+    pub fn tools_cache_hint(&self) -> Option<CacheHint> {
+        self.aggregate_cache_hints(|server| Some(server.tool_cache_hint()))
+    }
+
+    pub fn resources_cache_hint(&self) -> Option<CacheHint> {
+        self.aggregate_cache_hints(DownstreamServer::resource_cache_hint)
+    }
+
+    pub fn resource_templates_cache_hint(&self) -> Option<CacheHint> {
+        self.aggregate_cache_hints(DownstreamServer::resource_template_cache_hint)
+    }
+
+    pub fn prompts_cache_hint(&self) -> Option<CacheHint> {
+        self.aggregate_cache_hints(DownstreamServer::prompt_cache_hint)
+    }
+
+    /// Positive downstream TTLs schedule a refresh at their expiry. Zero/missing
+    /// hints do not create a one-second polling loop; notifications still invalidate
+    /// them immediately through the existing dirty-bit path.
+    pub fn expired_cache_kinds(&self) -> u8 {
+        let mut kinds = 0;
+        for slot in &self.servers {
+            let server = slot
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if server.tool_cache_hint().needs_refresh() {
+                kinds |= crate::downstream::change::TOOLS;
+            }
+            if server.resource_cache_hint().is_some_and(|hint| hint.needs_refresh())
+                || server
+                    .resource_template_cache_hint()
+                    .is_some_and(|hint| hint.needs_refresh())
+            {
+                kinds |= crate::downstream::change::RESOURCES;
+            }
+            if server.prompt_cache_hint().is_some_and(|hint| hint.needs_refresh()) {
+                kinds |= crate::downstream::change::PROMPTS;
+            }
+        }
+        kinds
     }
 
     /// Re-query every live server's tool list (a downstream announced a
@@ -720,6 +794,16 @@ impl Router {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .refresh_tools();
+        }
+        self.rebuild_aggregation();
+    }
+
+    pub fn refresh_stale_tools(&mut self) {
+        for slot in &self.servers {
+            slot.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .refresh_tools_if_stale();
         }
         self.rebuild_aggregation();
     }
@@ -739,6 +823,16 @@ impl Router {
         self.rebuild_aggregation();
     }
 
+    pub fn refresh_stale_resources(&mut self) {
+        for slot in &self.servers {
+            slot.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .refresh_resources_if_stale();
+        }
+        self.rebuild_aggregation();
+    }
+
     /// Re-query every live server's prompt list (a downstream announced a
     /// `prompts/list_changed`) and rebuild the exposed aggregation in place.
     /// Mirrors [`refresh_tools`].
@@ -748,6 +842,16 @@ impl Router {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .refresh_prompts();
+        }
+        self.rebuild_aggregation();
+    }
+
+    pub fn refresh_stale_prompts(&mut self) {
+        for slot in &self.servers {
+            slot.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .refresh_prompts_if_stale();
         }
         self.rebuild_aggregation();
     }
@@ -968,6 +1072,17 @@ impl Router {
         cancel: Option<CancelContext>,
         meta: Option<&Value>,
     ) -> Result<Value, String> {
+        self.route_call_with_cancel_and_mrtr(exposed_name, arguments, cancel, meta, None)
+    }
+
+    pub fn route_call_with_cancel_and_mrtr(
+        &self,
+        exposed_name: &str,
+        arguments: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, String> {
         if let Some(reason) = self.blocked.get(exposed_name) {
             return Err(format!("tool '{exposed_name}' is {reason}"));
         }
@@ -977,7 +1092,13 @@ impl Router {
             .ok_or_else(|| format!("no route for tool '{exposed_name}'"))?;
         let slot = self.slot_for(server_id)?;
         self.call_with_retry(&slot, |server| {
-            server.call_with_cancel(tool, arguments.clone(), cancel.clone(), meta)
+            server.call_with_cancel_and_mrtr(
+                tool,
+                arguments.clone(),
+                cancel.clone(),
+                meta,
+                mrtr,
+            )
         })
     }
 
@@ -1109,13 +1230,23 @@ impl Router {
         cancel: Option<CancelContext>,
         meta: Option<&Value>,
     ) -> Result<Value, String> {
+        self.read_resource_with_cancel_and_mrtr(uri, cancel, meta, None)
+    }
+
+    pub fn read_resource_with_cancel_and_mrtr(
+        &self,
+        uri: &str,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, String> {
         let server_id = self
             .resource_server(uri)
             .ok_or_else(|| format!("no server owns resource '{uri}'"))?
             .to_string();
         let slot = self.slot_for(&server_id)?;
         self.call_with_retry(&slot, |server| {
-            server.read_resource_with_cancel(uri, cancel.clone(), meta)
+            server.read_resource_with_cancel_and_mrtr(uri, cancel.clone(), meta, mrtr)
         })
     }
 
@@ -1169,6 +1300,17 @@ impl Router {
         cancel: Option<CancelContext>,
         meta: Option<&Value>,
     ) -> Result<Value, String> {
+        self.get_prompt_with_cancel_and_mrtr(exposed_name, arguments, cancel, meta, None)
+    }
+
+    pub fn get_prompt_with_cancel_and_mrtr(
+        &self,
+        exposed_name: &str,
+        arguments: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, String> {
         let (server_id, name) = self
             .prompt_routes
             .get(exposed_name)
@@ -1176,7 +1318,13 @@ impl Router {
             .ok_or_else(|| format!("no route for prompt '{exposed_name}'"))?;
         let slot = self.slot_for(&server_id)?;
         self.call_with_retry(&slot, |server| {
-            server.get_prompt_with_cancel(&name, arguments.clone(), cancel.clone(), meta)
+            server.get_prompt_with_cancel_and_mrtr(
+                &name,
+                arguments.clone(),
+                cancel.clone(),
+                meta,
+                mrtr,
+            )
         })
     }
 
@@ -1432,6 +1580,42 @@ mod tests {
         ds
     }
 
+    struct HintTransport {
+        tool: String,
+        ttl_ms: u64,
+        scope: &'static str,
+    }
+
+    impl Transport for HintTransport {
+        fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+            match method {
+                "initialize" => Ok(json!({ "protocolVersion": "2025-06-18", "capabilities": {} })),
+                "tools/list" => Ok(json!({
+                    "tools": [{ "name": self.tool }],
+                    "ttlMs": self.ttl_ms,
+                    "cacheScope": self.scope
+                })),
+                other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
+            }
+        }
+
+        fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    fn hinted_server(id: &str, ttl_ms: u64, scope: &'static str) -> DownstreamServer {
+        DownstreamServer::connect(
+            id.to_string(),
+            Box::new(HintTransport {
+                tool: "tool".to_string(),
+                ttl_ms,
+                scope,
+            }),
+        )
+        .unwrap()
+    }
+
     /// Handshakes fine (so it can be constructed) but every `tools/call` reports the
     /// connection is dead - i.e. a crashed/hung stdio child mid-session.
     struct DeadOnCallTransport;
@@ -1541,11 +1725,51 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "github__echo",
                 "github__add",
-                "postgres__echo",
-                "postgres__add"
+                "github__echo",
+                "postgres__add",
+                "postgres__echo"
             ]
+        );
+    }
+
+    #[test]
+    fn tool_order_is_stable_across_server_add_order() {
+        let mut first = Router::new();
+        first.add(mock_server("zeta"));
+        first.add(mock_server("alpha"));
+        let mut second = Router::new();
+        second.add(mock_server("alpha"));
+        second.add(mock_server("zeta"));
+
+        assert_eq!(first.aggregated_tools(), second.aggregated_tools());
+    }
+
+    #[test]
+    fn aggregated_cache_hint_uses_minimum_ttl_and_private_wins() {
+        let mut public = Router::new();
+        public.add(hinted_server("slow", 60_000, "public"));
+        public.add(hinted_server("fast", 30_000, "public"));
+        let hint = public.tools_cache_hint().unwrap();
+        assert!(hint.is_public());
+        let ttl = hint.remaining_ttl_ms();
+        assert!(ttl > 0 && ttl <= 30_000, "minimum contributor TTL should win: {ttl}");
+
+        let mut mixed = Router::new();
+        mixed.add(hinted_server("public", 60_000, "public"));
+        mixed.add(hinted_server("private", 60_000, "private"));
+        assert!(!mixed.tools_cache_hint().unwrap().is_public());
+    }
+
+    #[test]
+    fn positive_cache_ttl_marks_its_catalog_for_refresh() {
+        let mut router = Router::new();
+        router.add(hinted_server("expiring", 5, "public"));
+        std::thread::sleep(std::time::Duration::from_millis(15));
+
+        assert_ne!(
+            router.expired_cache_kinds() & crate::downstream::change::TOOLS,
+            0
         );
     }
 
@@ -1769,7 +1993,11 @@ mod tests {
         router.add(mock_server("file-system"));
 
         let tools = router.aggregated_tools();
-        let name = tools[0]["name"].as_str().unwrap();
+        let name = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .find(|name| name.ends_with("__echo"))
+            .unwrap();
         assert_eq!(name, "file_system__echo");
 
         let result = router.route_call(name, json!({})).unwrap();

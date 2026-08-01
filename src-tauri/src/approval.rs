@@ -1,11 +1,9 @@
 //! Human-in-the-loop (HITL) tool-approval: the contract both sides share.
 //!
-//! When HITL is on, the gateway holds a *gated* tool call and asks the Toolport app for a
-//! human decision before it runs. The app hosts a small approval broker; every gateway
-//! process (there is one per stdio client, plus the app's `--http` bridge) dials OUT to it,
-//! sends the pending call, and blocks reading for the decision. Arguments travel over the
-//! connection and never touch disk. Everything is fail-closed: no endpoint, no answer, a
-//! timeout, or any transport error all mean DENY.
+//! Legacy clients and code-mode calls use the app's approval broker and block for the
+//! decision. Modern direct calls use MCP multi-round-trip elicitation instead: the client
+//! returns the human's answer on a fresh request, so no gateway request remains held.
+//! Arguments never touch disk, and every path remains fail-closed.
 //!
 //! This module is the piece both the gateway-side client and the app-side broker share:
 //! the wire types, the gating policy, and the on-disk endpoint descriptor. Keeping it in

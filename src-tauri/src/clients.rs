@@ -79,6 +79,9 @@ pub struct DetectedClient {
 enum Format {
     /// JSON with a top-level `mcpServers` object (Claude Desktop, Cursor, Windsurf).
     JsonMcpServers,
+    /// GitHub Copilot CLI's `mcpServers` object. Entries use the standard JSON
+    /// shape but require a `tools` allowlist; Toolport enables every gateway tool.
+    JsonCopilotMcpServers,
     /// Amp's shared settings file stores servers under the literal dotted
     /// top-level key `amp.mcpServers` (not a nested `amp` object).
     JsonAmpMcpServers,
@@ -247,16 +250,7 @@ fn resolve_client_config_path(
     let path = match client_id {
         "claude-desktop" => config.join("Claude").join("claude_desktop_config.json"),
         "cursor" => home.join(".cursor").join("mcp.json"),
-        "crush" => match platform {
-            Platform::Windows => home
-                .join("AppData")
-                .join("Local")
-                .join("crush")
-                .join("crush.json"),
-            Platform::MacOs | Platform::Linux => {
-                home.join(".config").join("crush").join("crush.json")
-            }
-        },
+        "crush" => home.join(".config").join("crush").join("crush.json"),
         "boltai" => home.join(".boltai").join("mcp.json"),
         "pi" => home.join(".pi").join("agent").join("mcp.json"),
         "omp" => home.join(".omp").join("agent").join("mcp.json"),
@@ -270,9 +264,11 @@ fn resolve_client_config_path(
         "kilo-code" => home.join(".config").join("kilo").join("kilo.jsonc"),
         "grok" => home.join(".grok").join("config.toml"),
         "codex" => home.join(".codex").join("config.toml"),
+        "github-copilot-cli" => home.join(".copilot").join("mcp-config.json"),
         "claude-code" => home.join(".claude.json"),
         "gemini-cli" => home.join(".gemini").join("settings.json"),
         "qwen-code" => home.join(".qwen").join("settings.json"),
+        "junie" => home.join(".junie").join("mcp").join("mcp.json"),
         "antigravity" => home.join(".gemini").join("config").join("mcp_config.json"),
         "cline" => config
             .join("Code")
@@ -363,9 +359,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
     let path = match client_id {
         "claude-desktop" => config.join("Claude").join("claude_desktop_config.json"),
         "cursor" => home.join(".cursor").join("mcp.json"),
-        // Crush documents a literal home-relative path and does not follow
-        // XDG_CONFIG_HOME.
-        "crush" => home.join(".config").join("crush").join("crush.json"),
+        "crush" => config.join("crush").join("crush.json"),
         "boltai" => home.join(".boltai").join("mcp.json"),
         "pi" => home.join(".pi").join("agent").join("mcp.json"),
         "omp" => home.join(".omp").join("agent").join("mcp.json"),
@@ -382,9 +376,11 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "kilo-code" => home.join(".config").join("kilo").join("kilo.jsonc"),
         "grok" => home.join(".grok").join("config.toml"),
         "codex" => home.join(".codex").join("config.toml"),
+        "github-copilot-cli" => home.join(".copilot").join("mcp-config.json"),
         "claude-code" => home.join(".claude.json"),
         "gemini-cli" => home.join(".gemini").join("settings.json"),
         "qwen-code" => home.join(".qwen").join("settings.json"),
+        "junie" => home.join(".junie").join("mcp").join("mcp.json"),
         "antigravity" => home.join(".gemini").join("config").join("mcp_config.json"),
         "cline" => config
             .join("Code")
@@ -562,22 +558,43 @@ fn crush_override_path(config_dir: Option<std::ffi::OsString>) -> Option<PathBuf
         .map(|dir| PathBuf::from(dir).join("crush.json"))
 }
 
-/// Crush reads its global config from the directory in CRUSH_GLOBAL_CONFIG
-/// when set. Otherwise Windows uses %LOCALAPPDATA% while macOS/Linux use
-/// ~/.config.
+fn resolve_crush_path(
+    home: &Path,
+    config_override: Option<std::ffi::OsString>,
+    xdg_config_home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(path) = crush_override_path(config_override) {
+        return path;
+    }
+    xdg_config_home
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("crush")
+        .join("crush.json")
+}
+
+/// Crush v0.88.0 resolves its global config through CRUSH_GLOBAL_CONFIG, then
+/// XDG_CONFIG_HOME, and finally ~/.config on every OS. Older Windows releases
+/// used LocalAppData, so retain that path only when it already contains a file.
 fn crush_path() -> Option<PathBuf> {
+    let home = home()?;
     if let Some(path) = crush_override_path(std::env::var_os("CRUSH_GLOBAL_CONFIG")) {
         return Some(path);
     }
+    let current = resolve_crush_path(&home, None, std::env::var_os("XDG_CONFIG_HOME"));
     #[cfg(windows)]
-    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").filter(|p| !p.is_empty()) {
-        return Some(
-            PathBuf::from(local_app_data)
+    if !current.exists() {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").filter(|p| !p.is_empty()) {
+            let legacy = PathBuf::from(local_app_data)
                 .join("crush")
-                .join("crush.json"),
-        );
+                .join("crush.json");
+            if legacy.exists() {
+                return Some(legacy);
+            }
+        }
     }
-    client_config_path("crush")
+    Some(current)
 }
 
 fn anythingllm_path() -> Option<PathBuf> {
@@ -618,6 +635,16 @@ fn windsurf_path() -> Option<PathBuf> {
 
 fn codex_path() -> Option<PathBuf> {
     client_config_path("codex")
+}
+
+/// GitHub Copilot CLI stores user-level MCP servers under `COPILOT_HOME`,
+/// defaulting to `~/.copilot/mcp-config.json` on every supported platform.
+fn github_copilot_cli_path() -> Option<PathBuf> {
+    std::env::var_os("COPILOT_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join("mcp-config.json"))
+        .or_else(|| client_config_path("github-copilot-cli"))
 }
 
 /// Grok Build (xAI's terminal coding agent) stores MCP servers in
@@ -704,6 +731,12 @@ fn gemini_cli_path() -> Option<PathBuf> {
 /// supported platform.
 fn qwen_code_path() -> Option<PathBuf> {
     client_config_path("qwen-code")
+}
+
+/// Junie stores user-scoped MCP servers at ~/.junie/mcp/mcp.json on every
+/// supported platform. Project-scoped configs are intentionally left untouched.
+fn junie_path() -> Option<PathBuf> {
+    client_config_path("junie")
 }
 
 /// Google Antigravity reads MCP servers from `mcp_config.json` under `~/.gemini`.
@@ -1012,6 +1045,14 @@ fn defs() -> Vec<ClientDef> {
             plugin_scan: None,
         },
         ClientDef {
+            id: "github-copilot-cli",
+            name: "GitHub Copilot CLI",
+            format: Format::JsonCopilotMcpServers,
+            uses_connectors: false,
+            path: github_copilot_cli_path,
+            plugin_scan: None,
+        },
+        ClientDef {
             id: "antigravity",
             name: "Antigravity",
             format: Format::JsonMcpServers,
@@ -1041,6 +1082,14 @@ fn defs() -> Vec<ClientDef> {
             format: Format::JsonQwenMcpServers,
             uses_connectors: false,
             path: qwen_code_path,
+            plugin_scan: None,
+        },
+        ClientDef {
+            id: "junie",
+            name: "JetBrains Junie",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            path: junie_path,
             plugin_scan: None,
         },
         ClientDef {
@@ -2194,6 +2243,17 @@ fn app_present_for(config_path: &str, config_exists: bool) -> bool {
                 .unwrap_or(false))
 }
 
+fn app_present_with_override(
+    config_path: &str,
+    config_exists: bool,
+    install_marker: Option<&Path>,
+) -> bool {
+    match install_marker {
+        Some(marker) => config_exists || marker.exists(),
+        None => app_present_for(config_path, config_exists),
+    }
+}
+
 /// Warp keeps its state under the OS data dir, not next to its MCP config: it reads
 /// file-based servers from `~/.warp/.mcp.json` but only creates `~/.warp` on first
 /// file-based use, while the app itself lives under the data dir. So the
@@ -2239,6 +2299,9 @@ fn install_override(id: &str) -> Option<PathBuf> {
         // ~/.kiro/settings may not exist until something is configured; ~/.kiro is
         // created on install.
         "kiro" => Some(home()?.join(".kiro")),
+        // ~/.junie/mcp may not exist until MCP is configured; ~/.junie is the
+        // stable user-scope data root created by Junie.
+        "junie" => Some(home()?.join(".junie")),
         // MCP file lives under ~/.toolport-studio, but presence also includes
         // Electron userData and installer dirs (and the transitional t3code path).
         "toolport-studio" => toolport_studio_install_marker(),
@@ -2270,10 +2333,9 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         // Clients with an explicit install dir use it (and ignore the config-parent
         // heuristic, which for them is wrong); everyone else uses the parent of
         // their resolved config path (which is their data dir, e.g. ~/.codex).
-        let app_present = match install_override(def.id) {
-            Some(marker) => config_exists || marker.exists(),
-            None => app_present_for(&config_path, config_exists),
-        };
+        let install_marker = install_override(def.id);
+        let app_present =
+            app_present_with_override(&config_path, config_exists, install_marker.as_deref());
         DetectedClient {
             id: def.id.to_string(),
             name: def.name.to_string(),
@@ -2324,6 +2386,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
 
     let parsed = match def.format {
         Format::JsonMcpServers => parse_json(&content, "mcpServers"),
+        Format::JsonCopilotMcpServers => parse_json(&content, "mcpServers"),
         Format::JsonAmpMcpServers => parse_json(&content, "amp.mcpServers"),
         Format::JsonQwenMcpServers => parse_qwen_json(&content),
         Format::JsonServers => parse_json(&content, "servers"),
@@ -2784,11 +2847,15 @@ fn write_json(
     servers: &[ServerEntry],
     lenient: bool,
 ) -> Result<(), String> {
-    write_json_with(path, key, servers, lenient, entry_to_json, false)
+    write_json_with(path, key, servers, lenient, entry_to_json, false, false)
 }
 
 fn write_crush_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    write_json_with(path, "mcp", servers, true, entry_to_crush_json, true)
+    write_json_with(path, "mcp", servers, true, entry_to_crush_json, true, false)
+}
+
+fn write_copilot_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
+    write_json_with(path, "mcpServers", servers, false, entry_to_json, false, true)
 }
 
 fn write_json_with(
@@ -2798,6 +2865,7 @@ fn write_json_with(
     lenient: bool,
     entry_to_value: fn(&ServerEntry) -> serde_json::Value,
     validate_crush_shape: bool,
+    include_tools: bool,
 ) -> Result<(), String> {
     let mut root = if path.exists() {
         let content = read_config_file(path)?;
@@ -2815,7 +2883,16 @@ fn write_json_with(
     let obj = root.as_object_mut().unwrap();
     let servers_map: serde_json::Map<String, serde_json::Value> = servers
         .iter()
-        .map(|s| (s.name.clone(), entry_to_value(s)))
+        .map(|server| {
+            let mut value = entry_to_value(server);
+            if include_tools {
+                value.as_object_mut().unwrap().insert(
+                    "tools".into(),
+                    serde_json::json!(["*"]),
+                );
+            }
+            (server.name.clone(), value)
+        })
         .collect();
     obj.insert(key.to_string(), serde_json::Value::Object(servers_map));
 
@@ -3485,6 +3562,7 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
     let lenient = config_is_whole_app_state(client_id);
     match def.format {
         Format::JsonMcpServers => write_json(&path, "mcpServers", servers, lenient)?,
+        Format::JsonCopilotMcpServers => write_copilot_json(&path, servers)?,
         Format::JsonAmpMcpServers => write_json(&path, "amp.mcpServers", servers, true)?,
         Format::JsonQwenMcpServers => write_qwen_json(&path, servers)?,
         Format::JsonServers => write_json(&path, "servers", servers, lenient)?,
@@ -3689,6 +3767,7 @@ pub fn client_uses_mcp_remote_bridge(client_id: &str) -> bool {
         // Native remote shapes already exist in our writers.
         Format::JsonQwenMcpServers
         | Format::JsonMcp
+        | Format::JsonCopilotMcpServers
         | Format::JsonOpenCodeMcp
         | Format::JsonServers
         | Format::YamlMcpServers
@@ -3772,7 +3851,7 @@ fn edit_json_gateway(
     entry: Option<&ServerEntry>,
     lenient: bool,
 ) -> Result<(), String> {
-    edit_json_gateway_with(path, key, entry, lenient, None, false)
+    edit_json_gateway_with(path, key, entry, lenient, None, false, false)
 }
 
 fn edit_crush_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
@@ -3783,7 +3862,12 @@ fn edit_crush_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), St
         true,
         Some(entry_to_crush_json),
         true,
+        false,
     )
+}
+
+fn edit_copilot_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
+    edit_json_gateway_with(path, "mcpServers", entry, false, None, false, true)
 }
 
 fn edit_json_gateway_with(
@@ -3793,6 +3877,7 @@ fn edit_json_gateway_with(
     lenient: bool,
     entry_formatter: Option<fn(&ServerEntry) -> serde_json::Value>,
     validate_crush_shape: bool,
+    include_tools: bool,
 ) -> Result<(), String> {
     let mut root = if path.exists() {
         let content = read_config_file(path)?;
@@ -3820,11 +3905,13 @@ fn edit_json_gateway_with(
         !gateway_identity_matches(name, name, command)
     });
     if let Some(entry) = entry {
-        let value = if let Some(formatter) = entry_formatter {
+        let mut value = if let Some(formatter) = entry_formatter {
             formatter(entry)
-        // Remote-only entries: Qwen wants httpUrl+headers; VS Code "servers" keeps url.
-        // entry_to_qwen_json leaves url as-is for SSE and renames for streamable HTTP.
+        } else if include_tools {
+            entry_to_json(entry)
         } else if entry.command.is_none() && entry.url.is_some() {
+            // Remote-only entries: Qwen wants httpUrl+headers; VS Code "servers" keeps url.
+            // entry_to_qwen_json leaves url as-is for SSE and renames for streamable HTTP.
             if key == "servers" {
                 entry_to_json(entry)
             } else {
@@ -3833,6 +3920,12 @@ fn edit_json_gateway_with(
         } else {
             entry_to_json(entry)
         };
+        if include_tools {
+            value.as_object_mut().unwrap().insert(
+                "tools".into(),
+                serde_json::json!(["*"]),
+            );
+        }
         servers.insert(GATEWAY_ENTRY_NAME.to_string(), value);
     }
 
@@ -3923,8 +4016,13 @@ fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<Wri
     // we put on disk (SOU-406). Strip secrets for the registry record.
     let managed = entry.map(ManagedEntry::from_gateway_entry);
     match def.format {
-        Format::JsonMcpServers => edit_json_gateway(&path, "mcpServers", entry, lenient)?,
-        Format::JsonAmpMcpServers => edit_json_gateway(&path, "amp.mcpServers", entry, true)?,
+        Format::JsonMcpServers => {
+            edit_json_gateway(&path, "mcpServers", entry, lenient)?
+        }
+        Format::JsonCopilotMcpServers => edit_copilot_json_gateway(&path, entry)?,
+        Format::JsonAmpMcpServers => {
+            edit_json_gateway(&path, "amp.mcpServers", entry, true)?
+        }
         Format::JsonQwenMcpServers => edit_json_gateway(&path, "mcpServers", entry, true)?,
         Format::JsonServers => edit_json_gateway(&path, "servers", entry, lenient)?,
         Format::JsonMcp => edit_crush_gateway(&path, entry)?,
@@ -5053,6 +5151,27 @@ bad = "not-a-table"
         assert!(client_uses_mcp_remote_bridge("amp"));
         assert!(!client_uses_mcp_remote_bridge("opencode"));
         assert!(!client_uses_mcp_remote_bridge("vscode"));
+        assert!(!client_uses_mcp_remote_bridge("github-copilot-cli"));
+    }
+
+    #[test]
+    fn github_copilot_cli_shared_http_entry_uses_native_schema() {
+        let path = temp_path("github-copilot-cli-http.json");
+        let spec = SharedHttpSpec {
+            url: "http://127.0.0.1:8765/mcp".into(),
+            token: "tok".into(),
+        };
+        let entry = gateway_entry_shared_http("github-copilot-cli", None, &spec);
+
+        edit_copilot_json_gateway(&path, Some(&entry)).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let gateway = &root["mcpServers"][GATEWAY_ENTRY_NAME];
+        assert_eq!(gateway["type"], "http");
+        assert_eq!(gateway["url"], "http://127.0.0.1:8765/mcp");
+        assert_eq!(gateway["tools"], serde_json::json!(["*"]));
+        assert_eq!(gateway["headers"]["Authorization"], "Bearer tok");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -5740,6 +5859,7 @@ command = "npx"
             "Claude Code must check ~/.claude, not the home dir its config sits in"
         );
         assert!(install_override("kiro").unwrap().ends_with(".kiro"));
+        assert!(install_override("junie").unwrap().ends_with(".junie"));
         let _ = install_override("warp"); // env-dependent; just ensure no panic.
         assert!(
             install_override("toolport-studio").is_some(),
@@ -5749,6 +5869,31 @@ command = "npx"
         assert!(install_override("cursor").is_none());
         assert!(install_override("codex").is_none());
         assert!(install_override("vscode").is_none());
+    }
+
+    #[test]
+    fn junie_install_marker_controls_detection_without_config() {
+        let marker = std::env::temp_dir().join(format!(
+            "toolport-junie-marker-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&marker).ok();
+        let config = marker.join("mcp").join("mcp.json");
+
+        assert!(!app_present_with_override(
+            &config.to_string_lossy(),
+            false,
+            Some(&marker)
+        ));
+
+        std::fs::create_dir_all(&marker).unwrap();
+        assert!(app_present_with_override(
+            &config.to_string_lossy(),
+            false,
+            Some(&marker)
+        ));
+
+        std::fs::remove_dir_all(&marker).ok();
     }
 
     #[test]
@@ -6283,14 +6428,34 @@ command = "npx"
             crush_override_path(Some(std::ffi::OsString::from("custom-config"))),
             Some(PathBuf::from("custom-config").join("crush.json"))
         );
+        let home = Path::new("mock-home");
+        assert_eq!(
+            resolve_crush_path(home, None, None),
+            home.join(".config").join("crush").join("crush.json")
+        );
+        assert_eq!(
+            resolve_crush_path(
+                home,
+                None,
+                Some(std::ffi::OsString::from("xdg-config")),
+            ),
+            PathBuf::from("xdg-config").join("crush").join("crush.json")
+        );
+        assert_eq!(
+            resolve_crush_path(
+                home,
+                Some(std::ffi::OsString::from("custom-config")),
+                Some(std::ffi::OsString::from("xdg-config")),
+            ),
+            PathBuf::from("custom-config").join("crush.json")
+        );
     }
 
     #[test]
     fn new_json_clients_are_registered() {
-        // Warp, Amazon Q, Kiro, LM Studio, Jan, AnythingLLM, and Witsy all use the
-        // standard mcpServers JSON shape, so a ClientDef + path is all they need.
-        // Lock in their registration, format, and that their config paths resolve
-        // on this OS.
+        // These clients all use the standard mcpServers JSON shape, so a ClientDef
+        // plus a path is all they need. Lock in their registration, format, and
+        // that their config paths resolve on this OS.
         for id in [
             "warp",
             "amazon-q",
@@ -6299,6 +6464,7 @@ command = "npx"
             "jan",
             "anythingllm",
             "witsy",
+            "junie",
         ] {
             let d = defs()
                 .into_iter()
@@ -6310,6 +6476,123 @@ command = "npx"
             );
             assert!((d.path)().is_some(), "{id} path should resolve");
         }
+    }
+
+    #[test]
+    fn github_copilot_cli_is_registered_with_required_tools_format() {
+        let definition = defs()
+            .into_iter()
+            .find(|definition| definition.id == "github-copilot-cli")
+            .unwrap();
+        assert_eq!(definition.name, "GitHub Copilot CLI");
+        assert!(matches!(
+            definition.format,
+            Format::JsonCopilotMcpServers
+        ));
+        assert!((definition.path)().is_some());
+    }
+
+    #[test]
+    fn github_copilot_cli_mcp_config_round_trips() {
+        let path = temp_path("github-copilot-cli-mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"existing":{"command":"node","args":["server.js"],"env":{"TOKEN":"keep"}}}}"#,
+        )
+        .unwrap();
+
+        let original: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let original_existing = original["mcpServers"]["existing"].clone();
+
+        let before = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].name, "existing");
+
+        {
+            let gateway = sample_gateway(None, "github-copilot-cli");
+            edit_copilot_json_gateway(&path, Some(&gateway))
+        }
+        .unwrap();
+        let installed =
+            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        assert_eq!(installed.len(), 2);
+        assert!(installed.iter().any(|server| server.name == "existing"));
+        assert!(installed
+            .iter()
+            .any(|server| server.name == GATEWAY_ENTRY_NAME));
+        let installed_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            installed_json["mcpServers"]["existing"],
+            original_existing
+        );
+        assert_eq!(
+            installed_json["mcpServers"][GATEWAY_ENTRY_NAME]["tools"],
+            serde_json::json!(["*"])
+        );
+
+        edit_copilot_json_gateway(&path, None).unwrap();
+        let removed =
+            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].name, "existing");
+        let removed_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(removed_json["mcpServers"]["existing"], original_existing);
+
+        write_copilot_json(&path, &[stdio("replacement")]).unwrap();
+        let replaced_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            replaced_json["mcpServers"]["replacement"]["tools"],
+            serde_json::json!(["*"])
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn junie_mcp_config_round_trips() {
+        let path = temp_path("junie-mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"existing":{"command":"node","args":["server.js"],"env":{"TOKEN":"keep"}}}}"#,
+        )
+        .unwrap();
+
+        let original: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let original_existing = original["mcpServers"]["existing"].clone();
+
+        let before = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].name, "existing");
+
+        { let _e = sample_gateway(None, "junie"); edit_json_gateway(&path, "mcpServers", Some(&_e), false) }
+            .unwrap();
+        let installed =
+            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        assert_eq!(installed.len(), 2);
+        assert!(installed.iter().any(|server| server.name == "existing"));
+        assert!(installed
+            .iter()
+            .any(|server| server.name == GATEWAY_ENTRY_NAME));
+        let installed_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            installed_json["mcpServers"]["existing"],
+            original_existing
+        );
+
+        edit_json_gateway(&path, "mcpServers", None, false).unwrap();
+        let removed =
+            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].name, "existing");
+        let removed_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(removed_json["mcpServers"]["existing"], original_existing);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -6816,11 +7099,23 @@ command = "npx"
     }
 
     #[test]
+    fn github_copilot_cli_home_overrides_default_path() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let override_path = std::env::temp_dir().join("copilot-custom-home");
+        let _restore = EnvRestore::set("COPILOT_HOME", &override_path);
+        assert_eq!(
+            github_copilot_cli_path(),
+            Some(override_path.join("mcp-config.json"))
+        );
+    }
+
+    #[test]
     fn client_config_paths_match_current_platform() {
         // Hold the env lock: the path resolution reads `dirs::config_dir()`, which
         // another test mutates via `XDG_CONFIG_HOME`. Serialize so we never read it
         // mid-change.
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _copilot_home = EnvRestore::set("COPILOT_HOME", Path::new(""));
         let home = home().expect("home dir should be available in tests");
         let platform = Platform::current();
         for client in defs() {
@@ -6845,17 +7140,11 @@ command = "npx"
     fn client_config_paths_are_stable_across_platforms() {
         let cases: &[(&str, fn(&Path, Platform) -> PathBuf)] = &[
             ("cursor", |home, _| home.join(".cursor").join("mcp.json")),
-            ("crush", |home, platform| match platform {
-                Platform::Windows => home
-                    .join("AppData")
-                    .join("Local")
-                    .join("crush")
-                    .join("crush.json"),
-                Platform::MacOs | Platform::Linux => {
-                    home.join(".config").join("crush").join("crush.json")
-                }
-            }),
+            ("crush", |home, _| home.join(".config").join("crush").join("crush.json")),
             ("grok", |home, _| home.join(".grok").join("config.toml")),
+            ("github-copilot-cli", |home, _| {
+                home.join(".copilot").join("mcp-config.json")
+            }),
             ("toolport-studio", |home, _| {
                 home.join(".toolport-studio").join("mcp.json")
             }),
@@ -6867,6 +7156,9 @@ command = "npx"
             }),
             ("qwen-code", |home, _| {
                 home.join(".qwen").join("settings.json")
+            }),
+            ("junie", |home, _| {
+                home.join(".junie").join("mcp").join("mcp.json")
             }),
             ("continue", |home, _| {
                 home.join(".continue").join("config.yaml")
@@ -6987,7 +7279,10 @@ command = "npx"
             jan,
             xdg_data.join("Jan").join("data").join("mcp_config.json")
         );
-        assert_eq!(crush, home.join(".config").join("crush").join("crush.json"));
+        assert_eq!(
+            crush,
+            xdg_config.join("crush").join("crush.json")
+        );
         assert_eq!(
             opencode,
             home.join(".config").join("opencode").join("opencode.json")
