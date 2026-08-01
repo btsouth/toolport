@@ -9086,25 +9086,30 @@ fn validate_modern_http_headers(
         }
     }
 
-    let body_method = req.get("method").and_then(Value::as_str);
-    let encoded_method = body_method.map(downstream::encode_mcp_header_text);
-    if headers.method != encoded_method.as_deref() {
+    let Some(body_method) = req.get("method").and_then(Value::as_str) else {
+        return Err(modern_http_header_error(
+            req,
+            "modern HTTP request is missing a JSON-RPC method".to_string(),
+        ));
+    };
+    let encoded_method = downstream::encode_mcp_header_text(body_method);
+    if headers.method != Some(encoded_method.as_str()) {
         return Err(modern_http_header_error(
             req,
             format!(
                 "Mcp-Method header '{}' does not match body method '{}'",
                 headers.method.unwrap_or("<absent>"),
-                body_method.unwrap_or("<absent>")
+                body_method
             ),
         ));
     }
 
     let body_name = match body_method {
-        Some("tools/call") | Some("prompts/get") => req
+        "tools/call" | "prompts/get" => req
             .get("params")
             .and_then(|params| params.get("name"))
             .and_then(Value::as_str),
-        Some("resources/read") => req
+        "resources/read" => req
             .get("params")
             .and_then(|params| params.get("uri"))
             .and_then(Value::as_str),
@@ -9112,10 +9117,10 @@ fn validate_modern_http_headers(
     };
     let requires_name = matches!(
         body_method,
-        Some("tools/call") | Some("prompts/get") | Some("resources/read")
+        "tools/call" | "prompts/get" | "resources/read"
     );
     let encoded_name = body_name.map(downstream::encode_mcp_header_text);
-    if requires_name && headers.name != encoded_name.as_deref() {
+    if requires_name && (body_name.is_none() || headers.name != encoded_name.as_deref()) {
         return Err(modern_http_header_error(
             req,
             format!(
@@ -9126,6 +9131,19 @@ fn validate_modern_http_headers(
         ));
     }
     Ok(())
+}
+
+fn non_post_http_era_gate(protocol_version: Option<&str>) -> Option<HttpOut> {
+    match protocol_version {
+        Some(MODERN_PROTOCOL_VERSION) => Some(
+            HttpOut::json_err(405, "method not allowed on modern /mcp")
+                .with_header("Allow", "POST"),
+        ),
+        Some(version) if !SUPPORTED_UPSTREAM_VERSIONS[1..].contains(&version) => Some(
+            HttpOut::json_err(400, &format!("unsupported MCP-Protocol-Version: {version}")),
+        ),
+        _ => None,
+    }
 }
 
 fn modern_http_status(resp: &Value) -> u16 {
@@ -9161,9 +9179,8 @@ fn handle_mcp_http(
         // 2026-07-28. Their transport header is the era boundary because neither
         // verb carries a JSON-RPC envelope. Legacy sessions remain unchanged.
         "GET" => {
-            if headers.protocol_version == Some(MODERN_PROTOCOL_VERSION) {
-                return HttpOut::json_err(405, "method not allowed on modern /mcp")
-                    .with_header("Allow", "POST");
+            if let Some(out) = non_post_http_era_gate(headers.protocol_version) {
+                return out;
             }
             if !mcp_prefers_sse(headers.accept) {
                 return HttpOut::json_err(406, "Accept must include text/event-stream");
@@ -9181,25 +9198,26 @@ fn handle_mcp_http(
                 Err(e) => e,
             }
         }
-        "DELETE" if headers.protocol_version == Some(MODERN_PROTOCOL_VERSION) => {
-            HttpOut::json_err(405, "method not allowed on modern /mcp")
-                .with_header("Allow", "POST")
-        }
-        "DELETE" => match mcp_require_session(state, headers.session_id, session_owner) {
-            Ok((sid, session)) => {
-                session.close();
-                state
-                    .mcp_sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&sid);
-                // Drop resource subscriptions for this HTTP session and release
-                // any last-holder downstream subs (SOU-394).
-                cleanup_resource_subs_for_session(state, &sid);
-                HttpOut::new(204, "text/plain", String::new())
+        "DELETE" => {
+            if let Some(out) = non_post_http_era_gate(headers.protocol_version) {
+                return out;
             }
-            Err(e) => e,
-        },
+            match mcp_require_session(state, headers.session_id, session_owner) {
+                Ok((sid, session)) => {
+                    session.close();
+                    state
+                        .mcp_sessions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&sid);
+                    // Drop resource subscriptions for this HTTP session and release
+                    // any last-holder downstream subs (SOU-394).
+                    cleanup_resource_subs_for_session(state, &sid);
+                    HttpOut::new(204, "text/plain", String::new())
+                }
+                Err(e) => e,
+            }
+        }
         "POST" => {
             let req: Value = if body.trim().is_empty() {
                 return HttpOut::json_err(400, "empty JSON-RPC body");
@@ -13951,6 +13969,37 @@ mod tests {
         let missing: Value = serde_json::from_str(&missing_headers.body).unwrap();
         assert_eq!(missing["error"]["code"], downstream::HEADER_MISMATCH);
 
+        let missing_method_body = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION
+                }
+            }
+        })
+        .to_string();
+        let missing_method = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &missing_method_body,
+            McpHttpRequestHeaders {
+                protocol_version: Some(MODERN_PROTOCOL_VERSION),
+                ..McpHttpRequestHeaders::default()
+            },
+            None,
+            None,
+        );
+        assert_eq!(missing_method.status, 400);
+        let missing_method_json: Value = serde_json::from_str(&missing_method.body).unwrap();
+        assert_eq!(
+            missing_method_json["error"]["code"],
+            downstream::HEADER_MISMATCH
+        );
+
         let wrong_method = handle_http_with_headers(
             &state,
             &SearchGuard::default(),
@@ -13985,6 +14034,24 @@ mod tests {
         assert_eq!(wrong_name.status, 400);
         let wrong_name_body: Value = serde_json::from_str(&wrong_name.body).unwrap();
         assert_eq!(wrong_name_body["error"]["code"], downstream::HEADER_MISMATCH);
+
+        let absent_name = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &modern_http_body(3, "tools/call", json!({ "arguments": {} })),
+            modern_http_headers("tools/call", None, None, None),
+            None,
+            None,
+        );
+        assert_eq!(absent_name.status, 400);
+        let absent_name_json: Value = serde_json::from_str(&absent_name.body).unwrap();
+        assert_eq!(
+            absent_name_json["error"]["code"],
+            downstream::HEADER_MISMATCH
+        );
 
         let unsupported_body = json!({
             "jsonrpc": "2.0",
@@ -14053,6 +14120,42 @@ mod tests {
             assert!(out.extra.iter().any(|(name, value)| {
                 name.eq_ignore_ascii_case("Allow") && value == "POST"
             }));
+
+            let unsupported_verb = handle_http_with_headers(
+                &state,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                method,
+                "/mcp",
+                "",
+                McpHttpRequestHeaders {
+                    session_id: Some("legacy-looking-id"),
+                    protocol_version: Some("2099-01-01"),
+                    accept: Some("text/event-stream"),
+                    ..McpHttpRequestHeaders::default()
+                },
+                None,
+                None,
+            );
+            assert_eq!(unsupported_verb.status, 400);
+
+            let legacy_verb = handle_http_with_headers(
+                &state,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                method,
+                "/mcp",
+                "",
+                McpHttpRequestHeaders {
+                    session_id: Some("legacy-looking-id"),
+                    protocol_version: Some("2025-06-18"),
+                    accept: Some("text/event-stream"),
+                    ..McpHttpRequestHeaders::default()
+                },
+                None,
+                None,
+            );
+            assert_eq!(legacy_verb.status, 404);
         }
     }
 
