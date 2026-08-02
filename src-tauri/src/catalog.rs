@@ -61,8 +61,8 @@ fn category_for(name: &str) -> &'static str {
             "Code & infrastructure"
         }
         "Supabase" | "Neon" | "PostgreSQL" | "MongoDB" | "Elasticsearch" | "Qdrant" => "Databases",
-        "Context7" | "DeepWiki" | "Hugging Face" | "OpenRouter" | "Brave Search" | "Exa"
-        | "Tavily" | "Perplexity" | "DataForSEO" => "Search & knowledge",
+        "Context7" | "DeepWiki" | "Hugging Face" | "OpenRouter" | "Parallel Search"
+        | "Brave Search" | "Exa" | "Tavily" | "Perplexity" | "DataForSEO" => "Search & knowledge",
         "Firecrawl" | "Apify" | "Browserbase" => "Web & automation",
         "Stripe" | "Stripe (Full API)" | "Notion" | "Composio" | "Linear" | "Atlassian"
         | "Asana" | "Airtable" | "Todoist" | "Slack" | "Resend" | "Figma" | "Postiz"
@@ -267,6 +267,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         http("DeepWiki", "Ask questions about any public GitHub repo. No auth.", "https://mcp.deepwiki.com/mcp", "https://deepwiki.com"),
         http("Hugging Face", "Models, datasets, and Spaces on Hugging Face.", "https://huggingface.co/mcp", "https://huggingface.co/settings/mcp"),
         http("OpenRouter", "Live model intelligence: list and compare models, prices, and your credits.", "https://mcp.openrouter.ai/mcp", "https://openrouter.ai/docs/mcp-server"),
+        http("Parallel Search", "Live web search and clean content from URLs. No account or API key required.", "https://search.parallel.ai/mcp", "https://docs.parallel.ai/search/mcp-server/quickstart"),
         cmd("Brave Search", "Web search via the Brave Search API.", "npx", &["-y", "@modelcontextprotocol/server-brave-search"], &["BRAVE_API_KEY"], "https://github.com/modelcontextprotocol/servers"),
         cmd("Exa", "AI-native web search built for agents.", "npx", &["-y", "exa-mcp-server"], &["EXA_API_KEY"], "https://github.com/exa-labs/exa-mcp-server"),
         cmd("Tavily", "Web search and content extraction built for LLMs.", "npx", &["-y", "tavily-mcp"], &["TAVILY_API_KEY"], "https://github.com/tavily-ai/tavily-mcp"),
