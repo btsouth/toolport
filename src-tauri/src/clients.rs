@@ -82,6 +82,9 @@ enum Format {
     /// GitHub Copilot CLI's `mcpServers` object. Entries use the standard JSON
     /// shape but require a `tools` allowlist; Toolport enables every gateway tool.
     JsonCopilotMcpServers,
+    /// Factory Droid's `mcpServers` object. Standard JSON shape, but every
+    /// entry requires a `"type"` field ("stdio" for local servers).
+    JsonDroidMcpServers,
     /// Amp's shared settings file stores servers under the literal dotted
     /// top-level key `amp.mcpServers` (not a nested `amp` object).
     JsonAmpMcpServers,
@@ -910,7 +913,7 @@ fn defs() -> Vec<ClientDef> {
         ClientDef {
             id: "droid",
             name: "Factory Droid",
-            format: Format::JsonMcpServers,
+            format: Format::JsonDroidMcpServers,
             uses_connectors: false,
             path: droid_path,
             plugin_scan: None,
@@ -2364,6 +2367,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
     let parsed = match def.format {
         Format::JsonMcpServers => parse_json(&content, "mcpServers"),
         Format::JsonCopilotMcpServers => parse_json(&content, "mcpServers"),
+        Format::JsonDroidMcpServers => parse_json(&content, "mcpServers"),
         Format::JsonAmpMcpServers => parse_json(&content, "amp.mcpServers"),
         Format::JsonQwenMcpServers => parse_qwen_json(&content),
         Format::JsonServers => parse_json(&content, "servers"),
@@ -2816,6 +2820,33 @@ fn write_json(
 
 fn write_copilot_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
     write_json_with_tools(path, "mcpServers", servers, false, true)
+}
+
+fn write_droid_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
+    let mut root = if path.exists() {
+        let content = read_config_file(path)?;
+        read_existing_json(&content, false)?
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+    if !root.is_object() {
+        root = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let obj = root.as_object_mut().unwrap();
+    let servers_map: serde_json::Map<String, serde_json::Value> = servers
+        .iter()
+        .map(|server| {
+            let mut value = entry_to_json(server);
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert("type".into(), serde_json::json!("stdio"));
+            (server.name.clone(), value)
+        })
+        .collect();
+    obj.insert("mcpServers".to_string(), serde_json::Value::Object(servers_map));
+    let json = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    atomic_write(path, &json)
 }
 
 fn write_json_with_tools(
@@ -3532,6 +3563,7 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
     match def.format {
         Format::JsonMcpServers => write_json(&path, "mcpServers", servers, lenient)?,
         Format::JsonCopilotMcpServers => write_copilot_json(&path, servers)?,
+        Format::JsonDroidMcpServers => write_droid_json(&path, servers)?,
         Format::JsonAmpMcpServers => write_json(&path, "amp.mcpServers", servers, true)?,
         Format::JsonQwenMcpServers => write_qwen_json(&path, servers)?,
         Format::JsonServers => write_json(&path, "servers", servers, lenient)?,
@@ -3735,6 +3767,7 @@ pub fn client_uses_mcp_remote_bridge(client_id: &str) -> bool {
         // Native remote shapes already exist in our writers.
         Format::JsonQwenMcpServers
         | Format::JsonCopilotMcpServers
+        | Format::JsonDroidMcpServers
         | Format::JsonOpenCodeMcp
         | Format::JsonServers
         | Format::YamlMcpServers
@@ -3823,6 +3856,26 @@ fn edit_json_gateway(
 
 fn edit_copilot_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
     edit_json_gateway_with_tools(path, "mcpServers", entry, false, true)
+}
+
+fn edit_droid_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
+    edit_json_gateway(&path, "mcpServers", entry, false)?;
+    let Some(entry) = entry else { return Ok(()) };
+    let content = read_config_file(path)?;
+    let mut root = read_existing_json(&content, false)?;
+    let obj = root.as_object_mut().ok_or("Droid config root must be an object")?;
+    let servers = obj
+        .get_mut("mcpServers")
+        .and_then(|v| v.as_object_mut())
+        .ok_or("missing mcpServers after write")?;
+    if let Some(value) = servers.get_mut(&entry.name) {
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("type".into(), serde_json::json!("stdio"));
+    }
+    let json = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    atomic_write(path, &json)
 }
 
 fn edit_json_gateway_with_tools(
@@ -3975,6 +4028,7 @@ fn install_or_remove(
             edit_json_gateway(&path, "mcpServers", entry, lenient)?
         }
         Format::JsonCopilotMcpServers => edit_copilot_json_gateway(&path, entry)?,
+        Format::JsonDroidMcpServers => edit_droid_json_gateway(&path, entry)?,
         Format::JsonAmpMcpServers => {
             edit_json_gateway(&path, "amp.mcpServers", entry, true)?
         }
@@ -6292,7 +6346,6 @@ command = "npx"
             "jan",
             "anythingllm",
             "witsy",
-            "droid",
             "junie",
         ] {
             let d = defs()
