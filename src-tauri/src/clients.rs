@@ -2838,9 +2838,47 @@ fn serde_to_cst_input(value: &serde_json::Value) -> jsonc_parser::cst::CstInputV
     }
 }
 
+/// Count how many times `key` appears as a top-level property name in a JSONC object.
+fn count_top_level_key(obj: &jsonc_parser::cst::CstObject, key: &str) -> usize {
+    obj.properties()
+        .into_iter()
+        .filter(|prop| {
+            prop.name()
+                .and_then(|n| n.decoded_value().ok())
+                .map(|name| name == key)
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Reject duplicate top-level occurrences of `key` in JSONC text.
+///
+/// Duplicate keys are ambiguous: `obj.get(key)` only rewrites the first, so a later
+/// effective entry can stay stale. Callers must not fall back to pretty JSON when this
+/// fails — the file must remain unchanged (#555 review).
+fn reject_duplicate_top_level_key(original: &str, key: &str) -> Result<(), String> {
+    use jsonc_parser::cst::CstRootNode;
+    use jsonc_parser::ParseOptions;
+
+    let root = CstRootNode::parse(original, &ParseOptions::default())
+        .map_err(|e| e.to_string())?;
+    let Some(obj) = root.object_value() else {
+        return Ok(());
+    };
+    let n = count_top_level_key(&obj, key);
+    if n > 1 {
+        return Err(format!(
+            "malformed config: top-level key '{key}' appears {n} times; refusing to write"
+        ));
+    }
+    Ok(())
+}
+
 /// Rewrite a single top-level object property in `original` JSON/JSONC text,
 /// preserving comments, trailing commas, and formatting of everything else.
 /// Used so gateway install/write no longer strips user annotations (#555).
+///
+/// Fails if `key` appears more than once at the top level (ambiguous rewrite).
 fn rewrite_json_key_preserving(
     original: &str,
     key: &str,
@@ -2856,6 +2894,12 @@ fn rewrite_json_key_preserving(
     let Some(obj) = root.object_value() else {
         return Err("JSONC root is not an object".into());
     };
+    let n = count_top_level_key(&obj, key);
+    if n > 1 {
+        return Err(format!(
+            "malformed config: top-level key '{key}' appears {n} times; refusing to write"
+        ));
+    }
     let input = serde_to_cst_input(new_value);
     if let Some(prop) = obj.get(key) {
         prop.set_value(input);
@@ -2869,6 +2913,9 @@ fn rewrite_json_key_preserving(
 /// only `changed_key` via a JSONC CST so comments outside that key survive.
 /// Falls back to `serde_json::to_string_pretty` for new/empty files or when the
 /// CST rewrite cannot apply (keeps prior behavior for pure JSON / edge cases).
+///
+/// Duplicate top-level keys for `changed_key` are a hard error (no pretty fallback)
+/// so the existing file is left untouched.
 fn atomic_write_json_config(
     path: &Path,
     original: Option<&str>,
@@ -2881,8 +2928,12 @@ fn atomic_write_json_config(
 
     let out = match (original, root.get(changed_key)) {
         (Some(src), Some(val)) if !src.trim().is_empty() => {
+            // Hard-fail on duplicate target keys before any rewrite/fallback so the
+            // file is never replaced with pretty JSON that drops one of the entries.
+            reject_duplicate_top_level_key(src, changed_key)?;
             match rewrite_json_key_preserving(src, changed_key, val) {
                 Ok(text) => text,
+                Err(e) if e.contains("appears") && e.contains("times") => return Err(e),
                 Err(_) => pretty()?,
             }
         }
@@ -6539,6 +6590,47 @@ command = "npx"
         let root = parse_json_value(&rewritten).unwrap();
         assert_eq!(root["ui_font_size"], 16);
         assert!(root["context_servers"].get("Toolport").is_some());
+    }
+
+    #[test]
+    fn atomic_write_json_config_rejects_duplicate_top_level_keys() {
+        // Duplicate top-level mcpServers: rewriting only the first would leave a stale second.
+        let path = temp_path("dup-mcpServers.json");
+        let original = r#"{
+  // keep me
+  "mcpServers": { "a": { "command": "old-a" } },
+  "other": 1,
+  "mcpServers": { "b": { "command": "old-b" } }
+}
+"#;
+        std::fs::write(&path, original).unwrap();
+        let root = serde_json::json!({
+            "mcpServers": { "Toolport": { "command": "toolport-gateway" } },
+            "other": 1
+        });
+        let err = atomic_write_json_config(&path, Some(original), &root, "mcpServers").unwrap_err();
+        assert!(
+            err.contains("malformed") && err.contains("mcpServers"),
+            "expected malformed duplicate-key error, got: {err}"
+        );
+        // File must stay unchanged (no pretty-JSON fallback).
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rewrite_json_key_preserving_rejects_duplicate_top_level_keys() {
+        let original = r#"{
+  "context_servers": { "a": {} },
+  "context_servers": { "b": {} }
+}"#;
+        let err = rewrite_json_key_preserving(
+            original,
+            "context_servers",
+            &serde_json::json!({ "Toolport": {} }),
+        )
+        .unwrap_err();
+        assert!(err.contains("appears") && err.contains("2"), "got: {err}");
     }
 
     #[test]
