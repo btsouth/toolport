@@ -22,6 +22,69 @@ pub struct Stack {
     pub servers: Vec<CatalogEntry>,
 }
 
+/// Raw stack definition before catalog resolution. Kept as a separate list so
+/// tests can assert every referenced name resolves without a magic server total.
+struct StackDef {
+    id: &'static str,
+    name: &'static str,
+    description: &'static str,
+    /// Exact `catalog::curated()` entry names, in display order.
+    server_names: &'static [&'static str],
+}
+
+fn stack_defs() -> Vec<StackDef> {
+    vec![
+        StackDef {
+            id: "fullstack-web",
+            name: "Full-stack web dev",
+            description: "Ship and run a web app: repo, deploys, database, and error tracking.",
+            server_names: &["GitHub", "Vercel", "PostgreSQL", "Sentry", "Filesystem"],
+        },
+        StackDef {
+            id: "backend-data",
+            name: "Backend & data",
+            description: "Work across your databases and code from one agent.",
+            server_names: &["PostgreSQL", "MongoDB", "GitHub", "Fetch", "Filesystem"],
+        },
+        StackDef {
+            id: "infra-devops",
+            name: "Infra & DevOps",
+            description: "Manage cloud infrastructure from your editor: Linode, Kubernetes, and AWS.",
+            server_names: &["Linode", "Kubernetes", "AWS", "GitHub", "Sentry"],
+        },
+        StackDef {
+            id: "research-docs",
+            name: "Research & docs",
+            description: "Search the web, pull up-to-date library docs, and write into Notion.",
+            server_names: &["Context7", "Exa", "Perplexity", "Notion", "Fetch"],
+        },
+        StackDef {
+            id: "ai-ml",
+            name: "AI & ML",
+            description: "Build with models and retrieval: model catalogs, a vector store, and up-to-date docs.",
+            server_names: &["Hugging Face", "OpenRouter", "Qdrant", "Context7", "Exa"],
+        },
+        StackDef {
+            id: "product-design",
+            name: "Product & design",
+            description: "Run product work from one place: issues, docs, designs, and team chat.",
+            server_names: &["Linear", "Notion", "Figma", "Slack"],
+        },
+        StackDef {
+            id: "founder",
+            name: "Founder / indie SaaS",
+            description: "Ship and run a small SaaS: payments, deploys, code, email, and issues.",
+            server_names: &["Stripe", "Vercel", "GitHub", "Resend", "Linear"],
+        },
+        StackDef {
+            id: "web-automation",
+            name: "Web scraping & automation",
+            description: "Pull data from any site and drive real browsers: search, scrape, extract, and automate.",
+            server_names: &["Firecrawl", "Tavily", "Playwright", "Browserbase", "Apify"],
+        },
+    ]
+}
+
 /// The curated set of stacks. Each references catalog entries by name; we resolve
 /// them here so a typo surfaces as a missing server in tests, not at runtime.
 pub fn stacks() -> Vec<Stack> {
@@ -29,66 +92,19 @@ pub fn stacks() -> Vec<Stack> {
     let by_name: std::collections::HashMap<&str, &CatalogEntry> =
         catalog.iter().map(|e| (e.name.as_str(), e)).collect();
 
-    let make = |id: &str, name: &str, desc: &str, names: &[&str]| Stack {
-        id: id.to_string(),
-        name: name.to_string(),
-        description: desc.to_string(),
-        servers: names
-            .iter()
-            .filter_map(|n| by_name.get(n).map(|e| (*e).clone()))
-            .collect(),
-    };
-
-    vec![
-        make(
-            "fullstack-web",
-            "Full-stack web dev",
-            "Ship and run a web app: repo, deploys, database, and error tracking.",
-            &["GitHub", "Vercel", "PostgreSQL", "Sentry", "Filesystem"],
-        ),
-        make(
-            "backend-data",
-            "Backend & data",
-            "Work across your databases and code from one agent.",
-            &["PostgreSQL", "MongoDB", "GitHub", "Fetch", "Filesystem"],
-        ),
-        make(
-            "infra-devops",
-            "Infra & DevOps",
-            "Manage cloud infrastructure from your editor: Linode, Kubernetes, and AWS.",
-            &["Linode", "Kubernetes", "AWS", "GitHub", "Sentry"],
-        ),
-        make(
-            "research-docs",
-            "Research & docs",
-            "Search the web, pull up-to-date library docs, and write into Notion.",
-            &["Context7", "Exa", "Perplexity", "Notion", "Fetch"],
-        ),
-        make(
-            "ai-ml",
-            "AI & ML",
-            "Build with models and retrieval: model catalogs, a vector store, and up-to-date docs.",
-            &["Hugging Face", "OpenRouter", "Qdrant", "Context7", "Exa"],
-        ),
-        make(
-            "product-design",
-            "Product & design",
-            "Run product work from one place: issues, docs, designs, and team chat.",
-            &["Linear", "Notion", "Figma", "Slack"],
-        ),
-        make(
-            "founder",
-            "Founder / indie SaaS",
-            "Ship and run a small SaaS: payments, deploys, code, email, and issues.",
-            &["Stripe", "Vercel", "GitHub", "Resend", "Linear"],
-        ),
-        make(
-            "web-automation",
-            "Web scraping & automation",
-            "Pull data from any site and drive real browsers: search, scrape, extract, and automate.",
-            &["Firecrawl", "Tavily", "Playwright", "Browserbase", "Apify"],
-        ),
-    ]
+    stack_defs()
+        .into_iter()
+        .map(|def| Stack {
+            id: def.id.to_string(),
+            name: def.name.to_string(),
+            description: def.description.to_string(),
+            servers: def
+                .server_names
+                .iter()
+                .filter_map(|n| by_name.get(n).map(|e| (*e).clone()))
+                .collect(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -97,15 +113,32 @@ mod tests {
 
     #[test]
     fn every_stack_resolves_all_its_servers() {
-        // The intended reference count, kept in sync with `stacks()` above. If a
-        // server name is mistyped, it silently drops and this total falls short.
-        let intended = 5 + 5 + 5 + 5 + 5 + 4 + 5 + 5;
-        let resolved: usize = stacks().iter().map(|s| s.servers.len()).sum();
-        assert_eq!(resolved, intended, "a stack references a server name not in the catalog");
-        // Every stack is non-empty and has a stable id + name.
+        let catalog = catalog::curated();
+        let by_name: std::collections::HashMap<&str, &CatalogEntry> =
+            catalog.iter().map(|e| (e.name.as_str(), e)).collect();
+
+        for def in stack_defs() {
+            for server_name in def.server_names {
+                assert!(
+                    by_name.contains_key(server_name),
+                    "stack `{}` references server name `{}` not in the catalog",
+                    def.id,
+                    server_name
+                );
+            }
+        }
+
+        // Resolved stacks stay non-empty and carry stable id + name.
         for s in stacks() {
             assert!(!s.servers.is_empty(), "stack {} is empty", s.id);
             assert!(!s.id.is_empty() && !s.name.is_empty());
+            let def = stack_defs().into_iter().find(|d| d.id == s.id).unwrap();
+            assert_eq!(
+                s.servers.len(),
+                def.server_names.len(),
+                "stack `{}` dropped a server during resolution",
+                s.id
+            );
         }
     }
 
