@@ -155,7 +155,7 @@ and refreshes too.
 
 ## Supported clients
 
-Toolport auto-detects these **31 AI clients**, installs the gateway into each with one
+Toolport auto-detects these **32 AI clients**, installs the gateway into each with one
 click, and can import a client's existing servers. It writes the config file shown
 below for you, so you never have to edit these by hand.
 
@@ -164,6 +164,7 @@ below for you, so you never have to edit these by hand.
 | Claude Desktop  | `<config>/Claude/claude_desktop_config.json`                                               | JSON (`mcpServers`)      |
 | Claude Code     | `~/.claude.json`                                                                           | JSON (`mcpServers`)      |
 | Cursor          | `~/.cursor/mcp.json`                                                                       | JSON (`mcpServers`)      |
+| Factory Droid   | `~/.factory/mcp.json`                                                                      | JSON (`mcpServers`)      |
 | VS Code         | `<config>/Code/User/mcp.json`                                                              | JSON (`servers`)         |
 | Windsurf        | `~/.codeium/windsurf/mcp_config.json`                                                      | JSON (`mcpServers`)      |
 | OpenCode        | `~/.config/opencode/opencode.json`                                                         | JSON (`mcp`)             |
