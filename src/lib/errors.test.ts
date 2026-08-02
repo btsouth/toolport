@@ -30,7 +30,7 @@ describe("errorHeadline", () => {
       "Host not found (ENOTFOUND)",
     );
     expect(errorHeadline("getaddrinfo EAI_AGAIN mcp.example.com")).toBe(
-      "Host not found (EAI_AGAIN)",
+      "Temporary DNS failure (EAI_AGAIN)",
     );
     expect(errorHeadline("read ECONNRESET")).toBe("Connection reset");
     expect(errorHeadline("spawn EACCES")).toBe("Permission denied (EACCES)");
@@ -54,6 +54,16 @@ describe("errorHeadline", () => {
     expect(errorHeadline("listen EADDRINUSE 127.0.0.1:50001")).toBe(
       "Port already in use (127.0.0.1:50001)",
     );
+    expect(errorHeadline("listen EADDRINUSE 127.0.0.1:503")).toBe(
+      "Port already in use (127.0.0.1:503)",
+    );
+  });
+
+  it("does not treat a bare numeric port as an HTTP failure", () => {
+    expect(errorHeadline("connect failed on port 503")).toBe(
+      "connect failed on port 503",
+    );
+    expect(errorHeadline("retrying after 429 ms")).toBe("retrying after 429 ms");
   });
 
   it("does not treat a giant OAuth authorize URL as an auth headline by itself", () => {

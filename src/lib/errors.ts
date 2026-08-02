@@ -18,7 +18,7 @@ const PATTERNS: Array<[RegExp, (m: RegExpMatchArray) => string]> = [
   [/EADDRINUSE/i, () => "Port already in use"],
   [/ENOENT/i, () => "Command or file not found (ENOENT)"],
   [/ENOTFOUND/i, () => "Host not found (ENOTFOUND)"],
-  [/EAI_AGAIN/i, () => "Host not found (EAI_AGAIN)"],
+  [/EAI_AGAIN/i, () => "Temporary DNS failure (EAI_AGAIN)"],
   [/ECONNREFUSED/i, () => "Connection refused"],
   [/ECONNRESET/i, () => "Connection reset"],
   [/EACCES/i, () => "Permission denied (EACCES)"],
@@ -29,8 +29,14 @@ const PATTERNS: Array<[RegExp, (m: RegExpMatchArray) => string]> = [
   ],
   [/\b401\b|unauthorized/i, () => "Authentication required (401)"],
   [/\b403\b|forbidden/i, () => "Access forbidden (403)"],
-  [/\b429\b/, () => "Rate limited (429)"],
-  [/\b(5\d{2})\b/, (m) => `Server error (${m[1]})`],
+  [
+    /(?:HTTP\s+|status\s+|returned\s+)429\b|\b429\s+Too Many Requests/i,
+    () => "Rate limited (429)",
+  ],
+  [
+    /(?:HTTP\s+|status\s+|returned\s+)(5\d{2})\b|\b(5\d{2})\s+(?:Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout|error)/i,
+    (m) => `Server error (${m[1] ?? m[2]})`,
+  ],
   [
     /UNABLE_TO_VERIFY_LEAF_SIGNATURE|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN/i,
     () => "TLS certificate not trusted",
