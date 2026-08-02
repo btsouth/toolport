@@ -2930,10 +2930,12 @@ fn atomic_write_json_config(
         (Some(src), Some(val)) if !src.trim().is_empty() => {
             // Hard-fail on duplicate target keys before any rewrite/fallback so the
             // file is never replaced with pretty JSON that drops one of the entries.
+            // Pre-check (not error-string matching) so jsonc-parser message rewords
+            // cannot silently re-enable the pretty fallback (#592 review).
             reject_duplicate_top_level_key(src, changed_key)?;
             match rewrite_json_key_preserving(src, changed_key, val) {
                 Ok(text) => text,
-                Err(e) if e.contains("appears") && e.contains("times") => return Err(e),
+                // rewrite may still fail for non-object roots / CST issues → pretty
                 Err(_) => pretty()?,
             }
         }
