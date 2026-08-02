@@ -306,8 +306,9 @@ pub fn popular() -> Vec<CatalogEntry> {
     curated()
 }
 
-/// Filter a catalog list by a query (name or description). Substring match, plus
-/// an all-terms fallback so multi-word queries still hit. Empty query = all.
+/// Filter a catalog list by a query (name, description, or category). Substring
+/// match, plus an all-terms fallback so multi-word queries still hit. Empty query
+/// = all.
 fn filter_catalog(list: Vec<CatalogEntry>, query: &str) -> Vec<CatalogEntry> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
@@ -316,7 +317,12 @@ fn filter_catalog(list: Vec<CatalogEntry>, query: &str) -> Vec<CatalogEntry> {
     let terms: Vec<&str> = q.split_whitespace().collect();
     list.into_iter()
         .filter(|e| {
-            let hay = format!("{} {}", e.name.to_lowercase(), e.description.to_lowercase());
+            let hay = format!(
+                "{} {} {}",
+                e.name.to_lowercase(),
+                e.description.to_lowercase(),
+                e.category.to_lowercase()
+            );
             hay.contains(&q) || terms.iter().all(|t| hay.contains(t))
         })
         .collect()
@@ -577,6 +583,66 @@ mod tests {
             .any(|e| e.name == "Neon"));
         // Empty query returns the full set.
         assert_eq!(filter_catalog(curated(), "").len(), curated().len());
+    }
+
+    #[test]
+    fn filter_catalog_matches_category_headings() {
+        let c = curated();
+        let databases = filter_catalog(c.clone(), "databases");
+        for name in [
+            "Supabase",
+            "Neon",
+            "Elasticsearch",
+            "Qdrant",
+            "MongoDB",
+            "PostgreSQL",
+        ] {
+            assert!(
+                databases.iter().any(|e| e.name == name),
+                "searching 'databases' should include {name}"
+            );
+        }
+
+        let productivity = filter_catalog(c.clone(), "productivity");
+        assert!(
+            productivity.iter().any(|e| e.name == "Notion"),
+            "searching 'productivity' should include Apps & productivity members"
+        );
+        assert!(
+            productivity.iter().any(|e| e.name == "Linear"),
+            "searching 'productivity' should include Apps & productivity members"
+        );
+
+        let infrastructure = filter_catalog(c, "infrastructure");
+        assert!(
+            infrastructure.iter().any(|e| e.name == "GitHub"),
+            "searching 'infrastructure' should include Code & infrastructure members"
+        );
+        assert!(
+            infrastructure.iter().any(|e| e.name == "AWS"),
+            "searching 'infrastructure' should include Code & infrastructure members"
+        );
+    }
+
+    #[test]
+    fn filter_catalog_empty_category_does_not_match_everything() {
+        let entry = CatalogEntry {
+            name: "Registry Only".into(),
+            description: "A live registry result with no browse category.".into(),
+            transport: "http".into(),
+            command: None,
+            args: vec![],
+            url: Some("https://example.com/mcp".into()),
+            env_keys: vec![],
+            source: "registry".into(),
+            homepage: None,
+            publisher: None,
+            category: String::new(),
+            credentials_url: None,
+            setup_hint: None,
+            url_hint: None,
+        };
+        assert!(filter_catalog(vec![entry], "databases").is_empty());
     }
 
     #[test]
