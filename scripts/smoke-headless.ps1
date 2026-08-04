@@ -115,6 +115,9 @@ try {
     $codeNoAuth = Wait-HttpCode "http://127.0.0.1:${port}/" "401"
     if ($codeNoAuth -eq "401") { Pass "GET / without auth returns 401" } else { Fail "GET / without auth returned $codeNoAuth (expected 401)" }
 
+    $codeIncorrectAuth = curl.exe -s --connect-timeout 2 --max-time 5 -o NUL -w "%{http_code}" -H "Authorization: Bearer incorrect-smoke-token" "http://127.0.0.1:${port}/"
+    if ($codeIncorrectAuth -eq "401") { Pass "GET / with incorrect bearer returns 401" } else { Fail "GET / with incorrect bearer returned $codeIncorrectAuth (expected 401)" }
+
     $codeAuth = curl.exe -s --connect-timeout 2 --max-time 5 -o NUL -w "%{http_code}" -H "Authorization: Bearer $token" "http://127.0.0.1:${port}/"
     if ($codeAuth -eq "200") { Pass "GET / with bearer returns 200" } else { Fail "GET / with bearer returned $codeAuth (expected 200)" }
 

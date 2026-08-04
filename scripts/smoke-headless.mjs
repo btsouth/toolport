@@ -26,6 +26,7 @@ const children = new Set();
 let smokeDir;
 let failures = 0;
 let cleanupPromise;
+let shuttingDown = false;
 
 function pass(message) {
   console.log(`[PASS] ${message}`);
@@ -68,6 +69,7 @@ function smokeEnvironment({ host, authToken }) {
 }
 
 function startGateway({ port, host, authToken, insecureLoopback = false }) {
+  if (shuttingDown) throw new Error("cannot start gateway during shutdown");
   const args = ["--http", String(port)];
   if (insecureLoopback) args.push("--insecure-loopback");
   const child = spawn(gatewayBinary, args, {
@@ -107,6 +109,7 @@ async function stopGateway(child) {
 
 async function cleanup() {
   if (cleanupPromise) return cleanupPromise;
+  shuttingDown = true;
   cleanupPromise = (async () => {
     await Promise.all([...children].map(stopGateway));
     if (smokeDir) await rm(smokeDir, { recursive: true, force: true });
@@ -250,6 +253,21 @@ async function testAuthenticatedGateway() {
     if (unauthenticated.response) pass("GET / without auth returns 401");
     else
       fail(`GET / without auth did not return 401: ${unauthenticated.last}; ${stderr()}`);
+
+    let incorrectToken;
+    try {
+      incorrectToken = await request({
+        port,
+        headers: { Authorization: "Bearer incorrect-smoke-token" },
+      });
+    } catch (error) {
+      fail(`GET / with incorrect bearer failed: ${error.message}`);
+    }
+    if (incorrectToken?.status === 401) {
+      pass("GET / with incorrect bearer returns 401");
+    } else if (incorrectToken) {
+      fail(`GET / with incorrect bearer returned ${incorrectToken.status}`);
+    }
 
     let authenticated;
     try {
