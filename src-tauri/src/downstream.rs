@@ -78,7 +78,9 @@ fn is_http_token(value: &str) -> bool {
         })
 }
 
-fn encode_mcp_header_text(value: &str) -> String {
+/// Encode a modern MCP routing/header value using the SEP-2243 sentinel form.
+#[doc(hidden)]
+pub fn encode_mcp_header_text(value: &str) -> String {
     let safe_ascii = value
         .bytes()
         .all(|byte| matches!(byte, 0x20..=0x7e))
@@ -111,9 +113,22 @@ fn modern_standard_headers(body: &Value) -> Result<Vec<(String, String)>, Transp
             .get("params")
             .and_then(|params| params.get("uri"))
             .and_then(Value::as_str),
+        "tasks/get" | "tasks/update" | "tasks/cancel" => body
+            .get("params")
+            .and_then(|params| params.get("taskId"))
+            .and_then(Value::as_str),
         _ => None,
     };
-    if matches!(method, "tools/call" | "prompts/get" | "resources/read") && name.is_none() {
+    if matches!(
+        method,
+        "tools/call"
+            | "prompts/get"
+            | "resources/read"
+            | "tasks/get"
+            | "tasks/update"
+            | "tasks/cancel"
+    ) && name.is_none()
+    {
         return Err(TransportError::Fatal(format!(
             "modern HTTP request '{method}' is missing its routing name"
         )));
@@ -318,6 +333,98 @@ fn choose_protocol_version(discovered: &Value) -> Option<String> {
 /// and opens with `initialize`. Toolport is dual-era, so it must drive both.
 pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 
+/// Conservative cache policy for one cacheable MCP result (SOU-454).
+///
+/// `expires_at` is absolute rather than a stored TTL so Toolport never resets a
+/// downstream server's freshness clock each time an upstream client asks for the
+/// aggregated result. `refresh_after` normally matches it; after a failed refresh
+/// it moves forward briefly to avoid retrying on every one-second watcher tick
+/// while the advertised remaining TTL correctly stays at zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheHint {
+    expires_at: Option<Instant>,
+    refresh_after: Option<Instant>,
+    public: bool,
+}
+
+impl Default for CacheHint {
+    fn default() -> Self {
+        Self {
+            expires_at: None,
+            refresh_after: None,
+            public: false,
+        }
+    }
+}
+
+impl CacheHint {
+    pub fn from_result(result: &Value) -> Self {
+        let ttl_ms = result.get("ttlMs").and_then(Value::as_u64).unwrap_or(0);
+        let now = Instant::now();
+        let expires_at = (ttl_ms > 0)
+            .then(|| Duration::from_millis(ttl_ms))
+            .and_then(|ttl| now.checked_add(ttl));
+        Self {
+            expires_at,
+            refresh_after: expires_at,
+            // Unknown, missing, or malformed values fail closed to private.
+            public: result.get("cacheScope").and_then(Value::as_str) == Some("public"),
+        }
+    }
+
+    pub fn local(ttl_ms: u64) -> Self {
+        let now = Instant::now();
+        let expires_at = (ttl_ms > 0)
+            .then(|| Duration::from_millis(ttl_ms))
+            .and_then(|ttl| now.checked_add(ttl));
+        Self {
+            expires_at,
+            refresh_after: expires_at,
+            public: true,
+        }
+    }
+
+    /// Most-conservative combination for an aggregated or paginated result.
+    pub fn merge(self, other: Self) -> Self {
+        let expires_at = match (self.expires_at, other.expires_at) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            _ => None,
+        };
+        let refresh_after = match (self.refresh_after, other.refresh_after) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            _ => None,
+        };
+        Self {
+            expires_at,
+            refresh_after,
+            public: self.public && other.public,
+        }
+    }
+
+    pub fn remaining_ttl_ms(&self) -> u64 {
+        self.expires_at
+            .and_then(|expires| expires.checked_duration_since(Instant::now()))
+            .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0)
+    }
+
+    pub fn is_public(&self) -> bool {
+        self.public
+    }
+
+    /// Only positive TTLs schedule polling. A zero/missing TTL means immediately
+    /// stale, but the protocol does not require clients to hammer the server; the
+    /// existing list-changed notification path remains the invalidation mechanism.
+    pub fn needs_refresh(&self) -> bool {
+        self.refresh_after.is_some_and(|at| Instant::now() >= at)
+    }
+
+    fn mark_stale_and_defer(&mut self) {
+        self.expires_at = None;
+        self.refresh_after = Some(Instant::now() + Duration::from_secs(30));
+    }
+}
+
 /// Error codes the 2026-07-28 allocation policy reserves for the specification
 /// (`-32020`..`-32099`). Their presence in a response is what identifies a modern
 /// server during the backward-compatibility probe.
@@ -402,6 +509,38 @@ fn with_meta(mut params: Value, meta: Option<&Value>) -> Value {
     params
 }
 
+/// Copy only extension declarations from the upstream client's per-request
+/// capabilities onto a modern downstream hop.
+///
+/// Core client capabilities remain per-hop: Toolport may only advertise roots,
+/// sampling, or elicitation when it can service those callbacks itself. Unknown
+/// extension declarations are different. Their negotiation and payloads are
+/// intentionally opaque to a transparent gateway, so preserving the settings
+/// object is the only future-compatible behavior (SOU-453).
+fn attach_client_extensions(params: &mut Value, meta: Option<&Value>) {
+    let Some(extensions) = meta
+        .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"))
+        .and_then(|capabilities| capabilities.get("extensions"))
+        .and_then(Value::as_object)
+        .filter(|extensions| !extensions.is_empty())
+        .cloned()
+    else {
+        return;
+    };
+    let Some(params) = params.as_object_mut() else {
+        return;
+    };
+    let meta = params
+        .entry("_meta")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !meta.is_object() {
+        *meta = Value::Object(serde_json::Map::new());
+    }
+    meta["io.modelcontextprotocol/clientCapabilities"] = json!({
+        "extensions": Value::Object(extensions)
+    });
+}
+
 /// Wire-only fields used when a 2026-07-28 client retries an incomplete request.
 ///
 /// They are intentionally kept separate from tool arguments and `_meta`: all three
@@ -479,7 +618,23 @@ fn merge_protocol_meta(params: &mut Value, protocol: &Value) {
     }
     if let Some(meta) = slot.as_object_mut() {
         for (key, value) in protocol {
-            meta.insert(key.clone(), value.clone());
+            // `clientCapabilities` is still owned by this hop, but extension
+            // negotiation is the one intentionally transparent part. The
+            // request builder copied only the upstream extension map here; keep
+            // it while replacing every core capability with Toolport's own.
+            let mut value = value.clone();
+            if key == "io.modelcontextprotocol/clientCapabilities" {
+                if let Some(extensions) = meta
+                    .get(key)
+                    .and_then(|capabilities| capabilities.get("extensions"))
+                    .and_then(Value::as_object)
+                    .filter(|extensions| !extensions.is_empty())
+                    .cloned()
+                {
+                    value["extensions"] = Value::Object(extensions);
+                }
+            }
+            meta.insert(key.clone(), value);
         }
     }
 }
@@ -497,6 +652,37 @@ fn protocol_meta_for(version: &str) -> Value {
         // gateway service sampling/elicitation on a client's behalf.
         "io.modelcontextprotocol/clientCapabilities": {}
     })
+}
+
+const MCP_APPS_EXTENSION: &str = "io.modelcontextprotocol/ui";
+const MCP_APP_HTML_MIME: &str = "text/html;profile=mcp-app";
+
+/// Metadata used for Toolport's own modern catalog fetches.
+///
+/// MCP Apps servers may expose their UI linkage only after the client declares
+/// support. Toolport can faithfully relay that linkage and the reserved HTML
+/// resource to a capable upstream host, so it truthfully declares the one MIME
+/// type it supports here. Other extensions stay request-driven: claiming them
+/// without an originating client could invite callbacks or semantics the
+/// gateway cannot service.
+fn protocol_meta_for_catalog(version: &str, server_capabilities: Option<&Value>) -> Value {
+    let mut meta = protocol_meta_for(version);
+    let supports_mcp_apps = server_capabilities
+        .and_then(|capabilities| capabilities.get("extensions"))
+        .and_then(|extensions| extensions.get(MCP_APPS_EXTENSION))
+        .and_then(|settings| settings.get("mimeTypes"))
+        .and_then(Value::as_array)
+        .is_some_and(|mime_types| mime_types.iter().any(|mime| mime == MCP_APP_HTML_MIME));
+    if supports_mcp_apps {
+        meta["io.modelcontextprotocol/clientCapabilities"] = json!({
+            "extensions": {
+                (MCP_APPS_EXTENSION): {
+                    "mimeTypes": [MCP_APP_HTML_MIME]
+                }
+            }
+        });
+    }
+    meta
 }
 
 /// Max time to wait for a single stdio response before giving up. Without this a
@@ -2731,6 +2917,48 @@ fn ids_match(got: Option<&Value>, wanted: Option<&Value>) -> bool {
 /// a forced error is surfaced as a per-server authentication failure.
 pub type RefreshFn = Box<dyn Fn(bool) -> Result<Option<String>, String> + Send + Sync>;
 
+/// Interactive OAuth step-up callback. Unlike a refresh-token exchange, this
+/// obtains user consent for the challenged scope and returns a new access token.
+pub type ScopeReauthorizeFn = Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+
+fn insufficient_scope_challenge(response: &ureq::Response) -> Option<crate::oauth::BearerChallenge> {
+    let values = response.all("www-authenticate");
+    let challenge = crate::oauth::bearer_challenge(values.iter().copied())?;
+    challenge
+        .error
+        .as_deref()
+        .is_some_and(|error| error.eq_ignore_ascii_case("insufficient_scope"))
+        .then_some(challenge)
+}
+
+fn authorization_operation(body: &Value) -> String {
+    let method = body
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("MCP request");
+    let discriminator = match method {
+        "tools/call" | "prompts/get" => body
+            .get("params")
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str),
+        "resources/read" => body
+            .get("params")
+            .and_then(|params| params.get("uri"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    discriminator
+        .map(|value| format!("{method}:{value}"))
+        .unwrap_or_else(|| method.to_string())
+}
+
+fn canonical_scope_set(scope: &str) -> String {
+    let mut scopes: Vec<&str> = scope.split_whitespace().collect();
+    scopes.sort_unstable();
+    scopes.dedup();
+    scopes.join(" ")
+}
+
 /// Screen resolved socket addresses against the SSRF policy, fail-closed: returns
 /// `Err` if ANY address is link-local / cloud-metadata, or - when `block_private` -
 /// private / loopback / CGNAT. Refusing the whole set (not just filtering the bad
@@ -2807,6 +3035,12 @@ pub struct HttpTransport {
     /// `None` or error keeps the current token; a forced refresh must return a new
     /// raw token or the authentication failure is surfaced.
     refresh: Option<Arc<Mutex<RefreshFn>>>,
+    /// Separate from token refresh: `insufficient_scope` requires interactive
+    /// consent and a new authorization, not another token from the old grant.
+    scope_reauthorize: Option<Arc<Mutex<ScopeReauthorizeFn>>>,
+    /// Bound repeated browser prompts and retries per operation+scope on this
+    /// connection, as required by the MCP step-up guidance.
+    scope_upgrade_attempts: Arc<Mutex<HashSet<(String, String)>>>,
     /// The token a forced refresh produced and that has not yet been accepted by
     /// the server, if any.
     ///
@@ -2892,6 +3126,8 @@ impl HttpTransport {
             next_id: 1,
             auth: Arc::new(Mutex::new(auth)),
             refresh: refresh.map(|refresh| Arc::new(Mutex::new(refresh))),
+            scope_reauthorize: None,
+            scope_upgrade_attempts: Arc::new(Mutex::new(HashSet::new())),
             forced_refresh_token: None,
             server_handler: None,
             pending_mrtr: None,
@@ -2902,6 +3138,10 @@ impl HttpTransport {
             listener_generation: Arc::new(AtomicU64::new(0)),
             subscription_listener_id: None,
         }
+    }
+
+    pub fn set_scope_reauthorize(&mut self, callback: Option<ScopeReauthorizeFn>) {
+        self.scope_reauthorize = callback.map(|callback| Arc::new(Mutex::new(callback)));
     }
 
     /// Wire the gateway sink for `notifications/resources/updated` seen on SSE
@@ -3056,6 +3296,56 @@ impl HttpTransport {
         }
     }
 
+    fn reauthorize_after_scope_challenge(
+        &mut self,
+        code: u16,
+        operation: &str,
+        challenge: crate::oauth::BearerChallenge,
+    ) -> Result<(), TransportError> {
+        let required_scope = challenge
+            .scope
+            .map(|scope| canonical_scope_set(&scope))
+            .filter(|scope| !scope.is_empty())
+            .ok_or_else(|| {
+                TransportError::Fatal(format!(
+                    "HTTP {code} (needs authentication): OAuth reported insufficient_scope without the required scope"
+                ))
+            })?;
+        let attempt_key = (operation.to_string(), required_scope.clone());
+        let first_attempt = self
+            .scope_upgrade_attempts
+            .lock()
+            .map_err(|_| TransportError::Fatal("OAuth scope-attempt lock poisoned".into()))?
+            .insert(attempt_key);
+        if !first_attempt {
+            return Err(TransportError::Fatal(format!(
+                "HTTP {code} (needs authentication): OAuth scope '{required_scope}' was already requested for {operation} and remains insufficient"
+            )));
+        }
+        let callback = self.scope_reauthorize.as_ref().ok_or_else(|| {
+            TransportError::Fatal(format!(
+                "HTTP {code} (needs authentication): OAuth scope '{required_scope}' requires interactive authorization"
+            ))
+        })?;
+        let token = callback
+            .lock()
+            .map_err(|_| TransportError::Fatal("OAuth scope callback lock poisoned".into()))?
+            (&required_scope)
+            .map_err(|e| {
+                TransportError::Fatal(format!(
+                    "HTTP {code} (needs authentication): OAuth scope authorization failed for '{required_scope}': {e}"
+                ))
+            })?;
+        *self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token.clone());
+        // Do not follow a freshly-authorized token's rejection with an automatic
+        // refresh-token exchange: it cannot add a scope the user did not grant.
+        self.forced_refresh_token = Some(token);
+        Ok(())
+    }
+
     /// POST JSON-RPC without waiting for a response body (inline replies mid-SSE).
     fn send_post_no_response(&mut self, body: &Value) -> Result<(), TransportError> {
         let payload = body.to_string();
@@ -3089,6 +3379,17 @@ impl HttpTransport {
             }
             match req.send_string(&payload) {
                 Ok(resp) => break resp,
+                Err(ureq::Error::Status(code, resp))
+                    if (code == 401 || code == 403)
+                        && insufficient_scope_challenge(&resp).is_some() =>
+                {
+                    let challenge = insufficient_scope_challenge(&resp)
+                        .expect("match guard established an insufficient-scope challenge");
+                    let _ = read_capped(resp, 8 * 1024);
+                    let operation = authorization_operation(body);
+                    self.reauthorize_after_scope_challenge(code, &operation, challenge)?;
+                    refreshed = true;
+                }
                 Err(ureq::Error::Status(code, resp))
                     if (code == 401 || code == 403)
                         && !refreshed
@@ -3278,6 +3579,18 @@ impl HttpTransport {
                         message: "HTTP 429: rate limited".to_string(),
                     });
                 }
+                Err(ureq::Error::Status(code, r))
+                    if (code == 401 || code == 403)
+                        && insufficient_scope_challenge(&r).is_some() =>
+                {
+                    let challenge = insufficient_scope_challenge(&r)
+                        .expect("match guard established an insufficient-scope challenge");
+                    let _ = read_capped(r, 8 * 1024);
+                    let operation = authorization_operation(body);
+                    self.reauthorize_after_scope_challenge(code, &operation, challenge)?;
+                    refreshed = true;
+                    continue;
+                }
                 // The access token likely expired: refresh it once and retry with
                 // the new token, so a long-running session self-heals instead of
                 // 401ing until the server is manually reconnected.
@@ -3420,6 +3733,8 @@ impl Transport for HttpTransport {
         let url = self.url.clone();
         let auth = Arc::clone(&self.auth);
         let refresh = self.refresh.clone();
+        let scope_reauthorize = self.scope_reauthorize.clone();
+        let scope_upgrade_attempts = Arc::clone(&self.scope_upgrade_attempts);
         let wire_version = self.wire_protocol_version();
         let dirty = self.change_dirty.clone();
         let resource_updated = self.resource_updated.clone();
@@ -3454,6 +3769,56 @@ impl Transport for HttpTransport {
                     }
                     match request.send_string(&payload) {
                         Ok(response) => break Some(response),
+                        Err(ureq::Error::Status(code, response))
+                            if (code == 401 || code == 403)
+                                && insufficient_scope_challenge(&response).is_some() =>
+                        {
+                            let challenge = insufficient_scope_challenge(&response)
+                                .expect("match guard established an insufficient-scope challenge");
+                            let _ = read_capped(response, 8 * 1024);
+                            let Some(scope) = challenge
+                                .scope
+                                .map(|scope| canonical_scope_set(&scope))
+                                .filter(|scope| !scope.is_empty())
+                            else {
+                                downstream_trace(
+                                    "subscriptions/listen insufficient_scope challenge omitted scope",
+                                );
+                                break None;
+                            };
+                            let attempt_key =
+                                ("subscriptions/listen".to_string(), scope.clone());
+                            let first_attempt = scope_upgrade_attempts
+                                .lock()
+                                .map(|mut attempts| attempts.insert(attempt_key))
+                                .unwrap_or(false);
+                            let upgraded = if first_attempt {
+                                scope_reauthorize.as_ref().and_then(|callback| {
+                                    callback
+                                        .lock()
+                                        .ok()
+                                        .and_then(|callback| callback(&scope).ok())
+                                })
+                            } else {
+                                None
+                            };
+                            match upgraded {
+                                Some(token) => {
+                                    *auth
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Some(token);
+                                    forced_refresh = true;
+                                    continue;
+                                }
+                                None => {
+                                    downstream_trace(&format!(
+                                        "subscriptions/listen needs interactive OAuth scope '{scope}'"
+                                    ));
+                                    break None;
+                                }
+                            }
+                        }
                         Err(ureq::Error::Status(code, response))
                             if (code == 401 || code == 403)
                                 && !forced_refresh
@@ -3601,12 +3966,20 @@ pub struct DownstreamServer {
     /// MCP defines no separate templates list-change notification.
     pub resource_templates: Vec<Value>,
     pub prompts: Vec<Value>,
+    tool_cache_hint: CacheHint,
+    resource_cache_hint: CacheHint,
+    resource_template_cache_hint: CacheHint,
+    prompt_cache_hint: CacheHint,
     /// Whether the server's `initialize` advertised resources / prompts. The
     /// actual lists are fetched lazily via `load_resources_prompts`.
     caps_resources: bool,
     caps_prompts: bool,
     /// Whether the server's `initialize` advertised the completions utility.
     caps_completions: bool,
+    /// Opaque extension settings advertised by a modern server. These are
+    /// aggregated verbatim for modern upstream discovery; legacy extension
+    /// negotiation is initialize-scoped and cannot safely be bridged here.
+    caps_extensions: serde_json::Map<String, Value>,
     /// The protocol era this connection settled on at handshake (SOU-445).
     era: Era,
     /// Modern Streamable HTTP can mirror schema-annotated tool arguments into
@@ -3752,16 +4125,31 @@ impl DownstreamServer {
                         discovered.get("supportedVersions")
                     )
                 })?;
+                let capabilities = discovered.get("capabilities").cloned();
                 // From here every request carries its own protocol metadata;
                 // there is no handshake and no `notifications/initialized`.
-                transport.set_protocol_meta(Some(protocol_meta_for(&version)));
-                (Era::Modern { version }, discovered.get("capabilities").cloned())
+                // Catalog fetches additionally declare the MCP Apps MIME when
+                // this server offers it, so a capability-aware server includes
+                // its UI tool metadata in tools/list.
+                transport.set_protocol_meta(Some(protocol_meta_for_catalog(
+                    &version,
+                    capabilities.as_ref(),
+                )));
+                (Era::Modern { version }, capabilities)
             }
         };
         let caps = caps.as_ref();
         let caps_resources = caps.and_then(|c| c.get("resources")).is_some();
         let caps_prompts = caps.and_then(|c| c.get("prompts")).is_some();
         let caps_completions = caps.and_then(|c| c.get("completions")).is_some();
+        let caps_extensions = if matches!(era, Era::Modern { .. }) {
+            caps.and_then(|c| c.get("extensions"))
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            serde_json::Map::new()
+        };
 
         // `initialize` answered, so any launcher download is done: the rest of the
         // handshake goes back to the tight budget - a server that comes up but then
@@ -3778,6 +4166,13 @@ impl DownstreamServer {
         } else {
             listed.items
         };
+
+        // MCP Apps is advertised only for capability-aware catalog fetches.
+        // Restore Toolport's ordinary per-request metadata before any live call
+        // so a non-Apps upstream client cannot inherit that capability.
+        if let Era::Modern { version } = &era {
+            transport.set_protocol_meta(Some(protocol_meta_for(version)));
+        }
 
         // Restore the longer timeout: actual tool calls can legitimately be slow.
         transport.set_read_timeout(STDIO_READ_TIMEOUT);
@@ -3802,9 +4197,14 @@ impl DownstreamServer {
             resources: Vec::new(),
             resource_templates: Vec::new(),
             prompts: Vec::new(),
+            tool_cache_hint: listed.cache_hint,
+            resource_cache_hint: CacheHint::default(),
+            resource_template_cache_hint: CacheHint::default(),
+            prompt_cache_hint: CacheHint::default(),
             caps_resources,
             caps_prompts,
             caps_completions,
+            caps_extensions,
             era,
             modern_http,
             modern_resource_subscriptions: std::collections::HashSet::new(),
@@ -3926,9 +4326,13 @@ impl DownstreamServer {
         headers: &[(String, String)],
     ) -> Result<Value, TransportError> {
         let modern_upstream = upstream_is_modern(meta);
+        let modern_downstream = matches!(self.era, Era::Modern { .. });
         let mut retry = mrtr.cloned().unwrap_or_default();
         for round in 0..=MRTR_LEGACY_MAX_ROUNDS {
-            let params = with_meta_and_mrtr(params.clone(), meta, Some(&retry));
+            let mut params = with_meta_and_mrtr(params.clone(), meta, Some(&retry));
+            if modern_downstream {
+                attach_client_extensions(&mut params, meta);
+            }
             let result = self.transport.request_with_cancel_and_headers(
                 method,
                 params,
@@ -3954,24 +4358,60 @@ impl DownstreamServer {
     /// announced a `tools/list_changed`. Bounds the wait like the handshake so a
     /// hung server can't stall the refresh; on error the previous list is kept.
     pub fn refresh_tools(&mut self) {
+        self.refresh_tools_inner();
+    }
+
+    /// Refresh a positive-TTL catalog only once its downstream freshness window
+    /// expires. Notifications keep calling `refresh_tools` and therefore bypass
+    /// this check: they invalidate a still-fresh result immediately.
+    pub fn refresh_tools_if_stale(&mut self) {
+        if self.tool_cache_hint.needs_refresh() {
+            self.refresh_tools_inner();
+        }
+    }
+
+    fn refresh_tools_inner(&mut self) {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        match fetch_paginated_list(&mut *self.transport, "tools/list", "tools") {
+        let modern_version = match &self.era {
+            Era::Modern { version } => Some(version.clone()),
+            Era::Legacy { .. } => None,
+        };
+        if let Some(version) = modern_version.as_deref() {
+            let capabilities = json!({ "extensions": self.caps_extensions.clone() });
+            self.transport.set_protocol_meta(Some(protocol_meta_for_catalog(
+                version,
+                Some(&capabilities),
+            )));
+        }
+        let listed = fetch_paginated_list(&mut *self.transport, "tools/list", "tools");
+        if let Some(version) = modern_version.as_deref() {
+            self.transport
+                .set_protocol_meta(Some(protocol_meta_for(version)));
+        }
+        match listed {
             Ok(listed) if listed.warning.is_none() => {
+                self.tool_cache_hint = listed.cache_hint;
                 self.tools = if self.modern_http {
                     filter_modern_http_tools(&self.id, listed.items)
                 } else {
                     listed.items
                 };
             }
-            Ok(listed) => eprintln!(
-                "toolport: keeping server '{}' previous tool catalog after an incomplete refresh: {}",
-                self.id,
-                listed.warning.unwrap_or_default()
-            ),
-            Err(error) => eprintln!(
-                "toolport: keeping server '{}' previous tool catalog after refresh failed: {error}",
-                self.id
-            ),
+            Ok(listed) => {
+                self.tool_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous tool catalog after an incomplete refresh: {}",
+                    self.id,
+                    listed.warning.unwrap_or_default()
+                );
+            }
+            Err(error) => {
+                self.tool_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous tool catalog after refresh failed: {error}",
+                    self.id
+                );
+            }
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
@@ -3985,21 +4425,42 @@ impl DownstreamServer {
     /// separate `resources/templates/list_changed`; template catalogs change
     /// under the resources capability, so this is the protocol-aligned trigger.
     pub fn refresh_resources(&mut self) {
+        self.refresh_resources_inner();
+    }
+
+    pub fn refresh_resources_if_stale(&mut self) {
+        if self.resource_cache_hint.needs_refresh()
+            || self.resource_template_cache_hint.needs_refresh()
+        {
+            self.refresh_resources_inner();
+        }
+    }
+
+    fn refresh_resources_inner(&mut self) {
         if !self.caps_resources {
             return;
         }
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         match fetch_paginated_list(&mut *self.transport, "resources/list", "resources") {
-            Ok(listed) if listed.warning.is_none() => self.resources = listed.items,
-            Ok(listed) => eprintln!(
-                "toolport: keeping server '{}' previous resource catalog after an incomplete refresh: {}",
-                self.id,
-                listed.warning.unwrap_or_default()
-            ),
-            Err(error) => eprintln!(
-                "toolport: keeping server '{}' previous resource catalog after refresh failed: {error}",
-                self.id
-            ),
+            Ok(listed) if listed.warning.is_none() => {
+                self.resource_cache_hint = listed.cache_hint;
+                self.resources = listed.items;
+            }
+            Ok(listed) => {
+                self.resource_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous resource catalog after an incomplete refresh: {}",
+                    self.id,
+                    listed.warning.unwrap_or_default()
+                );
+            }
+            Err(error) => {
+                self.resource_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous resource catalog after refresh failed: {error}",
+                    self.id
+                );
+            }
         }
         // Templates share the resources capability and list-change signal.
         // Incomplete/failed traversal keeps the previous complete snapshot.
@@ -4008,16 +4469,25 @@ impl DownstreamServer {
             "resources/templates/list",
             "resourceTemplates",
         ) {
-            Ok(listed) if listed.warning.is_none() => self.resource_templates = listed.items,
-            Ok(listed) => eprintln!(
-                "toolport: keeping server '{}' previous resource-template catalog after an incomplete refresh: {}",
-                self.id,
-                listed.warning.unwrap_or_default()
-            ),
-            Err(error) => eprintln!(
-                "toolport: keeping server '{}' previous resource-template catalog after refresh failed: {error}",
-                self.id
-            ),
+            Ok(listed) if listed.warning.is_none() => {
+                self.resource_template_cache_hint = listed.cache_hint;
+                self.resource_templates = listed.items;
+            }
+            Ok(listed) => {
+                self.resource_template_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous resource-template catalog after an incomplete refresh: {}",
+                    self.id,
+                    listed.warning.unwrap_or_default()
+                );
+            }
+            Err(error) => {
+                self.resource_template_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous resource-template catalog after refresh failed: {error}",
+                    self.id
+                );
+            }
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
@@ -4026,21 +4496,40 @@ impl DownstreamServer {
     /// announced a `prompts/list_changed`. Mirrors [`refresh_tools`]; best-effort,
     /// and a no-op if the server never advertised prompts.
     pub fn refresh_prompts(&mut self) {
+        self.refresh_prompts_inner();
+    }
+
+    pub fn refresh_prompts_if_stale(&mut self) {
+        if self.prompt_cache_hint.needs_refresh() {
+            self.refresh_prompts_inner();
+        }
+    }
+
+    fn refresh_prompts_inner(&mut self) {
         if !self.caps_prompts {
             return;
         }
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         match fetch_paginated_list(&mut *self.transport, "prompts/list", "prompts") {
-            Ok(listed) if listed.warning.is_none() => self.prompts = listed.items,
-            Ok(listed) => eprintln!(
-                "toolport: keeping server '{}' previous prompt catalog after an incomplete refresh: {}",
-                self.id,
-                listed.warning.unwrap_or_default()
-            ),
-            Err(error) => eprintln!(
-                "toolport: keeping server '{}' previous prompt catalog after refresh failed: {error}",
-                self.id
-            ),
+            Ok(listed) if listed.warning.is_none() => {
+                self.prompt_cache_hint = listed.cache_hint;
+                self.prompts = listed.items;
+            }
+            Ok(listed) => {
+                self.prompt_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous prompt catalog after an incomplete refresh: {}",
+                    self.id,
+                    listed.warning.unwrap_or_default()
+                );
+            }
+            Err(error) => {
+                self.prompt_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous prompt catalog after refresh failed: {error}",
+                    self.id
+                );
+            }
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
@@ -4062,6 +4551,7 @@ impl DownstreamServer {
                         self.id
                     );
                 }
+                self.resource_cache_hint = listed.cache_hint;
                 self.resources = listed.items;
             }
             if let Ok(listed) = fetch_paginated_list(
@@ -4075,6 +4565,7 @@ impl DownstreamServer {
                         self.id
                     );
                 }
+                self.resource_template_cache_hint = listed.cache_hint;
                 self.resource_templates = listed.items;
             }
         }
@@ -4088,6 +4579,7 @@ impl DownstreamServer {
                         self.id
                     );
                 }
+                self.prompt_cache_hint = listed.cache_hint;
                 self.prompts = listed.items;
             }
         }
@@ -4249,6 +4741,47 @@ impl DownstreamServer {
         self.caps_completions
     }
 
+    pub fn tool_cache_hint(&self) -> CacheHint {
+        self.tool_cache_hint
+    }
+
+    pub fn resource_cache_hint(&self) -> Option<CacheHint> {
+        self.caps_resources.then_some(self.resource_cache_hint)
+    }
+
+    pub fn resource_template_cache_hint(&self) -> Option<CacheHint> {
+        self.caps_resources
+            .then_some(self.resource_template_cache_hint)
+    }
+
+    pub fn prompt_cache_hint(&self) -> Option<CacheHint> {
+        self.caps_prompts.then_some(self.prompt_cache_hint)
+    }
+
+    /// Extension capability settings from a modern `server/discover` response.
+    pub fn extensions(&self) -> &serde_json::Map<String, Value> {
+        &self.caps_extensions
+    }
+
+    /// Forward a Tasks extension request on the same modern hop as the call
+    /// that created it. The router has already translated the client-facing
+    /// task id back to the server's native id.
+    pub fn task_request(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+    ) -> Result<Value, TransportError> {
+        if !self.caps_extensions.contains_key("io.modelcontextprotocol/tasks") {
+            return Err(TransportError::Fatal(format!(
+                "server '{}' did not advertise io.modelcontextprotocol/tasks",
+                self.id
+            )));
+        }
+        self.request_with_mrtr(method, params, cancel, meta, None, &[])
+    }
+
     /// The protocol era and version this connection negotiated (SOU-445).
     pub fn era(&self) -> &Era {
         &self.era
@@ -4262,9 +4795,14 @@ impl DownstreamServer {
 
     pub fn complete_with_cancel(
         &mut self,
-        params: Value,
+        mut params: Value,
         cancel: Option<CancelContext>,
     ) -> Result<Value, TransportError> {
+        let original_meta = params.get("_meta").cloned();
+        sanitize_forwarded_meta(&mut params);
+        if matches!(self.era, Era::Modern { .. }) {
+            attach_client_extensions(&mut params, original_meta.as_ref());
+        }
         self.transport
             .request_with_cancel("completion/complete", params, cancel)
     }
@@ -4286,6 +4824,9 @@ fn extract_array(result: &Value, key: &str) -> Vec<Value> {
 
 struct PaginatedList {
     items: Vec<Value>,
+    /// Minimum remaining TTL and most-private scope across every page. A partial
+    /// traversal is always reset to the conservative zero/private policy.
+    cache_hint: CacheHint,
     /// Present when at least one page succeeded but traversal could not finish.
     /// Initial discovery may expose that useful prefix; refreshes keep the prior
     /// complete snapshot instead of replacing it with a partial catalog.
@@ -4305,11 +4846,13 @@ fn fetch_paginated_list(
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
     let started = Instant::now();
+    let mut cache_hint: Option<CacheHint> = None;
 
     for page_index in 0..MAX_LIST_PAGES {
         if page_index > 0 && started.elapsed() >= MAX_LIST_DURATION {
             return Ok(PaginatedList {
                 items,
+                cache_hint: CacheHint::default(),
                 warning: Some(format!(
                     "catalog traversal exceeded the {}-second safety cap",
                     MAX_LIST_DURATION.as_secs()
@@ -4324,11 +4867,18 @@ fn fetch_paginated_list(
             Err(error) if page_index > 0 => {
                 return Ok(PaginatedList {
                     items,
+                    cache_hint: CacheHint::default(),
                     warning: Some(format!("page {} failed: {error}", page_index + 1)),
                 });
             }
             Err(error) => return Err(error),
         };
+
+        let page_hint = CacheHint::from_result(&result);
+        cache_hint = Some(match cache_hint {
+            Some(current) => current.merge(page_hint),
+            None => page_hint,
+        });
 
         let page = extract_array(&result, key);
         let remaining = MAX_LIST_ITEMS.saturating_sub(items.len());
@@ -4336,6 +4886,7 @@ fn fetch_paginated_list(
             items.extend(page.into_iter().take(remaining));
             return Ok(PaginatedList {
                 items,
+                cache_hint: CacheHint::default(),
                 warning: Some(format!("catalog exceeded the {MAX_LIST_ITEMS}-item safety cap")),
             });
         }
@@ -4348,12 +4899,14 @@ fn fetch_paginated_list(
         else {
             return Ok(PaginatedList {
                 items,
+                cache_hint: cache_hint.unwrap_or_default(),
                 warning: None,
             });
         };
         if !seen_cursors.insert(next_cursor.clone()) {
             return Ok(PaginatedList {
                 items,
+                cache_hint: CacheHint::default(),
                 warning: Some("server repeated a pagination cursor".to_string()),
             });
         }
@@ -4362,6 +4915,7 @@ fn fetch_paginated_list(
 
     Ok(PaginatedList {
         items,
+        cache_hint: CacheHint::default(),
         warning: Some(format!("catalog exceeded the {MAX_LIST_PAGES}-page safety cap")),
     })
 }
@@ -4371,12 +4925,12 @@ mod tests {
     use super::{
         cwd_validation_error, empty_cwd_variables, expand_cwd, file_uri_to_path, resolve_command,
         resolve_root_token, screen_resolved_addrs, screen_spawn_command, screen_spawn_env,
-        validate_cwd, CancelRegistry, DownstreamServer, MrtrRequest, ServerRequestAction,
+        validate_cwd, CacheHint, CancelRegistry, DownstreamServer, MrtrRequest, ServerRequestAction,
         ServerRequestHandler, Transport, TransportError, MODERN_PROTOCOL_VERSION,
         fetch_paginated_list,
     };
     use serde_json::{json, Value};
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -4489,6 +5043,73 @@ mod tests {
     }
 
     #[test]
+    fn paginated_list_uses_the_shortest_ttl_and_most_private_scope() {
+        let mut transport = PaginationTransport::new(vec![
+            Ok(json!({
+                "tools": [{"name":"a"}],
+                "nextCursor": "two",
+                "ttlMs": 60_000,
+                "cacheScope": "public"
+            })),
+            Ok(json!({
+                "tools": [{"name":"b"}],
+                "ttlMs": 30_000,
+                "cacheScope": "private"
+            })),
+        ]);
+        let listed = fetch_paginated_list(&mut transport, "tools/list", "tools").unwrap();
+        assert_eq!(listed.items.len(), 2);
+        assert!(!listed.cache_hint.is_public());
+        let ttl = listed.cache_hint.remaining_ttl_ms();
+        assert!(ttl > 0 && ttl <= 30_000, "minimum page TTL should win: {ttl}");
+    }
+
+    #[test]
+    fn oversized_cache_ttl_is_handled_without_panicking() {
+        let downstream = CacheHint::from_result(&json!({
+            "ttlMs": u64::MAX,
+            "cacheScope": "public"
+        }));
+        let _ = downstream.remaining_ttl_ms();
+        let _ = CacheHint::local(u64::MAX).remaining_ttl_ms();
+    }
+
+    #[test]
+    fn positive_ttl_refreshes_once_stale_but_zero_ttl_does_not_poll() {
+        let expiring = PaginationTransport::new(vec![
+            Ok(json!({ "capabilities": {} })),
+            Ok(json!({
+                "tools": [{"name":"old"}],
+                "ttlMs": 5,
+                "cacheScope": "public"
+            })),
+            Ok(json!({
+                "tools": [{"name":"fresh"}],
+                "ttlMs": 60_000,
+                "cacheScope": "public"
+            })),
+        ]);
+        let mut server = DownstreamServer::connect("ttl".to_string(), Box::new(expiring)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        server.refresh_tools_if_stale();
+        assert_eq!(server.tools[0]["name"], "fresh");
+
+        // No third scripted response: this panics if zero/missing TTL turns the
+        // one-second watcher into an unbounded polling loop.
+        let zero = PaginationTransport::new(vec![
+            Ok(json!({ "capabilities": {} })),
+            Ok(json!({
+                "tools": [{"name":"stable"}],
+                "ttlMs": 0,
+                "cacheScope": "private"
+            })),
+        ]);
+        let mut server = DownstreamServer::connect("zero".to_string(), Box::new(zero)).unwrap();
+        server.refresh_tools_if_stale();
+        assert_eq!(server.tools[0]["name"], "stable");
+    }
+
+    #[test]
     fn paginated_list_stops_on_a_repeated_cursor() {
         let mut transport = PaginationTransport::new(vec![
             Ok(json!({"resources":[{"uri":"one:"}],"nextCursor":"same"})),
@@ -4545,9 +5166,14 @@ mod tests {
             resources: Vec::new(),
             resource_templates: Vec::new(),
             prompts: Vec::new(),
+            tool_cache_hint: CacheHint::default(),
+            resource_cache_hint: CacheHint::default(),
+            resource_template_cache_hint: CacheHint::default(),
+            prompt_cache_hint: CacheHint::default(),
             caps_resources: false,
             caps_prompts: false,
             caps_completions: false,
+            caps_extensions: serde_json::Map::new(),
             era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
             modern_http: false,
             modern_resource_subscriptions: std::collections::HashSet::new(),
@@ -4573,9 +5199,14 @@ mod tests {
             resources: vec![json!({"uri":"stable-r:"})],
             resource_templates: vec![json!({"uriTemplate":"stable://{id}"})],
             prompts: Vec::new(),
+            tool_cache_hint: CacheHint::default(),
+            resource_cache_hint: CacheHint::default(),
+            resource_template_cache_hint: CacheHint::default(),
+            prompt_cache_hint: CacheHint::default(),
             caps_resources: true,
             caps_prompts: false,
             caps_completions: false,
+            caps_extensions: serde_json::Map::new(),
             era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
             modern_http: false,
             modern_resource_subscriptions: std::collections::HashSet::new(),
@@ -6087,6 +6718,91 @@ mod tests {
     }
 
     #[test]
+    fn modern_http_listener_steps_up_scope_and_retries() {
+        use super::{
+            HttpTransport, ScopeReauthorizeFn, SubscriptionFilter, Transport,
+            MODERN_PROTOCOL_VERSION,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let seen_auth = Arc::new(Mutex::new(Vec::new()));
+        let captured_auth = Arc::clone(&seen_auth);
+        let handle = std::thread::spawn(move || {
+            for hit in 0..2 {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect("subscription listen request");
+                captured_auth.lock().unwrap().push(
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("Authorization"))
+                        .map(|header| header.value.as_str().to_string())
+                        .unwrap_or_default(),
+                );
+                let response = if hit == 0 {
+                    tiny_http::Response::from_string("more access required")
+                        .with_status_code(403)
+                        .with_header(
+                            tiny_http::Header::from_bytes(
+                                b"WWW-Authenticate",
+                                b"Bearer error=\"insufficient_scope\", scope=\" files:write files:read files:write \"",
+                            )
+                            .unwrap(),
+                        )
+                } else {
+                    tiny_http::Response::from_string(format!(
+                        "data: {}\n\n",
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/subscriptions/acknowledged",
+                            "params": {
+                                "_meta": { "io.modelcontextprotocol/subscriptionId": 1 }
+                            }
+                        })
+                    ))
+                    .with_header(
+                        tiny_http::Header::from_bytes(b"Content-Type", b"text/event-stream")
+                            .unwrap(),
+                    )
+                };
+                request.respond(response).unwrap();
+            }
+        });
+
+        let challenged_scope = Arc::new(Mutex::new(String::new()));
+        let captured_scope = Arc::clone(&challenged_scope);
+        let reauthorize: Option<ScopeReauthorizeFn> = Some(Box::new(move |scope| {
+            *captured_scope.lock().unwrap() = scope.to_string();
+            Ok("step-up-token".to_string())
+        }));
+        let mut transport = HttpTransport::with_auth_refresh(
+            &format!("http://127.0.0.1:{port}/"),
+            Some("old-token".to_string()),
+            None,
+        );
+        transport.set_protocol_meta(Some(super::protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+        transport.set_scope_reauthorize(reauthorize);
+        transport
+            .set_subscription_listener(SubscriptionFilter::default())
+            .unwrap();
+        handle.join().unwrap();
+        drop(transport);
+
+        assert_eq!(
+            seen_auth.lock().unwrap().as_slice(),
+            &["Bearer old-token".to_string(), "Bearer step-up-token".to_string()]
+        );
+        assert_eq!(
+            challenged_scope.lock().unwrap().as_str(),
+            "files:read files:write"
+        );
+    }
+
+    #[test]
     fn modern_resource_subscriptions_replace_the_listener_filter() {
         use super::{DownstreamServer, SubscriptionFilter, Transport, TransportError};
         use std::sync::{Arc, Mutex};
@@ -6161,15 +6877,107 @@ mod tests {
         const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 
         // A pre-existing `_meta` is merged into, not replaced.
-        let mut params = json!({ "_meta": { "traceparent": "keep" } });
+        let mut params = json!({
+            "_meta": {
+                "traceparent": "keep",
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "sampling": {},
+                    "extensions": { "com.example/opaque": { "mode": "strict" } }
+                }
+            }
+        });
         merge_protocol_meta(&mut params, &protocol_meta_for(MODERN_PROTOCOL_VERSION));
         assert_eq!(params["_meta"]["traceparent"], "keep", "client keys survive");
         assert_eq!(params["_meta"][VERSION_KEY], MODERN_PROTOCOL_VERSION);
+        assert_eq!(
+            params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                ["com.example/opaque"]["mode"],
+            "strict"
+        );
+        assert!(params["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+            .get("sampling")
+            .is_none());
 
         // A non-object `_meta` is rebuilt rather than panicking or being ignored.
         let mut params = json!({ "_meta": "nonsense" });
         merge_protocol_meta(&mut params, &protocol_meta_for(MODERN_PROTOCOL_VERSION));
         assert_eq!(params["_meta"][VERSION_KEY], MODERN_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn modern_requests_forward_only_client_extension_capabilities() {
+        use super::{DownstreamServer, Transport, TransportError, MODERN_PROTOCOL_VERSION};
+        use std::sync::{Arc, Mutex};
+
+        struct ExtensionProbe {
+            calls: Arc<Mutex<Vec<Value>>>,
+        }
+
+        impl Transport for ExtensionProbe {
+            fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
+                match method {
+                    "initialize" => Err(TransportError::Rpc(json!({
+                        "code": -32601,
+                        "message": "method not found"
+                    }))),
+                    "server/discover" => Ok(json!({
+                        "supportedVersions": [MODERN_PROTOCOL_VERSION],
+                        "capabilities": {
+                            "extensions": {
+                                "com.example/opaque": { "mode": "strict" }
+                            }
+                        }
+                    })),
+                    "tools/list" => Ok(json!({ "tools": [{ "name": "work" }] })),
+                    "tools/call" => {
+                        self.calls.lock().unwrap().push(params);
+                        Ok(json!({ "content": [], "isError": false }))
+                    }
+                    other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
+                }
+            }
+
+            fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut server = DownstreamServer::connect(
+            "modern".to_string(),
+            Box::new(ExtensionProbe { calls: Arc::clone(&calls) }),
+        )
+        .unwrap();
+        assert_eq!(server.extensions()["com.example/opaque"]["mode"], "strict");
+
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {
+                "sampling": {},
+                "extensions": {
+                    "com.example/opaque": { "mimeTypes": ["text/html"] },
+                    "io.modelcontextprotocol/tasks": {}
+                }
+            },
+            "com.example/request": { "keep": true }
+        });
+        server
+            .call_with_cancel("work", json!({}), None, Some(&meta))
+            .unwrap();
+
+        let calls = calls.lock().unwrap();
+        let params = &calls[0];
+        let capabilities = &params["_meta"]["io.modelcontextprotocol/clientCapabilities"];
+        assert_eq!(
+            capabilities["extensions"]["com.example/opaque"]["mimeTypes"][0],
+            "text/html"
+        );
+        assert!(capabilities.get("sampling").is_none());
+        assert_eq!(
+            capabilities["extensions"]["io.modelcontextprotocol/tasks"],
+            json!({})
+        );
+        assert_eq!(params["_meta"]["com.example/request"]["keep"], true);
     }
 
     #[test]
@@ -6234,6 +7042,26 @@ mod tests {
         assert_eq!(headers.get("mcp-param-region").map(String::as_str), Some("west"));
         assert!(!headers.contains_key("mcp-session-id"));
         assert!(transport.session_id.is_none(), "modern responses cannot restore a legacy session");
+    }
+
+    #[test]
+    fn modern_http_task_requests_route_by_native_task_id() {
+        for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
+            let headers = super::modern_standard_headers(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": { "taskId": "native-task-id" }
+            }))
+            .unwrap()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+            assert_eq!(headers.get("Mcp-Method").map(String::as_str), Some(method));
+            assert_eq!(
+                headers.get("Mcp-Name").map(String::as_str),
+                Some("native-task-id")
+            );
+        }
     }
 
     #[test]
@@ -6681,6 +7509,236 @@ mod tests {
             error.to_string(),
             "HTTP 401 (needs authentication): no refresh callback configured"
         );
+    }
+
+    #[test]
+    fn insufficient_scope_reauthorizes_and_retries_without_refreshing() {
+        use super::{HttpTransport, RefreshFn, ScopeReauthorizeFn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let seen_auth = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen_auth);
+        let handle = std::thread::spawn(move || {
+            for hit in 0..2 {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect("step-up request");
+                captured.lock().unwrap().push(
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("Authorization"))
+                        .map(|header| header.value.as_str().to_string())
+                        .unwrap_or_default(),
+                );
+                if hit == 0 {
+                    let challenge = tiny_http::Header::from_bytes(
+                        b"WWW-Authenticate",
+                        b"Bearer error=\"insufficient_scope\", scope=\"files:write\"",
+                    )
+                    .unwrap();
+                    request
+                        .respond(
+                            tiny_http::Response::from_string("more access required")
+                                .with_status_code(403)
+                                .with_header(challenge),
+                        )
+                        .unwrap();
+                } else {
+                    let content_type =
+                        tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                            .unwrap();
+                    request
+                        .respond(
+                            tiny_http::Response::from_string(
+                                r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#,
+                            )
+                            .with_header(content_type),
+                        )
+                        .unwrap();
+                }
+            }
+        });
+
+        let forced_refreshes = Arc::new(AtomicUsize::new(0));
+        let forced = Arc::clone(&forced_refreshes);
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+            if force {
+                forced.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(None)
+        }));
+        let challenged_scope = Arc::new(Mutex::new(String::new()));
+        let captured_scope = Arc::clone(&challenged_scope);
+        let reauthorize: Option<ScopeReauthorizeFn> = Some(Box::new(move |scope| {
+            *captured_scope.lock().unwrap() = scope.to_string();
+            Ok("step-up-token".to_string())
+        }));
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut transport =
+            HttpTransport::with_auth_refresh(&url, Some("old-token".to_string()), refresh);
+        transport.set_scope_reauthorize(reauthorize);
+
+        let result = transport
+            .post(
+                &serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "files_write", "arguments": {} }
+                }),
+                true,
+            )
+            .expect("step-up token should retry the original request");
+        handle.join().unwrap();
+
+        assert!(result.is_some());
+        assert_eq!(*challenged_scope.lock().unwrap(), "files:write");
+        assert_eq!(forced_refreshes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            seen_auth.lock().unwrap().as_slice(),
+            &["Bearer old-token".to_string(), "Bearer step-up-token".to_string()]
+        );
+    }
+
+    #[test]
+    fn scope_attempts_use_a_canonical_set_key() {
+        assert_eq!(
+            super::canonical_scope_set(" files:write files:read files:write "),
+            "files:read files:write"
+        );
+    }
+
+    #[test]
+    fn repeated_insufficient_scope_is_bounded_and_never_uses_refresh() {
+        use super::{HttpTransport, RefreshFn, ScopeReauthorizeFn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for hit in 0..2 {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect("step-up request");
+                let scope = if hit == 0 {
+                    "files:write files:read"
+                } else {
+                    "files:read files:write files:write"
+                };
+                let challenge = tiny_http::Header::from_bytes(
+                    b"WWW-Authenticate",
+                    format!("Bearer error=\"insufficient_scope\", scope=\"{scope}\"")
+                        .as_bytes(),
+                )
+                .unwrap();
+                request
+                    .respond(
+                        tiny_http::Response::from_string("still insufficient")
+                            .with_status_code(403)
+                            .with_header(challenge),
+                    )
+                    .unwrap();
+            }
+        });
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_count = Arc::clone(&refresh_calls);
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+            if force {
+                refresh_count.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(None)
+        }));
+        let reauth_calls = Arc::new(AtomicUsize::new(0));
+        let reauth_count = Arc::clone(&reauth_calls);
+        let reauthorize: Option<ScopeReauthorizeFn> = Some(Box::new(move |_| {
+            reauth_count.fetch_add(1, Ordering::SeqCst);
+            Ok("step-up-token".to_string())
+        }));
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut transport =
+            HttpTransport::with_auth_refresh(&url, Some("old-token".to_string()), refresh);
+        transport.set_scope_reauthorize(reauthorize);
+
+        let error = transport
+            .post(
+                &serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "files_write", "arguments": {} }
+                }),
+                true,
+            )
+            .expect_err("the same rejected scope must not loop");
+        handle.join().unwrap();
+
+        assert!(error.to_string().contains("already requested"));
+        assert_eq!(reauth_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn rejected_step_up_token_does_not_consume_a_refresh_exchange() {
+        use super::{HttpTransport, RefreshFn, ScopeReauthorizeFn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for hit in 0..2 {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect("step-up request");
+                let response = if hit == 0 {
+                    tiny_http::Response::from_string("more access required")
+                        .with_status_code(403)
+                        .with_header(
+                            tiny_http::Header::from_bytes(
+                                b"WWW-Authenticate",
+                                b"Bearer error=\"insufficient_scope\", scope=\"files:write\"",
+                            )
+                            .unwrap(),
+                        )
+                } else {
+                    tiny_http::Response::from_string("new token rejected").with_status_code(401)
+                };
+                request.respond(response).unwrap();
+            }
+        });
+
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_count = Arc::clone(&refresh_calls);
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+            if force {
+                refresh_count.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(Some("refreshed-token".to_string()))
+        }));
+        let reauthorize: Option<ScopeReauthorizeFn> =
+            Some(Box::new(move |_| Ok("step-up-token".to_string())));
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut transport =
+            HttpTransport::with_auth_refresh(&url, Some("old-token".to_string()), refresh);
+        transport.set_scope_reauthorize(reauthorize);
+
+        let error = transport
+            .post(
+                &serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "files_write", "arguments": {} }
+                }),
+                true,
+            )
+            .expect_err("a rejected step-up token must surface without refreshing");
+        handle.join().unwrap();
+
+        assert!(error.to_string().contains("HTTP 401"));
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

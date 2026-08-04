@@ -472,7 +472,9 @@ function ProfileToolScope({
         return (
           <div key={serverId} className="rounded border border-border/50 bg-muted/10">
             <button
+              type="button"
               onClick={() => expand(serverId)}
+              aria-expanded={open}
               className="flex w-full items-center gap-2 px-2 py-1.5 text-xs hover:bg-muted/30"
             >
               <ChevronRight

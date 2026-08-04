@@ -16,6 +16,7 @@ export function TransportPill({ transport }: { transport: Transport }) {
   const Icon = m.icon;
   return (
     <span
+      role="img"
       aria-label={`Transport: ${m.label}`}
       className="inline-flex items-center gap-1 font-mono text-2xs text-muted-foreground"
     >

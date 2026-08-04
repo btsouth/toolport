@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::downstream::{
     DownstreamServer, HttpTransport, ProgressSink, RefreshFn, ResourceUpdatedSink,
-    ServerRequestHandler, Transport,
+    ScopeReauthorizeFn, ServerRequestHandler, Transport,
 };
 use crate::registry::ServerEntry;
 use crate::{oauth, secrets};
@@ -28,6 +28,10 @@ const PROACTIVE_REFRESH_RETRY_SECS: u64 = 15;
 
 #[derive(Serialize, Deserialize)]
 struct OAuthState {
+    /// Validated authorization-server issuer that owns the client credentials.
+    /// Optional for states vaulted before Toolport recorded issuer binding.
+    #[serde(default)]
+    issuer: Option<String>,
     token_endpoint: String,
     client_id: String,
     refresh_token: Option<String>,
@@ -35,6 +39,10 @@ struct OAuthState {
     /// to. Optional for back-compat with states vaulted before this existed.
     #[serde(default)]
     resource: Option<String>,
+    /// Scope set requested for the current authorization. Optional for vaulted
+    /// states written before Toolport supported runtime scope step-up.
+    #[serde(default)]
+    scope: Option<String>,
     /// Unix timestamp when Toolport received the latest token response.
     /// Optional for states vaulted by older Toolport versions.
     #[serde(default)]
@@ -82,18 +90,22 @@ fn refresh_decision(state: &OAuthState, now: u64) -> RefreshDecision {
 /// Persist what's needed to refresh this server's token later.
 pub fn store_oauth_state(
     server_id: &str,
+    issuer: Option<String>,
     token_endpoint: &str,
     client_id: &str,
     refresh_token: Option<String>,
     resource: Option<String>,
+    scope: Option<String>,
     issued_at: u64,
     expires_at: Option<u64>,
 ) -> Result<(), String> {
     let state = OAuthState {
+        issuer,
         token_endpoint: token_endpoint.to_string(),
         client_id: client_id.to_string(),
         refresh_token,
         resource,
+        scope,
         issued_at: Some(issued_at),
         expires_at,
     };
@@ -104,6 +116,20 @@ pub fn store_oauth_state(
 fn load_state(server_id: &str) -> Option<OAuthState> {
     secrets::get_secret(server_id, STATE_KEY)
         .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn issuer_bound_token_endpoint<'a>(
+    expected_issuer: &str,
+    endpoints: &'a oauth::Endpoints,
+) -> Result<&'a str, String> {
+    if endpoints.issuer == expected_issuer {
+        Ok(&endpoints.token_endpoint)
+    } else {
+        Err(
+            "the server's OAuth issuer changed; needs authentication before credentials can be reused"
+                .to_string(),
+        )
+    }
 }
 
 /// Remove refresh metadata when the user clears OAuth or replaces it with a
@@ -121,15 +147,34 @@ fn refresh_token_with_expiry(server_id: &str) -> Result<RefreshedToken, String> 
         .refresh_token
         .as_deref()
         .ok_or("no refresh token available")?;
+    // Credentials minted under a known issuer may only be sent to endpoints from
+    // that issuer's current validated metadata. If the MCP resource changes its
+    // authorization server, fail closed so the UI asks the user to authenticate
+    // and register a fresh client instead of reusing the old credentials.
+    let refreshed_endpoints = match (state.issuer.as_deref(), state.resource.as_deref()) {
+        (Some(expected_issuer), Some(resource)) => {
+            let endpoints = oauth::discover(resource).map_err(|e| {
+                format!("could not verify the stored OAuth issuer; needs authentication: {e}")
+            })?;
+            issuer_bound_token_endpoint(expected_issuer, &endpoints)?;
+            Some(endpoints)
+        }
+        _ => None,
+    };
+    let token_endpoint = refreshed_endpoints
+        .as_ref()
+        .map(|e| e.token_endpoint.as_str())
+        .unwrap_or(&state.token_endpoint);
+
     // Block a rebind to the internal network unless the token endpoint is itself a
     // local/LAN host (a self-hosted auth server). Fail closed (block) if the stored
     // endpoint host can't be parsed OR can't be positively confirmed local, so an
     // unresolvable stored endpoint stays screened rather than opening the guard (#422).
-    let block_private = oauth::host_of_url(&state.token_endpoint)
+    let block_private = oauth::host_of_url(token_endpoint)
         .map(|h| !oauth::host_is_definitely_private(&h))
         .unwrap_or(true);
     let tokens = oauth::refresh(
-        &state.token_endpoint,
+        token_endpoint,
         &state.client_id,
         rt,
         state.resource.as_deref(),
@@ -140,10 +185,12 @@ fn refresh_token_with_expiry(server_id: &str) -> Result<RefreshedToken, String> 
     // the reverse order could strand a new access token with an invalidated old
     // refresh token after a second-write failure.
     let new_state = OAuthState {
-        token_endpoint: state.token_endpoint,
+        issuer: state.issuer,
+        token_endpoint: token_endpoint.to_string(),
         client_id: state.client_id,
         refresh_token: tokens.refresh_token.or(state.refresh_token),
         resource: state.resource,
+        scope: state.scope,
         issued_at: Some(tokens.issued_at),
         expires_at: tokens.expires_at,
     };
@@ -153,6 +200,38 @@ fn refresh_token_with_expiry(server_id: &str) -> Result<RefreshedToken, String> 
     Ok(RefreshedToken {
         access_token: tokens.access_token,
         expires_at: tokens.expires_at,
+    })
+}
+
+/// Complete an interactive step-up flow for a runtime `insufficient_scope`
+/// challenge. A fresh authorization (and client registration when needed) is
+/// intentional here: refresh-token grants cannot obtain user consent for new
+/// permissions. Persist the full new state before replacing the access token so
+/// a partial keychain write cannot strand rotated credentials.
+fn reauthorize_for_scope(
+    server_id: &str,
+    resource: &str,
+    required_scope: &str,
+) -> Result<RefreshedToken, String> {
+    let previous = load_state(server_id)
+        .ok_or("saved OAuth state is unavailable; authenticate again to grant additional scope")?;
+    let requested = oauth::scope_union(previous.scope.as_deref(), Some(required_scope));
+    let result = oauth::authenticate_with_scope(resource, requested.as_deref())?;
+    store_oauth_state(
+        server_id,
+        Some(result.issuer),
+        &result.token_endpoint,
+        &result.client_id,
+        result.refresh_token,
+        Some(resource.to_string()),
+        result.scope,
+        result.issued_at,
+        result.expires_at,
+    )?;
+    secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, &result.access_token)?;
+    Ok(RefreshedToken {
+        access_token: result.access_token,
+        expires_at: result.expires_at,
     })
 }
 
@@ -231,15 +310,26 @@ fn authed_transport(
     if token.is_some() {
         require_secure_for_auth(url)?;
     }
+    // Shared by ordinary refresh and scope step-up so a newly-authorized token's
+    // expiry replaces the previous token's proactive deadline immediately.
+    let refresh_at = load_state(server_id)
+        .and_then(|state| state.expires_at)
+        .map(|expires_at| expires_at.saturating_sub(PROACTIVE_REFRESH_SKEW_SECS));
+    let next_refresh_at = Arc::new(Mutex::new(refresh_at));
+    // The request path and the background subscription listener can refresh or
+    // step up concurrently. Serialize credential-changing flows so an older
+    // refresh result cannot overwrite a newer interactive authorization state.
+    let credential_update = Arc::new(Mutex::new(()));
     let refresh: Option<RefreshFn> = if token.is_some() {
         let sid = server_id.to_string();
         // Keep the proactive deadline in memory. This avoids a keychain read on
         // every tool call while still updating the deadline after each refresh.
-        let refresh_at = load_state(server_id)
-            .and_then(|state| state.expires_at)
-            .map(|expires_at| expires_at.saturating_sub(PROACTIVE_REFRESH_SKEW_SECS));
-        let next_refresh_at = Mutex::new(refresh_at);
+        let next_refresh_at = Arc::clone(&next_refresh_at);
+        let credential_update = Arc::clone(&credential_update);
         Some(Box::new(move |force| {
+            let _update = credential_update
+                .lock()
+                .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
             if !force {
                 let deadline = *next_refresh_at
                     .lock()
@@ -275,10 +365,33 @@ fn authed_transport(
     } else {
         None
     };
+    let scope_reauthorize: Option<ScopeReauthorizeFn> = if token.is_some() && load_state(server_id).is_some() {
+        let sid = server_id.to_string();
+        let resource = url.to_string();
+        let next_refresh_at = Arc::clone(&next_refresh_at);
+        let credential_update = Arc::clone(&credential_update);
+        Some(Box::new(move |scope| {
+            let _update = credential_update
+                .lock()
+                .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
+            let token = reauthorize_for_scope(&sid, &resource, scope)?;
+            let deadline = token
+                .expires_at
+                .map(|expires_at| expires_at.saturating_sub(PROACTIVE_REFRESH_SKEW_SECS));
+            *next_refresh_at
+                .lock()
+                .map_err(|_| "OAuth refresh deadline lock poisoned".to_string())? = deadline;
+            Ok(token.access_token)
+        }))
+    } else {
+        None
+    };
     // The resolver enforces the SSRF policy at connect time (DNS-rebind safe); it
     // mirrors `guard_connect_target`: link-local/metadata blocked for all, private
     // blocked only for untrusted-provenance servers.
-    Ok(HttpTransport::guarded(url, token, refresh, block_private))
+    let mut transport = HttpTransport::guarded(url, token, refresh, block_private);
+    transport.set_scope_reauthorize(scope_reauthorize);
+    Ok(transport)
 }
 
 /// Provenance Toolport doesn't trust to point at the user's private network. Shared
@@ -452,10 +565,12 @@ mod tests {
 
     fn oauth_state(expires_at: Option<u64>, refresh_token: Option<&str>) -> OAuthState {
         OAuthState {
+            issuer: Some("https://auth.example.com".into()),
             token_endpoint: "https://auth.example.com/token".into(),
             client_id: "client".into(),
             refresh_token: refresh_token.map(str::to_string),
             resource: Some("https://mcp.example.com".into()),
+            scope: Some("files:read".into()),
             issued_at: Some(1_000),
             expires_at,
         }
@@ -498,7 +613,31 @@ mod tests {
 
         assert_eq!(state.issued_at, None);
         assert_eq!(state.expires_at, None);
+        assert_eq!(state.issuer, None);
+        assert_eq!(state.scope, None);
         assert_eq!(refresh_decision(&state, 1_000), RefreshDecision::NotNeeded);
+    }
+
+    #[test]
+    fn refresh_credentials_stay_bound_to_their_issuer() {
+        let endpoints = |issuer: &str, token_endpoint: &str| oauth::Endpoints {
+            issuer: issuer.into(),
+            authorization_endpoint: "https://auth.example.com/authorize".into(),
+            token_endpoint: token_endpoint.into(),
+            registration_endpoint: None,
+            scope: None,
+            authorization_response_iss_parameter_supported: false,
+            client_id_metadata_document_supported: false,
+        };
+
+        let rotated = endpoints("https://auth.example.com", "https://auth.example.com/token-v2");
+        assert_eq!(
+            issuer_bound_token_endpoint("https://auth.example.com", &rotated).unwrap(),
+            "https://auth.example.com/token-v2"
+        );
+
+        let changed = endpoints("https://other.example.com", "https://other.example.com/token");
+        assert!(issuer_bound_token_endpoint("https://auth.example.com", &changed).is_err());
     }
 
     #[test]

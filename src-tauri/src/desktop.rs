@@ -2330,10 +2330,12 @@ async fn authenticate_oauth(
     secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &res.access_token)?;
     remote::store_oauth_state(
         &server_id,
+        Some(res.issuer),
         &res.token_endpoint,
         &res.client_id,
         res.refresh_token,
         Some(resource),
+        res.scope,
         res.issued_at,
         res.expires_at,
     )?;

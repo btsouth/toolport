@@ -515,6 +515,18 @@ fn gateway_connects_to_a_modern_server() {
 
     assert!(server.era().is_modern(), "era should be detected as modern");
     assert_eq!(server.era().version(), MODERN);
+    assert!(server.tool_cache_hint().is_public());
+    assert!(server.tool_cache_hint().remaining_ttl_ms() > 0);
+    server.load_resources_prompts();
+    for hint in [
+        server.resource_cache_hint(),
+        server.resource_template_cache_hint(),
+        server.prompt_cache_hint(),
+    ] {
+        let hint = hint.expect("fixture advertised the resources/prompts capability");
+        assert!(hint.is_public());
+        assert!(hint.remaining_ttl_ms() > 0);
+    }
 
     // The connection is not merely established: it is usable. The strict fixture
     // rejects any request lacking the protocol `_meta`, so a successful call

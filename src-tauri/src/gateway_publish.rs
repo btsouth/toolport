@@ -28,8 +28,7 @@ pub fn should_publish_client_gateway() -> bool {
             return !lower.contains("\\target\\");
         }
     }
-    #[cfg(not(windows))]
-    let _ = ();
+    
     false
 }
 

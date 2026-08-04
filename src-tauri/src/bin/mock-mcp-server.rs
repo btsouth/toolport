@@ -367,6 +367,7 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
         }),
         "tools/list" => tool_list(cfg, state.grown),
         "resources/list" => resource_list(state.grown),
+        "resources/templates/list" => json!({ "resourceTemplates": [] }),
         "prompts/list" => prompt_list(state.grown),
         "tools/call" => {
             let params = req.get("params");

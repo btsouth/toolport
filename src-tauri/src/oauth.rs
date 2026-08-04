@@ -1,7 +1,8 @@
 //! OAuth 2.1 for remote MCP servers: RFC 8414 metadata discovery, RFC 7591
-//! dynamic client registration, RFC 7636 PKCE, and an authorization-code flow
-//! with a loopback redirect. The result is a bearer access token that rides the
-//! same keychain injection path as a manually-pasted token.
+//! dynamic client registration, RFC 7636 PKCE, RFC 9207 issuer validation, and
+//! an authorization-code flow with a loopback redirect. The result is a bearer
+//! access token that rides the same keychain injection path as a manually-pasted
+//! token.
 //!
 //! The browser leg is interactive and can't be unit-tested; the deterministic
 //! pieces (PKCE, URL building, origin parsing) are.
@@ -13,6 +14,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+/// Stable HTTPS client identifier whose metadata is published by toolport.app.
+/// Authorization servers that advertise CIMD support fetch this document rather
+/// than accepting an unauthenticated dynamic-registration write.
+const CLIENT_ID_METADATA_URL: &str = "https://toolport.app/.well-known/oauth-client/toolport.json";
 
 pub struct Tokens {
     pub access_token: String,
@@ -33,14 +39,22 @@ pub struct AuthResult {
     pub expires_at: Option<u64>,
     pub token_endpoint: String,
     pub client_id: String,
+    /// Validated authorization-server issuer that minted the client credentials.
+    pub issuer: String,
+    /// Scope set requested for this authorization. Persisted so a later runtime
+    /// challenge can add to it without dropping previously granted access.
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Endpoints {
+    pub issuer: String,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub registration_endpoint: Option<String>,
     pub scope: Option<String>,
+    pub authorization_response_iss_parameter_supported: bool,
+    pub client_id_metadata_document_supported: bool,
 }
 
 fn base64url(data: &[u8]) -> String {
@@ -98,15 +112,159 @@ fn origin_of(url: &str) -> String {
 
 #[derive(Deserialize)]
 struct ProtectedResource {
+    resource: Option<String>,
     authorization_servers: Option<Vec<String>>,
+    scopes_supported: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BearerChallenge {
+    pub(crate) resource_metadata: Option<String>,
+    pub(crate) scope: Option<String>,
+    pub(crate) error: Option<String>,
+}
+
+/// Split an HTTP authentication header on commas that are outside quoted
+/// strings. Authentication parameters commonly contain URLs and descriptions,
+/// so a plain `split(',')` corrupts valid quoted values.
+fn auth_header_parts(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                parts.push(value[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(value[start..].trim());
+    parts
+}
+
+fn auth_param(value: &str) -> Option<(&str, String)> {
+    let (name, value) = value.split_once('=')?;
+    let name = name.trim();
+    let value = value.trim();
+    if name.is_empty() || value.is_empty() {
+        return None;
+    }
+    let decoded = if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+        let mut out = String::new();
+        let mut escaped = false;
+        for ch in value[1..value.len() - 1].chars() {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else {
+                out.push(ch);
+            }
+        }
+        if escaped {
+            return None;
+        }
+        out
+    } else {
+        value.to_string()
+    };
+    Some((name, decoded))
+}
+
+/// Select the first Bearer challenge from one or more `WWW-Authenticate`
+/// fields. A response may advertise another scheme first or place Bearer
+/// parameters in later comma-separated segments.
+pub(crate) fn bearer_challenge<'a>(
+    headers: impl IntoIterator<Item = &'a str>,
+) -> Option<BearerChallenge> {
+    for header in headers {
+        let mut bearer = false;
+        let mut challenge = BearerChallenge::default();
+        let mut found = false;
+        for part in auth_header_parts(header) {
+            let (candidate, param) = match part.split_once(char::is_whitespace) {
+                Some((scheme, rest))
+                    if !scheme.contains('=') && !rest.trim_start().starts_with('=') =>
+                {
+                    (Some(scheme), rest.trim())
+                }
+                None if !part.contains('=') => (Some(part), ""),
+                _ => (None, part),
+            };
+            if let Some(scheme) = candidate {
+                // Any new auth scheme starts a new challenge, including a
+                // second Bearer challenge. Do not merge its parameters into
+                // the first Bearer challenge selected above.
+                if found {
+                    break;
+                }
+                bearer = scheme.eq_ignore_ascii_case("bearer");
+                found = bearer;
+            }
+            if !bearer || param.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = auth_param(param) else {
+                continue;
+            };
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                continue;
+            }
+            if name.eq_ignore_ascii_case("resource_metadata") {
+                challenge.resource_metadata.get_or_insert(value);
+            } else if name.eq_ignore_ascii_case("scope") {
+                challenge.scope.get_or_insert(value);
+            } else if name.eq_ignore_ascii_case("error") {
+                challenge.error.get_or_insert(value);
+            }
+        }
+        if found {
+            return Some(challenge);
+        }
+    }
+    None
 }
 
 #[derive(Deserialize)]
 struct AsMeta {
+    issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
     registration_endpoint: Option<String>,
     scopes_supported: Option<Vec<String>>,
+    #[serde(default)]
+    authorization_response_iss_parameter_supported: bool,
+    #[serde(default)]
+    client_id_metadata_document_supported: bool,
+}
+
+enum ClientRegistration<'a> {
+    MetadataDocument,
+    Dynamic(&'a str),
+}
+
+fn select_client_registration(endpoints: &Endpoints) -> Result<ClientRegistration<'_>, String> {
+    if endpoints.client_id_metadata_document_supported {
+        Ok(ClientRegistration::MetadataDocument)
+    } else if let Some(endpoint) = endpoints.registration_endpoint.as_deref() {
+        Ok(ClientRegistration::Dynamic(endpoint))
+    } else {
+        Err(
+            "this server supports neither Client ID Metadata Documents nor dynamic registration; OAuth needs a pre-registered client"
+                .to_string(),
+        )
+    }
 }
 
 /// A ureq agent with a connect + read timeout for all OAuth HTTP. These endpoints
@@ -174,6 +332,17 @@ fn agent_no_redirect(block_private: bool) -> ureq::Agent {
         .build()
 }
 
+/// Short-lived, no-redirect agent for the optional Bearer challenge probe.
+/// Discovery must not inherit the 30-second credential-exchange timeout when
+/// an older or unhealthy MCP endpoint does not answer the preflight request.
+fn challenge_probe_agent(block_private: bool) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(5))
+        .redirects(0)
+        .resolver(move |netloc: &str| screened_resolve(netloc, block_private))
+        .build()
+}
+
 fn get_json<T: serde::de::DeserializeOwned>(url: &str, block_private: bool) -> Result<T, String> {
     agent(block_private)
         .get(url)
@@ -181,6 +350,24 @@ fn get_json<T: serde::de::DeserializeOwned>(url: &str, block_private: bool) -> R
         .map_err(|e| e.to_string())?
         .into_json::<T>()
         .map_err(|e| e.to_string())
+}
+
+/// Fetch optional discovery metadata while distinguishing an absent/unreachable
+/// endpoint from a reachable endpoint that returned malformed JSON. Older MCP
+/// servers may not implement the protected-resource well-known URI, but a 2xx
+/// response must not bypass validation merely by being unparseable.
+fn get_optional_discovery_json<T: serde::de::DeserializeOwned>(
+    url: &str,
+    block_private: bool,
+) -> Result<Option<T>, String> {
+    let response = match agent(block_private).get(url).call() {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
+    };
+    response
+        .into_json::<T>()
+        .map(Some)
+        .map_err(|e| format!("metadata response was not valid JSON: {e}"))
 }
 
 fn split_origin_path(url: &str) -> (String, String) {
@@ -212,9 +399,129 @@ fn metadata_candidates(issuer: &str) -> Vec<String> {
         vec![
             format!("{origin}/.well-known/oauth-authorization-server{path}"),
             format!("{origin}/.well-known/openid-configuration{path}"),
-            format!("{origin}{path}/.well-known/oauth-authorization-server"),
             format!("{origin}{path}/.well-known/openid-configuration"),
+            // Compatibility fallback used by some pre-spec servers. The three
+            // required MCP candidates above retain their normative priority.
+            format!("{origin}{path}/.well-known/oauth-authorization-server"),
         ]
+    }
+}
+
+/// RFC 9728 inserts the protected-resource well-known suffix between the origin
+/// and the resource path. MCP additionally requires clients to fall back to the
+/// origin-level document after trying the path-specific form.
+fn protected_resource_metadata_candidates(resource: &str) -> Vec<String> {
+    let Ok(parsed) = url::Url::parse(resource) else {
+        return vec![format!(
+            "{}/.well-known/oauth-protected-resource",
+            origin_of(resource).trim_end_matches('/')
+        )];
+    };
+    let mut origin_url = parsed.clone();
+    origin_url.set_path("");
+    origin_url.set_query(None);
+    origin_url.set_fragment(None);
+    let origin = origin_url.as_str().trim_end_matches('/');
+    let root = format!("{origin}/.well-known/oauth-protected-resource");
+    let path = parsed.path().trim_start_matches('/');
+    let mut specific = root.clone();
+    if !path.is_empty() {
+        specific.push('/');
+        specific.push_str(path);
+    }
+    if let Some(query) = parsed.query() {
+        specific.push('?');
+        specific.push_str(query);
+    }
+    if specific == root {
+        vec![root]
+    } else {
+        vec![specific, root]
+    }
+}
+
+fn validated_protected_resource(
+    expected_resource: &str,
+    metadata: ProtectedResource,
+) -> Result<(String, Option<String>), String> {
+    let resource = metadata.resource.ok_or_else(|| {
+        "protected-resource metadata has no resource identifier; refusing OAuth discovery"
+            .to_string()
+    })?;
+    if resource != expected_resource {
+        return Err(
+            "protected-resource metadata describes a different resource; refusing OAuth discovery"
+                .to_string(),
+        );
+    }
+    let issuer = metadata
+        .authorization_servers
+        .and_then(|servers| {
+            servers
+                .into_iter()
+                .map(|issuer| issuer.trim().to_string())
+                .find(|issuer| !issuer.is_empty())
+        })
+        .ok_or_else(|| {
+            "protected-resource metadata has no authorization server; refusing OAuth discovery"
+                .to_string()
+        })?;
+    let scope = metadata.scopes_supported.and_then(normalized_scope);
+    Ok((issuer, scope))
+}
+
+fn normalized_scope(scopes: Vec<String>) -> Option<String> {
+    let scope = scopes
+        .into_iter()
+        .map(|scope| scope.trim().to_string())
+        .filter(|scope| !scope.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!scope.is_empty()).then_some(scope)
+}
+
+fn initial_scope(
+    protected_resource_found: bool,
+    protected_resource_scope: Option<String>,
+    authorization_server_scopes: Option<Vec<String>>,
+) -> Option<String> {
+    if protected_resource_found {
+        // Absence is meaningful: current MCP says to omit `scope` when the
+        // resource did not advertise one, not to request every AS-wide scope.
+        protected_resource_scope
+    } else {
+        // Compatibility for older MCP servers that predate RFC 9728 metadata.
+        authorization_server_scopes.and_then(normalized_scope)
+    }
+}
+
+/// Preserve the order supplied by the authorization server while removing
+/// duplicates. In a step-up flow `existing` is the scope set Toolport requested
+/// previously and `additional` is the current operation's authoritative
+/// challenge, as required by the MCP scope-union rule.
+pub(crate) fn scope_union(existing: Option<&str>, additional: Option<&str>) -> Option<String> {
+    let mut scopes: Vec<&str> = Vec::new();
+    for scope in existing
+        .into_iter()
+        .chain(additional)
+        .flat_map(str::split_whitespace)
+    {
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+    (!scopes.is_empty()).then(|| scopes.join(" "))
+}
+
+/// RFC 8414 and OIDC Discovery bind a metadata document to the issuer used to
+/// locate it. Keep this as an exact string comparison: normalizing case, ports,
+/// slashes, or percent encoding would weaken the value later recorded for RFC
+/// 9207 authorization-response validation.
+fn validate_metadata_issuer(expected: &str, actual: &str) -> Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err("authorization-server metadata issuer mismatch; refusing OAuth discovery".to_string())
     }
 }
 
@@ -384,6 +691,68 @@ fn guard_endpoint(url: &str, server_local: bool, what: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// Ask the configured endpoint for its Bearer challenge before starting OAuth.
+/// Current MCP servers use this response to point clients at the exact RFC 9728
+/// metadata document and, when authorization is incremental, the scope needed
+/// for the attempted request. Failure to obtain a challenge is not fatal because
+/// pre-RFC 9728 servers still rely on well-known discovery.
+fn probe_bearer_challenge(mcp_url: &str, block_private: bool) -> Option<BearerChallenge> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "server/discover",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": crate::downstream::MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "toolport",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }
+    });
+    let response = challenge_probe_agent(block_private)
+        .post(mcp_url)
+        .set("Content-Type", "application/json")
+        .set("Accept", "application/json, text/event-stream")
+        .set(
+            "MCP-Protocol-Version",
+            crate::downstream::MODERN_PROTOCOL_VERSION,
+        )
+        .set("Mcp-Method", "server/discover")
+        .send_json(body);
+    match response {
+        Err(ureq::Error::Status(code, response)) if code == 401 || code == 403 => {
+            let values = response.all("www-authenticate");
+            let challenge = bearer_challenge(values.iter().copied());
+            drain_probe_response(response);
+            challenge
+        }
+        Ok(response) => {
+            drain_probe_response(response);
+            None
+        }
+        Err(ureq::Error::Status(code, response)) => {
+            drain_probe_response(response);
+            debug_log(&format!("OAuth challenge probe returned HTTP {code}"));
+            None
+        }
+        Err(error @ ureq::Error::Transport(_)) => {
+            debug_log(&format!("OAuth challenge probe failed: {error}"));
+            None
+        }
+    }
+}
+
+/// Drain a bounded amount from probe responses so ordinary error pages do not
+/// prevent connection reuse, without allowing a hostile body to consume
+/// unbounded memory or time.
+fn drain_probe_response(response: ureq::Response) {
+    let mut reader = response.into_reader().take(8 * 1024);
+    let _ = std::io::copy(&mut reader, &mut std::io::sink());
+}
+
 /// Discover the authorization + token endpoints for an MCP server URL.
 pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
     let origin = origin_of(mcp_url);
@@ -398,23 +767,83 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
         .map(|h| host_is_definitely_private(&h))
         .unwrap_or(false);
     let block_private = !server_local;
-    let issuer = match get_json::<ProtectedResource>(
-        &format!("{origin}/.well-known/oauth-protected-resource"),
-        block_private,
-    ) {
-        Ok(pr) => pr
-            .authorization_servers
-            .and_then(|v| v.into_iter().next())
-            .unwrap_or_else(|| origin.clone()),
-        Err(_) => origin.clone(),
-    };
+    let challenge = probe_bearer_challenge(mcp_url, block_private);
+    let challenge_scope = challenge
+        .as_ref()
+        .and_then(|challenge| challenge.scope.clone());
+    let mut protected_resource_found = false;
+    let mut resource_scope = None;
+    let mut discovered_issuer = None;
+    let challenge_metadata = challenge.and_then(|challenge| challenge.resource_metadata);
+    if let Some(url) = challenge_metadata.as_ref() {
+        require_https(url, "protected-resource metadata")?;
+        guard_endpoint(url, server_local, "protected-resource metadata")?;
+        match get_optional_discovery_json::<ProtectedResource>(url, block_private) {
+            Ok(Some(metadata)) => {
+                let (issuer, scope) =
+                    validated_protected_resource(mcp_url, metadata).map_err(|e| {
+                        format!("protected-resource metadata rejected at {url}: {e}")
+                    })?;
+                protected_resource_found = true;
+                discovered_issuer = Some(issuer);
+                resource_scope = scope;
+            }
+            Ok(None) => debug_log(&format!(
+                "protected-resource metadata advertised at {url} was unavailable; trying well-known discovery"
+            )),
+            Err(e) => {
+                return Err(format!(
+                    "protected-resource metadata rejected at {url}: {e}"
+                ))
+            }
+        }
+    }
+    if discovered_issuer.is_none() {
+        for url in protected_resource_metadata_candidates(mcp_url) {
+            match get_optional_discovery_json::<ProtectedResource>(&url, block_private) {
+                Ok(Some(metadata)) => match validated_protected_resource(mcp_url, metadata) {
+                    Ok((issuer, scope)) => {
+                        protected_resource_found = true;
+                        discovered_issuer = Some(issuer);
+                        resource_scope = scope;
+                        break;
+                    }
+                    // A document was found and parsed, so rejecting its security
+                    // binding must fail closed. Falling back to origin-level AS
+                    // discovery here would silently bypass RFC 9728 validation.
+                    Err(e) => {
+                        return Err(format!(
+                            "protected-resource metadata rejected at {url}: {e}"
+                        ))
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(format!(
+                        "protected-resource metadata rejected at {url}: {e}"
+                    ))
+                }
+            }
+        }
+    }
+    // Preserve compatibility with pre-RFC 9728 servers that publish only
+    // authorization-server metadata at the MCP origin. Current MCP servers are
+    // expected to take the validated protected-resource path above.
+    let issuer = discovered_issuer.unwrap_or_else(|| origin.clone());
 
     // The issuer can come from the protected-resource document, so guard the
-    // metadata fetch too, not just the final endpoints.
+    // metadata fetch too, not just the final endpoints. Requiring TLS here
+    // prevents an attacker from substituting the metadata before its endpoint
+    // URLs receive their own HTTPS and SSRF checks.
+    require_https(&issuer, "authorization server")?;
     guard_endpoint(&issuer, server_local, "authorization server")?;
 
     for url in metadata_candidates(&issuer) {
         if let Ok(meta) = get_json::<AsMeta>(&url, block_private) {
+            if let Err(e) = validate_metadata_issuer(&issuer, &meta.issuer) {
+                debug_log(&format!("metadata rejected at {url}: {e}"));
+                continue;
+            }
             // OAuth 2.1 requires TLS for these endpoints. Without this check a
             // hostile/MITM'd metadata document could point the token endpoint at
             // an attacker (or an internal address), and we'd POST the auth code +
@@ -431,10 +860,24 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
                 guard_endpoint(reg, server_local, "registration endpoint")?;
             }
             return Ok(Endpoints {
+                issuer: meta.issuer,
                 authorization_endpoint: meta.authorization_endpoint,
                 token_endpoint: meta.token_endpoint,
                 registration_endpoint: meta.registration_endpoint,
-                scope: meta.scopes_supported.map(|s| s.join(" ")),
+                // The protected resource defines the scopes needed to access it.
+                // Keep AS metadata as a compatibility fallback for older servers
+                // that did not publish RFC 9728 protected-resource metadata.
+                scope: challenge_scope.or_else(|| {
+                    initial_scope(
+                        protected_resource_found,
+                        resource_scope,
+                        meta.scopes_supported,
+                    )
+                }),
+                authorization_response_iss_parameter_supported: meta
+                    .authorization_response_iss_parameter_supported,
+                client_id_metadata_document_supported: meta
+                    .client_id_metadata_document_supported,
             });
         }
     }
@@ -455,13 +898,7 @@ fn register_client(
     redirect_uri: &str,
     block_private: bool,
 ) -> Result<String, String> {
-    let body = serde_json::json!({
-        "client_name": "Toolport",
-        "redirect_uris": [redirect_uri],
-        "grant_types": ["authorization_code", "refresh_token"],
-        "response_types": ["code"],
-        "token_endpoint_auth_method": "none"
-    });
+    let body = dcr_request_body(redirect_uri);
     let resp: DcrResponse = agent_no_redirect(block_private)
         .post(registration_endpoint)
         .send_json(body)
@@ -469,6 +906,19 @@ fn register_client(
         .into_json()
         .map_err(|e| e.to_string())?;
     Ok(resp.client_id)
+}
+
+fn dcr_request_body(redirect_uri: &str) -> serde_json::Value {
+    serde_json::json!({
+        "client_name": "Toolport",
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        // Toolport uses an RFC 8252 loopback redirect with an OS-assigned port,
+        // so it is a native public client rather than an OIDC web client.
+        "application_type": "native"
+    })
 }
 
 pub fn build_authorize_url(
@@ -613,7 +1063,31 @@ fn open_browser(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
-fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String, String> {
+fn validate_authorization_response_issuer(
+    response_issuer: Option<&str>,
+    expected_issuer: &str,
+    issuer_parameter_required: bool,
+) -> Result<(), String> {
+    match response_issuer {
+        Some(actual) if actual == expected_issuer => Ok(()),
+        Some(_) => Err(
+            "authorization response issuer mismatch (possible mix-up attack); try connecting again"
+                .to_string(),
+        ),
+        None if issuer_parameter_required => Err(
+            "authorization server omitted the issuer it advertised; try connecting again"
+                .to_string(),
+        ),
+        None => Ok(()),
+    }
+}
+
+fn wait_for_code(
+    listener: &TcpListener,
+    expected_state: &str,
+    expected_issuer: &str,
+    issuer_parameter_required: bool,
+) -> Result<String, String> {
     let deadline = Instant::now() + Duration::from_secs(180);
 
     loop {
@@ -643,11 +1117,12 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String,
                 let code = params.get("code");
                 let error = params.get("error");
                 debug_log(&format!(
-                    "callback request: {} bytes of query, has_code={} has_error={} has_state={}",
+                    "callback request: {} bytes of query, has_code={} has_error={} has_state={} has_iss={}",
                     query.len(),
                     code.is_some(),
                     error.is_some(),
-                    params.contains_key("state")
+                    params.contains_key("state"),
+                    params.contains_key("iss")
                 ));
 
                 // Ignore connections that carry neither an authorization result nor
@@ -660,6 +1135,22 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String,
                     continue;
                 }
 
+                // Validate state and issuer before accepting a code OR acting on an
+                // error. RFC 9207 explicitly forbids displaying attacker-supplied
+                // error details when the response issuer does not match.
+                if params.get("state").map(String::as_str) != Some(expected_state) {
+                    write_callback_page(&mut stream, "Authorization could not be verified. You can close this window.");
+                    return Err("state mismatch (possible CSRF); try connecting again".to_string());
+                }
+                if let Err(e) = validate_authorization_response_issuer(
+                    params.get("iss").map(String::as_str),
+                    expected_issuer,
+                    issuer_parameter_required,
+                ) {
+                    write_callback_page(&mut stream, "Authorization could not be verified. You can close this window.");
+                    return Err(e);
+                }
+
                 if let Some(error) = error {
                     let desc = params
                         .get("error_description")
@@ -669,13 +1160,15 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String,
                     return Err(format!("authorization server returned an error ({error}){desc}"));
                 }
 
-                // We have a code. Validate state before accepting it.
-                if params.get("state").map(String::as_str) != Some(expected_state) {
-                    write_callback_page(&mut stream, "Authorization could not be verified. You can close this window.");
-                    return Err("state mismatch (possible CSRF); try connecting again".to_string());
-                }
+                let Some(code) = code.filter(|code| !code.trim().is_empty()) else {
+                    write_callback_page(&mut stream, "Authorization failed. You can close this window and return to Toolport.");
+                    return Err(
+                        "authorization server returned an empty authorization code".to_string(),
+                    );
+                };
+
                 write_callback_page(&mut stream, "Authorization complete. You can close this window and return to Toolport.");
-                return Ok(code.cloned().unwrap_or_default());
+                return Ok(code.clone());
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(150));
@@ -740,6 +1233,16 @@ fn write_callback_page(stream: &mut std::net::TcpStream, message: &str) {
 
 /// Run the full interactive flow and return tokens plus what's needed to refresh.
 pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
+    authenticate_with_scope(mcp_url, None)
+}
+
+/// Run interactive authorization while retaining a previously requested scope
+/// set and adding a runtime challenge. Discovery's initial scope is included too,
+/// but never replaces either side of the step-up union.
+pub fn authenticate_with_scope(
+    mcp_url: &str,
+    requested_scope_set: Option<&str>,
+) -> Result<AuthResult, String> {
     debug_log(&format!("=== oauth start: {mcp_url} ==="));
     // Same provenance rule as discover(): a public configured server must not have
     // its DCR / token POST reach a private/loopback host, even via a DNS rebind. Use the
@@ -748,12 +1251,14 @@ pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
         .map(|h| host_is_definitely_private(&h))
         .unwrap_or(false);
     let endpoints = discover(mcp_url)?;
+    let scope = scope_union(requested_scope_set, endpoints.scope.as_deref());
     debug_log(&format!(
-        "endpoints: authz={} token={} reg={:?} scope={:?}",
+        "endpoints: authz={} token={} reg={:?} cimd={} scope={:?}",
         endpoints.authorization_endpoint,
         endpoints.token_endpoint,
         endpoints.registration_endpoint,
-        endpoints.scope
+        endpoints.client_id_metadata_document_supported,
+        scope
     ));
     // Bind the callback listener BEFORE registering/opening the browser, so a
     // fast redirect can't arrive before we're listening AND we know the real port.
@@ -769,13 +1274,10 @@ pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     debug_log(&format!("callback listening on {redirect_uri}"));
 
-    let client_id = match &endpoints.registration_endpoint {
-        Some(reg) => register_client(reg, &redirect_uri, block_private)?,
-        None => {
-            return Err(
-                "this server has no dynamic-registration endpoint; OAuth needs a pre-registered client"
-                    .to_string(),
-            )
+    let client_id = match select_client_registration(&endpoints)? {
+        ClientRegistration::MetadataDocument => CLIENT_ID_METADATA_URL.to_string(),
+        ClientRegistration::Dynamic(registration_endpoint) => {
+            register_client(registration_endpoint, &redirect_uri, block_private)?
         }
     };
     debug_log(&format!("client_id='{client_id}' (len {})", client_id.len()));
@@ -789,7 +1291,7 @@ pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
     // offline_access (the refresh-token scope) when the server supports it;
     // forcing offline_access otherwise gets the authorization rejected with
     // invalid_scope (e.g. Stripe).
-    let scope = requested_scope(endpoints.scope.clone());
+    let scope = requested_scope(scope);
     let auth_url = build_authorize_url(
         &endpoints.authorization_endpoint,
         &client_id,
@@ -804,7 +1306,12 @@ pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
         endpoints.authorization_endpoint
     ));
     open_browser(&auth_url);
-    let code = wait_for_code(&listener, &state)?;
+    let code = wait_for_code(
+        &listener,
+        &state,
+        &endpoints.issuer,
+        endpoints.authorization_response_iss_parameter_supported,
+    )?;
     debug_log(&format!("got code (len {})", code.len()));
     let tokens = match exchange_code(
         &endpoints.token_endpoint,
@@ -831,6 +1338,8 @@ pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
         expires_at: tokens.expires_at,
         token_endpoint: endpoints.token_endpoint,
         client_id,
+        issuer: endpoints.issuer,
+        scope,
     })
 }
 
@@ -1028,6 +1537,83 @@ mod tests {
     }
 
     #[test]
+    fn dcr_identifies_the_loopback_client_as_native() {
+        let body = dcr_request_body("http://127.0.0.1:41789/callback");
+        assert_eq!(body["application_type"], "native");
+        assert_eq!(body["token_endpoint_auth_method"], "none");
+        assert_eq!(
+            body["redirect_uris"],
+            serde_json::json!(["http://127.0.0.1:41789/callback"])
+        );
+    }
+
+    #[test]
+    fn authorization_response_issuer_follows_rfc9207_table() {
+        let expected = "https://auth.example.com";
+        assert!(validate_authorization_response_issuer(Some(expected), expected, true).is_ok());
+        assert!(validate_authorization_response_issuer(Some(expected), expected, false).is_ok());
+        assert!(validate_authorization_response_issuer(None, expected, false).is_ok());
+        assert!(validate_authorization_response_issuer(None, expected, true).is_err());
+        assert!(validate_authorization_response_issuer(
+            Some("https://evil.example.com"),
+            expected,
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn authorization_response_issuer_comparison_is_not_normalized() {
+        let expected = "https://auth.example.com";
+        for different in [
+            "https://AUTH.example.com",
+            "https://auth.example.com/",
+            "https://auth.example.com:443",
+        ] {
+            assert!(
+                validate_authorization_response_issuer(Some(different), expected, false).is_err(),
+                "must compare the issuer exactly: {different}"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_rejects_an_empty_authorization_code() {
+        use std::io::Write;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream
+                .write_all(
+                    b"GET /callback?code=&state=expected HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let error = wait_for_code(&listener, "expected", "https://auth.example.com", false)
+            .expect_err("an empty authorization code must not reach token exchange");
+        client.join().unwrap();
+        assert!(error.contains("empty authorization code"));
+    }
+
+    #[test]
+    fn metadata_issuer_must_match_the_selected_authorization_server() {
+        assert!(validate_metadata_issuer(
+            "https://auth.example.com",
+            "https://auth.example.com"
+        )
+        .is_ok());
+        assert!(validate_metadata_issuer(
+            "https://auth.example.com",
+            "https://other.example.com"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn requested_scope_never_forces_unsupported_offline_access() {
         // offline_access advertised -> kept (server supports refresh tokens).
         assert_eq!(
@@ -1082,5 +1668,560 @@ mod tests {
             c2[0],
             "https://as.example.com/.well-known/oauth-authorization-server"
         );
+        assert_eq!(
+            c[2],
+            "https://access.stripe.com/mcp/.well-known/openid-configuration"
+        );
+    }
+
+    #[test]
+    fn protected_resource_candidates_try_the_endpoint_path_then_origin() {
+        assert_eq!(
+            protected_resource_metadata_candidates("https://mcp.example.com/public/mcp"),
+            vec![
+                "https://mcp.example.com/.well-known/oauth-protected-resource/public/mcp",
+                "https://mcp.example.com/.well-known/oauth-protected-resource",
+            ]
+        );
+        assert_eq!(
+            protected_resource_metadata_candidates("https://mcp.example.com"),
+            vec!["https://mcp.example.com/.well-known/oauth-protected-resource"]
+        );
+        assert_eq!(
+            protected_resource_metadata_candidates("https://mcp.example.com/mcp?tenant=acme"),
+            vec![
+                "https://mcp.example.com/.well-known/oauth-protected-resource/mcp?tenant=acme",
+                "https://mcp.example.com/.well-known/oauth-protected-resource",
+            ]
+        );
+    }
+
+    #[test]
+    fn protected_resource_metadata_is_bound_and_supplies_scopes() {
+        let metadata = ProtectedResource {
+            resource: Some("https://mcp.example.com/mcp".into()),
+            authorization_servers: Some(vec!["https://auth.example.com".into()]),
+            scopes_supported: Some(vec!["files:read".into(), "files:write".into()]),
+        };
+        let (issuer, scope) =
+            validated_protected_resource("https://mcp.example.com/mcp", metadata).unwrap();
+        assert_eq!(issuer, "https://auth.example.com");
+        assert_eq!(scope.as_deref(), Some("files:read files:write"));
+    }
+
+    #[test]
+    fn protected_resource_metadata_normalizes_advertised_scopes() {
+        let metadata = ProtectedResource {
+            resource: Some("https://mcp.example.com/mcp".into()),
+            authorization_servers: Some(vec!["  https://auth.example.com  ".into()]),
+            scopes_supported: Some(vec![
+                " files:read ".into(),
+                "".into(),
+                "  ".into(),
+                "files:write".into(),
+            ]),
+        };
+        let (issuer, scope) =
+            validated_protected_resource("https://mcp.example.com/mcp", metadata).unwrap();
+        assert_eq!(issuer, "https://auth.example.com");
+        assert_eq!(scope.as_deref(), Some("files:read files:write"));
+    }
+
+    #[test]
+    fn protected_resource_scope_absence_does_not_expand_to_all_as_scopes() {
+        assert_eq!(
+            initial_scope(
+                true,
+                None,
+                Some(vec!["openid".into(), "admin".into()])
+            ),
+            None
+        );
+        assert_eq!(
+            initial_scope(
+                false,
+                None,
+                Some(vec![" ".into(), " legacy:mcp ".into(), "".into()])
+            ),
+            Some("legacy:mcp".into())
+        );
+    }
+
+    #[test]
+    fn protected_resource_metadata_rejects_impersonation_and_empty_issuers() {
+        let missing_resource = ProtectedResource {
+            resource: None,
+            authorization_servers: Some(vec!["https://auth.example.com".into()]),
+            scopes_supported: None,
+        };
+        let error = validated_protected_resource(
+            "https://mcp.example.com/mcp",
+            missing_resource,
+        )
+        .unwrap_err();
+        assert!(error.contains("no resource identifier"));
+
+        let wrong_resource = ProtectedResource {
+            resource: Some("https://other.example.com/mcp".into()),
+            authorization_servers: Some(vec!["https://auth.example.com".into()]),
+            scopes_supported: None,
+        };
+        assert!(validated_protected_resource(
+            "https://mcp.example.com/mcp",
+            wrong_resource
+        )
+        .is_err());
+
+        let no_issuer = ProtectedResource {
+            resource: Some("https://mcp.example.com/mcp".into()),
+            authorization_servers: Some(vec!["".into()]),
+            scopes_supported: None,
+        };
+        assert!(validated_protected_resource("https://mcp.example.com/mcp", no_issuer).is_err());
+    }
+
+    #[test]
+    fn bearer_challenge_extracts_resource_metadata_and_scope() {
+        let parsed = bearer_challenge([
+            "Basic realm=\"legacy\", Bearer resource_metadata=\"https://mcp.example.com/auth/meta?label=a,b\", scope=\"files:read files:write\", error=\"insufficient_scope\"",
+        ])
+        .expect("Bearer challenge should be selected after another scheme");
+        assert_eq!(
+            parsed.resource_metadata.as_deref(),
+            Some("https://mcp.example.com/auth/meta?label=a,b")
+        );
+        assert_eq!(parsed.scope.as_deref(), Some("files:read files:write"));
+        assert_eq!(parsed.error.as_deref(), Some("insufficient_scope"));
+    }
+
+    #[test]
+    fn bearer_challenge_supports_repeated_headers_and_quoted_escapes() {
+        let parsed = bearer_challenge([
+            "Basic realm=\"legacy\"",
+            "Bearer error=\"invalid_token\", resource_metadata=\"https://mcp.example.com/meta?note=a\\\"b\"",
+        ])
+        .expect("Bearer challenge should be found in a later field");
+        assert_eq!(
+            parsed.resource_metadata.as_deref(),
+            Some("https://mcp.example.com/meta?note=a\"b")
+        );
+        assert_eq!(parsed.scope, None);
+    }
+
+    #[test]
+    fn bearer_challenge_ignores_empty_scope_and_stops_at_the_next_scheme() {
+        let parsed = bearer_challenge([
+            "Bearer scope=\"\", Basic realm=\"other\", resource_metadata=\"https://wrong.example/meta\"",
+        ])
+        .expect("Bearer scheme should still be recognized");
+        assert_eq!(parsed, BearerChallenge::default());
+    }
+
+    #[test]
+    fn bearer_challenge_does_not_merge_multiple_bearer_challenges() {
+        let parsed = bearer_challenge([
+            "Bearer scope=\"files:read\", Bearer resource_metadata=\"https://wrong.example/meta\"",
+        ])
+        .expect("the first Bearer challenge should be selected");
+        assert_eq!(parsed.scope.as_deref(), Some("files:read"));
+        assert_eq!(parsed.resource_metadata, None);
+    }
+
+    #[test]
+    fn bearer_challenge_recognizes_a_bare_scheme() {
+        assert_eq!(
+            bearer_challenge(["Bearer, Basic realm=\"legacy\""]),
+            Some(BearerChallenge::default())
+        );
+    }
+
+    #[test]
+    fn bearer_challenge_accepts_whitespace_around_parameter_equals() {
+        let parsed = bearer_challenge([
+            "Bearer resource_metadata = \"https://mcp.example.com/meta\", scope = \"files:read\"",
+        ])
+        .expect("Bearer challenge with optional whitespace should parse");
+        assert_eq!(
+            parsed.resource_metadata.as_deref(),
+            Some("https://mcp.example.com/meta")
+        );
+        assert_eq!(parsed.scope.as_deref(), Some("files:read"));
+    }
+
+    #[test]
+    fn bearer_challenge_probe_handles_other_http_errors() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let url = format!("http://{address}/mcp");
+        let handle = std::thread::spawn(move || {
+            let request = server
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .expect("challenge probe");
+            request
+                .respond(
+                    tiny_http::Response::from_string("method not allowed")
+                        .with_status_code(405),
+                )
+                .unwrap();
+        });
+
+        assert_eq!(probe_bearer_challenge(&url, false), None);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn discovery_uses_the_metadata_url_and_scope_from_the_bearer_challenge() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let mcp_url = format!("{origin}/mcp");
+        let resource_metadata = format!("{origin}/oauth-resource");
+        let expected_resource = mcp_url.clone();
+        let expected_origin = origin.clone();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect("OAuth discovery request");
+                let response = match request.url() {
+                    "/mcp" => {
+                        let challenge = format!(
+                            "Bearer resource_metadata=\"{resource_metadata}\", scope=\"files:read\""
+                        );
+                        tiny_http::Response::from_string("authorization required")
+                            .with_status_code(401)
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    b"WWW-Authenticate",
+                                    challenge.as_bytes(),
+                                )
+                                .unwrap(),
+                            )
+                    }
+                    "/oauth-resource" => tiny_http::Response::from_string(
+                        serde_json::json!({
+                            "resource": expected_resource,
+                            "authorization_servers": [expected_origin]
+                        })
+                        .to_string(),
+                    )
+                    .with_header(
+                        tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                            .unwrap(),
+                    ),
+                    "/.well-known/oauth-authorization-server" => {
+                        tiny_http::Response::from_string(
+                            serde_json::json!({
+                                "issuer": expected_origin,
+                                "authorization_endpoint": format!("{expected_origin}/authorize"),
+                                "token_endpoint": format!("{expected_origin}/token"),
+                                "registration_endpoint": format!("{expected_origin}/register"),
+                                "scopes_supported": ["admin"]
+                            })
+                            .to_string(),
+                        )
+                        .with_header(
+                            tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                                .unwrap(),
+                        )
+                    }
+                    path => panic!("unexpected OAuth discovery path: {path}"),
+                };
+                request.respond(response).unwrap();
+            }
+        });
+
+        let endpoints = discover(&mcp_url).expect("challenge-guided discovery should succeed");
+        handle.join().unwrap();
+        assert_eq!(endpoints.issuer, origin);
+        assert_eq!(endpoints.scope.as_deref(), Some("files:read"));
+    }
+
+    #[test]
+    fn discovery_falls_back_when_challenge_metadata_is_unavailable() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let mcp_url = format!("{origin}/mcp");
+        let resource_metadata = format!("{origin}/unavailable-resource");
+        let expected_resource = mcp_url.clone();
+        let expected_origin = origin.clone();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect("OAuth discovery request");
+                let response = match request.url() {
+                    "/mcp" => {
+                        let challenge = format!(
+                            "Bearer resource_metadata=\"{resource_metadata}\", scope=\"files:read\""
+                        );
+                        tiny_http::Response::from_string("authorization required")
+                            .with_status_code(401)
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    b"WWW-Authenticate",
+                                    challenge.as_bytes(),
+                                )
+                                .unwrap(),
+                            )
+                    }
+                    "/unavailable-resource" => {
+                        tiny_http::Response::from_string("temporarily unavailable")
+                            .with_status_code(503)
+                    }
+                    "/.well-known/oauth-protected-resource/mcp" => {
+                        tiny_http::Response::from_string(
+                            serde_json::json!({
+                                "resource": expected_resource,
+                                "authorization_servers": [expected_origin]
+                            })
+                            .to_string(),
+                        )
+                        .with_header(
+                            tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                                .unwrap(),
+                        )
+                    }
+                    "/.well-known/oauth-authorization-server" => {
+                        tiny_http::Response::from_string(
+                            serde_json::json!({
+                                "issuer": expected_origin,
+                                "authorization_endpoint": format!("{expected_origin}/authorize"),
+                                "token_endpoint": format!("{expected_origin}/token")
+                            })
+                            .to_string(),
+                        )
+                        .with_header(
+                            tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                                .unwrap(),
+                        )
+                    }
+                    path => panic!("unexpected OAuth discovery path: {path}"),
+                };
+                request.respond(response).unwrap();
+            }
+        });
+
+        let endpoints = discover(&mcp_url).expect("well-known fallback should succeed");
+        handle.join().unwrap();
+        assert_eq!(endpoints.issuer, origin);
+        assert_eq!(endpoints.scope.as_deref(), Some("files:read"));
+    }
+
+    #[test]
+    fn discovery_rejects_malformed_challenge_metadata_without_fallback() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let mcp_url = format!("{origin}/mcp");
+        let resource_metadata = format!("{origin}/malformed-resource");
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect("OAuth discovery request");
+                let response = match request.url() {
+                    "/mcp" => {
+                        let challenge =
+                            format!("Bearer resource_metadata=\"{resource_metadata}\"");
+                        tiny_http::Response::from_string("authorization required")
+                            .with_status_code(401)
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    b"WWW-Authenticate",
+                                    challenge.as_bytes(),
+                                )
+                                .unwrap(),
+                            )
+                    }
+                    "/malformed-resource" => tiny_http::Response::from_string("not json")
+                        .with_header(
+                            tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                                .unwrap(),
+                        ),
+                    path => panic!("unexpected OAuth discovery path: {path}"),
+                };
+                request.respond(response).unwrap();
+            }
+        });
+
+        let error = discover(&mcp_url).unwrap_err();
+        handle.join().unwrap();
+        assert!(error.contains("metadata response was not valid JSON"));
+        assert!(error.contains("/malformed-resource"));
+    }
+
+    #[test]
+    fn discover_fails_closed_on_invalid_protected_resource_metadata() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let resource = format!("http://{address}");
+        let requested_paths = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requested_paths);
+        let handle = std::thread::spawn(move || {
+            while let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(250)) {
+                seen.lock().unwrap().push(request.url().to_string());
+                let response = tiny_http::Response::from_string(
+                    serde_json::json!({
+                        "authorization_servers": ["https://auth.example.com"]
+                    })
+                    .to_string(),
+                )
+                .with_header(
+                    tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap(),
+                );
+                request.respond(response).unwrap();
+            }
+        });
+
+        let error = discover(&resource).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(error.contains("no resource identifier"));
+        assert_eq!(
+            requested_paths.lock().unwrap().as_slice(),
+            ["/", "/.well-known/oauth-protected-resource"]
+        );
+    }
+
+    #[test]
+    fn discover_fails_closed_on_malformed_protected_resource_metadata() {
+        use std::time::Duration;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let resource = format!("http://{address}");
+        let handle = std::thread::spawn(move || {
+            for body in ["", "not json"] {
+                let request = server
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .expect("OAuth discovery request");
+                let response = if body.is_empty() {
+                    tiny_http::Response::from_string(body)
+                } else {
+                    tiny_http::Response::from_string(body).with_header(
+                        tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                            .unwrap(),
+                    )
+                };
+                request.respond(response).unwrap();
+            }
+        });
+
+        let error = discover(&resource).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(error.contains("metadata response was not valid JSON"));
+    }
+
+    #[test]
+    fn discover_refuses_cleartext_authorization_server_metadata() {
+        use std::time::Duration;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let resource = format!("http://{address}");
+        let document_resource = resource.clone();
+        let handle = std::thread::spawn(move || {
+            for body in [
+                String::new(),
+                serde_json::json!({
+                    "resource": document_resource,
+                    "authorization_servers": ["http://8.8.8.8"]
+                })
+                .to_string(),
+            ] {
+                let request = server
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .expect("OAuth discovery request");
+                let response = if body.is_empty() {
+                    tiny_http::Response::from_string(body)
+                } else {
+                    tiny_http::Response::from_string(body).with_header(
+                        tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                            .unwrap(),
+                    )
+                };
+                request.respond(response).unwrap();
+            }
+        });
+
+        let error = discover(&resource).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(error.contains("authorization server must use https"));
+    }
+
+    #[test]
+    fn step_up_scope_union_preserves_prior_access_and_deduplicates() {
+        assert_eq!(
+            scope_union(
+                Some("files:read profile"),
+                Some("files:write files:read")
+            )
+            .as_deref(),
+            Some("files:read profile files:write")
+        );
+        assert_eq!(scope_union(None, Some("  files:read  ")).as_deref(), Some("files:read"));
+        assert_eq!(scope_union(Some(""), None), None);
+    }
+
+    #[test]
+    fn cimd_is_preferred_over_dynamic_registration_when_advertised() {
+        let endpoints = |cimd, registration_endpoint| Endpoints {
+            issuer: "https://auth.example.com".into(),
+            authorization_endpoint: "https://auth.example.com/authorize".into(),
+            token_endpoint: "https://auth.example.com/token".into(),
+            registration_endpoint,
+            scope: None,
+            authorization_response_iss_parameter_supported: false,
+            client_id_metadata_document_supported: cimd,
+        };
+
+        assert!(matches!(
+            select_client_registration(&endpoints(
+                true,
+                Some("https://auth.example.com/register".into())
+            )),
+            Ok(ClientRegistration::MetadataDocument)
+        ));
+        assert!(matches!(
+            select_client_registration(&endpoints(
+                false,
+                Some("https://auth.example.com/register".into())
+            )),
+            Ok(ClientRegistration::Dynamic("https://auth.example.com/register"))
+        ));
+        assert!(select_client_registration(&endpoints(false, None)).is_err());
+    }
+
+    #[test]
+    fn cimd_client_id_is_a_stable_https_url_with_a_path() {
+        let client_id = url::Url::parse(CLIENT_ID_METADATA_URL).unwrap();
+        assert_eq!(client_id.scheme(), "https");
+        assert_ne!(client_id.path(), "/");
+        assert_eq!(client_id.as_str(), CLIENT_ID_METADATA_URL);
+    }
+
+    #[test]
+    fn authorization_server_metadata_reads_cimd_capability() {
+        let metadata: AsMeta = serde_json::from_value(serde_json::json!({
+            "issuer": "https://auth.example.com",
+            "authorization_endpoint": "https://auth.example.com/authorize",
+            "token_endpoint": "https://auth.example.com/token",
+            "client_id_metadata_document_supported": true
+        }))
+        .unwrap();
+        assert!(metadata.client_id_metadata_document_supported);
     }
 }

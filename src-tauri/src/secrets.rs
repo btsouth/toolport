@@ -5,6 +5,9 @@
 
 const SERVICE: &str = "conduit-mcp";
 
+const INTERNAL_SERVER_ID: &str = "__toolport_internal__";
+const TASK_HANDLE_KEY: &str = "__task_handle_key__";
+
 /// Reserved secret key for an http server's bearer token (Tier A auth, and where
 /// the OAuth flow stores its access token).
 pub const HTTP_AUTH_KEY: &str = "__http_auth__";
@@ -478,6 +481,10 @@ mod platform {
         let mut not_found = 0;
 
         for (server_id, key) in keys {
+            if server_id.as_str() == super::INTERNAL_SERVER_ID {
+                failed += 1;
+                continue;
+            }
             let acct = account(server_id, key);
             match get_generic_password(SERVICE, &acct) {
                 Ok(bytes) => match String::from_utf8(bytes) {
@@ -537,6 +544,10 @@ mod platform {
         let mut not_found = 0;
 
         for (server_id, key) in keys {
+            if server_id.as_str() == super::INTERNAL_SERVER_ID {
+                failed += 1;
+                continue;
+            }
             let acct = account(server_id, key);
             match get_generic_password(SERVICE, &acct) {
                 Ok(bytes) => match String::from_utf8(bytes) {
@@ -771,15 +782,70 @@ mod file {
     }
 }
 
-pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+fn set_secret_raw(server_id: &str, key: &str, value: &str) -> Result<(), String> {
     if file::active() {
         return file::set_secret(server_id, key, value);
     }
     platform::set_secret(server_id, key, value)
 }
 
+pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    set_secret_raw(server_id, key, value)
+}
+
 pub fn get_secret(server_id: &str, key: &str) -> Option<String> {
     get_secret_result(server_id, key).ok().flatten()
+}
+
+/// Stable installation-local key used to seal client-facing Tasks handles.
+/// Keeping the owner and native task id inside an authenticated ciphertext makes
+/// the handle unguessable and tamper-evident while still surviving gateway and
+/// app restarts. It is internal metadata, never a downstream server credential.
+pub(crate) fn task_handle_key() -> Result<[u8; 32], String> {
+    #[cfg(test)]
+    {
+        return Ok([0x54; 32]);
+    }
+
+    #[cfg(not(test))]
+    {
+        use base64::Engine as _;
+        use std::sync::OnceLock;
+
+        static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+        if let Some(key) = KEY.get() {
+            return Ok(*key);
+        }
+        let loaded = (|| {
+            let decode = |encoded: &str| -> Result<[u8; 32], String> {
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(encoded.trim())
+                    .map_err(|_| "Toolport task-handle key is corrupt".to_string())?;
+                raw.try_into()
+                    .map_err(|_| "Toolport task-handle key has the wrong length".to_string())
+            };
+            let _first_use_lock = crate::registry::conduit_dir()
+                .map(|dir| crate::registry::lock_at(&dir.join("task-handle-key")))
+                .transpose()?;
+            if let Some(encoded) = get_secret_result_raw(INTERNAL_SERVER_ID, TASK_HANDLE_KEY)? {
+                return decode(&encoded);
+            }
+
+            let mut key = [0u8; 32];
+            getrandom::getrandom(&mut key).map_err(|e| e.to_string())?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(key);
+            set_secret_raw(INTERNAL_SERVER_ID, TASK_HANDLE_KEY, &encoded)?;
+            // Read back through the active backend before caching the key.
+            let stored = get_secret_result_raw(INTERNAL_SERVER_ID, TASK_HANDLE_KEY)?
+                .ok_or_else(|| "Toolport task-handle key was not persisted".to_string())?;
+            decode(&stored)
+        })()?;
+        let _ = KEY.set(loaded);
+        Ok(*KEY.get().unwrap_or(&loaded))
+    }
 }
 
 /// Like `get_secret`, but distinguishes "no such secret was saved" (`Ok(None)`)
@@ -796,7 +862,7 @@ pub fn get_secret(server_id: &str, key: &str) -> Option<String> {
 /// 3. Encrypted `secrets.enc` when `TOOLPORT_SECRET_KEY` (legacy
 ///    `CONDUIT_SECRET_KEY`) is set
 /// 4. OS keychain / platform backend
-pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
+fn get_secret_result_raw(server_id: &str, key: &str) -> Result<Option<String>, String> {
     if let Some(v) = env_secret_override(key) {
         return Ok(Some(v));
     }
@@ -804,6 +870,13 @@ pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, S
         return file::get_secret_result(server_id, key);
     }
     platform::get_secret_result(server_id, key)
+}
+
+pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    get_secret_result_raw(server_id, key)
 }
 
 /// Look up a secret from the process environment for container / env-file deploys.
@@ -832,11 +905,18 @@ fn env_var_nonblank(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
-pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
+fn delete_secret_raw(server_id: &str, key: &str) -> Result<(), String> {
     if file::active() {
         return file::delete_secret(server_id, key);
     }
     platform::delete_secret(server_id, key)
+}
+
+pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    delete_secret_raw(server_id, key)
 }
 
 // ── Legacy keychain migration (macOS) ──────────────────────────────────────
@@ -852,16 +932,11 @@ pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
 // once on upgrade so EXISTING secrets are rewritten WITH the shared-access ACL,
 // not just legacy keyring-API entries.
 
-/// Marker file name for the legacy ACL migration (keychain -> ACL-free keychain).
-/// Left untouched for backward compatibility, but the current macOS path migrates
-/// secrets into the file backend instead (see `FILE_MIGRATION_MARKER`).
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-const MIGRATION_MARKER: &str = ".keychain-acl-migrated";
-
 /// Marker file name for the keychain -> encrypted-file migration. A NEW name so
 /// the migration runs exactly once on upgrade to the file-backend-by-default
-/// build, even on installs that already ran the older ACL migration.
+/// build, even on installs that already ran the older ACL migration. An older
+/// `.keychain-acl-migrated` marker file may exist on disk from that legacy
+/// migration; it is intentionally ignored.
 #[cfg(target_os = "macos")]
 const FILE_MIGRATION_MARKER: &str = ".secrets-file-migrated";
 
@@ -1035,6 +1110,13 @@ mod tests {
     /// races with a sibling that assumes the keychain path, causing spurious
     /// failures under the default multi-threaded test runner.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn server_secrets_cannot_use_the_internal_task_key_namespace() {
+        assert!(set_secret(INTERNAL_SERVER_ID, "user-key", "value").is_err());
+        assert!(get_secret_result(INTERNAL_SERVER_ID, "user-key").is_err());
+        assert!(delete_secret(INTERNAL_SERVER_ID, "user-key").is_err());
+    }
 
     // Round-trips through the real OS keychain. Headless Linux CI has no Secret
     // Service (D-Bus), so skip it there; it still runs on Windows.

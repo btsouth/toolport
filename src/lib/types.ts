@@ -296,46 +296,6 @@ export interface Stack {
   servers: CatalogEntry[];
 }
 
-/** A server merged across every client that has it configured. */
-export interface AggregatedServer {
-  name: string;
-  transport: Transport;
-  command: string | null;
-  url: string | null;
-  args: string[];
-  envKeys: string[];
-  clients: { id: string; name: string }[];
-}
-
-/** Group the per-client server lists into one deduplicated, cross-client view. */
-export function aggregateServers(clients: DetectedClient[]): AggregatedServer[] {
-  const byName = new Map<string, AggregatedServer>();
-
-  for (const client of clients) {
-    for (const server of client.servers) {
-      const key = server.name.toLowerCase();
-      const existing = byName.get(key);
-      if (existing) {
-        existing.clients.push({ id: client.id, name: client.name });
-      } else {
-        byName.set(key, {
-          name: server.name,
-          transport: server.transport,
-          command: server.command,
-          url: server.url,
-          args: server.args,
-          envKeys: server.envKeys,
-          clients: [{ id: client.id, name: client.name }],
-        });
-      }
-    }
-  }
-
-  return [...byName.values()].sort((a, b) =>
-    a.name.toLowerCase().localeCompare(b.name.toLowerCase()),
-  );
-}
-
 // --- Toolport registry (source of truth) ---
 
 export interface EnvVar {
