@@ -52,7 +52,11 @@ If a client reports the gateway "was not found," you forgot this step.
 # Backend (Rust: library, binaries, and integration tests)
 npm run test:rust
 
-# Headless gateway smoke (Windows; build gateway first)
+# Headless gateway security smoke (Node source of truth; build gateway first)
+npm run build:gateway
+npm run smoke:headless
+
+# Windows PowerShell mirror
 powershell -ExecutionPolicy Bypass -File scripts/smoke-headless.ps1
 
 # Frontend unit tests (Vitest)

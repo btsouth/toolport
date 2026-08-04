@@ -78,3 +78,9 @@ jobs:
       # out of CI when the command is updated.
       - name: Rust tests (lib + binaries + integration)
         run: npm run test:rust
+
+      - name: Build headless gateway for smoke tests
+        run: npm run build:gateway
+
+      - name: Headless gateway security smoke
+        run: npm run smoke:headless
