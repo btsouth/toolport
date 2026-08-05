@@ -1,0 +1,51 @@
+# CodeRev shadow review.
+#
+# Runs alongside CodeRabbit rather than replacing it. CodeRev's benchmark
+# (four runs over ten recorded toolport-studio PRs; logs in the coderev repo)
+# proved cost (~$0.05/PR) and latency (~3 min) but not precision: that is
+# judged during this shadow phase by comparing its comments against
+# CodeRabbit's on real pull requests. Do not cancel CodeRabbit on the
+# strength of this file existing.
+#
+# Advisory (continue-on-error): a red X on a model's opinion trains people to
+# ignore the check.
+name: PR review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# A second push reviews the new head, not race the old one.
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: CodeRev (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    # Fork PRs do not get repository secrets, and Dependabot-triggered runs get
+    # the Dependabot secret store rather than the repository one, so in both
+    # cases the model call would fail with a confusing auth error rather than
+    # an obvious skip. Drafts are declared-unfinished work; the
+    # ready_for_review trigger picks the PR up the moment that changes.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.draft == false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Tracks main during the shadow phase so reviewer fixes land without a
+      # release step. Pin to a tag once the shadow comparison earns it.
+      - name: Review
+        uses: tsouth89/coderev@main
+        with:
+          api-key: ${{ secrets.REVIEW_API_KEY }}
