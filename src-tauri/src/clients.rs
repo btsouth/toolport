@@ -581,8 +581,11 @@ fn resolve_crush_path(
         .unwrap_or_else(|| home.join(".config"))
         .join("crush")
         .join("crush.json")
-    }
+}
 
+/// Crush v0.88.0 resolves its global config through CRUSH_GLOBAL_CONFIG, then
+/// XDG_CONFIG_HOME, and finally ~/.config on every OS. Older Windows releases
+/// used LocalAppData, so retain that path only when it already contains a file.
 fn crush_path() -> Option<PathBuf> {
     let home = home()?;
     if let Some(path) = crush_override_path(std::env::var_os("CRUSH_GLOBAL_CONFIG")) {
