@@ -11006,7 +11006,97 @@ fn handle_connection(
         let _ = request.respond(response);
 }
 
+/// Flags `toolport-gateway` recognizes on the command line today, kept in one
+/// place so `--help`'s usage text and the unknown-flag check in [`parse_args`]
+/// can't drift from the real parsers in `http_port`, `insecure_loopback_requested`,
+/// and `main`'s `--selftest-secrets` check.
+const KNOWN_FLAGS: &[&str] = &["--http", INSECURE_LOOPBACK_FLAG, "--selftest-secrets"];
+
+/// What the command line is asking `main` to do, decided purely from `args`
+/// (already excluding argv[0]) with no I/O - unit-testable without spawning a
+/// process, matching how `resolve_http_port` and `insecure_loopback_requested`
+/// are factored.
+#[derive(Debug, PartialEq, Eq)]
+enum ArgAction {
+    /// Print usage and exit 0.
+    Help,
+    /// Print the version and exit 0.
+    Version,
+    /// An argument looked like a flag (`-`-prefixed) but isn't one of the
+    /// flags this binary knows. Carries the offending argument for the error.
+    Unknown(String),
+    /// Nothing that changes startup mode; fall through to normal gateway
+    /// startup.
+    Run,
+}
+
+/// Classify the command line.
+///
+/// `--help`/`-h` wins even when combined with other flags, including an
+/// unknown one - a user asking for help should always get it, never an error
+/// about something else on the same line. `--version`/`-V` is checked next.
+/// Only arguments that *look like flags* (start with `-`) are ever rejected;
+/// bare positional arguments (like the port after `--http`) keep their
+/// current behavior so nothing that spawns the gateway today breaks.
+fn parse_args(args: &[String]) -> ArgAction {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return ArgAction::Help;
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        return ArgAction::Version;
+    }
+    for arg in args {
+        if arg.starts_with('-') && !KNOWN_FLAGS.contains(&arg.as_str()) {
+            return ArgAction::Unknown(arg.clone());
+        }
+    }
+    ArgAction::Run
+}
+
+/// Usage text shared by `--help` and the unknown-flag error, so a typo and a
+/// deliberate `--help` land on the same page.
+fn usage() -> String {
+    format!(
+        "toolport-gateway {version}\n\
+         Local-first MCP gateway - see docs/headless.md for the full guide.\n\
+         \n\
+         USAGE:\n    toolport-gateway [FLAGS]\n\
+         \n\
+         FLAGS:\n\
+         \x20   --http [port]         Serve over HTTP instead of stdio (default port 8765)\n\
+         \x20   {insecure}   Allow unauthenticated HTTP access on a loopback bind\n\
+         \x20   --selftest-secrets    Diagnostic: read every vaulted secret and report\n\
+         \x20   -h, --help            Print this message and exit\n\
+         \x20   -V, --version         Print the version and exit\n\
+         \n\
+         ENV:\n\
+         \x20   TOOLPORT_HTTP, TOOLPORT_HTTP_PORT, TOOLPORT_HTTP_HOST, TOOLPORT_HTTP_TOKEN,\n\
+         \x20   TOOLPORT_REGISTRY, TOOLPORT_DEBUG",
+        version = env!("CARGO_PKG_VERSION"),
+        insecure = INSECURE_LOOPBACK_FLAG,
+    )
+}
+
 fn main() {
+    // `--help`/`--version`/an unrecognized flag are decided before anything
+    // else touches disk, the keychain, or stdin - see #605. Positional args
+    // and the existing four flags fall through to `Run` unchanged.
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    match parse_args(&cli_args) {
+        ArgAction::Help => {
+            println!("{}", usage());
+            std::process::exit(0);
+        }
+        ArgAction::Version => {
+            println!("toolport-gateway {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        ArgAction::Unknown(flag) => {
+            eprintln!("toolport-gateway: unrecognized flag '{flag}'\n\n{}", usage());
+            std::process::exit(1);
+        }
+        ArgAction::Run => {}
+    }
     // Persist org rate-limit counters across restarts (SOU-340). Safe if dir missing;
     // counters then stay process-local until the first successful bind.
     if let Some(dir) = registry::conduit_dir() {
@@ -18727,6 +18817,75 @@ mod tests {
         // BACK-COMPAT: no env, no override anywhere resolves to exactly the old bool.
         assert_mode(resolve_mode_from(None, None, None, true), Lazy);
         assert_mode(resolve_mode_from(None, None, None, false), Full);
+    }
+
+    #[test]
+    fn parse_args_known_flags_run_normally() {
+        for flag in KNOWN_FLAGS {
+            assert_eq!(
+                parse_args(&[flag.to_string()]),
+                ArgAction::Run,
+                "known flag {flag} must fall through to Run"
+            );
+        }
+        // A bare positional (e.g. the port after --http) is never rejected.
+        assert_eq!(
+            parse_args(&["--http".to_string(), "9000".to_string()]),
+            ArgAction::Run
+        );
+    }
+
+    #[test]
+    fn parse_args_no_args_runs_normally() {
+        assert_eq!(parse_args(&[]), ArgAction::Run);
+    }
+
+    #[test]
+    fn parse_args_help_and_version() {
+        assert_eq!(parse_args(&["--help".to_string()]), ArgAction::Help);
+        assert_eq!(parse_args(&["-h".to_string()]), ArgAction::Help);
+        assert_eq!(parse_args(&["--version".to_string()]), ArgAction::Version);
+        assert_eq!(parse_args(&["-V".to_string()]), ArgAction::Version);
+    }
+
+    #[test]
+    fn parse_args_help_wins_when_combined_with_other_flags() {
+        assert_eq!(
+            parse_args(&["--http".to_string(), "--help".to_string()]),
+            ArgAction::Help
+        );
+        assert_eq!(
+            parse_args(&["--htpp".to_string(), "--help".to_string()]),
+            ArgAction::Help
+        );
+        assert_eq!(
+            parse_args(&["--help".to_string(), "--version".to_string()]),
+            ArgAction::Help
+        );
+    }
+
+    #[test]
+    fn parse_args_unknown_flag_is_rejected() {
+        assert_eq!(
+            parse_args(&["--htpp".to_string(), "9000".to_string()]),
+            ArgAction::Unknown("--htpp".to_string())
+        );
+        assert_eq!(
+            parse_args(&["--insecure_loopback".to_string()]),
+            ArgAction::Unknown("--insecure_loopback".to_string())
+        );
+        assert_eq!(
+            parse_args(&["--insecure".to_string()]),
+            ArgAction::Unknown("--insecure".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_args_bare_positionals_never_rejected() {
+        assert_eq!(
+            parse_args(&["some-registry-path.json".to_string()]),
+            ArgAction::Run
+        );
     }
 
     #[test]
