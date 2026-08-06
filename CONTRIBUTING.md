@@ -182,7 +182,7 @@ Keep comments at the density of the file you're editing.
 - New curated catalog entries (real, verified MCP servers) in `catalog.rs`.
 - New curated stacks (role-based server bundles) in `stacks.rs`.
 - Additional client support in `clients.rs` (a new AI tool's config format).
-- Frontend polish: empty states, error messages, keyboard shortcuts.
+- Frontend polish: empty states and error messages.
 - Tests for any of the above.
 
 ## Adding a curated catalog entry
