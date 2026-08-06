@@ -1277,14 +1277,6 @@ impl Registry {
     }
 }
 
-/// Leaf directory name under the OS config root (`Toolport` release, `Toolport-dev`
-/// for debug/`tauri dev` builds). Override the full path with `TOOLPORT_DATA_DIR`
-/// (legacy: `CONDUIT_DATA_DIR`). Existing `Conduit` / `Conduit-dev` dirs are migrated
-/// in place by [`crate::brand::resolve_data_dir_under`] when safe.
-pub(crate) fn data_dir_leaf_name() -> &'static str {
-    crate::brand::data_dir_leaf_name()
-}
-
 /// How [`conduit_dir`] was resolved, for startup diagnostics. Only Windows has
 /// interesting cases (MSIX app containers); everywhere else it is `Direct`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2764,7 +2756,10 @@ mod tests {
         // Prefer Toolport; existing installs may still resolve under the legacy leaf
         // until desktop launch migrates it.
         assert!(
-            s.ends_with(&format!("AppData\\Roaming\\{}", data_dir_leaf_name()))
+            s.ends_with(&format!(
+                "AppData\\Roaming\\{}",
+                crate::brand::data_dir_leaf_name()
+            ))
                 || s.ends_with(&format!(
                     "AppData\\Roaming\\{}",
                     crate::brand::legacy_data_dir_leaf_name()
@@ -3225,7 +3220,7 @@ mod tests {
     #[test]
     fn data_dir_leaf_is_dev_in_debug_builds() {
         assert_eq!(
-            data_dir_leaf_name(),
+            crate::brand::data_dir_leaf_name(),
             if cfg!(debug_assertions) {
                 "Toolport-dev"
             } else {

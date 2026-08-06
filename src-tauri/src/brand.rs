@@ -56,7 +56,11 @@ pub fn env_flag(new_key: &str, legacy_key: &str) -> bool {
     }
 }
 
-/// Canonical data-dir leaf under the OS config root (`Toolport` / `Toolport-dev`).
+/// Leaf directory name under the OS config root (`Toolport` release,
+/// `Toolport-dev` for debug/`tauri dev` builds). Override the full path with
+/// `TOOLPORT_DATA_DIR` (legacy: `CONDUIT_DATA_DIR`). Existing `Conduit` /
+/// `Conduit-dev` dirs are migrated in place by [`resolve_data_dir_under`] when
+/// safe.
 pub fn data_dir_leaf_name() -> &'static str {
     if cfg!(debug_assertions) {
         "Toolport-dev"
