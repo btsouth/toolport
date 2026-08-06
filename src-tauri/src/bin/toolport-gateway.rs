@@ -6890,6 +6890,8 @@ fn watch_registry(
     resource_updated: Option<ResourceUpdatedDispatch>,
     // Subscription table so rebuilds re-issue resources/subscribe.
     resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
+    // Single-flight with startup self-heal and ${ROOT} rebuilds (SOU-337).
+    rebuild_lock: Arc<Mutex<()>>,
 ) {
     eprintln!("toolport: watching registry at {}", path.display());
     let mut state = WatchLoopState {
@@ -6920,6 +6922,7 @@ fn watch_registry(
             Some(&mcp_sessions),
             resource_updated.as_ref(),
             resource_subs.as_ref(),
+            &rebuild_lock,
             &mut state,
         );
     }
@@ -6948,6 +6951,9 @@ fn watch_tick(
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
     resource_updated: Option<&ResourceUpdatedDispatch>,
     resource_subs: Option<&Arc<Mutex<ResourceSubscriptionTable>>>,
+    // Serializes full rebuilds with self-heal / ${ROOT} (SOU-337). Unused on the
+    // in-place list_changed refresh branch, which does not spawn.
+    rebuild_lock: &Arc<Mutex<()>>,
     state: &mut WatchLoopState,
 ) -> TickOutcome {
     // Re-approving a tool rewrites quarantine.json, which is NOT the registry file
@@ -7051,7 +7057,13 @@ fn watch_tick(
             *guard = resolved.clone();
             prev
         };
-        // Build the new router (spawns processes) before taking locks.
+        // Full rebuild spawns stdio children. Single-flight with startup self-heal
+        // and ${ROOT} rebuild so two concurrent build_router+swap paths cannot
+        // double-spawn and kill the loser's children on Drop (SOU-337).
+        let _rebuild = rebuild_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Build the new router (spawns processes) before taking the router lock.
         let new_router = build_router(
             &new_reg,
             resolved.as_deref(),
@@ -7215,10 +7227,11 @@ struct GatewayState {
     stdout: Arc<Mutex<std::io::Stdout>>,
     ready: Arc<AtomicBool>,
     downstream_dirty: Arc<AtomicU8>,
-    /// Serializes the self-heal rebuild so a startup burst of concurrent tools/call
-    /// workers that all observe an empty router don't each spawn the full server set
-    /// (single-flight). The winner rebuilds; the others block here, then re-check
-    /// server_count under the router lock and skip.
+    /// Serializes every full `build_router` + router swap: startup background build,
+    /// empty-router self-heal, `${ROOT}` rebuild, and registry-watcher full rebuild
+    /// (SOU-337). Without this, overlapping builds double-spawn stdio children and
+    /// the loser's Drop kills mid-flight work. In-place tools/list_changed refresh
+    /// does not take it (no spawn).
     rebuild_lock: Arc<Mutex<()>>,
     lazy: bool,
     /// Live-updated: the registry watcher keeps this in sync with
@@ -11349,6 +11362,7 @@ fn main() {
         let mcp_sessions = Arc::clone(&mcp_sessions);
         let resource_updated = resource_updated_sink.clone();
         let resource_subs_watch = Arc::clone(&resource_subs);
+        let rebuild_lock = Arc::clone(&rebuild_lock);
         std::thread::spawn(move || {
             watch_registry(
                 path,
@@ -11366,6 +11380,7 @@ fn main() {
                 mcp_sessions,
                 resource_updated,
                 Some(resource_subs_watch),
+                rebuild_lock,
             )
         });
     }
@@ -17887,6 +17902,7 @@ mod tests {
         };
 
         // First tick: pick up the quarantined tool from disk.
+        let rebuild_lock = Arc::new(Mutex::new(()));
         let load = watch_tick(
             &reg_path,
             &registry,
@@ -17903,6 +17919,7 @@ mod tests {
             None,
             None,
             None,
+            &rebuild_lock,
             &mut state,
         );
         assert!(
@@ -17932,6 +17949,7 @@ mod tests {
             None,
             None,
             None,
+            &rebuild_lock,
             &mut state,
         );
         assert!(steady.idle_after_quarantine);
@@ -17955,6 +17973,7 @@ mod tests {
             None,
             None,
             None,
+            &rebuild_lock,
             &mut state,
         );
         assert!(
