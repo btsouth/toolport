@@ -304,21 +304,21 @@ is in `src-tauri/src/clients.rs`.
 
 Check the client's config file and match it to a `Format` variant:
 
-| Format               | Config shape                                       | Existing clients                 |
-| -------------------- | -------------------------------------------------- | -------------------------------- |
-| `JsonMcpServers`     | `{"mcpServers": {...}}`                            | Claude Desktop, Cursor, Windsurf |
-| `JsonCopilotMcpServers` | `{"mcpServers": {...}}` entries require a `tools` allowlist | GitHub Copilot CLI |
-| `JsonDroidMcpServers` | `{"mcpServers": {...}}` every entry requires a `"type"` field | Factory Droid |
-| `JsonAmpMcpServers`  | dotted top-level key `amp.mcpServers` (not a nested object) | Amp |
-| `JsonMcp`            | top-level `mcp` object                              | Crush                           |
-| `JsonQwenMcpServers` | `{"mcpServers": {"name": {"httpUrl": "..."}}}`     | Qwen Code                        |
-| `JsonServers`        | `{"servers": {...}}`                               | VS Code                          |
-| `JsonOpenCodeMcp`    | `{"mcp": {"name": {"command": [...]}}}`            | OpenCode, Kilo Code              |
-| `JsonContextServers` | `{"context_servers": {...}}` (JSONC)               | Zed                              |
-| `TomlMcpServers`     | `[mcp_servers.name]`                               | Codex CLI                        |
-| `YamlExtensions`     | `extensions:` map (Goose shape: `cmd`/`envs`)      | Goose                            |
-| `YamlMcpServers`     | `mcp_servers:` map (Hermes shape: `command`/`env`) | Hermes                           |
-| `YamlMcpServersList` | `mcpServers:` list                                 | Continue                         |
+| Format                  | Config shape                                                  | Existing clients                 |
+| ----------------------- | ------------------------------------------------------------- | -------------------------------- |
+| `JsonMcpServers`        | `{"mcpServers": {...}}`                                       | Claude Desktop, Cursor, Windsurf |
+| `JsonCopilotMcpServers` | `{"mcpServers": {...}}` entries require a `tools` allowlist   | GitHub Copilot CLI               |
+| `JsonDroidMcpServers`   | `{"mcpServers": {...}}` every entry requires a `"type"` field | Factory Droid                    |
+| `JsonAmpMcpServers`     | dotted top-level key `amp.mcpServers` (not a nested object)   | Amp                              |
+| `JsonMcp`               | top-level `mcp` object                                        | Crush                            |
+| `JsonQwenMcpServers`    | `{"mcpServers": {"name": {"httpUrl": "..."}}}`                | Qwen Code                        |
+| `JsonServers`           | `{"servers": {...}}`                                          | VS Code                          |
+| `JsonOpenCodeMcp`       | `{"mcp": {"name": {"command": [...]}}}`                       | OpenCode, Kilo Code              |
+| `JsonContextServers`    | `{"context_servers": {...}}` (JSONC)                          | Zed                              |
+| `TomlMcpServers`        | `[mcp_servers.name]`                                          | Codex CLI                        |
+| `YamlExtensions`        | `extensions:` map (Goose shape: `cmd`/`envs`)                 | Goose                            |
+| `YamlMcpServers`        | `mcp_servers:` map (Hermes shape: `command`/`env`)            | Hermes                           |
+| `YamlMcpServersList`    | `mcpServers:` list                                            | Continue                         |
 
 If the client uses a genuinely new format, add a variant to `enum Format` and a
 parse function (follow the pattern of `parse_json` or `parse_toml`).
