@@ -11119,7 +11119,8 @@ fn usage() -> String {
          \n\
          ENV:\n\
          \x20   TOOLPORT_HTTP, TOOLPORT_HTTP_PORT, TOOLPORT_HTTP_HOST, TOOLPORT_HTTP_TOKEN,\n\
-         \x20   TOOLPORT_REGISTRY, TOOLPORT_DEBUG",
+         \x20   TOOLPORT_REGISTRY, TOOLPORT_DISCOVERY, TOOLPORT_CODE_MODE,\n\
+         \x20   TOOLPORT_DATA_DIR, TOOLPORT_DEBUG",
         version = env!("CARGO_PKG_VERSION"),
         insecure = INSECURE_LOOPBACK_FLAG,
     )
