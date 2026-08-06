@@ -4455,12 +4455,23 @@ impl DownstreamServer {
         }
         match listed {
             Ok(listed) if listed.warning.is_none() => {
-                self.tool_cache_hint = listed.cache_hint;
-                self.tools = if self.modern_http {
+                let new_tools = if self.modern_http {
                     filter_modern_http_tools(&self.id, listed.items)
                 } else {
                     listed.items
                 };
+                // SOU-338: a successful empty list can be a transient glitch (or a
+                // list_changed race). Never wipe a previously non-empty catalog.
+                if !self.tools.is_empty() && new_tools.is_empty() {
+                    self.tool_cache_hint.mark_stale_and_defer();
+                    eprintln!(
+                        "toolport: keeping server '{}' previous tool catalog after a successful empty refresh",
+                        self.id
+                    );
+                } else {
+                    self.tool_cache_hint = listed.cache_hint;
+                    self.tools = new_tools;
+                }
             }
             Ok(listed) => {
                 self.tool_cache_hint.mark_stale_and_defer();
@@ -4508,8 +4519,17 @@ impl DownstreamServer {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         match fetch_paginated_list(&mut *self.transport, "resources/list", "resources") {
             Ok(listed) if listed.warning.is_none() => {
-                self.resource_cache_hint = listed.cache_hint;
-                self.resources = listed.items;
+                // SOU-338: same empty-success guard as tools (and prompts).
+                if !self.resources.is_empty() && listed.items.is_empty() {
+                    self.resource_cache_hint.mark_stale_and_defer();
+                    eprintln!(
+                        "toolport: keeping server '{}' previous resource catalog after a successful empty refresh",
+                        self.id
+                    );
+                } else {
+                    self.resource_cache_hint = listed.cache_hint;
+                    self.resources = listed.items;
+                }
             }
             Ok(listed) => {
                 self.resource_cache_hint.mark_stale_and_defer();
@@ -4535,8 +4555,17 @@ impl DownstreamServer {
             "resourceTemplates",
         ) {
             Ok(listed) if listed.warning.is_none() => {
-                self.resource_template_cache_hint = listed.cache_hint;
-                self.resource_templates = listed.items;
+                // SOU-338: empty-success guard (templates share the resources signal).
+                if !self.resource_templates.is_empty() && listed.items.is_empty() {
+                    self.resource_template_cache_hint.mark_stale_and_defer();
+                    eprintln!(
+                        "toolport: keeping server '{}' previous resource-template catalog after a successful empty refresh",
+                        self.id
+                    );
+                } else {
+                    self.resource_template_cache_hint = listed.cache_hint;
+                    self.resource_templates = listed.items;
+                }
             }
             Ok(listed) => {
                 self.resource_template_cache_hint.mark_stale_and_defer();
@@ -4577,8 +4606,17 @@ impl DownstreamServer {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         match fetch_paginated_list(&mut *self.transport, "prompts/list", "prompts") {
             Ok(listed) if listed.warning.is_none() => {
-                self.prompt_cache_hint = listed.cache_hint;
-                self.prompts = listed.items;
+                // SOU-338: same empty-success guard as tools/resources.
+                if !self.prompts.is_empty() && listed.items.is_empty() {
+                    self.prompt_cache_hint.mark_stale_and_defer();
+                    eprintln!(
+                        "toolport: keeping server '{}' previous prompt catalog after a successful empty refresh",
+                        self.id
+                    );
+                } else {
+                    self.prompt_cache_hint = listed.cache_hint;
+                    self.prompts = listed.items;
+                }
             }
             Ok(listed) => {
                 self.prompt_cache_hint.mark_stale_and_defer();
@@ -5246,6 +5284,112 @@ mod tests {
         };
         server.refresh_tools();
         assert_eq!(server.tools, vec![json!({"name":"stable"})]);
+    }
+
+    /// SOU-338: a successful empty tools/list must not wipe a non-empty catalog.
+    /// Mutation check: remove the empty-success guard and this fails.
+    #[test]
+    fn empty_successful_tool_refresh_keeps_previous_catalog() {
+        let transport = PaginationTransport::new(vec![Ok(json!({ "tools": [] }))]);
+        let mut server = DownstreamServer {
+            id: "fixture".to_string(),
+            transport: Box::new(transport),
+            tools: vec![json!({"name":"stable"})],
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+            prompts: Vec::new(),
+            tool_cache_hint: CacheHint::default(),
+            resource_cache_hint: CacheHint::default(),
+            resource_template_cache_hint: CacheHint::default(),
+            prompt_cache_hint: CacheHint::default(),
+            caps_resources: false,
+            caps_prompts: false,
+            caps_completions: false,
+            caps_extensions: serde_json::Map::new(),
+            era: super::Era::Legacy {
+                version: super::PROTOCOL_VERSION.to_string(),
+            },
+            modern_http: false,
+            modern_resource_subscriptions: std::collections::HashSet::new(),
+            server_handler: None,
+        };
+        server.refresh_tools();
+        assert_eq!(
+            server.tools,
+            vec![json!({"name":"stable"})],
+            "successful empty list must not wipe prior tools"
+        );
+    }
+
+    /// SOU-338: empty success is allowed when the catalog was already empty
+    /// (first-time empty, or intentionally emptied after a real full wipe path).
+    #[test]
+    fn empty_successful_tool_refresh_ok_when_already_empty() {
+        let transport = PaginationTransport::new(vec![Ok(json!({ "tools": [] }))]);
+        let mut server = DownstreamServer {
+            id: "fixture".to_string(),
+            transport: Box::new(transport),
+            tools: Vec::new(),
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+            prompts: Vec::new(),
+            tool_cache_hint: CacheHint::default(),
+            resource_cache_hint: CacheHint::default(),
+            resource_template_cache_hint: CacheHint::default(),
+            prompt_cache_hint: CacheHint::default(),
+            caps_resources: false,
+            caps_prompts: false,
+            caps_completions: false,
+            caps_extensions: serde_json::Map::new(),
+            era: super::Era::Legacy {
+                version: super::PROTOCOL_VERSION.to_string(),
+            },
+            modern_http: false,
+            modern_resource_subscriptions: std::collections::HashSet::new(),
+            server_handler: None,
+        };
+        server.refresh_tools();
+        assert!(server.tools.is_empty());
+    }
+
+    /// SOU-338: resources and prompts share the empty-success guard.
+    #[test]
+    fn empty_successful_resource_and_prompt_refresh_keeps_previous() {
+        let transport = PaginationTransport::new(vec![
+            Ok(json!({ "resources": [] })),
+            Ok(json!({ "resourceTemplates": [] })),
+            Ok(json!({ "prompts": [] })),
+        ]);
+        let mut server = DownstreamServer {
+            id: "fixture".to_string(),
+            transport: Box::new(transport),
+            tools: Vec::new(),
+            resources: vec![json!({"uri":"stable-r:"})],
+            resource_templates: vec![json!({"uriTemplate":"stable://{id}"})],
+            prompts: vec![json!({"name":"stable-p"})],
+            tool_cache_hint: CacheHint::default(),
+            resource_cache_hint: CacheHint::default(),
+            resource_template_cache_hint: CacheHint::default(),
+            prompt_cache_hint: CacheHint::default(),
+            caps_resources: true,
+            caps_prompts: true,
+            caps_completions: false,
+            caps_extensions: serde_json::Map::new(),
+            era: super::Era::Legacy {
+                version: super::PROTOCOL_VERSION.to_string(),
+            },
+            modern_http: false,
+            modern_resource_subscriptions: std::collections::HashSet::new(),
+            server_handler: None,
+        };
+        server.refresh_resources();
+        server.refresh_prompts();
+        assert_eq!(server.resources, vec![json!({"uri":"stable-r:"})]);
+        assert_eq!(
+            server.resource_templates,
+            vec![json!({"uriTemplate":"stable://{id}"})]
+        );
+        assert_eq!(server.prompts, vec![json!({"name":"stable-p"})]);
     }
 
     #[test]
