@@ -3704,6 +3704,9 @@ fn execute_call(
     let mut exec_router_owned: Option<Arc<Router>> = None;
     let mut active_modern_hitl: Option<String> = None;
     let mut routed_mrtr: Option<MrtrRequest> = None;
+    // Defer the "approved" audit line until after the exec-route rebind so it names
+    // the same (server, tool) as route_call / defense / inspect (CodeRabbit on SOU-478).
+    let mut pending_approval_audit: Option<(&'static str, u64)> = None;
 
     // Human-in-the-loop approval: gate a destructive or untrusted call until a
     // person approves it in the Toolport app. Legacy clients hold this request;
@@ -3924,18 +3927,9 @@ fn execute_call(
                 }
                 exec_router_owned = Some(live);
             }
-            // Approved calls are audited too, so the trail shows what actually ran,
-            // not only what was blocked.
+            // Defer the approval audit until after the exec-route rebind below.
             if audit_approval {
-                audit::record_decision(
-                    srv,
-                    tool,
-                    client,
-                    reason_str,
-                    "approved",
-                    &arguments,
-                    Some(held_ms),
-                );
+                pending_approval_audit = Some((reason_str, held_ms));
             }
             // Skip the agent-confirm step and route the call.
             confirmed = true;
@@ -3964,6 +3958,20 @@ fn execute_call(
     let (server_id, tool) = exec_router.route_of(name).unwrap_or((server_id, tool));
     let srv_owned = sanitize_segment(server_id);
     let srv = srv_owned.as_str();
+
+    // Approval decision audit uses the rebound identity so the trail matches
+    // the server/tool that will actually run (and that content defense uses).
+    if let Some((reason_str, held_ms)) = pending_approval_audit {
+        audit::record_decision(
+            srv,
+            tool,
+            client,
+            reason_str,
+            "approved",
+            &arguments,
+            Some(held_ms),
+        );
+    }
 
     // Per-call confirmation for destructive tools: intercept the first
     // call with these arguments, store it, and return a preview. The

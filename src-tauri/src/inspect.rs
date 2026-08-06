@@ -261,6 +261,12 @@ mod tests {
         reset();
 
         let path = inspect_path().unwrap();
+        // Direct write (not via record/write_line) must ensure the data dir exists.
+        // On a fresh override / cold CI home the parent can be missing; write_line
+        // create_dir_all's it, so this test must match (CI flake: NotFound on write).
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
 
         std::fs::write(
             &path,
