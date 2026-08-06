@@ -11119,7 +11119,8 @@ fn usage() -> String {
          \n\
          ENV:\n\
          \x20   TOOLPORT_HTTP, TOOLPORT_HTTP_PORT, TOOLPORT_HTTP_HOST, TOOLPORT_HTTP_TOKEN,\n\
-         \x20   TOOLPORT_REGISTRY, TOOLPORT_DEBUG",
+         \x20   TOOLPORT_REGISTRY, TOOLPORT_DEBUG, TOOLPORT_DISCOVERY,\n\
+         \x20   TOOLPORT_CODE_MODE, TOOLPORT_DATA_DIR",
         version = env!("CARGO_PKG_VERSION"),
         insecure = INSECURE_LOOPBACK_FLAG,
     )
@@ -18969,6 +18970,23 @@ mod tests {
         assert_eq!(parse_args(&["-h".to_string()]), ArgAction::Help);
         assert_eq!(parse_args(&["--version".to_string()]), ArgAction::Version);
         assert_eq!(parse_args(&["-V".to_string()]), ArgAction::Version);
+    }
+
+    #[test]
+    fn usage_lists_public_gateway_environment_overrides() {
+        let help = usage();
+
+        for variable in [
+            "TOOLPORT_DISCOVERY",
+            "TOOLPORT_CODE_MODE",
+            "TOOLPORT_DATA_DIR",
+        ] {
+            assert!(help.contains(variable), "{variable} should be documented in --help");
+        }
+
+        // Profiling is an internal diagnostic switch, not a gateway configuration
+        // setting, so it remains intentionally absent from the public help text.
+        assert!(!help.contains("TOOLPORT_PROFILE_CALLS"));
     }
 
     #[test]
