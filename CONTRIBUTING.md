@@ -84,11 +84,10 @@ npm run format:check  # check only (fails without writing — same as CI)
 ```
 
 **Do not run `cargo fmt`.** The Rust tree is deliberately not rustfmt-clean and
-there is no fmt gate in CI, so `cargo fmt` currently rewrites 725 places across
-33 files, which is effectively every Rust file in the project. That buries your
-actual change in unrelated reflow, and it conflicts with every other open PR
-touching the same file. Match the style of the code around you, and leave the
-rest alone.
+there is no fmt gate in CI, so `cargo fmt` currently rewrites roughly 850
+places across every Rust file in the project. That buries your actual change in
+unrelated reflow, and it conflicts with every other open PR touching the same
+file. Match the style of the code around you, and leave the rest alone.
 
 If your editor formats Rust on save, turn it off for this repo:
 
