@@ -1,4 +1,17 @@
+# Check every text file out as LF, on every platform.
+#
+# Without this, a Windows clone with core.autocrlf=true gets CRLF working files
+# while Prettier is configured `endOfLine: "lf"`. `npm run format:check` then
+# reports nearly every file in the repo as unformatted, which buries the one or
+# two files that are genuinely wrong and trains contributors to ignore the
+# check. Worse, the obvious fix (`prettier --write`) rewrites the tree with CRLF
+# and still fails CI on Linux.
+#
+# Every blob in this repo is already stored LF, so this changes no file content
+# -- only how Git materializes the working tree.
+* text=auto eol=lf
+
 # Shell scripts must stay LF, or they fail to run on the macOS/Linux CI runners
-# (a CRLF in the shebang line gives "bad interpreter"). This pins them regardless
-# of a contributor's core.autocrlf setting.
+# (a CRLF in the shebang line gives "bad interpreter"). Kept explicit so the
+# guarantee survives any future narrowing of the rule above.
 *.sh text eol=lf
