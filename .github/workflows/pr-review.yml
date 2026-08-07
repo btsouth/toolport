@@ -12,8 +12,8 @@
 name: PR review
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
 
 # A second push reviews the new head, not race the old one.
 concurrency:
@@ -30,18 +30,28 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 20
-    # Fork PRs do not get repository secrets, and Dependabot-triggered runs get
-    # the Dependabot secret store rather than the repository one, so in both
-    # cases the model call would fail with a confusing auth error rather than
-    # an obvious skip. Drafts are declared-unfinished work; the
-    # ready_for_review trigger picks the PR up the moment that changes.
+    # Reviews run for: same-repo branches, established contributors (GitHub
+    # flips author_association to CONTRIBUTOR when a first PR merges, so
+    # merging someone's first PR is what adds them to the known list), or any
+    # PR a maintainer explicitly labels 'coderev' (the first-timer approval
+    # act). pull_request_target supplies secrets and runs the BASE repo's
+    # workflow, so PR authors cannot tamper with this file; the checkout below
+    # pins the PR head and nothing in the pipeline executes workspace code.
     if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
       github.actor != 'dependabot[bot]' &&
-      github.event.pull_request.draft == false
+      github.event.pull_request.draft == false &&
+      (github.event.pull_request.head.repo.full_name == github.repository ||
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association) ||
+       contains(github.event.pull_request.labels.*.name, 'coderev'))
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          # PR head, not the base: the file inventory and cited-region
+          # evidence must describe the code under review. The contents are
+          # read into prompts, never executed, and credentials do not persist.
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
 
       # Tracks main during the shadow phase so reviewer fixes land without a
       # release step. Pin to a tag once the shadow comparison earns it.
