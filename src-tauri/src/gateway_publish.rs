@@ -1951,37 +1951,6 @@ mod tests {
         assert_eq!(m, back);
     }
 
-    /// Serializes copy-then-exec of a stand-in binary across tests.
-    ///
-    /// Not for reaper reasons -- `reap_listed` bounds what a pass may touch, so tests
-    /// cannot reach each other's processes. This is the POSIX `ETXTBSY` race: while
-    /// one thread holds a write fd to the file it just copied, another thread's
-    /// `Command::spawn` forks and the child inherits that fd. The descriptor is
-    /// `O_CLOEXEC`, but it stays open across the window between the child's fork and
-    /// its exec, and a file any process holds open for writing cannot be exec'd. The
-    /// first thread's exec then fails with "Text file busy".
-    ///
-    /// Without this the three tests fail intermittently -- 3 runs in 8 while this was
-    /// being written.
-    ///
-    /// The guard deliberately spans copy through *exec completing*, i.e. it wraps the
-    /// readiness poll too, not just the copy and fork.
-    ///
-    /// Narrowing it to copy-through-fork looks correct -- `fs::copy` drops its
-    /// destination handle before `spawn`, so a child forked afterwards has no write fd
-    /// to inherit -- and was tried. It reintroduces the failure at a lower rate: 1 run
-    /// in 25, panicking in `spawn` with ETXTBSY, versus 25 in 25 clean with the guard
-    /// held across the poll. A forked child holds *every* inherited descriptor until
-    /// its own exec lands, so releasing at fork still leaves a window in which another
-    /// thread's copy target is held open by a child that has not exec'd yet.
-    ///
-    /// The cost is bounded and small: the poll is an exec-completion wait that returns
-    /// in tens of milliseconds, and the 3s in the loop below is a failure timeout, not
-    /// a typical duration. The whole `gateway_publish` suite runs in 0.36s.
-    ///
-    /// Poison is ignored so one failing test does not cascade.
-    static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// A small, long-running binary to stand in for a gateway image.
     ///
     /// Searches `PATH` rather than assuming `/bin/sleep`, so the tests still run on
@@ -2102,15 +2071,41 @@ mod tests {
             if let Some(parent) = exe.parent() {
                 std::fs::create_dir_all(parent).expect("create gateway dir");
             }
-            let _spawn = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             std::fs::copy(stand_in_binary_source(), &exe).expect("copy stand-in binary");
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod +x");
 
-            let child = std::process::Command::new(&exe)
-                .arg("300")
-                .spawn()
-                .expect("spawn stand-in gateway");
+            // Retry ETXTBSY rather than fail.
+            //
+            // Any thread that forks while this copy's write fd is open passes that fd
+            // to its child, and the descriptor stays open across the child's own
+            // fork-to-exec window. A file some process holds open for writing cannot
+            // be exec'd, so the spawn here fails with "Text file busy".
+            //
+            // A mutex around copy-through-exec used to guard this, but it could only
+            // ever serialize spawns going through *this helper*. The rest of the suite
+            // forks freely, which is why the failure never appeared running
+            // `--lib gateway_publish` alone and did appear in a full-suite run.
+            // Retrying covers every forker, not just the cooperating ones. Measured:
+            // with the mutex removed, retrying alone is 30/30 clean where the
+            // unprotected version was 5/8.
+            let mut waited = std::time::Duration::ZERO;
+            let child = loop {
+                match std::process::Command::new(&exe).arg("300").spawn() {
+                    Ok(child) => break child,
+                    // ETXTBSY. Matched on the raw errno so this does not depend on
+                    // `ErrorKind::ExecutableFileBusy`, and the block is Linux-only.
+                    Err(e)
+                        if e.raw_os_error() == Some(26)
+                            && waited < std::time::Duration::from_secs(5) =>
+                    {
+                        let step = std::time::Duration::from_millis(10);
+                        std::thread::sleep(step);
+                        waited += step;
+                    }
+                    Err(e) => panic!("spawn stand-in gateway {}: {e}", exe.display()),
+                }
+            };
             let me = Self { child, exe };
 
             let link = PathBuf::from(format!("/proc/{}/exe", me.pid()));
