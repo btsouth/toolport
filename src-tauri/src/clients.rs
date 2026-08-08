@@ -92,6 +92,12 @@ enum Format {
     /// command/args/env shape, while remote entries distinguish SSE (`url`) from
     /// streamable HTTP (`httpUrl`) and store credentials under `headers`.
     JsonQwenMcpServers,
+    /// Kimi Code's top-level `mcpServers` object (`~/.kimi-code/mcp.json`).
+    /// Stdio entries use the standard command/args/env shape; remote entries are
+    /// streamable HTTP unless they carry `transport: "sse"` (Kimi ignores the
+    /// `type` hint other clients use), and bearer auth is declared via
+    /// `bearerTokenEnvVar` naming a shell env var that holds the token.
+    JsonKimiMcpServers,
     /// JSON with a top-level `servers` object (VS Code).
     JsonServers,
     /// JSON with a top-level `mcp` object (Crush).
@@ -291,6 +297,7 @@ fn resolve_client_config_path(
         "warp" => home.join(".warp").join(".mcp.json"),
         "amazon-q" => home.join(".aws").join("amazonq").join("mcp.json"),
         "kiro" => home.join(".kiro").join("settings").join("mcp.json"),
+        "kimi-code" => home.join(".kimi-code").join("mcp.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
         "jan" => data.join("Jan").join("data").join("mcp_config.json"),
         "zed" => match platform {
@@ -404,6 +411,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "warp" => home.join(".warp").join(".mcp.json"),
         "amazon-q" => home.join(".aws").join("amazonq").join("mcp.json"),
         "kiro" => home.join(".kiro").join("settings").join("mcp.json"),
+        "kimi-code" => home.join(".kimi-code").join("mcp.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
         "jan" => data.join("Jan").join("data").join("mcp_config.json"),
         "zed" => home.join(".config").join("zed").join("settings.json"),
@@ -804,6 +812,20 @@ fn kiro_path() -> Option<PathBuf> {
     client_config_path("kiro")
 }
 
+/// Kimi Code (Moonshot AI) user-level MCP config: `~/.kimi-code/mcp.json`
+/// (`mcpServers`). Kimi merges a per-project `.kimi-code/mcp.json` over it on
+/// startup; we manage the user-level file so the gateway is available
+/// everywhere. `KIMI_CODE_HOME` relocates the whole data root, mcp.json
+/// included. The data root is created by the CLI itself, so the default
+/// parent-dir presence check detects the install.
+fn kimi_code_path() -> Option<PathBuf> {
+    std::env::var_os("KIMI_CODE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .map(|root| root.join("mcp.json"))
+        .or_else(|| client_config_path("kimi-code"))
+}
+
 /// LM Studio reads MCP servers from `~/.lmstudio/mcp.json` (`mcpServers`, plain
 /// JSON). The file is created by LM Studio, so the parent-dir presence check works.
 fn lmstudio_path() -> Option<PathBuf> {
@@ -1150,6 +1172,14 @@ fn defs() -> Vec<ClientDef> {
             plugin_scan: None,
         },
         ClientDef {
+            id: "kimi-code",
+            name: "Kimi Code",
+            format: Format::JsonKimiMcpServers,
+            uses_connectors: false,
+            path: kimi_code_path,
+            plugin_scan: None,
+        },
+        ClientDef {
             id: "zed",
             name: "Zed",
             format: Format::JsonContextServers,
@@ -1323,7 +1353,25 @@ fn json_server_with_values(name: &str, def: &serde_json::Value) -> ParsedSnippet
             }
         }
     }
-    let type_hint = def.get("type").and_then(|t| t.as_str());
+    // `type` is the common hint key (VS Code, Droid); Kimi Code marks legacy
+    // SSE endpoints with `transport: "sse"` instead. Both mean the same thing
+    // anywhere they appear, so either keys the hint.
+    // Kimi Code's `bearerTokenEnvVar` names a shell env var holding the token
+    // (the value never sits in the file). Surface the var NAME as a value-less
+    // env key so import vaults the token and remote connects send it as
+    // `Authorization: Bearer` (see `first_vaulted_secret`).
+    if let Some(var) = def.get("bearerTokenEnvVar").and_then(|v| v.as_str()) {
+        if !var.is_empty() && !env.iter().any(|e| e.key == var) {
+            env.push(SnippetEnvVar {
+                key: var.to_string(),
+                value: None,
+            });
+        }
+    }
+    let type_hint = def
+        .get("type")
+        .or_else(|| def.get("transport"))
+        .and_then(|t| t.as_str());
     let transport = classify(&command, &url, type_hint);
     ParsedSnippetServer {
         name: name.to_string(),
@@ -2407,6 +2455,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         Format::JsonDroidMcpServers => parse_json(&content, "mcpServers"),
         Format::JsonAmpMcpServers => parse_json(&content, "amp.mcpServers"),
         Format::JsonQwenMcpServers => parse_qwen_json(&content),
+        Format::JsonKimiMcpServers => parse_json(&content, "mcpServers"),
         Format::JsonServers => parse_json(&content, "servers"),
         Format::JsonMcp => parse_json(&content, "mcp"),
         Format::JsonOpenCodeMcp => parse_opencode_json(&content),
@@ -2761,6 +2810,24 @@ fn entry_to_qwen_json(entry: &ServerEntry) -> serde_json::Value {
     value
 }
 
+/// Kimi Code treats a bare `url` entry as streamable HTTP and needs an explicit
+/// `transport: "sse"` on legacy SSE endpoints; it ignores the `type` hint
+/// `entry_to_json` emits, which would silently downgrade an SSE server to HTTP.
+fn entry_to_kimi_json(entry: &ServerEntry) -> serde_json::Value {
+    let mut value = entry_to_json(entry);
+    if entry.command.is_none() {
+        let object = value.as_object_mut().unwrap();
+        object.remove("type");
+        if entry.transport.eq_ignore_ascii_case("sse") {
+            object.insert(
+                "transport".into(),
+                serde_json::Value::String("sse".into()),
+            );
+        }
+    }
+    value
+}
+
 fn entry_to_opencode_json(entry: &ServerEntry) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     map.insert("enabled".into(), serde_json::Value::Bool(true));
@@ -3013,6 +3080,12 @@ fn write_copilot_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String
 
 fn write_droid_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
     write_json_with(path, "mcpServers", servers, false, entry_to_droid_json, false, false)
+}
+
+/// Kimi Code's `mcp.json` is MCP-only (app settings live in config.toml), so a
+/// parse failure starts fresh rather than refusing to write.
+fn write_kimi_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
+    write_json_with(path, "mcpServers", servers, false, entry_to_kimi_json, false, false)
 }
 
 fn write_json_with(
@@ -3751,6 +3824,7 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
         Format::JsonDroidMcpServers => write_droid_json(&path, servers)?,
         Format::JsonAmpMcpServers => write_json(&path, "amp.mcpServers", servers, true)?,
         Format::JsonQwenMcpServers => write_qwen_json(&path, servers)?,
+        Format::JsonKimiMcpServers => write_kimi_json(&path, servers)?,
         Format::JsonServers => write_json(&path, "servers", servers, lenient)?,
         Format::JsonMcp => write_crush_json(&path, servers)?,
         Format::JsonOpenCodeMcp => write_opencode_json(&path, servers)?,
@@ -3952,6 +4026,7 @@ pub fn client_uses_mcp_remote_bridge(client_id: &str) -> bool {
     match def.format {
         // Native remote shapes already exist in our writers.
         Format::JsonQwenMcpServers
+        | Format::JsonKimiMcpServers
         | Format::JsonMcp
         | Format::JsonCopilotMcpServers
         | Format::JsonDroidMcpServers
@@ -4253,6 +4328,9 @@ fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<Wri
             edit_json_gateway(&path, "amp.mcpServers", entry, true)?
         }
         Format::JsonQwenMcpServers => edit_json_gateway(&path, "mcpServers", entry, true)?,
+        Format::JsonKimiMcpServers => {
+            edit_json_gateway(&path, "mcpServers", entry, lenient)?
+        }
         Format::JsonServers => edit_json_gateway(&path, "servers", entry, lenient)?,
         Format::JsonMcp => edit_crush_gateway(&path, entry)?,
         Format::JsonOpenCodeMcp => edit_opencode_gateway(&path, entry)?,
@@ -7066,6 +7144,153 @@ command = "npx"
     }
 
     #[test]
+    fn kimi_code_is_registered_with_its_native_transport_format() {
+        let definition = defs()
+            .into_iter()
+            .find(|definition| definition.id == "kimi-code")
+            .unwrap();
+        assert_eq!(definition.name, "Kimi Code");
+        assert!(matches!(definition.format, Format::JsonKimiMcpServers));
+        assert!(!definition.uses_connectors);
+        assert!((definition.path)().is_some());
+        assert!(!client_uses_mcp_remote_bridge("kimi-code"));
+    }
+
+    #[test]
+    fn kimi_code_config_path_is_under_home_data_root() {
+        for platform in Platform::ALL {
+            let home = mock_home(platform);
+            let path = resolve_client_config_path("kimi-code", &home, platform)
+                .expect("kimi-code path");
+            assert_eq!(
+                path,
+                home.join(".kimi-code").join("mcp.json"),
+                "kimi-code path on {platform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_code_path_honors_kimi_code_home_override() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "toolport-kimi-home-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _restore = EnvRestore::set("KIMI_CODE_HOME", &root);
+        let resolved = kimi_code_path().expect("kimi-code path with override");
+        assert_eq!(resolved, root.join("mcp.json"));
+        drop(_restore);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn kimi_json_parses_sse_transport_hint_and_bearer_env_var() {
+        let content = r#"{
+            "mcpServers": {
+                "filesystem": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+                },
+                "context7": {
+                    "url": "https://mcp.context7.com/mcp",
+                    "headers": { "CONTEXT7_API_KEY": "your-key" }
+                },
+                "legacy-events": {
+                    "transport": "sse",
+                    "url": "https://mcp.example.com/sse"
+                },
+                "authed": {
+                    "url": "https://mcp.example.com/mcp",
+                    "bearerTokenEnvVar": "MY_MCP_TOKEN"
+                }
+            }
+        }"#;
+        let servers = parse_json(content, "mcpServers").unwrap();
+        assert_eq!(servers.len(), 4);
+
+        let filesystem = servers.iter().find(|s| s.name == "filesystem").unwrap();
+        assert_eq!(filesystem.transport, "stdio");
+        assert_eq!(filesystem.command.as_deref(), Some("npx"));
+
+        let http = servers.iter().find(|s| s.name == "context7").unwrap();
+        assert_eq!(http.transport, "http");
+        assert_eq!(http.env_keys, vec!["CONTEXT7_API_KEY".to_string()]);
+
+        let sse = servers.iter().find(|s| s.name == "legacy-events").unwrap();
+        assert_eq!(sse.transport, "sse");
+        assert_eq!(sse.url.as_deref(), Some("https://mcp.example.com/sse"));
+
+        let authed = servers.iter().find(|s| s.name == "authed").unwrap();
+        assert_eq!(authed.transport, "http");
+        assert_eq!(authed.env_keys, vec!["MY_MCP_TOKEN".to_string()]);
+    }
+
+    #[test]
+    fn kimi_write_round_trips_stdio_http_and_sse() {
+        let path = temp_path("kimi-mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"existing":{"command":"node","args":["server.js"],"env":{"TOKEN":"keep"}}}}"#,
+        )
+        .unwrap();
+
+        let servers = vec![
+            stdio("filesystem"),
+            remote("remote-http", "http"),
+            remote("remote-sse", "sse"),
+        ];
+        write_kimi_json(&path, &servers).unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(root["mcpServers"].get("existing").is_none());
+
+        let http = &root["mcpServers"]["remote-http"];
+        assert_eq!(http["url"], "https://remote-http.example.com/mcp");
+        assert!(http.get("type").is_none());
+        assert!(http.get("transport").is_none());
+        assert_eq!(http["headers"]["Authorization"], "Bearer fixture");
+
+        let sse = &root["mcpServers"]["remote-sse"];
+        assert_eq!(sse["url"], "https://remote-sse.example.com/mcp");
+        assert_eq!(sse["transport"], "sse");
+        assert!(sse.get("type").is_none());
+        assert_eq!(sse["headers"]["Authorization"], "Bearer fixture");
+
+        let parsed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(
+            parsed.iter().find(|s| s.name == "filesystem").unwrap().transport,
+            "stdio"
+        );
+        assert_eq!(
+            parsed.iter().find(|s| s.name == "remote-http").unwrap().transport,
+            "http"
+        );
+        assert_eq!(
+            parsed.iter().find(|s| s.name == "remote-sse").unwrap().transport,
+            "sse"
+        );
+
+        // Gateway install preserves existing servers and uses the standard stdio shape.
+        {
+            let _e = sample_gateway(None, "kimi-code");
+            edit_json_gateway(&path, "mcpServers", Some(&_e), false)
+        }
+        .unwrap();
+        let installed =
+            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        assert!(installed.iter().any(|s| s.name == "filesystem"));
+        assert!(installed
+            .iter()
+            .any(|s| s.name == GATEWAY_ENTRY_NAME));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn goose_yaml_round_trip_preserves_config() {
         let path = temp_path("goose.yaml");
         // A real config.yaml has model settings AND extensions; touch neither but ours.
@@ -7586,6 +7811,9 @@ command = "npx"
         // mid-change.
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _copilot_home = EnvRestore::set("COPILOT_HOME", Path::new(""));
+        // kimi_code_path() honors KIMI_CODE_HOME; clear it so the wrapper matches
+        // the static resolver used for the expected path.
+        let _kimi_home = EnvRestore::set("KIMI_CODE_HOME", Path::new(""));
         let home = home().expect("home dir should be available in tests");
         let platform = Platform::current();
         for client in defs() {
@@ -7630,6 +7858,9 @@ command = "npx"
             }),
             ("junie", |home, _| {
                 home.join(".junie").join("mcp").join("mcp.json")
+            }),
+            ("kimi-code", |home, _| {
+                home.join(".kimi-code").join("mcp.json")
             }),
             ("continue", |home, _| {
                 home.join(".continue").join("config.yaml")
