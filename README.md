@@ -155,7 +155,7 @@ and refreshes too.
 
 ## Supported clients
 
-Toolport auto-detects these **33 AI clients**, installs the gateway into each with one
+Toolport auto-detects these **35 AI clients**, installs the gateway into each with one
 click, and can import a client's existing servers. It writes the config file shown
 below for you, so you never have to edit these by hand.
 
@@ -173,6 +173,7 @@ below for you, so you never have to edit these by hand.
 | Codex           | `~/.codex/config.toml`                                                                                 | TOML (`mcp_servers`)     |
 | Copilot CLI     | `~/.copilot/mcp-config.json`                                                                           | JSON (`mcpServers`)      |
 | Grok Build      | `~/.grok/config.toml`                                                                                  | TOML (`mcp_servers`)     |
+| Toolport Studio | `~/.toolport-studio/mcp.json`                                                                          | JSON (`mcpServers`)      |
 | Continue        | `~/.continue/config.yaml`                                                                              | YAML (`mcpServers`)      |
 | Antigravity     | `~/.gemini/config/mcp_config.json`                                                                     | JSON (`mcpServers`)      |
 | Gemini CLI      | `~/.gemini/settings.json`                                                                              | JSON (`mcpServers`)      |
@@ -183,6 +184,7 @@ below for you, so you never have to edit these by hand.
 | Warp            | `~/.warp/.mcp.json`                                                                                    | JSON (`mcpServers`)      |
 | Amazon Q        | `~/.aws/amazonq/mcp.json`                                                                              | JSON (`mcpServers`)      |
 | Kiro            | `~/.kiro/settings/mcp.json`                                                                            | JSON (`mcpServers`)      |
+| Kimi Code       | `$KIMI_CODE_HOME/mcp.json` (default `~/.kimi-code/mcp.json`)                                           | JSON (`mcpServers`)      |
 | Zed             | `~/.config/zed/settings.json`                                                                          | JSON (`context_servers`) |
 | LM Studio       | `~/.lmstudio/mcp.json`                                                                                 | JSON (`mcpServers`)      |
 | Jan             | `<data>/Jan/data/mcp_config.json`                                                                      | JSON (`mcpServers`)      |
