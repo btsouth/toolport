@@ -1075,6 +1075,90 @@ fn delete_secret(
     Ok(reg)
 }
 
+/// Configure the headless OAuth client-credentials flow for an HTTP server
+/// (SBS-524).
+///
+/// The secret goes to the keychain; only the non-secret client id, auth method
+/// and scopes are written to the registry. Deliberately not routed through
+/// [`set_secret`], which records an env var: this credential is not an env var,
+/// and surfacing it as one would put it in the server's environment listing.
+#[tauri::command]
+fn set_client_credentials(
+    state: State<RegistryState>,
+    server_id: String,
+    client_id: String,
+    client_secret: Option<String>,
+    token_endpoint_auth_method: Option<String>,
+    scope: Option<String>,
+) -> Result<Registry, String> {
+    let client_id = client_id.trim().to_string();
+    if client_id.is_empty() {
+        return Err("a client id is required for client-credentials auth".into());
+    }
+    // Reject an unknown method here rather than at connect time, so a typo is a
+    // dialog error instead of a failed connection later.
+    if let Some(method) = token_endpoint_auth_method.as_deref() {
+        if oauth::ClientAuthMethod::parse(method).is_none() {
+            return Err(format!(
+                "unknown token endpoint auth method {method:?}; expected \
+                 client_secret_basic, client_secret_post, or private_key_jwt"
+            ));
+        }
+    }
+    // Keychain first, outside the registry lock, matching `set_secret`. An empty
+    // secret means "keep the vaulted one", so editing scopes does not require
+    // re-entering the credential.
+    if let Some(secret) = client_secret.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        secrets::set_secret(&server_id, secrets::CLIENT_SECRET_KEY, secret)?;
+    } else if secrets::get_secret(&server_id, secrets::CLIENT_SECRET_KEY).is_none() {
+        return Err("no client secret is stored for this server yet; enter one".into());
+    }
+    // Any config change invalidates a token minted under the old settings.
+    remote::reset_client_credentials(&server_id)?;
+
+    let (reg, _) = write_registry(state.inner(), |reg| {
+        if let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) {
+            let existing = server.client_credentials.take().unwrap_or_default();
+            server.client_credentials = Some(registry::ClientCredentials {
+                client_id: client_id.clone(),
+                token_endpoint_auth_method: token_endpoint_auth_method.clone(),
+                scope: scope.clone(),
+                // Preserve fields a newer build wrote, same contract as elsewhere.
+                unknown_fields: existing.unknown_fields,
+            });
+        }
+        reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
+        Ok(())
+    })?;
+    Ok(reg)
+}
+
+/// Remove client-credentials auth from a server: the vaulted secret, the minted
+/// access token, and the registry config.
+#[tauri::command]
+fn clear_client_credentials(
+    state: State<RegistryState>,
+    server_id: String,
+) -> Result<Registry, String> {
+    let _ = secrets::delete_secret(&server_id, secrets::CLIENT_SECRET_KEY);
+    remote::reset_client_credentials(&server_id)?;
+    let (reg, _) = write_registry(state.inner(), |reg| {
+        if let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) {
+            server.client_credentials = None;
+        }
+        reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
+        Ok(())
+    })?;
+    Ok(reg)
+}
+
+/// Whether a client secret is vaulted for this server, so the UI can show
+/// "configured" without ever reading the value back.
+#[tauri::command]
+fn has_client_secret(server_id: String) -> bool {
+    secrets::get_secret(&server_id, secrets::CLIENT_SECRET_KEY).is_some()
+}
+
 /// The most recent tool-call audit entries (newest first).
 #[tauri::command]
 fn get_audit_log(limit: usize) -> Vec<serde_json::Value> {
@@ -3446,6 +3530,9 @@ pub fn run() {
             migrate_client,
             set_secret,
             delete_secret,
+            set_client_credentials,
+            clear_client_credentials,
+            has_client_secret,
             secret_status,
             get_audit_log,
             audit_stats,

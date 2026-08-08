@@ -5,6 +5,9 @@ import { toastError } from "@/lib/toast";
 import { openExternal } from "@/lib/openUrl";
 import {
   authenticateOauth,
+  setClientCredentials,
+  clearClientCredentials,
+  hasClientSecret,
   clearAuthToken,
   deleteSecret,
   hasAuthToken,
@@ -91,6 +94,15 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   const [authSet, setAuthSet] = useState(false);
   const [authInput, setAuthInput] = useState("");
   const [oauthBusy, setOauthBusy] = useState(false);
+  // Headless (client-credentials) auth. `ccSecretSet` tracks only whether a
+  // secret exists; the value is never read back out of the keychain.
+  const [ccOpen, setCcOpen] = useState(false);
+  const [ccBusy, setCcBusy] = useState(false);
+  const [ccSecretSet, setCcSecretSet] = useState(false);
+  const [ccClientId, setCcClientId] = useState("");
+  const [ccSecret, setCcSecret] = useState("");
+  const [ccScope, setCcScope] = useState("");
+  const [ccMethod, setCcMethod] = useState("");
   const [authInfo, setAuthInfo] = useState<AuthInfo | null>(null);
   const [probing, setProbing] = useState(false);
 
@@ -122,6 +134,17 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
     if (isRemote && server.url) {
       hasAuthToken(server.id)
         .then((v) => fresh() && setAuthSet(v))
+        .catch(() => {});
+      // Seed the headless form from the registry. The secret is deliberately not
+      // fetched: only whether one exists, so it can never be read back out.
+      const cc = server.clientCredentials ?? null;
+      setCcClientId(cc?.clientId ?? "");
+      setCcScope(cc?.scope ?? "");
+      setCcMethod(cc?.tokenEndpointAuthMethod ?? "");
+      setCcSecret("");
+      setCcOpen(cc != null);
+      hasClientSecret(server.id)
+        .then((v) => fresh() && setCcSecretSet(v))
         .catch(() => {});
       setProbing(true);
       setAuthInfo(null);
@@ -164,6 +187,54 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       toastError(secretErrorMessage(e));
     } finally {
       setBusyKey(null);
+    }
+  }
+
+  async function saveClientCredentials() {
+    if (!ccClientId.trim()) {
+      toastError("Enter the client id issued by your authorization server.");
+      return;
+    }
+    setCcBusy(true);
+    try {
+      onSaved(
+        await setClientCredentials(
+          server.id,
+          ccClientId.trim(),
+          ccSecret,
+          ccMethod ? ccMethod : null,
+          ccScope.trim() ? ccScope.trim() : null,
+        ),
+      );
+      setCcSecretSet(true);
+      setCcSecret("");
+      toast.success("Saved client credentials", {
+        description: "The next connection will request a token. No browser needed.",
+      });
+      onChanged?.();
+    } catch (e) {
+      toastError(`${e}`);
+    } finally {
+      setCcBusy(false);
+    }
+  }
+
+  async function removeClientCredentials() {
+    setCcBusy(true);
+    try {
+      onSaved(await clearClientCredentials(server.id));
+      setCcSecretSet(false);
+      setCcClientId("");
+      setCcSecret("");
+      setCcScope("");
+      setCcMethod("");
+      setCcOpen(false);
+      toast.success("Removed client credentials");
+      onChanged?.();
+    } catch (e) {
+      toastError(`${e}`);
+    } finally {
+      setCcBusy(false);
     }
   }
 
@@ -397,6 +468,94 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                       here.
                     </p>
                   )}
+
+                  {/* Headless auth. Kept behind a disclosure so the common case
+                      (browser sign-in) stays the obvious one, and deliberately
+                      worded to distinguish the two: the failure people hit is
+                      configuring this and then waiting for a browser prompt that
+                      never comes. */}
+                  <div className="mt-1 border-t border-border/60 pt-3">
+                    {!ccOpen ? (
+                      <button
+                        type="button"
+                        className="text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                        onClick={() => setCcOpen(true)}
+                      >
+                        No browser available? Use a client id and secret instead
+                      </button>
+                    ) : (
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-xs font-medium">
+                            Client credentials (no browser)
+                          </p>
+                          {ccSecretSet && (
+                            <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+                              <Check className="size-3" /> secret stored
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-muted-foreground">
+                          For servers that authenticate the application rather than a
+                          person, e.g. on a build machine. Toolport requests a token
+                          directly and renews it automatically; it never opens a browser
+                          for this server.
+                        </p>
+                        <Input
+                          value={ccClientId}
+                          onChange={(e) => setCcClientId(e.target.value)}
+                          placeholder="Client ID"
+                          autoComplete="off"
+                        />
+                        <Input
+                          type="password"
+                          value={ccSecret}
+                          onChange={(e) => setCcSecret(e.target.value)}
+                          placeholder={
+                            ccSecretSet
+                              ? "Client secret (leave blank to keep the stored one)"
+                              : "Client secret"
+                          }
+                          autoComplete="off"
+                        />
+                        <Input
+                          value={ccScope}
+                          onChange={(e) => setCcScope(e.target.value)}
+                          placeholder="Scopes (optional, space separated)"
+                          autoComplete="off"
+                        />
+                        <p className="text-[11px] text-muted-foreground">
+                          The secret is stored in your OS keychain, never in
+                          Toolport&rsquo;s config file, backups, or shared setups.
+                        </p>
+                        <div className="flex gap-2">
+                          <Button
+                            size="sm"
+                            disabled={ccBusy}
+                            onClick={saveClientCredentials}
+                            aria-label="Save client credentials"
+                          >
+                            {ccBusy ? (
+                              <Loader2 className="size-4 animate-spin" />
+                            ) : (
+                              "Save"
+                            )}
+                          </Button>
+                          {(ccSecretSet || server.clientCredentials) && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              disabled={ccBusy}
+                              onClick={removeClientCredentials}
+                              aria-label="Remove client credentials"
+                            >
+                              Remove
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </>
               )}
             </div>

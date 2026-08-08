@@ -280,6 +280,19 @@ fn reacquire_client_credentials(server_id: &str) -> Result<RefreshedToken, Strin
     })
 }
 
+/// Drop vaulted client-credentials state so the next connect re-acquires.
+///
+/// Called whenever the configuration changes. The state records the issuer,
+/// method and scopes resolved at acquisition time, so leaving it in place after
+/// an edit would keep minting tokens against the OLD configuration and the user's
+/// change would appear to do nothing.
+pub fn reset_client_credentials(server_id: &str) -> Result<(), String> {
+    let _ = secrets::delete_secret(server_id, CC_STATE_KEY);
+    // The access token was minted under the previous configuration too.
+    let _ = secrets::delete_secret(server_id, secrets::HTTP_AUTH_KEY);
+    Ok(())
+}
+
 /// Expiry of the vaulted client-credentials token, if this server uses that flow.
 fn client_credentials_expiry(server_id: &str) -> Option<u64> {
     let state: ClientCredentialsState = secrets::get_secret(server_id, CC_STATE_KEY)
