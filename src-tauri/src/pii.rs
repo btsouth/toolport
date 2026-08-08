@@ -436,13 +436,34 @@ fn for_each_result_text(result: &mut Value, f: &mut impl FnMut(&mut String)) {
     }
 }
 
-/// Apply `f` to every string in a JSON tree, including object keys' values and
-/// nested arrays.
+/// Apply `f` to every string in a JSON tree: values, array elements, and object
+/// KEYS.
+///
+/// Keys matter. A model handed `⟦EMAIL_1⟧` can just as easily use it as a map key
+/// as a value -- `{"⟦EMAIL_1⟧": "owner"}` -- and skipping keys would send the
+/// pseudonym to the real server, which is the one outcome re-hydration exists to
+/// prevent. Keys are only rebuilt when one actually changes, so the common case
+/// does not pay for the allocation.
 fn walk_strings(v: &mut Value, f: &mut impl FnMut(&mut String)) {
     match v {
         Value::String(s) => f(s),
         Value::Array(items) => items.iter_mut().for_each(|i| walk_strings(i, f)),
-        Value::Object(map) => map.values_mut().for_each(|i| walk_strings(i, f)),
+        Value::Object(map) => {
+            let renames: Vec<(String, String)> = map
+                .keys()
+                .filter_map(|k| {
+                    let mut candidate = k.clone();
+                    f(&mut candidate);
+                    (candidate != *k).then(|| (k.clone(), candidate))
+                })
+                .collect();
+            for (old, new) in renames {
+                if let Some(value) = map.remove(&old) {
+                    map.insert(new, value);
+                }
+            }
+            map.values_mut().for_each(|i| walk_strings(i, f));
+        }
         _ => {}
     }
 }
@@ -752,6 +773,43 @@ mod tests {
         rehydrate_args(&m, &mut args);
         assert_eq!(args["known"], "ada@example.com");
         assert_eq!(args["never_seen"], "grace@example.com");
+    }
+
+    /// A model can use a token as a map key just as easily as a value. Skipping
+    /// keys would send the pseudonym to the real server -- the one outcome
+    /// re-hydration exists to prevent.
+    #[test]
+    fn rehydrate_replaces_tokens_used_as_object_keys() {
+        let mut m = map();
+        m.pseudonymize("ada@example.com");
+        let mut args = serde_json::json!({
+            "roles": { "⟦EMAIL_1⟧": "owner", "untouched": "value" }
+        });
+        rehydrate_args(&m, &mut args);
+        assert_eq!(args["roles"]["ada@example.com"], "owner");
+        assert!(args["roles"].get("⟦EMAIL_1⟧").is_none());
+        assert_eq!(args["roles"]["untouched"], "value");
+    }
+
+    /// Two clients share one gateway process over the HTTP bridge. Their maps must
+    /// be separate, or a token minted from one client's result re-hydrates into the
+    /// other's outgoing call and hands over real PII.
+    #[test]
+    fn separate_maps_do_not_share_tokens() {
+        let mut a = map();
+        let mut b = map();
+        assert_eq!(a.pseudonymize("ada@example.com").text, "⟦EMAIL_1⟧");
+        assert_eq!(b.pseudonymize("grace@example.com").text, "⟦EMAIL_1⟧");
+
+        // Same token text, different owners: each map must resolve only its own.
+        assert_eq!(a.rehydrate("⟦EMAIL_1⟧"), "ada@example.com");
+        assert_eq!(b.rehydrate("⟦EMAIL_1⟧"), "grace@example.com");
+
+        // And a token minted only by `a` is unknown to `b`, so it stays literal
+        // rather than resolving to whatever `b` happens to hold.
+        a.pseudonymize("carol@example.com");
+        assert_eq!(a.rehydrate("⟦EMAIL_2⟧"), "carol@example.com");
+        assert_eq!(b.rehydrate("⟦EMAIL_2⟧"), "⟦EMAIL_2⟧");
     }
 
     #[test]

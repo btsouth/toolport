@@ -1524,6 +1524,7 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     reg.team_forced_quarantine_on_drift = policy_forces("forceQuarantineOnDrift");
     reg.team_forced_human_approval = policy_forces("forceHumanApproval");
     reg.team_forced_block_on_injection = policy_forces("forceBlockOnInjection");
+    reg.team_forced_pii_redaction = policy_forces("forcePiiRedaction");
 
     // SOU-171: org opt-in for per-call audit export (member apps upload when true).
     // SOU-340: resolved tool-call caps for this member (empty clears prior caps).
@@ -1762,6 +1763,7 @@ pub fn remove_team(reg: &mut Registry, team_id: &str) {
     reg.team_forced_content_defense = false;
     reg.team_forced_quarantine_on_drift = false;
     reg.team_forced_block_on_injection = false;
+    reg.team_forced_pii_redaction = false;
     // Export flag lives on TeamConnection which is cleared on disconnect; no extra field.
 }
 
