@@ -3343,10 +3343,15 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // `generate_context!()` must expand exactly once in this crate: on macOS dev
+    // builds each expansion embeds a `_EMBED_INFO_PLIST` byte section, and two
+    // collide at codegen ("symbol is already defined"). Both startup paths share
+    // this one Context; exactly one of them consumes it.
+    let context = tauri::generate_context!();
     let registry = match registry::load() {
         Ok(registry) => registry,
         Err(error) => {
-            run_registry_startup_failure(error);
+            run_registry_startup_failure(error, context);
             return;
         }
     };
@@ -3745,7 +3750,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             // Never orphan the HTTP bridge: kill the supervised child on exit.
@@ -3774,7 +3779,7 @@ pub fn run() {
 /// normal app (and therefore every mutating command) is never initialized with an invented
 /// empty registry. Closing the dialog exits; the user can then resolve a stuck lock or restore
 /// one of the preserved backup/unreadable files before relaunching (SOU-331).
-fn run_registry_startup_failure(error: String) {
+fn run_registry_startup_failure(error: String, context: tauri::Context) {
     let message = registry_startup_failure_message(
         registry::resolved_path().as_deref(),
         &error,
@@ -3791,7 +3796,7 @@ fn run_registry_startup_failure(error: String) {
                 .show(move |_| handle.exit(1));
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while showing the Toolport registry recovery dialog");
 }
 
