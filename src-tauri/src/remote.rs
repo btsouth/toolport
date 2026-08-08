@@ -302,6 +302,21 @@ pub fn reset_client_credentials(server_id: &str) -> Result<(), String> {
     secrets::delete_secret(server_id, secrets::HTTP_AUTH_KEY)
 }
 
+/// Does the vaulted state name a different MCP URL than the one being connected?
+///
+/// Compared case-insensitively on the trimmed string. An unreadable state counts
+/// as unchanged: the caller only uses this to decide whether to discard state,
+/// and discarding on a parse failure would loop a broken vault into re-acquiring
+/// on every connect.
+fn client_credentials_resource_changed(server_id: &str, url: &str) -> bool {
+    let Some(state) = secrets::get_secret(server_id, CC_STATE_KEY)
+        .and_then(|s| serde_json::from_str::<ClientCredentialsState>(&s).ok())
+    else {
+        return false;
+    };
+    !state.resource.trim().eq_ignore_ascii_case(url.trim())
+}
+
 /// Expiry of the vaulted client-credentials token, if this server uses that flow.
 fn client_credentials_expiry(server_id: &str) -> Option<u64> {
     let state: ClientCredentialsState = secrets::get_secret(server_id, CC_STATE_KEY)
@@ -700,12 +715,25 @@ pub fn connect_remote_with_handler(
     // registry config (client id, method, scopes); every later reacquisition runs
     // from the state vaulted here, which is why it can go through the shared seam
     // with just a server id.
-    // Config removed while vaulted state survived -- e.g. registry.json edited by
-    // hand with the app closed. Clear it here, at the one place that can see both,
-    // so the reacquire path cannot keep the headless flow alive for a server that
-    // is no longer configured for it.
-    if !uses_client_credentials(server) && secrets::get_secret(server_id, CC_STATE_KEY).is_some() {
-        let _ = reset_client_credentials(server_id);
+    // Vaulted state that no longer matches the entry. Two cases, both reached by
+    // editing the server outside `set_client_credentials`:
+    //
+    //   * the config was removed (e.g. registry.json edited with the app closed),
+    //     which would otherwise keep the headless flow alive for a server no
+    //     longer configured for it;
+    //   * the URL changed, which matters more. The vaulted state pins `resource`,
+    //     and the token is bound to it via RFC 8707, so reusing it would present a
+    //     credential minted for the OLD resource to the new one. Reset instead, so
+    //     the next acquisition binds to the URL actually being contacted.
+    //
+    // Handled here because this is the only place that sees both the current entry
+    // and the vault; the reacquire seam takes just a server id by design.
+    if secrets::get_secret(server_id, CC_STATE_KEY).is_some()
+        && (!uses_client_credentials(server) || client_credentials_resource_changed(server_id, url))
+    {
+        // Not ignored: leaving stale state would silently keep using the wrong
+        // flow, or the wrong resource binding, for the rest of the session.
+        reset_client_credentials(server_id)?;
     }
     if uses_client_credentials(server) && secrets::get_secret(server_id, CC_STATE_KEY).is_none() {
         let config = server

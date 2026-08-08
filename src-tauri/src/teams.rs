@@ -1356,7 +1356,10 @@ fn team_server_export(reg: &Registry) -> Value {
                 // payload, so a teammate importing this gets a server that tells
                 // them to add their own secret rather than one that silently falls
                 // back to an interactive browser flow they cannot complete.
-                "clientCredentials": s.client_credentials,
+                "clientCredentials": s.client_credentials.clone().map(|mut c| {
+                    c.strip_secret_fields();
+                    c
+                }),
             })
         })
         .collect();
@@ -1653,7 +1656,10 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
             {
                 return TeamClass::Blocked
             }
-            Ok(c) => Some(c),
+            Ok(mut c) => {
+                c.strip_secret_fields();
+                Some(c)
+            }
             Err(_) => return TeamClass::Blocked,
         },
         None => None,
@@ -2492,6 +2498,55 @@ mod tests {
             }
             _ => panic!("expected import"),
         }
+    }
+
+    /// A `clientSecret` must never survive into the registry or back out to the
+    /// org. `unknown_fields` is forward-compat, not a smuggling channel.
+    #[test]
+    fn team_client_credentials_never_carry_a_secret_in_unknown_fields() {
+        let mut hostile = serde_json::json!({
+            "id": "s", "name": "S", "transport": "http",
+            "url": "https://mcp.example.com/mcp",
+        });
+        hostile["clientCredentials"] = serde_json::json!({
+            "clientId": "c",
+            "clientSecret": "leaked",
+            "somethingNewer": 1,
+        });
+
+        let imported = match classify_team_server(&hostile, "team:t1") {
+            TeamClass::Review(e) | TeamClass::Ready(e) => e,
+            _ => panic!("expected import"),
+        };
+        let cc = imported.client_credentials.expect("config imported");
+        assert!(
+            !cc.unknown_fields.contains_key("clientSecret"),
+            "a secret must not be persisted: {:?}",
+            cc.unknown_fields
+        );
+        // Genuine forward-compat still survives.
+        assert!(cc.unknown_fields.contains_key("somethingNewer"));
+
+        // And the export leg strips it too, for a registry that already has one.
+        let mut reg = base_registry();
+        let entry = reg.servers.iter_mut().find(|s| s.id == "mine").unwrap();
+        entry.transport = "http".into();
+        entry.command = None;
+        entry.url = Some("https://mcp.example.com/mcp".into());
+        let mut smuggled = crate::registry::ClientCredentials {
+            client_id: "c".into(),
+            ..Default::default()
+        };
+        smuggled
+            .unknown_fields
+            .insert("clientSecret".into(), Value::String("leaked".into()));
+        entry.client_credentials = Some(smuggled);
+
+        let json = serde_json::to_string(&team_server_export(&reg)).unwrap();
+        assert!(
+            !json.contains("leaked") && !json.contains("clientSecret"),
+            "a secret must never be pushed to the org: {json}"
+        );
     }
 
     /// An auth method this build cannot perform is refused at import, rather than

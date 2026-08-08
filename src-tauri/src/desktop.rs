@@ -1118,10 +1118,13 @@ fn set_client_credentials(
     // Reject an unknown method here rather than at connect time, so a typo is a
     // dialog error instead of a failed connection later.
     if let Some(method) = token_endpoint_auth_method.as_deref() {
-        if oauth::ClientAuthMethod::parse(method).is_none() {
+        // Unusable as well as unrecognised. `private_key_jwt` parses but is not
+        // implemented, so persisting it produces a server that fails closed at
+        // every connect. Team import already refuses it; this is the same rule at
+        // the other entry point.
+        if !oauth::ClientAuthMethod::parse(method).is_some_and(|m| m.is_implemented()) {
             return Err(format!(
-                "unknown token endpoint auth method {method:?}; expected \
-                 client_secret_basic, client_secret_post, or private_key_jwt"
+                "unsupported token endpoint auth method {method:?}; expected                  client_secret_basic or client_secret_post (private_key_jwt is                  not implemented yet, see SBS-599)"
             ));
         }
     }

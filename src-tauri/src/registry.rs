@@ -157,8 +157,31 @@ pub struct ClientCredentials {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     /// Forward-compat, same contract as `ServerEntry::unknown_fields`.
+    ///
+    /// Sanitized by [`Self::strip_secret_fields`] wherever this crosses a trust
+    /// boundary: forward-compat must not become a smuggling channel for a
+    /// credential this type is specifically designed never to hold.
     #[serde(flatten)]
     pub unknown_fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ClientCredentials {
+    /// Drop any forward-compat field whose name looks like a credential.
+    ///
+    /// `unknown_fields` exists so a newer build's additions survive a round trip
+    /// through an older one. That is the right default for configuration, and the
+    /// wrong one for secrets: a `clientSecret` key written by hand into
+    /// registry.json, or present in a team payload, would otherwise be preserved
+    /// and then pushed to the org control plane and every teammate by
+    /// `team_server_export` -- the exact leak this struct's shape is meant to make
+    /// impossible.
+    ///
+    /// Name-based and deliberately broad. A real forward-compat field is free to
+    /// avoid the word; a credential that slips through is not recoverable.
+    pub fn strip_secret_fields(&mut self) {
+        self.unknown_fields
+            .retain(|k, _| !k.to_ascii_lowercase().contains("secret"));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
