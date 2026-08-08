@@ -1095,6 +1095,15 @@ fn set_client_credentials(
     if client_id.is_empty() {
         return Err("a client id is required for client-credentials auth".into());
     }
+    // Trim at the boundary, not just in the UI. `ClientAuthMethod::parse` trims
+    // before matching, so an untrimmed method would validate here and then be
+    // persisted with the whitespace still on it; scope is sent to the token
+    // endpoint verbatim, where padding can be rejected.
+    let blank_to_none = |v: Option<String>| {
+        v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    };
+    let token_endpoint_auth_method = blank_to_none(token_endpoint_auth_method);
+    let scope = blank_to_none(scope);
     // Reject an unknown method here rather than at connect time, so a typo is a
     // dialog error instead of a failed connection later.
     if let Some(method) = token_endpoint_auth_method.as_deref() {
@@ -1117,16 +1126,20 @@ fn set_client_credentials(
     remote::reset_client_credentials(&server_id)?;
 
     let (reg, _) = write_registry(state.inner(), |reg| {
-        if let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) {
-            let existing = server.client_credentials.take().unwrap_or_default();
-            server.client_credentials = Some(registry::ClientCredentials {
-                client_id: client_id.clone(),
-                token_endpoint_auth_method: token_endpoint_auth_method.clone(),
-                scope: scope.clone(),
-                // Preserve fields a newer build wrote, same contract as elsewhere.
-                unknown_fields: existing.unknown_fields,
-            });
-        }
+        // Fail loudly on an unknown id. The keychain write above already happened,
+        // so silently skipping the registry half would leave a stored secret with
+        // no configuration pointing at it, and report success.
+        let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) else {
+            return Err(format!("no server with id {server_id:?}"));
+        };
+        let existing = server.client_credentials.take().unwrap_or_default();
+        server.client_credentials = Some(registry::ClientCredentials {
+            client_id: client_id.clone(),
+            token_endpoint_auth_method: token_endpoint_auth_method.clone(),
+            scope: scope.clone(),
+            // Preserve fields a newer build wrote, same contract as elsewhere.
+            unknown_fields: existing.unknown_fields,
+        });
         reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
         Ok(())
     })?;
@@ -1143,9 +1156,10 @@ fn clear_client_credentials(
     let _ = secrets::delete_secret(&server_id, secrets::CLIENT_SECRET_KEY);
     remote::reset_client_credentials(&server_id)?;
     let (reg, _) = write_registry(state.inner(), |reg| {
-        if let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) {
-            server.client_credentials = None;
-        }
+        let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) else {
+            return Err(format!("no server with id {server_id:?}"));
+        };
+        server.client_credentials = None;
         reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
         Ok(())
     })?;

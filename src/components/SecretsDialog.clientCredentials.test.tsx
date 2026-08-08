@@ -134,6 +134,21 @@ describe("SecretsDialog client credentials (SBS-524)", () => {
     );
   });
 
+  /// The backend also rejects this, but its message describes stored state; the
+  /// first-time user needs a direct instruction.
+  it("requires a secret the first time, before calling the backend", async () => {
+    hasClientSecret.mockResolvedValue(false);
+    const user = await openDialog(server());
+    await user.click(
+      screen.getByText(/No browser available\? Use a client id and secret/i),
+    );
+    await user.type(screen.getByPlaceholderText("Client ID"), "client-abc");
+    await user.click(screen.getByRole("button", { name: "Save client credentials" }));
+
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(setClientCredentials).not.toHaveBeenCalled();
+  });
+
   it("refuses to save without a client id instead of calling the backend", async () => {
     const user = await openDialog(server());
     await user.click(

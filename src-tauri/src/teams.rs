@@ -1351,6 +1351,12 @@ fn team_server_export(reg: &Registry) -> Value {
                 "url": url,
                 "env": s.env.iter().map(|e| serde_json::json!({ "key": e.key, "secret": e.secret })).collect::<Vec<_>>(),
                 "disabledTools": s.disabled_tools,
+                // Non-secret by construction: client id, method and scopes only.
+                // The client SECRET is vaulted per member and is never in this
+                // payload, so a teammate importing this gets a server that tells
+                // them to add their own secret rather than one that silently falls
+                // back to an interactive browser flow they cannot complete.
+                "clientCredentials": s.client_credentials,
             })
         })
         .collect();
@@ -1634,7 +1640,14 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         source: Some(tag.to_string()),
         disabled_tools: str_array("disabledTools"),
         cwd: None,
-        client_credentials: None,
+        // Carried through so a shared headless server stays headless. Dropping it
+        // silently downgraded the member to interactive OAuth, which is exactly
+        // what this flow exists to avoid; the secret is still theirs to add.
+        client_credentials: s
+            .get("clientCredentials")
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .filter(|c: &crate::registry::ClientCredentials| !c.client_id.trim().is_empty()),
         unknown_fields: serde_json::Map::new(),
     };
 
@@ -2362,6 +2375,95 @@ mod tests {
         assert!(message.contains("nothing was overwritten"));
         assert_eq!(push_status_message(401), None);
         assert_eq!(push_status_message(500), None);
+    }
+
+    #[test]
+    /// SBS-524: a shared headless server must stay headless.
+    ///
+    /// Dropping the block on either leg silently downgrades the member to the
+    /// interactive browser flow, which is the exact thing that flow exists to
+    /// avoid, and nothing would report an error.
+    #[test]
+    fn client_credentials_round_trip_through_team_import_and_export() {
+        let config = crate::registry::ClientCredentials {
+            client_id: "client-abc".into(),
+            token_endpoint_auth_method: Some("client_secret_basic".into()),
+            scope: Some("mcp:read".into()),
+            unknown_fields: serde_json::Map::new(),
+        };
+        let mut reg = base_registry();
+        let server = reg
+            .servers
+            .iter_mut()
+            .find(|s| s.id == "mine")
+            .expect("fixture server");
+        server.transport = "http".into();
+        server.command = None;
+        server.url = Some("https://mcp.example.com/mcp".into());
+        server.client_credentials = Some(config.clone());
+
+        let exported = team_server_export(&reg);
+        let entry = exported
+            .as_array()
+            .and_then(|a| a.iter().find(|s| s.get("id").and_then(Value::as_str) == Some("mine")))
+            .expect("the server must be exported");
+        assert_eq!(
+            entry.get("clientCredentials").and_then(|c| c.get("clientId")),
+            Some(&Value::String("client-abc".into())),
+            "export dropped the config: {entry}"
+        );
+        // The secret is per member and must never ride along.
+        assert!(
+            !serde_json::to_string(entry).unwrap().contains("clientSecret"),
+            "a client secret must never be pushed to the org: {entry}"
+        );
+
+        match classify_team_server(entry, "team:t1") {
+            TeamClass::Review(imported) | TeamClass::Ready(imported) => {
+                assert_eq!(
+                    imported.client_credentials.as_ref().map(|c| c.client_id.as_str()),
+                    Some("client-abc"),
+                    "import dropped the config"
+                );
+                assert_eq!(
+                    imported
+                        .client_credentials
+                        .as_ref()
+                        .and_then(|c| c.scope.as_deref()),
+                    Some("mcp:read")
+                );
+            }
+            _ => panic!("expected the http server to import"),
+        }
+    }
+
+    /// A server with no block, or a blank client id, must not be treated as
+    /// configured: that would send every connect down the headless path and fail
+    /// with "no client secret vaulted".
+    #[test]
+    fn team_import_ignores_absent_or_blank_client_credentials() {
+        let base = serde_json::json!({
+            "id": "s", "name": "S", "transport": "http",
+            "url": "https://mcp.example.com/mcp",
+        });
+        match classify_team_server(&base, "team:t1") {
+            TeamClass::Review(e) | TeamClass::Ready(e) => {
+                assert!(e.client_credentials.is_none())
+            }
+            _ => panic!("expected import"),
+        }
+
+        let mut blank = base.clone();
+        blank["clientCredentials"] = serde_json::json!({ "clientId": "   " });
+        match classify_team_server(&blank, "team:t1") {
+            TeamClass::Review(e) | TeamClass::Ready(e) => {
+                assert!(
+                    e.client_credentials.is_none(),
+                    "a blank client id must not count as configured"
+                )
+            }
+            _ => panic!("expected import"),
+        }
     }
 
     #[test]

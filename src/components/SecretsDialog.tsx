@@ -195,6 +195,13 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       toastError("Enter the client id issued by your authorization server.");
       return;
     }
+    // A blank secret means "keep the stored one", which is only meaningful when
+    // one exists. Catch it here so the first-time case gets a direct instruction
+    // instead of a backend error describing internal state.
+    if (!ccSecretSet && !ccSecret.trim()) {
+      toastError("Enter the client secret issued by your authorization server.");
+      return;
+    }
     setCcBusy(true);
     try {
       onSaved(
@@ -527,6 +534,9 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                         <p className="text-[11px] text-muted-foreground">
                           The secret is stored in your OS keychain, never in
                           Toolport&rsquo;s config file, backups, or shared setups.
+                          {ccSecretSet
+                            ? " It cannot be shown again; leave the field blank to keep it."
+                            : ""}
                         </p>
                         <div className="flex gap-2">
                           <Button
