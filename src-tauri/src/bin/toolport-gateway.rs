@@ -3617,22 +3617,6 @@ fn execute_call(
     // `None` only in test wrappers that lack `GatewayState`.
     live_router: Option<&Arc<Mutex<Arc<Router>>>>,
 ) -> Value {
-    // Turn pseudonyms back into real values BEFORE anything inspects the arguments
-    // (SBS-346).
-    //
-    // Every gate downstream of here reads them: the human-approval prompt, the
-    // destructive-call confirmation preview, the content-binding hash, and the
-    // audit record. An approver asked to authorize a send to `⟦EMAIL_1⟧` cannot
-    // make an informed decision, and a hash taken over pseudonyms would not
-    // describe the call actually dispatched. Re-hydrating once, up front, keeps
-    // all of them consistent with what the downstream server receives.
-    //
-    // A no-op when the feature is off or nothing was ever tokenized.
-    let mut arguments = arguments;
-    if reg.pii_redaction_effective() {
-        with_pii_session(client, |map| pii::rehydrate_args(map, &mut arguments));
-    }
-
     let mut confirmed = opts.confirmed;
     let shape = opts.shape;
     if !opts.allow_app_only && !named_tool_is_model_visible(name, cached, router) {
@@ -3779,7 +3763,12 @@ fn execute_call(
                 server: srv.to_string(),
                 tool: tool.to_string(),
                 reason,
-                arguments: arguments.clone(),
+                // Real values, for THIS path only (SBS-346). The local broker is a
+                // loopback UI shown to the trusted human on this machine and is not
+                // persisted, so an approver sees the recipient they are actually
+                // authorizing rather than `⟦EMAIL_1⟧`. Everything model-facing keeps
+                // the pseudonyms.
+                arguments: rehydrated_for_local_approver(reg, client, &arguments),
                 tool_fingerprint: current_fp.clone(),
             };
             let mut approval_reason = reason;
@@ -4068,6 +4057,17 @@ fn execute_call(
     let (_progress_route, relay_owned) = prepare_progress(client_meta, server_id);
     let client_meta = relay_owned.as_ref().or(client_meta);
 
+    // Resolve pseudonyms LAST, immediately before the call leaves the machine, so
+    // the downstream server gets real data while every model-facing path above
+    // kept the tokens (SBS-346).
+    //
+    // Gated on the map rather than the setting: a user who turns PII off
+    // mid-session still has tokens sitting in the model's context, and skipping
+    // this would dispatch a literal `⟦EMAIL_1⟧` as the recipient. `rehydrate_args`
+    // is already a no-op on an empty map.
+    let mut arguments = arguments;
+    with_pii_session(client, |map| pii::rehydrate_args(map, &mut arguments));
+
     let started = Instant::now();
     let effective_mrtr = routed_mrtr.as_ref().or(mrtr);
     match exec_router.route_call_with_cancel_and_mrtr(
@@ -4246,6 +4246,24 @@ fn with_pii_session<T>(client: Option<&str>, f: impl FnOnce(&mut pii::SessionMap
 /// Runs BEFORE content-defense so the injection wrapper, which is Toolport's own
 /// text rather than untrusted content, is not scanned as if it were PII.
 ///
+/// A copy of `arguments` with pseudonyms resolved, for the LOCAL approval UI.
+///
+/// Deliberately not applied to `arguments` itself. Everything else that reads them
+/// before dispatch is model-facing -- the modern HITL elicitation is relayed back
+/// through the model host, the destructive-confirm preview is returned to the
+/// model as a tool result, and live inspect writes them to disk -- so resolving
+/// them in place would push real PII into exactly the places this feature exists
+/// to keep it out of. The local broker is loopback-only and unpersisted, which is
+/// the one audience that should see real values before the wire does.
+fn rehydrated_for_local_approver(reg: &Registry, client: Option<&str>, arguments: &Value) -> Value {
+    if !reg.pii_redaction_effective() {
+        return arguments.clone();
+    }
+    let mut copy = arguments.clone();
+    with_pii_session(client, |map| pii::rehydrate_args(map, &mut copy));
+    copy
+}
+
 /// An incomplete pass is logged. This path fails OPEN -- a full map or an over-cap
 /// result leaves values in the clear -- and the whole point of returning
 /// `complete` was so that could be noticed rather than assumed away.
@@ -4256,7 +4274,7 @@ fn pseudonymize_if_enabled(reg: &Registry, client: Option<&str>, result: &mut Va
     let out = with_pii_session(client, |map| pii::pseudonymize_result(map, result));
     if !out.complete {
         eprintln!(
-            "toolport: PII pseudonymization was incomplete for this result - some values              reached the model in the clear (the session map is full, or the result exceeded              the scan cap)."
+            "toolport: PII pseudonymization was incomplete for this result - some values reached the model in the clear (the session map is full, or the result exceeded the scan cap)."
         );
     }
     out.replaced

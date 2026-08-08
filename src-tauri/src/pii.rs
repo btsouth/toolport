@@ -414,6 +414,15 @@ fn for_each_result_text(result: &mut Value, f: &mut impl FnMut(&mut String)) {
     let Some(obj) = result.as_object_mut() else {
         return;
     };
+    // `structuredContent` is model-facing payload, not plumbing: modern hosts feed
+    // it straight to the model, and `shaping::shape_result` relays it verbatim.
+    // Leaving it out meant a structured-output server handed the model real PII
+    // while the feature reported it was redacting -- the headline claim was simply
+    // untrue for those servers. Walked in full, unlike `nextCursor` and friends,
+    // which stay untouched because a rewrite there breaks the NEXT call.
+    if let Some(structured) = obj.get_mut("structuredContent") {
+        walk_strings(structured, f);
+    }
     for key in ["content", "contents", "messages"] {
         let Some(items) = obj.get_mut(key).and_then(Value::as_array_mut) else {
             continue;
@@ -458,6 +467,15 @@ fn walk_strings(v: &mut Value, f: &mut impl FnMut(&mut String)) {
                 })
                 .collect();
             for (old, new) in renames {
+                // Never clobber. A model routinely mixes a value it read verbatim
+                // with one it echoed as a token, so `{"ada@example.com": "viewer",
+                // "⟦EMAIL_1⟧": "owner"}` is reachable -- and `Map::insert` would
+                // silently drop one of the two entries before dispatch. Leaving the
+                // token in place is visibly wrong; deleting a role assignment is
+                // not.
+                if map.contains_key(&new) {
+                    continue;
+                }
                 if let Some(value) = map.remove(&old) {
                     map.insert(new, value);
                 }
@@ -703,20 +721,44 @@ mod tests {
         assert_eq!(args["body"]["text"], "hi ada@example.com");
     }
 
-    /// Ids, cursors and URLs live outside the text blocks and a rewrite there
-    /// would break the next call.
+    /// Ids and cursors are plumbing: a rewrite there breaks the NEXT call, so they
+    /// stay untouched. `structuredContent` is the opposite -- model-facing payload
+    /// relayed verbatim by `shaping::shape_result` -- so leaving it raw handed the
+    /// model real PII while the feature claimed to be redacting.
     #[test]
-    fn result_walk_leaves_non_text_fields_alone() {
+    fn result_walk_covers_structured_content_but_not_plumbing() {
         let mut m = map();
         let mut result = serde_json::json!({
             "content": [{ "type": "text", "text": "ada@example.com" }],
             "nextCursor": "ada@example.com",
-            "structuredContent": { "email": "ada@example.com" }
+            "structuredContent": { "customer": { "email": "ada@example.com" } }
         });
         pseudonymize_result(&mut m, &mut result);
-        assert_eq!(result["nextCursor"], "ada@example.com");
-        assert_eq!(result["structuredContent"]["email"], "ada@example.com");
+        assert_eq!(
+            result["nextCursor"], "ada@example.com",
+            "a cursor rewrite would break the next call"
+        );
         assert_eq!(result["content"][0]["text"], "⟦EMAIL_1⟧");
+        assert_eq!(
+            result["structuredContent"]["customer"]["email"], "⟦EMAIL_1⟧",
+            "structured output reaches the model and must be pseudonymized too"
+        );
+        // Same value, same token, across both shapes.
+        assert_eq!(m.rehydrate("⟦EMAIL_1⟧"), "ada@example.com");
+    }
+
+    /// A rename must never overwrite a sibling that already holds the target key.
+    #[test]
+    fn rehydrate_does_not_drop_a_colliding_sibling_key() {
+        let mut m = map();
+        m.pseudonymize("ada@example.com");
+        let mut args = serde_json::json!({
+            "roles": { "ada@example.com": "viewer", "⟦EMAIL_1⟧": "owner" }
+        });
+        rehydrate_args(&m, &mut args);
+        let roles = args["roles"].as_object().unwrap();
+        assert_eq!(roles.len(), 2, "an entry was silently dropped: {roles:?}");
+        assert_eq!(roles["ada@example.com"], "viewer");
     }
 
     #[test]
