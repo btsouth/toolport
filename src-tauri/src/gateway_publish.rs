@@ -1937,17 +1937,146 @@ mod tests {
         assert_eq!(m, back);
     }
 
-    /// Kills the child and removes the scratch directory even if an assertion
-    /// panics, so a failing run cannot leave a stray `sleep` behind.
+    /// Serializes every test that spawns real gateways and walks the process table.
+    ///
+    /// Each of them puts its fixtures under a literal `Toolport` path segment
+    /// (`decide_reap` will not kill anything else), so two running concurrently
+    /// would let one test's reap pass kill the other's processes. Poison is
+    /// ignored: one failing test should not cascade into the rest.
     #[cfg(all(unix, not(target_os = "macos")))]
-    struct SpawnedGateway(std::process::Child, PathBuf);
+    static PROCESS_TABLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn lock_process_table() -> std::sync::MutexGuard<'static, ()> {
+        PROCESS_TABLE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A small, long-running binary to stand in for a gateway image.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn stand_in_binary_source() -> &'static str {
+        // into_iter, not iter().map(Path::new): the latter returns a &Path borrowed
+        // from the temporary array, which does not outlive the statement.
+        ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+            .expect("no sleep binary available to stand in for a gateway")
+    }
+
+    /// Scratch tree removed on drop, shared by every gateway one test spawns.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    struct ScratchDir(PathBuf);
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    impl ScratchDir {
+        /// Ends in a literal `Toolport` segment on purpose: `decide_reap` only kills
+        /// an image under a path `path_looks_like_our_install` recognizes, so a bare
+        /// temp dir would be treated as a stranger's binary and kept.
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("toolport-reaper-{tag}-{}", std::process::id()))
+                .join("Toolport");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+
+        fn join(&self, rel: &str) -> PathBuf {
+            self.0.join(rel)
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A stand-in gateway process running from a scratch path.
+    ///
+    /// Kills and reaps the child on drop, so a failing assertion cannot leave a
+    /// stray `sleep` behind.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    struct SpawnedGateway {
+        child: std::process::Child,
+        exe: PathBuf,
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    impl SpawnedGateway {
+        /// Copy the stand-in binary to `exe`, run it, and block until the exec has
+        /// actually happened.
+        ///
+        /// `spawn()` returns before exec completes, so `/proc/<pid>` is not populated
+        /// yet; polling the exe symlink is what makes the enumeration assertions
+        /// deterministic rather than racy.
+        fn at(exe: PathBuf) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            if let Some(parent) = exe.parent() {
+                std::fs::create_dir_all(parent).expect("create gateway dir");
+            }
+            std::fs::copy(stand_in_binary_source(), &exe).expect("copy stand-in binary");
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x");
+
+            let child = std::process::Command::new(&exe)
+                .arg("300")
+                .spawn()
+                .expect("spawn stand-in gateway");
+            let me = Self { child, exe };
+
+            let link = PathBuf::from(format!("/proc/{}/exe", me.pid()));
+            for _ in 0..300 {
+                if std::fs::read_link(&link)
+                    .map(|p| p == me.exe)
+                    .unwrap_or(false)
+                {
+                    return me;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("child never exec'd into {}", me.exe.display());
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+
+        /// Unlink the running image, which is what an in-place binary replacement
+        /// (package upgrade, installer overwrite) does. `/proc/<pid>/exe` carries the
+        /// ` (deleted)` marker from here on.
+        fn unlink_image(&self) {
+            std::fs::remove_file(&self.exe).expect("unlink running image");
+        }
+
+        /// Did the process exit within `budget`? Reaps the zombie, so a later `/proc`
+        /// walk cannot see it.
+        fn exited_within(&mut self, budget: std::time::Duration) -> bool {
+            let deadline = std::time::Instant::now() + budget;
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => return true,
+                    Ok(None) => {}
+                    Err(_) => return false,
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        fn still_running(&mut self) -> bool {
+            matches!(self.child.try_wait(), Ok(None))
+        }
+    }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     impl Drop for SpawnedGateway {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-            let _ = std::fs::remove_dir_all(&self.1);
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
     }
 
@@ -1967,44 +2096,14 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn linux_enumeration_finds_a_versioned_gateway_via_the_exe_fallback() {
-        use std::os::unix::fs::PermissionsExt as _;
+        let _serial = lock_process_table();
 
-        // into_iter, not iter().map(Path::new): the latter returns a &Path borrowed
-        // from the temporary array, which does not outlive the statement.
-        let src = ["/bin/sleep", "/usr/bin/sleep"]
-            .into_iter()
-            .find(|p| Path::new(p).exists())
-            .expect("no sleep binary available to stand in for a gateway");
-
-        let dir = std::env::temp_dir().join(format!("toolport-reaper-enum-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-
+        let dir = ScratchDir::new("enum");
         // Deliberately longer than comm's 15-char window so the truncation this
         // test exists for actually happens.
         let exe = dir.join("toolport-gateway-9.9.9");
-        std::fs::copy(src, &exe).expect("copy stand-in binary");
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod +x");
-
-        let child = std::process::Command::new(&exe)
-            .arg("30")
-            .spawn()
-            .expect("spawn stand-in gateway");
-        let pid = child.id();
-        let guard = SpawnedGateway(child, dir.clone());
-
-        // spawn() returns before the exec completes, so /proc entries are not
-        // populated yet. Wait for the exe symlink to point at our copy.
-        let exe_link = PathBuf::from(format!("/proc/{pid}/exe"));
-        let mut execed = false;
-        for _ in 0..300 {
-            if std::fs::read_link(&exe_link).map(|p| p == exe).unwrap_or(false) {
-                execed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(execed, "child never exec'd into {}", exe.display());
+        let gw = SpawnedGateway::at(exe.clone());
+        let pid = gw.pid();
 
         // The premise: comm is truncated past recognition, so a hit below can only
         // have come from the exe fallback. If a future kernel widens comm this
@@ -2039,8 +2138,167 @@ mod tests {
             Some(exe.as_path()),
             "path must be the resolved exe so keep-path comparisons work"
         );
+    }
 
-        drop(guard);
+    /// SBS-418: the `(deleted)` policy from #505, against a real unlinked process.
+    ///
+    /// Two halves that pull in opposite directions and have to hold at once:
+    ///
+    /// * the marker is **stripped for basename matching**, so an unlinked image is
+    ///   still recognized as a gateway and enumerated at all;
+    /// * the marker is **kept on the stored path**, so that image misses keep-paths
+    ///   and is reaped even when the path it was launched from *is* the current
+    ///   keep-path.
+    ///
+    /// The second half is why this needs a real process. It reversed twice inside 16
+    /// minutes during development (e1242eb added a path strip, 2ba9f95 reverted it),
+    /// and until now only `decide_reap` fixtures covered it — which cannot catch the
+    /// enumerator handing `decide_reap` an already-stripped path, since the fixtures
+    /// build that path themselves.
+    ///
+    /// Uses the unversioned name deliberately. `toolport-gateway` is 16 chars and
+    /// `comm` caps at 15, so detection can only come from `/proc/<pid>/exe`, and the
+    /// verdict can only come from the unversioned path-identity branch. The legacy
+    /// `conduit-gateway` is exactly 15 and *does* match `comm`, which would mask a
+    /// broken fallback.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn linux_deleted_image_is_enumerated_but_misses_its_own_keep_path() {
+        let _serial = lock_process_table();
+
+        let dir = ScratchDir::new("deleted");
+        let exe = dir.join("bin/toolport-gateway");
+        let gw = SpawnedGateway::at(exe.clone());
+        gw.unlink_image();
+
+        let found = linux_list_gateway_processes();
+        let hit = found.iter().find(|p| p.pid == gw.pid()).unwrap_or_else(|| {
+            panic!(
+                "linux_list_gateway_processes() lost pid {} once its image was unlinked. \
+                 The ` (deleted)` marker must be stripped for basename matching, or an \
+                 in-place upgrade leaves the old inode running forever.",
+                gw.pid()
+            )
+        });
+
+        assert_eq!(
+            hit.basename, "toolport-gateway",
+            "basename must have the ` (deleted)` marker stripped"
+        );
+        let stored = hit
+            .path
+            .as_ref()
+            .expect("an unlinked image must still carry a path");
+        assert!(
+            stored.to_string_lossy().ends_with(" (deleted)"),
+            "path must KEEP the ` (deleted)` marker so the keep-path comparison misses; \
+             got {}",
+            stored.display()
+        );
+
+        // The launch path is the current keep-path and the process must still be
+        // killed. That is the entire point of leaving the marker on.
+        let ctx = ReapContext {
+            current_version: "9.9.9".into(),
+            keep_paths: vec![exe.clone()],
+            keep_pids: Vec::new(),
+            kill_all: false,
+        };
+        assert_eq!(
+            decide_reap(hit, &ctx),
+            ReapDecision::Kill,
+            "an unlinked image launched from the keep path {} must still be reaped, or \
+             an in-place upgrade keeps serving the old binary",
+            exe.display()
+        );
+
+        // Control: same name, same kind of path, image intact. The marker is the only
+        // difference between this and the case above, so it must flip the verdict.
+        let live_dir = ScratchDir::new("deleted-control");
+        let live_exe = live_dir.join("bin/toolport-gateway");
+        let live_gw = SpawnedGateway::at(live_exe.clone());
+        let live_hit = linux_list_gateway_processes()
+            .into_iter()
+            .find(|p| p.pid == live_gw.pid())
+            .expect("control gateway was not enumerated");
+        assert_eq!(
+            decide_reap(
+                &live_hit,
+                &ReapContext {
+                    keep_paths: vec![live_exe],
+                    ..ctx
+                }
+            ),
+            ReapDecision::Keep,
+            "an intact image at its keep path must survive"
+        );
+    }
+
+    /// SBS-418: a real `reap_with_context` pass over real processes.
+    ///
+    /// The decision tests are pure. This one proves the whole path — enumerate, plan,
+    /// signal — actually does what the plan says, including the row that matters most
+    /// operationally: **a live gateway at the keep path is still running afterwards.**
+    /// Every other test in this file could pass while the reaper killed the bridge it
+    /// had just started.
+    ///
+    /// Every gateway already running when the test starts is pinned into `keep_pids`,
+    /// so running the suite on a developer's Linux box cannot kill their real Toolport
+    /// gateway. Only the three processes spawned here are candidates.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn linux_reap_keeps_the_live_keep_path_and_kills_stale_and_unlinked_images() {
+        let _serial = lock_process_table();
+
+        let mut keep_pids: Vec<u32> = linux_list_gateway_processes()
+            .into_iter()
+            .map(|p| p.pid)
+            .collect();
+        keep_pids.push(std::process::id());
+
+        let dir = ScratchDir::new("reap");
+        let keep_exe = dir.join("bin/toolport-gateway");
+        let stale_exe = dir.join("old/toolport-gateway");
+        let upgraded_exe = dir.join("upgraded/toolport-gateway");
+
+        let mut keep = SpawnedGateway::at(keep_exe.clone());
+        let mut stale = SpawnedGateway::at(stale_exe.clone());
+        let mut upgraded = SpawnedGateway::at(upgraded_exe.clone());
+
+        // An in-place upgrade: the file at a path we still consider current was
+        // replaced, so this process now holds an unlinked inode.
+        upgraded.unlink_image();
+
+        let report = reap_with_context(&ReapContext {
+            current_version: "9.9.9".into(),
+            keep_paths: vec![keep_exe.clone(), upgraded_exe.clone()],
+            keep_pids,
+            kill_all: false,
+        });
+
+        let budget = std::time::Duration::from_secs(5);
+        assert!(
+            stale.exited_within(budget),
+            "a gateway at {} is not at any keep path and must be reaped; report: {report:?}",
+            stale_exe.display()
+        );
+        assert!(
+            upgraded.exited_within(budget),
+            "the unlinked image must be reaped even though it was launched from the keep \
+             path {}, otherwise an in-place upgrade keeps the old inode serving traffic; \
+             report: {report:?}",
+            upgraded_exe.display()
+        );
+        assert!(
+            keep.still_running(),
+            "the live gateway at the keep path {} must survive the reap; report: {report:?}",
+            keep_exe.display()
+        );
+        assert!(
+            report.failed.is_empty(),
+            "the reaper could not stop processes it planned to kill: {:?}",
+            report.failed
+        );
     }
 
     // ----- SOU-435: restart advice -------------------------------------------
