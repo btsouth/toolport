@@ -100,7 +100,11 @@ impl ClientAuthMethod {
     }
 
     /// Does this method authenticate with a shared secret Toolport can send today?
-    fn is_implemented(self) -> bool {
+    ///
+    /// Public because callers that persist a configuration need to refuse an
+    /// unimplemented method up front, rather than storing it and failing at every
+    /// later connect.
+    pub fn is_implemented(self) -> bool {
         matches!(self, Self::ClientSecretPost | Self::ClientSecretBasic)
     }
 }

@@ -700,6 +700,13 @@ pub fn connect_remote_with_handler(
     // registry config (client id, method, scopes); every later reacquisition runs
     // from the state vaulted here, which is why it can go through the shared seam
     // with just a server id.
+    // Config removed while vaulted state survived -- e.g. registry.json edited by
+    // hand with the app closed. Clear it here, at the one place that can see both,
+    // so the reacquire path cannot keep the headless flow alive for a server that
+    // is no longer configured for it.
+    if !uses_client_credentials(server) && secrets::get_secret(server_id, CC_STATE_KEY).is_some() {
+        let _ = reset_client_credentials(server_id);
+    }
     if uses_client_credentials(server) && secrets::get_secret(server_id, CC_STATE_KEY).is_none() {
         let config = server
             .client_credentials

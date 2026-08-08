@@ -1641,10 +1641,15 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
             // the same reason a malformed block is: importing it produces a
             // server that fails at connect instead of one the member was told
             // about.
+            // Unrecognised OR recognised-but-unimplemented. `private_key_jwt`
+            // parses fine and would otherwise import, then fail closed at every
+            // connect with "not supported yet" -- a silently broken server, which
+            // is the outcome this guard exists to prevent.
             Ok(c)
-                if c.token_endpoint_auth_method
-                    .as_deref()
-                    .is_some_and(|m| crate::oauth::ClientAuthMethod::parse(m).is_none()) =>
+                if c.token_endpoint_auth_method.as_deref().is_some_and(|m| {
+                    crate::oauth::ClientAuthMethod::parse(m)
+                        .is_none_or(|parsed| !parsed.is_implemented())
+                }) =>
             {
                 return TeamClass::Blocked
             }
@@ -2500,6 +2505,17 @@ mod tests {
         bad["clientCredentials"] = serde_json::json!({
             "clientId": "c",
             "tokenEndpointAuthMethod": "unknown_method",
+        });
+        assert!(matches!(
+            classify_team_server(&bad, "team:t1"),
+            TeamClass::Blocked
+        ));
+
+        // Recognised but unimplemented counts too: importing it would produce a
+        // server that fails closed on every connect.
+        bad["clientCredentials"] = serde_json::json!({
+            "clientId": "c",
+            "tokenEndpointAuthMethod": "private_key_jwt",
         });
         assert!(matches!(
             classify_team_server(&bad, "team:t1"),
