@@ -1962,9 +1962,24 @@ mod tests {
     /// first thread's exec then fails with "Text file busy".
     ///
     /// Without this the three tests fail intermittently -- 3 runs in 8 while this was
-    /// being written. The critical section has to run from opening the destination
-    /// through exec actually completing, which is why it wraps the readiness poll and
-    /// not just the copy. Poison is ignored so one failing test does not cascade.
+    /// being written.
+    ///
+    /// The guard deliberately spans copy through *exec completing*, i.e. it wraps the
+    /// readiness poll too, not just the copy and fork.
+    ///
+    /// Narrowing it to copy-through-fork looks correct -- `fs::copy` drops its
+    /// destination handle before `spawn`, so a child forked afterwards has no write fd
+    /// to inherit -- and was tried. It reintroduces the failure at a lower rate: 1 run
+    /// in 25, panicking in `spawn` with ETXTBSY, versus 25 in 25 clean with the guard
+    /// held across the poll. A forked child holds *every* inherited descriptor until
+    /// its own exec lands, so releasing at fork still leaves a window in which another
+    /// thread's copy target is held open by a child that has not exec'd yet.
+    ///
+    /// The cost is bounded and small: the poll is an exec-completion wait that returns
+    /// in tens of milliseconds, and the 3s in the loop below is a failure timeout, not
+    /// a typical duration. The whole `gateway_publish` suite runs in 0.36s.
+    ///
+    /// Poison is ignored so one failing test does not cascade.
     static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A small, long-running binary to stand in for a gateway image.
@@ -2057,10 +2072,10 @@ mod tests {
         fn at(exe: PathBuf) -> Self {
             use std::os::unix::fs::PermissionsExt as _;
 
-            let _spawn = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(parent) = exe.parent() {
                 std::fs::create_dir_all(parent).expect("create gateway dir");
             }
+            let _spawn = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             std::fs::copy(stand_in_binary_source(), &exe).expect("copy stand-in binary");
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod +x");
