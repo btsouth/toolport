@@ -1983,14 +1983,26 @@ mod tests {
     static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A small, long-running binary to stand in for a gateway image.
+    ///
+    /// Searches `PATH` rather than assuming `/bin/sleep`, so the tests still run on
+    /// layouts that put it elsewhere (NixOS, busybox images, minimal containers).
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn stand_in_binary_source() -> &'static str {
+    fn stand_in_binary_source() -> PathBuf {
+        if let Some(path) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path) {
+                let candidate = dir.join("sleep");
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
         // into_iter, not iter().map(Path::new): the latter returns a &Path borrowed
         // from the temporary array, which does not outlive the statement.
         ["/bin/sleep", "/usr/bin/sleep"]
             .into_iter()
-            .find(|p| Path::new(p).exists())
-            .expect("no sleep binary available to stand in for a gateway")
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+            .expect("no sleep binary on PATH to stand in for a gateway")
     }
 
     /// Scratch tree removed on drop, shared by every gateway one test spawns.
@@ -2033,7 +2045,15 @@ mod tests {
             // forms, and a failure surfaced 3s later as an unexplained readiness-poll
             // panic. The directory was just created, so failure here means a broken
             // environment and should say so.
-            let root = std::fs::canonicalize(&root).expect("canonicalize scratch root");
+            let root = match std::fs::canonicalize(&root) {
+                Ok(canonical) => canonical,
+                Err(e) => {
+                    // `Self` does not exist yet, so `Drop` cannot clean up the
+                    // directory just created. Remove it before unwinding.
+                    let _ = std::fs::remove_dir_all(&root);
+                    panic!("canonicalize scratch root {}: {e}", root.display());
+                }
+            };
             let dir = root.join("Toolport");
             std::fs::create_dir_all(&dir).expect("create scratch dir");
             Self { dir, root }
@@ -2134,9 +2154,18 @@ mod tests {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     impl Drop for SpawnedGateway {
+        /// Only signals a child that has not already been reaped.
+        ///
+        /// `exited_within` reaps via `try_wait`, which frees the pid for reuse. A
+        /// bare `kill()` afterwards would signal whatever now holds that number.
+        /// `std` does not save us here: reaping with `try_wait` and then calling
+        /// `Child::kill()` returns `Ok(())` rather than refusing, so the guard has to
+        /// be explicit.
         fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            if matches!(self.child.try_wait(), Ok(None)) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
         }
     }
 
@@ -2287,6 +2316,44 @@ mod tests {
             ),
             ReapDecision::Keep,
             "an intact image at its keep path must survive"
+        );
+    }
+
+    /// `ScratchDir` removes its whole root, including when a test panics.
+    ///
+    /// The panic half is the point: cleanup used to be a `remove_dir_all` on the last
+    /// line of each test, which is exactly the line an assertion failure skips, so a
+    /// failing test leaked its tree and the binaries in it.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn scratch_dir_removes_its_root_on_drop_and_on_panic() {
+        let root = {
+            let dir = ScratchDir::new("reaper-cleanup");
+            std::fs::write(dir.join("file"), b"x").expect("write into scratch dir");
+            dir.root.clone()
+        };
+        assert!(
+            !root.exists(),
+            "scratch root {} survived a normal drop",
+            root.display()
+        );
+
+        // The parent, not just the `Toolport` leaf: removing only the leaf is what
+        // leaked one directory per test per run.
+        let leaked = std::panic::catch_unwind(|| {
+            let dir = ScratchDir::new("reaper-cleanup-panic");
+            let root = dir.root.clone();
+            std::fs::write(dir.join("file"), b"x").expect("write into scratch dir");
+            std::panic::panic_any(root);
+        })
+        .expect_err("the closure must panic");
+        let root = leaked
+            .downcast::<PathBuf>()
+            .expect("panic payload is the scratch root");
+        assert!(
+            !root.exists(),
+            "scratch root {} survived a panicking test",
+            root.display()
         );
     }
 
