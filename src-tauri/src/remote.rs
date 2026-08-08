@@ -304,17 +304,23 @@ pub fn reset_client_credentials(server_id: &str) -> Result<(), String> {
 
 /// Does the vaulted state name a different MCP URL than the one being connected?
 ///
-/// Compared case-insensitively on the trimmed string. An unreadable state counts
-/// as unchanged: the caller only uses this to decide whether to discard state,
-/// and discarding on a parse failure would loop a broken vault into re-acquiring
-/// on every connect.
+/// Compared EXACTLY on the trimmed string, not case-insensitively. A URL path and
+/// query are case-sensitive, so `/MCP` and `/mcp` are different resources; folding
+/// case would let an edit between them keep a token that RFC 8707 bound to the old
+/// one. Erring the other way is harmless: a comparison that reports "changed" when
+/// only the scheme or host case differs just re-acquires, which is cheap and
+/// non-interactive by construction.
+///
+/// An unreadable state counts as unchanged: the caller only uses this to decide
+/// whether to discard state, and discarding on a parse failure would loop a broken
+/// vault into re-acquiring on every connect.
 fn client_credentials_resource_changed(server_id: &str, url: &str) -> bool {
     let Some(state) = secrets::get_secret(server_id, CC_STATE_KEY)
         .and_then(|s| serde_json::from_str::<ClientCredentialsState>(&s).ok())
     else {
         return false;
     };
-    !state.resource.trim().eq_ignore_ascii_case(url.trim())
+    state.resource.trim() != url.trim()
 }
 
 /// Expiry of the vaulted client-credentials token, if this server uses that flow.

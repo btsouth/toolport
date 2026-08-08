@@ -369,7 +369,29 @@ struct AsMeta {
     /// RFC 8414. Absent means `client_secret_basic` per the spec, so this stays
     /// `Option` rather than defaulting to an empty list, which would instead read
     /// as "the server supports nothing".
+    #[serde(default, deserialize_with = "lenient_string_list")]
     token_endpoint_auth_methods_supported: Option<Vec<String>>,
+}
+
+/// Parse a list-of-strings metadata field without letting a malformed value fail
+/// the whole document.
+///
+/// This field is new to `AsMeta`. Before it was read, a server that published it
+/// as a bare string (or any non-array) was simply ignored; typing it strictly
+/// would turn that into a hard discovery failure and break the interactive flow
+/// for servers that work today. A malformed value is treated as absent, and
+/// non-string entries are dropped rather than poisoning the list.
+fn lenient_string_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_array().map(|items| {
+        items
+            .iter()
+            .filter_map(|item| item.as_str().map(String::from))
+            .collect()
+    }))
 }
 
 enum ClientRegistration<'a> {
@@ -2450,6 +2472,44 @@ mod tests {
         }))
         .unwrap();
         assert!(metadata.client_id_metadata_document_supported);
+    }
+
+    /// A malformed `token_endpoint_auth_methods_supported` must not fail the whole
+    /// metadata document.
+    ///
+    /// This field is new. Before it was read, a server publishing it as a bare
+    /// string was simply ignored; typing it strictly would turn that into a hard
+    /// discovery failure and break the interactive flow for servers that work
+    /// today.
+    #[test]
+    fn malformed_token_endpoint_auth_methods_do_not_fail_discovery() {
+        let parse = |methods: serde_json::Value| {
+            serde_json::from_value::<AsMeta>(serde_json::json!({
+                "issuer": "https://auth.example.com",
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+                "token_endpoint_auth_methods_supported": methods,
+            }))
+        };
+
+        // A bare string, an object, and null are all "absent", not fatal.
+        for bad in [
+            serde_json::json!("client_secret_basic"),
+            serde_json::json!({ "a": 1 }),
+            serde_json::Value::Null,
+        ] {
+            let meta = parse(bad.clone())
+                .unwrap_or_else(|e| panic!("{bad} must not fail the document: {e}"));
+            assert_eq!(meta.token_endpoint_auth_methods_supported, None);
+        }
+
+        // A well-formed list still parses, and non-string entries are dropped
+        // rather than poisoning it.
+        let meta = parse(serde_json::json!(["client_secret_basic", 7])).unwrap();
+        assert_eq!(
+            meta.token_endpoint_auth_methods_supported,
+            Some(vec!["client_secret_basic".to_string()])
+        );
     }
 
     // ----- SBS-524: client-credentials auth-method selection ------------------

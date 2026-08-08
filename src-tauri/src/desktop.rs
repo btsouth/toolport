@@ -1159,12 +1159,15 @@ fn set_client_credentials(
         let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) else {
             return Err(format!("no server with id {server_id:?}"));
         };
-        let existing = server.client_credentials.take().unwrap_or_default();
+        let mut existing = server.client_credentials.take().unwrap_or_default();
+        // Preserve a newer build's fields, but never a credential smuggled in
+        // through them -- e.g. a `clientSecret` hand-written into registry.json,
+        // which saving here would otherwise re-persist and hand to team export.
+        existing.strip_secret_fields();
         server.client_credentials = Some(registry::ClientCredentials {
             client_id: client_id.clone(),
             token_endpoint_auth_method: token_endpoint_auth_method.clone(),
             scope: scope.clone(),
-            // Preserve fields a newer build wrote, same contract as elsewhere.
             unknown_fields: existing.unknown_fields,
         });
         reg.secrets_generation = reg.secrets_generation.wrapping_add(1);

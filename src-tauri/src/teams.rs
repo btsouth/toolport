@@ -1658,6 +1658,17 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
             }
             Ok(mut c) => {
                 c.strip_secret_fields();
+                // Trim like the desktop command does: a padded client id or scope
+                // reaches the token endpoint verbatim and can be rejected there.
+                c.client_id = c.client_id.trim().to_string();
+                c.scope = c
+                    .scope
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                c.token_endpoint_auth_method = c
+                    .token_endpoint_auth_method
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty());
                 Some(c)
             }
             Err(_) => return TeamClass::Blocked,
