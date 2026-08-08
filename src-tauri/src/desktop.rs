@@ -431,6 +431,7 @@ fn server_from_detected(server: &clients::McpServer, client_id: &str) -> ServerE
         source: Some(format!("imported:{client_id}")),
         disabled_tools: vec![],
         cwd: None,
+        client_credentials: None,
         unknown_fields: serde_json::Map::new(),
     }
 }
@@ -3836,6 +3837,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -3869,6 +3871,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -4236,6 +4239,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         });
 
@@ -4299,6 +4303,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         });
         let doc = build_export(&reg, None, None, None);
@@ -4339,6 +4344,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         });
         let doc = build_export(&reg, None, None, None);
@@ -4371,6 +4377,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         });
         let json = serde_json::to_string(&build_export(&reg, None, None, None)).unwrap();
@@ -4484,6 +4491,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         });
         reg.add_server(ServerEntry {
@@ -4497,6 +4505,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         });
 

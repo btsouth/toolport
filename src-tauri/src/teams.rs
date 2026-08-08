@@ -1634,6 +1634,7 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         source: Some(tag.to_string()),
         disabled_tools: str_array("disabledTools"),
         cwd: None,
+        client_credentials: None,
         unknown_fields: serde_json::Map::new(),
     };
 
@@ -1769,6 +1770,7 @@ mod tests {
             source: Some("manual".into()),
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         });
         let active = r.active_profile_id.clone().unwrap();
@@ -1919,6 +1921,7 @@ mod tests {
             source: Some("manual".into()),
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         });
         let cfg = json!({ "servers": [
@@ -2043,6 +2046,7 @@ mod tests {
             source: Some("manual".into()),
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         });
         apply_team_config(
@@ -2375,6 +2379,7 @@ mod tests {
             source: Some("manual".into()),
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         });
         // A team-sourced server: excluded too (don't echo the team's own set back).
@@ -2389,6 +2394,7 @@ mod tests {
             source: Some("team:abc".into()),
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         });
         let servers = team_server_export(&r);
