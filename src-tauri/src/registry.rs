@@ -359,6 +359,8 @@ pub struct Registry {
     pub team_forced_quarantine_on_drift: bool,
     #[serde(default)]
     pub team_forced_block_on_injection: bool,
+    #[serde(default)]
+    pub team_forced_pii_redaction: bool,
     /// Per-tool exposure overrides, keyed by server id then ORIGINAL tool name (not the
     /// exposed name, so a rename or `_2` collision suffix can't misalign the key): rename or
     /// re-describe a tool as clients see it (e.g. neutralize a poisoned description). The
@@ -422,6 +424,12 @@ pub struct Registry {
     /// on high-confidence hits (SOU-345).
     #[serde(default = "default_true")]
     pub content_defense: bool,
+    /// Replace PII in tool results with stable pseudonyms before they reach the model,
+    /// re-hydrating them on the way back out (SBS-346). OFF by default: it rewrites tool
+    /// output, and unlike content defense a missed value fails OPEN, so it is a reduction
+    /// in exposure rather than a guarantee and must be opted into knowingly.
+    #[serde(default)]
+    pub pii_redaction: bool,
     /// Opt-in fail-closed content defense (SOU-345): when true (or team-forced), a
     /// high-confidence injection hit fails the call instead of only labeling. Off by
     /// default so v1 label-only behavior is preserved. Per-server exempt list:
@@ -722,6 +730,8 @@ impl Default for Registry {
             team_forced_content_defense: false,
             team_forced_quarantine_on_drift: false,
             team_forced_block_on_injection: false,
+            team_forced_pii_redaction: false,
+            pii_redaction: false,
             tool_overrides: HashMap::new(),
             pinned_tools: HashMap::new(),
             quarantine_on_drift: false,
@@ -1018,6 +1028,10 @@ impl Registry {
     }
     pub fn content_defense_effective(&self) -> bool {
         self.content_defense || self.team_forced_content_defense
+    }
+    /// Member's own OR team-forced PII pseudonymization (SBS-346).
+    pub fn pii_redaction_effective(&self) -> bool {
+        self.pii_redaction || self.team_forced_pii_redaction
     }
     pub fn quarantine_on_drift_effective(&self) -> bool {
         self.quarantine_on_drift || self.team_forced_quarantine_on_drift
