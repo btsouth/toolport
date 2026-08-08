@@ -149,6 +149,22 @@ describe("SecretsDialog client credentials (SBS-524)", () => {
     expect(setClientCredentials).not.toHaveBeenCalled();
   });
 
+  /// The secret is never shown again and may have to be re-issued, so a single
+  /// stray click must not destroy it.
+  it("does not remove credentials until the destructive action is confirmed", async () => {
+    hasClientSecret.mockResolvedValue(true);
+    const user = await openDialog(
+      server({ clientCredentials: { clientId: "client-abc" } }),
+    );
+    await waitFor(() => expect(hasClientSecret).toHaveBeenCalled());
+
+    await user.click(screen.getByRole("button", { name: "Remove client credentials" }));
+    expect(clearClientCredentials).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(clearClientCredentials).toHaveBeenCalledWith("srv-1"));
+  });
+
   it("refuses to save without a client id instead of calling the backend", async () => {
     const user = await openDialog(server());
     await user.click(

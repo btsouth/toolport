@@ -1178,11 +1178,18 @@ fn clear_client_credentials(
     state: State<RegistryState>,
     server_id: String,
 ) -> Result<Registry, String> {
-    // Reset first. If it fails the secret is still there and the user can retry;
-    // deleting the credential first would destroy it on a half-completed removal,
-    // leaving a server configured for a flow whose secret is gone.
+    // Reset first, so a failure here preserves the credential and the removal can
+    // be retried.
     remote::reset_client_credentials(&server_id)?;
-    secrets::delete_secret(&server_id, secrets::CLIENT_SECRET_KEY)?;
+    // Then the config, and only then the secret. This is the OPPOSITE order to
+    // `set_client_credentials`, deliberately: there, a stranded secret is one the
+    // user still has in hand, so failing visibly is the better trade. Here the
+    // secret may be unrecoverable -- it is never shown again and may have to be
+    // re-issued by the authorization server -- so it must not be destroyed until
+    // the config is durably gone. If the delete is what fails, the result is a
+    // stale keychain entry with nothing pointing at it, and Remove can be run
+    // again; that is strictly better than losing a credential the user cannot get
+    // back.
     let (reg, _) = write_registry(state.inner(), |reg| {
         let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) else {
             return Err(format!("no server with id {server_id:?}"));
@@ -1191,6 +1198,7 @@ fn clear_client_credentials(
         reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
         Ok(())
     })?;
+    secrets::delete_secret(&server_id, secrets::CLIENT_SECRET_KEY)?;
     Ok(reg)
 }
 

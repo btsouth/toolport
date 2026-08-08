@@ -99,6 +99,10 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   const [ccOpen, setCcOpen] = useState(false);
   const [ccBusy, setCcBusy] = useState(false);
   const [ccSecretSet, setCcSecretSet] = useState(false);
+  // Whether the `hasClientSecret` probe has settled. The "secret required" guard
+  // below must not fire while this is unknown, or a fast click after opening
+  // would demand a credential that is already vaulted.
+  const [ccSecretKnown, setCcSecretKnown] = useState(false);
   const [ccClientId, setCcClientId] = useState("");
   const [ccSecret, setCcSecret] = useState("");
   const [ccScope, setCcScope] = useState("");
@@ -143,9 +147,12 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       setCcMethod(cc?.tokenEndpointAuthMethod ?? "");
       setCcSecret("");
       setCcOpen(cc != null);
+      setCcSecretKnown(false);
       hasClientSecret(server.id)
         .then((v) => fresh() && setCcSecretSet(v))
-        .catch(() => {});
+        .catch(() => {})
+        // Settled either way: on failure the backend stays authoritative.
+        .finally(() => fresh() && setCcSecretKnown(true));
       setProbing(true);
       setAuthInfo(null);
       probeAuth(server.url)
@@ -197,8 +204,10 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
     }
     // A blank secret means "keep the stored one", which is only meaningful when
     // one exists. Catch it here so the first-time case gets a direct instruction
-    // instead of a backend error describing internal state.
-    if (!ccSecretSet && !ccSecret.trim()) {
+    // instead of a backend error describing internal state. Skipped until the
+    // presence probe has settled: the backend knows authoritatively and returns a
+    // clear message, so deferring is always safe, while guessing is not.
+    if (ccSecretKnown && !ccSecretSet && !ccSecret.trim()) {
       toastError("Enter the client secret issued by your authorization server.");
       return;
     }
@@ -552,15 +561,23 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                             )}
                           </Button>
                           {(ccSecretSet || server.clientCredentials) && (
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              disabled={ccBusy}
-                              onClick={removeClientCredentials}
-                              aria-label="Remove client credentials"
-                            >
-                              Remove
-                            </Button>
+                            <ConfirmDialog
+                              destructive
+                              title="Remove client credentials?"
+                              description="The client secret is deleted from your keychain and cannot be shown again. You'll need to get a new one from your authorization server to reconnect this way."
+                              confirmLabel="Remove"
+                              onConfirm={removeClientCredentials}
+                              trigger={
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  disabled={ccBusy}
+                                  aria-label="Remove client credentials"
+                                >
+                                  Remove
+                                </Button>
+                              }
+                            />
                           )}
                         </div>
                       </div>

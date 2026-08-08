@@ -1637,6 +1637,17 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         Some(v) => match serde_json::from_value::<crate::registry::ClientCredentials>(v.clone()) {
             // A blank client id is "not configured", not malformed.
             Ok(c) if c.client_id.trim().is_empty() => None,
+            // An auth method this build cannot perform is refused at import for
+            // the same reason a malformed block is: importing it produces a
+            // server that fails at connect instead of one the member was told
+            // about.
+            Ok(c)
+                if c.token_endpoint_auth_method
+                    .as_deref()
+                    .is_some_and(|m| crate::oauth::ClientAuthMethod::parse(m).is_none()) =>
+            {
+                return TeamClass::Blocked
+            }
             Ok(c) => Some(c),
             Err(_) => return TeamClass::Blocked,
         },
@@ -2474,6 +2485,38 @@ mod tests {
                     "a blank client id must not count as configured"
                 )
             }
+            _ => panic!("expected import"),
+        }
+    }
+
+    /// An auth method this build cannot perform is refused at import, rather than
+    /// persisted and failing at connect.
+    #[test]
+    fn team_import_refuses_an_unknown_token_endpoint_auth_method() {
+        let mut bad = serde_json::json!({
+            "id": "s", "name": "S", "transport": "http",
+            "url": "https://mcp.example.com/mcp",
+        });
+        bad["clientCredentials"] = serde_json::json!({
+            "clientId": "c",
+            "tokenEndpointAuthMethod": "unknown_method",
+        });
+        assert!(matches!(
+            classify_team_server(&bad, "team:t1"),
+            TeamClass::Blocked
+        ));
+
+        // A method we DO support still imports.
+        bad["clientCredentials"] = serde_json::json!({
+            "clientId": "c",
+            "tokenEndpointAuthMethod": "client_secret_post",
+        });
+        match classify_team_server(&bad, "team:t1") {
+            TeamClass::Review(e) | TeamClass::Ready(e) => assert_eq!(
+                e.client_credentials
+                    .and_then(|c| c.token_endpoint_auth_method),
+                Some("client_secret_post".into())
+            ),
             _ => panic!("expected import"),
         }
     }
