@@ -628,6 +628,7 @@ mod tests {
             scope: None,
             authorization_response_iss_parameter_supported: false,
             client_id_metadata_document_supported: false,
+            token_endpoint_auth_methods_supported: None,
         };
 
         let rotated = endpoints("https://auth.example.com", "https://auth.example.com/token-v2");
