@@ -408,6 +408,9 @@ export interface Registry {
   quarantineOnDrift?: boolean;
   /** Opt-in fail-closed content defense: block high-confidence injection hits (SOU-345). */
   blockOnInjection?: boolean;
+  /** Replace PII in tool results with stable pseudonyms before the model sees them,
+   * re-hydrating them on the way back out (SBS-346). Off by default. */
+  piiRedaction?: boolean;
   /** Server ids exempt from block-on-injection (label only). */
   injectionBlockExempt?: Record<string, boolean>;
   /** Global switch: expose 4 meta-tools instead of the full catalog. */

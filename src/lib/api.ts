@@ -288,6 +288,14 @@ export function setBlockOnInjection(on: boolean): Promise<Registry> {
   return invoke<Registry>("set_block_on_injection", { on });
 }
 
+/** Toggle PII pseudonymization: replace emails, cards and keys in tool results with
+ * stable pseudonyms before the model sees them, re-hydrating them on the way out.
+ * Off by default. A value no detector recognises passes through, so this reduces
+ * what reaches the model rather than guaranteeing anything. */
+export function setPiiRedaction(on: boolean): Promise<Registry> {
+  return invoke<Registry>("set_pii_redaction", { on });
+}
+
 /** A tool blocked after high-risk drift or loss of the integrity baseline,
  * awaiting re-approval. */
 export interface QuarantinedTool {

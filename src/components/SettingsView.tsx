@@ -53,6 +53,7 @@ import {
   setFolderProfiles,
   setLiveInspect,
   setBlockOnInjection,
+  setPiiRedaction,
   setQuarantineOnDrift,
   setToolPinned,
   startHttpBridge,
@@ -552,6 +553,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   const allowAgentControl = registry?.allowAgentControl ?? false;
   const quarantineOnDrift = registry?.quarantineOnDrift ?? false;
   const blockOnInjection = registry?.blockOnInjection ?? false;
+  const piiRedaction = registry?.piiRedaction ?? false;
   const liveInspect = registry?.liveInspect ?? false;
   const [busy, setBusy] = useState(false);
   // Profile cards collapse so a big Default profile doesn't dump every server (and its
@@ -974,6 +976,14 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "Block high-confidence injection",
           "Fail a tool call when content defense finds a high-confidence prompt-injection hit, instead of only labeling the text. Off by default; medium-confidence hits still label only",
           apply(setBlockOnInjection),
+        )}
+        {toggle(
+          EyeOff,
+          piiRedaction,
+          "text-info",
+          "Hide personal data from the model",
+          "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. Real data stays on this machine. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
+          apply(setPiiRedaction),
         )}
         {toggle(
           Bot,

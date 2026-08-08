@@ -1983,6 +1983,16 @@ fn set_block_on_injection(state: State<RegistryState>, on: bool) -> Result<Regis
     Ok(reg)
 }
 
+/// Toggle PII pseudonymization of tool results (SBS-346).
+#[tauri::command]
+fn set_pii_redaction(state: State<RegistryState>, on: bool) -> Result<Registry, String> {
+    let (reg, _) = write_registry(state.inner(), |reg| {
+        reg.pii_redaction = on;
+        Ok(())
+    })?;
+    Ok(reg)
+}
+
 /// Tools currently quarantined (blocked after a high-risk drift), across all profiles.
 ///
 /// Also fires an OS notification when a **new** entry appears after the first baseline
@@ -3632,6 +3642,7 @@ pub fn run() {
             list_tool_identities,
             set_quarantine_on_drift,
             set_block_on_injection,
+            set_pii_redaction,
             list_quarantined,
             release_quarantine,
             set_lazy_discovery,
