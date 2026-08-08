@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use regex::Regex;
+use serde_json::Value;
 
 /// Matches `integrity`'s scan cap, so a huge result cannot turn one pass into a
 /// denial of service. Text past this point is left untouched, which is a fail-open
@@ -361,6 +362,91 @@ impl SessionMap {
     }
 }
 
+/// Pseudonymize the text blocks of a tool/resource/prompt result in place.
+///
+/// Walks the same shapes content-defense does -- `content[]`, `contents[]`,
+/// `messages[].content` -- rather than every string in the tree. That is
+/// deliberate: those are the fields whose text reaches the model, and confining
+/// the rewrite to them keeps a false positive from mangling an id, cursor or URL
+/// that a later call depends on.
+///
+/// Run BEFORE content-defense wraps the block. The injection wrapper is Toolport's
+/// own text, not untrusted content, and must not be scanned as if it were.
+pub fn pseudonymize_result(map: &mut SessionMap, result: &mut Value) -> Pseudonymized {
+    let mut replaced = 0usize;
+    let mut complete = true;
+    for_each_result_text(result, &mut |text| {
+        let out = map.pseudonymize(text);
+        replaced += out.replaced;
+        complete &= out.complete;
+        *text = out.text;
+    });
+    Pseudonymized {
+        // The caller mutated in place; this field is not meaningful here.
+        text: String::new(),
+        replaced,
+        complete,
+    }
+}
+
+/// Turn tokens back into real values across every string in a call's arguments.
+///
+/// Unlike the inbound pass this walks the WHOLE tree. The model can put a token
+/// anywhere in an argument object, and re-hydrating a string that contains no
+/// token is a no-op, so a broad walk costs nothing and a narrow one would silently
+/// send `⟦EMAIL_1⟧` to a real server.
+pub fn rehydrate_args(map: &SessionMap, args: &mut Value) {
+    if map.is_empty() {
+        return;
+    }
+    walk_strings(args, &mut |s| {
+        if s.contains('⟦') {
+            *s = map.rehydrate(s);
+        }
+    });
+}
+
+/// Apply `f` to each text field content-defense treats as untrusted.
+///
+/// A visitor rather than a `Vec<&mut String>`: several `get_mut` calls against the
+/// same object cannot hand out overlapping mutable borrows.
+fn for_each_result_text(result: &mut Value, f: &mut impl FnMut(&mut String)) {
+    let Some(obj) = result.as_object_mut() else {
+        return;
+    };
+    for key in ["content", "contents", "messages"] {
+        let Some(items) = obj.get_mut(key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for item in items.iter_mut() {
+            let Some(item) = item.as_object_mut() else {
+                continue;
+            };
+            // `messages[].content` nests one level further.
+            if let Some(Value::Object(nested)) = item.get_mut("content") {
+                if let Some(Value::String(text)) = nested.get_mut("text") {
+                    f(text);
+                }
+                continue;
+            }
+            if let Some(Value::String(text)) = item.get_mut("text") {
+                f(text);
+            }
+        }
+    }
+}
+
+/// Apply `f` to every string in a JSON tree, including object keys' values and
+/// nested arrays.
+fn walk_strings(v: &mut Value, f: &mut impl FnMut(&mut String)) {
+    match v {
+        Value::String(s) => f(s),
+        Value::Array(items) => items.iter_mut().for_each(|i| walk_strings(i, f)),
+        Value::Object(map) => map.values_mut().for_each(|i| walk_strings(i, f)),
+        _ => {}
+    }
+}
+
 /// Largest prefix of `s` that is at most `max` bytes and ends on a char boundary.
 fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
     if s.len() <= max {
@@ -564,6 +650,67 @@ mod tests {
         assert_eq!(m.rehydrate(&out.text), input, "round trip must survive");
         // 200 distinct emails + 1 shared card.
         assert_eq!(m.len(), 201);
+    }
+
+    // ----- result / args walks --------------------------------------------
+
+    #[test]
+    fn pseudonymizes_result_text_blocks_and_round_trips_through_args() {
+        let mut m = map();
+        let mut result = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "owner ada@example.com" },
+                { "type": "text", "text": "backup grace@example.com" }
+            ]
+        });
+        let out = pseudonymize_result(&mut m, &mut result);
+        assert_eq!(out.replaced, 2);
+        assert!(out.complete);
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert!(!rendered.contains("ada@example.com"), "{rendered}");
+        assert!(rendered.contains("⟦EMAIL_1⟧"), "{rendered}");
+
+        // The model echoes a token back in a later call's arguments.
+        let mut args = serde_json::json!({
+            "to": "⟦EMAIL_1⟧",
+            "cc": ["⟦EMAIL_2⟧"],
+            "body": { "text": "hi ⟦EMAIL_1⟧" }
+        });
+        rehydrate_args(&m, &mut args);
+        assert_eq!(args["to"], "ada@example.com");
+        assert_eq!(args["cc"][0], "grace@example.com");
+        assert_eq!(args["body"]["text"], "hi ada@example.com");
+    }
+
+    /// Ids, cursors and URLs live outside the text blocks and a rewrite there
+    /// would break the next call.
+    #[test]
+    fn result_walk_leaves_non_text_fields_alone() {
+        let mut m = map();
+        let mut result = serde_json::json!({
+            "content": [{ "type": "text", "text": "ada@example.com" }],
+            "nextCursor": "ada@example.com",
+            "structuredContent": { "email": "ada@example.com" }
+        });
+        pseudonymize_result(&mut m, &mut result);
+        assert_eq!(result["nextCursor"], "ada@example.com");
+        assert_eq!(result["structuredContent"]["email"], "ada@example.com");
+        assert_eq!(result["content"][0]["text"], "⟦EMAIL_1⟧");
+    }
+
+    #[test]
+    fn args_walk_is_a_noop_without_a_map_or_tokens() {
+        let empty = map();
+        let mut args = serde_json::json!({ "to": "⟦EMAIL_1⟧" });
+        rehydrate_args(&empty, &mut args);
+        assert_eq!(args["to"], "⟦EMAIL_1⟧", "an empty map must change nothing");
+
+        let mut m = map();
+        m.pseudonymize("ada@example.com");
+        let mut plain = serde_json::json!({ "to": "someone@else.com", "n": 3 });
+        let before = plain.clone();
+        rehydrate_args(&m, &mut plain);
+        assert_eq!(plain, before);
     }
 
     #[test]
