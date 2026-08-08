@@ -1627,6 +1627,22 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         })
         .unwrap_or_default();
 
+    // A block that is present but unparseable refuses the whole server rather
+    // than importing it without one. Dropping it silently would hand the member a
+    // server that falls back to the interactive browser flow -- which is the exact
+    // thing this configuration exists to avoid, and on a headless machine it can
+    // never complete. `Blocked` is counted in the merge outcome, so the member
+    // sees that something was refused instead of getting a quietly broken server.
+    let client_credentials = match s.get("clientCredentials").filter(|v| !v.is_null()) {
+        Some(v) => match serde_json::from_value::<crate::registry::ClientCredentials>(v.clone()) {
+            // A blank client id is "not configured", not malformed.
+            Ok(c) if c.client_id.trim().is_empty() => None,
+            Ok(c) => Some(c),
+            Err(_) => return TeamClass::Blocked,
+        },
+        None => None,
+    };
+
     let transport = str_field("transport").unwrap_or("stdio").to_string();
     let command = str_field("command").map(String::from);
     let mut entry = ServerEntry {
@@ -1643,11 +1659,7 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         // Carried through so a shared headless server stays headless. Dropping it
         // silently downgraded the member to interactive OAuth, which is exactly
         // what this flow exists to avoid; the secret is still theirs to add.
-        client_credentials: s
-            .get("clientCredentials")
-            .filter(|v| !v.is_null())
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .filter(|c: &crate::registry::ClientCredentials| !c.client_id.trim().is_empty()),
+        client_credentials,
         unknown_fields: serde_json::Map::new(),
     };
 
@@ -2464,6 +2476,21 @@ mod tests {
             }
             _ => panic!("expected import"),
         }
+    }
+
+    /// A malformed block must refuse the server, not import it as interactive.
+    #[test]
+    fn team_import_refuses_a_server_with_a_malformed_client_credentials_block() {
+        let mut bad = serde_json::json!({
+            "id": "s", "name": "S", "transport": "http",
+            "url": "https://mcp.example.com/mcp",
+        });
+        // clientId as a number: parses as JSON, not as the struct.
+        bad["clientCredentials"] = serde_json::json!({ "clientId": 42 });
+        assert!(
+            matches!(classify_team_server(&bad, "team:t1"), TeamClass::Blocked),
+            "a malformed block must be refused, not silently downgraded"
+        );
     }
 
     #[test]

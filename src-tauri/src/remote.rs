@@ -136,8 +136,13 @@ fn issuer_bound_token_endpoint<'a>(
 /// manually pasted bearer token. Otherwise stale vaulted state could silently
 /// recreate a credential the user explicitly removed.
 pub fn clear_oauth_state(server_id: &str) -> Result<(), String> {
-    let _ = secrets::delete_secret(server_id, CC_STATE_KEY);
-    secrets::delete_secret(server_id, STATE_KEY)
+    // Attempt both, then surface the first failure. Swallowing the
+    // client-credentials delete would leave state that silently reacquires with
+    // the long-lived secret after the user believed they had cleared auth; only
+    // attempting the second on success would leave the other key behind.
+    let headless = secrets::delete_secret(server_id, CC_STATE_KEY);
+    let interactive = secrets::delete_secret(server_id, STATE_KEY);
+    headless.and(interactive)
 }
 
 // ── Client-credentials flow (SBS-524) ──────────────────────────────────────

@@ -1127,12 +1127,16 @@ fn set_client_credentials(
             return Err(format!("no server with id {server_id:?}"));
         }
     }
-    // Keychain next, outside the registry lock, matching `set_secret`. An empty
-    // secret means "keep the vaulted one", so editing scopes does not require
-    // re-entering the credential.
-    if let Some(secret) = client_secret.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        secrets::set_secret(&server_id, secrets::CLIENT_SECRET_KEY, secret)?;
-    } else if secrets::get_secret(&server_id, secrets::CLIENT_SECRET_KEY).is_none() {
+    // An empty secret means "keep the vaulted one", so editing scopes does not
+    // require re-entering the credential. Resolve it here but do not write yet.
+    let secret_to_store = client_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if secret_to_store.is_none()
+        && secrets::get_secret(&server_id, secrets::CLIENT_SECRET_KEY).is_none()
+    {
         return Err("no client secret is stored for this server yet; enter one".into());
     }
     // Any config change invalidates a token minted under the old settings.
@@ -1156,6 +1160,14 @@ fn set_client_credentials(
         reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
         Ok(())
     })?;
+    // Secret LAST, so no earlier failure can leave one vaulted with nothing
+    // referencing it and no way to reach it from the UI. If this write is the
+    // thing that fails, the config exists without a secret, which surfaces at
+    // connect as "no client secret is vaulted" and can simply be retried -- a
+    // visible, recoverable state rather than an invisible orphan.
+    if let Some(secret) = secret_to_store {
+        secrets::set_secret(&server_id, secrets::CLIENT_SECRET_KEY, &secret)?;
+    }
     Ok(reg)
 }
 
@@ -1166,8 +1178,11 @@ fn clear_client_credentials(
     state: State<RegistryState>,
     server_id: String,
 ) -> Result<Registry, String> {
-    let _ = secrets::delete_secret(&server_id, secrets::CLIENT_SECRET_KEY);
+    // Reset first. If it fails the secret is still there and the user can retry;
+    // deleting the credential first would destroy it on a half-completed removal,
+    // leaving a server configured for a flow whose secret is gone.
     remote::reset_client_credentials(&server_id)?;
+    secrets::delete_secret(&server_id, secrets::CLIENT_SECRET_KEY)?;
     let (reg, _) = write_registry(state.inner(), |reg| {
         let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) else {
             return Err(format!("no server with id {server_id:?}"));
