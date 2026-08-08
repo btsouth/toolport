@@ -16,6 +16,7 @@ pub mod integrity;
 pub mod launcher;
 pub mod metrics;
 pub mod oauth;
+pub mod pii;
 pub mod rate_limits;
 pub mod registry;
 pub mod remote;
