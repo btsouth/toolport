@@ -568,6 +568,16 @@ fn authed_transport(
     // blocked only for untrusted-provenance servers.
     let mut transport = HttpTransport::guarded(url, token, refresh, block_private);
     transport.set_scope_reauthorize(scope_reauthorize);
+    // Declared per request only while the flow is actually in use, which is what
+    // the extension requires. Keyed off vaulted state rather than registry config
+    // so it is true of the credential actually being sent: a server configured for
+    // the flow but not yet provisioned has nothing to declare.
+    if secrets::get_secret(server_id, CC_STATE_KEY).is_some() {
+        transport.declare_extension(
+            crate::downstream::OAUTH_CLIENT_CREDENTIALS_EXTENSION,
+            serde_json::json!({}),
+        );
+    }
     Ok(transport)
 }
 
