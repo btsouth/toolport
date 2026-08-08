@@ -1962,33 +1962,59 @@ mod tests {
             .expect("no sleep binary available to stand in for a gateway")
     }
 
-    /// Scratch tree removed on drop, shared by every gateway one test spawns.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    struct ScratchDir(PathBuf);
+    /// Scratch tree removed on drop.
+    ///
+    /// Every test in this file that needs real files on disk goes through this, so
+    /// cleanup happens even when an assertion panics and the whole unique root is
+    /// removed rather than just its `Toolport` leaf. Doing it by hand at the end of
+    /// each test got both of those wrong: a failing test leaked its tree, and a
+    /// passing one still leaked the tree's parent, once per test per run.
+    struct ScratchDir {
+        /// Handed to tests. Ends in a literal `Toolport` segment on purpose:
+        /// `decide_reap` only kills an image under a path
+        /// `path_looks_like_our_install` recognizes, so a bare temp dir would be
+        /// treated as a stranger's binary and kept.
+        dir: PathBuf,
+        /// The unique root actually removed on drop. Dropping only `dir` would leave
+        /// its parent behind, leaking one empty directory per tag per run.
+        root: PathBuf,
+    }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
     impl ScratchDir {
-        /// Ends in a literal `Toolport` segment on purpose: `decide_reap` only kills
-        /// an image under a path `path_looks_like_our_install` recognizes, so a bare
-        /// temp dir would be treated as a stranger's binary and kept.
+        /// Thread id as well as pid: the advice/prune tests run in parallel and each
+        /// needs its own tree.
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("toolport-reaper-{tag}-{}", std::process::id()))
-                .join("Toolport");
-            let _ = std::fs::remove_dir_all(&dir);
+            let root = std::env::temp_dir().join(format!(
+                "toolport-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let dir = root.join("Toolport");
             std::fs::create_dir_all(&dir).expect("create scratch dir");
-            Self(dir)
-        }
-
-        fn join(&self, rel: &str) -> PathBuf {
-            self.0.join(rel)
+            // Canonicalize, because `/proc/<pid>/exe` reports the kernel's own
+            // resolved path. Where TMPDIR is a symlink (a container layout, or a
+            // custom TMPDIR pointing through one) an uncanonicalized path would make
+            // every `read_link(...) == exe` comparison fail even though the exec
+            // succeeded, turning a portability quirk into a spurious test failure.
+            let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+            Self { dir, root }
         }
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    /// So a `ScratchDir` can be used anywhere the old `PathBuf` helper was, without
+    /// rewriting every call site.
+    impl std::ops::Deref for ScratchDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.dir
+        }
+    }
+
     impl Drop for ScratchDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
@@ -2098,7 +2124,7 @@ mod tests {
     fn linux_enumeration_finds_a_versioned_gateway_via_the_exe_fallback() {
         let _serial = lock_process_table();
 
-        let dir = ScratchDir::new("enum");
+        let dir = ScratchDir::new("reaper-enum");
         // Deliberately longer than comm's 15-char window so the truncation this
         // test exists for actually happens.
         let exe = dir.join("toolport-gateway-9.9.9");
@@ -2166,7 +2192,7 @@ mod tests {
     fn linux_deleted_image_is_enumerated_but_misses_its_own_keep_path() {
         let _serial = lock_process_table();
 
-        let dir = ScratchDir::new("deleted");
+        let dir = ScratchDir::new("reaper-deleted");
         let exe = dir.join("bin/toolport-gateway");
         let gw = SpawnedGateway::at(exe.clone());
         gw.unlink_image();
@@ -2214,7 +2240,7 @@ mod tests {
 
         // Control: same name, same kind of path, image intact. The marker is the only
         // difference between this and the case above, so it must flip the verdict.
-        let live_dir = ScratchDir::new("deleted-control");
+        let live_dir = ScratchDir::new("reaper-deleted-control");
         let live_exe = live_dir.join("bin/toolport-gateway");
         let live_gw = SpawnedGateway::at(live_exe.clone());
         let live_hit = linux_list_gateway_processes()
@@ -2250,13 +2276,7 @@ mod tests {
     fn linux_reap_keeps_the_live_keep_path_and_kills_stale_and_unlinked_images() {
         let _serial = lock_process_table();
 
-        let mut keep_pids: Vec<u32> = linux_list_gateway_processes()
-            .into_iter()
-            .map(|p| p.pid)
-            .collect();
-        keep_pids.push(std::process::id());
-
-        let dir = ScratchDir::new("reap");
+        let dir = ScratchDir::new("reaper-reap");
         let keep_exe = dir.join("bin/toolport-gateway");
         let stale_exe = dir.join("old/toolport-gateway");
         let upgraded_exe = dir.join("upgraded/toolport-gateway");
@@ -2268,6 +2288,19 @@ mod tests {
         // An in-place upgrade: the file at a path we still consider current was
         // replaced, so this process now holds an unlinked inode.
         upgraded.unlink_image();
+
+        // Snapshot immediately before the pass and pin everything that is not one of
+        // this test's three fixtures, so a real Toolport gateway on a developer's
+        // machine cannot be reaped by the suite. Snapshotting before the fixtures
+        // spawn would instead leave the whole spawn sequence as a window in which a
+        // real gateway could start, miss the snapshot, and be killed.
+        let mine = [keep.pid(), stale.pid(), upgraded.pid()];
+        let mut keep_pids: Vec<u32> = linux_list_gateway_processes()
+            .into_iter()
+            .map(|p| p.pid)
+            .filter(|pid| !mine.contains(pid))
+            .collect();
+        keep_pids.push(std::process::id());
 
         let report = reap_with_context(&ReapContext {
             current_version: "9.9.9".into(),
@@ -2299,26 +2332,25 @@ mod tests {
             "the reaper could not stop processes it planned to kill: {:?}",
             report.failed
         );
+        // The pid snapshot above is the only thing standing between this pass and a
+        // real gateway that started in the window before it was taken. Assert the
+        // blast radius directly, so such a miss fails the suite loudly instead of
+        // silently killing a developer's gateway.
+        assert_eq!(
+            report.killed.len(),
+            2,
+            "expected exactly the stale and unlinked fixtures to be killed: {:?}",
+            report.killed
+        );
+        for label in &report.killed {
+            assert!(
+                label.contains("toolport-reaper-reap-"),
+                "the reap pass killed a process outside this test's scratch tree: {label}"
+            );
+        }
     }
 
     // ----- SOU-435: restart advice -------------------------------------------
-
-    /// Unique temp dir for a test that needs real files on disk.
-    ///
-    /// Ends in a literal `Toolport` segment because `decide_reap` only kills a
-    /// versioned gateway under a path `path_looks_like_our_install` recognizes; a
-    /// bare temp dir is treated as a stranger's binary and kept.
-    fn advice_temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!(
-                "toolport-advice-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ))
-            .join("Toolport");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     /// A context where anything not at `keep` and not current-version is obsolete.
     fn advice_ctx(keep: &Path) -> ReapContext {
@@ -2332,7 +2364,7 @@ mod tests {
 
     #[test]
     fn advice_names_the_parent_app_and_carries_its_pid() {
-        let dir = advice_temp_dir("names-parent");
+        let dir = ScratchDir::new("advice-names-parent");
         let keep = dir.join("toolport-gateway-9.9.9.exe");
         let stale = dir.join("toolport-gateway-1.9.4.exe");
         let ctx = advice_ctx(&keep);
@@ -2357,12 +2389,11 @@ mod tests {
             }],
             "an obsolete gateway with a named parent must be attributed to that app"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn advice_is_empty_for_the_updater_kill_all_pass() {
-        let dir = advice_temp_dir("kill-all");
+        let dir = ScratchDir::new("advice-kill-all");
         let keep = dir.join("toolport-gateway-9.9.9.exe");
         let mut ctx = advice_ctx(&keep);
         ctx.kill_all = true;
@@ -2382,7 +2413,6 @@ mod tests {
             clients_needing_restart(&procs, &ctx).is_empty(),
             "kill_all gives every process a Kill verdict, so obsolescence means nothing there"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The case #542 got backwards. ` (deleted)` means *unlinked*, which covers an
@@ -2392,7 +2422,7 @@ mod tests {
     /// passed because it ran on macOS where no marker appears at all.
     #[test]
     fn deleted_marker_advises_only_when_the_path_is_really_gone() {
-        let dir = advice_temp_dir("deleted-marker");
+        let dir = ScratchDir::new("advice-deleted-marker");
         let keep = dir.join("toolport-gateway-9.9.9");
         let ctx = advice_ctx(&keep);
 
@@ -2447,12 +2477,11 @@ mod tests {
             }],
             "the stale-install-location case must be reported, on every platform"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn advice_skips_unattributable_and_non_app_parents() {
-        let dir = advice_temp_dir("skips");
+        let dir = ScratchDir::new("advice-skips");
         let keep = dir.join("toolport-gateway-9.9.9.exe");
         let stale = dir.join("toolport-gateway-1.9.4.exe");
         let ctx = advice_ctx(&keep);
@@ -2516,12 +2545,11 @@ mod tests {
             &ctx
         )
         .is_empty());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn advice_dedupes_repeat_respawns_of_the_same_app() {
-        let dir = advice_temp_dir("dedupe");
+        let dir = ScratchDir::new("advice-dedupe");
         let keep = dir.join("toolport-gateway-9.9.9.exe");
         let stale = dir.join("toolport-gateway-1.9.4.exe");
         let ctx = advice_ctx(&keep);
@@ -2537,7 +2565,6 @@ mod tests {
             &ctx,
         );
         assert_eq!(advice.len(), 1, "one entry per app to act on, not per respawn");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The ordering requirement that three review rounds kept relocating: advice is
@@ -2545,7 +2572,7 @@ mod tests {
     /// table a previous pass already cleared.
     #[test]
     fn plan_reap_derives_advice_from_the_same_prekill_snapshot() {
-        let dir = advice_temp_dir("plan");
+        let dir = ScratchDir::new("advice-plan");
         let keep = dir.join("toolport-gateway-9.9.9.exe");
         let stale = dir.join("toolport-gateway-1.9.4.exe");
         let ctx = advice_ctx(&keep);
@@ -2577,7 +2604,6 @@ mod tests {
             after.needs_restart.is_empty(),
             "a post-kill table cannot produce the advice, so it must never be the source"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ----- SOU-484: pruning published gateway binaries ------------------------
@@ -2597,7 +2623,7 @@ mod tests {
 
     #[test]
     fn prune_deletes_only_old_versioned_images() {
-        let dir = advice_temp_dir("prune-basic");
+        let dir = ScratchDir::new("advice-prune-basic");
         let ctx = prune_ctx("1.10.0");
 
         assert_eq!(
@@ -2629,7 +2655,6 @@ mod tests {
             decide_prune(&bin(&dir, "toolport-gateway-1.10.0.exe"), &ctx),
             PruneDecision::Keep(_)
         ));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The exact situation from the SOU-484 report: on the machine where this was
@@ -2638,7 +2663,7 @@ mod tests {
     /// Deleting it there would have broken Claude Code rather than updated it.
     #[test]
     fn prune_keeps_a_binary_a_live_process_is_running() {
-        let dir = advice_temp_dir("prune-live");
+        let dir = ScratchDir::new("advice-prune-live");
         let rc = bin(&dir, "toolport-gateway-1.9.7-rc.1.exe");
         let mut ctx = prune_ctx("1.10.0");
         // No config references it; only the live process speaks for it.
@@ -2648,12 +2673,11 @@ mod tests {
             decide_prune(&rc, &ctx),
             PruneDecision::Keep("backing a running process")
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn prune_keeps_a_binary_a_client_config_still_names() {
-        let dir = advice_temp_dir("prune-referenced");
+        let dir = ScratchDir::new("advice-prune-referenced");
         let old = bin(&dir, "toolport-gateway-1.8.0.exe");
         let mut ctx = prune_ctx("1.10.0");
         // Nothing is running it, but a client will spawn exactly this path.
@@ -2663,7 +2687,6 @@ mod tests {
             decide_prune(&old, &ctx),
             PruneDecision::Keep("named by a client config")
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The window evidence alone misses: the client was reaped, has not respawned
@@ -2673,7 +2696,7 @@ mod tests {
     /// safe to do only after SOU-435.
     #[test]
     fn prune_keeps_a_binary_a_client_is_still_relaunching() {
-        let dir = advice_temp_dir("prune-advised");
+        let dir = ScratchDir::new("advice-prune-advised");
         let old = bin(&dir, "toolport-gateway-1.9.6.exe");
         let mut ctx = prune_ctx("1.10.0");
         assert_eq!(
@@ -2688,12 +2711,11 @@ mod tests {
             PruneDecision::Keep("a client is still relaunching it"),
             "restart advice must veto deletion even with no process and no config"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn prune_keeps_the_two_newest_non_current_versions() {
-        let dir = advice_temp_dir("prune-recent");
+        let dir = ScratchDir::new("advice-prune-recent");
         let all: Vec<PathBuf> = [
             "toolport-gateway-1.6.2.exe",
             "toolport-gateway-1.9.0.exe",
@@ -2735,7 +2757,6 @@ mod tests {
             decide_prune(&bin(&dir, "toolport-gateway-1.6.2.exe"), &ctx),
             PruneDecision::Delete
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `1.10.0` must sort above `1.9.6`, which a lexical compare gets backwards and
@@ -2772,7 +2793,7 @@ mod tests {
     /// listing happened to yield first.
     #[test]
     fn recency_floor_picks_the_newest_of_two_candidates() {
-        let dir = advice_temp_dir("prune-two-rcs");
+        let dir = ScratchDir::new("advice-prune-two-rcs");
         // Deliberately listed oldest-first, the order that hid this.
         let all: Vec<PathBuf> = [
             "toolport-gateway-1.9.6.exe",
@@ -2795,14 +2816,13 @@ mod tests {
             ],
             "the two newest are both candidates of 1.9.7, newest first"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The whole reported directory, end to end: 14 binaries, one current, one held
     /// by a live client, and the rest reclaimable.
     #[test]
     fn prune_plan_over_the_reported_directory() {
-        let dir = advice_temp_dir("prune-whole");
+        let dir = ScratchDir::new("advice-prune-whole");
         let names = [
             "toolport-gateway-1.6.2.exe",
             "toolport-gateway-1.7.0.exe",
@@ -2840,6 +2860,5 @@ mod tests {
             ],
             "current, the live rc, and the recency floor survive; the other 11 go"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
