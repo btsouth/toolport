@@ -287,10 +287,14 @@ fn reacquire_client_credentials(server_id: &str) -> Result<RefreshedToken, Strin
 /// an edit would keep minting tokens against the OLD configuration and the user's
 /// change would appear to do nothing.
 pub fn reset_client_credentials(server_id: &str) -> Result<(), String> {
-    let _ = secrets::delete_secret(server_id, CC_STATE_KEY);
+    // Errors propagate. A failed delete leaves state that would keep minting
+    // tokens under the OLD configuration, so reporting success here would tell
+    // the user their change had taken effect when it had not. Deleting a key that
+    // is not there is already `Ok` in every backend, so this does not fail on a
+    // server being configured for the first time.
+    secrets::delete_secret(server_id, CC_STATE_KEY)?;
     // The access token was minted under the previous configuration too.
-    let _ = secrets::delete_secret(server_id, secrets::HTTP_AUTH_KEY);
-    Ok(())
+    secrets::delete_secret(server_id, secrets::HTTP_AUTH_KEY)
 }
 
 /// Expiry of the vaulted client-credentials token, if this server uses that flow.

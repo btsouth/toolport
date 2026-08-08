@@ -1114,7 +1114,20 @@ fn set_client_credentials(
             ));
         }
     }
-    // Keychain first, outside the registry lock, matching `set_secret`. An empty
+    // Validate the id BEFORE touching the keychain. Writing first and erroring
+    // afterwards would leave an orphaned secret with nothing referencing it and
+    // no path to clean it up. The closure below re-checks under the lock, which
+    // is what actually guarantees consistency; this is purely so the common
+    // typo case cannot leave a credential behind.
+    {
+        let reg = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !reg.servers.iter().any(|s| s.id == server_id) {
+            return Err(format!("no server with id {server_id:?}"));
+        }
+    }
+    // Keychain next, outside the registry lock, matching `set_secret`. An empty
     // secret means "keep the vaulted one", so editing scopes does not require
     // re-entering the credential.
     if let Some(secret) = client_secret.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
