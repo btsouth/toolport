@@ -1075,6 +1075,17 @@ fn delete_secret(
     Ok(reg)
 }
 
+/// Did the user supply a new client secret, and what exactly should be stored?
+///
+/// Whitespace decides only whether the field was left blank ("keep the stored
+/// one"). The value itself is stored VERBATIM: generated secrets are opaque, and
+/// one that legitimately begins or ends with whitespace would otherwise be
+/// silently altered, rejected by the token endpoint as `invalid_client`, and
+/// impossible to correct through the UI since the field cannot be read back.
+fn supplied_secret(input: Option<String>) -> Option<String> {
+    input.filter(|s| !s.trim().is_empty())
+}
+
 /// Configure the headless OAuth client-credentials flow for an HTTP server
 /// (SBS-524).
 ///
@@ -1129,11 +1140,7 @@ fn set_client_credentials(
     }
     // An empty secret means "keep the vaulted one", so editing scopes does not
     // require re-entering the credential. Resolve it here but do not write yet.
-    let secret_to_store = client_secret
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    let secret_to_store = supplied_secret(client_secret);
     if secret_to_store.is_none()
         && secrets::get_secret(&server_id, secrets::CLIENT_SECRET_KEY).is_none()
     {
@@ -4984,5 +4991,24 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(only_server(&guard), "first");
+    }
+
+    /// SBS-524: whitespace decides only whether the field was blank; the value
+    /// itself must reach the keychain byte-for-byte. Trimming it would corrupt an
+    /// opaque secret that legitimately carries edge whitespace, and the resulting
+    /// `invalid_client` would be uncorrectable from a field that cannot be read back.
+    #[test]
+    fn supplied_secret_keeps_the_value_verbatim() {
+        assert_eq!(
+            supplied_secret(Some("  s3cret  ".into())).as_deref(),
+            Some("  s3cret  ")
+        );
+        assert_eq!(supplied_secret(Some("s3cret".into())).as_deref(), Some("s3cret"));
+        // Blank in any form means "keep the vaulted one".
+        assert_eq!(supplied_secret(Some(String::new())), None);
+        assert_eq!(supplied_secret(Some("   ".into())), None);
+        assert_eq!(supplied_secret(Some("	
+".into())), None);
+        assert_eq!(supplied_secret(None), None);
     }
 }
