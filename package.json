@@ -81,7 +81,8 @@
     "eslint-plugin-jsx-a11y": {
       "eslint": "$eslint"
     },
-    "postcss": "8.5.23"
+    "postcss": "8.5.23",
+    "nanoid": "^3.3.17"
   },
   "lint-staged": {
     "*.{ts,tsx,css,mjs,json,md}": "prettier --write",
