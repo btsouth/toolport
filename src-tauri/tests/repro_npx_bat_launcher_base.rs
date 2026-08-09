@@ -28,7 +28,8 @@ fn npx_bat_must_dedupe_by_package_like_npx_cmd() {
 fn parse_snippet_names_package_for_npx_bat() {
     use conduit_lib::clients::parse_snippet;
 
-    let json = r#"{"command":"C:\\Program Files\\nodejs\\npx.bat","args":["-y","@acme/mcp-weather"]}"#;
+    let json =
+        r#"{"command":"C:\\Program Files\\nodejs\\npx.bat","args":["-y","@acme/mcp-weather"]}"#;
     let servers = parse_snippet(json).expect("parse");
     assert_eq!(servers.len(), 1);
     assert_eq!(

@@ -32,15 +32,15 @@ fn ascii_template_matching_is_unchanged() {
         "fixture://item/06/extra",
         "fixture://item/{id}"
     ));
-    assert!(uri_matches_template(
-        "file:///a/b/c.txt",
-        "file:///{+path}"
-    ));
+    assert!(uri_matches_template("file:///a/b/c.txt", "file:///{+path}"));
 }
 
 #[test]
 fn multibyte_reserved_expansion_also_survives() {
     // `{+var}` uses the `.+` branch, which had the same raw-byte backtrack.
-    assert!(uri_matches_template("file:///naïve/päth.txt", "file:///{+path}"));
+    assert!(uri_matches_template(
+        "file:///naïve/päth.txt",
+        "file:///{+path}"
+    ));
     assert!(uri_matches_template("file:///日本語/x", "file:///{+path}"));
 }
