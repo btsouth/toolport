@@ -4261,26 +4261,103 @@ fn pii_sessions() -> &'static Mutex<HashMap<String, pii::SessionMap>> {
 /// local page that legitimately talks to it run on different ports. Anything that is
 /// not a loopback host — including a domain that currently *resolves* to 127.0.0.1,
 /// which is the whole DNS-rebinding trick — is foreign.
-fn origin_is_loopback(origin: &str) -> bool {
-    let Some(rest) = origin
+fn origin_host(origin: &str) -> Option<String> {
+    let rest = origin
         .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
-    else {
-        return false;
-    };
-    let host = rest.split('/').next().unwrap_or("");
+        .or_else(|| origin.strip_prefix("https://"))?;
+    let authority = rest.split('/').next().unwrap_or("");
     // Strip the port, taking care with a bracketed IPv6 literal.
-    let host = match host.strip_prefix('[') {
+    let host = match authority.strip_prefix('[') {
         Some(v6) => v6.split(']').next().unwrap_or(""),
-        None => host.split(':').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
     };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+fn origin_is_loopback(origin: &str) -> bool {
+    let Some(host) = origin_host(origin) else {
+        return false;
+    };
     host == "localhost"
         || host.ends_with(".localhost")
-        || host == "::1"
         || host
             .parse::<std::net::Ipv4Addr>()
             .is_ok_and(|ip| ip.is_loopback())
+        || host
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether a browser `Origin` may talk to this bridge.
+///
+/// Loopback is always allowed. Beyond that the bridge can be deliberately exposed
+/// (`TOOLPORT_HTTP_HOST=0.0.0.0`, or a specific LAN address), and a browser UI served
+/// from that host sends its own Origin — which is legitimate and must not be refused
+/// just because it is not loopback. Two ways to say so, neither of them DNS:
+///
+/// * the Origin host equals the address the bridge was bound to, when that is a
+///   concrete host rather than a wildcard; and
+/// * `TOOLPORT_HTTP_ALLOWED_ORIGINS`, a comma-separated list of hosts, for the
+///   wildcard-bind case where the browser's host cannot be inferred from the bind.
+///
+/// Still no name resolution anywhere: a host is compared as written, so a domain that
+/// merely resolves to the bridge stays foreign, which is the point of the check.
+fn origin_is_allowed(origin: &str, bind_host: &str, allowlist: &[String]) -> bool {
+    if origin_is_loopback(origin) {
+        return true;
+    }
+    let Some(host) = origin_host(origin) else {
+        return false;
+    };
+    let bind = bind_host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if !bind.is_empty() && !matches!(bind.as_str(), "0.0.0.0" | "::" | "[::]") && host == bind {
+        return true;
+    }
+    allowlist
+        .iter()
+        .any(|a| a.trim().trim_end_matches('.').eq_ignore_ascii_case(&host))
+}
+
+/// The 403 decision for a browser-shaped request, in one place so the wire-up is
+/// testable rather than a bare boolean OR at the call site.
+///
+/// `Sec-Fetch-Site` and `Origin` are both consulted because they cover different
+/// attacks: the first catches an ordinary cross-site fetch, the second catches DNS
+/// rebinding, where the browser believes it is same-origin. OPTIONS is exempt — it is
+/// the data-less CORS preflight and is handled by the normal preflight path.
+fn cross_origin_forbidden(
+    method: &str,
+    sec_fetch_site: Option<&str>,
+    origin: Option<&str>,
+    bind_host: &str,
+    allowlist: &[String],
+) -> bool {
+    if method == "OPTIONS" {
+        return false;
+    }
+    let cross_site = sec_fetch_site.is_some_and(|v| v.eq_ignore_ascii_case("cross-site"));
+    let foreign_origin = origin
+        .map(str::trim)
+        .filter(|o| !o.is_empty() && !o.eq_ignore_ascii_case("null"))
+        .is_some_and(|o| !origin_is_allowed(o, bind_host, allowlist));
+    cross_site || foreign_origin
+}
+
+/// Hosts an operator has declared safe for browser access, for a bridge bound to a
+/// wildcard address. Empty by default; loopback never needs to be listed.
+fn configured_allowed_origins() -> Vec<String> {
+    conduit_lib::brand::env_var(
+        "TOOLPORT_HTTP_ALLOWED_ORIGINS",
+        "CONDUIT_HTTP_ALLOWED_ORIGINS",
+    )
+    .map(|v| {
+        v.split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Reserved key for the local stdio client, which has no bearer identity. Carries a
@@ -7755,6 +7832,11 @@ struct GatewayState {
     /// True when this process is the HTTP/OpenAPI bridge (vs a stdio client's
     /// gateway). The bridge connects the union of all registered clients' servers.
     http: bool,
+    /// The address the HTTP bridge was bound to, and any extra browser origins the
+    /// operator declared. Held on state so the Origin check needs no env lookup per
+    /// request. Both empty for stdio.
+    http_bind_host: String,
+    http_allowed_origins: Vec<String>,
     /// Streamable-HTTP MCP sessions (`Mcp-Session-Id` → state). Only used when
     /// `http` is true; empty for stdio gateways.
     mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
@@ -11477,31 +11559,35 @@ fn handle_connection(
     // request outright so a malicious web page the user has open can't reach
     // the bridge or read tool output even when no token is set. The data-less
     // CORS preflight (OPTIONS) is left to the normal preflight path.
-    let cross_site = request
+    let sec_fetch_site = request
         .headers()
         .iter()
         .find(|h| h.field.equiv("Sec-Fetch-Site"))
-        .map(|h| h.value.as_str().eq_ignore_ascii_case("cross-site"))
-        .unwrap_or(false);
+        .map(|h| h.value.as_str().to_string());
 
     // Origin is checked as well as Sec-Fetch-Site, because they stop different
     // attacks and the second does not cover the first.
     //
     // Under DNS rebinding the attacker's domain resolves to 127.0.0.1, so the page
     // and the bridge share an origin as far as the browser is concerned: it sends
-    // `Sec-Fetch-Site: same-origin` and the guard above waves it through. What the
-    // request still carries is `Origin: http://attacker.tld`, which is the signal
+    // `Sec-Fetch-Site: same-origin` and the cross-site check waves it through. What
+    // the request still carries is `Origin: http://attacker.tld`, which is the signal
     // the spec has servers validate for exactly this reason.
     //
     // Absent Origin is allowed: curl, Open WebUI's backend and every other
     // server-side caller omit it, and those are the callers the bridge exists for.
-    let foreign_origin = request
+    let origin_hdr = request
         .headers()
         .iter()
         .find(|h| h.field.equiv("Origin"))
-        .map(|h| h.value.as_str().to_string())
-        .filter(|o| !o.is_empty() && !o.eq_ignore_ascii_case("null"))
-        .is_some_and(|o| !origin_is_loopback(&o));
+        .map(|h| h.value.as_str().to_string());
+    let forbidden = cross_origin_forbidden(
+        &method,
+        sec_fetch_site.as_deref(),
+        origin_hdr.as_deref(),
+        &state.http_bind_host,
+        &state.http_allowed_origins,
+    );
 
     // Auth + scope gate: resolve the bearer to (authorized, allowed-servers).
     // OPTIONS is the data-less preflight, always allowed and unscoped. Else the
@@ -11534,7 +11620,7 @@ fn handle_connection(
         }
     };
 
-    let out: HttpOut = if (cross_site || foreign_origin) && method != "OPTIONS" {
+    let out: HttpOut = if forbidden {
         HttpOut::json_err(403, "cross-site browser requests are not allowed")
     } else {
         match scope {
@@ -12052,6 +12138,14 @@ fn main() {
         lazy,
         profile: Arc::clone(&profile),
         http: http_mode,
+        http_bind_host: if http_mode {
+            conduit_lib::brand::env_var("TOOLPORT_HTTP_HOST", "CONDUIT_HTTP_HOST")
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "127.0.0.1".to_string())
+        } else {
+            String::new()
+        },
+        http_allowed_origins: configured_allowed_origins(),
         mcp_sessions,
         client_upstream,
         client_root,
@@ -12477,6 +12571,110 @@ mod tests {
         ] {
             assert!(!origin_is_loopback(bad), "should be foreign: {bad}");
         }
+    }
+
+    #[test]
+    fn a_deliberately_exposed_bridge_still_serves_its_own_browser_ui() {
+        // Review of #674: TOOLPORT_HTTP_HOST=0.0.0.0 is documented and supported, so a
+        // browser UI served from the LAN address sends a non-loopback Origin. Refusing
+        // that would break a supported deployment even with a valid bearer.
+        let none: Vec<String> = Vec::new();
+
+        // Bound to a concrete LAN address: that host is its own UI's origin.
+        assert!(origin_is_allowed(
+            "http://192.168.1.5:8765",
+            "192.168.1.5",
+            &none
+        ));
+        // A different LAN host is still foreign.
+        assert!(!origin_is_allowed(
+            "http://192.168.1.9:8765",
+            "192.168.1.5",
+            &none
+        ));
+
+        // Wildcard bind cannot infer the browser's host, so it takes an explicit list.
+        let allow = vec!["nas.local".to_string()];
+        assert!(origin_is_allowed(
+            "http://nas.local:8765",
+            "0.0.0.0",
+            &allow
+        ));
+        assert!(origin_is_allowed(
+            "http://NAS.LOCAL:8765",
+            "0.0.0.0",
+            &allow
+        ));
+        assert!(!origin_is_allowed(
+            "http://other.local:8765",
+            "0.0.0.0",
+            &allow
+        ));
+        // A wildcard bind must never match itself as a host.
+        assert!(!origin_is_allowed("http://0.0.0.0:8765", "0.0.0.0", &none));
+
+        // Loopback needs no configuration, whatever the bind.
+        assert!(origin_is_allowed("http://localhost:5173", "0.0.0.0", &none));
+        // And an allowlist never rescues an attacker origin.
+        assert!(!origin_is_allowed("http://attacker.tld", "0.0.0.0", &allow));
+    }
+
+    #[test]
+    fn the_403_decision_uses_both_signals_and_exempts_preflight() {
+        // Review of #674 asked for coverage of the wire-up, not just the host parser:
+        // the guard is only useful if both signals actually reach the decision.
+        let none: Vec<String> = Vec::new();
+        let bind = "127.0.0.1";
+
+        // Ordinary local browser request: allowed.
+        assert!(!cross_origin_forbidden(
+            "POST",
+            Some("same-origin"),
+            Some("http://localhost:5173"),
+            bind,
+            &none
+        ));
+        // Server-side caller with no browser headers at all: allowed, this is the
+        // primary supported client (curl, Open WebUI's backend).
+        assert!(!cross_origin_forbidden("POST", None, None, bind, &none));
+
+        // Plain cross-site fetch: caught by Sec-Fetch-Site.
+        assert!(cross_origin_forbidden(
+            "POST",
+            Some("cross-site"),
+            None,
+            bind,
+            &none
+        ));
+        // DNS rebinding: the browser believes it is same-origin, so ONLY Origin
+        // catches this. This is the case the old guard let through.
+        assert!(cross_origin_forbidden(
+            "POST",
+            Some("same-origin"),
+            Some("http://attacker.tld"),
+            bind,
+            &none
+        ));
+
+        // Preflight is exempt on both signals; the CORS path handles it.
+        assert!(!cross_origin_forbidden(
+            "OPTIONS",
+            Some("cross-site"),
+            Some("http://attacker.tld"),
+            bind,
+            &none
+        ));
+
+        // `null` and empty Origin are not foreign hosts; Sec-Fetch-Site still guards
+        // the browser cases that produce them.
+        assert!(!cross_origin_forbidden(
+            "POST",
+            None,
+            Some("null"),
+            bind,
+            &none
+        ));
+        assert!(!cross_origin_forbidden("POST", None, Some(""), bind, &none));
     }
 
     #[test]
@@ -14513,6 +14711,8 @@ mod tests {
             lazy,
             profile: Arc::new(Mutex::new(None)),
             http: true,
+            http_bind_host: "127.0.0.1".to_string(),
+            http_allowed_origins: Vec::new(),
             mcp_sessions,
             client_upstream,
             client_root: Arc::new(Mutex::new(None)),
