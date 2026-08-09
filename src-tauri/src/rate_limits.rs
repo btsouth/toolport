@@ -188,6 +188,8 @@ fn save_file(path: &Path, file: &CounterFile) -> Result<(), String> {
 }
 
 fn lock_counters(path: &Path) -> Result<crate::registry::FileLock, String> {
+    // lock_at is bounded-blocking, not a one-shot try-lock: it retries every
+    // 20 ms for up to five seconds before returning contention to the caller.
     crate::registry::lock_at(path)
         .map_err(|err| format!("Toolport rate-limit counters are busy; try again ({err})"))
 }
@@ -203,6 +205,9 @@ fn sync_bound_state(st: &mut CounterState) -> Result<(), String> {
     let mut disk = load_file(path)?;
     prune(&mut disk);
     if st.pending_merge {
+        // Calls accepted before bind can cross a UTC day/month boundary before
+        // this merge. Do not resurrect expired keys after pruning the disk copy.
+        prune(&mut st.file);
         for (key, pending) in &st.file.counts {
             let persisted = disk.counts.entry(key.clone()).or_insert(0);
             *persisted = persisted.saturating_add(*pending);
@@ -268,6 +273,7 @@ pub fn check_and_count(caps: &[Cap], server_id: &str, orig_tool: &str) -> Result
         let mut disk = load_file(path)?;
         prune(&mut disk);
         if st.pending_merge {
+            prune(&mut st.file);
             for (key, pending) in &st.file.counts {
                 let persisted = disk.counts.entry(key.clone()).or_insert(0);
                 *persisted = persisted.saturating_add(*pending);
@@ -510,6 +516,27 @@ mod tests {
 
         assert!(err.contains("cannot be parsed"), "{err}");
         assert_eq!(fs::read(&path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn late_binding_drops_expired_pending_windows() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TestDir::new("expired-pending");
+        reset_for_test();
+        {
+            let mut guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
+            let st = guard.as_mut().unwrap();
+            st.file.counts.insert("day:2000-01-01:*".into(), 7);
+            st.file.counts.insert("month:2000-01:*".into(), 11);
+            st.pending_merge = true;
+        }
+
+        bind_data_dir(&dir.0);
+
+        let persisted = load_file(&dir.0.join("rate_limit_counters.json")).unwrap();
+        assert!(persisted.counts.is_empty());
+        let guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(guard.as_ref().unwrap().file.counts.is_empty());
     }
 
     #[test]

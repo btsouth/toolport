@@ -61,7 +61,7 @@ fn concurrent_gateway_processes_must_not_lose_rate_limit_increments() {
 
     let executable = std::env::current_exe().expect("current test executable");
     let mut children = Vec::new();
-    for id in ["a", "b"] {
+    for id in ["a", "b", "c", "d"] {
         children.push(
             Command::new(&executable)
                 .env("TOOLPORT_RL_CHILD", "1")
@@ -78,8 +78,12 @@ fn concurrent_gateway_processes_must_not_lose_rate_limit_increments() {
     }
 
     wait_until(
-        || dir.join("ready-a").exists() && dir.join("ready-b").exists(),
-        "both children",
+        || {
+            ["a", "b", "c", "d"]
+                .iter()
+                .all(|id| dir.join(format!("ready-{id}")).exists())
+        },
+        "all children",
     );
     fs::write(dir.join("go"), b"1").unwrap();
 
@@ -88,6 +92,6 @@ fn concurrent_gateway_processes_must_not_lose_rate_limit_increments() {
         assert!(status.success(), "rate-limit child failed: {status}");
     }
 
-    assert_eq!(counter_total(&dir), 50);
+    assert_eq!(counter_total(&dir), 100);
     let _ = fs::remove_dir_all(dir);
 }
