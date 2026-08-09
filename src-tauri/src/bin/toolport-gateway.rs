@@ -4507,14 +4507,40 @@ fn run_script_dispatch(
         .map(|call| json!({ "index": call.index, "name": call.name, "ok": call.ok }))
         .collect();
 
+    // The same ledger rendered into the TEXT body, and placed ahead of the error
+    // message rather than after it. `shape_result` drops `structuredContent` from
+    // an oversized result (it is recoverable only via the cursor), and it
+    // truncates the body head-first — so a script that dies with a very large
+    // error would otherwise lose its recovery data at exactly the moment that
+    // data matters most. Leading with it means truncation eats the error text,
+    // which is the more expendable half. Bounded by `max_calls` (64).
+    let ledger_text = if outcome.progress.is_empty() {
+        "no calls completed".to_string()
+    } else {
+        let entries: Vec<String> = outcome
+            .progress
+            .iter()
+            .map(|call| {
+                format!(
+                    "{}:{}{}",
+                    call.index,
+                    call.name,
+                    if call.ok { "" } else { "(failed)" }
+                )
+            })
+            .collect();
+        format!(
+            "{} completed call(s), resume by index and do NOT skip by tool name: {}",
+            entries.len(),
+            entries.join(", ")
+        )
+    };
+
     let mut result = match outcome.error {
         Some(err) => json!({
             "content": [{
                 "type": "text",
-                "text": format!(
-                    "Toolport code mode: the script failed after {} completed call(s): {err}",
-                    progress.len()
-                )
+                "text": format!("Toolport code mode: the script failed. {ledger_text}. Error: {err}")
             }],
             "isError": true,
             "structuredContent": { "toolportScript": { "ok": false, "calls": outcome.calls, "progress": progress, "error": err } }
@@ -13068,6 +13094,51 @@ mod tests {
         let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
         assert_eq!(result["isError"].as_bool(), Some(true));
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], false);
+    }
+
+    /// #646 regression, found by CodeRabbit on the original PR. `shape_result`
+    /// rebuilds an oversized result and carries across every top-level field
+    /// EXCEPT `content`, `structuredContent` and `isError` — so the ledger in
+    /// `structuredContent.toolportScript.progress` is gone from the immediate
+    /// response, recoverable only by following the cursor. A script that dies
+    /// with a very large error is exactly when recovery data matters, so the
+    /// ledger is rendered into the text body as well, AHEAD of the error, since
+    /// shaping truncates the body head-first.
+    #[test]
+    fn an_oversized_code_mode_failure_keeps_its_call_ledger_in_the_text() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("TOOLPORT_RESULT_BUDGET").ok();
+        std::env::set_var("TOOLPORT_RESULT_BUDGET", "2048");
+
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        // One real call, then an error far larger than the budget.
+        let args = json!({
+            "script": "toolport.call('s__tool', {}); throw new Error('E'.repeat(20000));"
+        });
+        let result =
+            run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+
+        // Restore before asserting so a failure cannot leak the override.
+        match previous {
+            Some(value) => std::env::set_var("TOOLPORT_RESULT_BUDGET", value),
+            None => std::env::remove_var("TOOLPORT_RESULT_BUDGET"),
+        }
+
+        assert_eq!(result["isError"].as_bool(), Some(true));
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("[Toolport shaped this result"),
+            "test needs an actually-shaped result to be meaningful; got: {text}"
+        );
+        assert!(
+            text.contains("0:s__tool"),
+            "the completed-call ledger must survive shaping in the text body; got: {text}"
+        );
+        assert!(
+            text.contains("do NOT skip by tool name"),
+            "the ordinal contract must survive with it; got: {text}"
+        );
     }
 
     /// Kill switch path: when the live flag is off, dispatch refuses
