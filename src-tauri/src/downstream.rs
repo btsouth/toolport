@@ -1355,6 +1355,62 @@ pub fn resolve_root_token(cwd: &str, root: Option<&str>) -> Option<String> {
     }
 }
 
+/// Where a resolved project root came from, so the gateway can log it and tests can
+/// assert the precedence rather than just the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootSource {
+    /// `TOOLPORT_ROOT` (or the legacy `CONDUIT_ROOT`). An explicit operator choice.
+    EnvOverride,
+    /// The client's `roots/list`. Deprecated in MCP 2026-07-28 (SEP-2577).
+    ClientRoots,
+    /// The gateway's own working directory.
+    ProcessCwd,
+}
+
+/// Resolve the project root that folder-scoped routing and `${ROOT}` run on, from the
+/// first source that has an answer.
+///
+/// Roots, Sampling and Logging were all deprecated in 2026-07-28 (SEP-2577) with a
+/// twelve-month window. Roots is not cosmetic here: it is the only input folder-scoped
+/// auto-routing ever had, so when a client stops sending it the root becomes `None`,
+/// no mapping matches, and the client silently falls back to the unscoped profile.
+/// That is a **security** regression rather than a cosmetic one — it widens the set of
+/// servers a client can reach, quietly, with nothing in the UI to show it happened.
+///
+/// Precedence, and why:
+///
+/// 1. `TOOLPORT_ROOT` — an explicit operator choice outranks anything discovered.
+/// 2. The client's roots — its live declaration, honoured for the whole deprecation
+///    window, and still the most accurate answer while clients send it.
+/// 3. The gateway's process cwd — for stdio, the client spawns the gateway from the
+///    project directory, so this is usually the same path roots would have reported.
+///    It needs no protocol round trip, which also removes roots-fetch latency from
+///    profile switches.
+///
+/// A blank or whitespace-only value at any level is treated as absent so an empty env
+/// var cannot mask a real answer further down.
+pub fn resolve_project_root(
+    client_root: Option<&str>,
+    cwd: Option<&str>,
+) -> Option<(String, RootSource)> {
+    fn clean(v: Option<&str>) -> Option<String> {
+        v.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    let env_root = std::env::var("TOOLPORT_ROOT")
+        .or_else(|_| std::env::var("CONDUIT_ROOT"))
+        .ok();
+    if let Some(r) = clean(env_root.as_deref()) {
+        return Some((r, RootSource::EnvOverride));
+    }
+    if let Some(r) = clean(client_root) {
+        return Some((r, RootSource::ClientRoots));
+    }
+    clean(cwd).map(|r| (r, RootSource::ProcessCwd))
+}
+
 /// Decode a `file://` URI (the form MCP roots report) to a filesystem path
 /// string (issue #239). Uses `url::Url::to_file_path`, which handles the local
 /// platform's conventions: POSIX (`file:///home/x`), Windows drive letters
@@ -5302,11 +5358,11 @@ fn fetch_paginated_list(
 mod tests {
     use super::{
         cwd_validation_error, empty_cwd_variables, expand_cwd, fetch_paginated_list,
-        file_uri_to_path, protocol_meta_for, resolve_command, resolve_root_token,
-        screen_resolved_addrs, screen_spawn_command, screen_spawn_env, validate_cwd, CacheHint,
-        CancelRegistry, DownstreamServer, HttpTransport, MrtrRequest, ServerRequestAction,
-        ServerRequestHandler, Transport, TransportError, MODERN_PROTOCOL_VERSION,
-        OAUTH_CLIENT_CREDENTIALS_EXTENSION,
+        file_uri_to_path, protocol_meta_for, resolve_command, resolve_project_root,
+        resolve_root_token, screen_resolved_addrs, screen_spawn_command, screen_spawn_env,
+        validate_cwd, CacheHint, CancelRegistry, DownstreamServer, HttpTransport, MrtrRequest,
+        RootSource, ServerRequestAction, ServerRequestHandler, Transport, TransportError,
+        MODERN_PROTOCOL_VERSION, OAUTH_CLIENT_CREDENTIALS_EXTENSION,
     };
     use serde_json::{json, Value};
     use std::collections::{HashMap, VecDeque};
@@ -6276,6 +6332,114 @@ mod tests {
         // Clean up: kill the child to exit early, then wait to prevent a zombie.
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// Serializes the tests that set `TOOLPORT_ROOT`, since env is process-global and
+    /// a parallel test reading it would see another test's value.
+    static ROOT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_root_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ROOT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Both names, because `resolve_project_root` falls back to the legacy
+        // CONDUIT_ROOT. Clearing only TOOLPORT_ROOT would let a machine that happens
+        // to export CONDUIT_ROOT satisfy the env branch, so the tests asserting the
+        // cwd fallback would silently assert the wrong source.
+        let restore: Vec<(&str, Option<String>)> = ["TOOLPORT_ROOT", "CONDUIT_ROOT"]
+            .into_iter()
+            .map(|k| (k, std::env::var(k).ok()))
+            .collect();
+        std::env::remove_var("CONDUIT_ROOT");
+        match value {
+            Some(v) => std::env::set_var("TOOLPORT_ROOT", v),
+            None => std::env::remove_var("TOOLPORT_ROOT"),
+        }
+        let out = f();
+        for (k, prior) in restore {
+            match prior {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_client_without_roots_still_gets_a_project_root() {
+        // SBS-455, the whole point: Roots is deprecated, and a client that never sends
+        // it used to leave the root None -> no folder mapping matched -> the client
+        // silently dropped to the unscoped profile, widening what it could reach.
+        with_root_env(None, || {
+            assert_eq!(
+                resolve_project_root(None, Some("/home/u/proj")),
+                Some(("/home/u/proj".to_string(), RootSource::ProcessCwd))
+            );
+        });
+    }
+
+    #[test]
+    fn client_roots_win_over_the_process_cwd() {
+        // While clients still send roots, that is the more accurate answer: the gateway
+        // may have been spawned somewhere other than the project the client is in.
+        with_root_env(None, || {
+            assert_eq!(
+                resolve_project_root(Some("/home/u/actual"), Some("/somewhere/else")),
+                Some(("/home/u/actual".to_string(), RootSource::ClientRoots))
+            );
+        });
+    }
+
+    #[test]
+    fn an_explicit_env_override_outranks_everything() {
+        with_root_env(Some("/opt/pinned"), || {
+            assert_eq!(
+                resolve_project_root(Some("/home/u/actual"), Some("/somewhere/else")),
+                Some(("/opt/pinned".to_string(), RootSource::EnvOverride))
+            );
+        });
+    }
+
+    #[test]
+    fn blank_values_do_not_mask_a_real_answer_below_them() {
+        // An empty env var or an empty roots entry must fall through rather than
+        // resolving to "" — which would match no folder mapping and look identical to
+        // the silent-unscoping bug this fixes.
+        with_root_env(Some("   "), || {
+            assert_eq!(
+                resolve_project_root(Some(""), Some("/home/u/proj")),
+                Some(("/home/u/proj".to_string(), RootSource::ProcessCwd))
+            );
+        });
+    }
+
+    #[test]
+    fn a_client_that_drops_roots_mid_session_falls_back_rather_than_unscoping() {
+        // The mid-session case from the ticket: roots present, then withdrawn. The root
+        // must move to the cwd, never to None.
+        with_root_env(None, || {
+            let before = resolve_project_root(Some("/home/u/proj"), Some("/home/u/proj"));
+            assert_eq!(
+                before.as_ref().map(|(_, s)| *s),
+                Some(RootSource::ClientRoots)
+            );
+            let after = resolve_project_root(None, Some("/home/u/proj"));
+            assert_eq!(
+                after,
+                Some(("/home/u/proj".to_string(), RootSource::ProcessCwd)),
+                "dropping roots must not blank the root"
+            );
+        });
+    }
+
+    #[test]
+    fn no_source_at_all_is_still_none() {
+        // A context with neither (the desktop probe) keeps the existing behaviour:
+        // ${ROOT} servers inherit the gateway cwd rather than spawning wrong.
+        with_root_env(None, || {
+            assert_eq!(resolve_project_root(None, None), None);
+            assert_eq!(resolve_project_root(Some("  "), Some("")), None);
+        });
     }
 
     #[test]

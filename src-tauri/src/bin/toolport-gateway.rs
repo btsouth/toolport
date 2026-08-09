@@ -9092,6 +9092,25 @@ fn refresh_client_root(state: &GatewayState) {
     } else {
         None
     };
+    // Fall back rather than going unscoped (SBS-455). Roots is deprecated as of
+    // 2026-07-28, and a client that never sent it — or stops mid-session — used to
+    // leave this `None`, so no folder mapping matched and the client silently dropped
+    // to the unscoped profile. That widens the servers it can reach, quietly.
+    let new_root = match downstream::resolve_project_root(
+        new_root.as_deref(),
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .as_deref(),
+    ) {
+        Some((root, source)) => {
+            if source != downstream::RootSource::ClientRoots {
+                glog(&format!("toolport: project root from {source:?} ({root})"));
+            }
+            Some(root)
+        }
+        None => None,
+    };
     let changed = {
         let mut cur = state
             .client_root
