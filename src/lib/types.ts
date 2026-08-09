@@ -167,6 +167,10 @@ export interface McpTool {
    * some servers also emit it at the top level, so both are tolerated. */
   annotations?: { destructiveHint?: boolean; [k: string]: unknown };
   destructiveHint?: boolean;
+  /** Server-declared icons (SEP-973). Already transit the gateway untouched. Only
+   * `data:` sources are ever rendered — see `pickIconSrc` for why a remote URL is a
+   * request rather than a picture. */
+  icons?: { src: string; mimeType?: string; sizes?: string }[];
 }
 
 /** A resource as advertised by a downstream server (raw `resources/list` entry). */

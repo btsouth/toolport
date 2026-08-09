@@ -38,6 +38,7 @@ import type {
   ToolCallResult,
 } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
+import { pickIconSrc } from "@/lib/icons";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -1112,6 +1113,18 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
                           className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left"
                         >
                           <span className="flex min-w-0 items-center gap-2">
+                            {/* SEP-973. Only data: icons render (see pickIconSrc); a
+                                remote URL is a request to a server-chosen host on every
+                                paint, and the app's CSP blocks it anyway. Fixed box so a
+                                malformed or oddly-shaped icon cannot shift the row. */}
+                            {pickIconSrc(t.icons) && (
+                              <img
+                                src={pickIconSrc(t.icons) ?? undefined}
+                                alt=""
+                                aria-hidden="true"
+                                className="size-4 shrink-0 rounded-sm object-contain"
+                              />
+                            )}
                             <span className="truncate font-mono text-sm">{t.name}</span>
                             {destructive && <Badge variant="warning">destructive</Badge>}
                             {!exposed && (
