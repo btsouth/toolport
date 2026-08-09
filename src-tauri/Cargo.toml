@@ -6,6 +6,11 @@ authors = ["South Forge AI"]
 edition = "2021"
 default-run = "conduit"
 
+[[bin]]
+name = "conduit"
+path = "src/main.rs"
+required-features = ["desktop"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]

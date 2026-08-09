@@ -84,3 +84,45 @@ jobs:
 
       - name: Headless gateway security smoke
         run: npm run smoke:headless
+
+  cross-platform-rust:
+    name: Headless Rust tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      # The headless build skips Tauri/WebKit, but the Linux keyring backend still
+      # needs libdbus headers and pkg-config at compile time.
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev pkg-config libdbus-1-dev
+
+      - name: Cache cargo + target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-headless-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-headless-cargo-
+
+      - name: Rust tests (lib + binaries + integration, no desktop)
+        if: matrix.os != 'windows-latest'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib --bins --tests
+
+      # Reuse the local Windows helper so a stale debug gateway cannot lock the
+      # executable while Cargo rebuilds it.
+      - name: Rust tests (Windows, no desktop)
+        if: matrix.os == 'windows-latest'
+        run: powershell -ExecutionPolicy Bypass -File scripts/test-rust-windows.ps1 -NoDefaultFeatures
