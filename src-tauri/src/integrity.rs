@@ -634,7 +634,16 @@ fn load_quarantine(profile: Option<&str>) -> Result<Quarantine, String> {
 /// Parse quarantine JSON. Shared by disk load and the mtime-cached read path.
 fn parse_quarantine_raw(raw: &str, path: &Path) -> Result<Quarantine, String> {
     if raw.trim().is_empty() {
-        return Ok(Quarantine::new());
+        // An empty store is a LOST store, not a fresh start — the same reasoning
+        // `load_pins` already applies to an empty baseline. `atomic_write` (temp + fsync
+        // + rename) never leaves an empty file, and a release always writes at least
+        // `{}`, so emptiness means truncation or a wipe. Treating it as "nothing
+        // quarantined" silently re-exposes every tool held after high-risk drift or
+        // baseline tamper, which is exactly the fail-open SOU-320 closed for corrupt JSON.
+        return Err(format!(
+            "quarantine store at {path:?} is empty, which means it was truncated or wiped; \
+             refusing to treat that as an empty quarantine set"
+        ));
     }
     match serde_json::from_str::<Quarantine>(raw) {
         // A destructive tool APPEARING (first sight) is no longer quarantine-worthy: that
