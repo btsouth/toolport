@@ -8,8 +8,10 @@ import {
   Plug,
   PlugZap,
   Puzzle,
+  RefreshCw,
   Shuffle,
   TriangleAlert,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
@@ -118,6 +120,27 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     setTransport(managedTransport);
   }, [managedTransport, client.id]);
 
+  // SOU-317 follow-up (SBS-336): the restart advice is load-bearing — an MCP client
+  // typically does not pick up a rewritten config until relaunch — but it only ever
+  // appeared in a toast, which fades after a few seconds and is gone if the user was
+  // looking elsewhere. Keep it in the panel until they dismiss it.
+  // Keyed by client id rather than cleared in an effect: selecting another client must
+  // not carry the previous one's advice across, and deriving that from the key avoids a
+  // cascading-render setState-in-effect.
+  const [restartNotice, setRestartNotice] = useState<{
+    clientId: string;
+    text: string;
+  } | null>(null);
+  const showRestartNotice =
+    restartNotice?.clientId === client.id ? restartNotice.text : null;
+
+  function noteRestartNeeded() {
+    setRestartNotice({
+      clientId: client.id,
+      text: clientRestartHint(client.name, client.id),
+    });
+  }
+
   // Discovery: the global mode this client falls back to, and its own override (if any).
   // The gateway resolves env > per-client > global, so an override here applies live.
   const globalMode =
@@ -194,6 +217,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           : `${client.name} now follows the active profile.`,
         { description: clientRestartHint(client.name, client.id) },
       );
+      noteRestartNeeded();
       onChanged();
     } catch (e) {
       toastError(`${e}`);
@@ -210,6 +234,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       toast.success(`Reset ${client.name} to the default Toolport gateway`, {
         description: clientRestartHint(client.name, client.id),
       });
+      noteRestartNeeded();
       setResetOpen(false);
       onChanged();
     } catch (e) {
@@ -374,6 +399,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           ),
         });
       }
+      noteRestartNeeded();
       onChanged();
     } catch (e) {
       toastError(`${e}`);
@@ -537,6 +563,27 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             <p className="font-medium">Couldn't read this client's configuration</p>
             <p className="mt-0.5 break-words text-xs">{client.error}</p>
           </div>
+        </div>
+      )}
+
+      {showRestartNotice && (
+        <div
+          role="status"
+          className="flex items-start gap-2 rounded-lg border border-info/30 bg-info/10 px-3 py-2 text-sm text-info"
+        >
+          <RefreshCw className="mt-0.5 size-4 shrink-0" />
+          <div className="min-w-0 flex-1">
+            <p className="font-medium">Not live yet</p>
+            <p className="mt-0.5 break-words text-xs">{showRestartNotice}</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setRestartNotice(null)}
+            aria-label="Dismiss restart reminder"
+            className="rounded p-0.5 text-info/70 transition-colors hover:bg-info/10 hover:text-info focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-info"
+          >
+            <X className="size-3.5" />
+          </button>
         </div>
       )}
 
