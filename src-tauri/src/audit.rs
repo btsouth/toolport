@@ -406,14 +406,17 @@ pub fn read_recent(limit: usize) -> Vec<Value> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let mut entries: Vec<Value> = content
+    // Filter BEFORE take, matching `inspect::read_recent` and `searchtrace`. Taking
+    // first let an unparseable line consume a slot, so one corrupt row among the
+    // newest entries returned a short page and dropped older valid history that
+    // should have filled it.
+    let entries: Vec<Value> = content
         .lines()
         .rev()
-        .take(limit)
         .filter_map(|line| serde_json::from_str(line).ok())
+        .take(limit)
         .collect();
-    // `rev().take()` gives newest-first already.
-    entries.truncate(limit);
+    // `rev()` gives newest-first already.
     entries
 }
 
