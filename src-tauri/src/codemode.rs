@@ -28,6 +28,25 @@
 //! (they never enter model context). The gateway shapes only the script's final aggregate
 //! for the client. Limits: call budget, wall-clock deadline, max concurrent host calls,
 //! promise-job budget, and boa's loop/recursion caps.
+//!
+//! # What actually bounds a pure-JS runaway (SBS-430)
+//!
+//! [`Limits::wall_clock`] is NOT enforced while synchronous JS is running. It is checked
+//! when a script reserves a host call ([`reserve_budget`]) and between promise jobs
+//! ([`BoundedJobExecutor`]), and boa 0.21 exposes no time-based interrupt to check it
+//! anywhere else. A script that never calls a tool and never awaits is bounded only by
+//! boa's own counters:
+//!
+//!   * `loop_iteration_limit` — total loop iterations, across nested loops, not per-loop.
+//!   * recursion limit — depth, which trips almost immediately.
+//!
+//! Both fail closed, so a runaway always terminates. The gap is that the loop bound counts
+//! *iterations*, not *time*: at the 10M default a trivial body measured ~15s, and a heavier
+//! body scales from there with nothing consulting the 60s wall clock. Treat `wall_clock` as
+//! a bound on host-call and async work, not as a hard ceiling on a CPU-bound script.
+//!
+//! `pure_js_runaways_are_bounded_by_count_not_wall_clock` pins this so a boa upgrade that
+//! drops either counter is caught rather than silently removing the only real bound.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1386,6 +1405,65 @@ mod tests {
         let out = run("while (true) {} return 1;", json!({}), call, limits);
         assert_ne!(out.error, None, "an infinite loop must be stopped");
         assert_eq!(out.calls, 0);
+    }
+
+    #[test]
+    fn nested_loops_share_one_iteration_budget() {
+        // SBS-430: the cap is total iterations, not per-loop, so nesting cannot multiply
+        // its way past it. Without this a script could sit under the limit in every
+        // individual loop and still run unbounded work.
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let limits = Limits {
+            loop_iteration_limit: 1_000,
+            ..Limits::default()
+        };
+        let out = run(
+            "let n = 0; for (let i = 0; i < 1000; i++) { for (let j = 0; j < 1000; j++) { n++; } } return n;",
+            json!({}),
+            call,
+            limits,
+        );
+
+        let err = out.error.expect("nested loops must hit the shared budget");
+        assert!(err.contains("loop iteration limit"), "got: {err}");
+    }
+
+    #[test]
+    fn unbounded_recursion_is_stopped_without_a_host_call() {
+        // The other half of the pure-JS bound. Depth-limited, and it trips long before
+        // the loop budget would.
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let out = run(
+            "function f(n) { return n <= 0 ? 0 : f(n - 1) + 1; } return f(10000000);",
+            json!({}),
+            call,
+            Limits::default(),
+        );
+
+        let err = out.error.expect("unbounded recursion must be stopped");
+        assert!(err.contains("recursive calls"), "got: {err}");
+        assert_eq!(out.calls, 0, "it never reached a host call");
+    }
+
+    #[test]
+    fn pure_js_runaways_are_bounded_by_count_not_wall_clock() {
+        // Documents the real contract (SBS-430): a CPU-bound script that never calls a
+        // tool and never awaits is stopped by boa's iteration counter, NOT by
+        // Limits::wall_clock, which nothing consults on that path. A wall_clock of zero
+        // therefore does not stop it -- only the loop budget does.
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let limits = Limits {
+            wall_clock: StdDuration::from_secs(0),
+            loop_iteration_limit: 5_000,
+            ..Limits::default()
+        };
+        let out = run("while (true) {} return 1;", json!({}), call, limits);
+
+        let err = out.error.expect("the loop budget must still stop it");
+        assert!(
+            err.contains("loop iteration limit"),
+            "an expired wall clock is not what stops a pure-JS loop; got: {err}"
+        );
     }
 
     #[test]
