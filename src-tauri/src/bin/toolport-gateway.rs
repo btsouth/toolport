@@ -6590,78 +6590,84 @@ fn handle_resource_subscription(
     let session = active_resource_session_id();
     match method {
         "resources/subscribe" => {
-            // Single-flight loop: leaders open downstream; waiters re-enter after
-            // the gate resolves so they either join or see a fail-closed error.
-            loop {
-                let begin = {
-                    let mut table = state
-                        .resource_subs
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    match table.begin_subscribe(&session, uri, &owner) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            return Some(error(id, -32602, &format!("Toolport: {e}")));
-                        }
+            // Single-flight: the first caller opens downstream, the rest wait on the
+            // gate and then either join the open subscription or inherit the leader's
+            // error. Deliberately fail-closed -- a waiter does NOT retry as a new leader,
+            // so one failed open cannot turn N parked waiters into N retries against a
+            // server that just failed.
+            //
+            // This was a `loop` whose every arm returned, so it never iterated. The comment
+            // described a waiter re-entry the code never performed (SBS-434 item 4), and
+            // clippy's deny-by-default never_loop was the one hard error blocking a
+            // -D warnings gate in CI.
+            let begin = {
+                let mut table = state
+                    .resource_subs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match table.begin_subscribe(&session, uri, &owner) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Some(error(id, -32602, &format!("Toolport: {e}")));
                     }
-                };
-                match begin {
-                    BeginSubscribe::AlreadyLocal | BeginSubscribe::Joined => {
-                        return Some(success(id, json!({})));
-                    }
-                    BeginSubscribe::Lead(gate) => {
-                        // If subscribe_resource panics, Drop clears `opening` and
-                        // fails waiters instead of parking them forever (WS1-4).
-                        let mut lead_guard = LeadOpenGuard {
-                            state,
-                            uri: uri.to_string(),
-                            gate: Arc::clone(&gate),
-                            armed: true,
-                        };
-                        match router.subscribe_resource(uri) {
-                            Ok(_) => {
-                                let mut table = state
-                                    .resource_subs
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                table.finish_open_ok(uri, &gate);
-                                lead_guard.disarm();
-                                return Some(success(id, json!({})));
-                            }
-                            Err(e) => {
-                                let msg = integrity::defend_error_text(uri, &e);
-                                let mut table = state
-                                    .resource_subs
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                table.finish_open_err(uri, &gate, msg.clone());
-                                lead_guard.disarm();
-                                return Some(error(
-                                    id,
-                                    -32602,
-                                    &format!("Toolport: {msg}"),
-                                ));
-                            }
-                        }
-                    }
-                    BeginSubscribe::Wait(gate) => match gate.wait() {
-                        Ok(()) => {
+                }
+            };
+            match begin {
+                BeginSubscribe::AlreadyLocal | BeginSubscribe::Joined => {
+                    return Some(success(id, json!({})));
+                }
+                BeginSubscribe::Lead(gate) => {
+                    // If subscribe_resource panics, Drop clears `opening` and
+                    // fails waiters instead of parking them forever (WS1-4).
+                    let mut lead_guard = LeadOpenGuard {
+                        state,
+                        uri: uri.to_string(),
+                        gate: Arc::clone(&gate),
+                        armed: true,
+                    };
+                    match router.subscribe_resource(uri) {
+                        Ok(_) => {
                             let mut table = state
                                 .resource_subs
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            match table.join_open(&session, uri, &owner) {
-                                Ok(()) => return Some(success(id, json!({}))),
-                                Err(e) => {
-                                    return Some(error(id, -32602, &format!("Toolport: {e}")));
-                                }
-                            }
+                            table.finish_open_ok(uri, &gate);
+                            lead_guard.disarm();
+                            return Some(success(id, json!({})));
                         }
                         Err(e) => {
-                            return Some(error(id, -32602, &format!("Toolport: {e}")));
+                            let msg = integrity::defend_error_text(uri, &e);
+                            let mut table = state
+                                .resource_subs
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            table.finish_open_err(uri, &gate, msg.clone());
+                            lead_guard.disarm();
+                            return Some(error(
+                                id,
+                                -32602,
+                                &format!("Toolport: {msg}"),
+                            ));
                         }
-                    },
+                    }
                 }
+                BeginSubscribe::Wait(gate) => match gate.wait() {
+                    Ok(()) => {
+                        let mut table = state
+                            .resource_subs
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match table.join_open(&session, uri, &owner) {
+                            Ok(()) => return Some(success(id, json!({}))),
+                            Err(e) => {
+                                return Some(error(id, -32602, &format!("Toolport: {e}")));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Some(error(id, -32602, &format!("Toolport: {e}")));
+                    }
+                },
             }
         }
         "resources/unsubscribe" => {
