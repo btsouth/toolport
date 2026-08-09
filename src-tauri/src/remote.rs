@@ -511,8 +511,12 @@ fn require_secure_for_auth(url: &str) -> Result<(), String> {
     if oauth::host_is_definitely_private(&host) {
         return Ok(());
     }
+    // Redact before interpolating: this message reaches the activity UI, client error
+    // text, and any log that records the failure, and a URL of the form
+    // `http://user:hunter2@host/mcp` would carry the password into all three.
+    let shown = crate::registry::redact_url_userinfo(url);
     Err(format!(
-        "refusing to send the saved auth token to a non-HTTPS URL ({url}); \
+        "refusing to send the saved auth token to a non-HTTPS URL ({shown}); \
          use https for an authenticated remote server"
     ))
 }
@@ -822,6 +826,38 @@ mod tests {
         assert!(is_auth_error("HTTP 401"));
         assert!(is_auth_error("server said 403."));
         assert!(is_auth_error("(403)"));
+    }
+
+    #[test]
+    fn refusing_cleartext_auth_does_not_echo_url_credentials() {
+        // The refusal message reaches the activity UI, client error text, and logs. A
+        // password in the URL would ride along into all three, which is the leak this
+        // error was supposed to prevent in the first place.
+        let err = require_secure_for_auth("http://user:hunter2@8.8.8.8/mcp")
+            .expect_err("cleartext auth to a public host must be refused");
+
+        assert!(
+            !err.contains("hunter2"),
+            "credentials leaked into the error: {err}"
+        );
+        assert!(
+            err.contains("8.8.8.8"),
+            "the host has to survive or the error is unactionable: {err}"
+        );
+    }
+
+    #[test]
+    fn a_cleartext_url_without_credentials_is_reported_as_written() {
+        let err = require_secure_for_auth("http://8.8.8.8/mcp")
+            .expect_err("cleartext auth to a public host must be refused");
+        assert!(err.contains("http://8.8.8.8/mcp"), "got: {err}");
+    }
+
+    #[test]
+    fn private_and_https_hosts_are_still_allowed() {
+        // Redaction must not change which URLs are accepted.
+        assert!(require_secure_for_auth("https://mcp.example.com/mcp").is_ok());
+        assert!(require_secure_for_auth("http://127.0.0.1:4000/mcp").is_ok());
     }
 
     fn oauth_state(expires_at: Option<u64>, refresh_token: Option<&str>) -> OAuthState {
