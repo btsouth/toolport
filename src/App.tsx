@@ -449,6 +449,24 @@ function App() {
     setView(v);
   }
 
+  /** Focus the search box once it exists.
+   *
+   * Coming from another view the input is not mounted yet, and the view it replaces
+   * may be lazy-loaded behind Suspense, so a single frame is not reliably enough.
+   * Retry for a few frames, then give up rather than spin.
+   */
+  function focusSearchWhenMounted() {
+    let frames = 0;
+    const tick = () => {
+      if (searchRef.current) {
+        searchRef.current.select();
+        return;
+      }
+      if (frames++ < 15) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+
   // One global keydown listener rather than per-control handlers, so a shortcut works
   // wherever focus happens to be. The decision of what a keystroke means lives in
   // `resolveShortcut` and is unit-tested there; this only performs the effect.
@@ -468,8 +486,7 @@ function App() {
           // Search only exists on the servers list; go there first so the shortcut
           // is not a silent no-op from another view.
           selectView("servers");
-          // After the view switch has painted, or the input is not mounted yet.
-          requestAnimationFrame(() => searchRef.current?.select());
+          focusSearchWhenMounted();
           break;
         case "addServer":
           e.preventDefault();
@@ -824,7 +841,7 @@ function App() {
                 size="icon"
                 className="size-8"
                 aria-label="Refresh"
-                title="Reload servers, clients, and health"
+                title={`Reload servers, clients, and health (${isMac ? "⌘" : "Ctrl"}R)`}
                 onClick={() => load(true)}
                 disabled={loading}
               >
@@ -1007,7 +1024,14 @@ function App() {
         <ServerDialog
           autoOpen
           onClose={() => setAddServerOpen(false)}
-          onSaved={setRegistry}
+          onSaved={(reg) => {
+            setRegistry(reg);
+            // A successful save closes the dialog internally without going through
+            // onOpenChange, so `onClose` never fires and this stays mounted-but-open.
+            // Without clearing it here the next Ctrl+N is a silent no-op. Same pattern
+            // CatalogView already uses for its autoOpen dialog.
+            setAddServerOpen(false);
+          }}
           existingNames={servers.map((s) => s.name)}
         />
       )}
