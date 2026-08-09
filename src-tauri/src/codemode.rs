@@ -846,12 +846,12 @@ fn drive_to_completion(
         }
 
         let Some(obj) = top.as_object() else {
-            return Ok(top.to_json(context).ok().flatten().unwrap_or(Value::Null));
+            return json_from_js(context, &top);
         };
         let promise = match JsPromise::from_object(obj.clone()) {
             Ok(p) => p,
             Err(_) => {
-                return Ok(top.to_json(context).ok().flatten().unwrap_or(Value::Null));
+                return json_from_js(context, &top);
             }
         };
 
@@ -864,7 +864,7 @@ fn drive_to_completion(
                 )));
             }
             PromiseState::Fulfilled(value) => {
-                return Ok(value.to_json(context).ok().flatten().unwrap_or(Value::Null));
+                return json_from_js(context, &value);
             }
             PromiseState::Rejected(reason) => {
                 let msg = reason
@@ -881,6 +881,45 @@ fn drive_to_completion(
     Err(JsError::from_native(JsNativeError::error().with_message(
         "toolport script exceeded internal async drive budget",
     )))
+}
+
+/// Convert a script's return value to JSON through JS `JSON.stringify`, the same boundary
+/// the prelude already uses for tool arguments and results.
+///
+/// Not `JsValue::to_json`: that is a host-side walk of internal property slots, so it never
+/// runs `toJSON()` and never sees accessors. A `Date` has no own enumerable properties and
+/// came back as `{}`; a `BigInt` produced an `Err` that the old call sites discarded with
+/// `.ok().flatten().unwrap_or(Value::Null)`. Either way the script reported success with
+/// the data gone, which the agent cannot distinguish from a real `null` return.
+///
+/// Going through `JSON.stringify` gives `Date` its ISO-8601 string and turns values that
+/// genuinely cannot be represented (`BigInt`, cyclic structures) into a thrown `TypeError`
+/// we surface as a script error. `undefined` — a script that returned nothing — stays
+/// `null`, matching [`ScriptOutcome::value`]'s contract.
+fn json_from_js(context: &mut Context, value: &JsValue) -> Result<Value, JsError> {
+    let json = context.global_object().get(js_string!("JSON"), context)?;
+    let stringify = json
+        .as_object()
+        .ok_or_else(|| type_error("JSON is not an object"))?
+        .get(js_string!("stringify"), context)?
+        .as_callable()
+        .ok_or_else(|| type_error("JSON.stringify is not callable"))?;
+
+    let encoded = stringify.call(&JsValue::undefined(), &[value.clone()], context)?;
+    let Some(text) = encoded.as_string() else {
+        // `JSON.stringify(undefined)` is `undefined`: the script returned nothing.
+        return Ok(Value::Null);
+    };
+
+    serde_json::from_str(&text.to_std_string_escaped()).map_err(|e| {
+        JsError::from_native(JsNativeError::typ().with_message(format!(
+            "script return value could not be encoded as JSON: {e}"
+        )))
+    })
+}
+
+fn type_error(message: &str) -> JsError {
+    JsError::from_native(JsNativeError::typ().with_message(message.to_string()))
 }
 
 /// Take queued `callAsync` work, run it with bounded host-side parallelism, resolve each
@@ -1047,6 +1086,88 @@ mod tests {
         assert_eq!(progress_names(&out), vec!["first", "second"]);
         assert!(out.progress.iter().all(|c| c.ok));
         assert_eq!(out.calls, 2);
+    }
+
+    /// A binding no return-value test needs, since none of them call a tool.
+    fn no_calls() -> CallBinding {
+        Arc::new(|_name: &str, _args: Value| json!({}))
+    }
+
+    fn returns(script: &str) -> ScriptOutcome {
+        run(script, json!({}), no_calls(), Limits::default())
+    }
+
+    #[test]
+    fn a_returned_date_survives_as_its_instant() {
+        // SBS-631: boa's to_json walks internal slots, so it never ran Date's toJSON()
+        // and the instant arrived as {} under a successful outcome.
+        let out = returns("return new Date(0);");
+
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(out.value, json!("1970-01-01T00:00:00.000Z"));
+    }
+
+    #[test]
+    fn a_returned_bigint_fails_closed_instead_of_reporting_null() {
+        // The old path produced `Err` here and then dropped it on the floor with
+        // `.ok().flatten().unwrap_or(Value::Null)`, so the agent saw a successful
+        // `null` id. A false success is worse than an error it can recover from.
+        let out = returns("return 9007199254740993n;");
+
+        let err = out.error.expect("BigInt cannot be represented in JSON");
+        assert!(
+            err.to_lowercase().contains("bigint"),
+            "error should name the unrepresentable type, got: {err}"
+        );
+    }
+
+    #[test]
+    fn dates_nested_in_a_returned_structure_survive_too() {
+        // Aggregation output is where this actually bit: the timestamp is a field on
+        // a row, not the whole return value.
+        let out = returns(r#"return { ranAt: new Date(0), rows: [{ at: new Date(0) }] };"#);
+
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(
+            out.value,
+            json!({
+                "ranAt": "1970-01-01T00:00:00.000Z",
+                "rows": [{ "at": "1970-01-01T00:00:00.000Z" }],
+            })
+        );
+    }
+
+    #[test]
+    fn a_cyclic_return_value_is_an_error_not_an_empty_success() {
+        let out = returns("const a = {}; a.self = a; return a;");
+
+        let err = out.error.expect("a cycle cannot be encoded as JSON");
+        assert!(
+            err.to_lowercase().contains("circular") || err.to_lowercase().contains("cyclic"),
+            "error should explain the cycle, got: {err}"
+        );
+    }
+
+    #[test]
+    fn returning_nothing_is_still_a_successful_null() {
+        // `JSON.stringify(undefined)` is `undefined`, not a string. That has to stay a
+        // successful null rather than falling into the encode-failure branch.
+        let out = returns("return;");
+
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(out.value, json!(null));
+    }
+
+    #[test]
+    fn ordinary_return_values_are_unchanged() {
+        // The conversion swap must not disturb the shapes scripts actually return.
+        let out = returns(r#"return { n: 1, s: "x", b: true, nil: null, arr: [1, 2] };"#);
+
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(
+            out.value,
+            json!({ "n": 1, "s": "x", "b": true, "nil": null, "arr": [1, 2] })
+        );
     }
 
     #[test]
