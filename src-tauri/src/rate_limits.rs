@@ -6,14 +6,14 @@
 //! windowed (UTC day / UTC month). They persist across restarts in the app data dir
 //! so a restart mid-window does not reset the budget.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use crate::usage_report;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::usage_report;
 
 /// One resolved cap from the team config pull (member-scoped on the server).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,7 +83,11 @@ fn tool_matches(cap_tool: &str, server_id: &str, orig_tool: &str) -> bool {
     }
     // `server/tool` or `server__tool` forms from admin authoring.
     let dunder = format!("{server_id}__{orig_tool}");
-    cap_tool == dunder || cap_tool.strip_suffix(orig_tool).and_then(|s| s.strip_suffix("/")) == Some(server_id)
+    cap_tool == dunder
+        || cap_tool
+            .strip_suffix(orig_tool)
+            .and_then(|s| s.strip_suffix("/"))
+            == Some(server_id)
 }
 
 fn utc_ymd() -> (i64, u32, u32) {
@@ -95,7 +99,7 @@ fn utc_ymd() -> (i64, u32, u32) {
 }
 
 fn ymd_from_ms(ms: i64) -> (i64, u32, u32) {
-   usage_report::civil_from_days(ms.div_euclid(86_400_000))
+    usage_report::civil_from_days(ms.div_euclid(86_400_000))
 }
 
 fn window_key(window: &str) -> String {
@@ -108,12 +112,7 @@ fn window_key(window: &str) -> String {
 
 /// Counter key: `{window_kind}:{window_key}:{tool_or_*}` so day and month roll independently.
 fn counter_key(window: &str, tool: Option<&str>) -> String {
-    format!(
-        "{}:{}:{}",
-        window,
-        window_key(window),
-        tool.unwrap_or("*")
-    )
+    format!("{}:{}:{}", window, window_key(window), tool.unwrap_or("*"))
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -125,6 +124,10 @@ struct CounterFile {
 struct CounterState {
     path: Option<PathBuf>,
     file: CounterFile,
+    /// Calls accepted before the data directory was known. They must be merged
+    /// into the first fresh on-disk snapshot while holding the cross-process
+    /// lock, never written as a process-local whole-file replacement.
+    pending_merge: bool,
 }
 
 static STATE: OnceLock<Mutex<Option<CounterState>>> = OnceLock::new();
@@ -141,39 +144,74 @@ pub fn bind_data_dir(dir: &Path) {
     match guard.as_mut() {
         Some(st) if st.path.is_some() => return,
         Some(st) => {
-            let mut file = load_file(&path);
-            for (key, pending) in &st.file.counts {
-                let persisted = file.counts.entry(key.clone()).or_insert(0);
-                *persisted = persisted.saturating_add(*pending);
-            }
             st.path = Some(path);
-            st.file = file;
-            save_file(st);
+            st.pending_merge = !st.file.counts.is_empty();
+            // Binding cannot report an error to its startup callers. Keep any
+            // pending counters in memory on failure; the first enforcement call
+            // retries and fails closed instead of overwriting corrupt state.
+            let _ = sync_bound_state(st);
         }
         None => {
-            let file = load_file(&path);
-            *guard = Some(CounterState {
+            let mut st = CounterState {
                 path: Some(path),
-                file,
-            });
+                file: CounterFile::default(),
+                pending_merge: false,
+            };
+            let _ = sync_bound_state(&mut st);
+            *guard = Some(st);
         }
     }
 }
 
-fn load_file(path: &Path) -> CounterFile {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return CounterFile::default();
+fn load_file(path: &Path) -> Result<CounterFile, String> {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(CounterFile::default()),
+        Err(err) => {
+            return Err(format!(
+                "Toolport could not read rate-limit counters; refusing the call: {err}"
+            ))
+        }
     };
-    serde_json::from_str(&raw).unwrap_or_default()
+    serde_json::from_str(&raw).map_err(|err| {
+        format!(
+            "Toolport rate-limit counters cannot be parsed; refusing the call rather than resetting usage: {err}"
+        )
+    })
 }
 
-fn save_file(st: &CounterState) {
+fn save_file(path: &Path, file: &CounterFile) -> Result<(), String> {
+    let raw = serde_json::to_string(file)
+        .map_err(|err| format!("Could not serialize rate-limit counters: {err}"))?;
+    crate::registry::atomic_write(path, &raw)
+        .map_err(|err| format!("Could not persist rate-limit counters: {err}"))
+}
+
+fn lock_counters(path: &Path) -> Result<crate::registry::FileLock, String> {
+    crate::registry::lock_at(path)
+        .map_err(|err| format!("Toolport rate-limit counters are busy; try again ({err})"))
+}
+
+/// Refresh a bound process from disk and merge any calls accepted before bind.
+/// The sibling lock spans the entire read/merge/write so another gateway cannot
+/// observe the same old value and overwrite this process's increments.
+fn sync_bound_state(st: &mut CounterState) -> Result<(), String> {
     let Some(path) = st.path.as_ref() else {
-        return;
+        return Ok(());
     };
-    if let Ok(raw) = serde_json::to_string(&st.file) {
-        let _ = fs::write(path, raw);
+    let _lock = lock_counters(path)?;
+    let mut disk = load_file(path)?;
+    prune(&mut disk);
+    if st.pending_merge {
+        for (key, pending) in &st.file.counts {
+            let persisted = disk.counts.entry(key.clone()).or_insert(0);
+            *persisted = persisted.saturating_add(*pending);
+        }
+        save_file(path, &disk)?;
+        st.pending_merge = false;
     }
+    st.file = disk;
+    Ok(())
 }
 
 /// Prune counters for windows that are no longer current (keep file small).
@@ -214,10 +252,33 @@ pub fn check_and_count(caps: &[Cap], server_id: &str, orig_tool: &str) -> Result
         *guard = Some(CounterState {
             path: None,
             file: CounterFile::default(),
+            pending_merge: false,
         });
     }
     let st = guard.as_mut().expect("just set");
-    prune(&mut st.file);
+
+    // Bound gateways always decide against a fresh on-disk snapshot while
+    // holding the same cross-process lock through the atomic replacement.
+    let bound_path = st.path.clone();
+    let _counter_lock = match bound_path.as_deref() {
+        Some(path) => Some(lock_counters(path)?),
+        None => None,
+    };
+    if let Some(path) = bound_path.as_deref() {
+        let mut disk = load_file(path)?;
+        prune(&mut disk);
+        if st.pending_merge {
+            for (key, pending) in &st.file.counts {
+                let persisted = disk.counts.entry(key.clone()).or_insert(0);
+                *persisted = persisted.saturating_add(*pending);
+            }
+            save_file(path, &disk)?;
+            st.pending_merge = false;
+        }
+        st.file = disk;
+    } else {
+        prune(&mut st.file);
+    }
 
     // Fail closed: if any cap is already at max, deny without incrementing.
     for cap in &applicable {
@@ -241,12 +302,22 @@ pub fn check_and_count(caps: &[Cap], server_id: &str, orig_tool: &str) -> Result
         }
     }
 
-    // All clear: increment every applicable counter once.
+    // All clear: increment every distinct counter once. Multiple policy caps
+    // may intentionally constrain the same key at different maxima, but one
+    // real tool call must consume only one unit from that shared counter.
+    let mut incremented = HashSet::new();
     for cap in &applicable {
         let key = counter_key(&cap.window, cap.tool.as_deref());
-        *st.file.counts.entry(key).or_insert(0) += 1;
+        if incremented.insert(key.clone()) {
+            let used = st.file.counts.entry(key).or_insert(0);
+            *used = used.saturating_add(1);
+        }
     }
-    save_file(st);
+    if let Some(path) = bound_path.as_deref() {
+        save_file(path, &st.file)?;
+    } else {
+        st.pending_merge = true;
+    }
     Ok(())
 }
 
@@ -267,6 +338,7 @@ pub fn reset_for_test() {
     *guard = Some(CounterState {
         path: None,
         file: CounterFile::default(),
+        pending_merge: false,
     });
 }
 
@@ -363,6 +435,84 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_caps_increment_a_shared_key_once_per_call() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let caps = vec![
+            Cap {
+                id: "org-day".into(),
+                window: "day".into(),
+                max_calls: 2,
+                tool: None,
+            },
+            Cap {
+                id: "team-day".into(),
+                window: "day".into(),
+                max_calls: 2,
+                tool: None,
+            },
+        ];
+
+        assert!(check_and_count(&caps, "srv", "echo").is_ok());
+        assert!(check_and_count(&caps, "srv", "echo").is_ok());
+        assert!(check_and_count(&caps, "srv", "echo").is_err());
+        assert_eq!(peek("day", None), 2);
+    }
+
+    #[test]
+    fn distinct_window_and_scope_keys_each_advance_once() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let caps = vec![
+            Cap {
+                id: "day-global".into(),
+                window: "day".into(),
+                max_calls: 10,
+                tool: None,
+            },
+            Cap {
+                id: "month-global".into(),
+                window: "month".into(),
+                max_calls: 10,
+                tool: None,
+            },
+            Cap {
+                id: "day-echo".into(),
+                window: "day".into(),
+                max_calls: 10,
+                tool: Some("echo".into()),
+            },
+        ];
+
+        assert!(check_and_count(&caps, "srv", "echo").is_ok());
+        assert_eq!(peek("day", None), 1);
+        assert_eq!(peek("month", None), 1);
+        assert_eq!(peek("day", Some("echo")), 1);
+    }
+
+    #[test]
+    fn corrupt_persisted_counters_fail_closed_without_overwrite() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TestDir::new("corrupt-fail-closed");
+        let path = dir.0.join("rate_limit_counters.json");
+        let corrupt = b"{ definitely not valid json";
+        fs::write(&path, corrupt).unwrap();
+        let caps = vec![Cap {
+            id: "day".into(),
+            window: "day".into(),
+            max_calls: 10,
+            tool: None,
+        }];
+
+        *state_lock().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        bind_data_dir(&dir.0);
+        let err = check_and_count(&caps, "srv", "echo").unwrap_err();
+
+        assert!(err.contains("cannot be parsed"), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
+    }
+
+    #[test]
     fn unbound_states_do_not_write_counter_files() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fallback_artifact = UnexpectedFile::new("rate_limit_counters.json");
@@ -439,7 +589,7 @@ mod tests {
             (
                 bound_path.as_deref(),
                 count,
-                load_file(&path).counts.get(&key).copied(),
+                load_file(&path).unwrap().counts.get(&key).copied(),
             ),
             (Some(path.as_path()), 1, Some(1)),
             "binding must set the path and persist the first call"
@@ -557,7 +707,7 @@ mod tests {
             "late binding must merge every pending and persisted counter"
         );
         assert_eq!(
-            values(&load_file(&first_path)),
+            values(&load_file(&first_path).unwrap()),
             expected,
             "the merged state must be persisted immediately"
         );
@@ -597,6 +747,6 @@ mod tests {
 
     #[test]
     fn ymd_from_ms_handles_pre_epoch_dates() {
-       assert_eq!(ymd_from_ms(-86_400_000), (1969, 12, 31));
+        assert_eq!(ymd_from_ms(-86_400_000), (1969, 12, 31));
     }
 }
