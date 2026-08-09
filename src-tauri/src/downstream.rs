@@ -6991,15 +6991,37 @@ mod tests {
             "PATHEXT is honored in the order given"
         );
 
-        // Empty PATH/PATHEXT segments are skipped, not joined as "".
+        // PATHEXT is matched case-insensitively, as Windows does: every stub on
+        // disk here has an uppercase extension.
+        assert!(
+            resolve_bare_in(&path, ".exe", "both")
+                .unwrap()
+                .to_lowercase()
+                .ends_with("both.exe"),
+            "a lowercase PATHEXT entry matches an uppercase file on disk"
+        );
+
+        // An empty PATHEXT entry is skipped, NOT treated as "no extension".
+        // `both` exists without one, so a loop that failed to filter would
+        // return it in preference to `both.EXE`.
+        stub(&first, "both");
         assert_eq!(
-            resolve_bare_in(&format!(";{path};"), ";.EXE;", "both").as_deref(),
+            resolve_bare_in(&path, ";.EXE", "both").as_deref(),
+            Some(both_exe.to_string_lossy().as_ref()),
+            "an empty PATHEXT entry must not match the extensionless file"
+        );
+        // Empty PATH entries are tolerated the same way.
+        assert_eq!(
+            resolve_bare_in(&format!(";{path};"), ".EXE", "both").as_deref(),
             Some(both_exe.to_string_lossy().as_ref())
         );
 
         // No candidate anywhere: the caller falls back to the bare command.
         assert_eq!(resolve_bare_in(&path, ".EXE;.CMD", "absent"), None);
-        assert_eq!(resolve_command("toolport-definitely-not-installed"), "toolport-definitely-not-installed");
+        assert_eq!(
+            resolve_command("toolport-definitely-not-installed"),
+            "toolport-definitely-not-installed"
+        );
 
         // An explicit extension or a path separator is passed through untouched,
         // so PATH is never consulted for it.
