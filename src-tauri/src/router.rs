@@ -190,6 +190,16 @@ fn regex_is_match(pattern: &str, text: &str) -> bool {
     match_simple_pattern(inner, text)
 }
 
+/// Byte offsets just past each char of `s`, longest prefix first — the lengths a greedy
+/// variable segment should try, in greedy order.
+///
+/// Backtracking used to count raw bytes (`(1..=end).rev()`), which slices mid-codepoint
+/// and panics on any multi-byte URI: matching `file://café` against `file://{name}é`
+/// took the router down. Only whole chars are valid stopping points.
+fn char_end_offsets(s: &str) -> impl Iterator<Item = usize> + '_ {
+    s.char_indices().map(|(i, c)| i + c.len_utf8()).rev()
+}
+
 fn match_simple_pattern(mut pattern: &str, mut text: &str) -> bool {
     // Iterative literal consumption keeps recursion depth proportional to the
     // number of placeholders, not the URI length. Variable branches still
@@ -204,7 +214,7 @@ fn match_simple_pattern(mut pattern: &str, mut text: &str) -> bool {
                 return false;
             }
             let end = text.find('/').unwrap_or(text.len());
-            for take in (1..=end).rev() {
+            for take in char_end_offsets(&text[..end]) {
                 if match_simple_pattern(rest, &text[take..]) {
                     return true;
                 }
@@ -215,7 +225,7 @@ fn match_simple_pattern(mut pattern: &str, mut text: &str) -> bool {
             if text.is_empty() {
                 return false;
             }
-            for take in (1..=text.len()).rev() {
+            for take in char_end_offsets(text) {
                 if match_simple_pattern(rest, &text[take..]) {
                     return true;
                 }
