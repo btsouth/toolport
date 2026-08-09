@@ -343,7 +343,78 @@ fn uses_client_credentials(server: &ServerEntry) -> bool {
 
 /// Use the stored refresh token to mint a fresh access token, vault it, and
 /// return it.
+/// Cross-process lock serializing programmatic refresh for one server.
+///
+/// The desktop app's health probe and the gateway are separate processes sharing one
+/// keychain. Both could read RT0, both POST `/token`, and a provider with refresh-token
+/// reuse detection revokes the whole family — the exact failure the in-process guard was
+/// added to prevent, reached by another route (SBS-479). The app's existing OAuth lock
+/// covers only the interactive browser flow.
+///
+/// Best-effort by design: with no resolvable data dir there is nowhere to put a lock, and
+/// refusing to refresh at all would be worse than the race it prevents. `lock_at` is
+/// bounded-blocking (retries for a few seconds), so a slow winner delays the loser rather
+/// than failing it.
+fn lock_oauth_refresh(server_id: &str) -> Option<crate::registry::FileLock> {
+    let dir = crate::registry::conduit_dir()?;
+    let leaf = format!(
+        "oauth-refresh-{}.lock",
+        crate::router::sanitize_segment(server_id)
+    );
+    crate::registry::lock_at(&dir.join(leaf)).ok()
+}
+
+/// After winning the refresh lock, decide whether another process already did the work.
+///
+/// Compares the vaulted access token against the snapshot taken BEFORE the lock. Unchanged
+/// means the refresh is still ours to do. Changed means someone rotated it while we were
+/// parked, so we use theirs rather than spending a second exchange on a refresh token they
+/// have already invalidated.
+///
+/// A rotated-but-already-expired token is not reusable, so that falls through and refreshes
+/// normally.
+fn refreshed_while_waiting(server_id: &str, before: Option<&str>) -> Option<RefreshedToken> {
+    let current = secrets::get_secret(server_id, secrets::HTTP_AUTH_KEY);
+    let state = load_state(server_id);
+    reuse_racing_refresh(before, current, state.as_ref(), now_epoch_seconds())
+}
+
+/// The decision half of [`refreshed_while_waiting`], with the vault reads lifted out so
+/// it is testable without writing to the developer's keychain.
+///
+/// Reuses the racing process's token only when it is both *different* from what we saw
+/// before the lock and *usable* — the same `refresh_decision` the proactive path uses, so
+/// the two cannot disagree about what "still good" means.
+fn reuse_racing_refresh(
+    before: Option<&str>,
+    current: Option<String>,
+    state: Option<&OAuthState>,
+    now: u64,
+) -> Option<RefreshedToken> {
+    let current = current?;
+    if Some(current.as_str()) == before {
+        return None;
+    }
+    let state = state?;
+    if refresh_decision(state, now) != RefreshDecision::NotNeeded {
+        return None;
+    }
+    Some(RefreshedToken {
+        access_token: current,
+        expires_at: state.expires_at,
+    })
+}
+
 fn refresh_token_with_expiry(server_id: &str) -> Result<RefreshedToken, String> {
+    // Snapshot before locking: the comparison after we win is what tells us whether a
+    // racing process rotated the credential while we waited.
+    let before_access = secrets::get_secret(server_id, secrets::HTTP_AUTH_KEY);
+    // Held for the whole function, including the client-credentials branch, so two
+    // processes cannot mint two tokens for the same server.
+    let _refresh_lock = lock_oauth_refresh(server_id);
+    if let Some(winner) = refreshed_while_waiting(server_id, before_access.as_deref()) {
+        return Ok(winner);
+    }
     // Client-credentials servers have no refresh token by construction, so they
     // reacquire instead. Checked first because this is the seam BOTH the proactive
     // pre-expiry path and the reactive 401/403 retry go through; branching here
@@ -826,6 +897,92 @@ mod tests {
         assert!(is_auth_error("HTTP 401"));
         assert!(is_auth_error("server said 403."));
         assert!(is_auth_error("(403)"));
+    }
+
+    fn racing_state(expires_at: Option<u64>) -> OAuthState {
+        OAuthState {
+            issuer: Some("https://auth.example.com".into()),
+            token_endpoint: "https://auth.example.com/token".into(),
+            client_id: "client".into(),
+            refresh_token: Some("rt-1".into()),
+            resource: Some("https://mcp.example.com".into()),
+            scope: None,
+            issued_at: Some(1_000),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn an_unchanged_vaulted_token_leaves_the_refresh_to_us() {
+        // Nobody rotated it while we waited for the lock, so the caller must go on and
+        // do the exchange rather than handing back a token it already knows is stale.
+        let state = racing_state(Some(10_000));
+        assert!(
+            reuse_racing_refresh(Some("token-0"), Some("token-0".into()), Some(&state), 1_000)
+                .is_none(),
+            "an unchanged token is not somebody else's win"
+        );
+    }
+
+    #[test]
+    fn a_token_rotated_while_waiting_is_reused_instead_of_refreshed_again() {
+        // The SBS-479 race: we parked on the lock and the other process refreshed.
+        // Spending our own exchange now burns a refresh token it already invalidated,
+        // which is what trips a provider's reuse detection.
+        let state = racing_state(Some(10_000));
+        let winner =
+            reuse_racing_refresh(Some("token-0"), Some("token-1".into()), Some(&state), 1_000)
+                .expect("a rotated, still-valid token must be reused");
+        assert_eq!(winner.access_token, "token-1");
+        assert_eq!(winner.expires_at, Some(10_000));
+    }
+
+    #[test]
+    fn a_rotated_but_expired_token_still_triggers_a_refresh() {
+        // Reusing it would hand the caller a credential that is already dead. Uses the
+        // same refresh_decision as the proactive path, so the skew window agrees.
+        let state = racing_state(Some(1_030));
+        assert!(
+            reuse_racing_refresh(Some("token-0"), Some("token-1".into()), Some(&state), 1_000)
+                .is_none(),
+            "inside the pre-expiry skew window this is not a usable win"
+        );
+    }
+
+    #[test]
+    fn a_rotation_without_vaulted_state_is_not_reused() {
+        // No state means no expiry to judge it by; refreshing is the safe read.
+        assert!(
+            reuse_racing_refresh(Some("token-0"), Some("token-1".into()), None, 1_000).is_none()
+        );
+        // And an empty vault is not a win either.
+        let state = racing_state(Some(10_000));
+        assert!(reuse_racing_refresh(Some("token-0"), None, Some(&state), 1_000).is_none());
+    }
+
+    #[test]
+    fn the_refresh_lock_is_per_server_and_released_on_drop() {
+        // Two servers must not serialize against each other, or one slow provider
+        // stalls refresh for every other server in the registry.
+        let _guard = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-oauth-refresh-lock-{}-{}",
+            std::process::id(),
+            now_epoch_seconds()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch data dir");
+        let _override = crate::registry::DataDirOverride::set(&dir);
+
+        let a = lock_oauth_refresh("server-a").expect("a data dir is set, so a lock exists");
+        let b = lock_oauth_refresh("server-b").expect("a different server must not block");
+        drop((a, b));
+
+        assert!(
+            lock_oauth_refresh("server-a").is_some(),
+            "the lock must be reacquirable once released"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
