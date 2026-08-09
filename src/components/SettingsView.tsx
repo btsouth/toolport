@@ -982,7 +982,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           piiRedaction,
           "text-info",
           "Hide personal data from the model",
-          "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. Real data stays on this machine. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
+          "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. A value only goes back to the server it came from, so a call that would send one server's data to another is refused. Real data stays on this machine and is forgotten when the conversation ends. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
           apply(setPiiRedaction),
         )}
         {toggle(

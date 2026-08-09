@@ -409,7 +409,8 @@ export interface Registry {
   /** Opt-in fail-closed content defense: block high-confidence injection hits (SOU-345). */
   blockOnInjection?: boolean;
   /** Replace PII in tool results with stable pseudonyms before the model sees them,
-   * re-hydrating them on the way back out (SBS-346). Off by default. */
+   * re-hydrating them on the way back out (SBS-346), but only for the server that
+   * produced the value (SBS-605). Off by default. */
   piiRedaction?: boolean;
   /** Server ids exempt from block-on-injection (label only). */
   injectionBlockExempt?: Record<string, boolean>;

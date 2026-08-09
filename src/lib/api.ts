@@ -290,8 +290,10 @@ export function setBlockOnInjection(on: boolean): Promise<Registry> {
 
 /** Toggle PII pseudonymization: replace emails, cards and keys in tool results with
  * stable pseudonyms before the model sees them, re-hydrating them on the way out.
- * Off by default. A value no detector recognises passes through, so this reduces
- * what reaches the model rather than guaranteeing anything. */
+ * Rehydration is scoped to the server that produced the value, and a call carrying
+ * another server's token is refused (SBS-605). Off by default. A value no detector
+ * recognises passes through, so this reduces what reaches the model rather than
+ * guaranteeing anything. */
 export function setPiiRedaction(on: boolean): Promise<Registry> {
   return invoke<Registry>("set_pii_redaction", { on });
 }
