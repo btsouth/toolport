@@ -4096,6 +4096,21 @@ fn execute_call(
 
     let started = Instant::now();
     let effective_mrtr = routed_mrtr.as_ref().or(mrtr);
+    // MRTR retry fields ride the same downstream hop as `arguments` and are spliced
+    // straight into the params by `MrtrRequest::apply`, so they need the same
+    // rehydration on the same leg. A host that answers an elicitation from model
+    // context puts `⟦EMAIL_1⟧` in `inputResponses`, and the server would receive a
+    // pseudonym where an address belongs (SBS-606).
+    let rehydrated_mrtr = match rehydrate_mrtr_for_downstream(client, srv, effective_mrtr) {
+        Ok(m) => m,
+        Err(msg) => {
+            return json!({
+                "content": [{ "type": "text", "text": format!("Toolport: {msg}") }],
+                "isError": true,
+            });
+        }
+    };
+    let effective_mrtr = rehydrated_mrtr.as_ref().or(effective_mrtr);
     match exec_router.route_call_with_cancel_and_mrtr(
         name,
         arguments,
@@ -4313,6 +4328,49 @@ fn rehydrate_for_downstream(
         ));
     }
     Ok(arguments)
+}
+
+/// The same resolve-and-refuse pass as [`rehydrate_for_downstream`], for the MRTR
+/// retry fields that travel beside `arguments` on the downstream hop.
+///
+/// `Ok(None)` when there is nothing to rewrite, so the caller keeps borrowing the
+/// original. Returns an owned copy otherwise: the input is borrowed from the
+/// request snapshot and must not be mutated in place, since the model-facing retry
+/// state has to keep its tokens for exactly the reason `arguments` does.
+///
+/// `client_meta` (`params._meta`) is deliberately NOT rewritten. It is protocol
+/// bookkeeping populated by the client rather than the model — progress tokens and
+/// per-hop routing keys — so a pseudonym there would mean the client invented one,
+/// and rewriting it risks corrupting a key a later hop matches on.
+fn rehydrate_mrtr_for_downstream(
+    client: Option<&str>,
+    server: &str,
+    mrtr: Option<&MrtrRequest>,
+) -> Result<Option<MrtrRequest>, String> {
+    let Some(mrtr) = mrtr else {
+        return Ok(None);
+    };
+    if mrtr.is_empty() {
+        return Ok(None);
+    }
+    let mut out = mrtr.clone();
+    let mut refused = std::collections::BTreeSet::new();
+    with_pii_session(client, |map| {
+        for field in [&mut out.input_responses, &mut out.request_state]
+            .into_iter()
+            .flatten()
+        {
+            refused.extend(pii::rehydrate_args(map, server, field));
+        }
+    });
+    if !refused.is_empty() {
+        let list = refused.into_iter().collect::<Vec<_>>().join(", ");
+        return Err(format!(
+            "refusing to send redacted values to '{server}' in a retry response: {list} came from \
+             a different server. Toolport only returns a value to the server that provided it."
+        ));
+    }
+    Ok(Some(out))
 }
 
 /// Pseudonymize a result's text blocks in place, returning how many values were
@@ -12068,6 +12126,71 @@ mod tests {
         assert!(
             !err.contains("ada@example.com"),
             "the refusal must not leak the value it is protecting: {err}"
+        );
+    }
+
+    #[test]
+    fn mrtr_retry_fields_are_rehydrated_on_the_downstream_leg() {
+        // SBS-606: a host that answers an elicitation from model context puts the
+        // pseudonym in `inputResponses`. Relaying that literal gives the server a
+        // token where an address belongs.
+        let client = Some("pii-mrtr-regression");
+        let token = with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("mailer", "ada@example.com").text
+        });
+        let mrtr = MrtrRequest {
+            input_responses: Some(json!({ "recipient": token })),
+            request_state: Some(json!({ "draft": { "to": "⟦EMAIL_1⟧" } })),
+        };
+
+        let out = rehydrate_mrtr_for_downstream(client, "mailer", Some(&mrtr))
+            .expect("the minting server may have its own value back")
+            .expect("retry fields were present, so a rewritten copy is expected");
+
+        assert_eq!(out.input_responses.unwrap()["recipient"], "ada@example.com");
+        assert_eq!(
+            out.request_state.unwrap()["draft"]["to"],
+            "ada@example.com",
+            "requestState rides the same hop and needs the same pass"
+        );
+        assert_eq!(
+            mrtr.input_responses.as_ref().unwrap()["recipient"],
+            "⟦EMAIL_1⟧",
+            "the model-facing retry state must keep its tokens"
+        );
+    }
+
+    #[test]
+    fn mrtr_retry_fields_refuse_another_servers_token() {
+        let client = Some("pii-mrtr-cross-server");
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+        let mrtr = MrtrRequest {
+            input_responses: Some(json!({ "recipient": "⟦EMAIL_1⟧" })),
+            request_state: None,
+        };
+
+        let err = rehydrate_mrtr_for_downstream(client, "mailer", Some(&mrtr))
+            .expect_err("a foreign token in a retry must fail the call too");
+
+        assert!(err.contains("⟦EMAIL_1⟧"), "name the token: {err}");
+        assert!(!err.contains("ada@example.com"), "must not leak: {err}");
+    }
+
+    #[test]
+    fn absent_mrtr_needs_no_rewritten_copy() {
+        let client = Some("pii-mrtr-absent");
+        assert!(rehydrate_mrtr_for_downstream(client, "mailer", None)
+            .expect("no retry fields is not a failure")
+            .is_none());
+        assert!(
+            rehydrate_mrtr_for_downstream(client, "mailer", Some(&MrtrRequest::default()))
+                .expect("empty retry fields are not a failure")
+                .is_none(),
+            "an empty MrtrRequest must keep the caller on the original borrow"
         );
     }
 
