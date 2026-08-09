@@ -1534,7 +1534,11 @@ pub fn parse_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String> 
 fn launcher_base(command: &str) -> String {
     let file = command.rsplit(['/', '\\']).next().unwrap_or(command);
     let lower = file.to_ascii_lowercase();
-    for ext in [".exe", ".cmd", ".ps1"] {
+    // `.bat` belongs here too: a Node install can put `npx.bat` on PATH, and omitting it
+    // made launcher_package_arg return None, so two servers running different packages
+    // under one display name collapsed to a single import (and a bare paste got named
+    // "npx"). `launcher::command_base` already strips all four for the same role.
+    for ext in [".exe", ".cmd", ".bat", ".ps1"] {
         if let Some(stripped) = lower.strip_suffix(ext) {
             return stripped.to_string();
         }
