@@ -30,7 +30,7 @@ import {
 } from "@/lib/api";
 import { ClientLogo } from "@/components/ClientLogo";
 import { clientRestartHint } from "@/lib/clientConnect";
-import { teamUrlError } from "@/lib/teamUrl";
+import { HOSTED_TEAMS_URL, TEAMS_MARKETING_URL, teamUrlError } from "@/lib/teamUrl";
 import { Input } from "@/components/ui/input";
 import {
   importableServers,
@@ -267,7 +267,7 @@ function Welcome({
         </button>
         <button
           type="button"
-          onClick={() => openExternal("https://toolport.app/teams")}
+          onClick={() => openExternal(TEAMS_MARKETING_URL)}
           className="self-start text-2xs text-muted-foreground transition hover:text-foreground"
         >
           What is Toolport for Teams? →
@@ -276,8 +276,6 @@ function Welcome({
     </>
   );
 }
-
-const HOSTED_TEAMS_URL = "https://teams.toolport.app";
 
 /** The team-member on-ramp. A person handed an invite code lands here from the
  * Welcome step, pastes it, and the team's shared servers arrive locally. The

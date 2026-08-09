@@ -30,7 +30,7 @@ import {
   teamInstructionsStatus,
   setServerEnabled,
 } from "@/lib/api";
-import { teamUrlError } from "@/lib/teamUrl";
+import { HOSTED_TEAMS_URL, teamUrlError } from "@/lib/teamUrl";
 import { isEnabled, activeProfile } from "@/lib/types";
 import type { TeamPushPreview } from "@/lib/api";
 import type {
@@ -63,10 +63,6 @@ const INSTR_STATE_META: Record<
   },
   error: { label: "Write error", className: "text-destructive", Icon: AlertTriangle },
 };
-
-/** The hosted Toolport Teams instance, prefilled as the default. Self-hosters replace
- * it with their own server URL. */
-const HOSTED_TEAMS_URL = "https://teams.toolport.app";
 
 /**
  * Toolport Teams: join a team and have its shared MCP server set appear locally. The
