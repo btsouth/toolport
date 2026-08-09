@@ -21,6 +21,7 @@ desktop = [
     "dep:tauri-plugin-autostart",
     "dep:tauri-plugin-deep-link",
     "dep:tauri-plugin-single-instance",
+    "dep:tauri-plugin-window-state",
 ]
 
 [lib]
@@ -41,6 +42,7 @@ tauri-plugin-process = { version = "2", optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
 tauri-plugin-notification = { version = "2", optional = true }
 tauri-plugin-autostart = { version = "2", optional = true }
+tauri-plugin-window-state = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 json5 = "0.4"

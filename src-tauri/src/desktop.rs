@@ -3582,6 +3582,22 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--hidden"]),
         ))
+        // Remember where the user put the window (SBS-144). Without this every cold
+        // start reopens at the fixed 1240x820 centered geometry from tauri.conf.json,
+        // undoing a resize or a move on every quit, reboot, and update relaunch.
+        //
+        // VISIBLE is skipped deliberately: the window is configured `visible: false` and
+        // shown by `setup()` (or kept hidden for a `--hidden` autostart into the tray).
+        // Letting the plugin restore visibility would fight that and flash a window on
+        // every launch-at-login.
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all()
+                        - tauri_plugin_window_state::StateFlags::VISIBLE,
+                )
+                .build(),
+        )
         .manage(Mutex::new(registry))
         .manage(Mutex::new(HttpBridge::default()))
         .manage(PendingShare::default())

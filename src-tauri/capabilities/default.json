@@ -12,6 +12,7 @@
     "dialog:allow-open",
     "deep-link:default",
     "notification:default",
-    "autostart:default"
+    "autostart:default",
+    "window-state:default"
   ]
 }
