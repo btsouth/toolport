@@ -212,8 +212,18 @@ impl JobExecutor for BoundedJobExecutor {
 }
 
 /// One downstream tool call that actually reached the host binding.
+///
+/// Deliberately carries no arguments. A ledger is model-facing, and call
+/// arguments routinely hold credentials and personal data; #646 scopes payloads
+/// out for exactly that reason. The cost is that the ledger is ORDINAL — it says
+/// which positions in the call sequence completed, not which argument values
+/// did. See [`ScriptOutcome::progress`] for what that means for the caller.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallRecord {
+    /// Position in the call sequence, from zero. Explicit rather than implied by
+    /// array order so the ordinal contract survives serialization and is legible
+    /// to the agent reading the payload.
+    pub index: usize,
     /// Exposed tool name (`server__tool`) as the script asked for it.
     pub name: String,
     /// False when the downstream result carried `isError: true`. A recorded call
@@ -243,6 +253,14 @@ pub struct ScriptOutcome {
     /// The point is recovery: a script that dies on call 40 of 64 can tell the
     /// agent what it already did, instead of forcing a re-run that repeats every
     /// one of those side effects (#646).
+    ///
+    /// This is an ORDINAL record, and the distinction matters. A script that
+    /// calls the same tool with different arguments — `create_row({id:1})` then
+    /// `create_row({id:2})` — produces two entries with the same `name`, so
+    /// deduplicating by name would skip a call that never ran. Resume by
+    /// position: entries `0..n` completed, everything from `n` on did not. For a
+    /// script whose call sequence depends on data returned mid-run, even that
+    /// holds only if the re-run takes the same branches.
     pub progress: Vec<CallRecord>,
     /// `Some(message)` if the script threw, hit a limit, or failed to compile. Fail-closed:
     /// the caller surfaces this to the agent as an error result.
@@ -628,10 +646,15 @@ pub fn run_script(
             let result = (state.call)(&name, parsed);
             // After the binding returns: the side effect has committed, so the
             // ledger reflects work actually done (#646).
-            state.executed.borrow_mut().push(CallRecord {
-                name,
-                ok: result_ok(&result),
-            });
+            {
+                let mut executed = state.executed.borrow_mut();
+                let index = executed.len();
+                executed.push(CallRecord {
+                    index,
+                    name,
+                    ok: result_ok(&result),
+                });
+            }
             let result_str = serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string());
             Ok(JsValue::from(js_string!(result_str)))
         },
@@ -892,7 +915,9 @@ fn flush_pending_host_calls(context: &mut Context, state: &HostState) -> Result<
         {
             let mut executed = state.executed.borrow_mut();
             for (pending_call, result) in batch.iter().zip(results.iter()) {
+                let index = executed.len();
                 executed.push(CallRecord {
+                    index,
                     name: pending_call.name.clone(),
                     ok: result_ok(result),
                 });
@@ -1022,6 +1047,53 @@ mod tests {
         assert_eq!(progress_names(&out), vec!["first", "second"]);
         assert!(out.progress.iter().all(|c| c.ok));
         assert_eq!(out.calls, 2);
+    }
+
+    #[test]
+    fn repeated_tool_names_stay_distinguishable_by_index() {
+        // The ledger carries no args (they routinely hold credentials and personal
+        // data), so the same tool called twice yields two same-named entries. Index
+        // is what makes them separable — an agent that deduplicated by NAME would
+        // skip the third call, which never ran. Guard the ordinal contract.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let script = r#"
+            toolport.call("create_row", { id: 1 });
+            toolport.call("create_row", { id: 2 });
+            throw new Error("died before the third row");
+        "#;
+        let out = run(script, json!({}), recording_call(log), Limits::default());
+
+        assert!(out.error.is_some());
+        assert_eq!(progress_names(&out), vec!["create_row", "create_row"]);
+        assert_eq!(
+            out.progress.iter().map(|c| c.index).collect::<Vec<_>>(),
+            vec![0, 1],
+            "indexes must be dense and ordered so resume-by-position is unambiguous"
+        );
+    }
+
+    #[test]
+    fn progress_indexes_stay_dense_across_sync_and_async_calls() {
+        // Sync and flushed-async calls append to one ledger, so the index sequence
+        // has to stay contiguous across both recording sites.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let script = r#"
+            toolport.call("sync_one", {});
+            await Promise.all([toolport.callAsync("fan_a", {}), toolport.callAsync("fan_b", {})]);
+            toolport.call("sync_two", {});
+            return "done";
+        "#;
+        let out = run(script, json!({}), recording_call(log), Limits::default());
+
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(
+            out.progress.iter().map(|c| c.index).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            progress_names(&out),
+            vec!["sync_one", "fan_a", "fan_b", "sync_two"]
+        );
     }
 
     #[test]

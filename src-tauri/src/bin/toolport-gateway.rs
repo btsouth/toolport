@@ -1134,7 +1134,11 @@ fn run_script_tool_def() -> Value {
             Intermediate tool results are full-sized inside the script (not context-budget shaped); \
             only your returned aggregate is shaped for the model. Loop, branch, project, then \
             `return` one value. Top-level await works. Gates match toolport_call_tool (scope, human \
-            approval). Best when you already know the steps; explore with toolport_search_tools first.",
+            approval). If the script fails partway, `structuredContent.toolportScript.progress` lists \
+            the calls that already ran, in order, as {index, name, ok} - those side effects are \
+            committed. Resume by INDEX (entries 0..n ran, n onward did not); never skip by tool name, \
+            since the same tool appears once per call. Best when you already know the steps; explore \
+            with toolport_search_tools first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4500,7 +4504,7 @@ fn run_script_dispatch(
     let progress: Vec<Value> = outcome
         .progress
         .iter()
-        .map(|call| json!({ "name": call.name, "ok": call.ok }))
+        .map(|call| json!({ "index": call.index, "name": call.name, "ok": call.ok }))
         .collect();
 
     let mut result = match outcome.error {
