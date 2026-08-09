@@ -4254,6 +4254,35 @@ fn pii_sessions() -> &'static Mutex<HashMap<String, pii::SessionMap>> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// True when a browser `Origin` names this machine, so the request came from a page
+/// actually served by localhost rather than a remote site pointed at it.
+///
+/// Scheme and host only; the port is deliberately ignored, since the bridge and any
+/// local page that legitimately talks to it run on different ports. Anything that is
+/// not a loopback host — including a domain that currently *resolves* to 127.0.0.1,
+/// which is the whole DNS-rebinding trick — is foreign.
+fn origin_is_loopback(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    // Strip the port, taking care with a bracketed IPv6 literal.
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Reserved key for the local stdio client, which has no bearer identity. Carries a
 /// NUL so it cannot collide with a real client id.
 const PII_LOCAL_SESSION: &str = "\0local";
@@ -11455,6 +11484,25 @@ fn handle_connection(
         .map(|h| h.value.as_str().eq_ignore_ascii_case("cross-site"))
         .unwrap_or(false);
 
+    // Origin is checked as well as Sec-Fetch-Site, because they stop different
+    // attacks and the second does not cover the first.
+    //
+    // Under DNS rebinding the attacker's domain resolves to 127.0.0.1, so the page
+    // and the bridge share an origin as far as the browser is concerned: it sends
+    // `Sec-Fetch-Site: same-origin` and the guard above waves it through. What the
+    // request still carries is `Origin: http://attacker.tld`, which is the signal
+    // the spec has servers validate for exactly this reason.
+    //
+    // Absent Origin is allowed: curl, Open WebUI's backend and every other
+    // server-side caller omit it, and those are the callers the bridge exists for.
+    let foreign_origin = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Origin"))
+        .map(|h| h.value.as_str().to_string())
+        .filter(|o| !o.is_empty() && !o.eq_ignore_ascii_case("null"))
+        .is_some_and(|o| !origin_is_loopback(&o));
+
     // Auth + scope gate: resolve the bearer to (authorized, allowed-servers).
     // OPTIONS is the data-less preflight, always allowed and unscoped. Else the
     // registry decides: the legacy env token (full connected set), a registered
@@ -11486,7 +11534,7 @@ fn handle_connection(
         }
     };
 
-    let out: HttpOut = if cross_site && method != "OPTIONS" {
+    let out: HttpOut = if (cross_site || foreign_origin) && method != "OPTIONS" {
         HttpOut::json_err(403, "cross-site browser requests are not allowed")
     } else {
         match scope {
@@ -12292,6 +12340,53 @@ mod tests {
 
         let still_mapped = with_pii_session(client, |map| !map.is_empty());
         assert!(!still_mapped, "the map must not survive session teardown");
+    }
+
+    #[test]
+    fn origin_is_loopback_accepts_only_this_machine() {
+        // SBS-452 / SEP DNS-rebinding guard. Sec-Fetch-Site does not cover this case:
+        // when an attacker's domain resolves to 127.0.0.1 the browser considers the
+        // request same-origin and sends `Sec-Fetch-Site: same-origin`. Origin is the
+        // header that still names the attacker, so it is the one worth checking.
+        for ok in [
+            "http://localhost",
+            "http://localhost:3000",
+            "https://localhost:8080",
+            "http://127.0.0.1:1234",
+            "http://127.6.6.6",
+            "http://[::1]:9000",
+            "http://app.localhost:5173",
+            "http://LOCALHOST:3000",
+        ] {
+            assert!(origin_is_loopback(ok), "should be treated as local: {ok}");
+        }
+
+        for bad in [
+            "http://attacker.tld",
+            "https://evil.example:443",
+            // The rebinding shape: a name that currently resolves to loopback is
+            // still foreign, because the name is what the page was served from.
+            "http://rebind.attacker.tld",
+            // Not loopback, just adjacent.
+            "http://127.0.0.1.attacker.tld",
+            "http://192.168.1.10",
+            "http://10.0.0.5:8080",
+            // Non-http schemes and junk.
+            "file:///etc/passwd",
+            "chrome-extension://abcdef",
+            "localhost:3000",
+            "",
+        ] {
+            assert!(!origin_is_loopback(bad), "should be foreign: {bad}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_dot_host_cannot_dodge_the_origin_check() {
+        // "localhost." resolves the same as "localhost"; the check normalizes it so a
+        // trailing dot is neither a bypass nor a false rejection.
+        assert!(origin_is_loopback("http://localhost.:3000"));
+        assert!(!origin_is_loopback("http://attacker.tld.:3000"));
     }
 
     #[test]
