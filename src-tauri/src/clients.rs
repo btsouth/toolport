@@ -1359,7 +1359,7 @@ fn json_server_with_values(name: &str, def: &serde_json::Value) -> ParsedSnippet
     // Kimi Code's `bearerTokenEnvVar` names a shell env var holding the token
     // (the value never sits in the file). Surface the var NAME as a value-less
     // env key so import vaults the token and remote connects send it as
-    // `Authorization: Bearer` (see `first_vaulted_secret`).
+    // `Authorization: Bearer` (see `remote::first_vaulted_secret`).
     if let Some(var) = def.get("bearerTokenEnvVar").and_then(|v| v.as_str()) {
         if !var.is_empty() && !env.iter().any(|e| e.key == var) {
             env.push(SnippetEnvVar {
@@ -3082,10 +3082,11 @@ fn write_droid_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> 
     write_json_with(path, "mcpServers", servers, false, entry_to_droid_json, false, false)
 }
 
-/// Kimi Code's `mcp.json` is MCP-only (app settings live in config.toml), so a
-/// parse failure starts fresh rather than refusing to write.
+/// Kimi Code's `mcp.json` is MCP-only (app settings live in config.toml).
+/// `read_existing_json` ignores the lenient flag and always errors on a parse
+/// failure; pass `true` anyway to match Qwen, the closest analogue.
 fn write_kimi_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    write_json_with(path, "mcpServers", servers, false, entry_to_kimi_json, false, false)
+    write_json_with(path, "mcpServers", servers, true, entry_to_kimi_json, false, false)
 }
 
 fn write_json_with(
@@ -4329,7 +4330,7 @@ fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<Wri
         }
         Format::JsonQwenMcpServers => edit_json_gateway(&path, "mcpServers", entry, true)?,
         Format::JsonKimiMcpServers => {
-            edit_json_gateway(&path, "mcpServers", entry, lenient)?
+            edit_json_gateway(&path, "mcpServers", entry, true)?
         }
         Format::JsonServers => edit_json_gateway(&path, "servers", entry, lenient)?,
         Format::JsonMcp => edit_crush_gateway(&path, entry)?,
@@ -7236,10 +7237,21 @@ command = "npx"
         )
         .unwrap();
 
+        // Value-less env keys model Kimi's bearerTokenEnvVar import path; they are
+        // vaulted for remote::first_vaulted_secret, but entry_to_json drops them and
+        // entry_to_kimi_json never rewrites bearerTokenEnvVar — pin that asymmetry.
+        let mut bearer_remote = remote("bearer-remote", "http");
+        bearer_remote.env = vec![EnvVar {
+            key: "MY_MCP_TOKEN".to_string(),
+            value: None,
+            secret: true,
+        }];
+
         let servers = vec![
             stdio("filesystem"),
             remote("remote-http", "http"),
             remote("remote-sse", "sse"),
+            bearer_remote,
         ];
         write_kimi_json(&path, &servers).unwrap();
 
@@ -7259,8 +7271,14 @@ command = "npx"
         assert!(sse.get("type").is_none());
         assert_eq!(sse["headers"]["Authorization"], "Bearer fixture");
 
+        let bearer = &root["mcpServers"]["bearer-remote"];
+        assert_eq!(bearer["url"], "https://bearer-remote.example.com/mcp");
+        assert!(bearer.get("bearerTokenEnvVar").is_none());
+        assert!(bearer.get("headers").is_none());
+        assert!(bearer.get("env").is_none());
+
         let parsed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
-        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed.len(), 4);
         assert_eq!(
             parsed.iter().find(|s| s.name == "filesystem").unwrap().transport,
             "stdio"
@@ -7273,11 +7291,19 @@ command = "npx"
             parsed.iter().find(|s| s.name == "remote-sse").unwrap().transport,
             "sse"
         );
+        assert!(
+            parsed
+                .iter()
+                .find(|s| s.name == "bearer-remote")
+                .unwrap()
+                .env_keys
+                .is_empty()
+        );
 
         // Gateway install preserves existing servers and uses the standard stdio shape.
         {
             let _e = sample_gateway(None, "kimi-code");
-            edit_json_gateway(&path, "mcpServers", Some(&_e), false)
+            edit_json_gateway(&path, "mcpServers", Some(&_e), true)
         }
         .unwrap();
         let installed =
