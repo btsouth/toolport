@@ -87,6 +87,7 @@ jobs:
 
   cross-platform-rust:
     name: Headless Rust tests (${{ matrix.os }})
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

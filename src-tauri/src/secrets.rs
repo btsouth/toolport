@@ -1285,8 +1285,11 @@ mod tests {
 
     /// macOS: ensuring the master key returns 32 bytes and is idempotent — a
     /// second `ensure` returns the SAME key, and a plain `read` returns it too.
+    /// This uses the real legacy Keychain and can prompt for ACL access, so it is
+    /// opt-in on headless CI where no user can answer the prompt.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "requires an interactive macOS keychain; unavailable in headless CI"]
     fn master_key_ensure_then_read_is_idempotent() {
         let first = platform::ensure_master_key().expect("ensure should succeed");
         assert_eq!(first.len(), 32);
