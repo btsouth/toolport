@@ -40,7 +40,9 @@ import {
 } from "@/components/ui/select";
 
 interface Props {
-  trigger: ReactNode;
+  /** The control that opens the dialog. Omit when opening it with `autoOpen` (a
+   * keyboard shortcut or a catalog flow), where there is no button to render. */
+  trigger?: ReactNode;
   onSaved: (registry: Registry) => void;
   /** When set, the dialog edits this server (vs. adding a new one). */
   editId?: string;
@@ -277,7 +279,7 @@ export function ServerDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogTrigger asChild>{trigger}</DialogTrigger>
+      {trigger && <DialogTrigger asChild>{trigger}</DialogTrigger>}
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>{editing ? "Edit server" : "Add MCP server"}</DialogTitle>

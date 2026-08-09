@@ -91,12 +91,14 @@ import { Callout } from "@/components/Callout";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/sonner";
 import { useTheme } from "@/lib/theme";
 import { fmtTs } from "@/lib/utils";
+import { resolveShortcut, shortcutHelp } from "@/lib/shortcuts";
 
 /** Above this many servers, "Disable all" asks for confirmation first. */
 const BULK_DISABLE_CONFIRM_MIN = 3;
@@ -126,6 +128,15 @@ function App() {
   // only appears after a real failure.
   const [backendReachable, setBackendReachable] = useState(true);
   const [query, setQuery] = useState("");
+  // Keyboard shortcuts (SBS-143). The app had none, which for a developer tool means
+  // every interaction is mouse-only.
+  const searchRef = useRef<HTMLInputElement>(null);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  // Ctrl+N mounts its own ServerDialog with `autoOpen` rather than reaching into the
+  // trigger-based one, so the shortcut needs no changes to ServerDialog's API.
+  const [addServerOpen, setAddServerOpen] = useState(false);
+  const isMac =
+    typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform ?? "");
   const [onboarded, setOnboarded] = useState(
     () =>
       localStorage.getItem("toolport.onboarded") === "1" ||
@@ -438,6 +449,51 @@ function App() {
     setView(v);
   }
 
+  // One global keydown listener rather than per-control handlers, so a shortcut works
+  // wherever focus happens to be. The decision of what a keystroke means lives in
+  // `resolveShortcut` and is unit-tested there; this only performs the effect.
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      const action = resolveShortcut(e, e.target as HTMLElement | null);
+      if (!action) return;
+      // Only claim the key once we know it is ours. Ctrl+R in particular would
+      // otherwise reload the webview and throw away in-flight state.
+      switch (action.kind) {
+        case "view":
+          e.preventDefault();
+          selectView(action.view);
+          break;
+        case "focusSearch":
+          e.preventDefault();
+          // Search only exists on the servers list; go there first so the shortcut
+          // is not a silent no-op from another view.
+          selectView("servers");
+          // After the view switch has painted, or the input is not mounted yet.
+          requestAnimationFrame(() => searchRef.current?.select());
+          break;
+        case "addServer":
+          e.preventDefault();
+          setAddServerOpen(true);
+          break;
+        case "refresh":
+          e.preventDefault();
+          void load(true);
+          break;
+        case "help":
+          e.preventDefault();
+          setShortcutsOpen(true);
+          break;
+        case "closeHelp":
+          // No preventDefault: Escape belongs to whatever dialog or menu is open, and
+          // this must not stop it closing. Only acts when the sheet is actually up.
+          setShortcutsOpen(false);
+          break;
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [load]);
+
   const profileId = registry
     ? (registry.activeProfileId ?? registry.profiles[0]?.id)
     : undefined;
@@ -693,9 +749,11 @@ function App() {
                   <div className="relative">
                     <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
                     <Input
+                      ref={searchRef}
                       value={query}
                       onChange={(e) => setQuery(e.target.value)}
                       placeholder="Search servers"
+                      title={`Search servers (/ or ${isMac ? "⌘" : "Ctrl"}F)`}
                       className="h-9 w-44 pl-8"
                     />
                   </div>
@@ -703,7 +761,11 @@ function App() {
                     onSaved={setRegistry}
                     existingNames={servers.map((s) => s.name)}
                     trigger={
-                      <Button variant="outline" size="sm">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        title={`Add server (${isMac ? "⌘" : "Ctrl"}N)`}
+                      >
                         <Plus className="size-4" />
                         Add server
                       </Button>
@@ -939,6 +1001,36 @@ function App() {
         destructive
         onConfirm={handleToggleAll}
       />
+      {/* Ctrl+N. Mounted only while open so `autoOpen` fires each time, and unmounted
+          on close so the next press starts from a clean form. */}
+      {addServerOpen && (
+        <ServerDialog
+          autoOpen
+          onClose={() => setAddServerOpen(false)}
+          onSaved={setRegistry}
+          existingNames={servers.map((s) => s.name)}
+        />
+      )}
+      {/* `?` cheat sheet: shortcuts nobody can see are shortcuts nobody uses. */}
+      <Dialog open={shortcutsOpen} onOpenChange={setShortcutsOpen}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Keyboard shortcuts</DialogTitle>
+          </DialogHeader>
+          <dl className="grid grid-cols-[auto_1fr] items-center gap-x-4 gap-y-2 text-sm">
+            {shortcutHelp(isMac).map((row) => (
+              <div key={row.keys} className="contents">
+                <dt>
+                  <kbd className="rounded border border-border/60 bg-muted px-1.5 py-0.5 font-mono text-xs">
+                    {row.keys}
+                  </kbd>
+                </dt>
+                <dd className="text-muted-foreground">{row.what}</dd>
+              </div>
+            ))}
+          </dl>
+        </DialogContent>
+      </Dialog>
       <Toaster theme={resolvedTheme} position="bottom-right" />
     </TooltipProvider>
   );
