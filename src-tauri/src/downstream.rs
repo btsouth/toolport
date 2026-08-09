@@ -1172,26 +1172,37 @@ pub fn bearer_header(token: &str) -> String {
     }
 }
 
+/// What Windows falls back to when PATHEXT is unset.
+#[cfg(windows)]
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
 /// Resolve a bare command against an explicit `;`-separated PATH and PATHEXT.
+///
 /// Directories are the outer loop and extensions the inner one, so a hit in an
 /// earlier PATH entry beats an earlier PATHEXT extension in a later entry —
-/// which is what Windows itself does.
+/// which is what Windows itself does. A command that already carries an
+/// extension or a path separator is returned untouched, and one that resolves
+/// to nothing falls back to itself.
 ///
-/// Split out from [`resolve_command`] so the precedence rule is testable against
-/// known stub files instead of against whatever the developer happens to have
+/// Takes PATH and PATHEXT as arguments so the entire rule is testable against
+/// known stub files rather than against whatever the developer happens to have
 /// installed, and without mutating the process-wide PATH that every other test
-/// (and any process they spawn) is reading concurrently (#651).
+/// (and any process they spawn) reads concurrently (#651).
 #[cfg(windows)]
-fn resolve_bare_in(path: &str, pathext: &str, command: &str) -> Option<String> {
+fn resolve_command_with(path: &str, pathext: &str, command: &str) -> String {
+    let p = Path::new(command);
+    if p.extension().is_some() || command.contains('\\') || command.contains('/') {
+        return command.to_string();
+    }
     for dir in path.split(';').filter(|d| !d.is_empty()) {
         for ext in pathext.split(';').filter(|e| !e.is_empty()) {
             let candidate = Path::new(dir).join(format!("{command}{ext}"));
             if candidate.is_file() {
-                return Some(candidate.to_string_lossy().into_owned());
+                return candidate.to_string_lossy().into_owned();
             }
         }
     }
-    None
+    command.to_string()
 }
 
 /// Resolve a bare command to a concrete executable.
@@ -1199,17 +1210,14 @@ fn resolve_bare_in(path: &str, pathext: &str, command: &str) -> Option<String> {
 /// On Windows, Node tooling lives in `.cmd` shims (`npx` is really `npx.cmd`),
 /// and `Command::new("npx")` won't find it. Search PATH with PATHEXT so bare
 /// commands resolve. (Rust 1.77.2+ then runs the resolved `.cmd` via cmd.exe.)
+///
+/// An unset PATH yields no directories to search, so the command falls through
+/// to itself exactly as an unsuccessful search would.
 #[cfg(windows)]
 pub fn resolve_command(command: &str) -> String {
-    let p = Path::new(command);
-    if p.extension().is_some() || command.contains('\\') || command.contains('/') {
-        return command.to_string();
-    }
-    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-    let Ok(path) = std::env::var("PATH") else {
-        return command.to_string();
-    };
-    resolve_bare_in(&path, &exts, command).unwrap_or_else(|| command.to_string())
+    let path = std::env::var("PATH").unwrap_or_default();
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| DEFAULT_PATHEXT.to_string());
+    resolve_command_with(&path, &pathext, command)
 }
 
 /// A PATH that includes the user's real shell PATH plus common install dirs.
@@ -6944,7 +6952,7 @@ mod tests {
         // directory legitimately wins — so the test was over-specified rather
         // than the resolver wrong. Assert the rule against known stubs instead
         // of against whatever is installed (#651).
-        use super::resolve_bare_in;
+        use super::{resolve_command_with, DEFAULT_PATHEXT};
 
         let root = std::env::temp_dir().join(format!(
             "toolport-pathext-{}-{:?}",
@@ -6968,8 +6976,8 @@ mod tests {
         let early_cmd = stub(&first, "tool.CMD");
         stub(&second, "tool.EXE");
         assert_eq!(
-            resolve_bare_in(&path, ".COM;.EXE;.BAT;.CMD", "tool").as_deref(),
-            Some(early_cmd.to_string_lossy().as_ref()),
+            resolve_command_with(&path, DEFAULT_PATHEXT, "tool"),
+            early_cmd.to_string_lossy(),
             "an earlier PATH entry wins even with a later-ranked extension"
         );
 
@@ -6977,15 +6985,14 @@ mod tests {
         let both_exe = stub(&first, "both.EXE");
         stub(&first, "both.CMD");
         assert_eq!(
-            resolve_bare_in(&path, ".COM;.EXE;.BAT;.CMD", "both").as_deref(),
-            Some(both_exe.to_string_lossy().as_ref()),
+            resolve_command_with(&path, DEFAULT_PATHEXT, "both"),
+            both_exe.to_string_lossy(),
             "PATHEXT order decides within a single directory"
         );
         // ... and reordering PATHEXT reorders the result, so the precedence is
         // really coming from PATHEXT and not from directory enumeration order.
         assert!(
-            resolve_bare_in(&path, ".CMD;.EXE", "both")
-                .unwrap()
+            resolve_command_with(&path, ".CMD;.EXE", "both")
                 .to_lowercase()
                 .ends_with("both.cmd"),
             "PATHEXT is honored in the order given"
@@ -6994,8 +7001,7 @@ mod tests {
         // PATHEXT is matched case-insensitively, as Windows does: every stub on
         // disk here has an uppercase extension.
         assert!(
-            resolve_bare_in(&path, ".exe", "both")
-                .unwrap()
+            resolve_command_with(&path, ".exe", "both")
                 .to_lowercase()
                 .ends_with("both.exe"),
             "a lowercase PATHEXT entry matches an uppercase file on disk"
@@ -7006,30 +7012,126 @@ mod tests {
         // return it in preference to `both.EXE`.
         stub(&first, "both");
         assert_eq!(
-            resolve_bare_in(&path, ";.EXE", "both").as_deref(),
-            Some(both_exe.to_string_lossy().as_ref()),
+            resolve_command_with(&path, ";.EXE", "both"),
+            both_exe.to_string_lossy(),
             "an empty PATHEXT entry must not match the extensionless file"
         );
         // Empty PATH entries are tolerated the same way.
         assert_eq!(
-            resolve_bare_in(&format!(";{path};"), ".EXE", "both").as_deref(),
-            Some(both_exe.to_string_lossy().as_ref())
+            resolve_command_with(&format!(";{path};"), ".EXE", "both"),
+            both_exe.to_string_lossy()
         );
 
-        // No candidate anywhere: the caller falls back to the bare command.
-        assert_eq!(resolve_bare_in(&path, ".EXE;.CMD", "absent"), None);
+        // No candidate anywhere: fall back to the bare command.
+        assert_eq!(resolve_command_with(&path, ".EXE;.CMD", "absent"), "absent");
+
+        // A command that already carries an extension is passed through, so PATH
+        // is never consulted. `tool.CMD.EXE` exists purely so that skipping the
+        // early return would produce a visibly different answer.
+        stub(&first, "tool.CMD.EXE");
         assert_eq!(
-            resolve_command("toolport-definitely-not-installed"),
-            "toolport-definitely-not-installed"
+            resolve_command_with(&path, ".EXE", "tool.CMD"),
+            "tool.CMD",
+            "an explicit extension short-circuits the PATH search"
         );
-
-        // An explicit extension or a path separator is passed through untouched,
-        // so PATH is never consulted for it.
-        assert_eq!(resolve_command("node.exe"), "node.exe");
-        assert_eq!(resolve_command(r"C:\tools\node"), r"C:\tools\node");
-        assert_eq!(resolve_command("tools/node"), "tools/node");
+        // Same for a command containing a path separator.
+        let sub = first.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        stub(&sub, "nested.EXE");
+        assert_eq!(
+            resolve_command_with(&path, ".EXE", r"sub\nested"),
+            r"sub\nested",
+            "a path separator short-circuits the PATH search"
+        );
+        assert_eq!(
+            resolve_command_with(&path, ".EXE", "sub/nested"),
+            "sub/nested"
+        );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Prepends a directory to PATH and pins PATHEXT, restoring both on drop so
+    /// a panicking assertion cannot leak the mutation into the rest of the test
+    /// binary.
+    ///
+    /// Prepend rather than replace: PATH is process-wide, and other tests spawn
+    /// child processes that must still find their own executables. Widening PATH
+    /// with a directory holding one uniquely-named stub cannot shadow anything.
+    #[cfg(windows)]
+    struct ScopedPath {
+        path: Option<String>,
+        pathext: Option<String>,
+    }
+
+    #[cfg(windows)]
+    impl ScopedPath {
+        fn new(dir: &std::path::Path) -> Self {
+            let saved = Self {
+                path: std::env::var("PATH").ok(),
+                pathext: std::env::var("PATHEXT").ok(),
+            };
+            let next = match &saved.path {
+                Some(existing) => format!("{};{existing}", dir.display()),
+                None => dir.display().to_string(),
+            };
+            std::env::set_var("PATH", next);
+            // Pin PATHEXT too: reading the machine's value would put us right
+            // back to asserting on the developer's environment (#651).
+            std::env::set_var("PATHEXT", super::DEFAULT_PATHEXT);
+            saved
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ScopedPath {
+        fn drop(&mut self) {
+            match self.path.take() {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            match self.pathext.take() {
+                Some(value) => std::env::set_var("PATHEXT", value),
+                None => std::env::remove_var("PATHEXT"),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn resolve_command_passes_path_and_pathext_in_that_order() {
+        // The one thing `resolve_command_with` tests cannot reach: that
+        // `resolve_command` hands it PATH and PATHEXT the right way round.
+        // Swapping the two arguments leaves every hermetic assertion above green
+        // (CodeRev caught this on #659), so this test is the only thing between
+        // that mistake and production.
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-resolve-env-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Deliberately unique: this name goes on the real, process-wide PATH.
+        let stub = dir.join("toolport-stub-tool.EXE");
+        std::fs::write(&stub, b"stub").unwrap();
+
+        {
+            let _scoped = ScopedPath::new(&dir);
+            assert_eq!(
+                resolve_command("toolport-stub-tool").to_lowercase(),
+                stub.to_string_lossy().to_lowercase(),
+                "resolve_command must search PATH with PATHEXT, not the reverse"
+            );
+        }
+
+        // Restored: the stub is off PATH again, so it no longer resolves.
+        assert_eq!(
+            resolve_command("toolport-stub-tool"),
+            "toolport-stub-tool",
+            "ScopedPath must put PATH back"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
