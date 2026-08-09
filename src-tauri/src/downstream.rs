@@ -7051,15 +7051,31 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Prepends a directory to PATH and pins PATHEXT, restoring both on drop so
-    /// a panicking assertion cannot leak the mutation into the rest of the test
-    /// binary.
+    /// Serializes the PATH/PATHEXT mutation window below. Nothing else in the
+    /// crate writes either variable today, but this is what keeps that true when
+    /// the next env-mutating test is added — and it matches how the rest of the
+    /// crate guards process-global env (`ENV_LOCK` in `clients.rs`, `secrets.rs`
+    /// and `brand.rs`, `REGISTRY_ENV_LOCK` in `registry.rs`).
+    #[cfg(windows)]
+    static PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Widens PATH and PATHEXT for the duration of one test, restoring both on
+    /// drop so a panicking assertion cannot leak the mutation into the rest of
+    /// the binary.
     ///
-    /// Prepend rather than replace: PATH is process-wide, and other tests spawn
-    /// child processes that must still find their own executables. Widening PATH
-    /// with a directory holding one uniquely-named stub cannot shadow anything.
+    /// Both variables are WIDENED, never replaced. They are process-global and
+    /// `cargo test` runs in parallel, so a concurrent reader — `base_child_path`
+    /// hands PATH to spawned children — must still see everything it saw before.
+    /// A prepended directory holding one uniquely-named stub cannot shadow a
+    /// real tool, and prepending the standard PATHEXT keeps the assertion below
+    /// deterministic without discarding the machine's own entries.
+    ///
+    /// The lock guard is held for the whole window. `Drop::drop` runs before the
+    /// struct's fields are dropped, so the environment is restored before the
+    /// lock is released.
     #[cfg(windows)]
     struct ScopedPath {
+        _guard: std::sync::MutexGuard<'static, ()>,
         path: Option<String>,
         pathext: Option<String>,
     }
@@ -7067,18 +7083,25 @@ mod tests {
     #[cfg(windows)]
     impl ScopedPath {
         fn new(dir: &std::path::Path) -> Self {
+            let guard = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let saved = Self {
+                _guard: guard,
                 path: std::env::var("PATH").ok(),
                 pathext: std::env::var("PATHEXT").ok(),
             };
-            let next = match &saved.path {
+            let next_path = match &saved.path {
                 Some(existing) => format!("{};{existing}", dir.display()),
                 None => dir.display().to_string(),
             };
-            std::env::set_var("PATH", next);
-            // Pin PATHEXT too: reading the machine's value would put us right
-            // back to asserting on the developer's environment (#651).
-            std::env::set_var("PATHEXT", super::DEFAULT_PATHEXT);
+            std::env::set_var("PATH", next_path);
+            // Front the standard list so `.EXE` is always present and always
+            // ahead of anything machine-specific: reading PATHEXT raw would put
+            // us back to asserting on the developer's environment (#651).
+            let next_pathext = match &saved.pathext {
+                Some(existing) => format!("{};{existing}", super::DEFAULT_PATHEXT),
+                None => super::DEFAULT_PATHEXT.to_string(),
+            };
+            std::env::set_var("PATHEXT", next_pathext);
             saved
         }
     }
