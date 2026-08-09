@@ -8346,6 +8346,73 @@ mod tests {
     }
 
     #[test]
+    fn json_schema_2020_12_keywords_do_not_drop_a_tool_from_the_catalog() {
+        use super::filter_modern_http_tools;
+
+        // SBS-452 / SEP-1613 + SEP-2106: 2020-12 is the default dialect and any of its
+        // keywords may appear in inputSchema. The schema walk here can return Err, and
+        // an Err silently EXCLUDES the tool from a modern HTTP catalog — so a composition
+        // keyword choking the walk would make a server's tools vanish with only a log
+        // line. Pin that $ref, $defs, allOf/anyOf/oneOf and unevaluatedProperties all
+        // survive.
+        let exotic = json!({
+            "name": "composed",
+            "inputSchema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "$defs": { "Node": { "type": "object", "properties": { "next": { "$ref": "#/$defs/Node" } } } },
+                "properties": {
+                    "node": { "$ref": "#/$defs/Node" },
+                    "either": { "oneOf": [{ "type": "string" }, { "type": "integer" }] },
+                    "both": { "allOf": [{ "type": "object" }, { "required": ["x"] }] },
+                    "any": { "anyOf": [{ "type": "boolean" }, { "type": "null" }] }
+                },
+                "unevaluatedProperties": false
+            }
+        });
+
+        let kept = filter_modern_http_tools("fixture", vec![exotic]);
+        assert_eq!(kept.len(), 1, "a 2020-12 schema must not drop the tool");
+    }
+
+    #[test]
+    fn a_schema_with_no_annotations_at_all_is_still_kept() {
+        use super::filter_modern_http_tools;
+
+        // The overwhelmingly common case: no x-mcp-header anywhere. Nothing about the
+        // walk should be able to reject it.
+        let plain = json!({ "name": "plain", "inputSchema": { "type": "object" } });
+        let no_schema = json!({ "name": "bare" });
+        assert_eq!(
+            filter_modern_http_tools("fixture", vec![plain, no_schema]).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn x_mcp_header_under_a_composition_keyword_is_refused_deliberately() {
+        use super::filter_modern_http_tools;
+
+        // Not a gap: a header annotation reachable only through allOf/oneOf is not
+        // statically resolvable to one input property, so the tool is excluded rather
+        // than guessed at. Pinned so the refusal stays intentional rather than becoming
+        // an accident of the walk order.
+        let sneaky = json!({
+            "name": "sneaky",
+            "inputSchema": {
+                "type": "object",
+                "allOf": [
+                    { "properties": { "tenant": { "type": "string", "x-mcp-header": "Tenant" } } }
+                ]
+            }
+        });
+        assert!(
+            filter_modern_http_tools("fixture", vec![sneaky]).is_empty(),
+            "an unreachable x-mcp-header must exclude the tool, not be silently honoured"
+        );
+    }
+
+    #[test]
     fn x_mcp_header_filters_only_the_malformed_tool_and_encodes_values() {
         use super::{filter_modern_http_tools, tool_request_headers};
 
