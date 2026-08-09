@@ -20216,6 +20216,62 @@ mod tests {
         reg
     }
 
+    /// SBS-614: rehydration must stay the LAST step before dispatch.
+    ///
+    /// The destructive-confirm preview is returned to the model as a tool result, so
+    /// it has to show the token. That placement already regressed once (#657), and
+    /// nothing failed when it did — the `pii.rs` unit tests pass either way, because
+    /// they never exercise the gateway's ordering. This is the test that fails if
+    /// `rehydrate_for_downstream` ever moves back above the intercept.
+    #[test]
+    fn destructive_confirm_preview_shows_the_token_not_the_real_value() {
+        let client = None;
+        let token = with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("stripe", "ada@example.com").text
+        });
+        assert_eq!(token, "⟦EMAIL_1⟧");
+
+        let mut reg = registry_with_confirm();
+        reg.pii_redaction = true;
+        let req = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "stripe__delete_customer",
+                "arguments": { "id": "⟦EMAIL_1⟧" }
+            }
+        });
+
+        let resp = handle_request(
+            &req,
+            &reg,
+            &router(),
+            &catalog_with_destructive(),
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            client,
+        )
+        .unwrap();
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("Destructive action intercepted"),
+            "expected the intercept: {text}"
+        );
+        assert!(
+            text.contains("⟦EMAIL_1⟧"),
+            "the preview must keep the pseudonym: {text}"
+        );
+        assert!(
+            !text.contains("ada@example.com"),
+            "the preview is returned to the model, so it must not carry the real \
+             value -- rehydration has moved too early: {text}"
+        );
+    }
+
     #[test]
     fn confirm_destructive_intercepts_destructive_call() {
         let reg = registry_with_confirm();
