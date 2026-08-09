@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   clientRestartHint,
+  clientRestartHintAfterRemoval,
   connectSuccessDescription,
   toolportStudioClientBlurb,
 } from "./clientConnect";
@@ -43,5 +44,27 @@ describe("clientRestartHint / connectSuccessDescription (SOU-317)", () => {
   it("explains zero-config tools vs Connect for Studio", () => {
     expect(toolportStudioClientBlurb()).toMatch(/discovers Toolport automatically/);
     expect(toolportStudioClientBlurb()).toMatch(/pin a profile/);
+  });
+});
+
+describe("clientRestartHintAfterRemoval (SBS-336 review)", () => {
+  it("says the client stops loading Toolport, not that it loads it", () => {
+    // The connect wording on a disconnect reads as though the disconnect failed.
+    expect(clientRestartHintAfterRemoval("Claude Desktop")).toBe(
+      "Restart Claude Desktop so it stops loading Toolport.",
+    );
+    expect(clientRestartHintAfterRemoval("Claude Desktop")).not.toContain(
+      "so it loads Toolport",
+    );
+  });
+
+  it("keeps Studio's new-conversation wording", () => {
+    expect(clientRestartHintAfterRemoval("Toolport Studio", "toolport-studio")).toBe(
+      "Start a new conversation in Toolport Studio so it stops using Toolport.",
+    );
+    // A different client id must not pick up the Studio phrasing.
+    expect(clientRestartHintAfterRemoval("Other", "other-client")).toBe(
+      "Restart Other so it stops loading Toolport.",
+    );
   });
 });

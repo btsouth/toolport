@@ -53,6 +53,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
 import {
   clientRestartHint,
+  clientRestartHintAfterRemoval,
   connectSuccessDescription,
   toolportStudioClientBlurb,
 } from "@/lib/clientConnect";
@@ -129,15 +130,23 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   // cascading-render setState-in-effect.
   const [restartNotice, setRestartNotice] = useState<{
     clientId: string;
+    title: string;
     text: string;
   } | null>(null);
-  const showRestartNotice =
-    restartNotice?.clientId === client.id ? restartNotice.text : null;
+  const showRestartNotice = restartNotice?.clientId === client.id ? restartNotice : null;
 
-  function noteRestartNeeded() {
+  /** `applied` = Toolport was written into the config; `removed` = taken out of it.
+   *
+   * Both need a restart, for opposite reasons, and the connect wording ("so it loads
+   * Toolport") reads as a failed disconnect on the removal path. */
+  function noteRestartNeeded(kind: "applied" | "removed") {
     setRestartNotice({
       clientId: client.id,
-      text: clientRestartHint(client.name, client.id),
+      title: kind === "applied" ? "Not live yet" : "Still connected until restart",
+      text:
+        kind === "applied"
+          ? clientRestartHint(client.name, client.id)
+          : clientRestartHintAfterRemoval(client.name, client.id),
     });
   }
 
@@ -217,7 +226,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           : `${client.name} now follows the active profile.`,
         { description: clientRestartHint(client.name, client.id) },
       );
-      noteRestartNeeded();
+      noteRestartNeeded("applied");
       onChanged();
     } catch (e) {
       toastError(`${e}`);
@@ -234,7 +243,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       toast.success(`Reset ${client.name} to the default Toolport gateway`, {
         description: clientRestartHint(client.name, client.id),
       });
-      noteRestartNeeded();
+      noteRestartNeeded("applied");
       setResetOpen(false);
       onChanged();
     } catch (e) {
@@ -264,9 +273,12 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       toast.success(
         `Moved ${result.moved.length} server${result.moved.length === 1 ? "" : "s"} into Toolport`,
         {
-          description: `${client.name} now uses only the Toolport gateway. Config backed up.`,
+          // Migrate rewrites the whole gateway slot, so it needs the restart line for
+          // the same reason Connect does.
+          description: `${client.name} now uses only the Toolport gateway. Config backed up. ${clientRestartHint(client.name, client.id)}`,
         },
       );
+      noteRestartNeeded("applied");
       setMigrateOpen(false);
       onChanged();
     } catch (e) {
@@ -375,7 +387,10 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     try {
       if (installed) {
         await uninstallGateway(client.id);
-        toast.success(`Disconnected Toolport from ${client.name}`);
+        toast.success(`Disconnected Toolport from ${client.name}`, {
+          description: clientRestartHintAfterRemoval(client.name, client.id),
+        });
+        noteRestartNeeded("removed");
       } else {
         const outcome = await installGateway(
           client.id,
@@ -398,8 +413,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             client.id,
           ),
         });
+        noteRestartNeeded("applied");
       }
-      noteRestartNeeded();
       onChanged();
     } catch (e) {
       toastError(`${e}`);
@@ -573,8 +588,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         >
           <RefreshCw className="mt-0.5 size-4 shrink-0" />
           <div className="min-w-0 flex-1">
-            <p className="font-medium">Not live yet</p>
-            <p className="mt-0.5 break-words text-xs">{showRestartNotice}</p>
+            <p className="font-medium">{showRestartNotice.title}</p>
+            <p className="mt-0.5 break-words text-xs">{showRestartNotice.text}</p>
           </div>
           <button
             type="button"
