@@ -12343,6 +12343,104 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_tools_call_is_a_tool_error_not_a_protocol_error() {
+        // SEP-1303 (SBS-452): input/routing failures on tools/call must come back as
+        // tool execution errors so the model can read them and self-correct. A
+        // JSON-RPC error is invisible to the model and ends the turn instead.
+        let reg = Registry::default();
+        let resp = handle_request(
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "nosuch__tool", "arguments": { "x": 1 } }
+            }),
+            &reg,
+            &router(),
+            &catalog_with_destructive(),
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            resp.get("error").is_none(),
+            "a routing failure must not surface as a protocol error: {resp}"
+        );
+        assert_eq!(
+            resp["result"]["isError"], true,
+            "it must be a tool error the model can act on: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(!text.is_empty(), "and it must say something actionable");
+    }
+
+    #[test]
+    fn server_to_client_rpc_params_are_forwarded_verbatim() {
+        // SBS-452: sampling `tools`/`toolChoice` (SEP-1577) and the elicitation schema
+        // updates (EnumSchema SEP-1330, defaults SEP-1034) need no per-field code --
+        // they ride through because params are forwarded whole. Pinned because the
+        // regression would be silent and is exactly the failure SBS-442 was written
+        // about: a field-selective proxy quietly dropping the parts of the protocol it
+        // was not taught about.
+        let sampling = json!({
+            "method": "sampling/createMessage",
+            "params": {
+                "messages": [{ "role": "user", "content": { "type": "text", "text": "hi" } }],
+                "tools": [{ "name": "search" }],
+                "toolChoice": { "type": "tool", "name": "search" },
+                "_meta": { "traceparent": "00-abc-def-01" }
+            }
+        });
+        assert_eq!(
+            upstream_rpc_params("sampling/createMessage", &sampling),
+            sampling["params"],
+            "sampling params must reach the client unchanged, unknown fields included"
+        );
+
+        let elicit = json!({
+            "method": "elicitation/create",
+            "params": {
+                "mode": "form",
+                "message": "pick",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tier": {
+                            "type": "string",
+                            "enum": ["a", "b"],
+                            "enumNames": ["Alpha", "Beta"],
+                            "default": "a"
+                        },
+                        "tags": { "type": "array", "items": { "type": "string", "enum": ["x"] } },
+                        "count": { "type": "integer", "default": 3 },
+                        "on": { "type": "boolean", "default": true }
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            upstream_rpc_params("elicitation/create", &elicit),
+            elicit["params"],
+            "enum titles, multi-select and primitive defaults must survive the relay"
+        );
+
+        // roots/list is the deliberate exception: it takes no params, and forwarding a
+        // server's params there would be inventing a request the client never asked for.
+        assert_eq!(
+            upstream_rpc_params("roots/list", &json!({ "params": { "junk": 1 } })),
+            json!({})
+        );
+        // A request with no params at all still produces a valid empty object.
+        assert_eq!(
+            upstream_rpc_params("elicitation/create", &json!({ "method": "x" })),
+            json!({})
+        );
+    }
+
+    #[test]
     fn origin_is_loopback_accepts_only_this_machine() {
         // SBS-452 / SEP DNS-rebinding guard. Sec-Fetch-Site does not cover this case:
         // when an attacker's domain resolves to 127.0.0.1 the browser considers the
