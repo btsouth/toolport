@@ -19,9 +19,6 @@
 //! a remove takes the managed span back out, so a full join→edit→leave cycle returns the
 //! user's own content unchanged.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 /// How a client's rules file is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
@@ -110,10 +107,20 @@ fn start_marker(team_id: &str, version: i64) -> String {
 /// Stable content hash reported to the server as the "effective rules receipt": it identifies
 /// exactly the org content a client wrote to disk. Not cryptographic — only needs to detect
 /// change and let the dashboard prove on-disk == the pushed version.
+///
+/// SHA-256 truncated to 16 hex chars, NOT `DefaultHasher`. "Stable" here means stable across
+/// toolchains, not just within one build: this value is reported to the org server and used
+/// as a dedupe fingerprint, and `DefaultHasher`'s algorithm carries no cross-release
+/// guarantee. A Rust bump would silently change every member's reported hash and light up the
+/// coverage dashboard with drift that never happened (SBS-460). Width is unchanged, so the
+/// server sees the same shape.
 pub fn content_hash(content: &str) -> String {
-    let mut h = DefaultHasher::new();
-    content.hash(&mut h);
-    format!("{:016x}", h.finish())
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let digest = hasher.finalize();
+    // 8 bytes -> the same 16 hex chars DefaultHasher's u64 produced.
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Render the full body of an [`Strategy::OwnedFile`] file (header + a blank line + content).
