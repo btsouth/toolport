@@ -114,8 +114,7 @@ pub fn store_oauth_state(
 }
 
 fn load_state(server_id: &str) -> Option<OAuthState> {
-    secrets::get_secret(server_id, STATE_KEY)
-        .and_then(|s| serde_json::from_str(&s).ok())
+    secrets::get_secret(server_id, STATE_KEY).and_then(|s| serde_json::from_str(&s).ok())
 }
 
 fn issuer_bound_token_endpoint<'a>(
@@ -325,8 +324,8 @@ fn client_credentials_resource_changed(server_id: &str, url: &str) -> bool {
 
 /// Expiry of the vaulted client-credentials token, if this server uses that flow.
 fn client_credentials_expiry(server_id: &str) -> Option<u64> {
-    let state: ClientCredentialsState = secrets::get_secret(server_id, CC_STATE_KEY)
-        .and_then(|s| serde_json::from_str(&s).ok())?;
+    let state: ClientCredentialsState =
+        secrets::get_secret(server_id, CC_STATE_KEY).and_then(|s| serde_json::from_str(&s).ok())?;
     // A server that reports no lifetime keeps the reactive 401/403 behaviour,
     // matching the interactive flow. Returning 0 here would reacquire on every
     // single connect.
@@ -375,8 +374,39 @@ fn lock_oauth_refresh(server_id: &str) -> Option<crate::registry::FileLock> {
 /// normally.
 fn refreshed_while_waiting(server_id: &str, before: Option<&str>) -> Option<RefreshedToken> {
     let current = secrets::get_secret(server_id, secrets::HTTP_AUTH_KEY);
-    let state = load_state(server_id);
-    reuse_racing_refresh(before, current, state.as_ref(), now_epoch_seconds())
+    let now = now_epoch_seconds();
+    // Client-credentials servers keep their expiry under their own key and have no
+    // OAuthState, so they need their own read. Without this a CC waiter would win the
+    // lock and mint a second grant it did not need — serialized, so not a race, but a
+    // redundant round trip to the token endpoint on every contended connect.
+    if let Some(expires_at) = client_credentials_expiry(server_id) {
+        return reuse_racing_client_credentials(before, current, expires_at, now);
+    }
+    reuse_racing_refresh(before, current, load_state(server_id).as_ref(), now)
+}
+
+/// [`reuse_racing_refresh`] for the client-credentials flow.
+///
+/// Same rule, different source of truth for expiry, and deliberately the same skew the
+/// proactive CC path uses to decide a token is too close to its deadline — otherwise a
+/// waiter could accept a token the very next connect would immediately replace.
+fn reuse_racing_client_credentials(
+    before: Option<&str>,
+    current: Option<String>,
+    expires_at: u64,
+    now: u64,
+) -> Option<RefreshedToken> {
+    let current = current?;
+    if Some(current.as_str()) == before {
+        return None;
+    }
+    if now.saturating_add(PROACTIVE_REFRESH_SKEW_SECS) >= expires_at {
+        return None;
+    }
+    Some(RefreshedToken {
+        access_token: current,
+        expires_at: Some(expires_at),
+    })
 }
 
 /// The decision half of [`refreshed_while_waiting`], with the vault reads lifted out so
@@ -529,9 +559,12 @@ fn refresh_token_if_needed(server_id: &str) -> Result<Option<String>, String> {
     // simply replaced rather than surfaced as "needs sign-in".
     if let Some(expires_at) = client_credentials_expiry(server_id) {
         if now_epoch_seconds().saturating_add(PROACTIVE_REFRESH_SKEW_SECS) >= expires_at {
-            return Ok(reacquire_client_credentials(server_id)
-                .ok()
-                .map(|t| t.access_token));
+            // Through `refresh_token`, not `reacquire_client_credentials` directly: that
+            // seam is where the cross-process lock lives, and calling the reacquire
+            // straight from here left the proactive headless path as the one arm of the
+            // call graph still able to mint concurrently (SBS-479). Matches the shape of
+            // the refresh-token arm below.
+            return Ok(refresh_token(server_id).ok());
         }
         return Ok(None);
     }
@@ -660,27 +693,28 @@ fn authed_transport(
     } else {
         None
     };
-    let scope_reauthorize: Option<ScopeReauthorizeFn> = if token.is_some() && load_state(server_id).is_some() {
-        let sid = server_id.to_string();
-        let resource = url.to_string();
-        let next_refresh_at = Arc::clone(&next_refresh_at);
-        let credential_update = Arc::clone(&credential_update);
-        Some(Box::new(move |scope| {
-            let _update = credential_update
-                .lock()
-                .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
-            let token = reauthorize_for_scope(&sid, &resource, scope)?;
-            let deadline = token
-                .expires_at
-                .map(|expires_at| expires_at.saturating_sub(PROACTIVE_REFRESH_SKEW_SECS));
-            *next_refresh_at
-                .lock()
-                .map_err(|_| "OAuth refresh deadline lock poisoned".to_string())? = deadline;
-            Ok(token.access_token)
-        }))
-    } else {
-        None
-    };
+    let scope_reauthorize: Option<ScopeReauthorizeFn> =
+        if token.is_some() && load_state(server_id).is_some() {
+            let sid = server_id.to_string();
+            let resource = url.to_string();
+            let next_refresh_at = Arc::clone(&next_refresh_at);
+            let credential_update = Arc::clone(&credential_update);
+            Some(Box::new(move |scope| {
+                let _update = credential_update
+                    .lock()
+                    .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
+                let token = reauthorize_for_scope(&sid, &resource, scope)?;
+                let deadline = token
+                    .expires_at
+                    .map(|expires_at| expires_at.saturating_sub(PROACTIVE_REFRESH_SKEW_SECS));
+                *next_refresh_at
+                    .lock()
+                    .map_err(|_| "OAuth refresh deadline lock poisoned".to_string())? = deadline;
+                Ok(token.access_token)
+            }))
+        } else {
+            None
+        };
     // The resolver enforces the SSRF policy at connect time (DNS-rebind safe); it
     // mirrors `guard_connect_target`: link-local/metadata blocked for all, private
     // blocked only for untrusted-provenance servers.
@@ -961,6 +995,39 @@ mod tests {
     }
 
     #[test]
+    fn a_client_credentials_token_minted_while_waiting_is_reused() {
+        // A CC waiter that wins the lock after the other process already minted must not
+        // spend a second grant. Serialization alone would prevent the race but not the
+        // redundant round trip.
+        let winner =
+            reuse_racing_client_credentials(Some("token-0"), Some("token-1".into()), 10_000, 1_000)
+                .expect("a freshly minted, still-valid CC token must be reused");
+        assert_eq!(winner.access_token, "token-1");
+        assert_eq!(winner.expires_at, Some(10_000));
+    }
+
+    #[test]
+    fn client_credentials_reuse_honours_the_same_skew_as_the_proactive_path() {
+        // Inside the pre-expiry window the proactive path would replace this token on the
+        // very next connect, so accepting it here just defers the work by one call.
+        assert!(reuse_racing_client_credentials(
+            Some("token-0"),
+            Some("token-1".into()),
+            1_030,
+            1_000
+        )
+        .is_none());
+        // And an unchanged token still means the mint is ours to do.
+        assert!(reuse_racing_client_credentials(
+            Some("token-0"),
+            Some("token-0".into()),
+            10_000,
+            1_000
+        )
+        .is_none());
+    }
+
+    #[test]
     fn the_refresh_lock_is_per_server_and_released_on_drop() {
         // Two servers must not serialize against each other, or one slow provider
         // stalls refresh for every other server in the registry.
@@ -1085,13 +1152,19 @@ mod tests {
             token_endpoint_auth_methods_supported: None,
         };
 
-        let rotated = endpoints("https://auth.example.com", "https://auth.example.com/token-v2");
+        let rotated = endpoints(
+            "https://auth.example.com",
+            "https://auth.example.com/token-v2",
+        );
         assert_eq!(
             issuer_bound_token_endpoint("https://auth.example.com", &rotated).unwrap(),
             "https://auth.example.com/token-v2"
         );
 
-        let changed = endpoints("https://other.example.com", "https://other.example.com/token");
+        let changed = endpoints(
+            "https://other.example.com",
+            "https://other.example.com/token",
+        );
         assert!(issuer_bound_token_endpoint("https://auth.example.com", &changed).is_err());
     }
 
@@ -1232,7 +1305,10 @@ mod tests {
     /// headless path and fail with "no client secret vaulted".
     #[test]
     fn client_credentials_flow_requires_a_non_empty_client_id() {
-        assert!(uses_client_credentials(&http_server("a", Some(cc("client-abc")))));
+        assert!(uses_client_credentials(&http_server(
+            "a",
+            Some(cc("client-abc"))
+        )));
         assert!(!uses_client_credentials(&http_server("b", Some(cc("   ")))));
         assert!(!uses_client_credentials(&http_server("c", Some(cc("")))));
         assert!(!uses_client_credentials(&http_server("d", None)));
