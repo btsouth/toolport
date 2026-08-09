@@ -1672,6 +1672,14 @@ fn backup_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Sequence recorded alongside `.bak`, allowing recovery to distinguish two
+/// snapshots whose filesystem mtimes collapse into the same coarse bucket.
+fn backup_sequence_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".bak.seq");
+    PathBuf::from(name)
+}
+
 /// How many rolling backup generations `save_to` keeps beyond the single `.bak`.
 /// The registry is a few KB, so 5 generations is negligible on disk but means
 /// recovery has several recent snapshots to fall back to, not one file that (as
@@ -1679,8 +1687,8 @@ fn backup_path(path: &Path) -> PathBuf {
 const BACKUP_GENERATIONS: usize = 5;
 
 /// The rolling journal generations written by `save_to`, named
-/// `<registry>.bak.<ts-millis>`. Timestamps are fixed-width for any realistic
-/// epoch, so name order is age order; returned oldest-first. Excludes the single
+/// `<registry>.bak.<sequence>`. The sequence starts from epoch milliseconds and
+/// advances monotonically, so name order is age order; returned oldest-first. Excludes the single
 /// `<registry>.bak` (no trailing timestamp) and the `.unreadable-*` quarantine
 /// files, which use a different prefix.
 fn backup_generations(path: &Path) -> Vec<PathBuf> {
@@ -1698,7 +1706,8 @@ fn backup_generations(path: &Path) -> Vec<PathBuf> {
         .filter(|p| {
             p.file_name()
                 .and_then(|f| f.to_str())
-                .is_some_and(|f| f.starts_with(&prefix))
+                .and_then(|f| f.strip_prefix(&prefix))
+                .is_some_and(|suffix| suffix.parse::<u128>().is_ok())
         })
         .collect();
     gens.sort();
@@ -1709,13 +1718,30 @@ fn backup_generations(path: &Path) -> Vec<PathBuf> {
 /// newest `BACKUP_GENERATIONS`. Best-effort: a failure here never fails a save -
 /// the primary write and the single `.bak` remain the durability guarantees, and
 /// this only adds recovery depth on top of them.
-fn write_backup_generation(path: &Path, content: &str) {
-    let ts = std::time::SystemTime::now()
+fn next_backup_sequence(path: &Path) -> u128 {
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    let latest = backup_generations(path)
+        .into_iter()
+        .filter_map(|generation| {
+            generation
+                .file_name()?
+                .to_str()?
+                .rsplit_once(".bak.")?
+                .1
+                .parse::<u128>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0);
+    now.max(latest.saturating_add(1))
+}
+
+fn write_backup_generation(path: &Path, content: &str, sequence: u128) {
     let mut name = path.as_os_str().to_owned();
-    name.push(format!(".bak.{ts}"));
+    name.push(format!(".bak.{sequence}"));
     if atomic_write(&PathBuf::from(name), content).is_err() {
         return;
     }
@@ -1732,7 +1758,11 @@ fn write_backup_generation(path: &Path, content: &str) {
 /// when nothing usable remains. Walking the journal means one stale or corrupt
 /// `.bak` no longer strands recovery when fresher snapshots exist.
 fn restore_from_backup(path: &Path) -> Option<Registry> {
-    let mut candidates = vec![backup_path(path)];
+    let single_backup = backup_path(path);
+    let single_sequence = std::fs::read_to_string(backup_sequence_path(path))
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u128>().ok());
+    let mut candidates = vec![single_backup.clone()];
     candidates.extend(backup_generations(path));
     candidates.sort_by(|a, b| {
         let modified = |candidate: &Path| {
@@ -1740,11 +1770,27 @@ fn restore_from_backup(path: &Path) -> Option<Registry> {
                 .and_then(|metadata| metadata.modified())
                 .unwrap_or(std::time::UNIX_EPOCH)
         };
-        // On coarse-timestamp filesystems, prefer a journal generation over the
-        // single .bak on a tie: save_to writes the generation after .bak.
-        modified(b)
-            .cmp(&modified(a))
-            .then_with(|| b.as_os_str().len().cmp(&a.as_os_str().len()))
+        let sequence = |candidate: &Path| {
+            if candidate == single_backup {
+                single_sequence
+            } else {
+                candidate
+                    .file_name()?
+                    .to_str()?
+                    .rsplit_once(".bak.")?
+                    .1
+                    .parse::<u128>()
+                    .ok()
+            }
+        };
+        match (sequence(a), sequence(b)) {
+            (Some(a_sequence), Some(b_sequence)) => b_sequence.cmp(&a_sequence),
+            // Legacy backups have no sequence sidecar. Preserve mtime ordering
+            // for them, preferring the journal only when the coarse times tie.
+            _ => modified(b)
+                .cmp(&modified(a))
+                .then_with(|| b.as_os_str().len().cmp(&a.as_os_str().len())),
+        }
     });
 
     for candidate in candidates {
@@ -1915,11 +1961,19 @@ pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
         if !existing.trim().is_empty() {
             if serde_json::from_str::<Registry>(&existing).is_ok() {
                 // Single last-known-good (compat + the load_from fast path)...
-                let _ = atomic_write(&backup_path(path), &existing);
+                let sequence = next_backup_sequence(path);
+                if atomic_write(&backup_path(path), &existing).is_ok() {
+                    let sequence_path = backup_sequence_path(path);
+                    if atomic_write(&sequence_path, &sequence.to_string()).is_err() {
+                        // Never leave older metadata attached to newer `.bak`
+                        // contents; mtime fallback is safer than a stale sequence.
+                        let _ = std::fs::remove_file(sequence_path);
+                    }
+                }
                 // ...plus a rolling journal generation, so recovery can fall back
                 // to the immediately-previous state and a few before it, not just
                 // whatever the one .bak happens to hold.
-                write_backup_generation(path, &existing);
+                write_backup_generation(path, &existing, sequence);
             } else {
                 quarantine_unreadable(path, &existing);
             }
@@ -2067,17 +2121,21 @@ pub(crate) fn arg_looks_secret(arg: &str) -> bool {
     }
     // Common remote-MCP launchers pass an HTTP auth header as one argument.
     // It has no key=value marker, but sharing it would disclose the credential.
-    if let Some(value) = trimmed.strip_prefix("authorization:") {
-        let value = value.trim_start();
-        if value.starts_with("bearer") || value.starts_with("basic") {
+    for header in ["authorization:", "proxy-authorization:"] {
+        if trimmed
+            .strip_prefix(header)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
             return true;
         }
     }
     // Some launchers split the header name and value into separate arguments.
     // Catch the credential-bearing value even when "Authorization:" is adjacent.
-    if let Some(value) = trimmed.strip_prefix("bearer") {
-        if value.chars().next().is_some_and(char::is_whitespace) && !value.trim().is_empty() {
-            return true;
+    for scheme in ["bearer", "basic", "digest"] {
+        if let Some(value) = trimmed.strip_prefix(scheme) {
+            if value.chars().next().is_some_and(char::is_whitespace) && !value.trim().is_empty() {
+                return true;
+            }
         }
     }
     // A connection URI with embedded userinfo: scheme://user:pass@host/...
@@ -3382,6 +3440,58 @@ mod tests {
         std::fs::remove_file(backup_path(&path)).ok();
         for generation in backup_generations(&path) {
             std::fs::remove_file(generation).ok();
+        }
+    }
+
+    #[test]
+    fn recovery_uses_backup_sequence_when_mtimes_tie() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "conduit-reg-recover-sequence-{}.json",
+            std::process::id()
+        ));
+        let bak = backup_path(&path);
+        let sequence_path = backup_sequence_path(&path);
+        let mut generation_name = path.as_os_str().to_owned();
+        generation_name.push(".bak.100");
+        let generation = PathBuf::from(generation_name);
+
+        for candidate in [&path, &bak, &sequence_path, &generation] {
+            std::fs::remove_file(candidate).ok();
+        }
+
+        let mut stale = Registry::default();
+        stale.add_server(sample_server("stale"));
+        std::fs::write(&generation, serde_json::to_string(&stale).unwrap()).unwrap();
+
+        let mut fresh = stale.clone();
+        fresh.add_server(sample_server("fresh"));
+        std::fs::write(&bak, serde_json::to_string(&fresh).unwrap()).unwrap();
+        std::fs::write(&sequence_path, "200").unwrap();
+
+        let tied_time = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000);
+        let times = std::fs::FileTimes::new().set_modified(tied_time);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&bak)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&generation)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        std::fs::write(&path, "{ corrupt").unwrap();
+
+        let recovered = load_from(&path).unwrap();
+        assert_eq!(recovered.servers.len(), 2);
+        assert!(recovered.servers.iter().any(|server| server.name == "fresh"));
+
+        for candidate in [&path, &bak, &sequence_path, &generation] {
+            std::fs::remove_file(candidate).ok();
         }
     }
 

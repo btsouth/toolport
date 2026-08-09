@@ -4491,6 +4491,9 @@ mod tests {
         assert!(arg_looks_secret("Authorization: Bearer sk-live-secret"));
         assert!(arg_looks_secret("authorization:Basic Zm9vOmJhcg=="));
         assert!(arg_looks_secret("Bearer sk-live-secret"));
+        assert!(arg_looks_secret("Basic dXNlcjpwYXNz"));
+        assert!(arg_looks_secret("Digest username=admin,response=secret"));
+        assert!(arg_looks_secret("Proxy-Authorization: Basic dXNlcjpwYXNz"));
         // Legitimate args must NOT be redacted.
         assert!(!arg_looks_secret("-y"));
         assert!(!arg_looks_secret("@modelcontextprotocol/server-postgres"));
