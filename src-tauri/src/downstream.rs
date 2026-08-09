@@ -1172,6 +1172,28 @@ pub fn bearer_header(token: &str) -> String {
     }
 }
 
+/// Resolve a bare command against an explicit `;`-separated PATH and PATHEXT.
+/// Directories are the outer loop and extensions the inner one, so a hit in an
+/// earlier PATH entry beats an earlier PATHEXT extension in a later entry —
+/// which is what Windows itself does.
+///
+/// Split out from [`resolve_command`] so the precedence rule is testable against
+/// known stub files instead of against whatever the developer happens to have
+/// installed, and without mutating the process-wide PATH that every other test
+/// (and any process they spawn) is reading concurrently (#651).
+#[cfg(windows)]
+fn resolve_bare_in(path: &str, pathext: &str, command: &str) -> Option<String> {
+    for dir in path.split(';').filter(|d| !d.is_empty()) {
+        for ext in pathext.split(';').filter(|e| !e.is_empty()) {
+            let candidate = Path::new(dir).join(format!("{command}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
 /// Resolve a bare command to a concrete executable.
 ///
 /// On Windows, Node tooling lives in `.cmd` shims (`npx` is really `npx.cmd`),
@@ -1184,17 +1206,10 @@ pub fn resolve_command(command: &str) -> String {
         return command.to_string();
     }
     let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(';').filter(|d| !d.is_empty()) {
-            for ext in exts.split(';').filter(|e| !e.is_empty()) {
-                let candidate = Path::new(dir).join(format!("{command}{ext}"));
-                if candidate.is_file() {
-                    return candidate.to_string_lossy().into_owned();
-                }
-            }
-        }
-    }
-    command.to_string()
+    let Ok(path) = std::env::var("PATH") else {
+        return command.to_string();
+    };
+    resolve_bare_in(&path, &exts, command).unwrap_or_else(|| command.to_string())
 }
 
 /// A PATH that includes the user's real shell PATH plus common install dirs.
@@ -6922,12 +6937,77 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn resolves_bare_command_via_pathext() {
-        // `cmd` is always on PATH on Windows; it should resolve to a real file.
-        let resolved = resolve_command("cmd");
-        assert!(
-            resolved.to_lowercase().ends_with("cmd.exe"),
-            "expected cmd.exe, got {resolved}"
+        // Hermetic on purpose. This used to resolve the real `cmd` and assert it
+        // ended in `cmd.exe`, which fails on any machine carrying a `cmd.CMD` in
+        // an earlier PATH entry (npm's global bin directory is a common one).
+        // That resolution is CORRECT — `.CMD` is in PATHEXT and the earlier
+        // directory legitimately wins — so the test was over-specified rather
+        // than the resolver wrong. Assert the rule against known stubs instead
+        // of against whatever is installed (#651).
+        use super::resolve_bare_in;
+
+        let root = std::env::temp_dir().join(format!(
+            "toolport-pathext-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let stub = |dir: &std::path::Path, name: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, b"stub").unwrap();
+            p
+        };
+
+        let path = format!("{};{}", first.display(), second.display());
+
+        // PATH order beats PATHEXT order: `.EXE` sorts before `.CMD` in PATHEXT,
+        // but `second` is searched only after `first` has no candidate at all.
+        let early_cmd = stub(&first, "tool.CMD");
+        stub(&second, "tool.EXE");
+        assert_eq!(
+            resolve_bare_in(&path, ".COM;.EXE;.BAT;.CMD", "tool").as_deref(),
+            Some(early_cmd.to_string_lossy().as_ref()),
+            "an earlier PATH entry wins even with a later-ranked extension"
         );
+
+        // Within one directory, PATHEXT order decides.
+        let both_exe = stub(&first, "both.EXE");
+        stub(&first, "both.CMD");
+        assert_eq!(
+            resolve_bare_in(&path, ".COM;.EXE;.BAT;.CMD", "both").as_deref(),
+            Some(both_exe.to_string_lossy().as_ref()),
+            "PATHEXT order decides within a single directory"
+        );
+        // ... and reordering PATHEXT reorders the result, so the precedence is
+        // really coming from PATHEXT and not from directory enumeration order.
+        assert!(
+            resolve_bare_in(&path, ".CMD;.EXE", "both")
+                .unwrap()
+                .to_lowercase()
+                .ends_with("both.cmd"),
+            "PATHEXT is honored in the order given"
+        );
+
+        // Empty PATH/PATHEXT segments are skipped, not joined as "".
+        assert_eq!(
+            resolve_bare_in(&format!(";{path};"), ";.EXE;", "both").as_deref(),
+            Some(both_exe.to_string_lossy().as_ref())
+        );
+
+        // No candidate anywhere: the caller falls back to the bare command.
+        assert_eq!(resolve_bare_in(&path, ".EXE;.CMD", "absent"), None);
+        assert_eq!(resolve_command("toolport-definitely-not-installed"), "toolport-definitely-not-installed");
+
+        // An explicit extension or a path separator is passed through untouched,
+        // so PATH is never consulted for it.
+        assert_eq!(resolve_command("node.exe"), "node.exe");
+        assert_eq!(resolve_command(r"C:\tools\node"), r"C:\tools\node");
+        assert_eq!(resolve_command("tools/node"), "tools/node");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
