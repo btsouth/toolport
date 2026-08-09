@@ -1150,6 +1150,10 @@ fn run_script_tool_def() -> Value {
                     "type": "object",
                     "additionalProperties": true,
                     "description": "Optional input object exposed to the script as the global `data`."
+                },
+                "validate": {
+                    "type": "boolean",
+                    "description": "Dry run: compile the script, resolve every tool name against your scope, and return the plan of calls it WOULD make, executing NONE of them. Cheap way to check a draft before it commits side effects. Validation calls return an empty result envelope, so a script that branches on returned data stops early - `complete: false` means the plan is partial, not that the script is broken."
                 }
             },
             "required": ["script"],
@@ -4374,6 +4378,102 @@ fn script_catalog_tools(
     names
 }
 
+/// Dry-run a code-mode script: compile it, bind the same client-scoped `servers.*`
+/// surface, enforce the same limits, and record the calls it WOULD make — without
+/// executing any of them. Catches the large static class of mistakes (syntax
+/// errors, unknown or out-of-scope tool names) before a draft commits side
+/// effects (#647).
+///
+/// Unlike the executed-call ledger (#646), the recorded plan DOES include
+/// arguments, and the difference is principled rather than inconsistent. Here
+/// nothing downstream ever runs, so a recorded argument can only have come from
+/// the script or the `data` the agent itself passed in. No downstream payload
+/// can reach the plan, so echoing it back discloses nothing the caller did not
+/// already have.
+///
+/// Not a security control. Code mode is explicitly not a security boundary, and
+/// a dry run cannot predict a script whose calls depend on real returned data —
+/// which is what `complete` reports.
+fn validate_script_dispatch(
+    script: &str,
+    data: Value,
+    cached: &[Value],
+    allowed: Option<&std::collections::HashSet<String>>,
+    client: Option<&str>,
+) -> Value {
+    let plan = Arc::new(Mutex::new(Vec::<Value>::new()));
+
+    let recorder = Arc::clone(&plan);
+    let call: codemode::CallBinding = Arc::new(move |name: &str, args: Value| {
+        let mut plan = recorder.lock().unwrap_or_else(|e| e.into_inner());
+        let index = plan.len();
+        plan.push(json!({ "index": index, "name": name, "args": args }));
+        // Shaped like a real MCP tool result so ordinary envelope access
+        // (`r.content`, `r.isError`) keeps working. Anything deeper is
+        // undefined, which is exactly where a data-dependent script diverges —
+        // reported as `complete: false` rather than passed off as a clean run.
+        json!({ "content": [], "structuredContent": {}, "isError": false })
+    });
+
+    // Stubbed rather than absent: an unbound fetchResult fails closed, which
+    // would report a validation failure for a script that pages results
+    // perfectly correctly.
+    let fetch: codemode::FetchBinding =
+        Arc::new(|_args: codemode::FetchArgs| json!({ "content": [], "isError": false }));
+
+    let catalog = script_catalog_tools(cached, allowed);
+    let outcome = codemode::run_script(
+        script,
+        data,
+        call,
+        Some(fetch),
+        codemode::Limits::default(),
+        &catalog,
+    );
+
+    // No `savings::record_orchestration` here: a dry run replaced no round-trips,
+    // and counting it would inflate the savings the real feature is measured by.
+
+    let plan = plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let planned = plan.len();
+
+    let mut result = match outcome.error {
+        Some(err) => json!({
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "Toolport code mode: validation FAILED. Nothing was executed. {planned} call(s) \
+                     planned before it stopped, so the plan below is PARTIAL. Either the script has a \
+                     real defect, or it branched on a value a dry run cannot supply — validation calls \
+                     return an empty result envelope, so reading fields off a result diverges here. \
+                     Error: {err}"
+                )
+            }],
+            "isError": true,
+            "structuredContent": { "toolportValidate": { "ok": false, "complete": false, "planned": planned, "plan": plan, "error": err } }
+        }),
+        None => json!({
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "Toolport code mode: validation passed. The script compiled, every tool name \
+                     resolved in your scope, and it ran to completion against stubbed results. \
+                     {planned} call(s) planned, none executed."
+                )
+            }],
+            "isError": false,
+            "structuredContent": { "toolportValidate": { "ok": true, "complete": true, "planned": planned, "plan": plan } }
+        }),
+    };
+
+    let (budget, warning) = shaping::budget();
+    if let Some(msg) = warning {
+        eprintln!("{msg}");
+    }
+    shaping::shape_result(&mut result, budget, client);
+    result
+}
+
 /// Dispatch a `toolport_run_script` "code mode" call: run the agent's script in the boa
 /// sandbox with a `toolport.call()` binding that re-enters [`execute_call`] for each
 /// downstream call, so every call passes the identical scope + approval gates a direct call
@@ -4408,6 +4508,17 @@ fn run_script_dispatch(
         }
     };
     let data = arguments.get("data").cloned().unwrap_or_else(|| json!({}));
+
+    // Dry run: same compile, same scoped `servers.*` surface, same limits, but a
+    // call binding that records instead of executing. Branch before the real
+    // binding is built so there is no path from here to `execute_call` (#647).
+    if arguments
+        .get("validate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return validate_script_dispatch(&script, data, cached, allowed, client);
+    }
 
     // Owned handles so the sandbox's call binding can be `'static`. Each toolport.call()
     // re-enters execute_call with these, applying the identical scope + approval gates a
@@ -13094,6 +13205,106 @@ mod tests {
         let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
         assert_eq!(result["isError"].as_bool(), Some(true));
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], false);
+    }
+
+    /// #647: the whole point. Nothing downstream may execute.
+    ///
+    /// That is guaranteed structurally rather than by this assertion:
+    /// `validate_script_dispatch` takes no router and no registry, so there is
+    /// no path from it to `execute_call` — the dispatch branches to it before
+    /// the executing binding is built. This test covers the plan's shape.
+    #[test]
+    fn validate_plans_calls_without_executing_any_of_them() {
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        let args = json!({
+            "validate": true,
+            "script": "toolport.call('s__tool', { id: 1 }); toolport.call('s__tool', { id: 2 }); return 'done';"
+        });
+        let result =
+            run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+
+        assert_eq!(result["isError"].as_bool(), Some(false));
+        let validate = &result["structuredContent"]["toolportValidate"];
+        assert_eq!(validate["ok"], true);
+        assert_eq!(validate["complete"], true);
+        assert_eq!(validate["planned"], 2);
+        assert_eq!(validate["plan"][0]["name"], "s__tool");
+        assert_eq!(validate["plan"][0]["args"]["id"], 1);
+        assert_eq!(validate["plan"][1]["args"]["id"], 2);
+        assert_eq!(validate["plan"][1]["index"], 1);
+        // A dry run replaced no round-trips, so it must not report a ledger.
+        assert!(result["structuredContent"]["toolportScript"].is_null());
+    }
+
+    #[test]
+    fn validate_reports_a_syntax_error_without_a_plan() {
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        let args = json!({ "validate": true, "script": "this is not valid javascript )(" });
+        let result =
+            run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+
+        assert_eq!(result["isError"].as_bool(), Some(true));
+        let validate = &result["structuredContent"]["toolportValidate"];
+        assert_eq!(validate["ok"], false);
+        assert_eq!(validate["complete"], false);
+        assert_eq!(validate["planned"], 0);
+    }
+
+    /// A dry run that stops early must say so. Reporting a partial plan as if it
+    /// were the whole plan is the failure mode that makes validation worse than
+    /// no validation.
+    #[test]
+    fn validate_marks_a_partial_plan_incomplete_when_the_script_branches_on_a_result() {
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        // Stubbed calls return an empty envelope, so `.rows.length` throws.
+        let args = json!({
+            "validate": true,
+            "script": "var r = toolport.call('s__tool', {}); return r.structuredContent.rows.length;"
+        });
+        let result =
+            run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+
+        assert_eq!(result["isError"].as_bool(), Some(true));
+        let validate = &result["structuredContent"]["toolportValidate"];
+        assert_eq!(validate["complete"], false);
+        assert_eq!(validate["planned"], 1, "the call before the divergence is planned");
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("PARTIAL") && text.contains("branched on a value"),
+            "the message must not let a partial plan read as a clean run; got: {text}"
+        );
+    }
+
+    /// Validation binds the same scoped catalog, so an out-of-scope server is a
+    /// validation failure rather than something discovered at execution time.
+    #[test]
+    fn validate_rejects_a_tool_outside_the_client_scope() {
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        let catalog = vec![json!({ "name": "s__tool", "description": "d", "inputSchema": {} })];
+        let args = json!({
+            "validate": true,
+            "script": "return servers.nope.missing({});"
+        });
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &catalog,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
+
+        assert_eq!(result["isError"].as_bool(), Some(true));
+        assert_eq!(
+            result["structuredContent"]["toolportValidate"]["ok"],
+            false
+        );
     }
 
     /// #646 regression, found by CodeRabbit on the original PR. `shape_result`
