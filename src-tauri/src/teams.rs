@@ -2484,6 +2484,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn team_server_export_redacts_authorization_args() {
+        let mut reg = base_registry();
+        let server = reg
+            .servers
+            .iter_mut()
+            .find(|s| s.id == "mine")
+            .expect("fixture server");
+        server.args = vec![
+            "--header".into(),
+            "Authorization: Bearer team-secret".into(),
+        ];
+
+        let exported = team_server_export(&reg);
+        let serialized = serde_json::to_string(&exported).unwrap();
+        assert!(!serialized.contains("team-secret"), "secret leaked: {serialized}");
+        assert!(serialized.contains("<redacted>"));
+    }
+
     /// A server with no block, or a blank client id, must not be treated as
     /// configured: that would send every connect down the headless path and fail
     /// with "no client secret vaulted".

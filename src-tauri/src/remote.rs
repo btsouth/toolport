@@ -508,7 +508,7 @@ fn require_secure_for_auth(url: &str) -> Result<(), String> {
         return Ok(());
     }
     let host = oauth::host_of_url(url).unwrap_or_default();
-    if oauth::host_is_private(&host) {
+    if oauth::host_is_definitely_private(&host) {
         return Ok(());
     }
     Err(format!(
@@ -912,6 +912,10 @@ mod tests {
         // Loopback / private over http is acceptable (local dev).
         assert!(require_secure_for_auth("http://127.0.0.1:8080/mcp").is_ok());
         assert!(require_secure_for_auth("http://192.168.1.10/mcp").is_ok());
+        // An unresolvable host is not positively local. The refusal-side
+        // predicate treats this as private, but that must never grant permission
+        // to put a saved token on a cleartext connection.
+        assert!(require_secure_for_auth("http://no-such-host-633.invalid/mcp").is_err());
     }
 
     #[test]

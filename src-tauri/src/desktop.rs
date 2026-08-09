@@ -4488,6 +4488,9 @@ mod tests {
         assert!(arg_looks_secret("--dsn=postgres://u:p@h/db"));
         assert!(arg_looks_secret("PASSWORD=hunter2"));
         assert!(arg_looks_secret("Authorization: token=abc123"));
+        assert!(arg_looks_secret("Authorization: Bearer sk-live-secret"));
+        assert!(arg_looks_secret("authorization:Basic Zm9vOmJhcg=="));
+        assert!(arg_looks_secret("Bearer sk-live-secret"));
         // Legitimate args must NOT be redacted.
         assert!(!arg_looks_secret("-y"));
         assert!(!arg_looks_secret("@modelcontextprotocol/server-postgres"));
@@ -4504,6 +4507,7 @@ mod tests {
                 "-y".into(),
                 "@modelcontextprotocol/server-postgres".into(),
                 "postgresql://admin:hunter2@db.example.com:5432/app".into(),
+                "Authorization: Bearer sk-live-secret".into(),
             ],
             env: vec![],
             url: None,
@@ -4517,11 +4521,13 @@ mod tests {
         let serialized = serde_json::to_string(&doc).unwrap();
         // The password must never appear in a shared setup.
         assert!(!serialized.contains("hunter2"));
+        assert!(!serialized.contains("sk-live-secret"));
         let args = doc["servers"][0]["args"].as_array().unwrap();
         // Benign args are kept; only the credential-bearing one is redacted.
         assert_eq!(args[0], "-y");
         assert_eq!(args[1], "@modelcontextprotocol/server-postgres");
         assert_eq!(args[2], "<redacted>");
+        assert_eq!(args[3], "<redacted>");
     }
 
     #[test]

@@ -431,10 +431,17 @@ fn for_each_result_text(result: &mut Value, f: &mut impl FnMut(&mut String)) {
             let Some(item) = item.as_object_mut() else {
                 continue;
             };
-            // `messages[].content` nests one level further.
-            if let Some(Value::Object(nested)) = item.get_mut("content") {
-                if let Some(Value::String(text)) = nested.get_mut("text") {
-                    f(text);
+            // `messages[].content` may be either a bare string or a nested text
+            // object. Both are model-facing MCP prompt shapes.
+            if let Some(content) = item.get_mut("content") {
+                match content {
+                    Value::String(text) => f(text),
+                    Value::Object(nested) => {
+                        if let Some(Value::String(text)) = nested.get_mut("text") {
+                            f(text);
+                        }
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -745,6 +752,24 @@ mod tests {
         );
         // Same value, same token, across both shapes.
         assert_eq!(m.rehydrate("⟦EMAIL_1⟧"), "ada@example.com");
+    }
+
+    #[test]
+    fn result_walk_covers_bare_string_prompt_messages() {
+        let mut m = map();
+        let mut result = serde_json::json!({
+            "messages": [
+                { "role": "user", "content": "contact ada@example.com" },
+                { "role": "assistant", "content": { "type": "text", "text": "backup grace@example.com" } }
+            ]
+        });
+        let out = pseudonymize_result(&mut m, &mut result);
+        assert_eq!(out.replaced, 2);
+        assert_eq!(result["messages"][0]["content"], "contact ⟦EMAIL_1⟧");
+        assert_eq!(
+            result["messages"][1]["content"]["text"],
+            "backup ⟦EMAIL_2⟧"
+        );
     }
 
     /// A rename must never overwrite a sibling that already holds the target key.

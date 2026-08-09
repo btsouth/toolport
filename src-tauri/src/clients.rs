@@ -3386,7 +3386,28 @@ fn yaml_extensions_mut(root: &mut serde_yaml::Value) -> &mut serde_yaml::Mapping
 fn write_yaml_extensions(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
     let mut root = read_existing_yaml(path)?;
     let exts = yaml_extensions_mut(&mut root);
-    exts.clear();
+    // Replace only definitions Toolport can actually import as MCP servers.
+    // Goose builtins/platform extensions and unknown shapes share this map but
+    // have no inventory representation, so clearing the map silently deletes
+    // functionality during migration.
+    exts.retain(|_, definition| {
+        let Some(mapping) = definition.as_mapping() else {
+            return true;
+        };
+        let extension_type = mapping.get("type").and_then(|value| value.as_str());
+        if matches!(extension_type, Some("builtin" | "platform")) {
+            return true;
+        }
+        let has_command = mapping
+            .get("cmd")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.is_empty());
+        let has_url = mapping
+            .get("url")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.is_empty());
+        !has_command && !has_url
+    });
     for s in servers {
         exts.insert(
             serde_yaml::Value::String(s.name.clone()),
@@ -7386,6 +7407,31 @@ command = "npx"
         }
         .is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn goose_inventory_write_preserves_non_mcp_extensions() {
+        let path = temp_path("goose-preserve-builtins.yaml");
+        std::fs::write(
+            &path,
+            "GOOSE_MODEL: gpt-4o\nextensions:\n  developer:\n    type: builtin\n    enabled: true\n  platform-tools:\n    type: platform\n    cmd: internal\n  future-shape:\n    enabled: true\n  fetch:\n    type: stdio\n    cmd: uvx\n    args: [mcp-server-fetch]\n",
+        )
+        .unwrap();
+
+        let gateway = sample_gateway(None, "goose");
+        write_yaml_extensions(&path, &[gateway]).unwrap();
+
+        let root: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["GOOSE_MODEL"].as_str(), Some("gpt-4o"));
+        let extensions = root["extensions"].as_mapping().unwrap();
+        assert!(extensions.get("developer").is_some());
+        assert!(extensions.get("platform-tools").is_some());
+        assert!(extensions.get("future-shape").is_some());
+        assert!(extensions.get("fetch").is_none());
+        assert!(extensions.get(GATEWAY_ENTRY_NAME).is_some());
+
         std::fs::remove_file(&path).ok();
     }
 

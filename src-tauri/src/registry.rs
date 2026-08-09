@@ -1725,17 +1725,27 @@ fn write_backup_generation(path: &Path, content: &str) {
     }
 }
 
-/// Recover the registry from the backups `save_to` maintains, newest-first: the
-/// single `.bak` (the last-known-good fast path), then the rolling journal
-/// generations from newest to oldest. Returns the first that parses (and
+/// Recover the registry from the backups `save_to` maintains, newest-first by
+/// filesystem modification time across both `.bak` and rolling generations.
+/// Returns the first that parses (and
 /// best-effort rewrites the primary from it so a later read self-heals), or None
 /// when nothing usable remains. Walking the journal means one stale or corrupt
 /// `.bak` no longer strands recovery when fresher snapshots exist.
 fn restore_from_backup(path: &Path) -> Option<Registry> {
     let mut candidates = vec![backup_path(path)];
-    let mut gens = backup_generations(path);
-    gens.reverse(); // newest generation first
-    candidates.extend(gens);
+    candidates.extend(backup_generations(path));
+    candidates.sort_by(|a, b| {
+        let modified = |candidate: &Path| {
+            std::fs::metadata(candidate)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::UNIX_EPOCH)
+        };
+        // On coarse-timestamp filesystems, prefer a journal generation over the
+        // single .bak on a tie: save_to writes the generation after .bak.
+        modified(b)
+            .cmp(&modified(a))
+            .then_with(|| b.as_os_str().len().cmp(&a.as_os_str().len()))
+    });
 
     for candidate in candidates {
         let Ok(content) = std::fs::read_to_string(&candidate) else {
@@ -2047,12 +2057,28 @@ pub fn load_resolved() -> Result<Registry, String> {
 /// Biased toward over-redacting: for a share, a false positive is harmless.
 pub(crate) fn arg_looks_secret(arg: &str) -> bool {
     let lower = arg.to_ascii_lowercase();
+    let trimmed = lower.trim();
     const NEEDLES: [&str; 8] = [
         "password=", "pwd=", "token=", "apikey=", "api_key=", "secret=", "accountkey=",
         "access_key",
     ];
     if NEEDLES.iter().any(|n| lower.contains(n)) {
         return true;
+    }
+    // Common remote-MCP launchers pass an HTTP auth header as one argument.
+    // It has no key=value marker, but sharing it would disclose the credential.
+    if let Some(value) = trimmed.strip_prefix("authorization:") {
+        let value = value.trim_start();
+        if value.starts_with("bearer") || value.starts_with("basic") {
+            return true;
+        }
+    }
+    // Some launchers split the header name and value into separate arguments.
+    // Catch the credential-bearing value even when "Authorization:" is adjacent.
+    if let Some(value) = trimmed.strip_prefix("bearer") {
+        if value.chars().next().is_some_and(char::is_whitespace) && !value.trim().is_empty() {
+            return true;
+        }
     }
     // A connection URI with embedded userinfo: scheme://user:pass@host/...
     if let Some((_, rest)) = arg.split_once("://") {
@@ -3316,6 +3342,46 @@ mod tests {
         std::fs::remove_file(backup_path(&path)).ok();
         for g in backup_generations(&path) {
             std::fs::remove_file(g).ok();
+        }
+    }
+
+    #[test]
+    fn recovery_prefers_a_fresher_journal_over_a_stale_parseable_bak() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "conduit-reg-recover-freshest-{}.json",
+            std::process::id()
+        ));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(backup_path(&path)).ok();
+        for generation in backup_generations(&path) {
+            std::fs::remove_file(generation).ok();
+        }
+
+        let mut stale = Registry::default();
+        stale.add_server(sample_server("stale"));
+        std::fs::write(backup_path(&path), serde_json::to_string(&stale).unwrap()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let mut fresh = stale.clone();
+        fresh.add_server(sample_server("fresh"));
+        let mut generation_name = path.as_os_str().to_owned();
+        generation_name.push(".bak.9999999999999");
+        std::fs::write(
+            PathBuf::from(generation_name),
+            serde_json::to_string(&fresh).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&path, "{ corrupt").unwrap();
+
+        let recovered = load_from(&path).unwrap();
+        assert_eq!(recovered.servers.len(), 2);
+        assert!(recovered.servers.iter().any(|server| server.name == "fresh"));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(backup_path(&path)).ok();
+        for generation in backup_generations(&path) {
+            std::fs::remove_file(generation).ok();
         }
     }
 

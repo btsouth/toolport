@@ -140,10 +140,9 @@ mod platform {
     /// Builds a dictionary with `kSecClass=kSecClassGenericPassword`,
     /// `kSecAttrService`, `kSecAttrAccount`, `kSecValueData`,
     /// `kSecUseDataProtectionKeychain=true`, `kSecAttrAccessGroup=<shared group>`,
-    /// and `kSecAttrAccessible=kSecAttrAccessibleAfterFirstUnlock`. A
-    /// `SecItemDelete` with the SAME query keys (incl. the access group + the
-    /// data-protection flag) runs first for idempotency, then `SecItemAdd` creates
-    /// a fresh item.
+    /// and `kSecAttrAccessible=kSecAttrAccessibleAfterFirstUnlock`. Existing
+    /// items are replaced with `SecItemUpdate`; `SecItemAdd` is used only when
+    /// the account does not exist, so a failed update cannot destroy the old value.
     ///
     /// The high-level `security_framework::passwords` API targets the *legacy*
     /// keychain and cannot set the access group or the data-protection flag, so
@@ -193,7 +192,7 @@ mod platform {
                 access_ref: *mut *mut c_void,
             ) -> i32;
             fn SecItemAdd(attributes: *const c_void, result: *mut *const c_void) -> i32;
-            fn SecItemDelete(query: *const c_void) -> i32;
+            fn SecItemUpdate(query: *const c_void, attributes: *const c_void) -> i32;
             static kSecClass: CFTypeRef;
             static kSecClassGenericPassword: CFTypeRef;
             static kSecAttrService: CFTypeRef;
@@ -260,18 +259,33 @@ mod platform {
         let service_cf = CFString::new(SERVICE).as_CFType();
         let account_cf = CFString::new(account_str).as_CFType();
 
-        // 2. Remove any existing item for this account (SecItemAdd rejects dups).
-        let del = CFDictionary::from_CFType_pairs(&[
+        // 2. Update in place when the master key already exists. A failed update
+        // leaves the previous value intact; delete-then-add could destroy the only
+        // key capable of decrypting the file backend.
+        let query = CFDictionary::from_CFType_pairs(&[
             (k_class.clone(), k_generic.clone()),
             (k_service.clone(), service_cf.clone()),
             (k_account.clone(), account_cf.clone()),
         ]);
-        unsafe {
-            SecItemDelete(del.as_concrete_TypeRef() as *const c_void);
+        let data_cf = CFData::from_buffer(value.as_bytes()).as_CFType();
+        let update = CFDictionary::from_CFType_pairs(&[
+            (k_value.clone(), data_cf.clone()),
+            (k_access.clone(), access_cf.clone()),
+        ]);
+        let update_status = unsafe {
+            SecItemUpdate(
+                query.as_concrete_TypeRef() as *const c_void,
+                update.as_concrete_TypeRef() as *const c_void,
+            )
+        };
+        if update_status == 0 {
+            return Ok(());
+        }
+        if update_status != -25300 {
+            return Err(format!("SecItemUpdate with shared access failed: {update_status}"));
         }
 
-        // 3. Add the item WITH the shared-access ACL, atomically (no prompt).
-        let data_cf = CFData::from_buffer(value.as_bytes()).as_CFType();
+        // 3. No prior item: add it WITH the shared-access ACL atomically.
         let add = CFDictionary::from_CFType_pairs(&[
             (k_class, k_generic),
             (k_service, service_cf),
@@ -334,6 +348,7 @@ mod platform {
             fn SecItemAdd(attributes: *const c_void, result: *mut *const c_void) -> i32;
             fn SecItemCopyMatching(query: *const c_void, result: *mut *const c_void) -> i32;
             fn SecItemDelete(query: *const c_void) -> i32;
+            fn SecItemUpdate(query: *const c_void, attributes: *const c_void) -> i32;
 
             static kSecClass: CFTypeRef;
             static kSecClassGenericPassword: CFTypeRef;
@@ -375,22 +390,36 @@ mod platform {
             }
         }
 
-        /// `SecItemDelete` for idempotency, then `SecItemAdd`. Returns Err on any
-        /// non-success add status (notably -34018 `errSecMissingEntitlement` on an
-        /// unsigned build).
+        /// Update an existing item in place, or add it when absent. A failed
+        /// replacement never deletes the previous value.
         pub fn set(account_str: &str, value: &str) -> Result<(), String> {
-            // 1. Delete any existing item (same keys incl. access group + DP flag).
-            let del = CFDictionary::from_CFType_pairs(&base_query(account_str));
-            unsafe {
-                SecItemDelete(del.as_concrete_TypeRef() as *const c_void);
+            let query = CFDictionary::from_CFType_pairs(&base_query(account_str));
+            let value_data = CFData::from_buffer(value.as_bytes()).as_CFType();
+            let update = CFDictionary::from_CFType_pairs(&[
+                (k(unsafe { kSecValueData }), value_data.clone()),
+                (
+                    k(unsafe { kSecAttrAccessible }),
+                    k(unsafe { kSecAttrAccessibleAfterFirstUnlock }),
+                ),
+            ]);
+            let update_status = unsafe {
+                SecItemUpdate(
+                    query.as_concrete_TypeRef() as *const c_void,
+                    update.as_concrete_TypeRef() as *const c_void,
+                )
+            };
+            if update_status == 0 {
+                return Ok(());
+            }
+            if update_status != ERR_SEC_ITEM_NOT_FOUND {
+                return Err(format!(
+                    "SecItemUpdate (data-protection keychain) failed: {update_status}"
+                ));
             }
 
-            // 2. Add the fresh item with the value + accessibility class.
+            // No prior item: add the fresh value + accessibility class.
             let mut pairs = base_query(account_str);
-            pairs.push((
-                k(unsafe { kSecValueData }),
-                CFData::from_buffer(value.as_bytes()).as_CFType(),
-            ));
+            pairs.push((k(unsafe { kSecValueData }), value_data));
             pairs.push((
                 k(unsafe { kSecAttrAccessible }),
                 k(unsafe { kSecAttrAccessibleAfterFirstUnlock }),
@@ -1118,6 +1147,43 @@ mod tests {
     /// races with a sibling that assumes the keychain path, causing spurious
     /// failures under the default multi-threaded test runner.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn macos_secret_replacement_never_deletes_before_writing() {
+        // This source-contract test runs on Windows/Linux CI even though the
+        // Security.framework implementation is only compiled on macOS. It
+        // protects the data-loss invariant: both replacement paths must update
+        // an existing item in place and reserve SecItemAdd for a missing item.
+        let source = include_str!("secrets.rs");
+
+        let legacy_start = source
+            .find("fn add_with_shared_access(")
+            .expect("legacy keychain writer must exist");
+        let legacy_end = source[legacy_start..]
+            .find("pub fn seed_legacy_for_test")
+            .map(|offset| legacy_start + offset)
+            .expect("legacy writer must end before its test helper");
+        let legacy_writer = &source[legacy_start..legacy_end];
+
+        let dpk_module_start = source
+            .find("mod dpk {")
+            .expect("data-protection keychain module must exist");
+        let dpk_set_start = source[dpk_module_start..]
+            .find("pub fn set(")
+            .map(|offset| dpk_module_start + offset)
+            .expect("data-protection keychain writer must exist");
+        let dpk_set_end = source[dpk_set_start..]
+            .find("pub fn get(")
+            .map(|offset| dpk_set_start + offset)
+            .expect("data-protection writer must end before its reader");
+        let dpk_writer = &source[dpk_set_start..dpk_set_end];
+
+        for writer in [legacy_writer, dpk_writer] {
+            assert!(writer.contains("SecItemUpdate("));
+            assert!(writer.contains("SecItemAdd("));
+            assert!(!writer.contains("SecItemDelete("));
+        }
+    }
 
     #[test]
     fn server_secrets_cannot_use_the_internal_task_key_namespace() {

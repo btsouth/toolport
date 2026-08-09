@@ -4073,8 +4073,7 @@ fn execute_call(
     // mid-session still has tokens sitting in the model's context, and skipping
     // this would dispatch a literal `⟦EMAIL_1⟧` as the recipient. `rehydrate_args`
     // is already a no-op on an empty map.
-    let mut arguments = arguments;
-    with_pii_session(client, |map| pii::rehydrate_args(map, &mut arguments));
+    let arguments = rehydrate_for_downstream(client, arguments);
 
     let started = Instant::now();
     let effective_mrtr = routed_mrtr.as_ref().or(mrtr);
@@ -4246,6 +4245,16 @@ fn with_pii_session<T>(client: Option<&str>, f: impl FnOnce(&mut pii::SessionMap
         .entry(client.unwrap_or(PII_LOCAL_SESSION).to_string())
         .or_insert_with(pii::SessionMap::new);
     f(map)
+}
+
+/// Resolve pseudonyms on the owned dispatch copy only.
+///
+/// Callers must retain the original tokenized value for every model-facing or
+/// persisted preflight surface (HITL, destructive confirmation, inspect and
+/// audit hashing), and invoke this only at the final downstream boundary.
+fn rehydrate_for_downstream(client: Option<&str>, mut arguments: Value) -> Value {
+    with_pii_session(client, |map| pii::rehydrate_args(map, &mut arguments));
+    arguments
 }
 
 /// Pseudonymize a result's text blocks in place, returning how many values were
@@ -11936,6 +11945,21 @@ mod tests {
         assert_eq!(fmt_tokens(999_950), "1.0M");
         assert_eq!(fmt_tokens(1_000_000), "1.0M");
         assert_eq!(fmt_tokens(1_250_000), "1.2M");
+    }
+
+    #[test]
+    fn downstream_rehydration_does_not_mutate_model_facing_arguments() {
+        let client = Some("pii-placement-regression");
+        let token = with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("ada@example.com").text
+        });
+        let model_facing = json!({ "to": token });
+
+        let downstream = rehydrate_for_downstream(client, model_facing.clone());
+
+        assert_eq!(model_facing["to"], "⟦EMAIL_1⟧");
+        assert_eq!(downstream["to"], "ada@example.com");
     }
 
     #[test]

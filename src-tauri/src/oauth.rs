@@ -1175,6 +1175,10 @@ pub fn refresh(
     resource: Option<&str>,
     block_private: bool,
 ) -> Result<Tokens, String> {
+    // Refresh tokens are long-lived credentials. Re-check the endpoint at this
+    // public boundary so legacy vaulted state and direct callers cannot bypass
+    // the TLS rule enforced during discovery.
+    require_https(token_endpoint, "token endpoint")?;
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
@@ -2632,6 +2636,21 @@ mod tests {
             "s3cret",
             ClientAuthMethod::ClientSecretBasic,
             None,
+            None,
+            true,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a cleartext token endpoint must be refused"),
+        };
+        assert!(err.contains("must use https"), "{err}");
+    }
+
+    #[test]
+    fn refresh_refuses_a_cleartext_public_token_endpoint() {
+        let err = match refresh(
+            "http://auth.example.com/token",
+            "client",
+            "refresh-token-value",
             None,
             true,
         ) {
