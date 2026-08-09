@@ -4266,6 +4266,19 @@ fn pii_sessions() -> &'static Mutex<HashMap<String, pii::SessionMap>> {
 /// NUL so it cannot collide with a real client id.
 const PII_LOCAL_SESSION: &str = "\0local";
 
+/// The spelling of a server id used as a PII origin.
+///
+/// Origins are compared by string equality, so every mint and rehydrate path has to
+/// agree on one form. They did not: `execute_call` works in `sanitize_segment` space
+/// (`my-crm` -> `my_crm`) while the resources and prompts paths carry the raw
+/// registry id, so a value read from a resource was refused when the model passed it
+/// to a tool on the SAME hyphenated server. Normalizing here rather than at each call
+/// site means a new mint path cannot reintroduce the split; re-sanitizing an
+/// already-sanitized id is a no-op.
+fn pii_origin_id(server: &str) -> String {
+    sanitize_segment(server)
+}
+
 /// Forget everything mapped for one client.
 ///
 /// Called on MCP session teardown and on a fresh `initialize`. Without it "session"
@@ -4316,8 +4329,9 @@ fn rehydrate_for_downstream(
     server: &str,
     mut arguments: Value,
 ) -> Result<Value, String> {
+    let origin = pii_origin_id(server);
     let refused = with_pii_session(client, |map| {
-        pii::rehydrate_args(map, server, &mut arguments)
+        pii::rehydrate_args(map, &origin, &mut arguments)
     });
     if !refused.is_empty() {
         let list = refused.into_iter().collect::<Vec<_>>().join(", ");
@@ -4354,13 +4368,14 @@ fn rehydrate_mrtr_for_downstream(
         return Ok(None);
     }
     let mut out = mrtr.clone();
+    let origin = pii_origin_id(server);
     let mut refused = std::collections::BTreeSet::new();
     with_pii_session(client, |map| {
         for field in [&mut out.input_responses, &mut out.request_state]
             .into_iter()
             .flatten()
         {
-            refused.extend(pii::rehydrate_args(map, server, field));
+            refused.extend(pii::rehydrate_args(map, &origin, field));
         }
     });
     if !refused.is_empty() {
@@ -4403,7 +4418,8 @@ fn rehydrated_for_local_approver(
         return arguments.clone();
     }
     let mut copy = arguments.clone();
-    let _ = with_pii_session(client, |map| pii::rehydrate_args(map, server, &mut copy));
+    let origin = pii_origin_id(server);
+    let _ = with_pii_session(client, |map| pii::rehydrate_args(map, &origin, &mut copy));
     copy
 }
 
@@ -4419,7 +4435,8 @@ fn pseudonymize_if_enabled(
     if !reg.pii_redaction_effective() {
         return 0;
     }
-    let out = with_pii_session(client, |map| pii::pseudonymize_result(map, server, result));
+    let origin = pii_origin_id(server);
+    let out = with_pii_session(client, |map| pii::pseudonymize_result(map, &origin, result));
     if !out.complete {
         eprintln!(
             "toolport: PII pseudonymization was incomplete for this result - some values reached the model in the clear (the session map is full, or the result exceeded the scan cap)."
@@ -4974,6 +4991,11 @@ fn handle_request_with_cancel(
             }),
         )),
         "initialize" => {
+            // Every transport, not just HTTP: a stdio client that re-handshakes on the
+            // same process would otherwise carry the previous conversation's pseudonym
+            // map forward (SBS-605). Idempotent, so the HTTP path clearing it earlier
+            // costs nothing.
+            clear_pii_session(client);
             let requested = req
                 .get("params")
                 .and_then(|p| p.get("protocolVersion"))
@@ -12191,6 +12213,39 @@ mod tests {
                 .expect("empty retry fields are not a failure")
                 .is_none(),
             "an empty MrtrRequest must keep the caller on the original borrow"
+        );
+    }
+
+    #[test]
+    fn a_resource_and_a_tool_on_one_server_share_an_origin_identity() {
+        // Tool results credit `sanitize_segment(server_id)`; resources and prompts
+        // credit the raw registry id. For any hyphenated server ("my-crm" -> "my_crm")
+        // those disagree, so a value read from a resource was refused when the model
+        // passed it to a tool on the SAME server. Origins are compared by string
+        // equality, so both mint paths have to agree on the spelling.
+        let client = Some("pii-origin-identity");
+        let mut reg = Registry::default();
+        reg.pii_redaction = true;
+
+        with_pii_session(client, |map| *map = pii::SessionMap::new());
+
+        // Mint the way the resources/prompts paths do: the raw id.
+        let mut result = json!({
+            "contents": [{ "type": "text", "text": "owner ada@example.com" }]
+        });
+        let replaced = pseudonymize_if_enabled(&reg, client, "my-crm", &mut result);
+        assert_eq!(replaced, 1, "the resource text should have been tokenized");
+
+        // Then dispatch the way execute_call does: the sanitized id.
+        let sanitized = sanitize_segment("my-crm");
+        assert_eq!(sanitized, "my_crm", "guard the premise of this test");
+        let args = json!({ "to": "⟦EMAIL_1⟧" });
+
+        let out = rehydrate_for_downstream(client, &sanitized, args)
+            .expect("a tool on the same server must get its own value back");
+        assert_eq!(
+            out["to"], "ada@example.com",
+            "resource-minted PII must resolve for a tool on the same server"
         );
     }
 
