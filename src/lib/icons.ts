@@ -41,10 +41,3 @@ export function pickIconSrc(icons?: McpIcon[] | null): string | null {
   }
   return null;
 }
-
-/** True when a server offered icons but none were usable, so the UI can stay silent
- * rather than showing a broken image. Kept separate from [`pickIconSrc`] so a caller
- * can tell "no icons" from "icons we refused". */
-export function hasUnusableIcons(icons?: McpIcon[] | null): boolean {
-  return Array.isArray(icons) && icons.length > 0 && pickIconSrc(icons) === null;
-}

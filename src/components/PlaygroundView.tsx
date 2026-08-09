@@ -1102,6 +1102,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
                     const selected = t.name === selectedTool;
                     const perToolOff = disabledSet.has(t.name);
                     const pinned = pinnedSet.has(t.name);
+                    const icon = pickIconSrc(t.icons);
                     return (
                       <div
                         key={t.name}
@@ -1117,9 +1118,9 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
                                 remote URL is a request to a server-chosen host on every
                                 paint, and the app's CSP blocks it anyway. Fixed box so a
                                 malformed or oddly-shaped icon cannot shift the row. */}
-                            {pickIconSrc(t.icons) && (
+                            {icon && (
                               <img
-                                src={pickIconSrc(t.icons) ?? undefined}
+                                src={icon}
                                 alt=""
                                 aria-hidden="true"
                                 className="size-4 shrink-0 rounded-sm object-contain"

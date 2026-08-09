@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hasUnusableIcons, pickIconSrc, type McpIcon } from "./icons";
+import { pickIconSrc, type McpIcon } from "./icons";
 
 const png = "data:image/png;base64,iVBORw0KGgo=";
 
@@ -64,14 +64,5 @@ describe("pickIconSrc (SBS-708 / SEP-973)", () => {
     expect(pickIconSrc([{} as McpIcon])).toBeNull();
     expect(pickIconSrc([{ src: 123 } as unknown as McpIcon])).toBeNull();
     expect(pickIconSrc("nope" as unknown as McpIcon[])).toBeNull();
-  });
-});
-
-describe("hasUnusableIcons", () => {
-  it("distinguishes no icons from icons we refused", () => {
-    expect(hasUnusableIcons(undefined)).toBe(false);
-    expect(hasUnusableIcons([])).toBe(false);
-    expect(hasUnusableIcons([{ src: png }])).toBe(false);
-    expect(hasUnusableIcons([{ src: "https://cdn.example.com/a.png" }])).toBe(true);
   });
 });
