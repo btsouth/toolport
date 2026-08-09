@@ -1153,7 +1153,7 @@ fn run_script_tool_def() -> Value {
                 },
                 "validate": {
                     "type": "boolean",
-                    "description": "Dry run: compile the script, resolve every tool name against your scope, and return the plan of calls it WOULD make, executing NONE of them. Cheap way to check a draft before it commits side effects. Validation calls return an empty result envelope, so a script that branches on returned data stops early - `complete: false` means the plan is partial, not that the script is broken."
+                    "description": "Dry run: compile the script, resolve every tool name against your scope, and return the plan of calls it WOULD make, executing NONE of them. Cheap way to check a draft before it commits side effects. Two limits worth knowing: arguments are NOT checked against each tool's inputSchema, and calls return an empty result envelope, so a script that branches on a result takes the stub's branch. `finished: true` means the run reached the end of the script, NOT that the plan is exhaustive."
                 }
             },
             "required": ["script"],
@@ -4391,9 +4391,17 @@ fn script_catalog_tools(
 /// can reach the plan, so echoing it back discloses nothing the caller did not
 /// already have.
 ///
-/// Not a security control. Code mode is explicitly not a security boundary, and
-/// a dry run cannot predict a script whose calls depend on real returned data —
-/// which is what `complete` reports.
+/// Not a security control. Code mode is explicitly not a security boundary.
+///
+/// What it does NOT catch, stated plainly because a validator that overclaims is
+/// worse than none:
+///
+/// * Argument shape. `execute_call` validates args against each tool's
+///   inputSchema; this does not, because the crate has no JSON Schema validator.
+///   `toolport.call("s__tool", {wrong: 1})` validates clean and fails for real.
+/// * Anything downstream of a branch on a call result. Stubs return an empty
+///   envelope, so `if (r.isError)` and friends take the stub's branch. `finished`
+///   reports that the run reached the end, NOT that the plan is exhaustive.
 fn validate_script_dispatch(
     script: &str,
     data: Value,
@@ -4401,17 +4409,28 @@ fn validate_script_dispatch(
     allowed: Option<&std::collections::HashSet<String>>,
     client: Option<&str>,
 ) -> Value {
+    let catalog = script_catalog_tools(cached, allowed);
+    // Resolution set for the recorder. The typed `servers.*` stubs are built from
+    // this same list, so they reject an unknown name on their own — but the
+    // string form (`toolport.call("s__tool")`) reaches the binding directly and
+    // would otherwise plan a name that `execute_call` will refuse, which is the
+    // exact class of mistake this feature exists to catch.
+    let in_scope: std::collections::HashSet<String> = catalog.iter().cloned().collect();
+
     let plan = Arc::new(Mutex::new(Vec::<Value>::new()));
 
     let recorder = Arc::clone(&plan);
     let call: codemode::CallBinding = Arc::new(move |name: &str, args: Value| {
+        let resolved = in_scope.contains(name);
         let mut plan = recorder.lock().unwrap_or_else(|e| e.into_inner());
         let index = plan.len();
-        plan.push(json!({ "index": index, "name": name, "args": args }));
+        plan.push(json!({ "index": index, "name": name, "args": args, "resolved": resolved }));
+        // Record and keep going rather than throwing on the first bad name: one
+        // dry run should surface every unresolved call, not just the earliest.
+        //
         // Shaped like a real MCP tool result so ordinary envelope access
         // (`r.content`, `r.isError`) keeps working. Anything deeper is
-        // undefined, which is exactly where a data-dependent script diverges —
-        // reported as `complete: false` rather than passed off as a clean run.
+        // undefined, which is where a data-dependent script diverges.
         json!({ "content": [], "structuredContent": {}, "isError": false })
     });
 
@@ -4421,7 +4440,6 @@ fn validate_script_dispatch(
     let fetch: codemode::FetchBinding =
         Arc::new(|_args: codemode::FetchArgs| json!({ "content": [], "isError": false }));
 
-    let catalog = script_catalog_tools(cached, allowed);
     let outcome = codemode::run_script(
         script,
         data,
@@ -4436,6 +4454,22 @@ fn validate_script_dispatch(
 
     let plan = plan.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let planned = plan.len();
+    let unresolved: Vec<&str> = plan
+        .iter()
+        .filter(|call| call["resolved"] == json!(false))
+        .filter_map(|call| call["name"].as_str())
+        .collect();
+
+    // `finished` is deliberately NOT called `complete`. It says only that the dry
+    // run reached the end of the script without throwing. It does NOT promise the
+    // plan matches a real run: a script that branches on a result — `if
+    // (r.isError)`, `r.content[0]?.text`, `while (page.hasMore)` — takes whatever
+    // branch the empty stub implies and finishes happily with a plan a real run
+    // would never produce. Naming that field `complete` would have implied an
+    // exhaustiveness this cannot deliver, which is the failure mode that makes a
+    // validator worse than none.
+    let finished = outcome.error.is_none();
+    let ok = finished && unresolved.is_empty();
 
     let mut result = match outcome.error {
         Some(err) => json!({
@@ -4450,19 +4484,36 @@ fn validate_script_dispatch(
                 )
             }],
             "isError": true,
-            "structuredContent": { "toolportValidate": { "ok": false, "complete": false, "planned": planned, "plan": plan, "error": err } }
+            "structuredContent": { "toolportValidate": { "ok": false, "finished": false, "planned": planned, "unresolved": unresolved, "plan": plan, "error": err } }
+        }),
+        None if !unresolved.is_empty() => json!({
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "Toolport code mode: validation FAILED. Nothing was executed. The script ran to \
+                     the end, but {} of {planned} planned call(s) name a tool that is not in your \
+                     scope and would be refused at execution: {}. Fix those names, or enable the \
+                     server, before running this script.",
+                    unresolved.len(),
+                    unresolved.join(", ")
+                )
+            }],
+            "isError": true,
+            "structuredContent": { "toolportValidate": { "ok": false, "finished": true, "planned": planned, "unresolved": unresolved, "plan": plan } }
         }),
         None => json!({
             "content": [{
                 "type": "text",
                 "text": format!(
                     "Toolport code mode: validation passed. The script compiled, every tool name \
-                     resolved in your scope, and it ran to completion against stubbed results. \
-                     {planned} call(s) planned, none executed."
+                     resolved in your scope, and it ran to the end against stubbed results. \
+                     {planned} call(s) planned, none executed. Two limits: arguments are NOT checked \
+                     against each tool's inputSchema, and a script that branches on a call result \
+                     took the stub's branch, so a real run may make different calls."
                 )
             }],
             "isError": false,
-            "structuredContent": { "toolportValidate": { "ok": true, "complete": true, "planned": planned, "plan": plan } }
+            "structuredContent": { "toolportValidate": { "ok": ok, "finished": true, "planned": planned, "unresolved": unresolved, "plan": plan } }
         }),
     };
 
@@ -13213,42 +13264,158 @@ mod tests {
     /// `validate_script_dispatch` takes no router and no registry, so there is
     /// no path from it to `execute_call` — the dispatch branches to it before
     /// the executing binding is built. This test covers the plan's shape.
+    /// The scoped catalog every validate test resolves names against.
+    fn validate_catalog() -> Vec<Value> {
+        vec![json!({ "name": "s__tool", "description": "d", "inputSchema": {} })]
+    }
+
     #[test]
     fn validate_plans_calls_without_executing_any_of_them() {
         let reg = Registry::default();
         let router = Arc::new(routed_router("s", "tool"));
+        let catalog = validate_catalog();
         let args = json!({
             "validate": true,
             "script": "toolport.call('s__tool', { id: 1 }); toolport.call('s__tool', { id: 2 }); return 'done';"
         });
         let result =
-            run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, &args, None);
 
         assert_eq!(result["isError"].as_bool(), Some(false));
         let validate = &result["structuredContent"]["toolportValidate"];
         assert_eq!(validate["ok"], true);
-        assert_eq!(validate["complete"], true);
+        assert_eq!(validate["finished"], true);
         assert_eq!(validate["planned"], 2);
         assert_eq!(validate["plan"][0]["name"], "s__tool");
         assert_eq!(validate["plan"][0]["args"]["id"], 1);
+        assert_eq!(validate["plan"][0]["resolved"], true);
         assert_eq!(validate["plan"][1]["args"]["id"], 2);
         assert_eq!(validate["plan"][1]["index"], 1);
         // A dry run replaced no round-trips, so it must not report a ledger.
         assert!(result["structuredContent"]["toolportScript"].is_null());
     }
 
+    /// CodeRev on #664: the typed `servers.*` stubs reject an unknown name on
+    /// their own, but the STRING form reaches the binding directly. Without a
+    /// scope check there, a dry run happily plans a call `execute_call` would
+    /// refuse — the exact mistake validation exists to catch.
     #[test]
-    fn validate_reports_a_syntax_error_without_a_plan() {
+    fn validate_fails_a_string_form_call_naming_an_out_of_scope_tool() {
         let reg = Registry::default();
         let router = Arc::new(routed_router("s", "tool"));
-        let args = json!({ "validate": true, "script": "this is not valid javascript )(" });
+        let catalog = validate_catalog();
+        let args = json!({
+            "validate": true,
+            "script": "toolport.call('s__tool', {}); toolport.call('s__missing', {}); return 'done';"
+        });
         let result =
-            run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, &args, None);
 
         assert_eq!(result["isError"].as_bool(), Some(true));
         let validate = &result["structuredContent"]["toolportValidate"];
         assert_eq!(validate["ok"], false);
-        assert_eq!(validate["complete"], false);
+        // The run reached the end; the failure is the name, not a throw.
+        assert_eq!(validate["finished"], true);
+        assert_eq!(validate["unresolved"][0], "s__missing");
+        assert_eq!(validate["plan"][0]["resolved"], true);
+        assert_eq!(validate["plan"][1]["resolved"], false);
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("s__missing"), "name the offender; got: {text}");
+    }
+
+    /// One dry run should surface EVERY bad name, not stop at the first.
+    #[test]
+    fn validate_reports_all_unresolved_names_not_just_the_first() {
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        let catalog = validate_catalog();
+        let args = json!({
+            "validate": true,
+            "script": "toolport.call('a__one', {}); toolport.call('b__two', {}); return 'done';"
+        });
+        let result =
+            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, &args, None);
+
+        let unresolved = &result["structuredContent"]["toolportValidate"]["unresolved"];
+        assert_eq!(unresolved.as_array().map(Vec::len), Some(2));
+        assert_eq!(unresolved[0], "a__one");
+        assert_eq!(unresolved[1], "b__two");
+    }
+
+    /// CodeRev on #664: `finished: true` must NOT be read as "the plan is
+    /// exhaustive". A script that guards its access to a stub result never
+    /// throws, so it finishes — with a plan a real run would not produce. This
+    /// pins the honest semantics; the field is named `finished`, not `complete`,
+    /// for exactly this reason.
+    #[test]
+    fn validate_finishing_does_not_mean_the_plan_matches_a_real_run() {
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        let catalog = validate_catalog();
+        // Real results would have `isError: false` too, but a real `rows` array
+        // would send this down the other branch and plan a second call.
+        let args = json!({
+            "validate": true,
+            "script": "var r = toolport.call('s__tool', {}); if (r.structuredContent.rows) { toolport.call('s__tool', { follow: true }); } return 'done';"
+        });
+        let result =
+            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, &args, None);
+
+        let validate = &result["structuredContent"]["toolportValidate"];
+        assert_eq!(validate["finished"], true, "the guarded read never throws");
+        assert_eq!(validate["planned"], 1, "the stub took the empty branch");
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("branches on a call result") || text.contains("took the stub's branch"),
+            "a finished run must still warn the plan may not match; got: {text}"
+        );
+    }
+
+    /// CodeRev on #664, pinning a KNOWN limit rather than a bug: `execute_call`
+    /// validates arguments against the tool's inputSchema, and this does not
+    /// (the crate has no JSON Schema validator). Bad args validate clean. If that
+    /// ever changes, this test should fail and be updated deliberately.
+    #[test]
+    fn validate_does_not_check_arguments_against_the_input_schema() {
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        let catalog = vec![json!({
+            "name": "s__tool",
+            "description": "d",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "integer" } },
+                "required": ["id"]
+            }
+        })];
+        let args = json!({
+            "validate": true,
+            "script": "toolport.call('s__tool', { totally: 'wrong' }); return 'done';"
+        });
+        let result =
+            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, &args, None);
+
+        assert_eq!(result["structuredContent"]["toolportValidate"]["ok"], true);
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("NOT checked against"),
+            "the limit must be stated so a pass is not over-read; got: {text}"
+        );
+    }
+
+    #[test]
+    fn validate_reports_a_syntax_error_without_a_plan() {
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        let catalog = validate_catalog();
+        let args = json!({ "validate": true, "script": "this is not valid javascript )(" });
+        let result =
+            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, &args, None);
+
+        assert_eq!(result["isError"].as_bool(), Some(true));
+        let validate = &result["structuredContent"]["toolportValidate"];
+        assert_eq!(validate["ok"], false);
+        assert_eq!(validate["finished"], false);
         assert_eq!(validate["planned"], 0);
     }
 
@@ -13264,12 +13431,20 @@ mod tests {
             "validate": true,
             "script": "var r = toolport.call('s__tool', {}); return r.structuredContent.rows.length;"
         });
-        let result =
-            run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &validate_catalog(),
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
 
         assert_eq!(result["isError"].as_bool(), Some(true));
         let validate = &result["structuredContent"]["toolportValidate"];
-        assert_eq!(validate["complete"], false);
+        assert_eq!(validate["finished"], false);
         assert_eq!(validate["planned"], 1, "the call before the divergence is planned");
         let text = result["content"][0]["text"].as_str().unwrap_or_default();
         assert!(
