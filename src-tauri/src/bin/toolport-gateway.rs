@@ -4493,11 +4493,27 @@ fn run_script_dispatch(
         savings::record_orchestration((outcome.calls - 1) as u64);
     }
 
+    // The ledger of calls that actually ran, surfaced on the failure path only.
+    // On success the agent already has the value it asked for, and code mode
+    // exists to keep intermediate detail out of context; on failure this is the
+    // difference between resuming and re-running every side effect (#646).
+    let progress: Vec<Value> = outcome
+        .progress
+        .iter()
+        .map(|call| json!({ "name": call.name, "ok": call.ok }))
+        .collect();
+
     let mut result = match outcome.error {
         Some(err) => json!({
-            "content": [{ "type": "text", "text": format!("Toolport code mode: the script failed: {err}") }],
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "Toolport code mode: the script failed after {} completed call(s): {err}",
+                    progress.len()
+                )
+            }],
             "isError": true,
-            "structuredContent": { "toolportScript": { "ok": false, "calls": outcome.calls, "error": err } }
+            "structuredContent": { "toolportScript": { "ok": false, "calls": outcome.calls, "progress": progress, "error": err } }
         }),
         None => {
             // One aggregated value; the intermediate call results stayed out of context.

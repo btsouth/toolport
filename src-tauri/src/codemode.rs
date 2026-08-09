@@ -211,6 +211,16 @@ impl JobExecutor for BoundedJobExecutor {
     }
 }
 
+/// One downstream tool call that actually reached the host binding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallRecord {
+    /// Exposed tool name (`server__tool`) as the script asked for it.
+    pub name: String,
+    /// False when the downstream result carried `isError: true`. A recorded call
+    /// ran either way — `ok` says how it ended, not whether it happened.
+    pub ok: bool,
+}
+
 /// The outcome of running a script.
 #[derive(Debug, Clone)]
 pub struct ScriptOutcome {
@@ -220,9 +230,31 @@ pub struct ScriptOutcome {
     /// How many host tool invocations the script actually made — used to account
     /// round-trips saved (calls - 1) and to report fan-out.
     pub calls: usize,
+    /// Every downstream call that reached the host binding, in execution order
+    /// (batch order within a parallel `callAsync` flush).
+    ///
+    /// Distinct from `calls` in two ways, both deliberate. `calls` counts a call
+    /// when it is ISSUED, so queued `callAsync` work that never ran — a flush
+    /// that hits the wall-clock deadline abandons its batch — is still counted;
+    /// this list only holds calls whose side effects have actually committed.
+    /// And `fetchResult` counts against `calls` but is absent here, because
+    /// paging a cached result commits nothing downstream.
+    ///
+    /// The point is recovery: a script that dies on call 40 of 64 can tell the
+    /// agent what it already did, instead of forcing a re-run that repeats every
+    /// one of those side effects (#646).
+    pub progress: Vec<CallRecord>,
     /// `Some(message)` if the script threw, hit a limit, or failed to compile. Fail-closed:
     /// the caller surfaces this to the agent as an error result.
     pub error: Option<String>,
+}
+
+/// True unless the downstream result carried `isError: true`.
+fn result_ok(result: &Value) -> bool {
+    !result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// One deferred `callAsync` waiting for host execution + promise settlement.
@@ -258,6 +290,10 @@ struct HostState {
     call: CallBinding,
     /// Shared with the run so the count survives after the closure is moved into boa.
     calls_made: Rc<Cell<usize>>,
+    /// Ledger of calls that actually executed, shared with the run the same way
+    /// `calls_made` is. Appended after the host binding returns, never before, so
+    /// it records committed work rather than intent (#646).
+    executed: Rc<RefCell<Vec<CallRecord>>>,
     max_calls: usize,
     max_parallel: usize,
     deadline: Instant,
@@ -287,6 +323,7 @@ impl Clone for HostState {
         Self {
             call: Arc::clone(&self.call),
             calls_made: Rc::clone(&self.calls_made),
+            executed: Rc::clone(&self.executed),
             max_calls: self.max_calls,
             max_parallel: self.max_parallel,
             deadline: self.deadline,
@@ -306,7 +343,8 @@ impl Finalize for HostState {
 }
 
 // SAFETY: only the `ResolvingFunctions` inside `pending` point into the boa heap. The
-// `call` Arc, counters, and deadline are ordinary Rust-owned data. While a native call
+// `call` Arc, counters, the `executed` ledger (plain Rust strings/bools), and the
+// deadline are ordinary Rust-owned data, so tracing skips them. While a native call
 // holds `pending` mutably, GC is not expected to re-enter; `try_borrow` fails closed by
 // skipping the queue for that mark pass (queue entries stay reachable via the promise
 // resolvers already rooted as live JS objects).
@@ -548,6 +586,7 @@ pub fn run_script(
     catalog: &[String],
 ) -> ScriptOutcome {
     let calls_made = Rc::new(Cell::new(0usize));
+    let executed = Rc::new(RefCell::new(Vec::new()));
     let pending = Rc::new(RefCell::new(VecDeque::new()));
     let deadline = Instant::now() + limits.wall_clock;
     let executor = Rc::new(BoundedJobExecutor::new(deadline, limits.max_promise_jobs));
@@ -557,6 +596,7 @@ pub fn run_script(
             return ScriptOutcome {
                 value: json!(null),
                 calls: 0,
+                progress: Vec::new(),
                 error: Some(format!("toolport code mode: failed to create JS context: {e}")),
             };
         }
@@ -573,6 +613,7 @@ pub fn run_script(
     let state = HostState {
         call,
         calls_made: calls_made.clone(),
+        executed: executed.clone(),
         max_calls: limits.max_calls,
         max_parallel: limits.max_parallel.max(1),
         deadline,
@@ -585,6 +626,12 @@ pub fn run_script(
             let (name, parsed) = parse_call_args(args);
             state.calls_made.set(state.calls_made.get() + 1);
             let result = (state.call)(&name, parsed);
+            // After the binding returns: the side effect has committed, so the
+            // ledger reflects work actually done (#646).
+            state.executed.borrow_mut().push(CallRecord {
+                name,
+                ok: result_ok(&result),
+            });
             let result_str = serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string());
             Ok(JsValue::from(js_string!(result_str)))
         },
@@ -609,12 +656,12 @@ pub fn run_script(
 
     if let Err(e) = context.register_global_callable(js_string!("__toolport_call"), 2, sync_native)
     {
-        return fail(calls_made.get(), e);
+        return fail(calls_made.get(), executed.take(), e);
     }
     if let Err(e) =
         context.register_global_callable(js_string!("__toolport_call_async"), 2, async_native)
     {
-        return fail(calls_made.get(), e);
+        return fail(calls_made.get(), executed.take(), e);
     }
 
     // Fetch binding: pages shaped results by cursor. Absent binding fails closed.
@@ -677,7 +724,7 @@ pub fn run_script(
     if let Err(e) =
         context.register_global_callable(js_string!("__toolport_fetch_result"), 1, fetch_native)
     {
-        return fail(calls_made.get(), e);
+        return fail(calls_made.get(), executed.take(), e);
     }
 
     // Inject `data` as a global before the prelude/script run.
@@ -686,36 +733,37 @@ pub fn run_script(
             if let Err(e) =
                 context.register_global_property(js_string!("data"), v, Attribute::all())
             {
-                return fail(calls_made.get(), e);
+                return fail(calls_made.get(), executed.take(), e);
             }
         }
-        Err(e) => return fail(calls_made.get(), e),
+        Err(e) => return fail(calls_made.get(), executed.take(), e),
     }
 
     if let Err(e) = context.eval(Source::from_bytes(PRELUDE)) {
-        return fail(calls_made.get(), e);
+        return fail(calls_made.get(), executed.take(), e);
     }
 
     // Typed `servers.*` surface from the scoped catalog (after toolport bindings exist).
     let servers_js = build_servers_prelude(catalog);
     if let Err(e) = context.eval(Source::from_bytes(servers_js.as_bytes())) {
-        return fail(calls_made.get(), e);
+        return fail(calls_made.get(), executed.take(), e);
     }
 
     // Async IIFE: top-level `return` and `await` both work; the result is always a Promise.
     let wrapped = format!("(async function () {{\n{script}\n}})()");
     let top = match context.eval(Source::from_bytes(wrapped.as_bytes())) {
         Ok(v) => v,
-        Err(e) => return fail(calls_made.get(), e),
+        Err(e) => return fail(calls_made.get(), executed.take(), e),
     };
 
     match drive_to_completion(&mut context, &state, top) {
         Ok(value) => ScriptOutcome {
             value,
             calls: calls_made.get(),
+            progress: executed.take(),
             error: None,
         },
-        Err(e) => fail(calls_made.get(), e),
+        Err(e) => fail(calls_made.get(), executed.take(), e),
     }
 }
 
@@ -837,6 +885,20 @@ fn flush_pending_host_calls(context: &mut Context, state: &HostState) -> Result<
             .collect();
         let results = run_calls_parallel(&state.call, names_args);
 
+        // Record before resolving the promises: these calls have already run, and
+        // a resolver that throws must not lose the fact that they did (#646).
+        // `run_calls_parallel` preserves input order, so the ledger stays in batch
+        // order rather than completion order.
+        {
+            let mut executed = state.executed.borrow_mut();
+            for (pending_call, result) in batch.iter().zip(results.iter()) {
+                executed.push(CallRecord {
+                    name: pending_call.name.clone(),
+                    ok: result_ok(result),
+                });
+            }
+        }
+
         for (pending_call, result) in batch.into_iter().zip(results.into_iter()) {
             let result_str =
                 serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string());
@@ -909,10 +971,11 @@ fn run_calls_parallel(call: &CallBinding, items: Vec<(String, Value)>) -> Vec<Va
 /// runtime-limit errors (loop/recursion caps) panic when converted to an opaque JS value,
 /// and `Display` yields a usable message (`Uncaught Error: ...`, `RuntimeLimit: ...`) for
 /// every error kind.
-fn fail(calls: usize, err: JsError) -> ScriptOutcome {
+fn fail(calls: usize, progress: Vec<CallRecord>, err: JsError) -> ScriptOutcome {
     ScriptOutcome {
         value: json!(null),
         calls,
+        progress,
         error: Some(err.to_string()),
     }
 }
@@ -936,6 +999,138 @@ mod tests {
 
     fn run(script: &str, data: Value, call: CallBinding, limits: Limits) -> ScriptOutcome {
         run_script(script, data, call, None, limits, &[])
+    }
+
+    /// Names in `outcome.progress`, for terse assertions.
+    fn progress_names(out: &ScriptOutcome) -> Vec<&str> {
+        out.progress.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_failed_script_still_reports_the_calls_that_already_ran() {
+        // The point of #646: dying on call 3 must not erase calls 1 and 2, whose
+        // side effects have already committed downstream.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let script = r#"
+            toolport.call("first", {});
+            toolport.call("second", {});
+            throw new Error("boom");
+        "#;
+        let out = run(script, json!({}), recording_call(log), Limits::default());
+
+        assert!(out.error.is_some(), "script was supposed to throw");
+        assert_eq!(progress_names(&out), vec!["first", "second"]);
+        assert!(out.progress.iter().all(|c| c.ok));
+        assert_eq!(out.calls, 2);
+    }
+
+    #[test]
+    fn progress_marks_a_downstream_error_without_dropping_the_call() {
+        // `ok: false` means the call RAN and failed — it must still be listed,
+        // because a failed downstream call can still have committed a side effect.
+        let call: CallBinding = Arc::new(|name: &str, _: Value| {
+            if name == "bad" {
+                json!({ "content": [], "isError": true })
+            } else {
+                json!({ "content": [], "isError": false })
+            }
+        });
+        let script = r#"
+            toolport.call("good", {});
+            toolport.call("bad", {});
+            toolport.call("good", {});
+            return "done";
+        "#;
+        let out = run(script, json!({}), call, Limits::default());
+
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(progress_names(&out), vec!["good", "bad", "good"]);
+        assert_eq!(
+            out.progress.iter().map(|c| c.ok).collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
+    }
+
+    #[test]
+    fn progress_records_parallel_call_async_work_in_batch_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let script = r#"
+            var ps = [];
+            for (var i = 0; i < 4; i++) { ps.push(toolport.callAsync("fan" + i, {})); }
+            await Promise.all(ps);
+            throw new Error("after the fan-out");
+        "#;
+        let out = run(script, json!({}), recording_call(log), Limits::default());
+
+        assert!(out.error.is_some());
+        // run_calls_parallel preserves input order, so the ledger is deterministic
+        // even though the calls ran concurrently.
+        assert_eq!(
+            progress_names(&out),
+            vec!["fan0", "fan1", "fan2", "fan3"],
+            "parallel work is recorded in batch order"
+        );
+    }
+
+    #[test]
+    fn fetch_result_counts_against_the_budget_but_is_not_a_downstream_call() {
+        // fetchResult pages a cached result: it commits nothing downstream, so it
+        // must not appear in a ledger whose purpose is "what side effects landed".
+        let call = recording_call(Arc::new(Mutex::new(Vec::new())));
+        let fetch: FetchBinding = Arc::new(|_: FetchArgs| json!({ "page": 1 }));
+        let script = r#"
+            toolport.call("real", {});
+            toolport.fetchResult({ cursor: "c1", offset: 0, len: 1 });
+            return "done";
+        "#;
+        let out = run_script(script, json!({}), call, Some(fetch), Limits::default(), &[]);
+
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(progress_names(&out), vec!["real"]);
+        assert_eq!(out.calls, 2, "fetchResult still counts against max_calls");
+    }
+
+    #[test]
+    fn a_script_that_never_compiles_reports_no_progress() {
+        let call = recording_call(Arc::new(Mutex::new(Vec::new())));
+        let out = run("this is not ( valid javascript", json!({}), call, Limits::default());
+        assert!(out.error.is_some());
+        assert!(out.progress.is_empty());
+        assert_eq!(out.calls, 0);
+    }
+
+    #[test]
+    fn progress_is_populated_on_the_success_path_too() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let out = run(
+            "toolport.call('one', {}); return 'ok';",
+            json!({}),
+            recording_call(log),
+            Limits::default(),
+        );
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(progress_names(&out), vec!["one"]);
+    }
+
+    #[test]
+    fn a_budget_exhausted_script_reports_the_calls_it_got_through() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let limits = Limits {
+            max_calls: 2,
+            ..Limits::default()
+        };
+        let out = run(
+            "for (var i = 0; i < 10; i++) { toolport.call('t' + i, {}); } return 'done';",
+            json!({}),
+            recording_call(log),
+            limits,
+        );
+        assert!(out.error.is_some(), "budget should have aborted the script");
+        assert_eq!(
+            progress_names(&out),
+            vec!["t0", "t1"],
+            "the two calls that ran before the budget tripped are still reported"
+        );
     }
 
     #[test]
