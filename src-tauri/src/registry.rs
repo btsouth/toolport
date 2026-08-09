@@ -2146,6 +2146,43 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// One `secrets_generation` increment, retrying the way a real caller would.
+    ///
+    /// `lock_for` gives up after a bounded wait and returns "The registry is locked
+    /// by another Toolport process ...; try again." That is an expected outcome
+    /// under sustained contention, not a failure: every writer here holds the lock
+    /// across an fsync-ing `save_to`, so on a slow filesystem the queue can exceed
+    /// the acquisition deadline. Unwrapping it made the test assert "the lock is
+    /// always acquired within the deadline" on top of the property it actually
+    /// means to assert, which is "no update is lost" — and that is why it failed
+    /// under `cargo test --lib update_at_serializes_concurrent_writers` yet passed
+    /// in the full suite, where unrelated work spaced the writers out (#652).
+    ///
+    /// Only the contention error is retried; any other error still fails the test.
+    fn increment_with_retry(path: &Path) {
+        // Bound the retries by wall clock, not by a count: each attempt already
+        // spins inside `lock_for` for its own deadline, so a fixed attempt count
+        // would multiply out to minutes before the test admitted defeat.
+        let give_up_at = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match update_at(path, |r| {
+                r.secrets_generation += 1;
+                Ok(())
+            }) {
+                Ok(_) => return,
+                Err(e) if e.contains("is locked by another") => {
+                    assert!(
+                        std::time::Instant::now() < give_up_at,
+                        "registry lock stayed contended for 60s; this is a real hang, not scheduling"
+                    );
+                    // Let the current holder finish; `lock_for` already spun.
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("update_at failed for a reason other than contention: {e}"),
+            }
+        }
+    }
+
     #[test]
     fn update_at_serializes_concurrent_writers_with_no_lost_updates() {
         // The definitive lock check: many threads each read-increment-write via update_at.
@@ -2165,11 +2202,7 @@ mod tests {
                 let p = path.clone();
                 std::thread::spawn(move || {
                     for _ in 0..PER {
-                        update_at(&p, |r| {
-                            r.secrets_generation += 1;
-                            Ok(())
-                        })
-                        .unwrap();
+                        increment_with_retry(&p);
                     }
                 })
             })
