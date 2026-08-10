@@ -819,6 +819,30 @@ mod tests {
     }
 
     #[test]
+    fn shaping_preserves_is_error_on_oversized_failures() {
+        // A failure big enough to shape is still a failure. Dropping `isError` here
+        // would turn a downstream error into an apparent success for the model, and
+        // the marker must survive too so the failure detail stays pageable.
+        let mut r = json!({
+            "content": [{ "type": "text", "text": "boom: ".to_string() + &"e".repeat(10_000) }],
+            "isError": true
+        });
+        assert!(shape_result(&mut r, 2048, None));
+
+        // The JSON value itself, so a dropped or nulled field fails rather than
+        // silently reading as "not true".
+        assert_eq!(
+            r["isError"],
+            json!(true),
+            "shaped failure lost its isError flag: {}",
+            r
+        );
+        let text = r["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Toolport shaped this result"));
+        assert!(text.contains("\"cursor\":\"r"), "the failure must stay pageable");
+    }
+
+    #[test]
     fn fetch_result_projection_returns_nested_field() {
         let mut r = json!({
             "content": [{
