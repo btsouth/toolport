@@ -4609,8 +4609,14 @@ fn read_gateway_profile(client_id: &str) -> Option<String> {
 /// never be re-pointed onto a current binary. Deleting one out from under a plugin
 /// entry leaves a reference nothing will ever repair.
 pub fn referenced_gateway_paths() -> Option<Vec<PathBuf>> {
+    referenced_gateway_paths_in(&detect_clients())
+}
+
+/// The pure half of [`referenced_gateway_paths`], over an already-probed client list so
+/// the fail-closed and plugin-reference rules are testable without touching real configs.
+fn referenced_gateway_paths_in(clients: &[DetectedClient]) -> Option<Vec<PathBuf>> {
     let mut out: Vec<PathBuf> = Vec::new();
-    for client in detect_clients() {
+    for client in clients {
         if client.error.is_some() {
             return None;
         }
@@ -5785,6 +5791,103 @@ bad = "not-a-table"
             assert!(slot.get("env").is_none());
             std::fs::remove_file(&path).ok();
         }
+    }
+
+    /// A detected client with no servers, no error, and a config file present.
+    fn detected(id: &str) -> DetectedClient {
+        DetectedClient {
+            id: id.into(),
+            name: id.into(),
+            uses_connectors: false,
+            config_path: format!("/tmp/{id}.json"),
+            config_exists: true,
+            app_present: true,
+            servers: Vec::new(),
+            plugin_servers: Vec::new(),
+            gateway_installed: true,
+            entry_state: GatewayEntryState::Managed,
+            error: None,
+        }
+    }
+
+    fn gateway_server(name: &str, command: &str) -> McpServer {
+        McpServer {
+            name: name.into(),
+            transport: "stdio".into(),
+            command: Some(command.into()),
+            args: vec![],
+            env_keys: vec![],
+            url: None,
+        }
+    }
+
+    #[test]
+    fn referenced_gateway_paths_fails_closed_on_an_unreadable_client() {
+        // An unreadable config means that client's references are UNKNOWN, and an unknown
+        // reference must never be read as an absent one - the caller skips the whole prune.
+        let mut broken = detected("claude-desktop");
+        broken.error = Some("permission denied".into());
+        assert_eq!(referenced_gateway_paths_in(&[broken.clone()]), None);
+
+        // ...and it still fails closed alongside a client we CAN read, rather than
+        // handing back a partial list that would make the other binary look unreferenced.
+        let mut healthy = detected("cursor");
+        healthy.servers = vec![gateway_server(
+            GATEWAY_ENTRY_NAME,
+            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.5.exe",
+        )];
+        assert_eq!(
+            referenced_gateway_paths_in(&[healthy.clone(), broken.clone()]),
+            None,
+            "one unreadable client must veto the whole set, not yield a partial list"
+        );
+        assert_eq!(referenced_gateway_paths_in(&[broken, healthy]), None);
+    }
+
+    #[test]
+    fn referenced_gateway_paths_includes_plugin_and_customized_entries() {
+        let plugin_path = r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.8.0.exe";
+        // Plugin servers live outside the main config and can never be re-pointed, so a
+        // binary only they name must still survive the prune.
+        let mut plugin_only = detected("cursor");
+        plugin_only.plugin_servers = vec![gateway_server(GATEWAY_ENTRY_NAME, plugin_path)];
+        assert_eq!(
+            referenced_gateway_paths_in(&[plugin_only.clone()]),
+            Some(vec![PathBuf::from(plugin_path)])
+        );
+
+        // A customized entry (repoint leaves it alone) still names a binary the client
+        // will spawn, so it is included too.
+        let customized_path = r"C:\Users\me\custom\toolport-gateway-1.7.0.exe";
+        let mut customized = detected("windsurf");
+        customized.entry_state = GatewayEntryState::Customized;
+        customized.servers = vec![gateway_server(GATEWAY_ENTRY_NAME, customized_path)];
+        assert_eq!(
+            referenced_gateway_paths_in(&[customized.clone()]),
+            Some(vec![PathBuf::from(customized_path)])
+        );
+
+        // Both together, de-duplicated, and unrelated servers ignored.
+        let mut noise = detected("cline");
+        noise.servers = vec![gateway_server("github", "npx")];
+        let mut dupe = detected("claude-code");
+        dupe.servers = vec![gateway_server(GATEWAY_ENTRY_NAME, plugin_path)];
+        assert_eq!(
+            referenced_gateway_paths_in(&[plugin_only, customized, noise, dupe]),
+            Some(vec![
+                PathBuf::from(plugin_path),
+                PathBuf::from(customized_path),
+            ])
+        );
+    }
+
+    #[test]
+    fn referenced_gateway_paths_skips_clients_without_a_config() {
+        // No config file is a KNOWN-empty reference set, unlike an error: keep going.
+        let mut absent = detected("zed");
+        absent.config_exists = false;
+        absent.servers = vec![gateway_server(GATEWAY_ENTRY_NAME, "toolport-gateway-9.9.9")];
+        assert_eq!(referenced_gateway_paths_in(&[absent]), Some(vec![]));
     }
 
     #[test]
