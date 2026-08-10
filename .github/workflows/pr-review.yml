@@ -1,11 +1,10 @@
 # CodeRev shadow review.
 #
 # Runs alongside CodeRabbit rather than replacing it. CodeRev's benchmark
-# (four runs over ten recorded toolport-studio PRs; logs in the coderev repo)
-# proved cost (~$0.05/PR) and latency (~3 min) but not precision: that is
-# judged during this shadow phase by comparing its comments against
-# CodeRabbit's on real pull requests. Do not cancel CodeRabbit on the
-# strength of this file existing.
+# The Grok subscription canary changes generation only. DeepSeek keeps judging
+# the panel so generator quality can be measured independently before the
+# riskier panel swap. Keep rates and wall time come from run logs; do not scale
+# this workflow until they hold at 30-50% and under roughly five minutes.
 #
 # Advisory (continue-on-error): a red X on a model's opinion trains people to
 # ignore the check.
@@ -30,22 +29,19 @@ permissions:
 jobs:
   review:
     name: CodeRev (advisory)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, windows, toolport, grok]
     continue-on-error: true
     timeout-minutes: 20
-    # Reviews run for: same-repo branches, established contributors (GitHub
-    # flips author_association to CONTRIBUTOR when a first PR merges, so
-    # merging someone's first PR is what adds them to the known list), or any
-    # PR a maintainer explicitly labels 'coderev' (the first-timer approval
-    # act). pull_request_target supplies secrets and runs the BASE repo's
-    # workflow, so PR authors cannot tamper with this file; the checkout below
-    # pins the PR head and nothing in the pipeline executes workspace code.
+    # Public-repo boundary: only the owner's own same-repository branches may
+    # schedule a job on the local Grok runner. Forks, contributors, and labels
+    # never grant access to this machine. pull_request_target supplies secrets
+    # and runs the BASE repo's workflow; the checkout below pins the PR head
+    # and CodeRev treats its contents only as review evidence.
     if: >-
+      github.event.pull_request.user.login == 'tsouth89' &&
       github.actor != 'dependabot[bot]' &&
       github.event.pull_request.draft == false &&
-      (github.event.pull_request.head.repo.full_name == github.repository ||
-       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association) ||
-       contains(github.event.pull_request.labels.*.name, 'coderev'))
+      github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -61,8 +57,14 @@ jobs:
       - name: Review
         uses: tsouth89/coderev@main
         with:
-          api-key: ${{ secrets.REVIEW_API_KEY }}
-          # Dual-generator: inert until the REVIEW_FIND2_API_KEY secret exists.
+          provider: exec
+          model: grok-subscription
+          # Uses CodeRev's trusted action-owned wrapper, not PR-controlled code.
+          exec-command: grok
+          # Muse keeps the measured two-model recall diversity.
           find2-provider: meta
           find2-model: muse-spark-1.2-contributor
           find2-api-key: ${{ secrets.REVIEW_FIND2_API_KEY }}
+          # Phase one isolates Grok generation quality; DeepSeek remains the panel.
+          refute-provider: deepseek
+          refute-api-key: ${{ secrets.REVIEW_API_KEY }}
