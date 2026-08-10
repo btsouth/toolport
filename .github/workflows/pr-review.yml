@@ -38,8 +38,8 @@ jobs:
     # and runs the BASE repo's workflow; the checkout below pins the PR head
     # and CodeRev treats its contents only as review evidence.
     if: >-
-      github.event.pull_request.user.login == 'tsouth89' &&
-      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.user.login == github.repository_owner &&
+      github.actor == github.repository_owner &&
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository
     steps:
@@ -52,15 +52,15 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
-      # Tracks main during the shadow phase so reviewer fixes land without a
-      # release step. Pin to a tag once the shadow comparison earns it.
+      # Pin the reviewed action commit: mutable refs must not execute on a
+      # persistent self-hosted machine with repository secrets.
       - name: Review
-        uses: tsouth89/coderev@main
+        uses: tsouth89/coderev@4343c19eb746310259e13abfe5e3381c708385cf
         with:
           provider: exec
           model: grok-subscription
-          # Uses CodeRev's trusted action-owned wrapper, not PR-controlled code.
-          exec-command: grok
+          # Absolute path prevents the PR checkout from shadowing the CLI.
+          exec-command: 'C:\Users\tsout\.grok\bin\grok.exe'
           # Muse keeps the measured two-model recall diversity.
           find2-provider: meta
           find2-model: muse-spark-1.2-contributor
