@@ -1882,6 +1882,82 @@ mod tests {
         assert!(error.contains("empty authorization code"));
     }
 
+    /// Drive `wait_for_code` against a real loopback listener, feeding it the
+    /// given request targets one connection at a time.
+    ///
+    /// Each request is fully written and its response read to EOF before the next
+    /// connection opens, so the order `wait_for_code` sees is the order given here
+    /// and no test needs a sleep to synchronize.
+    fn callback_result(targets: &[&str], expected_state: &str) -> Result<String, String> {
+        use std::io::Write;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests: Vec<String> = targets.iter().map(|t| (*t).to_string()).collect();
+        let client = std::thread::spawn(move || {
+            for target in requests {
+                // `wait_for_code` may return before consuming every request (that is
+                // the point of some of these cases), so nothing here may block
+                // forever waiting for a reply that is never coming.
+                let Ok(mut stream) = std::net::TcpStream::connect(address) else {
+                    break;
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                if stream
+                    .write_all(format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes())
+                    .is_err()
+                {
+                    break;
+                }
+                // The server closes after replying, so this returns once the request
+                // has been handled - the handoff that keeps the ordering exact
+                // without a sleep.
+                let mut response = String::new();
+                let _ = stream.read_to_string(&mut response);
+            }
+        });
+
+        let result = wait_for_code(&listener, expected_state, "https://auth.example.com", false);
+        client.join().unwrap();
+        result
+    }
+
+    /// SBS-657: the `state` parameter is the only thing standing between the user
+    /// and an attacker-injected authorization code being redeemed against their
+    /// session, so a mismatch must abort rather than exchange the code.
+    #[test]
+    fn callback_rejects_a_code_carrying_the_wrong_state() {
+        let error = callback_result(&["/callback?code=attacker-code&state=wrong"], "expected")
+            .expect_err("a code arriving with the wrong state must not be redeemed");
+
+        assert!(
+            error.contains("state mismatch") && error.contains("CSRF"),
+            "the refusal has to name the reason: {error}"
+        );
+        assert!(
+            !error.contains("attacker-code"),
+            "the rejected code must not be echoed back: {error}"
+        );
+    }
+
+    /// A callback with no `state` at all is the same attack without the guesswork.
+    #[test]
+    fn callback_rejects_a_code_with_no_state_at_all() {
+        let error = callback_result(&["/callback?code=attacker-code"], "expected")
+            .expect_err("a missing state is not a matching state");
+        assert!(error.contains("state mismatch"), "{error}");
+    }
+
+    /// The happy path, so the callback suite is not failure-only: a matching state
+    /// and a non-empty code still complete the flow.
+    #[test]
+    fn callback_accepts_a_code_with_the_matching_state() {
+        let code = callback_result(&["/callback?code=good-code&state=expected"], "expected")
+            .expect("a matching state and a real code must complete the flow");
+        assert_eq!(code, "good-code");
+    }
+
     #[test]
     fn metadata_issuer_must_match_the_selected_authorization_server() {
         assert!(validate_metadata_issuer(
