@@ -55,12 +55,12 @@ jobs:
       # Pin the reviewed action commit: mutable refs must not execute on a
       # persistent self-hosted machine with repository secrets.
       - name: Review
-        uses: tsouth89/coderev@4343c19eb746310259e13abfe5e3381c708385cf
+        uses: tsouth89/coderev@8e991699725889f99b02f4f940e521de12144da5
         with:
           provider: exec
           model: grok-subscription
-          # Absolute path prevents the PR checkout from shadowing the CLI.
-          exec-command: 'C:\Users\tsout\.grok\bin\grok.exe'
+          # Activates CodeRev's pinned stdin-safe, one-turn Grok wrapper.
+          exec-command: grok
           # Muse keeps the measured two-model recall diversity.
           find2-provider: meta
           find2-model: muse-spark-1.2-contributor
