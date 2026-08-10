@@ -1245,31 +1245,13 @@ pub fn client_credentials_token(
     // `agent_no_redirect`: a 302 on a credential-bearing POST could hand the
     // client secret to a host named by an attacker-influenceable metadata
     // document. Same reasoning as the code exchange and refresh.
-    let request = agent_no_redirect(block_private).post(token_endpoint);
-    let response = match method {
-        ClientAuthMethod::ClientSecretBasic => {
-            // RFC 6749 §2.3.1: client_id and secret are form-urlencoded before
-            // base64, not sent raw. Skipping that corrupts any secret containing
-            // a `+`, `:` or `/`, which is common in generated credentials.
-            let credentials = format!(
-                "{}:{}",
-                urlencoding::encode(client_id),
-                urlencoding::encode(client_secret)
-            );
-            let header = format!(
-                "Basic {}",
-                base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes())
-            );
-            request.set("Authorization", &header).send_form(&form)
-        }
-        ClientAuthMethod::ClientSecretPost => {
-            let mut form = form.clone();
-            form.push(("client_id", client_id));
-            form.push(("client_secret", client_secret));
-            request.send_form(&form)
-        }
-        ClientAuthMethod::PrivateKeyJwt => unreachable!("rejected above"),
-    };
+    let mut request = agent_no_redirect(block_private).post(token_endpoint);
+    let authentication = client_authentication(method, client_id, client_secret);
+    if let Some(header) = &authentication.authorization {
+        request = request.set("Authorization", header);
+    }
+    form.extend_from_slice(&authentication.form_fields);
+    let response = request.send_form(&form);
 
     let resp: TokenResponse = response
         .map_err(|e| redact_secret(&e.to_string(), client_secret))?
@@ -1288,6 +1270,55 @@ pub fn client_credentials_token(
     // this flow is that re-authentication is cheap and non-interactive.
     tokens.refresh_token = None;
     Ok(tokens)
+}
+
+/// How the client proves its identity on a client-credentials token request:
+/// an `Authorization` header, extra form fields, or (per method) exactly one.
+struct ClientAuthentication<'a> {
+    authorization: Option<String>,
+    form_fields: Vec<(&'a str, &'a str)>,
+}
+
+/// Split out of [`client_credentials_token`] so the encoding rules are checkable
+/// without a network round trip: the credential encoding is the part that silently
+/// corrupts real secrets, and a live token endpoint is the worst possible place to
+/// discover that.
+fn client_authentication<'a>(
+    method: ClientAuthMethod,
+    client_id: &'a str,
+    client_secret: &'a str,
+) -> ClientAuthentication<'a> {
+    match method {
+        ClientAuthMethod::ClientSecretBasic => ClientAuthentication {
+            authorization: Some(client_secret_basic_header(client_id, client_secret)),
+            form_fields: Vec::new(),
+        },
+        // The secret rides in the body for this method, which is why the transport
+        // error path redacts it: it is quotable in a way the Basic header is not.
+        ClientAuthMethod::ClientSecretPost => ClientAuthentication {
+            authorization: None,
+            form_fields: vec![("client_id", client_id), ("client_secret", client_secret)],
+        },
+        ClientAuthMethod::PrivateKeyJwt => unreachable!("rejected above"),
+    }
+}
+
+/// Build the `client_secret_basic` credential header.
+///
+/// RFC 6749 §2.3.1: client_id and secret are form-urlencoded before base64, not
+/// sent raw. Skipping that corrupts any secret containing a `+`, `:` or `/`, which
+/// is common in generated credentials — and a `:` in the id would additionally
+/// move the field boundary the server splits on.
+fn client_secret_basic_header(client_id: &str, client_secret: &str) -> String {
+    let credentials = format!(
+        "{}:{}",
+        urlencoding::encode(client_id),
+        urlencoding::encode(client_secret)
+    );
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes())
+    )
 }
 
 /// Strip a credential out of text that is about to be surfaced or logged.
@@ -2675,6 +2706,78 @@ mod tests {
             Ok(_) => panic!("private_key_jwt must be refused before any request"),
         };
         assert!(err.contains("SBS-599"), "{err}");
+    }
+
+    /// Decode a `Basic <b64>` header back to the credential string the server sees.
+    fn decode_basic(header: &str) -> String {
+        let encoded = header
+            .strip_prefix("Basic ")
+            .unwrap_or_else(|| panic!("not a Basic header: {header}"));
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("a Basic header must be valid base64");
+        String::from_utf8(raw).expect("credentials are ASCII once encoded")
+    }
+
+    /// RFC 6749 §2.3.1. Generated secrets routinely contain `+`, `:` and `/`, and
+    /// sending the raw pair is the failure this encoding exists to prevent: a `:`
+    /// moves the field boundary the server splits on, and `+` decodes back to a
+    /// space at any server that form-decodes the halves.
+    #[test]
+    fn client_secret_basic_form_encodes_the_credential_pair() {
+        let header = client_secret_basic_header("client:id", "s+cr:et/1");
+
+        // Written out literally rather than via `urlencoding::encode`, which would
+        // just restate the implementation and pass for any encoding at all.
+        assert_eq!(decode_basic(&header), "client%3Aid:s%2Bcr%3Aet%2F1");
+        // The only unescaped `:` is the field separator RFC 6749 defines.
+        assert_eq!(decode_basic(&header).matches(':').count(), 1);
+        assert_ne!(
+            decode_basic(&header),
+            "client:id:s+cr:et/1",
+            "the raw pair must never be what the server receives"
+        );
+    }
+
+    /// Credentials with no reserved characters must survive untouched, or the
+    /// encoding would break the common case to fix the rare one.
+    #[test]
+    fn client_secret_basic_leaves_unreserved_credentials_alone() {
+        assert_eq!(
+            decode_basic(&client_secret_basic_header("client-abc", "s3cret_value.1~x")),
+            "client-abc:s3cret_value.1~x"
+        );
+    }
+
+    /// `client_secret_post` puts the secret in the body, not the header. If it ever
+    /// grew an Authorization header too, the secret would be sent twice and the
+    /// redaction in the error path would no longer cover every copy.
+    #[test]
+    fn client_secret_post_sends_the_secret_in_the_form_body_only() {
+        let auth = client_authentication(
+            ClientAuthMethod::ClientSecretPost,
+            "client:id",
+            "s+cr:et/1",
+        );
+
+        assert!(
+            auth.authorization.is_none(),
+            "client_secret_post must not also send a Basic header"
+        );
+        assert_eq!(
+            auth.form_fields,
+            vec![("client_id", "client:id"), ("client_secret", "s+cr:et/1")],
+            "form fields are urlencoded by the form encoder, so they ride verbatim"
+        );
+
+        // And the Basic method is the mirror image: header only, nothing in the body.
+        let basic =
+            client_authentication(ClientAuthMethod::ClientSecretBasic, "client:id", "s+cr:et/1");
+        assert!(basic.form_fields.is_empty(), "the secret must not ride twice");
+        assert_eq!(
+            basic.authorization.as_deref(),
+            Some(client_secret_basic_header("client:id", "s+cr:et/1").as_str())
+        );
     }
 
     /// A secret can appear in a transport error that quotes the request body.
