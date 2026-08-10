@@ -664,7 +664,7 @@ mod platform {
 #[path = "windows_keyring.rs"]
 mod platform;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 mod platform {
     use keyring::Entry;
 
@@ -1245,6 +1245,55 @@ mod tests {
         set_secret(&sid, key, &first).unwrap();
         delete_secret(&sid, key).unwrap();
         assert_eq!(get_secret_result(&sid, key).unwrap(), None);
+
+        let reserved = "toolport-chunked-v1:0123456789abcdef0123456789abcdef:1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        set_secret(&sid, key, reserved).unwrap();
+        assert_eq!(get_secret_result(&sid, key).unwrap().as_deref(), Some(reserved));
+
+        platform::set_raw_for_test(&sid, key, "toolport-chunked-v1:damaged").unwrap();
+        set_secret(&sid, key, "recovered after corrupt manifest").unwrap();
+        assert_eq!(
+            get_secret_result(&sid, key).unwrap().as_deref(),
+            Some("recovered after corrupt manifest")
+        );
+        delete_secret(&sid, key).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_chunk_reader_survives_concurrent_generation_swaps() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let sid = format!("toolport-windows-concurrent-secret-{unique}");
+        let key = "OAUTH_TOKEN";
+        let first = "a".repeat(4_000);
+        let second = "b".repeat(4_000);
+        set_secret(&sid, key, &first).unwrap();
+
+        let writer_sid = sid.clone();
+        let writer_first = first.clone();
+        let writer_second = second.clone();
+        let writer = std::thread::spawn(move || {
+            for index in 0..6 {
+                let value = if index % 2 == 0 {
+                    &writer_second
+                } else {
+                    &writer_first
+                };
+                set_secret(&writer_sid, key, value).unwrap();
+            }
+        });
+        for _ in 0..24 {
+            let value = get_secret_result(&sid, key)
+                .expect("a concurrent generation swap should be retried")
+                .expect("the base credential remains present during replacement");
+            assert!(value == first || value == second);
+        }
+        writer.join().unwrap();
+        delete_secret(&sid, key).unwrap();
     }
 
     /// Cross-platform: setting `CONDUIT_SECRET_KEY` activates the file backend.

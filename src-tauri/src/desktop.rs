@@ -44,6 +44,16 @@ struct OAuthFlowLock {
     attempt_id: String,
 }
 
+struct AuthMutationLock {
+    path: std::path::PathBuf,
+}
+
+impl Drop for AuthMutationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 impl Drop for OAuthFlowLock {
     fn drop(&mut self) {
         let completion = oauth_completion_path(&self.path, &self.attempt_id);
@@ -186,6 +196,78 @@ fn oauth_lock_path(server_id: &str, url: &str) -> Result<std::path::PathBuf, Str
     std::fs::create_dir_all(&locks)
         .map_err(|e| format!("could not create oauth lock directory: {e}"))?;
     Ok(locks.join(format!("{}.lock", oauth_lock_key(server_id, url))))
+}
+
+fn auth_mutation_lock_path(server_id: &str) -> Result<std::path::PathBuf, String> {
+    let dir = registry::conduit_dir().ok_or("could not resolve the data directory")?;
+    let locks = dir.join("oauth-locks");
+    std::fs::create_dir_all(&locks)
+        .map_err(|e| format!("could not create oauth lock directory: {e}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(server_id.as_bytes());
+    Ok(locks.join(format!("auth-write-{:x}.lock", hasher.finalize())))
+}
+
+fn try_acquire_auth_mutation_lock(
+    path: &std::path::Path,
+) -> Result<Option<AuthMutationLock>, String> {
+    let mutation_id = oauth_attempt_id();
+    let contents = format!(
+        "mutation_id={mutation_id}\npid={}\nstarted={}\nlease_secs={}\n",
+        std::process::id(),
+        now_unix_secs(),
+        OAUTH_LOCK_LEASE_SECS
+    );
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(contents.as_bytes())
+                .map_err(|e| format!("could not write auth mutation lock file: {e}"))?;
+            Ok(Some(AuthMutationLock {
+                path: path.to_path_buf(),
+            }))
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            let Some(observed) = read_oauth_lock_snapshot(path)? else {
+                return Ok(None);
+            };
+            if lock_snapshot_is_expired(&observed)
+                && try_replace_stale_lock(
+                    path,
+                    &observed,
+                    &contents,
+                    &mutation_id,
+                )?
+            {
+                return Ok(Some(AuthMutationLock {
+                    path: path.to_path_buf(),
+                }));
+            }
+            Ok(None)
+        }
+        Err(e) => Err(format!("could not create auth mutation lock file: {e}")),
+    }
+}
+
+fn acquire_auth_mutation_lock(server_id: &str) -> Result<AuthMutationLock, String> {
+    let path = auth_mutation_lock_path(server_id)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(OAUTH_LOCK_WAIT_SECS);
+    loop {
+        if let Some(lock) = try_acquire_auth_mutation_lock(&path)? {
+            return Ok(lock);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                "another Toolport process is updating credentials for this server; timed out waiting for it to finish"
+                    .to_string(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(OAUTH_LOCK_POLL_MS));
+    }
 }
 
 fn try_acquire_oauth_lock(path: &std::path::Path) -> Result<Option<OAuthFlowLock>, String> {
@@ -2531,6 +2613,7 @@ fn set_auth_token(
     server_id: String,
     token: String,
 ) -> Result<(), String> {
+    let _mutation = acquire_auth_mutation_lock(&server_id)?;
     // A manually pasted bearer replaces any prior OAuth session. Keeping stale
     // refresh metadata could otherwise overwrite the user's token later.
     remote::clear_oauth_state(&server_id)?;
@@ -2541,6 +2624,7 @@ fn set_auth_token(
 
 #[tauri::command]
 fn clear_auth_token(state: State<RegistryState>, server_id: String) -> Result<(), String> {
+    let _mutation = acquire_auth_mutation_lock(&server_id)?;
     // Remove refresh metadata first so a second-write failure cannot leave state
     // that silently recreates the bearer token the user asked to delete.
     remote::clear_oauth_state(&server_id)?;
@@ -2580,9 +2664,11 @@ async fn authenticate_oauth(
     let res = tauri::async_runtime::spawn_blocking(move || oauth::authenticate(&url))
         .await
         .map_err(|e| e.to_string())??;
-    let previous_access = secrets::get_secret_result(&server_id, secrets::HTTP_AUTH_KEY)?;
-    secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &res.access_token)?;
-    if let Err(state_error) = remote::store_oauth_state(
+    let _mutation = acquire_auth_mutation_lock(&server_id)?;
+    // Persist refresh metadata first. If the access-token write then fails, the
+    // next refresh still has the new state and can recover; the reverse order can
+    // strand a new access token beside an invalidated old refresh token.
+    remote::store_oauth_state(
         &server_id,
         Some(res.issuer),
         &res.token_endpoint,
@@ -2592,18 +2678,8 @@ async fn authenticate_oauth(
         res.scope,
         res.issued_at,
         res.expires_at,
-    ) {
-        let rollback = match previous_access {
-            Some(previous) => secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &previous),
-            None => secrets::delete_secret(&server_id, secrets::HTTP_AUTH_KEY),
-        };
-        return match rollback {
-            Ok(()) => Err(state_error),
-            Err(rollback_error) => Err(format!(
-                "{state_error}; additionally failed to restore the previous OAuth token: {rollback_error}"
-            )),
-        };
-    }
+    )?;
+    secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &res.access_token)?;
     bump_secrets_generation(state.inner());
     Ok(())
 }
@@ -4284,6 +4360,30 @@ mod tests {
             .expect("third lock should not fail")
             .expect("lock should be available after release");
         drop(lock2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auth_mutation_lock_serializes_token_and_oauth_writes() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("toolport-auth-write-{unique}.lock"));
+        let first = try_acquire_auth_mutation_lock(&path)
+            .expect("first mutation lock should not fail")
+            .expect("first mutation lock should be acquired");
+        assert!(
+            try_acquire_auth_mutation_lock(&path)
+                .expect("second mutation lock should not fail")
+                .is_none(),
+            "a concurrent manual-token or OAuth write must wait"
+        );
+        drop(first);
+        let second = try_acquire_auth_mutation_lock(&path)
+            .expect("lock reacquisition should not fail")
+            .expect("lock should be available after release");
+        drop(second);
         let _ = std::fs::remove_file(path);
     }
 

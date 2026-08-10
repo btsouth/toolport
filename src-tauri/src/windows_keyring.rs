@@ -10,6 +10,8 @@ use super::{account, SERVICE};
 
 const CHUNK_UTF16_UNITS: usize = 1_000;
 const MANIFEST_PREFIX: &str = "toolport-chunked-v1:";
+const DIRECT_PREFIX: &str = "toolport-direct-v1:";
+const READ_ATTEMPTS: usize = 3;
 
 struct ChunkManifest {
     generation: String,
@@ -77,6 +79,29 @@ fn manifest_value(manifest: &ChunkManifest) -> String {
     )
 }
 
+fn direct_value(value: &str) -> String {
+    if value.starts_with(MANIFEST_PREFIX) || value.starts_with(DIRECT_PREFIX) {
+        format!("{DIRECT_PREFIX}{}:{value}", checksum(value))
+    } else {
+        value.to_string()
+    }
+}
+
+fn parse_direct_value(value: &str) -> Option<String> {
+    let rest = value.strip_prefix(DIRECT_PREFIX)?;
+    let (expected, direct) = rest.split_once(':')?;
+    if expected.len() == 64
+        && expected.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && checksum(direct) == expected
+    {
+        Some(direct.to_string())
+    } else {
+        // Backward compatibility: a legacy raw secret may begin with our newly
+        // reserved prefix. Only unwrap the envelope when its checksum validates.
+        None
+    }
+}
+
 fn parse_manifest(value: &str) -> Result<Option<ChunkManifest>, String> {
     let Some(rest) = value.strip_prefix(MANIFEST_PREFIX) else {
         return Ok(None);
@@ -121,20 +146,37 @@ fn delete_chunks(base: &str, manifest: &ChunkManifest) -> Result<(), String> {
     }
 }
 
+fn cleanup_chunks(base: &str, manifest: &ChunkManifest) {
+    if let Err(error) = delete_chunks(base, manifest) {
+        // The base credential is the commit point. Once it names the new value (or
+        // has been deleted), stale chunks are unreachable and cleanup failure must
+        // not make callers believe the primary write failed.
+        eprintln!("toolport: Windows credential chunk cleanup deferred: {error}");
+    }
+}
+
 pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
     let base = account(server_id, key);
     let previous_manifest = read_entry(&base)?
         .as_deref()
-        .map(parse_manifest)
-        .transpose()?
-        .flatten();
+        .and_then(|value| match parse_manifest(value) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                // A damaged manifest must not permanently block reauthentication.
+                // Its chunks may be unreachable, but replacing the base repairs the
+                // user-visible credential and future writes.
+                eprintln!("toolport: replacing invalid Windows credential manifest: {error}");
+                None
+            }
+        });
 
-    if value.encode_utf16().count() <= CHUNK_UTF16_UNITS {
+    let direct = direct_value(value);
+    if direct.encode_utf16().count() <= CHUNK_UTF16_UNITS {
         entry(&base)?
-            .set_password(value)
+            .set_password(&direct)
             .map_err(|error| error.to_string())?;
         if let Some(previous) = previous_manifest {
-            delete_chunks(&base, &previous)?;
+            cleanup_chunks(&base, &previous);
         }
         return Ok(());
     }
@@ -152,7 +194,13 @@ pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String>
             .map_err(|error| error.to_string());
         if let Err(error) = result {
             for cleanup_index in 0..written {
-                let _ = delete_entry(&chunk_account(&base, &manifest.generation, cleanup_index));
+                if let Err(cleanup_error) =
+                    delete_entry(&chunk_account(&base, &manifest.generation, cleanup_index))
+                {
+                    eprintln!(
+                        "toolport: Windows credential partial-write cleanup deferred: {cleanup_error}"
+                    );
+                }
             }
             return Err(error);
         }
@@ -163,46 +211,68 @@ pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String>
         .set_password(&manifest_value(&manifest))
         .map_err(|error| error.to_string())
     {
-        let _ = delete_chunks(&base, &manifest);
+        cleanup_chunks(&base, &manifest);
         return Err(error);
     }
     if let Some(previous) = previous_manifest {
-        delete_chunks(&base, &previous)?;
+        cleanup_chunks(&base, &previous);
     }
     Ok(())
 }
 
 pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
     let base = account(server_id, key);
-    let Some(value) = read_entry(&base)? else {
-        return Ok(None);
-    };
-    let Some(manifest) = parse_manifest(&value)? else {
-        return Ok(Some(value));
-    };
-    let mut combined = String::new();
-    for index in 0..manifest.count {
-        let chunk = read_entry(&chunk_account(&base, &manifest.generation, index))?
-            .ok_or_else(|| format!("Windows credential chunk {index} is missing"))?;
-        combined.push_str(&chunk);
+    let mut last_error = None;
+    for attempt in 0..READ_ATTEMPTS {
+        let Some(value) = read_entry(&base)? else {
+            return Ok(None);
+        };
+        if let Some(direct) = parse_direct_value(&value) {
+            return Ok(Some(direct));
+        }
+        let Some(manifest) = parse_manifest(&value)? else {
+            return Ok(Some(value));
+        };
+        let mut combined = String::new();
+        let mut failed = None;
+        for index in 0..manifest.count {
+            match read_entry(&chunk_account(&base, &manifest.generation, index))? {
+                Some(chunk) => combined.push_str(&chunk),
+                None => {
+                    failed = Some(format!("Windows credential chunk {index} is missing"));
+                    break;
+                }
+            }
+        }
+        if failed.is_none() && checksum(&combined) == manifest.checksum {
+            return Ok(Some(combined));
+        }
+        last_error = failed.or_else(|| {
+            Some("Windows credential chunks failed their integrity check".to_string())
+        });
+        if attempt + 1 < READ_ATTEMPTS {
+            std::thread::yield_now();
+        }
     }
-    if checksum(&combined) != manifest.checksum {
-        return Err("Windows credential chunks failed their integrity check".to_string());
-    }
-    Ok(Some(combined))
+    Err(last_error.unwrap_or_else(|| "Windows credential read failed".to_string()))
 }
 
 pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
     let base = account(server_id, key);
     let manifest = read_entry(&base)?
         .as_deref()
-        .map(parse_manifest)
-        .transpose()?
-        .flatten();
+        .and_then(|value| parse_manifest(value).ok().flatten());
     // Make the value unreadable first, then clean up its generation chunks.
     delete_entry(&base)?;
     if let Some(manifest) = manifest {
-        delete_chunks(&base, &manifest)?;
+        cleanup_chunks(&base, &manifest);
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub fn set_raw_for_test(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    entry(&account(server_id, key))?
+        .set_password(value)
+        .map_err(|error| error.to_string())
 }

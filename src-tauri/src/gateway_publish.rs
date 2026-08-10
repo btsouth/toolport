@@ -86,21 +86,29 @@ fn file_size(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.len())
 }
 
-fn file_sha256(path: &Path) -> Option<String> {
+fn file_sha256(path: &Path) -> std::io::Result<String> {
     use std::io::Read as _;
 
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = std::fs::File::open(path)?;
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let read = file.read(&mut buffer).ok()?;
+        let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         digest.update(&buffer[..read]);
     }
     let digest = digest.finalize();
-    Some(format!("{digest:x}"))
+    Ok(format!("{digest:x}"))
+}
+
+fn existing_file_sha256(path: &Path) -> std::io::Result<Option<String>> {
+    match file_sha256(path) {
+        Ok(digest) => Ok(Some(digest)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// A second build of the same Cargo version can differ from the gateway already
@@ -121,6 +129,14 @@ fn content_addressed_dest(dest: &Path, digest: &str) -> PathBuf {
     dest.with_file_name(format!("{stem}-{short}{ext}"))
 }
 
+fn select_publish_dest(base_dest: &Path, src_digest: &str) -> PathBuf {
+    match existing_file_sha256(base_dest) {
+        Ok(Some(dest_digest)) if dest_digest == src_digest => base_dest.to_path_buf(),
+        Ok(Some(_)) | Err(_) => content_addressed_dest(base_dest, src_digest),
+        Ok(None) => base_dest.to_path_buf(),
+    }
+}
+
 /// Copy the install-dir gateway into `Toolport/bin` when needed and write the manifest.
 pub fn publish_bundled_gateway() -> Option<PathBuf> {
     if !should_publish_client_gateway() {
@@ -130,22 +146,22 @@ pub fn publish_bundled_gateway() -> Option<PathBuf> {
     let version = env!("CARGO_PKG_VERSION").to_string();
     let base_dest = versioned_dest(&version)?;
     let src_size = file_size(&src)?;
-    let src_digest = file_sha256(&src)?;
+    let src_digest = file_sha256(&src).ok()?;
 
     // Never overwrite a different same-version image in place. Besides being unsafe
     // for a running executable on Unix, Windows rejects it with a sharing violation.
-    let dest = match file_sha256(&base_dest) {
-        Some(dest_digest) if dest_digest == src_digest => base_dest,
-        Some(_) => content_addressed_dest(&base_dest, &src_digest),
-        None => base_dest,
-    };
-    if file_sha256(&dest).as_deref() != Some(src_digest.as_str()) {
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).ok()?;
-        }
-        std::fs::copy(&src, &dest).ok()?;
-        if file_sha256(&dest).as_deref() != Some(src_digest.as_str()) {
-            return None;
+    let dest = select_publish_dest(&base_dest, &src_digest);
+    match existing_file_sha256(&dest) {
+        Ok(Some(dest_digest)) if dest_digest == src_digest => {}
+        Ok(Some(_)) | Err(_) => return None,
+        Ok(None) => {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).ok()?;
+            }
+            std::fs::copy(&src, &dest).ok()?;
+            if file_sha256(&dest).ok().as_deref() != Some(src_digest.as_str()) {
+                return None;
+            }
         }
     }
 
@@ -451,7 +467,15 @@ fn basename_matches_current_version(name: &str, version: &str) -> bool {
     let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
     let want_tp = format!("toolport-gateway-{version}").to_ascii_lowercase();
     let want_cd = format!("conduit-gateway-{version}").to_ascii_lowercase();
-    stem == want_tp || stem == want_cd
+    [want_tp, want_cd].iter().any(|want| {
+        stem == want
+            || stem
+                .strip_prefix(&format!("{want}-"))
+                .map(|suffix| {
+                    suffix.len() == 12 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .unwrap_or(false)
+    })
 }
 
 /// Path looks like a cargo `target/...` dev binary — keep under stale mode so
@@ -1618,6 +1642,25 @@ mod tests {
     }
 
     #[test]
+    fn decide_keeps_current_content_addressed_basename_without_a_path() {
+        let c = ctx("1.9.6", &[], false);
+        assert_eq!(
+            decide_reap(
+                &proc(10, "toolport-gateway-1.9.6-0123456789ab.exe", None),
+                &c
+            ),
+            ReapDecision::Keep
+        );
+        assert!(
+            !basename_matches_current_version(
+                "toolport-gateway-1.9.6-not-a-digest.exe",
+                "1.9.6"
+            ),
+            "only the publisher's 12-hex content suffix is current"
+        );
+    }
+
+    #[test]
     fn decide_kills_older_versioned_basenames() {
         let c = ctx("1.9.6", &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.6.exe"], false);
         for (name, path) in [
@@ -2007,6 +2050,18 @@ mod tests {
             PathBuf::from(
                 r"C:\Users\u\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0-0123456789ab.exe"
             )
+        );
+    }
+
+    #[test]
+    fn unreadable_same_version_destination_uses_content_addressed_leaf() {
+        let dir = ScratchDir::new("publish-unreadable-base");
+        let base = dir.join("toolport-gateway-1.12.0.exe");
+        std::fs::create_dir(&base).expect("directory stand-in should be unreadable as a file");
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            select_publish_dest(&base, digest),
+            dir.join("toolport-gateway-1.12.0-0123456789ab.exe")
         );
     }
 
@@ -2808,6 +2863,13 @@ mod tests {
             decide_prune(&bin(&dir, "toolport-gateway-1.10.0.exe"), &ctx),
             PruneDecision::Keep(_)
         ));
+        assert_eq!(
+            decide_prune(
+                &bin(&dir, "toolport-gateway-1.10.0-0123456789ab.exe"),
+                &ctx
+            ),
+            PruneDecision::Keep("current version")
+        );
     }
 
     /// The exact situation from the SOU-484 report: on the machine where this was
