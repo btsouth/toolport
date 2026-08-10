@@ -1189,9 +1189,11 @@ fn is_retryable_transport(t: &ureq::Transport) -> bool {
 }
 
 /// Build an `Authorization` header value from a raw token, adding the `Bearer`
-/// scheme unless the caller already included one.
+/// scheme unless the caller supplied a supported scheme. Personal Atlassian API
+/// tokens use `Basic base64(email:token)` rather than Bearer authentication.
 pub fn bearer_header(token: &str) -> String {
-    if token.to_lowercase().starts_with("bearer ") {
+    let lower = token.to_ascii_lowercase();
+    if lower.starts_with("bearer ") || lower.starts_with("basic ") {
         token.to_string()
     } else {
         format!("Bearer {token}")
@@ -8261,6 +8263,7 @@ mod tests {
     fn bearer_header_adds_scheme_once() {
         assert_eq!(super::bearer_header("sk-123"), "Bearer sk-123");
         assert_eq!(super::bearer_header("Bearer sk-123"), "Bearer sk-123");
+        assert_eq!(super::bearer_header("Basic ZW1haWw6dG9rZW4="), "Basic ZW1haWw6dG9rZW4=");
         assert_eq!(super::bearer_header("bearer sk-123"), "bearer sk-123");
     }
 

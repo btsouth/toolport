@@ -123,6 +123,13 @@ fn vendors() -> &'static [Vendor] {
             instructions: "Sign in with OAuth, or create a personal API key in Linear settings.",
         },
         Vendor {
+            needle: "atlassian.com",
+            name: "Atlassian",
+            force_kind: None,
+            token_url: Some("https://id.atlassian.com/manage-profile/security/api-tokens"),
+            instructions: "OAuth is recommended. For a personal API token, select read:me, read:account, and the Jira or Confluence scopes you need, then paste Basic base64(email:token).",
+        },
+        Vendor {
             needle: "sentry.io",
             name: "Sentry",
             force_kind: None,
@@ -211,6 +218,12 @@ mod tests {
         assert_eq!(
             match_vendor("https://mcp.revenuecat.ai/mcp").unwrap().name,
             "RevenueCat"
+        );
+        assert_eq!(
+            match_vendor("https://mcp.atlassian.com/v1/mcp/authv2")
+                .unwrap()
+                .name,
+            "Atlassian"
         );
         assert!(match_vendor("https://unknown.example.com").is_none());
 

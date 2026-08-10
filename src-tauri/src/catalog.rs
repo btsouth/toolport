@@ -254,7 +254,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         http("Notion", "Search and edit Notion pages and databases.", "https://mcp.notion.com/mcp", "https://developers.notion.com"),
         http("Composio", "Connect AI agents to 1,000+ apps (Gmail, Slack, GitHub, Notion, Linear, and more).", "https://connect.composio.dev/mcp", "https://composio.dev"),
         http("Linear", "Issues, projects, and cycles in Linear.", "https://mcp.linear.app/mcp", "https://linear.app/docs"),
-        http("Atlassian", "Jira issues and Confluence pages.", "https://mcp.atlassian.com/v1/mcp", "https://support.atlassian.com/atlassian-rovo-mcp-server/"),
+        http("Atlassian", "Jira issues and Confluence pages.", "https://mcp.atlassian.com/v1/mcp/authv2", "https://support.atlassian.com/atlassian-rovo-mcp-server/"),
         http("Asana", "Tasks, projects, and portfolios in Asana.", "https://mcp.asana.com/mcp", "https://developers.asana.com/docs/mcp-server"),
         cmd("Airtable", "Read and write records in your Airtable bases.", "npx", &["-y", "airtable-mcp-server"], &["AIRTABLE_API_KEY"], "https://github.com/domdomegg/airtable-mcp-server"),
         cmd("Todoist", "Manage Todoist tasks and projects.", "npx", &["-y", "@abhiz123/todoist-mcp-server"], &["TODOIST_API_TOKEN"], "https://github.com/abhiz123/todoist-mcp-server"),
@@ -584,6 +584,18 @@ mod tests {
             .any(|e| e.name == "Neon"));
         // Empty query returns the full set.
         assert_eq!(filter_catalog(curated(), "").len(), curated().len());
+    }
+
+    #[test]
+    fn atlassian_uses_the_authv2_endpoint() {
+        let atlassian = curated()
+            .into_iter()
+            .find(|entry| entry.name == "Atlassian")
+            .expect("Atlassian must remain in the curated catalog");
+        assert_eq!(
+            atlassian.url.as_deref(),
+            Some("https://mcp.atlassian.com/v1/mcp/authv2")
+        );
     }
 
     #[test]

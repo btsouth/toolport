@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const MANIFEST_FILE: &str = "gateway-manifest.json";
 
@@ -85,6 +86,41 @@ fn file_size(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.len())
 }
 
+fn file_sha256(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let digest = digest.finalize();
+    Some(format!("{digest:x}"))
+}
+
+/// A second build of the same Cargo version can differ from the gateway already
+/// published under the version-only filename. On Windows that old image is commonly
+/// locked by Codex/Claude, so replacing it in place fails. Give the rebuilt image a
+/// content-addressed leaf instead; the manifest/repoint path can then migrate clients
+/// without fighting the running executable.
+fn content_addressed_dest(dest: &Path, digest: &str) -> PathBuf {
+    let stem = dest
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "toolport-gateway".into());
+    let ext = dest
+        .extension()
+        .map(|s| format!(".{}", s.to_string_lossy()))
+        .unwrap_or_default();
+    let short = &digest[..digest.len().min(12)];
+    dest.with_file_name(format!("{stem}-{short}{ext}"))
+}
+
 /// Copy the install-dir gateway into `Toolport/bin` when needed and write the manifest.
 pub fn publish_bundled_gateway() -> Option<PathBuf> {
     if !should_publish_client_gateway() {
@@ -92,18 +128,25 @@ pub fn publish_bundled_gateway() -> Option<PathBuf> {
     }
     let src = bundled_gateway_source()?;
     let version = env!("CARGO_PKG_VERSION").to_string();
-    let dest = versioned_dest(&version)?;
+    let base_dest = versioned_dest(&version)?;
     let src_size = file_size(&src)?;
+    let src_digest = file_sha256(&src)?;
 
-    let needs_copy = match file_size(&dest) {
-        Some(dest_size) => dest_size != src_size,
-        None => true,
+    // Never overwrite a different same-version image in place. Besides being unsafe
+    // for a running executable on Unix, Windows rejects it with a sharing violation.
+    let dest = match file_sha256(&base_dest) {
+        Some(dest_digest) if dest_digest == src_digest => base_dest,
+        Some(_) => content_addressed_dest(&base_dest, &src_digest),
+        None => base_dest,
     };
-    if needs_copy {
+    if file_sha256(&dest).as_deref() != Some(src_digest.as_str()) {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).ok()?;
         }
         std::fs::copy(&src, &dest).ok()?;
+        if file_sha256(&dest).as_deref() != Some(src_digest.as_str()) {
+            return None;
+        }
     }
 
     let manifest = GatewayManifest {
@@ -1949,6 +1992,22 @@ mod tests {
         let json = serde_json::to_string(&m).unwrap();
         let back: GatewayManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn same_version_rebuild_gets_content_addressed_leaf() {
+        let base = PathBuf::from(
+            r"C:\Users\u\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe",
+        );
+        assert_eq!(
+            content_addressed_dest(
+                &base,
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            ),
+            PathBuf::from(
+                r"C:\Users\u\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0-0123456789ab.exe"
+            )
+        );
     }
 
     /// A small, long-running binary to stand in for a gateway image.

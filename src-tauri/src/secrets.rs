@@ -660,7 +660,11 @@ mod platform {
 }
 
 // ── Windows / Linux ────────────────────────────────────────────────────────
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+#[path = "windows_keyring.rs"]
+mod platform;
+
+#[cfg(target_os = "linux")]
 mod platform {
     use keyring::Entry;
 
@@ -1213,6 +1217,34 @@ mod tests {
         assert_eq!(get_secret(sid, key).as_deref(), Some("s3cr3t"));
         delete_secret(sid, key).unwrap();
         assert_eq!(get_secret(sid, key), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_oversized_secret_round_trips_updates_and_deletes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let sid = format!("toolport-windows-large-secret-{unique}");
+        let key = "OAUTH_TOKEN";
+        let first = format!("{}{}", "a".repeat(3_500), "🔒".repeat(300));
+        let second = format!("{}{}", "b".repeat(6_100), "🚀".repeat(100));
+
+        delete_secret(&sid, key).unwrap();
+        set_secret(&sid, key, &first).unwrap();
+        assert_eq!(get_secret_result(&sid, key).unwrap().as_deref(), Some(first.as_str()));
+
+        set_secret(&sid, key, &second).unwrap();
+        assert_eq!(get_secret_result(&sid, key).unwrap().as_deref(), Some(second.as_str()));
+
+        set_secret(&sid, key, "short replacement").unwrap();
+        assert_eq!(get_secret(&sid, key).as_deref(), Some("short replacement"));
+
+        set_secret(&sid, key, &first).unwrap();
+        delete_secret(&sid, key).unwrap();
+        assert_eq!(get_secret_result(&sid, key).unwrap(), None);
     }
 
     /// Cross-platform: setting `CONDUIT_SECRET_KEY` activates the file backend.

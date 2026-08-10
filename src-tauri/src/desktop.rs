@@ -2580,8 +2580,9 @@ async fn authenticate_oauth(
     let res = tauri::async_runtime::spawn_blocking(move || oauth::authenticate(&url))
         .await
         .map_err(|e| e.to_string())??;
+    let previous_access = secrets::get_secret_result(&server_id, secrets::HTTP_AUTH_KEY)?;
     secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &res.access_token)?;
-    remote::store_oauth_state(
+    if let Err(state_error) = remote::store_oauth_state(
         &server_id,
         Some(res.issuer),
         &res.token_endpoint,
@@ -2591,7 +2592,18 @@ async fn authenticate_oauth(
         res.scope,
         res.issued_at,
         res.expires_at,
-    )?;
+    ) {
+        let rollback = match previous_access {
+            Some(previous) => secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &previous),
+            None => secrets::delete_secret(&server_id, secrets::HTTP_AUTH_KEY),
+        };
+        return match rollback {
+            Ok(()) => Err(state_error),
+            Err(rollback_error) => Err(format!(
+                "{state_error}; additionally failed to restore the previous OAuth token: {rollback_error}"
+            )),
+        };
+    }
     bump_secrets_generation(state.inner());
     Ok(())
 }
