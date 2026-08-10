@@ -1958,6 +1958,58 @@ mod tests {
         assert_eq!(code, "good-code");
     }
 
+    /// SBS-659: browsers hit the loopback redirect with /favicon.ico and other
+    /// stray requests. Treating the first connection as the authorization response
+    /// would fail the sign-in with "empty authorization code" while the real
+    /// redirect was still in flight right behind it.
+    #[test]
+    fn callback_ignores_stray_requests_and_waits_for_the_real_redirect() {
+        let result = callback_result(
+            &[
+                "/favicon.ico",
+                "/callback",
+                "/?utm_source=browser",
+                "/callback?code=good-code&state=expected",
+            ],
+            "expected",
+        );
+
+        match result {
+            Ok(code) => assert_eq!(code, "good-code"),
+            Err(e) => panic!("a stray request must not end the wait: {e}"),
+        }
+    }
+
+    /// A stray request must not be mistaken for a state mismatch either: it carries
+    /// no state, and rejecting it would abort the flow before the real redirect.
+    #[test]
+    fn callback_stray_request_is_not_treated_as_a_csrf_failure() {
+        let result = callback_result(
+            &["/favicon.ico?v=2", "/callback?code=good-code&state=expected"],
+            "expected",
+        );
+        match result {
+            Ok(code) => assert_eq!(code, "good-code"),
+            Err(e) => panic!("a stray request must not be read as a CSRF failure: {e}"),
+        }
+    }
+
+    /// An `error` response is still acted on once state checks out - the stray-request
+    /// skip must not swallow a genuine denial and leave the user waiting.
+    #[test]
+    fn callback_surfaces_an_authorization_error_after_a_stray_request() {
+        let error = callback_result(
+            &[
+                "/favicon.ico",
+                "/callback?error=access_denied&error_description=nope&state=expected",
+            ],
+            "expected",
+        )
+        .expect_err("a denial must end the wait");
+        assert!(error.contains("access_denied"), "{error}");
+        assert!(error.contains("nope"), "{error}");
+    }
+
     #[test]
     fn metadata_issuer_must_match_the_selected_authorization_server() {
         assert!(validate_metadata_issuer(
