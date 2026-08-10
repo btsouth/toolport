@@ -7352,6 +7352,321 @@ mod tests {
         assert!(!cancelled.forwarded);
     }
 
+    /// A real child process that records everything written to its stdin, so a
+    /// cancellation test can read back the exact bytes the production write path
+    /// produced. A genuine child is used rather than an in-process pipe because
+    /// `CancelEntry` holds a `ChildStdin`, and on Windows a `ChildStdin` adopted
+    /// from `std::io::pipe` swallows writes (that pipe is opened in overlapped
+    /// mode; the child-stdio writer is not).
+    struct StdinRecorder {
+        child: std::process::Child,
+        stdin: Arc<Mutex<std::process::ChildStdin>>,
+        output: std::path::PathBuf,
+        script: Option<std::path::PathBuf>,
+    }
+
+    impl StdinRecorder {
+        fn new(tag: &str) -> Self {
+            use std::process::{Command, Stdio};
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let output = std::env::temp_dir().join(format!(
+                "toolport-cancel-{tag}-{}-{nonce}.jsonl",
+                std::process::id()
+            ));
+            let sink = std::fs::File::create(&output).expect("create the recorder's output file");
+            // The child copies stdin to stdout, and stdout is the file above, so
+            // nothing has to be interpolated into the script itself.
+            let mut script = None;
+            let mut cmd = if cfg!(windows) {
+                let path = output.with_extension("ps1");
+                std::fs::write(
+                    &path,
+                    "$in = [Console]::OpenStandardInput()\n\
+                     $out = [Console]::OpenStandardOutput()\n\
+                     $in.CopyTo($out)\n\
+                     $out.Flush()\n",
+                )
+                .expect("write the recorder script");
+                let mut c = Command::new("powershell.exe");
+                c.args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                ])
+                .arg(&path);
+                script = Some(path);
+                c
+            } else {
+                Command::new("cat")
+            };
+            let mut child = cmd
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(sink))
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn the stdin recorder");
+            let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
+            Self {
+                child,
+                stdin,
+                output,
+                script,
+            }
+        }
+
+        /// Drop this side's handle to the child's stdin, wait for the child to
+        /// exit, then parse what it recorded.
+        ///
+        /// The wait is what makes these tests deterministic rather than timed: a
+        /// cancellation forward runs on a detached thread that owns a clone of
+        /// the stdin handle, so the child cannot reach EOF - and cannot exit -
+        /// until that thread has finished writing. Waiting therefore observes
+        /// every forward that will ever happen, and equally proves the absence of
+        /// one, with no sleep and no poll loop. Every other clone of the handle
+        /// must already be dropped.
+        fn finish(self) -> Vec<Value> {
+            let StdinRecorder {
+                mut child,
+                stdin,
+                output,
+                script,
+            } = self;
+            drop(stdin);
+            let status = child
+                .wait()
+                .expect("the recorder should exit once its stdin closes");
+            assert!(status.success(), "recorder exited with {status}");
+            let raw = std::fs::read_to_string(&output).expect("read the recorded stdin");
+            let _ = std::fs::remove_file(&output);
+            if let Some(script) = script {
+                let _ = std::fs::remove_file(script);
+            }
+            raw.lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad frame {l:?}: {e}")))
+                .collect()
+        }
+    }
+
+    /// Any short-lived process will do: `StdioTransport` owns a `Child` it never
+    /// speaks to in these tests (stdin is the recorder's pipe and stdout is a
+    /// pre-loaded channel), it just has to hold one. The recorder's own child is
+    /// deliberately NOT used here - dropping the transport kills its child, which
+    /// on unix would cut the recording short.
+    fn placeholder_child() -> std::process::Child {
+        use std::process::{Command, Stdio};
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "exit"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "exit 0"]);
+            c
+        };
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a placeholder child")
+    }
+
+    /// A `StdioTransport` whose stdin is `stdin` and whose only stdout line is
+    /// `response`, queued before the call so the read never depends on timing.
+    fn stdio_transport_fixture(
+        stdin: Arc<Mutex<std::process::ChildStdin>>,
+        response: &Value,
+    ) -> super::StdioTransport {
+        use std::sync::atomic::AtomicBool;
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(response.to_string()).expect("queue the response");
+        drop(tx);
+        super::StdioTransport {
+            child: placeholder_child(),
+            #[cfg(windows)]
+            job: None,
+            stdin,
+            rx,
+            stderr: Arc::new(Mutex::new(String::new())),
+            next_id: 1,
+            read_timeout: std::time::Duration::from_secs(30),
+            armed: Arc::new(AtomicBool::new(false)),
+            launcher: false,
+            server_handler: None,
+            pending_mrtr: None,
+            progress: Arc::new(Mutex::new(None)),
+            protocol_meta: None,
+            subscription_listener_id: None,
+        }
+    }
+
+    /// SBS-644. The cancel-before-registration race: the client cancels while the
+    /// request is still on its way to the child, so `cancel` finds nothing in
+    /// flight and can only record the mark. The `notifications/cancelled` write
+    /// has to happen afterwards, from the request path itself, once the
+    /// downstream id exists. Driven through the real `request_with_cancel` and
+    /// asserted on the bytes that reached stdin - the registry agreeing with
+    /// itself was never the claim, the frame on the wire is.
+    ///
+    /// The interleaving is forced, not raced: the cancel is issued before the
+    /// request begins, which is exactly the ordering that produces the bug.
+    #[test]
+    fn cancel_before_registration_is_forwarded_once_the_request_is_written() {
+        let registry = CancelRegistry::new();
+        assert!(registry.begin_client_request("c-1".to_string()));
+        // Nothing is in flight yet, so this can only leave the mark behind.
+        assert!(registry.cancel("c-1", Some("user pressed stop")));
+
+        let recorder = StdinRecorder::new("deferred");
+        let mut transport = stdio_transport_fixture(
+            Arc::clone(&recorder.stdin),
+            &json!({ "jsonrpc": "2.0", "id": 1, "result": { "ok": true } }),
+        );
+
+        transport
+            .request_with_cancel(
+                "tools/call",
+                json!({ "name": "echo" }),
+                Some(registry.context("c-1".to_string())),
+            )
+            .expect("the queued response should complete the request");
+
+        registry.finish_client_request("c-1");
+        drop(transport);
+
+        let frames = recorder.finish();
+        assert_eq!(
+            frames.len(),
+            2,
+            "expected the request then its deferred cancellation, got {frames:?}"
+        );
+        assert_eq!(frames[0]["method"], "tools/call");
+        let downstream_id = frames[0]["id"].clone();
+        assert!(
+            !downstream_id.is_null(),
+            "the request must carry a downstream id, got {:?}",
+            frames[0]
+        );
+
+        let cancel = &frames[1];
+        assert_eq!(
+            cancel["method"], "notifications/cancelled",
+            "the deferred forward must actually be written, got {cancel:?}"
+        );
+        assert_eq!(
+            cancel["params"]["requestId"], downstream_id,
+            "the forward must name the DOWNSTREAM id, got {cancel:?}"
+        );
+        assert_eq!(
+            cancel["params"]["reason"], "user pressed stop",
+            "the reason recorded before registration must survive the deferral, got {cancel:?}"
+        );
+    }
+
+    /// The `forwarded` latch: once a cancellation has reached the downstream
+    /// server, a repeat `notifications/cancelled` from the client must not put a
+    /// second one on the wire for the same in-flight request.
+    #[test]
+    fn a_forwarded_cancel_is_not_written_a_second_time() {
+        use super::CancelEntry;
+
+        let registry = CancelRegistry::new();
+        assert!(registry.begin_client_request("c-2".to_string()));
+
+        let recorder = StdinRecorder::new("latch");
+        let guard = registry.register(
+            "c-2".to_string(),
+            CancelEntry {
+                stdin: Arc::clone(&recorder.stdin),
+                downstream_id: json!(41),
+            },
+        );
+
+        assert!(registry.cancel("c-2", Some("user pressed stop")));
+        // Clients that hold down the stop key send this more than once.
+        assert!(registry.cancel("c-2", Some("user pressed stop")));
+        assert!(registry.cancel("c-2", None));
+
+        drop(guard);
+        registry.finish_client_request("c-2");
+
+        let frames = recorder.finish();
+        assert_eq!(
+            frames.len(),
+            1,
+            "three cancels of one in-flight request must forward exactly once, got {frames:?}"
+        );
+        assert_eq!(frames[0]["method"], "notifications/cancelled");
+        assert_eq!(frames[0]["params"]["requestId"], 41);
+        assert_eq!(frames[0]["params"]["reason"], "user pressed stop");
+    }
+
+    /// The latch is per in-flight registration, not for the life of the client
+    /// request: when a cancelled request is re-issued downstream (a retry lands
+    /// on a fresh downstream id), `register` clears `forwarded` so the new child
+    /// request is cancelled too. Each registration writes to its own recorder, so
+    /// the two forwards can never interleave mid-line.
+    #[test]
+    fn re_registering_a_cancelled_request_forwards_to_the_new_downstream_id() {
+        use super::CancelEntry;
+
+        let registry = CancelRegistry::new();
+        assert!(registry.begin_client_request("c-3".to_string()));
+
+        let first_recorder = StdinRecorder::new("retry-first");
+        let first_guard = registry.register(
+            "c-3".to_string(),
+            CancelEntry {
+                stdin: Arc::clone(&first_recorder.stdin),
+                downstream_id: json!(41),
+            },
+        );
+        assert!(registry.cancel("c-3", Some("user pressed stop")));
+        // The first attempt is over before the retry registers, so its guard
+        // cannot evict the replacement entry on drop.
+        drop(first_guard);
+
+        let second_recorder = StdinRecorder::new("retry-second");
+        let second_guard = registry.register(
+            "c-3".to_string(),
+            CancelEntry {
+                stdin: Arc::clone(&second_recorder.stdin),
+                downstream_id: json!(42),
+            },
+        );
+        // Same post-write step the stdio request path runs.
+        assert!(registry.is_cancelled("c-3"));
+        registry.forward_cancel_if_ready("c-3");
+        drop(second_guard);
+        registry.finish_client_request("c-3");
+
+        let first = first_recorder.finish();
+        assert_eq!(first.len(), 1, "the first attempt was cancelled: {first:?}");
+        assert_eq!(first[0]["params"]["requestId"], 41);
+
+        let second = second_recorder.finish();
+        assert_eq!(
+            second.len(),
+            1,
+            "the retry's downstream request must be cancelled too, got {second:?}"
+        );
+        assert_eq!(second[0]["method"], "notifications/cancelled");
+        assert_eq!(
+            second[0]["params"]["requestId"], 42,
+            "the forward must follow the new downstream id, got {:?}",
+            second[0]
+        );
+        assert_eq!(second[0]["params"]["reason"], "user pressed stop");
+    }
+
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
     }
