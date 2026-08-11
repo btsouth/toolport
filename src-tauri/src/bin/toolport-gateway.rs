@@ -5015,6 +5015,9 @@ fn run_script_dispatch(
         Some(v) => format!("checkpoint: {v}. "),
         None => String::new(),
     };
+    let protected_failure_prefix_bytes = outcome.checkpoint.as_ref().map_or(0, |checkpoint| {
+        format!("Toolport code mode: the script failed. checkpoint: {checkpoint}. ").len()
+    });
 
     let ledger_text = if outcome.progress.is_empty() {
         "no calls completed".to_string()
@@ -5066,7 +5069,12 @@ fn run_script_dispatch(
     if let Some(msg) = warning {
         eprintln!("{msg}");
     }
-    shaping::shape_result(&mut result, budget, client);
+    shaping::shape_result_preserving_prefix(
+        &mut result,
+        budget,
+        client,
+        protected_failure_prefix_bytes,
+    );
     result
 }
 
@@ -14550,7 +14558,7 @@ mod tests {
         let reg = Registry::default();
         let router = Arc::new(routed_router("s", "tool"));
         let args = json!({
-            "script": "toolport.checkpoint({ lastInsertedId: 99 }); throw new Error('E'.repeat(20000));"
+            "script": "toolport.checkpoint({ resume: 'x'.repeat(4000) }); throw new Error('E'.repeat(20000));"
         });
         let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
 
@@ -14561,13 +14569,10 @@ mod tests {
 
         assert_eq!(result["isError"].as_bool(), Some(true));
         let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("checkpoint:"), "missing checkpoint: {text}");
         assert!(
-            text.contains("[Toolport shaped this result"),
-            "test needs an actually-shaped result to be meaningful; got: {text}"
-        );
-        assert!(
-            text.contains("checkpoint:") && text.contains("lastInsertedId"),
-            "the checkpoint must survive head-first shaping in the text body; got: {text}"
+            text.contains(&"x".repeat(4000)),
+            "a near-limit checkpoint must remain complete even when the configured shaping budget is smaller"
         );
     }
 

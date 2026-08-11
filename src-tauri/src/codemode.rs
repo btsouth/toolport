@@ -345,6 +345,29 @@ struct HostState {
     pending: Rc<RefCell<VecDeque<PendingCall>>>,
 }
 
+/// A checkpoint is a resume marker, not a payload. Keep it bounded so even a
+/// failure response can surface it without becoming an unbounded escape hatch.
+const MAX_CHECKPOINT_BYTES: usize = 4096;
+
+fn store_checkpoint(
+    checkpoint: &RefCell<Option<Value>>,
+    raw: &str,
+) -> Result<(), JsError> {
+    if raw.len() > MAX_CHECKPOINT_BYTES {
+        return Err(JsError::from_native(JsNativeError::error().with_message(
+            format!("toolport.checkpoint value exceeds {MAX_CHECKPOINT_BYTES} bytes"),
+        )));
+    }
+    let parsed: Value = serde_json::from_str(raw).map_err(|error| {
+        JsError::from_native(
+            JsNativeError::error()
+                .with_message(format!("toolport.checkpoint received invalid JSON: {error}")),
+        )
+    })?;
+    *checkpoint.borrow_mut() = Some(parsed);
+    Ok(())
+}
+
 /// Capture for `__toolport_fetch_result` (no GC refs). Shares the same call
 /// budget and wall-clock deadline as `toolport.call` (WS2-2).
 struct FetchHost {
@@ -710,11 +733,6 @@ pub fn run_script(
         state.clone(),
     );
 
-    /// A checkpoint is a resume marker, not a payload — bounded well below the
-    /// call-arg budget so a script cannot smuggle a large blob out through the
-    /// one path (the failure text) that isn't subject to `max_calls`.
-    const MAX_CHECKPOINT_BYTES: usize = 4096;
-
     let checkpoint_native = NativeFunction::from_copy_closure_with_captures(
         |_this: &JsValue, args: &[JsValue], state: &HostState, _ctx: &mut Context| {
             // No reserve_call_slot: this makes no downstream call, so it costs
@@ -724,13 +742,7 @@ pub fn run_script(
                 .and_then(JsValue::as_string)
                 .map(|s| s.to_std_string_escaped())
                 .unwrap_or_else(|| "null".to_string());
-            if raw.len() > MAX_CHECKPOINT_BYTES {
-                return Err(JsError::from_native(JsNativeError::error().with_message(
-                    format!("toolport.checkpoint value exceeds {MAX_CHECKPOINT_BYTES} bytes"),
-                )));
-            }
-            let parsed: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-            *state.checkpoint.borrow_mut() = Some(parsed);
+            store_checkpoint(&state.checkpoint, &raw)?;
             Ok(JsValue::undefined())
         },
         state.clone(),
@@ -2059,6 +2071,20 @@ mod tests {
         assert!(err.contains("4096"), "error should name the byte cap: {err}");
         // The prior good checkpoint is untouched by the rejected call.
         assert_eq!(out.checkpoint, Some(json!({ "ok": true })));
+    }
+
+    #[test]
+    fn malformed_checkpoint_json_is_rejected_without_dropping_the_prior_one() {
+        let checkpoint = RefCell::new(Some(json!({ "safe": true })));
+
+        let error = store_checkpoint(&checkpoint, "{not-json")
+            .expect_err("malformed checkpoint JSON must fail closed");
+        assert!(error.to_string().contains("invalid JSON"), "got: {error}");
+        assert_eq!(
+            checkpoint.into_inner(),
+            Some(json!({ "safe": true })),
+            "parsing must succeed before the last good checkpoint is replaced"
+        );
     }
 
     #[test]

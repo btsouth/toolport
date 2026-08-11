@@ -187,6 +187,18 @@ fn is_text_representable(result: &Value) -> bool {
 /// A `budget` of 0 disables shaping. Lossless: the full body stays fetchable via
 /// [`fetch_result`].
 pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> bool {
+    shape_result_preserving_prefix(result, budget, owner, 0)
+}
+
+/// Shape a result while retaining at least `min_head_bytes` from the start of
+/// its text projection. If the protected prefix and marker cannot fit, leave the
+/// result whole instead of silently truncating recovery-critical data.
+pub fn shape_result_preserving_prefix(
+    result: &mut Value,
+    budget: usize,
+    owner: Option<&str>,
+    min_head_bytes: usize,
+) -> bool {
     if budget == 0 {
         return false;
     }
@@ -233,7 +245,10 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
     // floor won whenever `budget - reserve - preserved` fell below it. The final
     // fit-check below is what actually enforces the contract; this is only the
     // starting estimate.
-    let mut head_byte_limit = budget.saturating_sub(512 + preserved_bytes);
+    let min_head_bytes = min_head_bytes.min(body.len());
+    let mut head_byte_limit = budget
+        .saturating_sub(512 + preserved_bytes)
+        .max(min_head_bytes);
     let head = head_within_bytes(&body, head_byte_limit).to_string();
     let is_error = result
         .get("isError")
@@ -288,7 +303,9 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
             break;
         }
         let overage = shaped_size - budget;
-        head_byte_limit = head_byte_limit.saturating_sub(overage.max(1));
+        head_byte_limit = head_byte_limit
+            .saturating_sub(overage.max(1))
+            .max(min_head_bytes);
         head = head_within_bytes(&body, head_byte_limit).to_string();
         shaped = build(&head);
     }
