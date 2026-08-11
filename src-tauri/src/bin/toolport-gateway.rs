@@ -1217,8 +1217,11 @@ fn run_script_tool_def() -> Value {
             approval). If the script fails partway, `structuredContent.toolportScript.progress` lists \
             the calls that already ran, in order, as {index, name, ok} - those side effects are \
             committed. Resume by INDEX (entries 0..n ran, n onward did not); never skip by tool name, \
-            since the same tool appears once per call. Best when you already know the steps; explore \
-            with toolport_search_tools first.",
+            since the same tool appears once per call. Call `toolport.checkpoint(value)` to record \
+            your own resume state (e.g. the last id you processed) as you go; on failure it's \
+            returned as `structuredContent.toolportScript.checkpoint`, letting a retry pick up from \
+            where it actually left off instead of guessing from the index alone. Best when you \
+            already know the steps; explore with toolport_search_tools first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5008,6 +5011,11 @@ fn run_script_dispatch(
     // error would otherwise lose its recovery data at exactly the moment that
     // data matters most. Leading with it means truncation eats the error text,
     // which is the more expendable half. Bounded by `max_calls` (64).
+    let checkpoint_text = match &outcome.checkpoint {
+        Some(v) => format!("checkpoint: {v}. "),
+        None => String::new(),
+    };
+
     let ledger_text = if outcome.progress.is_empty() {
         "no calls completed".to_string()
     } else {
@@ -5034,10 +5042,10 @@ fn run_script_dispatch(
         Some(err) => json!({
             "content": [{
                 "type": "text",
-                "text": format!("Toolport code mode: the script failed. {ledger_text}. Error: {err}")
+                "text": format!("Toolport code mode: the script failed. {checkpoint_text}{ledger_text}. Error: {err}")
             }],
             "isError": true,
-            "structuredContent": { "toolportScript": { "ok": false, "calls": outcome.calls, "progress": progress, "error": err } }
+            "structuredContent": { "toolportScript": { "ok": false, "calls": outcome.calls, "progress": progress, "checkpoint": outcome.checkpoint, "error": err } }
         }),
         None => {
             // One aggregated value; the intermediate call results stayed out of context.
@@ -14527,6 +14535,74 @@ mod tests {
         assert!(
             text.contains("do NOT skip by tool name"),
             "the ordinal contract must survive with it; got: {text}"
+        );
+    }
+
+    /// Mirrors `an_oversized_code_mode_failure_keeps_its_call_ledger_in_the_text`:
+    /// the checkpoint is rendered ahead of the ledger and the error, so head-first
+    /// shaping must never eat it either (#663).
+    #[test]
+    fn an_oversized_code_mode_failure_keeps_its_checkpoint_in_the_text() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("TOOLPORT_RESULT_BUDGET").ok();
+        std::env::set_var("TOOLPORT_RESULT_BUDGET", "2048");
+
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        let args = json!({
+            "script": "toolport.checkpoint({ lastInsertedId: 99 }); throw new Error('E'.repeat(20000));"
+        });
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+
+        match previous {
+            Some(value) => std::env::set_var("TOOLPORT_RESULT_BUDGET", value),
+            None => std::env::remove_var("TOOLPORT_RESULT_BUDGET"),
+        }
+
+        assert_eq!(result["isError"].as_bool(), Some(true));
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("[Toolport shaped this result"),
+            "test needs an actually-shaped result to be meaningful; got: {text}"
+        );
+        assert!(
+            text.contains("checkpoint:") && text.contains("lastInsertedId"),
+            "the checkpoint must survive head-first shaping in the text body; got: {text}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_is_surfaced_in_structured_content_on_failure() {
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        let args = json!({
+            "script": "toolport.checkpoint({ lastInsertedId: 7 }); throw new Error('boom');"
+        });
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+
+        assert_eq!(result["isError"].as_bool(), Some(true));
+        assert_eq!(
+            result["structuredContent"]["toolportScript"]["checkpoint"],
+            json!({ "lastInsertedId": 7 })
+        );
+    }
+
+    #[test]
+    fn checkpoint_absent_when_the_script_never_calls_it() {
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        let args = json!({ "script": "throw new Error('boom');" });
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+
+        assert_eq!(result["isError"].as_bool(), Some(true));
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            !text.contains("checkpoint:"),
+            "no checkpoint text should appear when the script never called it; got: {text}"
+        );
+        assert_eq!(
+            result["structuredContent"]["toolportScript"]["checkpoint"],
+            Value::Null
         );
     }
 
