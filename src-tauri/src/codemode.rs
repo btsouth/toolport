@@ -338,6 +338,10 @@ struct HostState {
     /// Last checkpoint value the script recorded via `toolport.checkpoint(value)`.
     /// Last-write-wins — a fresh call overwrites, it doesn't append (#663).
     checkpoint: Rc<RefCell<Option<Value>>>,
+    /// Maximum serialized checkpoint size for this run. This is capped against
+    /// the active result budget so an accepted checkpoint can always be surfaced
+    /// immediately when the script fails.
+    max_checkpoint_bytes: usize,
     max_calls: usize,
     max_parallel: usize,
     deadline: Instant,
@@ -349,13 +353,29 @@ struct HostState {
 /// failure response can surface it without becoming an unbounded escape hatch.
 const MAX_CHECKPOINT_BYTES: usize = 4096;
 
+/// Space reserved for the failure prefix, shaping marker, and MCP result
+/// envelope. The remainder of the active result budget is available to the
+/// checkpoint itself.
+const CHECKPOINT_RESPONSE_RESERVE_BYTES: usize = 1024;
+
+fn checkpoint_limit_for_result_budget(result_budget: usize) -> usize {
+    if result_budget == 0 {
+        MAX_CHECKPOINT_BYTES
+    } else {
+        MAX_CHECKPOINT_BYTES.min(result_budget.saturating_sub(CHECKPOINT_RESPONSE_RESERVE_BYTES))
+    }
+}
+
 fn store_checkpoint(
     checkpoint: &RefCell<Option<Value>>,
     raw: &str,
+    max_bytes: usize,
 ) -> Result<(), JsError> {
-    if raw.len() > MAX_CHECKPOINT_BYTES {
+    if raw.len() > max_bytes {
         return Err(JsError::from_native(JsNativeError::error().with_message(
-            format!("toolport.checkpoint value exceeds {MAX_CHECKPOINT_BYTES} bytes"),
+            format!(
+                "toolport.checkpoint value exceeds {max_bytes} bytes for the active result budget"
+            ),
         )));
     }
     let parsed: Value = serde_json::from_str(raw).map_err(|error| {
@@ -392,6 +412,7 @@ impl Clone for HostState {
             calls_made: Rc::clone(&self.calls_made),
             executed: Rc::clone(&self.executed),
             checkpoint: Rc::clone(&self.checkpoint),
+            max_checkpoint_bytes: self.max_checkpoint_bytes,
             max_calls: self.max_calls,
             max_parallel: self.max_parallel,
             deadline: self.deadline,
@@ -659,6 +680,8 @@ pub fn run_script(
     let calls_made = Rc::new(Cell::new(0usize));
     let executed = Rc::new(RefCell::new(Vec::new()));
     let checkpoint = Rc::new(RefCell::new(None::<Value>));
+    let (result_budget, _warning) = crate::shaping::budget();
+    let max_checkpoint_bytes = checkpoint_limit_for_result_budget(result_budget);
     let pending = Rc::new(RefCell::new(VecDeque::new()));
     let deadline = Instant::now() + limits.wall_clock;
     let executor = Rc::new(BoundedJobExecutor::new(deadline, limits.max_promise_jobs));
@@ -688,6 +711,7 @@ pub fn run_script(
         calls_made: calls_made.clone(),
         executed: executed.clone(),
         checkpoint: checkpoint.clone(),
+        max_checkpoint_bytes,
         max_calls: limits.max_calls,
         max_parallel: limits.max_parallel.max(1),
         deadline,
@@ -742,7 +766,7 @@ pub fn run_script(
                 .and_then(JsValue::as_string)
                 .map(|s| s.to_std_string_escaped())
                 .unwrap_or_else(|| "null".to_string());
-            store_checkpoint(&state.checkpoint, &raw)?;
+            store_checkpoint(&state.checkpoint, &raw, state.max_checkpoint_bytes)?;
             Ok(JsValue::undefined())
         },
         state.clone(),
@@ -2075,15 +2099,24 @@ mod tests {
 
     #[test]
     fn malformed_checkpoint_json_is_rejected_without_dropping_the_prior_one() {
-        let checkpoint = RefCell::new(Some(json!({ "safe": true })));
-
-        let error = store_checkpoint(&checkpoint, "{not-json")
-            .expect_err("malformed checkpoint JSON must fail closed");
-        assert!(error.to_string().contains("invalid JSON"), "got: {error}");
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let out = run(
+            r#"
+                toolport.checkpoint({ safe: true });
+                try {
+                    __toolport_checkpoint('{not-json');
+                } catch (_) {}
+                return 'done';
+            "#,
+            json!({}),
+            call,
+            Limits::default(),
+        );
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
         assert_eq!(
-            checkpoint.into_inner(),
+            out.checkpoint,
             Some(json!({ "safe": true })),
-            "parsing must succeed before the last good checkpoint is replaced"
+            "malformed direct-binding input must not replace the last good checkpoint"
         );
     }
 

@@ -14558,7 +14558,7 @@ mod tests {
         let reg = Registry::default();
         let router = Arc::new(routed_router("s", "tool"));
         let args = json!({
-            "script": "toolport.checkpoint({ resume: 'x'.repeat(4000) }); throw new Error('E'.repeat(20000));"
+            "script": "toolport.checkpoint({ resume: 'x'.repeat(1000) }); try { toolport.checkpoint({ resume: 'y'.repeat(4000) }); } catch (_) {} throw new Error('E'.repeat(20000));"
         });
         let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
 
@@ -14569,10 +14569,18 @@ mod tests {
 
         assert_eq!(result["isError"].as_bool(), Some(true));
         let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("[Toolport shaped this result"),
+            "test needs an actually-shaped result to prove the budget is honored; got: {text}"
+        );
         assert!(text.contains("checkpoint:"), "missing checkpoint: {text}");
         assert!(
-            text.contains(&"x".repeat(4000)),
-            "a near-limit checkpoint must remain complete even when the configured shaping budget is smaller"
+            text.contains(&"x".repeat(1000)),
+            "the largest checkpoint accepted under a 2 KiB result budget must remain complete"
+        );
+        assert!(
+            !text.contains(&"y".repeat(4000)),
+            "a checkpoint too large for the active result budget must be rejected"
         );
     }
 
