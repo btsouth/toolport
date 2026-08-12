@@ -3158,22 +3158,60 @@ fn tools_per_server(tools: &[Value]) -> HashMap<String, usize> {
 /// server that is absent, or returned nothing at all, is indistinguishable here
 /// from one the user just disabled - and resurrecting a disabled server's tools
 /// from cache would be a far worse failure than briefly under-reporting one.
-fn preserve_collapsed_servers(new_tools: Vec<Value>, previous: &[Value]) -> Vec<Value> {
+/// Consecutive guarded rebuilds per server, so the rebuild path can confirm-then-accept
+/// exactly as [`conduit_lib::downstream::apply_catalog_refresh`] does on the refresh path.
+///
+/// Process-global because the three rebuild call sites do not share a struct, and a
+/// gateway process serves one client. Tests drive the pure function with their own map.
+static REBUILD_SHRINK_STREAKS: std::sync::LazyLock<Mutex<HashMap<String, u8>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// [`preserve_collapsed_servers`] against the process-global streak map.
+fn preserve_collapsed_servers_guarded(new_tools: Vec<Value>, previous: &[Value]) -> Vec<Value> {
+    let mut streaks = REBUILD_SHRINK_STREAKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    preserve_collapsed_servers(new_tools, previous, &mut streaks)
+}
+
+fn preserve_collapsed_servers(
+    new_tools: Vec<Value>,
+    previous: &[Value],
+    streaks: &mut HashMap<String, u8>,
+) -> Vec<Value> {
     if previous.is_empty() {
         return new_tools;
     }
     let before = tools_per_server(previous);
     let after = tools_per_server(&new_tools);
-    let collapsed: Vec<String> = after
-        .iter()
-        .filter(|(server, &now)| {
-            now > 0
-                && before
-                    .get(*server)
-                    .is_some_and(|&was| conduit_lib::downstream::is_implausible_shrink(was, now))
-        })
-        .map(|(server, _)| server.clone())
-        .collect();
+    // Confirm-then-accept, mirroring the refresh path. Holding a collapse forever
+    // would pin a server whose catalog genuinely shrank (revoked scopes, an admin
+    // pruning tools) to a stale catalog with no way back, which is the failure the
+    // refresh guard's streak exists to avoid - the rebuild guard must not disagree.
+    let mut collapsed: Vec<String> = Vec::new();
+    for (server, &now) in &after {
+        let Some(&was) = before.get(server) else {
+            continue;
+        };
+        if now == 0 || !conduit_lib::downstream::is_implausible_shrink(was, now) {
+            streaks.remove(server);
+            continue;
+        }
+        let streak = streaks.entry(server.clone()).or_insert(0);
+        *streak = streak.saturating_add(1);
+        if *streak < conduit_lib::downstream::EMPTY_CATALOG_CONFIRMATIONS {
+            collapsed.push(server.clone());
+        } else {
+            glog(&format!(
+                "toolport: accepting rebuilt catalog collapse {was} -> {now} for server '{server}' after {} consecutive rebuilds",
+                conduit_lib::downstream::EMPTY_CATALOG_CONFIRMATIONS
+            ));
+            streaks.remove(server);
+        }
+    }
+    // A server that vanished from the rebuild is not evidence either way; drop its
+    // streak so a later genuine collapse starts counting from zero.
+    streaks.retain(|server, _| after.contains_key(server));
     if collapsed.is_empty() {
         return new_tools;
     }
@@ -3187,10 +3225,12 @@ fn preserve_collapsed_servers(new_tools: Vec<Value>, previous: &[Value]) -> Vec<
         .collect();
     for server in &collapsed {
         glog(&format!(
-            "toolport: server '{}' rebuilt with {} tool(s) but was {}; keeping the previous catalog for it",
+            "toolport: server '{}' rebuilt with {} tool(s) but was {}; keeping the previous catalog for it ({}/{})",
             server,
             after.get(server).copied().unwrap_or(0),
             before.get(server).copied().unwrap_or(0),
+            streaks.get(server).copied().unwrap_or(0),
+            conduit_lib::downstream::EMPTY_CATALOG_CONFIRMATIONS,
         ));
         guarded.extend(
             previous
@@ -7810,7 +7850,7 @@ fn persist_and_emit_with_sessions(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            preserve_collapsed_servers(tools.to_vec(), &current.tools)
+            preserve_collapsed_servers_guarded(tools.to_vec(), &current.tools)
         };
         let next = Arc::new(CatalogSnapshot::new(tools.clone()));
         let index_bytes = next.search.estimated_auxiliary_bytes();
@@ -10052,7 +10092,7 @@ fn process_request(
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone();
-                    preserve_collapsed_servers(tools, &current.tools)
+                    preserve_collapsed_servers_guarded(tools, &current.tools)
                 };
                 if !tools.is_empty() {
                     *state
@@ -12712,7 +12752,7 @@ fn main() {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone();
-                    preserve_collapsed_servers(tools, &current.tools)
+                    preserve_collapsed_servers_guarded(tools, &current.tools)
                 };
                 *cached_tools
                     .lock()
@@ -16510,7 +16550,7 @@ mod tests {
             .chain((0..5).map(|i| json!({"name": format!("github__g{i}")})))
             .collect();
 
-        let guarded = preserve_collapsed_servers(rebuilt, &previous);
+        let guarded = preserve_collapsed_servers(rebuilt, &previous, &mut HashMap::new());
         let counts = tools_per_server(&guarded);
         assert_eq!(counts.get("atlassian").copied(), Some(40), "collapse held");
         assert_eq!(counts.get("github").copied(), Some(5), "healthy untouched");
@@ -16526,7 +16566,7 @@ mod tests {
             .collect();
         let rebuilt = vec![json!({"name": "github__g0"})];
 
-        let guarded = preserve_collapsed_servers(rebuilt, &previous);
+        let guarded = preserve_collapsed_servers(rebuilt, &previous, &mut HashMap::new());
         let counts = tools_per_server(&guarded);
         assert_eq!(counts.get("atlassian").copied(), None, "stayed removed");
         assert_eq!(counts.get("github").copied(), Some(1));
@@ -16540,8 +16580,57 @@ mod tests {
         let rebuilt: Vec<Value> = (0..12)
             .map(|i| json!({"name": format!("linear__t{i}")}))
             .collect();
-        let guarded = preserve_collapsed_servers(rebuilt, &previous);
+        let guarded = preserve_collapsed_servers(rebuilt, &previous, &mut HashMap::new());
         assert_eq!(tools_per_server(&guarded).get("linear").copied(), Some(12));
+    }
+
+    fn atlassian_catalog(n: usize) -> Vec<Value> {
+        (0..n)
+            .map(|i| json!({"name": format!("atlassian__t{i}")}))
+            .collect()
+    }
+
+    #[test]
+    fn a_confirmed_rebuild_collapse_is_accepted_on_the_second_pass() {
+        // The refresh path accepts a collapse after EMPTY_CATALOG_CONFIRMATIONS
+        // agreeing refreshes. The rebuild path must not disagree: holding forever
+        // pins a genuinely downsized server (revoked scopes, an admin pruning
+        // tools) to a stale catalog with no way back.
+        let previous = atlassian_catalog(40);
+        let rebuilt = atlassian_catalog(3);
+        let mut streaks = HashMap::new();
+
+        let first = preserve_collapsed_servers(rebuilt.clone(), &previous, &mut streaks);
+        assert_eq!(
+            tools_per_server(&first).get("atlassian").copied(),
+            Some(40),
+            "first collapse is held pending confirmation"
+        );
+        let second = preserve_collapsed_servers(rebuilt, &previous, &mut streaks);
+        assert_eq!(
+            tools_per_server(&second).get("atlassian").copied(),
+            Some(3),
+            "a second agreeing rebuild confirms the downsizing"
+        );
+    }
+
+    #[test]
+    fn a_recovered_rebuild_clears_the_collapse_streak() {
+        // A held collapse followed by a healthy rebuild must not leave the server one
+        // step from acceptance. Otherwise two unrelated blips, months apart, would
+        // combine into a "confirmation" and drop 37 tools on the strength of one.
+        let previous = atlassian_catalog(40);
+        let mut streaks = HashMap::new();
+
+        preserve_collapsed_servers(atlassian_catalog(3), &previous, &mut streaks);
+        preserve_collapsed_servers(atlassian_catalog(40), &previous, &mut streaks);
+        let after_recovery =
+            preserve_collapsed_servers(atlassian_catalog(3), &previous, &mut streaks);
+        assert_eq!(
+            tools_per_server(&after_recovery).get("atlassian").copied(),
+            Some(40),
+            "the recovery reset the streak, so this collapse is held again"
+        );
     }
 
     #[test]

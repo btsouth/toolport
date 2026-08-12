@@ -438,7 +438,7 @@ impl CacheHint {
 /// empty successes are treated as intentional (admin revoked tools, server
 /// emptied the catalog) and the wipe is accepted. A full router rebuild still
 /// replaces catalogs from a fresh connect regardless of this counter.
-const EMPTY_CATALOG_CONFIRMATIONS: u8 = 2;
+pub const EMPTY_CATALOG_CONFIRMATIONS: u8 = 2;
 
 /// True when a refresh returns so much less than the previous catalog that it is
 /// more likely a degraded answer than a real change.
