@@ -106,7 +106,12 @@ function Install-Toolport {
         $status = $null
         if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
         if ($status -eq 404) {
-            throw "No release tagged $tag. See $releasesUrl for what's published."
+            # $tag is null on the releases/latest lookup, which 404s when every
+            # release is still a draft.
+            if ($tag) {
+                throw "No release tagged $tag. See $releasesUrl for what's published."
+            }
+            throw "There is no published Toolport release yet. See $releasesUrl."
         }
         if ($status -eq 403 -or $status -eq 429) {
             throw "GitHub rate-limited this machine. Wait an hour, or set `$env:GITHUB_TOKEN to a personal access token and re-run."
