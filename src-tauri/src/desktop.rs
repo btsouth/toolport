@@ -2170,7 +2170,9 @@ fn release_quarantine(
     } else {
         Some(profile.as_str())
     };
-    if !integrity::release(prof, &tool) {
+    if !integrity::release(prof, &tool)
+        .map_err(|e| format!("Could not re-approve {tool}: {e}"))?
+    {
         // Idempotent across app/gateway instances: another process may have released the
         // same tool after this UI last polled. Only report failure when the persisted store
         // still says it is blocked (or cannot be read), which also preserves the useful

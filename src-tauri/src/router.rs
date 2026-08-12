@@ -2579,7 +2579,7 @@ mod tests {
             "server": "srv", "tool": "search", "change": "poison", "severity": "high"
         })];
         assert!(
-            integrity::apply_quarantine(profile, &current, &events),
+            integrity::apply_quarantine(profile, &current, &events).unwrap(),
             "a poison drift on a renamed tool must quarantine it"
         );
 
@@ -2599,7 +2599,10 @@ mod tests {
         assert!(err.contains("quarantine"), "a call to a quarantined rename must block: {err}");
 
         // Re-approve: release clears the persisted set and the router restores the tool.
-        assert!(integrity::release(profile, "search"), "release must clear the entry");
+        assert!(
+            integrity::release(profile, "search").unwrap(),
+            "release must clear the entry"
+        );
         let after = integrity::quarantined(profile).expect("quarantine store readable");
         assert!(!after.contains("search"), "a released tool leaves the persisted set");
         router.requarantine(after);
