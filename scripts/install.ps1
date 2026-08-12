@@ -166,7 +166,9 @@ Refusing to install it. Either:
     $work = Join-Path ([IO.Path]::GetTempPath()) ("toolport-install-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $work -Force | Out-Null
     try {
-        $exe = Join-Path $work $asset.name
+        # GetFileName so a release asset named with a path separator can't place
+        # the download outside the temp directory.
+        $exe = Join-Path $work ([IO.Path]::GetFileName($asset.name))
         $sizeMb = if ($asset.size) { " ({0:N1} MB)" -f ($asset.size / 1MB) } else { "" }
         Say "Downloading $($asset.name)$sizeMb"
         # Progress rendering makes Invoke-WebRequest roughly an order of magnitude
@@ -206,8 +208,10 @@ $hashAlgorithm mismatch for $($asset.name). Deleting the download and stopping.
         # match the file it's on is fatal.
         $signature = Get-AuthenticodeSignature -FilePath $exe
         $publisher = $null
-        if ($signature.SignerCertificate -and $signature.SignerCertificate.Subject -match "CN=([^,]+)") {
-            $publisher = $Matches[1].Trim('"')
+        # A CN containing a comma is quoted in the subject ('CN="South, Brandon", O=...'),
+        # so match the quoted form first or the name comes out truncated.
+        if ($signature.SignerCertificate -and $signature.SignerCertificate.Subject -match 'CN=("[^"]*"|[^,]+)') {
+            $publisher = $Matches[1].Trim('"').Trim()
         }
         switch ($signature.Status) {
             "Valid" { Say "Authenticode signature valid$(if ($publisher) { ": $publisher" })" }
@@ -275,12 +279,15 @@ $hashAlgorithm mismatch for $($asset.name). Deleting the download and stopping.
 
     # NSIS writes these quoted, and the app's binary is named after the crate
     # (conduit.exe), not the product, so take the name the installer recorded.
-    $installDir = $entry.InstallLocation.Trim('"')
-    Say "Installed Toolport $($entry.DisplayVersion) to $installDir"
+    # Both values are treated as optional: the install already succeeded by the
+    # time we read them, so a key that's missing a value is worth a vaguer
+    # message, not a failure report for a working install.
+    $installDir = if ($entry.InstallLocation) { $entry.InstallLocation.Trim('"') } else { $null }
+    Say "Installed Toolport $($entry.DisplayVersion)$(if ($installDir) { " to $installDir" })"
     if ($entry.DisplayVersion -and $tag -and $entry.DisplayVersion -ne $tag.TrimStart("v")) {
         Warn "That's not the $tag this script downloaded - an existing newer install may have won."
     }
-    $launcher = if ($entry.MainBinaryName) {
+    $launcher = if ($installDir -and $entry.MainBinaryName) {
         Join-Path $installDir $entry.MainBinaryName
     } elseif ($entry.DisplayIcon) {
         $entry.DisplayIcon.Trim('"')
@@ -302,4 +309,7 @@ try {
 } finally {
     $ErrorActionPreference = $prevErrorAction
     $ProgressPreference = $prevProgress
+    # Under `iex` the function is defined in the caller's session, so clear it too
+    # rather than leaving an Install-Toolport behind in their shell.
+    Remove-Item Function:\Install-Toolport -ErrorAction SilentlyContinue
 }
