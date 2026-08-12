@@ -3132,6 +3132,80 @@ fn server_of_tool(name: &str) -> &str {
     name.split_once("__").map(|(s, _)| s).unwrap_or(name)
 }
 
+/// Count a flat aggregated catalog by owning server.
+fn tools_per_server(tools: &[Value]) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for tool in tools {
+        if let Some(name) = tool.get("name").and_then(Value::as_str) {
+            *counts.entry(server_of_tool(name).to_string()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+/// Keep a server's previous catalog when a rebuild produced an implausibly
+/// smaller one for it.
+///
+/// A router rebuild replaces catalogs from *fresh connects*, which never consult
+/// [`conduit_lib::downstream::is_implausible_shrink`] - that guard only sits on
+/// the in-place refresh path. So a downstream that answers `tools/list`
+/// successfully but with a degraded subset (Atlassian returns 3 of its 40 tools
+/// when its token loses scope) gets that subset published to clients AND written
+/// to `tool-cache.json`, where every gateway that starts next inherits it. This
+/// is the rebuild-path half of the same policy.
+///
+/// Deliberately only guards servers that came back with at least one tool. A
+/// server that is absent, or returned nothing at all, is indistinguishable here
+/// from one the user just disabled - and resurrecting a disabled server's tools
+/// from cache would be a far worse failure than briefly under-reporting one.
+fn preserve_collapsed_servers(new_tools: Vec<Value>, previous: &[Value]) -> Vec<Value> {
+    if previous.is_empty() {
+        return new_tools;
+    }
+    let before = tools_per_server(previous);
+    let after = tools_per_server(&new_tools);
+    let collapsed: Vec<String> = after
+        .iter()
+        .filter(|(server, &now)| {
+            now > 0
+                && before
+                    .get(*server)
+                    .is_some_and(|&was| conduit_lib::downstream::is_implausible_shrink(was, now))
+        })
+        .map(|(server, _)| server.clone())
+        .collect();
+    if collapsed.is_empty() {
+        return new_tools;
+    }
+    let mut guarded: Vec<Value> = new_tools
+        .into_iter()
+        .filter(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_none_or(|name| !collapsed.iter().any(|s| s == server_of_tool(name)))
+        })
+        .collect();
+    for server in &collapsed {
+        glog(&format!(
+            "toolport: server '{}' rebuilt with {} tool(s) but was {}; keeping the previous catalog for it",
+            server,
+            after.get(server).copied().unwrap_or(0),
+            before.get(server).copied().unwrap_or(0),
+        ));
+        guarded.extend(
+            previous
+                .iter()
+                .filter(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| server_of_tool(name) == server.as_str())
+                })
+                .cloned(),
+        );
+    }
+    guarded
+}
+
 /// Whether the exposed tool `name` is destructive, for the HITL / confirm gate. Resolves
 /// from the cached catalog first, then the LIVE router if the cache doesn't list it (a
 /// cold or stale cache, or a tool whose `destructiveHint` was just added by drift). If
@@ -7731,7 +7805,14 @@ fn persist_and_emit_with_sessions(
 ) {
     if !tools.is_empty() {
         let started = Instant::now();
-        let next = Arc::new(CatalogSnapshot::new(tools.to_vec()));
+        let tools = {
+            let current = cached_tools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            preserve_collapsed_servers(tools.to_vec(), &current.tools)
+        };
+        let next = Arc::new(CatalogSnapshot::new(tools.clone()));
         let index_bytes = next.search.estimated_auxiliary_bytes();
         *cached_tools
             .lock()
@@ -7742,33 +7823,20 @@ fn persist_and_emit_with_sessions(
             index_bytes.div_ceil(1024),
             started.elapsed().as_secs_f64() * 1000.0
         ));
-        save_tool_cache(tools, profile);
+        save_tool_cache(&tools, profile);
     }
     notify_tools_changed(stdout, mcp_sessions);
 }
 
-/// Keep the always-on gateway log bounded; trimmed to roughly the back half once
-/// it grows past this, so a long-running client can't let it grow without limit.
-const GATEWAY_LOG_CAP: u64 = 256 * 1024;
-
 /// Append a line to the always-on gateway log (connection lifecycle: starts,
 /// connect successes and failures). This is what `gather_diagnostics` bundles
 /// into a bug report, so it stays on regardless of `CONDUIT_DEBUG`.
+///
+/// The implementation lives in the library so `downstream` can reach the same
+/// file: a truncated catalog is only visible there, and stderr does not survive
+/// an MCP client.
 fn glog(msg: &str) {
-    let Some(path) = registry::gateway_log_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = f.write_all(format!("{msg}\n").as_bytes());
-    }
-    trim_log_if_large(&path);
+    conduit_lib::gatewaylog::append(msg);
 }
 
 /// Per-request trace, gated behind `TOOLPORT_DEBUG` / `CONDUIT_DEBUG` so the
@@ -7778,28 +7846,6 @@ fn gtrace(msg: &str) {
     if conduit_lib::brand::env_var_os("TOOLPORT_DEBUG", "CONDUIT_DEBUG").is_some() {
         glog(msg);
     }
-}
-
-/// Trim the log to its back half (on a line boundary) once it exceeds the cap.
-/// Best-effort: a read/rewrite race between concurrent gateways at worst drops a
-/// few diagnostic lines, which is fine for a log.
-fn trim_log_if_large(path: &Path) {
-    let over = std::fs::metadata(path)
-        .map(|m| m.len() > GATEWAY_LOG_CAP)
-        .unwrap_or(false);
-    if !over {
-        return;
-    }
-    let Ok(data) = std::fs::read(path) else {
-        return;
-    };
-    let keep_from = data.len().saturating_sub((GATEWAY_LOG_CAP / 2) as usize);
-    let start = data[keep_from..]
-        .iter()
-        .position(|&b| b == b'\n')
-        .map(|i| keep_from + i + 1)
-        .unwrap_or(keep_from);
-    let _ = std::fs::write(path, &data[start..]);
 }
 
 /// Cache file for a given profile. Scoped clients get their own file
@@ -9998,6 +10044,16 @@ fn process_request(
                     .router
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(built);
+                let tools = if tools.is_empty() {
+                    tools
+                } else {
+                    let current = state
+                        .cached_tools
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    preserve_collapsed_servers(tools, &current.tools)
+                };
                 if !tools.is_empty() {
                     *state
                         .cached_tools
@@ -12648,6 +12704,16 @@ fn main() {
             // every downstream momentarily unreachable) clobber a good catalog -
             // that's what leaves a client showing only toolport_status.
             if !tools.is_empty() {
+                // The disk cache loaded at startup is the baseline here, so a cold
+                // start that reaches a degraded downstream cannot overwrite a
+                // known-good catalog with its subset.
+                let tools = {
+                    let current = cached_tools
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    preserve_collapsed_servers(tools, &current.tools)
+                };
                 *cached_tools
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -16428,6 +16494,54 @@ mod tests {
         assert_eq!(server_of_tool("resend__send_email"), "resend");
         // A meta-tool has no namespace; the whole name is returned.
         assert_eq!(server_of_tool("toolport_status"), "toolport_status");
+    }
+
+    #[test]
+    fn a_rebuild_keeps_the_previous_catalog_for_a_collapsed_server() {
+        // A router rebuild replaces catalogs from fresh connects, so the in-place
+        // refresh guard never sees it. Without this, a degraded Atlassian answer
+        // lands in tool-cache.json and every gateway started afterwards inherits it.
+        let previous: Vec<Value> = (0..40)
+            .map(|i| json!({"name": format!("atlassian__t{i}")}))
+            .chain((0..5).map(|i| json!({"name": format!("github__g{i}")})))
+            .collect();
+        let rebuilt: Vec<Value> = (0..3)
+            .map(|i| json!({"name": format!("atlassian__t{i}")}))
+            .chain((0..5).map(|i| json!({"name": format!("github__g{i}")})))
+            .collect();
+
+        let guarded = preserve_collapsed_servers(rebuilt, &previous);
+        let counts = tools_per_server(&guarded);
+        assert_eq!(counts.get("atlassian").copied(), Some(40), "collapse held");
+        assert_eq!(counts.get("github").copied(), Some(5), "healthy untouched");
+    }
+
+    #[test]
+    fn a_rebuild_does_not_resurrect_a_server_that_returned_nothing() {
+        // Absent or empty is indistinguishable from "the user disabled it", and
+        // reviving a disabled server's tools from cache is worse than
+        // under-reporting one.
+        let previous: Vec<Value> = (0..40)
+            .map(|i| json!({"name": format!("atlassian__t{i}")}))
+            .collect();
+        let rebuilt = vec![json!({"name": "github__g0"})];
+
+        let guarded = preserve_collapsed_servers(rebuilt, &previous);
+        let counts = tools_per_server(&guarded);
+        assert_eq!(counts.get("atlassian").copied(), None, "stayed removed");
+        assert_eq!(counts.get("github").copied(), Some(1));
+    }
+
+    #[test]
+    fn a_rebuild_that_grows_or_holds_steady_is_passed_through() {
+        let previous: Vec<Value> = (0..10)
+            .map(|i| json!({"name": format!("linear__t{i}")}))
+            .collect();
+        let rebuilt: Vec<Value> = (0..12)
+            .map(|i| json!({"name": format!("linear__t{i}")}))
+            .collect();
+        let guarded = preserve_collapsed_servers(rebuilt, &previous);
+        assert_eq!(tools_per_server(&guarded).get("linear").copied(), Some(12));
     }
 
     #[test]
@@ -22400,6 +22514,7 @@ mod tests {
     fn trim_log_bounds_size_and_keeps_a_line_boundary() {
         // A file past the cap is trimmed to its back half, starting at a clean
         // line boundary, and the most recent line survives.
+        use conduit_lib::gatewaylog::{trim_log_if_large, GATEWAY_LOG_CAP};
         let path = std::env::temp_dir().join("conduit-trim-test.log");
         let filler = "x".repeat(GATEWAY_LOG_CAP as usize + 8192);
         std::fs::write(&path, format!("OLDEST\n{filler}\nNEWEST\n")).unwrap();

@@ -430,8 +430,8 @@ impl CacheHint {
     }
 }
 
-/// Consecutive successful empty list responses required before we accept a wipe
-/// of a previously non-empty catalog (SOU-338).
+/// Consecutive successful shrunken list responses required before we accept a
+/// collapse of a previously larger catalog (SOU-338, extended).
 ///
 /// **Decision (CodeRev on #629):** a single empty success is treated as a
 /// transient glitch / list_changed race and is not applied. Two consecutive
@@ -440,39 +440,66 @@ impl CacheHint {
 /// replaces catalogs from a fresh connect regardless of this counter.
 const EMPTY_CATALOG_CONFIRMATIONS: u8 = 2;
 
-/// Apply a successful list refresh with SOU-338 empty-success handling.
+/// True when a refresh returns so much less than the previous catalog that it is
+/// more likely a degraded answer than a real change.
 ///
-/// - Non-empty `new_items` always replaces and clears the empty streak.
-/// - Empty `new_items` when `previous` is already empty is a no-op replace.
-/// - Empty `new_items` when `previous` is non-empty increments `empty_streak`;
-///   only at [`EMPTY_CATALOG_CONFIRMATIONS`] is the wipe accepted.
+/// The original rule only caught a shrink all the way to zero, which let the
+/// interesting case straight through: a remote server that answers `tools/list`
+/// successfully but with a *subset* of its catalog. Atlassian does exactly this -
+/// it returns its 3 beta Teamwork Graph tools instead of the full 40 when the
+/// access token is degraded - and the response is a perfectly well-formed
+/// success, indistinguishable at the transport layer from the server genuinely
+/// having 3 tools. Nothing downstream can tell those apart; only the size of the
+/// drop can.
+///
+/// Losing more than half a catalog in one refresh is the signal. Empty is just
+/// this rule's degenerate case (`0 * 2 < previous` for any non-empty previous),
+/// so the two policies stay unified rather than drifting apart.
+pub fn is_implausible_shrink(previous: usize, new: usize) -> bool {
+    new * 2 < previous
+}
+
+/// Apply a successful list refresh, holding off on an implausible collapse.
+///
+/// - A refresh that keeps at least half the previous catalog always replaces it
+///   and clears the streak.
+/// - A refresh that loses more than half increments `shrink_streak`; only at
+///   [`EMPTY_CATALOG_CONFIRMATIONS`] consecutive confirmations is it accepted.
+///   Requiring confirmation rather than refusing outright keeps a genuine
+///   downsizing (revoked scopes, an admin pruning tools) from being pinned to a
+///   stale catalog forever.
 fn apply_catalog_refresh(
     previous: &mut Vec<Value>,
     new_items: Vec<Value>,
-    empty_streak: &mut u8,
+    shrink_streak: &mut u8,
     cache_hint: &mut CacheHint,
     new_hint: CacheHint,
     server_id: &str,
     kind: &str,
 ) {
-    if !previous.is_empty() && new_items.is_empty() {
-        *empty_streak = empty_streak.saturating_add(1);
-        if *empty_streak < EMPTY_CATALOG_CONFIRMATIONS {
+    if is_implausible_shrink(previous.len(), new_items.len()) {
+        *shrink_streak = shrink_streak.saturating_add(1);
+        let (before, after) = (previous.len(), new_items.len());
+        if *shrink_streak < EMPTY_CATALOG_CONFIRMATIONS {
             cache_hint.mark_stale_and_defer();
-            eprintln!(
-                "toolport: keeping server '{server_id}' previous {kind} catalog after a successful empty refresh ({empty_streak}/{EMPTY_CATALOG_CONFIRMATIONS})"
+            let msg = format!(
+                "toolport: keeping server '{server_id}' previous {kind} catalog after a successful refresh collapsed it {before} -> {after} ({shrink_streak}/{EMPTY_CATALOG_CONFIRMATIONS})"
             );
+            eprintln!("{msg}");
+            crate::gatewaylog::append(&msg);
             return;
         }
-        eprintln!(
-            "toolport: accepting empty {kind} catalog for server '{server_id}' after {EMPTY_CATALOG_CONFIRMATIONS} consecutive empty refreshes"
+        let msg = format!(
+            "toolport: accepting {kind} catalog collapse {before} -> {after} for server '{server_id}' after {EMPTY_CATALOG_CONFIRMATIONS} consecutive confirmations"
         );
-        *empty_streak = 0;
+        eprintln!("{msg}");
+        crate::gatewaylog::append(&msg);
+        *shrink_streak = 0;
         *cache_hint = new_hint;
         *previous = new_items;
         return;
     }
-    *empty_streak = 0;
+    *shrink_streak = 0;
     *cache_hint = new_hint;
     *previous = new_items;
 }
@@ -4497,12 +4524,13 @@ pub struct DownstreamServer {
     resource_cache_hint: CacheHint,
     resource_template_cache_hint: CacheHint,
     prompt_cache_hint: CacheHint,
-    /// Consecutive successful empty tools/list responses while tools were non-empty
-    /// (SOU-338). Reset on any non-empty refresh. See [`EMPTY_CATALOG_CONFIRMATIONS`].
-    empty_tools_streak: u8,
-    empty_resources_streak: u8,
-    empty_templates_streak: u8,
-    empty_prompts_streak: u8,
+    /// Consecutive successful tools/list responses that collapsed the catalog to
+    /// less than half its previous size (SOU-338, extended to partial collapses).
+    /// Reset on any plausible refresh. See [`EMPTY_CATALOG_CONFIRMATIONS`].
+    shrink_tools_streak: u8,
+    shrink_resources_streak: u8,
+    shrink_templates_streak: u8,
+    shrink_prompts_streak: u8,
     /// Whether the server's `initialize` advertised resources / prompts. The
     /// actual lists are fetched lazily via `load_resources_prompts`.
     caps_resources: bool,
@@ -4694,7 +4722,31 @@ impl DownstreamServer {
         let listed = fetch_paginated_list(&mut *transport, "tools/list", "tools")
             .map_err(|e| e.to_string())?;
         if let Some(warning) = &listed.warning {
-            eprintln!("toolport: server '{id}' returned a partial tool catalog: {warning}");
+            let msg = format!(
+                "server '{id}' returned a partial tool catalog ({} tool(s)): {warning}",
+                listed.items.len()
+            );
+            eprintln!("toolport: {msg}");
+            // To the gateway log, not just stderr: an MCP client swallows a
+            // gateway's stderr, so this was the one place a silent truncation
+            // could have been caught and wasn't.
+            crate::gatewaylog::append(&format!("toolport: {msg}"));
+        }
+        // Refuse to adopt a prefix that only exists because a page failed. The
+        // catalog captured here is what gets published to clients AND persisted to
+        // `tool-cache.json`, and every later refresh declines to overwrite it with
+        // a partial - so a truncated catalog accepted at connect is not a transient
+        // glitch, it is a wrong answer that outlives the process that cached it and
+        // is served to every client that starts against that cache. Failing the
+        // connect keeps the previous cache intact and leaves a retry to the
+        // existing rebuild/self-heal path. `Bounded` truncation is kept: retrying
+        // it returns the same prefix, so the prefix is the real answer.
+        if listed.truncation == Some(Truncation::Transient) {
+            return Err(format!(
+                "incomplete tool catalog for '{id}' ({} tool(s) before traversal stopped): {}",
+                listed.items.len(),
+                listed.warning.unwrap_or_default()
+            ));
         }
         let modern_http = matches!(era, Era::Modern { .. }) && transport.supports_request_headers();
         let tools = if modern_http {
@@ -4737,10 +4789,10 @@ impl DownstreamServer {
             resource_cache_hint: CacheHint::default(),
             resource_template_cache_hint: CacheHint::default(),
             prompt_cache_hint: CacheHint::default(),
-            empty_tools_streak: 0,
-            empty_resources_streak: 0,
-            empty_templates_streak: 0,
-            empty_prompts_streak: 0,
+            shrink_tools_streak: 0,
+            shrink_resources_streak: 0,
+            shrink_templates_streak: 0,
+            shrink_prompts_streak: 0,
             caps_resources,
             caps_prompts,
             caps_completions,
@@ -4966,7 +5018,7 @@ impl DownstreamServer {
                 apply_catalog_refresh(
                     &mut self.tools,
                     new_tools,
-                    &mut self.empty_tools_streak,
+                    &mut self.shrink_tools_streak,
                     &mut self.tool_cache_hint,
                     listed.cache_hint,
                     &self.id,
@@ -4975,11 +5027,14 @@ impl DownstreamServer {
             }
             Ok(listed) => {
                 self.tool_cache_hint.mark_stale_and_defer();
-                eprintln!(
-                    "toolport: keeping server '{}' previous tool catalog after an incomplete refresh: {}",
+                let msg = format!(
+                    "toolport: keeping server '{}' previous tool catalog after an incomplete refresh ({} tool(s) fetched): {}",
                     self.id,
+                    listed.items.len(),
                     listed.warning.unwrap_or_default()
                 );
+                eprintln!("{msg}");
+                crate::gatewaylog::append(&msg);
             }
             Err(error) => {
                 self.tool_cache_hint.mark_stale_and_defer();
@@ -5022,7 +5077,7 @@ impl DownstreamServer {
                 apply_catalog_refresh(
                     &mut self.resources,
                     listed.items,
-                    &mut self.empty_resources_streak,
+                    &mut self.shrink_resources_streak,
                     &mut self.resource_cache_hint,
                     listed.cache_hint,
                     &self.id,
@@ -5056,7 +5111,7 @@ impl DownstreamServer {
                 apply_catalog_refresh(
                     &mut self.resource_templates,
                     listed.items,
-                    &mut self.empty_templates_streak,
+                    &mut self.shrink_templates_streak,
                     &mut self.resource_template_cache_hint,
                     listed.cache_hint,
                     &self.id,
@@ -5105,7 +5160,7 @@ impl DownstreamServer {
                 apply_catalog_refresh(
                     &mut self.prompts,
                     listed.items,
-                    &mut self.empty_prompts_streak,
+                    &mut self.shrink_prompts_streak,
                     &mut self.prompt_cache_hint,
                     listed.cache_hint,
                     &self.id,
@@ -5429,6 +5484,23 @@ fn extract_array(result: &Value, key: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// Why a paginated traversal stopped before the server ran out of pages.
+///
+/// The distinction decides whether the prefix we did collect is an *answer* or an
+/// *accident*, and callers must treat those differently: re-running a `Bounded`
+/// traversal returns the same prefix, so the prefix is the best result available,
+/// while re-running a `Transient` one probably returns the whole catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Truncation {
+    /// A page after the first failed, or the wall-clock cap tripped mid-chain.
+    /// The rest of the catalog still exists and another attempt can reach it, so
+    /// this prefix must never be mistaken for the server's real catalog.
+    Transient,
+    /// A defensive bound on catalog size was reached, or the server drove us into
+    /// a cursor loop. Deterministic: the prefix is all we will ever get.
+    Bounded,
+}
+
 struct PaginatedList {
     items: Vec<Value>,
     /// Minimum remaining TTL and most-private scope across every page. A partial
@@ -5438,6 +5510,32 @@ struct PaginatedList {
     /// Initial discovery may expose that useful prefix; refreshes keep the prior
     /// complete snapshot instead of replacing it with a partial catalog.
     warning: Option<String>,
+    /// Set whenever `warning` is. Kept in lockstep by the constructors below so
+    /// the two cannot drift into disagreeing about whether this list is complete.
+    truncation: Option<Truncation>,
+}
+
+impl PaginatedList {
+    /// Every page the server offered, traversed to the end.
+    fn complete(items: Vec<Value>, cache_hint: CacheHint) -> Self {
+        Self {
+            items,
+            cache_hint,
+            warning: None,
+            truncation: None,
+        }
+    }
+
+    /// A prefix. The cache hint collapses to the conservative default because a
+    /// partial traversal cannot vouch for the TTL or scope of the pages it missed.
+    fn truncated(items: Vec<Value>, truncation: Truncation, warning: String) -> Self {
+        Self {
+            items,
+            cache_hint: CacheHint::default(),
+            warning: Some(warning),
+            truncation: Some(truncation),
+        }
+    }
 }
 
 /// Traverse one MCP list operation using its opaque `nextCursor`. The first page
@@ -5457,14 +5555,16 @@ fn fetch_paginated_list(
 
     for page_index in 0..MAX_LIST_PAGES {
         if page_index > 0 && started.elapsed() >= MAX_LIST_DURATION {
-            return Ok(PaginatedList {
+            // A clock ran out, not a catalog. Whatever we are missing is still
+            // there to be fetched, so this is `Transient`.
+            return Ok(PaginatedList::truncated(
                 items,
-                cache_hint: CacheHint::default(),
-                warning: Some(format!(
+                Truncation::Transient,
+                format!(
                     "catalog traversal exceeded the {}-second safety cap",
                     MAX_LIST_DURATION.as_secs()
-                )),
-            });
+                ),
+            ));
         }
         let params = cursor
             .as_ref()
@@ -5472,11 +5572,11 @@ fn fetch_paginated_list(
         let result = match transport.request(method, params) {
             Ok(result) => result,
             Err(error) if page_index > 0 => {
-                return Ok(PaginatedList {
+                return Ok(PaginatedList::truncated(
                     items,
-                    cache_hint: CacheHint::default(),
-                    warning: Some(format!("page {} failed: {error}", page_index + 1)),
-                });
+                    Truncation::Transient,
+                    format!("page {} failed: {error}", page_index + 1),
+                ));
             }
             Err(error) => return Err(error),
         };
@@ -5488,16 +5588,26 @@ fn fetch_paginated_list(
         });
 
         let page = extract_array(&result, key);
+        // Per-page shape, behind the debug flag. Without this the only recorded
+        // fact is the final total, which cannot distinguish "the server owns a
+        // small catalog" from "we stopped reading a large one" - the ambiguity
+        // that made a truncated catalog impossible to diagnose after the fact.
+        if crate::brand::env_var_os("TOOLPORT_DEBUG", "CONDUIT_DEBUG").is_some() {
+            crate::gatewaylog::append(&format!(
+                "toolport: {method} page {} returned {} item(s), nextCursor={}",
+                page_index + 1,
+                page.len(),
+                result.get("nextCursor").and_then(Value::as_str).is_some()
+            ));
+        }
         let remaining = MAX_LIST_ITEMS.saturating_sub(items.len());
         if page.len() > remaining {
             items.extend(page.into_iter().take(remaining));
-            return Ok(PaginatedList {
+            return Ok(PaginatedList::truncated(
                 items,
-                cache_hint: CacheHint::default(),
-                warning: Some(format!(
-                    "catalog exceeded the {MAX_LIST_ITEMS}-item safety cap"
-                )),
-            });
+                Truncation::Bounded,
+                format!("catalog exceeded the {MAX_LIST_ITEMS}-item safety cap"),
+            ));
         }
         items.extend(page);
 
@@ -5506,29 +5616,26 @@ fn fetch_paginated_list(
             .and_then(Value::as_str)
             .map(str::to_string)
         else {
-            return Ok(PaginatedList {
+            return Ok(PaginatedList::complete(
                 items,
-                cache_hint: cache_hint.unwrap_or_default(),
-                warning: None,
-            });
+                cache_hint.unwrap_or_default(),
+            ));
         };
         if !seen_cursors.insert(next_cursor.clone()) {
-            return Ok(PaginatedList {
+            return Ok(PaginatedList::truncated(
                 items,
-                cache_hint: CacheHint::default(),
-                warning: Some("server repeated a pagination cursor".to_string()),
-            });
+                Truncation::Bounded,
+                "server repeated a pagination cursor".to_string(),
+            ));
         }
         cursor = Some(next_cursor);
     }
 
-    Ok(PaginatedList {
+    Ok(PaginatedList::truncated(
         items,
-        cache_hint: CacheHint::default(),
-        warning: Some(format!(
-            "catalog exceeded the {MAX_LIST_PAGES}-page safety cap"
-        )),
-    })
+        Truncation::Bounded,
+        format!("catalog exceeded the {MAX_LIST_PAGES}-page safety cap"),
+    ))
 }
 
 #[cfg(test)]
@@ -5538,8 +5645,9 @@ mod tests {
         file_uri_to_path, protocol_meta_for, resolve_command, resolve_project_root,
         resolve_root_token, screen_resolved_addrs, screen_spawn_command, screen_spawn_env,
         validate_cwd, CacheHint, CancelRegistry, DownstreamServer, HttpTransport, MrtrRequest,
-        RootSource, ServerRequestAction, ServerRequestHandler, Transport, TransportError,
-        MODERN_PROTOCOL_VERSION, OAUTH_CLIENT_CREDENTIALS_EXTENSION,
+        apply_catalog_refresh, is_implausible_shrink, RootSource, ServerRequestAction,
+        ServerRequestHandler, Transport, TransportError, Truncation, MODERN_PROTOCOL_VERSION,
+        OAUTH_CLIENT_CREDENTIALS_EXTENSION,
     };
     use serde_json::{json, Value};
     use std::collections::{HashMap, VecDeque};
@@ -5733,6 +5841,140 @@ mod tests {
     }
 
     #[test]
+    fn a_catalog_that_collapses_is_held_until_confirmed() {
+        // The Atlassian case: a *successful* tools/list that returns 3 of a
+        // server's 40 tools. Nothing about the response is malformed, so only the
+        // size of the drop can catch it.
+        let mut tools: Vec<Value> = (0..40).map(|i| json!({"name": format!("t{i}")})).collect();
+        let mut streak = 0u8;
+        let mut hint = CacheHint::default();
+        let degraded: Vec<Value> = (0..3).map(|i| json!({"name": format!("t{i}")})).collect();
+
+        apply_catalog_refresh(
+            &mut tools,
+            degraded.clone(),
+            &mut streak,
+            &mut hint,
+            CacheHint::default(),
+            "atlassian",
+            "tool",
+        );
+        assert_eq!(tools.len(), 40, "first collapse must not be applied");
+        assert_eq!(streak, 1);
+
+        // Confirmed twice: a real downsizing has to be able to land eventually.
+        apply_catalog_refresh(
+            &mut tools,
+            degraded,
+            &mut streak,
+            &mut hint,
+            CacheHint::default(),
+            "atlassian",
+            "tool",
+        );
+        assert_eq!(tools.len(), 3, "a confirmed collapse must be accepted");
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn an_ordinary_catalog_change_is_applied_immediately() {
+        // The guard must not add latency to normal churn: losing a few tools, or
+        // holding steady, is applied on the first refresh.
+        for new_len in [40usize, 39, 20] {
+            let mut tools: Vec<Value> = (0..40).map(|i| json!({"name": format!("t{i}")})).collect();
+            let mut streak = 0u8;
+            let mut hint = CacheHint::default();
+            apply_catalog_refresh(
+                &mut tools,
+                (0..new_len).map(|i| json!({"name": format!("t{i}")})).collect(),
+                &mut streak,
+                &mut hint,
+                CacheHint::default(),
+                "server",
+                "tool",
+            );
+            assert_eq!(tools.len(), new_len, "{new_len} should apply immediately");
+            assert_eq!(streak, 0);
+        }
+    }
+
+    #[test]
+    fn shrink_rule_treats_empty_as_the_degenerate_collapse() {
+        assert!(is_implausible_shrink(40, 3));
+        assert!(is_implausible_shrink(40, 0), "empty is still guarded");
+        assert!(!is_implausible_shrink(40, 20), "exactly half is plausible");
+        assert!(!is_implausible_shrink(0, 0), "no previous, nothing to lose");
+        assert!(!is_implausible_shrink(3, 40), "growth is never a collapse");
+    }
+
+    #[test]
+    fn a_failed_page_is_transient_and_a_safety_cap_is_bounded() {
+        // The two truncation classes must not be conflated: one says "ask again",
+        // the other says "this is all there is".
+        let mut failed_page = PaginationTransport::new(vec![
+            Ok(json!({"tools":[{"name":"one"}],"nextCursor":"two"})),
+            Err(TransportError::Unavailable("page two died".to_string())),
+        ]);
+        let listed = fetch_paginated_list(&mut failed_page, "tools/list", "tools").unwrap();
+        assert_eq!(listed.truncation, Some(Truncation::Transient));
+
+        let mut looping_cursor = PaginationTransport::new(vec![
+            Ok(json!({"tools":[{"name":"one"}],"nextCursor":"same"})),
+            Ok(json!({"tools":[{"name":"two"}],"nextCursor":"same"})),
+        ]);
+        let listed = fetch_paginated_list(&mut looping_cursor, "tools/list", "tools").unwrap();
+        assert_eq!(listed.truncation, Some(Truncation::Bounded));
+
+        let mut whole = PaginationTransport::new(vec![Ok(json!({"tools":[{"name":"one"}]}))]);
+        let listed = fetch_paginated_list(&mut whole, "tools/list", "tools").unwrap();
+        assert_eq!(listed.truncation, None);
+        assert!(listed.warning.is_none());
+    }
+
+    #[test]
+    fn connect_refuses_a_catalog_truncated_by_a_failed_page() {
+        // The regression this exists for: a server whose first page holds 1 of its
+        // tools and whose second page fails must NOT connect advertising that one
+        // tool as its catalog. That prefix would be published to clients and
+        // persisted to the on-disk tool cache, where every later refresh declines
+        // to overwrite it - so accepting it here strands the server on a wrong
+        // catalog that outlives the process.
+        let transport = PaginationTransport::new(vec![
+            Ok(json!({ "capabilities": {} })),
+            Ok(json!({"tools":[{"name":"first-page-only"}],"nextCursor":"two"})),
+            Err(TransportError::Unavailable(
+                "page two timed out".to_string(),
+            )),
+        ]);
+        let Err(err) = DownstreamServer::connect("fixture".to_string(), Box::new(transport)) else {
+            panic!("a transiently truncated catalog must fail the connect");
+        };
+        assert!(
+            err.contains("incomplete tool catalog"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("page two timed out"),
+            "error should carry the underlying cause: {err}"
+        );
+    }
+
+    #[test]
+    fn connect_keeps_a_catalog_truncated_by_a_safety_cap() {
+        // Bounded truncation is deterministic - retrying returns the same prefix -
+        // so refusing it would make an oversized or cursor-looping server
+        // permanently unusable rather than partially usable.
+        let transport = PaginationTransport::new(vec![
+            Ok(json!({ "capabilities": {} })),
+            Ok(json!({"tools":[{"name":"one"}],"nextCursor":"same"})),
+            Ok(json!({"tools":[{"name":"two"}],"nextCursor":"same"})),
+        ]);
+        let server = DownstreamServer::connect("fixture".to_string(), Box::new(transport))
+            .expect("a bounded truncation should still connect");
+        assert_eq!(server.tools.len(), 2);
+    }
+
+    #[test]
     fn downstream_server_loads_all_tool_resource_and_prompt_pages() {
         let transport = PaginationTransport::new(vec![
             Ok(json!({
@@ -5782,10 +6024,10 @@ mod tests {
             resource_cache_hint: CacheHint::default(),
             resource_template_cache_hint: CacheHint::default(),
             prompt_cache_hint: CacheHint::default(),
-            empty_tools_streak: 0,
-            empty_resources_streak: 0,
-            empty_templates_streak: 0,
-            empty_prompts_streak: 0,
+            shrink_tools_streak: 0,
+            shrink_resources_streak: 0,
+            shrink_templates_streak: 0,
+            shrink_prompts_streak: 0,
             caps_resources: false,
             caps_prompts: false,
             caps_completions: false,
@@ -5817,10 +6059,10 @@ mod tests {
             resource_cache_hint: CacheHint::default(),
             resource_template_cache_hint: CacheHint::default(),
             prompt_cache_hint: CacheHint::default(),
-            empty_tools_streak: 0,
-            empty_resources_streak: 0,
-            empty_templates_streak: 0,
-            empty_prompts_streak: 0,
+            shrink_tools_streak: 0,
+            shrink_resources_streak: 0,
+            shrink_templates_streak: 0,
+            shrink_prompts_streak: 0,
             caps_resources: false,
             caps_prompts: false,
             caps_completions: false,
@@ -5838,7 +6080,7 @@ mod tests {
             vec![json!({"name":"stable"})],
             "first successful empty list must not wipe prior tools"
         );
-        assert_eq!(server.empty_tools_streak, 1);
+        assert_eq!(server.shrink_tools_streak, 1);
     }
 
     /// CodeRev on #629 / SOU-338: two consecutive empty successes accept the wipe
@@ -5858,10 +6100,10 @@ mod tests {
             resource_cache_hint: CacheHint::default(),
             resource_template_cache_hint: CacheHint::default(),
             prompt_cache_hint: CacheHint::default(),
-            empty_tools_streak: 0,
-            empty_resources_streak: 0,
-            empty_templates_streak: 0,
-            empty_prompts_streak: 0,
+            shrink_tools_streak: 0,
+            shrink_resources_streak: 0,
+            shrink_templates_streak: 0,
+            shrink_prompts_streak: 0,
             caps_resources: false,
             caps_prompts: false,
             caps_completions: false,
@@ -5880,7 +6122,7 @@ mod tests {
             server.tools.is_empty(),
             "second consecutive empty success must accept the wipe"
         );
-        assert_eq!(server.empty_tools_streak, 0);
+        assert_eq!(server.shrink_tools_streak, 0);
     }
 
     /// SOU-338: empty success is allowed when the catalog was already empty
@@ -5899,10 +6141,10 @@ mod tests {
             resource_cache_hint: CacheHint::default(),
             resource_template_cache_hint: CacheHint::default(),
             prompt_cache_hint: CacheHint::default(),
-            empty_tools_streak: 0,
-            empty_resources_streak: 0,
-            empty_templates_streak: 0,
-            empty_prompts_streak: 0,
+            shrink_tools_streak: 0,
+            shrink_resources_streak: 0,
+            shrink_templates_streak: 0,
+            shrink_prompts_streak: 0,
             caps_resources: false,
             caps_prompts: false,
             caps_completions: false,
@@ -5937,10 +6179,10 @@ mod tests {
             resource_cache_hint: CacheHint::default(),
             resource_template_cache_hint: CacheHint::default(),
             prompt_cache_hint: CacheHint::default(),
-            empty_tools_streak: 0,
-            empty_resources_streak: 0,
-            empty_templates_streak: 0,
-            empty_prompts_streak: 0,
+            shrink_tools_streak: 0,
+            shrink_resources_streak: 0,
+            shrink_templates_streak: 0,
+            shrink_prompts_streak: 0,
             caps_resources: true,
             caps_prompts: true,
             caps_completions: false,
@@ -5984,10 +6226,10 @@ mod tests {
             resource_cache_hint: CacheHint::default(),
             resource_template_cache_hint: CacheHint::default(),
             prompt_cache_hint: CacheHint::default(),
-            empty_tools_streak: 0,
-            empty_resources_streak: 0,
-            empty_templates_streak: 0,
-            empty_prompts_streak: 0,
+            shrink_tools_streak: 0,
+            shrink_resources_streak: 0,
+            shrink_templates_streak: 0,
+            shrink_prompts_streak: 0,
             caps_resources: true,
             caps_prompts: false,
             caps_completions: false,
