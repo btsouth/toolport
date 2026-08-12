@@ -62,6 +62,23 @@ pub fn record_timed(
     record_timed_with_hash(server, tool, ok, duration_ms, error, client, None);
 }
 
+/// One pseudonymization pass's outcome, recorded so a reader can tell whether PII
+/// redaction did anything on this call -- and, far more importantly, when it did not
+/// fully apply.
+///
+/// Only the COUNT is ever recorded. The values are the entire point of the feature and
+/// must not reach this append-only log, which already holds only an `argsHash` for the
+/// same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PiiPass {
+    /// How many values were replaced with tokens.
+    pub replaced: usize,
+    /// False when the pass left values in the clear: the session map hit its cap, or
+    /// the result exceeded the scan cap. This path fails OPEN by design, so an
+    /// incomplete pass is the case a governance reader most needs to see.
+    pub complete: bool,
+}
+
 /// Same as [`record_timed`], optionally attaching a canonical args hash (SOU-171 export).
 /// Never stores the arguments themselves.
 pub fn record_timed_with_hash(
@@ -73,12 +90,74 @@ pub fn record_timed_with_hash(
     client: Option<&str>,
     args_hash: Option<&str>,
 ) {
+    record_timed_with_pii(
+        server,
+        tool,
+        ok,
+        duration_ms,
+        error,
+        client,
+        args_hash,
+        None,
+    )
+}
+
+/// Same as [`record_timed_with_hash`], also recording the call's pseudonymization pass.
+///
+/// `pii` is `None` when PII redaction was off for this call, which is deliberately
+/// distinct from `Some(PiiPass { replaced: 0, .. })` -- "the feature is not on" and "the
+/// feature ran and found nothing" are different facts, and collapsing them would make a
+/// disabled feature look like a clean call (SBS-607).
+#[allow(clippy::too_many_arguments)]
+pub fn record_timed_with_pii(
+    server: &str,
+    tool: &str,
+    ok: bool,
+    duration_ms: Option<u64>,
+    error: Option<&str>,
+    client: Option<&str>,
+    args_hash: Option<&str>,
+    pii: Option<PiiPass>,
+) {
+    write_line(&timed_entry(
+        server,
+        tool,
+        ok,
+        duration_ms,
+        error,
+        client,
+        args_hash,
+        pii,
+    ));
+}
+
+/// Build the tool-call audit entry. Pure (no I/O) so the record's shape is unit-testable,
+/// like [`decision_entry`] on the approval path.
+#[allow(clippy::too_many_arguments)]
+fn timed_entry(
+    server: &str,
+    tool: &str,
+    ok: bool,
+    duration_ms: Option<u64>,
+    error: Option<&str>,
+    client: Option<&str>,
+    args_hash: Option<&str>,
+    pii: Option<PiiPass>,
+) -> Value {
     let mut entry = json!({
         "ts": epoch_millis() as u64,
         "server": server,
         "tool": tool,
         "ok": ok,
     });
+    if let Some(pass) = pii {
+        entry["piiReplaced"] = json!(pass.replaced);
+        // Written only when something WAS left in the clear, so the anomalous case is
+        // greppable in the log rather than buried in a field that is usually `false`.
+        if !pass.complete {
+            entry["piiIncomplete"] = json!(true);
+        }
+    }
     if let Some(ms) = duration_ms {
         entry["durationMs"] = json!(ms);
     }
@@ -98,7 +177,7 @@ pub fn record_timed_with_hash(
             }
         }
     }
-    write_line(&entry);
+    entry
 }
 
 /// Record a destructive call that was held for confirmation. This is the
@@ -589,6 +668,11 @@ const CSV_COLUMNS: &[&str] = &[
     "heldMs",
     "action",
     "error",
+    // Appended at the END so a consumer reading the export positionally keeps working.
+    // How many values this call's result had pseudonymized, and whether any were left in
+    // the clear. Counts only -- the values never enter this log.
+    "piiReplaced",
+    "piiIncomplete",
 ];
 
 /// Render audit `entries` as CSV (RFC-4180-ish: CRLF rows, quoted cells, doubled
@@ -638,7 +722,7 @@ mod tests {
         })];
         let csv = to_csv(&entries);
         assert!(csv.starts_with(
-            "ts,server,tool,client,ok,held,kind,reason,decision,argsHash,durationMs,heldMs,action,error\r\n"
+            "ts,server,tool,client,ok,held,kind,reason,decision,argsHash,durationMs,heldMs,action,error,piiReplaced,piiIncomplete\r\n"
         ));
         assert!(csv.contains("\"gh\""));
         assert!(csv.contains("\"search\""));
@@ -826,6 +910,90 @@ mod tests {
         assert_eq!(approved["decision"], "approved");
         assert_eq!(approved["held"], false);
         assert_eq!(approved["ok"], true);
+    }
+
+    #[test]
+    fn timed_entry_records_the_pii_pass_as_a_count_and_flags_an_incomplete_one() {
+        let pass = |replaced, complete| {
+            timed_entry(
+                "crm",
+                "crm__lookup",
+                true,
+                Some(12),
+                None,
+                Some("claude"),
+                Some("deadbeef"),
+                Some(PiiPass { replaced, complete }),
+            )
+        };
+
+        // A complete pass records the count only. `piiIncomplete` is written just for the
+        // fail-open case, so its absence is the "fully applied" signal.
+        let clean = pass(3, true);
+        assert_eq!(clean["piiReplaced"], 3);
+        assert!(clean.get("piiIncomplete").is_none());
+
+        // The fail-open case is the one a reader must be able to see: values reached the
+        // model in the clear even though redaction was on.
+        let leaky = pass(2, false);
+        assert_eq!(leaky["piiReplaced"], 2);
+        assert_eq!(leaky["piiIncomplete"], true);
+
+        // Redaction on but nothing detected is NOT the same fact as redaction off, so the
+        // field is present and zero rather than absent.
+        let nothing_found = pass(0, true);
+        assert_eq!(nothing_found["piiReplaced"], 0);
+
+        // Redaction off: no PII fields at all, so an untouched call can't be misread as a
+        // clean redaction pass.
+        let off = timed_entry(
+            "crm",
+            "crm__lookup",
+            true,
+            Some(12),
+            None,
+            Some("claude"),
+            Some("deadbeef"),
+            None,
+        );
+        assert!(off.get("piiReplaced").is_none());
+        assert!(off.get("piiIncomplete").is_none());
+
+        // Counts only: no field of this record may carry a detected value.
+        let rendered = clean.to_string();
+        assert!(!rendered.contains("@"), "no value may reach the audit log");
+    }
+
+    #[test]
+    fn pii_counts_are_exported_to_csv() {
+        // The CSV is the governance export; a count that only exists in the JSONL would be
+        // invisible to the artifact an auditor actually receives.
+        let entries = vec![timed_entry(
+            "crm",
+            "crm__lookup",
+            true,
+            Some(12),
+            None,
+            None,
+            None,
+            Some(PiiPass {
+                replaced: 4,
+                complete: false,
+            }),
+        )];
+        let csv = to_csv(&entries);
+        let (header, rows) = csv.split_once("\r\n").expect("a header and a row");
+        let cols: Vec<&str> = header.split(',').collect();
+        let cells: Vec<&str> = rows.trim_end().split(',').collect();
+        let cell = |name: &str| {
+            let at = cols
+                .iter()
+                .position(|c| *c == name)
+                .expect("column present");
+            cells[at].trim_matches('"').to_string()
+        };
+        assert_eq!(cell("piiReplaced"), "4");
+        assert_eq!(cell("piiIncomplete"), "true");
     }
 
     #[test]

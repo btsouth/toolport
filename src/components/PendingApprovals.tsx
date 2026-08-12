@@ -32,6 +32,11 @@ const REASON: Record<Reason, { label: string; className: string; Icon: typeof Tr
       className: "bg-destructive/10 text-destructive",
       Icon: Trash2,
     },
+    pii_cross_server: {
+      label: "Releases private data",
+      className: "bg-destructive/10 text-destructive",
+      Icon: ShieldAlert,
+    },
   };
 
 /**
@@ -167,6 +172,7 @@ export function PendingApprovals() {
           {pending.map((a) => {
             const reason = REASON[a.reason];
             const urlElicitation = a.urlElicitation;
+            const piiRelease = a.piiRelease;
             // Count down to the broker's authoritative deadline; fall back to
             // first-sighting + timeout only if deadlineMs is somehow absent, so the
             // timer is never blank.
@@ -220,6 +226,36 @@ export function PendingApprovals() {
                     </Badge>
                   )}
                 </div>
+
+                {/* The release decision itself. Shown above the arguments because the
+                    question is "may these values go to this server?", not "is this call
+                    shaped correctly?". These are the real values, un-pseudonymized: this
+                    window is the only place they appear, and the model never sees them. */}
+                {piiRelease && (
+                  <div className="mb-3">
+                    <div className="mb-1 text-[0.7rem] font-medium uppercase tracking-wide text-muted-foreground">
+                      Would send to {piiRelease.server}
+                    </div>
+                    <ul className="divide-y divide-border/60 rounded-md border border-destructive/40 bg-destructive/5">
+                      {piiRelease.values.map((v) => (
+                        <li key={v.token} className="p-2.5 text-xs">
+                          <div className="font-mono break-all text-foreground">
+                            {v.value}
+                          </div>
+                          <div className="mt-0.5 text-muted-foreground">
+                            {v.token} · from {v.origins.join(", ")}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                    <p className="mt-1.5 text-xs text-muted-foreground">
+                      {piiRelease.server} has never seen{" "}
+                      {piiRelease.values.length === 1 ? "this value" : "these values"}.
+                      Approving releases {piiRelease.values.length === 1 ? "it" : "them"}{" "}
+                      to that server for the rest of this session, and nothing else.
+                    </p>
+                  </div>
+                )}
 
                 <div className="mb-3">
                   <div className="mb-1 text-[0.7rem] font-medium uppercase tracking-wide text-muted-foreground">
@@ -290,8 +326,11 @@ export function PendingApprovals() {
                   </div>
                 </div>
 
-                {/* Skip the prompt for this tool next time - curbs approval fatigue. */}
-                {!urlElicitation && (
+                {/* Skip the prompt for this tool next time - curbs approval fatigue.
+                    Never offered for a PII release: the allow key binds a tool definition,
+                    and the broker deliberately refuses to auto-approve a release on one
+                    (SBS-696). Offering it here would promise a bypass that never fires. */}
+                {!urlElicitation && !piiRelease && (
                   <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-muted-foreground">
                     <span>Skip next time?</span>
                     <button

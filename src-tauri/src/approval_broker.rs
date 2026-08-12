@@ -27,8 +27,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::approval::{
-    ApprovalDecision, ApprovalReason, ApprovalRequest, EndpointDescriptor, UrlElicitationRequest,
-    DEFAULT_TIMEOUT_SECS, ENDPOINT_FILE,
+    ApprovalDecision, ApprovalReason, ApprovalRequest, EndpointDescriptor, PiiReleaseRequest,
+    UrlElicitationRequest, DEFAULT_TIMEOUT_SECS, ENDPOINT_FILE,
 };
 
 /// A pending approval as the UI sees it. The auth token is deliberately NOT included.
@@ -44,6 +44,10 @@ pub struct PendingView {
     pub arguments: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url_elicitation: Option<UrlElicitationRequest>,
+    /// Real values this call would release to a server that never produced them, for the
+    /// approver to look at. Never persisted and never sent anywhere but this local UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pii_release: Option<PiiReleaseRequest>,
     /// Wall-clock epoch-millis when this call auto-denies (park time + the fail-closed
     /// timeout). The UI counts down to this exactly, instead of approximating from when
     /// it first saw the request. App and broker share one clock, so it's accurate.
@@ -377,7 +381,11 @@ fn preflight(
     // Legacy broad `server/tool` entries are intentionally ignored: a tool definition that
     // changed since approval should re-prompt instead of inheriting a stale bypass. A
     // request with no fingerprint at all likewise never auto-approves.
-    if req.url_elicitation.is_none() {
+    // A PII release is excluded for a stronger reason than a URL elicitation: the allow key
+    // binds a TOOL definition, and "this tool may run unprompted" is not consent to hand a
+    // particular customer's address to a server that never had it. Auto-approving here would
+    // let one earlier "always allow" quietly release every future value to that server.
+    if req.url_elicitation.is_none() && req.pii_release.is_none() {
         if let Some(fp) = req.tool_fingerprint.as_deref() {
             let key = crate::approval::fingerprint_allow_key(&req.server, &req.tool, fp);
             if is_allowed(&key) {
@@ -445,6 +453,7 @@ fn handle_conn(stream: TcpStream, broker: ApprovalBroker, app: AppHandle) {
         reason: req.reason,
         arguments: req.arguments.clone(),
         url_elicitation: req.url_elicitation.clone(),
+        pii_release: req.pii_release.clone(),
         // Stamp the deadline now, right before we park on `recv_timeout` below.
         deadline_ms: deadline_ms_from_now(),
     };
@@ -572,6 +581,7 @@ mod tests {
             reason: ApprovalReason::Destructive,
             arguments: serde_json::json!({}),
             url_elicitation: None,
+            pii_release: None,
             deadline_ms: deadline_ms_from_now(),
         };
         b.inner
@@ -688,6 +698,7 @@ mod tests {
             arguments: serde_json::json!({}),
             tool_fingerprint: fingerprint.map(str::to_string),
             url_elicitation: None,
+            pii_release: None,
         }
     }
 
@@ -760,6 +771,29 @@ mod tests {
             preflight(&request("bad", None), "tok", every_key),
             Preflight::Deny
         );
+    }
+
+    #[test]
+    fn preflight_never_auto_approves_a_pii_release() {
+        // SBS-696: the allow key binds a TOOL DEFINITION. "This tool may run unprompted" is
+        // not consent to hand a specific customer's address to a server that never had it,
+        // so an existing allow must not silently release every later value to it.
+        let mut req = request("tok", Some("v2:abc"));
+        req.reason = ApprovalReason::PiiCrossServer;
+        req.pii_release = Some(crate::approval::PiiReleaseRequest {
+            server: "mailer".into(),
+            values: vec![crate::approval::PiiReleaseValue {
+                token: "⟦EMAIL_1⟧".into(),
+                value: "ada@example.com".into(),
+                origins: vec!["crm".into()],
+            }],
+        });
+
+        // Every key allowed, and it still asks.
+        assert_eq!(preflight(&req, "tok", |_: &str| true), Preflight::AskHuman);
+        // Authentication still comes first.
+        req.token = "bad".into();
+        assert_eq!(preflight(&req, "tok", |_: &str| true), Preflight::Deny);
     }
 
     #[test]

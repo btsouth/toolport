@@ -43,6 +43,43 @@ pub enum ApprovalReason {
     UntrustedSource,
     /// Both of the above.
     DestructiveAndUntrusted,
+    /// The call carries a pseudonym minted by a DIFFERENT server, so dispatching it would
+    /// hand one server's data to another (SBS-696). Never produced by [`gate_reason`]: this
+    /// gate is not about the tool at all, it is about a specific value's destination, and it
+    /// fires even when HITL gating is off -- the alternative is not "the call runs", it is
+    /// "the call fails", so the prompt can only turn a certain failure into a possible
+    /// success.
+    PiiCrossServer,
+}
+
+/// A request to release specific pseudonymized values to a server that did not produce them.
+///
+/// Carries REAL values. That is the point -- a person cannot judge "may this address go to
+/// the mail server?" without seeing the address - and it is safe only because the broker is
+/// loopback-only, in-memory, and already the one audience that sees real arguments before
+/// dispatch. It must never be logged, persisted, or relayed to the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiiReleaseRequest {
+    /// The server that would receive the values, and that no value below came from.
+    pub server: String,
+    /// Every refused value in this call. Approval covers exactly this set, for exactly
+    /// this destination.
+    pub values: Vec<PiiReleaseValue>,
+}
+
+/// One value a [`PiiReleaseRequest`] would release.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiiReleaseValue {
+    /// The pseudonym as the model sees it, e.g. `⟦EMAIL_1⟧`.
+    pub token: String,
+    /// The real value behind it. Local approver only.
+    pub value: String,
+    /// The servers that already hold it, so the approver can see where it came from --
+    /// releasing to a server that already has the value is a different decision from
+    /// releasing to one that has never seen it.
+    pub origins: Vec<String>,
 }
 
 /// A request from a gateway to the broker: "a human should approve this call." The arguments
@@ -73,6 +110,10 @@ pub struct ApprovalRequest {
     /// cannot do so itself. Absent for ordinary tool approvals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url_elicitation: Option<UrlElicitationRequest>,
+    /// Pseudonymized values this call would send to a server that never produced them.
+    /// Present only for [`ApprovalReason::PiiCrossServer`]; absent for ordinary approvals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pii_release: Option<PiiReleaseRequest>,
 }
 
 /// The already-screened browser interaction carried over the local broker. The gateway
@@ -227,6 +268,7 @@ mod tests {
             arguments: serde_json::json!({ "table": "users" }),
             tool_fingerprint: Some("v2:abc".into()),
             url_elicitation: None,
+            pii_release: None,
         };
         let round: ApprovalRequest =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();

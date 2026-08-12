@@ -11,7 +11,7 @@ use super::{account, SERVICE};
 const CHUNK_UTF16_UNITS: usize = 1_000;
 const MANIFEST_PREFIX: &str = "toolport-chunked-v1:";
 const DIRECT_PREFIX: &str = "toolport-direct-v1:";
-const READ_ATTEMPTS: usize = 3;
+pub(super) const READ_ATTEMPTS: usize = 3;
 
 struct ChunkManifest {
     generation: String,
@@ -29,6 +29,76 @@ fn read_entry(account: &str) -> Result<Option<String>, String> {
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(error.to_string()),
     }
+}
+
+/// Test-only: script the next base-credential reads. `true` reports the target as
+/// absent, standing in for the window in which a concurrent `CredWriteW` replace
+/// makes Windows report a live credential as missing; `false` reads the real store.
+/// Reads past the end of the script go to the real store too.
+///
+/// A script rather than a count because the interesting cases are not all-absent:
+/// a chunk failure FOLLOWED by absences has to stay an error rather than decay
+/// into `Ok(None)`.
+///
+/// Thread-local, so tests running in parallel cannot consume each other's script.
+#[cfg(test)]
+pub(super) fn script_base_reads(absent: &[bool]) {
+    BASE_READ_SCRIPT.with(|queue| {
+        *queue.borrow_mut() = absent.iter().copied().collect();
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    static BASE_READ_SCRIPT: std::cell::RefCell<std::collections::VecDeque<bool>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// Pause between read attempts, escalating so the three attempts span ~5ms — far
+/// wider than any single one of them.
+///
+/// This deliberately sleeps rather than yields. A `CredWriteW` replace window
+/// outlives a bare `yield_now` on an idle multi-core machine, where yielding
+/// returns immediately if any core is free, so every attempt lands inside the same
+/// window and the retry buys almost nothing. Measured across 9,600 racing reads:
+///
+/// | backoff        | torn reads | hard errors |
+/// |----------------|-----------:|------------:|
+/// | none           |         37 |           0 |
+/// | `yield_now`    |         26 |          16 |
+/// | 250µs + 1ms    |         16 |           1 |
+/// | 1ms + 4ms      |          4 |           1 |
+///
+/// Note what that table does NOT show: a zero. This is a mitigation, not a
+/// guarantee — Windows offers no promise that a live credential always reads back,
+/// and the curve is asymptotic, so a wider span trades latency for ever smaller
+/// gains. That is why
+/// `windows_chunk_reader_survives_concurrent_generation_swaps` asserts on the
+/// integrity of whatever value comes back rather than on every read producing one,
+/// and why the retry itself is pinned by a deterministic test instead of that race.
+///
+/// The cost lands on genuinely-absent secrets, which now take ~5ms rather than a
+/// single read. Callers do check presence in loops over servers × keys, so that is
+/// real, but it is bounded, off the per-call path, and cheap next to reporting a
+/// live credential as missing.
+fn read_backoff(attempt: usize) {
+    const BACKOFF_MICROS: [u64; READ_ATTEMPTS - 1] = [1_000, 4_000];
+    let micros = BACKOFF_MICROS[attempt];
+    std::thread::sleep(std::time::Duration::from_micros(micros));
+}
+
+/// Read the base credential. Identical to [`read_entry`] outside tests; under
+/// `cfg(test)` it honours [`script_base_reads`] so the retry below can be driven
+/// deterministically instead of by racing a writer thread.
+fn read_base(account: &str) -> Result<Option<String>, String> {
+    #[cfg(test)]
+    {
+        let scripted = BASE_READ_SCRIPT.with(|queue| queue.borrow_mut().pop_front());
+        if scripted == Some(true) {
+            return Ok(None);
+        }
+    }
+    read_entry(account)
 }
 
 fn delete_entry(account: &str) -> Result<(), String> {
@@ -222,39 +292,58 @@ pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String>
 
 pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
     let base = account(server_id, key);
+    // Keep the most recent integrity error. A later transient absence must not
+    // erase evidence that we read a base credential but could not assemble it.
+    // `None` therefore means every attempt saw no base credential at all.
     let mut last_error = None;
     for attempt in 0..READ_ATTEMPTS {
-        let Some(value) = read_entry(&base)? else {
-            return Ok(None);
-        };
-        if let Some(direct) = parse_direct_value(&value) {
-            return Ok(Some(direct));
-        }
-        let Some(manifest) = parse_manifest(&value)? else {
-            return Ok(Some(value));
-        };
-        let mut combined = String::new();
-        let mut failed = None;
-        for index in 0..manifest.count {
-            match read_entry(&chunk_account(&base, &manifest.generation, index))? {
-                Some(chunk) => combined.push_str(&chunk),
-                None => {
-                    failed = Some(format!("Windows credential chunk {index} is missing"));
-                    break;
+        match read_base(&base)? {
+            Some(value) => {
+                if let Some(direct) = parse_direct_value(&value) {
+                    return Ok(Some(direct));
                 }
+                let Some(manifest) = parse_manifest(&value)? else {
+                    return Ok(Some(value));
+                };
+                let mut combined = String::new();
+                let mut failed = None;
+                for index in 0..manifest.count {
+                    match read_entry(&chunk_account(&base, &manifest.generation, index))? {
+                        Some(chunk) => combined.push_str(&chunk),
+                        None => {
+                            failed = Some(format!("Windows credential chunk {index} is missing"));
+                            break;
+                        }
+                    }
+                }
+                if failed.is_none() && checksum(&combined) == manifest.checksum {
+                    return Ok(Some(combined));
+                }
+                last_error = failed.or_else(|| {
+                    Some("Windows credential chunks failed their integrity check".to_string())
+                });
             }
+            // `set_secret` never deletes the base credential — it replaces it with a
+            // plain `CredWriteW` overwrite — so an absent base cannot mean "a write is
+            // partway through" in our own code. Windows reports it as absent anyway for
+            // the instant that replace is in flight, which made this a torn read: a
+            // caller asking for a token while the app rewrote a refreshed one got
+            // `Ok(None)`, indistinguishable from never having authenticated.
+            //
+            // So absence only counts once it survives the same retries a chunk race
+            // gets. See `read_backoff` for the measured effect and the cost this
+            // puts on genuinely-absent secrets.
+            None => {}
         }
-        if failed.is_none() && checksum(&combined) == manifest.checksum {
-            return Ok(Some(combined));
-        }
-        last_error = failed.or_else(|| {
-            Some("Windows credential chunks failed their integrity check".to_string())
-        });
         if attempt + 1 < READ_ATTEMPTS {
-            std::thread::yield_now();
+            read_backoff(attempt);
         }
     }
-    Err(last_error.unwrap_or_else(|| "Windows credential read failed".to_string()))
+    match last_error {
+        Some(error) => Err(error),
+        // Absent on every attempt: the credential really is gone.
+        None => Ok(None),
+    }
 }
 
 pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
@@ -275,4 +364,24 @@ pub fn set_raw_for_test(server_id: &str, key: &str, value: &str) -> Result<(), S
     entry(&account(server_id, key))?
         .set_password(value)
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+pub fn raw_entries_for_test(server_id: &str, key: &str) -> Result<Vec<String>, String> {
+    let base = account(server_id, key);
+    let mut accounts = vec![base.clone()];
+    if let Some(raw) = read_entry(&base)? {
+        if let Some(manifest) = parse_manifest(&raw)? {
+            accounts.extend(
+                (0..manifest.count)
+                    .map(|index| chunk_account(&base, &manifest.generation, index)),
+            );
+        }
+    }
+    Ok(accounts)
+}
+
+#[cfg(test)]
+pub fn raw_entry_exists_for_test(account: &str) -> Result<bool, String> {
+    Ok(read_entry(account)?.is_some())
 }

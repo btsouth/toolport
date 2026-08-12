@@ -612,6 +612,46 @@ function ServerRow({ s }: { s: ServerStat }) {
 /** One recent-call row. A failed call with a captured error message expands to
  * show why it failed; latency is shown inline. Args/results aren't recorded in
  * the audit log (it's an append-only governance record), so they're not shown. */
+/** What the PII pass did on this call: a count, and a warning when it did not fully
+ * apply (SBS-607).
+ *
+ * Renders nothing when redaction was off (no `piiReplaced`) AND when it ran but matched
+ * nothing. The audit record keeps those two apart, and the export still does; the row
+ * does not, because a badge on every call of a busy log is noise that buries the two
+ * cases worth looking at. Whether the feature is on is a setting the user set; whether it
+ * did something, or quietly failed to, is what a per-call row can tell them.
+ *
+ * The count is the whole payload. Pseudonymization exists to keep values away from the
+ * model, so surfacing one here to explain the count would defeat it. */
+function PiiBadge({ entry }: { entry: AuditEntry }) {
+  const replaced = entry.piiReplaced;
+  if (replaced === undefined) return null;
+  // Redaction fails OPEN: a full session map or an over-cap result leaves values in the
+  // clear. That case gets warning styling because the honest reading of the row is "some
+  // of this reached the model unredacted", not "N were handled".
+  if (entry.piiIncomplete) {
+    return (
+      <span
+        className="flex shrink-0 items-center gap-1 rounded bg-warning/15 px-1.5 py-0.5 text-[10px] text-warning"
+        title={`${replaced} value${replaced === 1 ? "" : "s"} pseudonymized, but the pass did not fully apply — some values reached the model in the clear (the session map was full, or the result exceeded the scan cap).`}
+      >
+        <ShieldAlert aria-hidden="true" className="size-3" />
+        {replaced} pseudonymized, incomplete
+      </span>
+    );
+  }
+  if (replaced === 0) return null;
+  return (
+    <span
+      className="flex shrink-0 items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+      title={`${replaced} value${replaced === 1 ? "" : "s"} in this result were replaced with pseudonyms before the model saw them. The values themselves are never logged.`}
+    >
+      <ShieldCheck aria-hidden="true" className="size-3" />
+      {replaced} pseudonymized
+    </span>
+  );
+}
+
 function CallRow({ e }: { e: AuditEntry }) {
   const [open, setOpen] = useState(false);
   const hasDetail = !e.ok && !!e.error;
@@ -665,6 +705,7 @@ function CallRow({ e }: { e: AuditEntry }) {
             {e.client}
           </span>
         )}
+        <PiiBadge entry={e} />
         <span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">
           {fmtMs(e.durationMs ?? e.heldMs ?? null)}
         </span>

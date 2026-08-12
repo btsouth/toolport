@@ -82,6 +82,46 @@ describe("ActivityView recent calls", () => {
     expect(screen.getByText("list_issues")).toBeInTheDocument();
     expect(screen.getByText("403: token lacks repo scope")).toBeInTheDocument();
   });
+
+  it("shows the pseudonymization count, and flags a pass that did not fully apply", async () => {
+    const user = userEvent.setup({
+      advanceTimers: (ms) => vi.advanceTimersByTime(ms),
+    });
+    getAuditLog.mockResolvedValue([
+      entry({ tool: "redacted_call", piiReplaced: 3 }),
+      entry({
+        ts: 1700000003000,
+        tool: "leaky_call",
+        piiReplaced: 2,
+        piiIncomplete: true,
+      }),
+      entry({ ts: 1700000004000, tool: "matched_nothing", piiReplaced: 0 }),
+      entry({ ts: 1700000005000, tool: "redaction_off" }),
+    ]);
+    render(<ActivityView refreshKey={0} registry={null} />);
+
+    await act(async () => {});
+    await user.click(screen.getByRole("button", { name: /recent calls/i }));
+
+    expect(screen.getByText("3 pseudonymized")).toBeInTheDocument();
+
+    // The fail-open case has to read as a warning, not as a tidy count: values reached
+    // the model in the clear even though redaction was on.
+    const incomplete = screen.getByText("2 pseudonymized, incomplete");
+    expect(incomplete).toBeInTheDocument();
+    expect(incomplete).toHaveAttribute(
+      "title",
+      expect.stringContaining("did not fully apply"),
+    );
+
+    // A pass that matched nothing, and a call made with redaction off, both stay silent —
+    // a badge on every row would bury the two cases above.
+    expect(screen.queryByText(/0 pseudonymized/)).not.toBeInTheDocument();
+    expect(screen.getAllByText(/pseudonymized/)).toHaveLength(2);
+
+    // The values are the point of the feature and must never reach this view.
+    expect(document.body.textContent).not.toMatch(/@example\.com/);
+  });
 });
 
 describe("ActivityView discovery", () => {

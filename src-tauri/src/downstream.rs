@@ -888,6 +888,18 @@ pub struct CancelContext {
     registry: CancelRegistry,
 }
 
+impl CancelContext {
+    /// Whether the upstream client has cancelled this request.
+    ///
+    /// Request handlers that are waiting before a downstream request is registered (for
+    /// example, a resource-subscription single-flight follower) use this to stop occupying a
+    /// worker as soon as the caller gives up. Once a downstream request exists, the registry's
+    /// normal forwarding path still sends `notifications/cancelled` to that server.
+    pub fn is_cancelled(&self) -> bool {
+        self.registry.is_cancelled(&self.client_request_id)
+    }
+}
+
 struct CancelGuard {
     client_request_id: String,
     registry: CancelRegistry,
