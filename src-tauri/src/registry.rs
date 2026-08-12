@@ -22,13 +22,80 @@ const REGISTRY_VERSION: u32 = 1;
 /// Per-process counter for unique atomic-write temp names.
 static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+trait AtomicWriteOps {
+    fn set_owner_only(&self, file: &std::fs::File) -> std::io::Result<()>;
+    fn write_all(&self, file: &mut std::fs::File, contents: &[u8]) -> std::io::Result<()>;
+    fn sync_all(&self, file: &std::fs::File) -> std::io::Result<()>;
+}
+
+struct FsAtomicWriteOps;
+
+impl AtomicWriteOps for FsAtomicWriteOps {
+    fn set_owner_only(&self, file: &std::fs::File) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            Ok(())
+        }
+    }
+
+    fn write_all(&self, file: &mut std::fs::File, contents: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        file.write_all(contents)
+    }
+
+    fn sync_all(&self, file: &std::fs::File) -> std::io::Result<()> {
+        file.sync_all()
+    }
+}
+
+struct TempFileCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempFileCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: false }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempFileCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Write `contents` to `path` atomically: a uniquely-named sibling temp file,
 /// then rename over the target. The unique name (pid + per-process sequence)
 /// means two writers to the same path can't overwrite each other's half-written
 /// temp. The temp sits in the same directory so the rename stays on one
-/// filesystem (and is therefore atomic). The temp is cleaned up if the rename
-/// fails, so a failed write never leaves a stray file behind.
+/// filesystem (and is therefore atomic). Once created, the temp is guarded so
+/// any permissions, write, sync, or rename failure removes it.
 pub fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
+    atomic_write_with_ops(path, contents, &FsAtomicWriteOps)
+}
+
+fn atomic_write_with_ops(
+    path: &Path,
+    contents: &str,
+    ops: &impl AtomicWriteOps,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -39,29 +106,25 @@ pub fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
         std::process::id(),
         seq
     ));
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        // Restrict to owner-only (0600) BEFORE writing, so secrets.enc, the registry,
-        // pins, and the audit log are never world-readable, not even for the brief
-        // window before the content lands, under a permissive umask on a shared or
-        // headless host. No-op on Windows (NTFS ACLs inherit from the parent dir).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| e.to_string())?;
-        }
-        f.write_all(contents.as_bytes()).map_err(|e| e.to_string())?;
-        // Flush the data to stable storage BEFORE the rename, so a crash/power loss
-        // can't make the rename durable while the file's blocks aren't — which would
-        // leave a truncated registry.json. `fs::write` + `rename` alone did not.
-        f.sync_all().map_err(|e| e.to_string())?;
-    }
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        e.to_string()
-    })?;
+    let mut cleanup = TempFileCleanup::new(tmp.clone());
+    let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    // Arm cleanup immediately after creation. Declaring the guard before the file makes
+    // Rust close the file first on every error path, which is required for removal on Windows.
+    cleanup.arm();
+    // Restrict to owner-only (0600) BEFORE writing, so secrets.enc, the registry,
+    // pins, and the audit log are never world-readable, not even for the brief
+    // window before the content lands, under a permissive umask on a shared or
+    // headless host. No-op on Windows (NTFS ACLs inherit from the parent dir).
+    ops.set_owner_only(&f).map_err(|e| e.to_string())?;
+    ops.write_all(&mut f, contents.as_bytes())
+        .map_err(|e| e.to_string())?;
+    // Flush the data to stable storage BEFORE the rename, so a crash/power loss
+    // can't make the rename durable while the file's blocks aren't — which would
+    // leave a truncated registry.json. `fs::write` + `rename` alone did not.
+    ops.sync_all(&f).map_err(|e| e.to_string())?;
+    drop(f);
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    cleanup.disarm();
     // Best-effort: fsync the containing directory so the rename entry itself is durable
     // (Unix). Opening a directory as a File fails on Windows, where NTFS journals the
     // rename anyway, so the error is ignored.
@@ -405,6 +468,12 @@ pub struct Registry {
     /// `CONDUIT_CODE_MODE`) still force-enables regardless of the toggle.
     #[serde(default = "default_true")]
     pub code_mode: bool,
+    /// Opt-in permission for agents to request persistence of Code Mode routines. Off by
+    /// default. This only exposes the save surface; each save still requires a separate,
+    /// content-bound human approval. Existing routines may still be listed and run while
+    /// writes are disabled.
+    #[serde(default)]
+    pub allow_routine_writes: bool,
     /// Opt-in agent control: when true, an agent may turn servers on or off via
     /// the gateway's `conduit_enable_server` / `conduit_disable_server` tools.
     /// Off by default. The `deny_destructive` safety switch is never agent-
@@ -548,11 +617,7 @@ impl ManagedEntry {
             .env
             .iter()
             .filter(|e| !e.key.eq_ignore_ascii_case("authorization"))
-            .filter_map(|e| {
-                e.value
-                    .as_ref()
-                    .map(|v| (e.key.clone(), v.clone()))
-            })
+            .filter_map(|e| e.value.as_ref().map(|v| (e.key.clone(), v.clone())))
             .collect();
         let args = strip_auth_header_args(&entry.args);
         let is_bridge = entry
@@ -701,7 +766,12 @@ fn default_blend() -> f32 {
 
 impl Default for SemanticSettings {
     fn default() -> Self {
-        SemanticSettings { enabled: false, endpoint: String::new(), model: String::new(), blend: 0.5 }
+        SemanticSettings {
+            enabled: false,
+            endpoint: String::new(),
+            model: String::new(),
+            blend: 0.5,
+        }
     }
 }
 
@@ -738,6 +808,7 @@ impl Default for Registry {
             lazy_discovery: true,
             discovery_mode: None,
             code_mode: true,
+            allow_routine_writes: false,
             allow_agent_control: false,
             integrity_check: true,
             content_defense: true,
@@ -1532,7 +1603,10 @@ fn compute_conduit_dir() -> (Option<PathBuf>, DirResolution) {
             Some(unc_home) if std::fs::metadata(&unc_home).is_ok() => {
                 (Some(under_roaming(&unc_home)), DirResolution::Devirtualized)
             }
-            _ => (Some(under_roaming(&home)), DirResolution::VirtualizedFallback),
+            _ => (
+                Some(under_roaming(&home)),
+                DirResolution::VirtualizedFallback,
+            ),
         }
     }
     #[cfg(not(windows))]
@@ -1865,7 +1939,9 @@ fn quarantine_unreadable(path: &Path, content: &str) -> Option<PathBuf> {
         return None;
     };
     let prefix = format!("{base}.unreadable-");
-    let Ok(entries) = std::fs::read_dir(dir) else { return None };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
+    };
     let mut quarantined: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -2056,7 +2132,9 @@ fn lock_for(path: &Path, timeout: std::time::Duration) -> Result<FileLock, Strin
 /// read. `f` mutates a FRESH on-disk copy; the persisted registry and `f`'s value are
 /// returned. Every registry writer (app commands, the gateway toggle, team sync) goes
 /// through this or [`update_at`] — that is what makes the lock effective.
-pub fn update<T>(f: impl FnOnce(&mut Registry) -> Result<T, String>) -> Result<(Registry, T), String> {
+pub fn update<T>(
+    f: impl FnOnce(&mut Registry) -> Result<T, String>,
+) -> Result<(Registry, T), String> {
     let path = resolved_path().ok_or("Could not resolve registry path")?;
     let lock = lock_for(&path, REGISTRY_LOCK_TIMEOUT)?;
     let mut reg = load_from_locked(&path, &lock)?;
@@ -2078,10 +2156,7 @@ pub fn lock_at(path: &Path) -> Result<FileLock, String> {
 /// Acquire an explicit-path lock with a caller-appropriate contention deadline.
 /// Registry operations use the short default above; operations that deliberately
 /// hold a lock across network I/O need to cover that I/O's timeout instead.
-pub(crate) fn lock_at_for(
-    path: &Path,
-    timeout: std::time::Duration,
-) -> Result<FileLock, String> {
+pub(crate) fn lock_at_for(path: &Path, timeout: std::time::Duration) -> Result<FileLock, String> {
     lock_for(path, timeout)
 }
 
@@ -2466,9 +2541,18 @@ mod tests {
     fn profile_for_root_longest_prefix_wins_on_a_path_boundary() {
         let mut r = Registry::default();
         r.folder_profiles = vec![
-            FolderProfile { path: "/home/me/work".into(), profile: "Work".into() },
-            FolderProfile { path: "/home/me/work/client-a".into(), profile: "ClientA".into() },
-            FolderProfile { path: "/home/me/personal".into(), profile: "Personal".into() },
+            FolderProfile {
+                path: "/home/me/work".into(),
+                profile: "Work".into(),
+            },
+            FolderProfile {
+                path: "/home/me/work/client-a".into(),
+                profile: "ClientA".into(),
+            },
+            FolderProfile {
+                path: "/home/me/personal".into(),
+                profile: "Personal".into(),
+            },
         ];
         // Exact match, and a descendant picks the parent mapping.
         assert_eq!(r.profile_for_root("/home/me/work"), Some("Work".into()));
@@ -2559,9 +2643,18 @@ mod tests {
     fn set_folder_profiles_drops_blank_entries() {
         let mut r = Registry::default();
         r.set_folder_profiles(vec![
-            FolderProfile { path: "/a".into(), profile: "P".into() },
-            FolderProfile { path: "  ".into(), profile: "P".into() }, // blank path
-            FolderProfile { path: "/b".into(), profile: " ".into() },  // blank profile
+            FolderProfile {
+                path: "/a".into(),
+                profile: "P".into(),
+            },
+            FolderProfile {
+                path: "  ".into(),
+                profile: "P".into(),
+            }, // blank path
+            FolderProfile {
+                path: "/b".into(),
+                profile: " ".into(),
+            }, // blank profile
         ]);
         assert_eq!(r.folder_profiles.len(), 1);
         assert_eq!(r.folder_profiles[0].path, "/a");
@@ -2570,8 +2663,10 @@ mod tests {
     #[test]
     fn profile_for_root_normalizes_separators_and_trailing_slash() {
         let mut r = Registry::default();
-        r.folder_profiles =
-            vec![FolderProfile { path: "/home/me/work/".into(), profile: "Work".into() }];
+        r.folder_profiles = vec![FolderProfile {
+            path: "/home/me/work/".into(),
+            profile: "Work".into(),
+        }];
         // A trailing slash on the mapping and backslash separators in the root both normalize.
         assert_eq!(r.profile_for_root("/home/me/work"), Some("Work".into()));
         assert_eq!(r.profile_for_root(r"\home\me\work\sub"), Some("Work".into()));
@@ -2985,6 +3080,92 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FailingAtomicWriteStep {
+        Permissions,
+        Write,
+        Sync,
+    }
+
+    struct FailingAtomicWriteOps(FailingAtomicWriteStep);
+
+    impl AtomicWriteOps for FailingAtomicWriteOps {
+        fn set_owner_only(&self, _file: &std::fs::File) -> std::io::Result<()> {
+            if self.0 == FailingAtomicWriteStep::Permissions {
+                return Err(std::io::Error::other("injected permissions failure"));
+            }
+            Ok(())
+        }
+
+        fn write_all(&self, file: &mut std::fs::File, contents: &[u8]) -> std::io::Result<()> {
+            if self.0 == FailingAtomicWriteStep::Write {
+                let partial_len = contents.len().min(3);
+                std::io::Write::write_all(file, &contents[..partial_len])?;
+                return Err(std::io::Error::other("injected write failure"));
+            }
+            std::io::Write::write_all(file, contents)
+        }
+
+        fn sync_all(&self, file: &std::fs::File) -> std::io::Result<()> {
+            if self.0 == FailingAtomicWriteStep::Sync {
+                return Err(std::io::Error::other("injected sync failure"));
+            }
+            file.sync_all()
+        }
+    }
+
+    fn atomic_temp_files(path: &Path) -> Vec<PathBuf> {
+        let prefix = format!("{}.", path.file_name().unwrap().to_string_lossy());
+        std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".conduit-tmp"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn atomic_write_cleans_temp_after_each_post_create_failure() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-atomic-failures-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for (label, step) in [
+            ("permissions", FailingAtomicWriteStep::Permissions),
+            ("write", FailingAtomicWriteStep::Write),
+            ("sync", FailingAtomicWriteStep::Sync),
+        ] {
+            let path = dir.join(format!("{label}.json"));
+            std::fs::write(&path, "original").unwrap();
+            let error = atomic_write_with_ops(&path, "replacement", &FailingAtomicWriteOps(step))
+                .expect_err("injected operation must fail");
+
+            assert!(error.contains(label), "unexpected {label} error: {error}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "original",
+                "failed {label} stage replaced the destination"
+            );
+            assert!(
+                atomic_temp_files(&path).is_empty(),
+                "failed {label} stage left a temp file behind"
+            );
+        }
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn file_lock_excludes_a_second_holder_and_releases_on_drop() {
         let dir = std::env::temp_dir();
@@ -3052,11 +3233,7 @@ mod tests {
             !reader.is_finished(),
             "reader must remain blocked while the writer owns the registry lock"
         );
-        atomic_write(
-            &path,
-            &serde_json::to_string_pretty(&latest).unwrap(),
-        )
-        .unwrap();
+        atomic_write(&path, &serde_json::to_string_pretty(&latest).unwrap()).unwrap();
         drop(guard);
 
         let loaded = reader.join().unwrap().expect("reader loads newest primary");

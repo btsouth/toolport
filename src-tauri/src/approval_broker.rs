@@ -421,6 +421,13 @@ fn handle_conn(stream: TcpStream, broker: ApprovalBroker, app: AppHandle) {
             deny(&mut out);
             return;
         }
+        // A correlation id identifies exactly one parked call. Replacing an existing
+        // waiter would disconnect the first caller and let its cleanup remove the second.
+        if pending.contains_key(&req.id) {
+            drop(pending);
+            deny(&mut out);
+            return;
+        }
         pending.insert(
             req.id.clone(),
             Waiter {
