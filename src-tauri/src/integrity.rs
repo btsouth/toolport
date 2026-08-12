@@ -355,6 +355,8 @@ fn save_pins(profile: Option<&str>, pins: &Pins) -> Result<(), String> {
 /// writer can clobber a peer's quarantine set and silently un-block a just-quarantined tool, or
 /// lose a peer's pin re-baseline (SOU-165). Lock acquisition is mandatory: running the
 /// mutation unlocked would let a stale writer silently undo a peer's security decision.
+/// When locks must be nested, always acquire quarantine first and pins second (as `release`
+/// does); never acquire a quarantine lock while already holding a pin-store lock.
 fn with_store_lock<T>(
     path: &Path,
     f: impl FnOnce() -> Result<T, String>,
@@ -1055,9 +1057,17 @@ pub fn apply_quarantine(
     with_store_lock(&path, || apply_quarantine_inner(profile, current, events))
 }
 
+fn is_high_risk_drift(event: &Value) -> bool {
+    event.get("severity").and_then(Value::as_str) == Some(SEV_HIGH)
+        && matches!(
+            event.get("change").and_then(Value::as_str),
+            Some("changed" | "poison")
+        )
+}
+
 /// Tool names an integrity failure must keep blocked in memory until their quarantine record is
-/// durable. Baseline tamper invalidates the whole catalog; ordinary enforcement matches the
-/// high-risk `changed` / `poison` cases in [`apply_quarantine_inner_with`].
+/// durable. Baseline tamper invalidates the whole catalog; ordinary enforcement shares the exact
+/// same high-risk predicate as persistence in [`apply_quarantine_inner_with`].
 pub fn quarantine_candidates(current: &[Value], events: &[Value]) -> BTreeSet<String> {
     if baseline_tamper_detected(events) {
         return current
@@ -1067,13 +1077,7 @@ pub fn quarantine_candidates(current: &[Value], events: &[Value]) -> BTreeSet<St
     }
     events
         .iter()
-        .filter(|event| event.get("severity").and_then(Value::as_str) == Some(SEV_HIGH))
-        .filter(|event| {
-            matches!(
-                event.get("change").and_then(Value::as_str),
-                Some("changed" | "poison")
-            )
-        })
+        .filter(|event| is_high_risk_drift(event))
         .filter_map(|event| event.get("tool").and_then(Value::as_str).map(str::to_string))
         .collect()
 }
@@ -1152,7 +1156,7 @@ fn apply_quarantine_inner_with(
         // downgrade (a tool shedding readOnlyHint/destructiveHint) - the exact
         // privilege-escalation case we want quarantined even though the tool isn't
         // itself marked destructive. A poison flag is always high.
-        if e.get("severity").and_then(Value::as_str) != Some(SEV_HIGH) {
+        if !is_high_risk_drift(e) {
             continue;
         }
         let reason = match change {
