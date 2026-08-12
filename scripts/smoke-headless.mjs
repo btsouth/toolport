@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 
-// Authoritative headless gateway security smoke suite. CI runs this file on Linux;
-// scripts/smoke-headless.ps1 is the Windows mirror and must cover the same
-// real-process HTTP scenarios.
+// Authoritative cross-platform headless gateway security smoke suite. CI runs this
+// file on Linux/macOS and through scripts/smoke-headless.ps1 on Windows.
 
 import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
@@ -11,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
+import { isDeepStrictEqual } from "node:util";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const defaultBinary = path.join(
@@ -21,6 +21,13 @@ const defaultBinary = path.join(
   process.platform === "win32" ? "toolport-gateway.exe" : "toolport-gateway",
 );
 const gatewayBinary = process.env.TOOLPORT_GATEWAY_BIN || defaultBinary;
+const mockBinary = path.join(
+  repoRoot,
+  "src-tauri",
+  "target",
+  "debug",
+  process.platform === "win32" ? "mock-mcp-server.exe" : "mock-mcp-server",
+);
 const token = "smoke-test-token-32chars-minimum!!";
 const children = new Set();
 let smokeDir;
@@ -179,6 +186,93 @@ function request({ port, method = "GET", route = "/", headers = {}, body }) {
   });
 }
 
+async function mcpRequest({ port, id, method, params, sessionId }) {
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+  if (sessionId) headers["Mcp-Session-Id"] = sessionId;
+  const response = await request({
+    port,
+    method: "POST",
+    route: "/mcp",
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) }),
+  });
+  let json;
+  try {
+    json = JSON.parse(response.body);
+  } catch (error) {
+    throw new Error(`${method} returned invalid JSON: ${error.message}`);
+  }
+  if (response.status !== 200) {
+    throw new Error(`${method} returned HTTP ${response.status}: ${response.body}`);
+  }
+  return { response, json };
+}
+
+async function initializeMcp(port) {
+  const { response, json } = await mcpRequest({
+    port,
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "smoke", version: "0" },
+    },
+  });
+  const sessionId = response.headers["mcp-session-id"];
+  if (typeof sessionId !== "string" || !sessionId) {
+    throw new Error(`initialize did not return Mcp-Session-Id: ${JSON.stringify(json)}`);
+  }
+  return sessionId;
+}
+
+async function startApprovalBroker() {
+  const approvalToken = "routine-smoke-approval-token";
+  let resolveRequest;
+  let rejectRequest;
+  const requestReceived = new Promise((resolve, reject) => {
+    resolveRequest = resolve;
+    rejectRequest = reject;
+  });
+  const server = net.createServer((socket) => {
+    let buffer = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      try {
+        const approval = JSON.parse(buffer.slice(0, newline));
+        resolveRequest(approval);
+        socket.end(`${JSON.stringify("approved")}\n`);
+      } catch (error) {
+        rejectRequest(error);
+        socket.destroy();
+      }
+    });
+    socket.once("error", rejectRequest);
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address !== "object") {
+    server.close();
+    throw new Error("approval broker did not expose a TCP address");
+  }
+  return {
+    server,
+    endpoint: `127.0.0.1:${address.port}`,
+    token: approvalToken,
+    requestReceived,
+  };
+}
+
 async function waitForStatus(port, expected, child, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   let last = "no response";
@@ -205,7 +299,7 @@ async function expectBindRefusal({ name, host }) {
   const port = await availablePort(host);
   const { child, stderr } = startGateway({ port, host });
   try {
-    const exited = await waitForExit(child, 5_000);
+    const exited = await waitForExit(child, 10_000);
     const output = stderr();
     if (
       exited &&
@@ -288,72 +382,247 @@ async function testAuthenticatedGateway() {
 }
 
 async function testMcpHandshake(port) {
-  const initBody = JSON.stringify({
-    jsonrpc: "2.0",
-    id: 1,
-    method: "initialize",
-    params: {
-      protocolVersion: "2025-06-18",
-      capabilities: {},
-      clientInfo: { name: "smoke", version: "0" },
-    },
-  });
-  let initialized;
+  let sessionId;
   try {
-    initialized = await request({
-      port,
-      method: "POST",
-      route: "/mcp",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: initBody,
-    });
+    sessionId = await initializeMcp(port);
   } catch (error) {
     fail(`MCP initialize request failed: ${error.message}`);
-    return;
-  }
-
-  const sessionId = initialized.headers["mcp-session-id"];
-  if (initialized.status !== 200) {
-    fail(`MCP initialize returned ${initialized.status} (expected 200)`);
-    return;
-  }
-  if (typeof sessionId !== "string" || !sessionId) {
-    fail("MCP initialize did not return Mcp-Session-Id");
     return;
   }
   pass("MCP initialize returns 200 + Mcp-Session-Id");
 
   let listed;
   try {
-    listed = await request({
+    listed = await mcpRequest({
       port,
-      method: "POST",
-      route: "/mcp",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        "Mcp-Session-Id": sessionId,
-      },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+      id: 2,
+      method: "tools/list",
+      sessionId,
     });
   } catch (error) {
     fail(`MCP tools/list request failed: ${error.message}`);
     return;
   }
 
+  const tools = listed.json?.result?.tools;
+  if (Array.isArray(tools) && tools.length >= 4) {
+    pass(`MCP tools/list returns ${tools.length} tools`);
+  } else {
+    fail(`MCP tools/list returned ${tools?.length ?? 0} tools`);
+  }
+}
+
+async function testRoutinePersistsAcrossGatewayRestart() {
+  const routineSource =
+    "const echoed = toolport.call('mock__echo', { text: input.value }); return { value: echoed.content[0].text, frozen: Object.isFrozen(input) };";
+  const routineInputSchema = {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object",
+    properties: { value: { type: "string" } },
+    required: ["value"],
+    additionalProperties: false,
+  };
+  await writeFile(
+    path.join(smokeDir, "registry.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        codeMode: true,
+        allowRoutineWrites: true,
+        humanApproval: false,
+        servers: [
+          {
+            id: "mock",
+            name: "Mock",
+            transport: "stdio",
+            command: mockBinary,
+            args: [],
+            env: [],
+            source: "manual",
+          },
+        ],
+        profiles: [{ id: "default", name: "Default", enabledServerIds: ["mock"] }],
+        activeProfileId: "default",
+      },
+      null,
+      2,
+    )}\n`,
+  );
+
+  const broker = await startApprovalBroker();
+  await writeFile(
+    path.join(smokeDir, "approval-endpoint.json"),
+    `${JSON.stringify({ endpoint: broker.endpoint, token: broker.token })}\n`,
+  );
+
+  let routineId;
+  const firstPort = await availablePort("127.0.0.1");
+  const first = startGateway({ port: firstPort, host: "127.0.0.1", authToken: token });
   try {
-    const tools = JSON.parse(listed.body)?.result?.tools;
-    if (listed.status === 200 && Array.isArray(tools) && tools.length >= 4) {
-      pass(`MCP tools/list returns ${tools.length} tools`);
-    } else {
-      fail(`MCP tools/list returned ${listed.status} with ${tools?.length ?? 0} tools`);
+    const ready = await waitForStatus(firstPort, 401, first.child);
+    if (!ready.response)
+      throw new Error(`first gateway did not start: ${ready.last}; ${first.stderr()}`);
+    const sessionId = await initializeMcp(firstPort);
+    const listed = await mcpRequest({
+      port: firstPort,
+      id: 2,
+      method: "tools/list",
+      sessionId,
+    });
+    const names = listed.json.result.tools.map((tool) => tool.name);
+    for (const name of [
+      "toolport_save_routine",
+      "toolport_list_routines",
+      "toolport_run_routine",
+    ]) {
+      if (!names.includes(name)) throw new Error(`${name} was not advertised`);
     }
+
+    const codeRun = await mcpRequest({
+      port: firstPort,
+      id: 3,
+      method: "tools/call",
+      sessionId,
+      params: {
+        name: "toolport_run_script",
+        arguments: {
+          script: routineSource,
+          input: { value: "before-restart" },
+          inputSchema: routineInputSchema,
+        },
+      },
+    });
+    const codeRunMeta = codeRun.json?.result?.structuredContent?.toolportScript;
+    const runId = codeRunMeta?.runId;
+    if (
+      codeRun.json?.result?.isError ||
+      !/^run_[0-9a-f]{32}$/.test(runId ?? "") ||
+      codeRunMeta?.inputMode !== "immutable" ||
+      codeRunMeta?.routineCandidate?.eligible !== true ||
+      codeRunMeta?.routineCandidate?.promotionAvailable !== true
+    ) {
+      throw new Error(
+        `immutable Code Run did not yield a Candidate: ${JSON.stringify(codeRun.json)}`,
+      );
+    }
+
+    const saved = await mcpRequest({
+      port: firstPort,
+      id: 4,
+      method: "tools/call",
+      sessionId,
+      params: {
+        name: "toolport_save_routine",
+        arguments: {
+          runId,
+          name: "restart-smoke",
+          description: "real-process restart fixture",
+        },
+      },
+    });
+    const approval = await broker.requestReceived;
+    routineId = saved.json?.result?.structuredContent?.routine?.id;
+    if (!routineId || saved.json?.result?.isError) {
+      throw new Error(`save_routine failed: ${JSON.stringify(saved.json)}`);
+    }
+    const savedHash = saved.json?.result?.structuredContent?.routine?.contentHash;
+    const approvalLimits = approval.arguments?.limits;
+    const limitsAreBound =
+      approvalLimits &&
+      [
+        "maxCalls",
+        "wallClockMs",
+        "maxParallel",
+        "maxPromiseJobs",
+        "loopIterationLimit",
+        "recursionLimit",
+      ].every(
+        (field) => Number.isInteger(approvalLimits[field]) && approvalLimits[field] > 0,
+      );
+    const approvalIsContentBound =
+      approval.token === broker.token &&
+      approval.reason === "persistent_code_write" &&
+      approval.server === "toolport" &&
+      approval.tool === "save_routine" &&
+      approval.arguments?.name === "restart-smoke" &&
+      approval.arguments?.description === "real-process restart fixture" &&
+      approval.arguments?.runId === runId &&
+      approval.arguments?.source === routineSource &&
+      isDeepStrictEqual(approval.arguments?.inputSchema, routineInputSchema) &&
+      approval.arguments?.contentHash === savedHash &&
+      /^sha256:[0-9a-f]{64}$/.test(savedHash ?? "") &&
+      /^sha256:[0-9a-f]{64}$/.test(approval.arguments?.definitionFingerprint ?? "") &&
+      approval.arguments?.evidence?.sourceRunId === runId &&
+      approval.arguments?.evidence?.calls === 1 &&
+      approval.arguments?.evidence?.observedDependencies?.[0]?.name === "mock__echo" &&
+      limitsAreBound &&
+      !("validationArguments" in approval.arguments) &&
+      !("toolFingerprint" in approval);
+    if (!approvalIsContentBound) {
+      throw new Error(
+        `approval was not bound to the exact definition: ${JSON.stringify(approval)}`,
+      );
+    }
+    pass("real immutable Code Run promotes by runId with exact-definition approval");
   } catch (error) {
-    fail(`MCP tools/list returned invalid JSON: ${error.message}`);
+    fail(`Routine save before restart failed: ${error.message}`);
+  } finally {
+    await stopGateway(first.child);
+    await new Promise((resolve) => broker.server.close(resolve));
+  }
+
+  if (!routineId) return;
+  const secondPort = await availablePort("127.0.0.1");
+  const second = startGateway({ port: secondPort, host: "127.0.0.1", authToken: token });
+  try {
+    const ready = await waitForStatus(secondPort, 401, second.child);
+    if (!ready.response)
+      throw new Error(
+        `restarted gateway did not start: ${ready.last}; ${second.stderr()}`,
+      );
+    const sessionId = await initializeMcp(secondPort);
+    const listed = await mcpRequest({
+      port: secondPort,
+      id: 2,
+      method: "tools/call",
+      sessionId,
+      params: {
+        name: "toolport_list_routines",
+        arguments: { query: "restart echo", limit: 8 },
+      },
+    });
+    const routines = listed.json?.result?.structuredContent?.routines;
+    if (
+      !Array.isArray(routines) ||
+      !routines.some((routine) => routine.id === routineId)
+    ) {
+      throw new Error(
+        `saved routine missing after restart: ${JSON.stringify(listed.json)}`,
+      );
+    }
+    const run = await mcpRequest({
+      port: secondPort,
+      id: 3,
+      method: "tools/call",
+      sessionId,
+      params: {
+        name: "toolport_run_routine",
+        arguments: { id: routineId, arguments: { value: "after-restart" } },
+      },
+    });
+    const result = run.json?.result?.structuredContent?.result;
+    if (
+      run.json?.result?.isError ||
+      result?.value !== "after-restart" ||
+      result?.frozen !== true
+    ) {
+      throw new Error(`run_routine failed after restart: ${JSON.stringify(run.json)}`);
+    }
+    pass("Routine persists and runs through MCP after Gateway restart");
+  } catch (error) {
+    fail(`Routine restart verification failed: ${error.message}`);
+  } finally {
+    await stopGateway(second.child);
   }
 }
 
@@ -363,6 +632,13 @@ async function main() {
   } catch {
     throw new Error(
       `gateway binary not found at ${gatewayBinary}; run npm run build:gateway first`,
+    );
+  }
+  try {
+    await access(mockBinary);
+  } catch {
+    throw new Error(
+      `mock MCP binary not found at ${mockBinary}; run npm run build:gateway first`,
     );
   }
 
@@ -393,6 +669,7 @@ async function main() {
   });
   await testInsecureLoopback();
   await testAuthenticatedGateway();
+  await testRoutinePersistsAcrossGatewayRestart();
 
   console.log("");
   if (failures > 0) throw new Error(`${failures} smoke assertion(s) failed`);

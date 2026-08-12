@@ -100,6 +100,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: matrix.os != 'ubuntu-22.04'
+        with:
+          node-version: 20
+
       # The headless build skips Tauri/WebKit, but the Linux keyring backend still
       # needs libdbus headers and pkg-config at compile time.
       - name: Install Linux build dependencies
@@ -127,3 +132,15 @@ jobs:
       - name: Rust tests (Windows, no desktop)
         if: matrix.os == 'windows-latest'
         run: powershell -ExecutionPolicy Bypass -File scripts/test-rust-windows.ps1 -NoDefaultFeatures
+
+      - name: Build headless gateway for cross-platform smoke
+        if: matrix.os != 'ubuntu-22.04'
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin toolport-gateway --bin mock-mcp-server --no-default-features
+
+      - name: Headless gateway security smoke (macOS)
+        if: matrix.os == 'macos-latest'
+        run: node scripts/smoke-headless.mjs
+
+      - name: Headless gateway security smoke (Windows)
+        if: matrix.os == 'windows-latest'
+        run: powershell -ExecutionPolicy Bypass -File scripts/smoke-headless.ps1
