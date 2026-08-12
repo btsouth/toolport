@@ -3983,6 +3983,23 @@ pub fn run() {
                         repoint.customized.join(", ")
                     );
                 }
+                if !repoint.failed.is_empty() {
+                    // A client that needed migrating and could not be written stays
+                    // on a superseded gateway until someone notices. Keep it
+                    // distinguishable from "nothing to do" at the call site too,
+                    // not just in the gateway log.
+                    eprintln!(
+                        "toolport: FAILED to re-point {} client config(s); they will keep \
+                         launching their previous gateway: {}",
+                        repoint.failed.len(),
+                        repoint
+                            .failed
+                            .iter()
+                            .map(|(id, why)| format!("{id} ({why})"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
                 // Stop obsolete gateway processes. Path-based identity on all OS
                 // (SOU-414); not gated on repoint (SOU-306).
                 //
