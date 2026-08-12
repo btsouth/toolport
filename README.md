@@ -289,8 +289,20 @@ brew install --cask tsouth89/toolport/toolport
 curl -fsSL https://raw.githubusercontent.com/tsouth89/toolport/main/scripts/install.sh | bash
 ```
 
-On **Windows**, download the `.exe` from the
-[latest release](https://github.com/tsouth89/toolport/releases/latest).
+```powershell
+# Windows (PowerShell: downloads the signed installer, verifies its checksum, installs per-user)
+irm https://raw.githubusercontent.com/tsouth89/toolport/main/scripts/install.ps1 | iex
+```
+
+The Windows script installs **silently** and needs no administrator rights. It
+refuses to install anything whose published SHA-256 doesn't match, and prints the
+signing publisher so a signature problem is distinguishable from a routine
+SmartScreen warning. Options go through environment variables, since a
+pipe-to-`iex` one-liner can't take parameters: `$env:TOOLPORT_VERSION` pins a
+release, `$env:TOOLPORT_INTERACTIVE=1` runs the setup wizard instead, and
+`$env:TOOLPORT_DOWNLOAD_ONLY=1` fetches and verifies without installing. Saved to
+a file, it takes the matching `-Version`, `-Interactive`, and `-DownloadOnly`
+parameters.
 
 Prebuilt installers are published on the
 [Releases](https://github.com/tsouth89/toolport/releases) page. Toolport runs on

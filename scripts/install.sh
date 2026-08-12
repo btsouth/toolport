@@ -8,7 +8,7 @@
 #     into ~/.local/bin with a desktop entry.
 #   - macOS: copies Toolport.app from the signed .dmg into /Applications (Homebrew is
 #     the cleaner path, and this script points you there).
-# Windows: download the .exe from the Releases page instead.
+# Windows: use scripts/install.ps1 instead.
 set -euo pipefail
 
 REPO="tsouth89/toolport"
@@ -125,5 +125,5 @@ say "Installing Toolport ${tag_name:-latest}"
 case "$os" in
   Linux) install_linux ;;
   Darwin) install_macos ;;
-  *) err "Unsupported OS: $os. On Windows, download the .exe from https://github.com/$REPO/releases/latest" ;;
+  *) err "Unsupported OS: $os. On Windows, run in PowerShell: irm https://raw.githubusercontent.com/$REPO/main/scripts/install.ps1 | iex" ;;
 esac
