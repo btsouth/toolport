@@ -1,13 +1,13 @@
 pub mod approval;
 #[cfg(feature = "desktop")]
 mod approval_broker;
-#[cfg(feature = "desktop")]
-mod desktop;
 pub mod audit;
 pub mod brand;
 pub mod catalog;
 pub mod clients;
 pub mod codemode;
+#[cfg(feature = "desktop")]
+mod desktop;
 pub mod downstream;
 pub mod gateway_publish;
 pub mod inspect;
@@ -21,11 +21,14 @@ pub mod rate_limits;
 pub mod registry;
 pub mod remote;
 pub mod router;
+pub mod routine_candidates;
+pub mod routine_catalog;
+pub mod routines;
 pub mod savings;
 pub mod searchtrace;
+pub mod secrets;
 pub mod semantic;
 pub mod shaping;
-pub mod secrets;
 pub mod stacks;
 pub mod teams;
 pub mod usage_report;
