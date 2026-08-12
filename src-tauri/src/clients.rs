@@ -353,8 +353,47 @@ fn resolve_client_config_path(
     Some(path)
 }
 
+/// Claude Code relocates its whole config tree - `.claude.json` included - when
+/// `CLAUDE_CONFIG_DIR` is set, so the default `~/.claude.json` is not always the
+/// file it reads.
+///
+/// Resolving only the default is not a cosmetic miss: Toolport rewrites the
+/// gateway path in this file on every upgrade, so a relocated config keeps
+/// pinning whichever versioned binary was current when it was written. The
+/// client then respawns that obsolete gateway forever, and the "app is still
+/// launching an old gateway" reaper cannot win - it stops the process, and the
+/// config Toolport never updated starts it again.
+///
+/// Taken from Toolport's own environment, which covers a user who exports the
+/// variable. It does NOT cover a launcher that sets the variable only for the
+/// child process it spawns - Toolport cannot see that, and such a config stays
+/// stale. Kept split from the pure path table so tests stay env-free.
+fn claude_config_dir_override() -> Option<PathBuf> {
+    claude_config_dir_from(std::env::var_os("CLAUDE_CONFIG_DIR"))
+}
+
+/// The env-free half of [`claude_config_dir_override`], so the validation rules
+/// are testable without mutating process environment from a parallel test.
+fn claude_config_dir_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let dir = PathBuf::from(raw?);
+    // An empty or relative value is a misconfiguration, not an instruction to
+    // write somewhere surprising: fall back to the documented default rather
+    // than resolving against whatever cwd Toolport happens to have.
+    dir.is_absolute().then_some(dir)
+}
+
+/// The `.claude.json` a Claude Code process reads, given its config dir.
+fn claude_code_config_path(config_dir: &std::path::Path) -> PathBuf {
+    config_dir.join(".claude.json")
+}
+
 fn client_config_path(client_id: &str) -> Option<PathBuf> {
     let home = home()?;
+    if client_id == "claude-code" {
+        if let Some(dir) = claude_config_dir_override() {
+            return Some(claude_code_config_path(&dir));
+        }
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         return resolve_client_config_path_linux(client_id, &home);
@@ -4705,6 +4744,36 @@ mod tests {
     use super::*;
     use crate::registry::EnvVar;
 
+    #[test]
+    fn claude_code_config_follows_a_relocated_config_dir() {
+        // Claude Code moves `.claude.json` when CLAUDE_CONFIG_DIR is set. Resolving
+        // only `~/.claude.json` leaves the relocated copy pinned to whichever
+        // versioned gateway binary was current when it was last written, and the
+        // client then respawns that obsolete gateway indefinitely.
+        let relocated = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\someone\.claude-work")
+        } else {
+            PathBuf::from("/home/someone/.claude-work")
+        };
+        assert_eq!(
+            claude_config_dir_from(Some(relocated.clone().into_os_string())),
+            Some(relocated.clone())
+        );
+        assert_eq!(
+            claude_code_config_path(&relocated),
+            relocated.join(".claude.json")
+        );
+    }
+
+    #[test]
+    fn an_unset_or_unusable_claude_config_dir_falls_back_to_the_default() {
+        assert_eq!(claude_config_dir_from(None), None);
+        assert_eq!(claude_config_dir_from(Some("".into())), None);
+        // Relative: resolving it would depend on Toolport's cwd, which has nothing
+        // to do with where the client reads its config.
+        assert_eq!(claude_config_dir_from(Some("relative/dir".into())), None);
+    }
+
     fn sample_gateway(profile: Option<&str>, client_id: &str) -> ServerEntry {
         let mut env = vec![EnvVar {
             key: crate::brand::CLIENT_ID.to_string(),
@@ -7999,6 +8068,12 @@ command = "npx"
         // kimi_code_path() honors KIMI_CODE_HOME; clear it so the wrapper matches
         // the static resolver used for the expected path.
         let _kimi_home = EnvRestore::set("KIMI_CODE_HOME", Path::new(""));
+        // This asserts the documented default table, so neutralize the Claude Code
+        // config-dir override the host may have exported (a Claude Code session
+        // running these tests has it set, which legitimately relocates
+        // `.claude.json`). The override itself is covered by
+        // `claude_code_config_follows_a_relocated_config_dir`.
+        let _claude_config_dir = EnvRestore::set("CLAUDE_CONFIG_DIR", Path::new(""));
         let home = home().expect("home dir should be available in tests");
         let platform = Platform::current();
         for client in defs() {
