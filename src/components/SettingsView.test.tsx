@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 
 import { ThemeProvider } from "@/lib/theme";
 import { SettingsView } from "./SettingsView";
-import { listServerTools } from "@/lib/api";
+import { listServerTools, setAllowRoutineWrites, setCodeMode } from "@/lib/api";
 import type { Registry } from "@/lib/types";
 
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -13,10 +13,14 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return {
     ...actual,
     listServerTools: vi.fn(),
+    setAllowRoutineWrites: vi.fn(),
+    setCodeMode: vi.fn(),
   };
 });
 
 const mockedListServerTools = vi.mocked(listServerTools);
+const mockedSetAllowRoutineWrites = vi.mocked(setAllowRoutineWrites);
+const mockedSetCodeMode = vi.mocked(setCodeMode);
 
 const registry: Registry = {
   version: 1,
@@ -62,14 +66,17 @@ function renderSettings() {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
 
-  const promise = new Promise<T>((res) => {
+  const promise = new Promise<T>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
 
   return {
     promise,
     resolve,
+    reject,
   };
 }
 
@@ -130,5 +137,112 @@ describe("SettingsView tool loading", () => {
     await waitFor(() => {
       expect(screen.queryByText("Loading tools…")).not.toBeInTheDocument();
     });
+  });
+});
+
+describe("SettingsView routine writes", () => {
+  it("keeps concurrent successful setting responses from reverting each other", async () => {
+    const user = userEvent.setup();
+    const onRegistryChange = vi.fn();
+    const routineRequest = deferred<Registry>();
+    const codeModeRequest = deferred<Registry>();
+    mockedSetAllowRoutineWrites.mockReturnValueOnce(routineRequest.promise);
+    mockedSetCodeMode.mockReturnValueOnce(codeModeRequest.promise);
+
+    render(
+      <ThemeProvider>
+        <SettingsView registry={registry} onRegistryChange={onRegistryChange} />
+      </ThemeProvider>,
+    );
+
+    const routineControl = screen.getByRole("switch", {
+      name: /allow routine writes/i,
+    });
+    const codeModeControl = screen.getByRole("switch", { name: /code mode/i });
+    const destructiveControl = screen.getByRole("switch", {
+      name: /block destructive tools/i,
+    });
+
+    await user.click(routineControl);
+    expect(routineControl).toBeDisabled();
+    expect(codeModeControl).toBeEnabled();
+    expect(destructiveControl).toBeEnabled();
+
+    await user.click(codeModeControl);
+    expect(mockedSetCodeMode).toHaveBeenCalledWith(false);
+    expect(codeModeControl).toBeDisabled();
+    expect(routineControl).toBeDisabled();
+    expect(destructiveControl).toBeEnabled();
+
+    // Resolve the later request first, then return a stale Routine snapshot that still
+    // has Code Mode enabled. Each response must update only the setting it owns.
+    const codeModeOff = { ...registry, codeMode: false };
+    codeModeRequest.resolve(codeModeOff);
+    await waitFor(() => expect(codeModeControl).toBeEnabled());
+    expect(onRegistryChange).toHaveBeenCalledWith(codeModeOff);
+
+    const routineWritesOn = { ...registry, allowRoutineWrites: true };
+    routineRequest.resolve(routineWritesOn);
+    await waitFor(() => expect(routineControl).toBeEnabled());
+    expect(onRegistryChange).toHaveBeenLastCalledWith({
+      ...registry,
+      codeMode: false,
+      allowRoutineWrites: true,
+    });
+    expect(destructiveControl).toBeEnabled();
+  });
+
+  it("defaults off and persists the explicit opt-in", async () => {
+    const user = userEvent.setup();
+    const onRegistryChange = vi.fn();
+    const updated = { ...registry, allowRoutineWrites: true };
+    mockedSetAllowRoutineWrites.mockResolvedValueOnce(updated);
+
+    render(
+      <ThemeProvider>
+        <SettingsView registry={registry} onRegistryChange={onRegistryChange} />
+      </ThemeProvider>,
+    );
+
+    const control = screen.getByRole("switch", { name: /allow routine writes/i });
+    expect(control).not.toBeChecked();
+    await user.click(control);
+
+    expect(mockedSetAllowRoutineWrites).toHaveBeenCalledWith(true);
+    await waitFor(() => expect(onRegistryChange).toHaveBeenCalledWith(updated));
+  });
+
+  it("stays off when persisting the opt-in fails", async () => {
+    const user = userEvent.setup();
+    const onRegistryChange = vi.fn();
+    mockedSetAllowRoutineWrites.mockRejectedValueOnce(new Error("locked"));
+
+    render(
+      <ThemeProvider>
+        <SettingsView registry={registry} onRegistryChange={onRegistryChange} />
+      </ThemeProvider>,
+    );
+
+    const control = screen.getByRole("switch", { name: /allow routine writes/i });
+    await user.click(control);
+    await waitFor(() => expect(mockedSetAllowRoutineWrites).toHaveBeenCalledWith(true));
+    await waitFor(() => expect(control).toBeEnabled());
+    expect(control).not.toBeChecked();
+    expect(onRegistryChange).not.toHaveBeenCalled();
+  });
+
+  it("hides the write opt-in while Code Mode is disabled", () => {
+    render(
+      <ThemeProvider>
+        <SettingsView
+          registry={{ ...registry, codeMode: false, allowRoutineWrites: true }}
+          onRegistryChange={vi.fn()}
+        />
+      </ThemeProvider>,
+    );
+
+    expect(
+      screen.queryByRole("switch", { name: /allow routine writes/i }),
+    ).not.toBeInTheDocument();
   });
 });

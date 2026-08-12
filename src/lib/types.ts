@@ -364,7 +364,11 @@ export interface PendingApproval {
   server: string;
   tool: string;
   toolFingerprint?: string | null;
-  reason: "destructive" | "untrusted_source" | "destructive_and_untrusted";
+  reason:
+    | "destructive"
+    | "untrusted_source"
+    | "destructive_and_untrusted"
+    | "persistent_code_write";
   arguments: unknown;
   /** A screened URL-mode elicitation brokered by the desktop because the MCP host
    * did not declare URL elicitation support. */
@@ -433,6 +437,9 @@ export interface Registry {
   /** Code mode: advertise `toolport_run_script` so agents can orchestrate many tool
    * calls in one server-side script. On by default (SOU-397); Settings is the kill switch. */
   codeMode?: boolean;
+  /** Opt-in: let agents request saving immutable Code Mode routines. Every save still
+   * requires a separate human approval. */
+  allowRoutineWrites?: boolean;
   /** Per-client discovery-mode override, keyed by client id (e.g. "cursor" ->
    * "grouped"). Absent = that client inherits the global mode. */
   clientDiscovery?: Record<string, string>;

@@ -335,6 +335,11 @@ export function setCodeMode(enabled: boolean): Promise<Registry> {
   return invoke<Registry>("set_code_mode", { enabled });
 }
 
+/** Opt into agent-requested Routine writes. Each save still requires human approval. */
+export function setAllowRoutineWrites(allow: boolean): Promise<Registry> {
+  return invoke<Registry>("set_allow_routine_writes", { allow });
+}
+
 /** Override one client's discovery mode ("full" | "lazy" | "grouped"), or clear it
  * (`null`) so the client inherits the global mode. Applies live via the gateway's
  * per-client resolution, no reconnect needed. */

@@ -45,6 +45,7 @@ import {
   revokeAllowedTool,
   removeHttpClient,
   setAllowAgentControl,
+  setAllowRoutineWrites,
   setConfirmDestructive,
   setDenyDestructive,
   setCodeMode,
@@ -303,6 +304,36 @@ interface Props {
   onRegistryChange: (registry: Registry) => void;
 }
 
+type SettingKey =
+  | "autostart"
+  | "lazy-discovery"
+  | "code-mode"
+  | "allow-routine-writes"
+  | "deny-destructive"
+  | "confirm-destructive"
+  | "human-approval"
+  | "quarantine-on-drift"
+  | "block-on-injection"
+  | "pii-redaction"
+  | "allow-agent-control"
+  | "live-inspect";
+
+type RegistrySettingKey = Exclude<SettingKey, "autostart">;
+
+const REGISTRY_FIELD_BY_SETTING = {
+  "lazy-discovery": "lazyDiscovery",
+  "code-mode": "codeMode",
+  "allow-routine-writes": "allowRoutineWrites",
+  "deny-destructive": "denyDestructive",
+  "confirm-destructive": "confirmDestructive",
+  "human-approval": "humanApproval",
+  "quarantine-on-drift": "quarantineOnDrift",
+  "block-on-injection": "blockOnInjection",
+  "pii-redaction": "piiRedaction",
+  "allow-agent-control": "allowAgentControl",
+  "live-inspect": "liveInspect",
+} as const satisfies Record<RegistrySettingKey, keyof Registry>;
+
 /** A one-line security posture readout at the top of the Security section, so the user can
  * tell at a glance whether they're protected instead of mentally AND-ing every toggle. */
 function PostureSummary({
@@ -547,6 +578,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   // On by default (SOU-397); only treat explicit false as off when the field is missing
   // during a partial load, match the registry serde default.
   const codeMode = registry?.codeMode ?? true;
+  const allowRoutineWrites = registry?.allowRoutineWrites ?? false;
   const denyDestructive = registry?.denyDestructive ?? false;
   const confirmDestructive = registry?.confirmDestructive ?? false;
   const humanApproval = registry?.humanApproval ?? false;
@@ -555,7 +587,13 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   const blockOnInjection = registry?.blockOnInjection ?? false;
   const piiRedaction = registry?.piiRedaction ?? false;
   const liveInspect = registry?.liveInspect ?? false;
-  const [busy, setBusy] = useState(false);
+  const [busySettings, setBusySettings] = useState<ReadonlySet<SettingKey>>(
+    () => new Set(),
+  );
+  const latestRegistry = useRef(registry);
+  useEffect(() => {
+    latestRegistry.current = registry;
+  }, [registry]);
   // Profile cards collapse so a big Default profile doesn't dump every server (and its
   // per-server tool rows) onto the page. Collapsed by default; the comma summary still shows.
   const [openProfiles, setOpenProfiles] = useState<Set<string>>(new Set());
@@ -604,7 +642,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   }, []);
 
   const toggleAutostart = async (on: boolean) => {
-    setBusy(true);
+    setBusySettings((current) => new Set(current).add("autostart"));
     try {
       if (on) await enableAutostart();
       else await disableAutostart();
@@ -612,7 +650,11 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     } catch (e) {
       toastError(`Couldn't ${on ? "enable" : "disable"} launch at login: ${e}`);
     } finally {
-      setBusy(false);
+      setBusySettings((current) => {
+        const next = new Set(current);
+        next.delete("autostart");
+        return next;
+      });
     }
   };
 
@@ -725,29 +767,48 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     );
   };
 
-  const apply = (fn: (v: boolean) => Promise<Registry>) => async (v: boolean) => {
-    setBusy(true);
-    try {
-      onRegistryChange(await fn(v));
-    } catch (e) {
-      toastError(`Couldn't update the setting: ${e}`);
-    } finally {
-      setBusy(false);
-    }
+  const publishRegistrySetting = (key: RegistrySettingKey, updated: Registry) => {
+    const field = REGISTRY_FIELD_BY_SETTING[key];
+    const reconciled: Registry = latestRegistry.current
+      ? { ...latestRegistry.current, [field]: updated[field] }
+      : updated;
+    latestRegistry.current = reconciled;
+    onRegistryChange(reconciled);
   };
+
+  const apply =
+    (key: RegistrySettingKey, fn: (v: boolean) => Promise<Registry>) =>
+    async (v: boolean) => {
+      setBusySettings((current) => new Set(current).add(key));
+      try {
+        publishRegistrySetting(key, await fn(v));
+      } catch (e) {
+        toastError(`Couldn't update the setting: ${e}`);
+      } finally {
+        setBusySettings((current) => {
+          const next = new Set(current);
+          next.delete(key);
+          return next;
+        });
+      }
+    };
 
   // Live inspection needs a step the plain `apply` helper doesn't: when turned OFF,
   // clear the ephemeral capture ring so nothing lingers on disk.
   const applyLiveInspect = async (on: boolean) => {
-    setBusy(true);
+    setBusySettings((current) => new Set(current).add("live-inspect"));
     try {
       const reg = await setLiveInspect(on);
       if (!on) await clearInspectLog();
-      onRegistryChange(reg);
+      publishRegistrySetting("live-inspect", reg);
     } catch (e) {
       toastError(`Couldn't update the setting: ${e}`);
     } finally {
-      setBusy(false);
+      setBusySettings((current) => {
+        const next = new Set(current);
+        next.delete("live-inspect");
+        return next;
+      });
     }
   };
 
@@ -758,6 +819,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     title: string,
     desc: string,
     onChange: (v: boolean) => void,
+    settingKey: SettingKey,
   ) => (
     <label className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm">
       <Icon className={`size-4 shrink-0 ${on ? accent : "text-muted-foreground"}`} />
@@ -765,7 +827,11 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         <span className="font-medium">{title}</span>
         <span className="text-xs text-muted-foreground">{desc}</span>
       </span>
-      <Switch checked={on} onCheckedChange={onChange} disabled={busy} />
+      <Switch
+        checked={on}
+        onCheckedChange={onChange}
+        disabled={busySettings.has(settingKey)}
+      />
     </label>
   );
 
@@ -782,6 +848,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "Launch at login",
           "Start Toolport in the tray when you sign in, so it can hold tool calls for approval even before you open it",
           toggleAutostart,
+          "autostart",
         )}
         <div className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm">
           <Sun className="size-4 shrink-0 text-info" />
@@ -902,7 +969,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-info",
           "Lazy discovery",
           "Expose 4 meta-tools, not the full catalog (all clients)",
-          apply(setLazyDiscovery),
+          apply("lazy-discovery", setLazyDiscovery),
+          "lazy-discovery",
         )}
         {/* Pinned prerequisites is a refinement of lazy discovery (the tools it must never
             hide), not a peer feature, so nest it under the Lazy discovery toggle with an
@@ -923,8 +991,20 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-info",
           "Code mode",
           "On by default: agents can run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary; turn off to hide toolport_run_script.",
-          apply(setCodeMode),
+          apply("code-mode", setCodeMode),
+          "code-mode",
         )}
+        {codeMode
+          ? toggle(
+              Braces,
+              allowRoutineWrites,
+              "text-warning",
+              "Allow routine writes",
+              "Allow agents to request saving persistent routines. Every save still requires your approval.",
+              apply("allow-routine-writes", setAllowRoutineWrites),
+              "allow-routine-writes",
+            )
+          : null}
       </section>
       <section className="flex flex-col gap-2">
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
@@ -943,7 +1023,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-warning",
           "Block destructive tools",
           "Hide any tool the server marks as able to delete or change data, from every client",
-          apply(setDenyDestructive),
+          apply("deny-destructive", setDenyDestructive),
+          "deny-destructive",
         )}
         {toggle(
           ShieldCheck,
@@ -951,7 +1032,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-info",
           "Confirm destructive tools",
           "Hold each destructive call for the agent to confirm before it runs",
-          apply(setConfirmDestructive),
+          apply("confirm-destructive", setConfirmDestructive),
+          "confirm-destructive",
         )}
         {toggle(
           UserCheck,
@@ -959,7 +1041,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-info",
           "Require human approval",
           "Hold destructive or untrusted-server calls until you approve them in the app",
-          apply(setHumanApproval),
+          apply("human-approval", setHumanApproval),
+          "human-approval",
         )}
         {toggle(
           ShieldX,
@@ -967,7 +1050,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-destructive",
           "Quarantine changed high-risk tools",
           "Block a destructive or poisoned tool that changes from its approved version, until you re-approve it",
-          apply(setQuarantineOnDrift),
+          apply("quarantine-on-drift", setQuarantineOnDrift),
+          "quarantine-on-drift",
         )}
         {toggle(
           ShieldAlert,
@@ -975,7 +1059,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-destructive",
           "Block high-confidence injection",
           "Fail a tool call when content defense finds a high-confidence prompt-injection hit, instead of only labeling the text. Off by default; medium-confidence hits still label only",
-          apply(setBlockOnInjection),
+          apply("block-on-injection", setBlockOnInjection),
+          "block-on-injection",
         )}
         {toggle(
           EyeOff,
@@ -983,7 +1068,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-info",
           "Hide personal data from the model",
           "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. A value only goes back to the server it came from, so a call that would send one server's data to another is refused. Real data stays on this machine and is forgotten when the conversation ends. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
-          apply(setPiiRedaction),
+          apply("pii-redaction", setPiiRedaction),
+          "pii-redaction",
         )}
         {toggle(
           Bot,
@@ -991,7 +1077,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-success",
           "Allow agent control",
           "Let an agent turn servers on/off; your destructive-tool block always stays yours",
-          apply(setAllowAgentControl),
+          apply("allow-agent-control", setAllowAgentControl),
+          "allow-agent-control",
         )}
         {toggle(
           Activity,
@@ -1000,6 +1087,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "Live request/response inspection",
           "Off by default. While on, Toolport captures each tool call's arguments and results to a small local, ephemeral buffer (the last 50 calls) so you can inspect them in Activity. This is separate from the audit log, never leaves your machine, and is cleared when you turn it off or restart the gateway.",
           applyLiveInspect,
+          "live-inspect",
         )}
         {quarantined.length === 0 && quarantineError && (
           <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">

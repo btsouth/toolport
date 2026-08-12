@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { Check, Globe, Loader2, Monitor, ShieldAlert, Trash2, X } from "lucide-react";
+import {
+  Check,
+  FileCode2,
+  Globe,
+  Loader2,
+  Monitor,
+  ShieldAlert,
+  Trash2,
+  X,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { decideApproval, listPendingApprovals, type ApprovalScope } from "@/lib/api";
@@ -13,6 +22,24 @@ import { toastError } from "@/lib/toast";
 const TIMEOUT_MS = 120_000;
 
 type Reason = PendingApproval["reason"];
+
+function routineApprovalView(value: unknown) {
+  if (!value || typeof value !== "object") return null;
+  const payload = value as Record<string, unknown>;
+  const evidence =
+    payload.evidence && typeof payload.evidence === "object"
+      ? (payload.evidence as Record<string, unknown>)
+      : undefined;
+  const dependencies = evidence?.observedDependencies;
+  return {
+    name: typeof payload.name === "string" ? payload.name : "Unnamed routine",
+    description: typeof payload.description === "string" ? payload.description : null,
+    risk: typeof payload.riskClass === "string" ? payload.riskClass : "unknown",
+    calls: evidence?.calls,
+    dependencies: Array.isArray(dependencies) ? dependencies : [],
+    technical: payload,
+  };
+}
 
 /** How each gate reason presents: label, badge tone, and an icon. */
 const REASON: Record<Reason, { label: string; className: string; Icon: typeof Trash2 }> =
@@ -31,6 +58,11 @@ const REASON: Record<Reason, { label: string; className: string; Icon: typeof Tr
       label: "Destructive · untrusted",
       className: "bg-destructive/10 text-destructive",
       Icon: Trash2,
+    },
+    persistent_code_write: {
+      label: "Persistent code",
+      className: "bg-warning/15 text-warning",
+      Icon: FileCode2,
     },
   };
 
@@ -223,12 +255,63 @@ export function PendingApprovals() {
 
                 <div className="mb-3">
                   <div className="mb-1 text-[0.7rem] font-medium uppercase tracking-wide text-muted-foreground">
-                    {urlElicitation ? "Why this is needed" : "Arguments"}
+                    {urlElicitation
+                      ? "Why this is needed"
+                      : a.reason === "persistent_code_write"
+                        ? "Routine definition"
+                        : "Arguments"}
                   </div>
                   {urlElicitation ? (
                     <div className="rounded-md border border-border/60 bg-muted/40 p-2.5 text-sm leading-relaxed">
                       {urlElicitation.message}
                     </div>
+                  ) : a.reason === "persistent_code_write" ? (
+                    (() => {
+                      const routine = routineApprovalView(a.arguments);
+                      if (!routine) return null;
+                      return (
+                        <div className="space-y-2 rounded-md border border-border/60 bg-muted/40 p-2.5 text-sm">
+                          <div className="font-medium text-foreground">
+                            {routine.name}
+                          </div>
+                          {routine.description && (
+                            <div className="text-xs leading-relaxed text-muted-foreground">
+                              {routine.description}
+                            </div>
+                          )}
+                          <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                            <span>Risk: {routine.risk}</span>
+                            {routine.calls !== undefined && (
+                              <span>Calls: {String(routine.calls)}</span>
+                            )}
+                            {routine.dependencies.length > 0 && (
+                              <span>
+                                Dependencies:{" "}
+                                {routine.dependencies
+                                  .map((dependency) =>
+                                    dependency &&
+                                    typeof dependency === "object" &&
+                                    "name" in dependency
+                                      ? String(
+                                          (dependency as Record<string, unknown>).name,
+                                        )
+                                      : String(dependency),
+                                  )
+                                  .join(", ")}
+                              </span>
+                            )}
+                          </div>
+                          <details>
+                            <summary className="cursor-pointer text-xs font-medium text-muted-foreground hover:text-foreground">
+                              Technical details
+                            </summary>
+                            <pre className="mt-2 max-h-36 overflow-auto rounded border border-border/60 bg-background/60 p-2 font-mono text-[0.7rem] leading-relaxed">
+                              {JSON.stringify(routine.technical, null, 2)}
+                            </pre>
+                          </details>
+                        </div>
+                      );
+                    })()
                   ) : (
                     <pre className="max-h-36 overflow-auto rounded-md border border-border/60 bg-muted/40 p-2.5 font-mono text-xs leading-relaxed">
                       {JSON.stringify(a.arguments, null, 2)}
@@ -291,7 +374,7 @@ export function PendingApprovals() {
                 </div>
 
                 {/* Skip the prompt for this tool next time - curbs approval fatigue. */}
-                {!urlElicitation && (
+                {!urlElicitation && a.reason !== "persistent_code_write" && (
                   <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-muted-foreground">
                     <span>Skip next time?</span>
                     <button
