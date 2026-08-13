@@ -69,7 +69,10 @@ fn empty_quarantine_file_must_not_silently_unblock() {
 
     // Present-but-empty is not a legitimate first-run state: a clean install has no
     // file at all, and a full release writes `{}`. Emptiness is truncation or wipe.
-    let path = dir.join("quarantine-q-empty-trunc.json");
+    let path = dir.join(format!(
+        "quarantine-v2-{}.json",
+        conduit_lib::registry::profile_store_key("q-empty-trunc")
+    ));
     assert!(
         path.is_file(),
         "quarantine store should exist at {}",
@@ -115,7 +118,10 @@ fn an_empty_store_also_blocks_rewrites_that_would_erase_it() {
     let profile = Some("q-no-rewrite");
     quarantine_a_destructive_tool(profile);
 
-    let path = dir.join("quarantine-q-no-rewrite.json");
+    let path = dir.join(format!(
+        "quarantine-v2-{}.json",
+        conduit_lib::registry::profile_store_key("q-no-rewrite")
+    ));
     std::fs::write(&path, "").expect("truncate quarantine store to empty");
 
     assert!(

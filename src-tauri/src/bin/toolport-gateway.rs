@@ -21116,7 +21116,10 @@ mod tests {
         let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
         let profile = Some("corrupt-pins-live-q");
         std::fs::write(
-            dir.join("tool-pins-corrupt-pins-live-q.json"),
+            dir.join(format!(
+                "tool-pins-v2-{}.json",
+                conduit_lib::registry::profile_store_key("corrupt-pins-live-q")
+            )),
             "{ corrupt trust root",
         )
         .unwrap();
@@ -21154,7 +21157,10 @@ mod tests {
 
         let profile = Some("baseline-tamper");
         std::fs::write(
-            dir.join("tool-pins-baseline-tamper.json"),
+            dir.join(format!(
+                "tool-pins-v2-{}.json",
+                conduit_lib::registry::profile_store_key("baseline-tamper")
+            )),
             "{ corrupt baseline",
         )
         .unwrap();
@@ -21217,7 +21223,10 @@ mod tests {
         assert!(router.lock().unwrap().quarantined().contains("srv__wipe"));
 
         // Corrupt the store underneath the running gateway.
-        let path = dir.join("quarantine-corrupt-q.json");
+        let path = dir.join(format!(
+            "quarantine-v2-{}.json",
+            conduit_lib::registry::profile_store_key("corrupt-q")
+        ));
         assert!(path.exists(), "fixture wrote where expected: {path:?}");
         std::fs::write(&path, "{ not json at all").unwrap();
 
