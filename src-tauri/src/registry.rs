@@ -800,15 +800,44 @@ pub fn unmigrated_legacy_profile_store(profile: &str, pins: bool) -> bool {
     if v2.exists() {
         return false;
     }
-    let slug = legacy_profile_store_slug(profile);
-    if slug.is_empty() {
-        return false;
+    let mut slugs = BTreeSet::from([legacy_profile_store_slug(profile)]);
+    // Live callers use stable ids, while pre-v2 files were usually named from the
+    // profile's display name. Read the registry without invoking migration again so
+    // both historical references are checked (SBS-715 / CodeRabbit).
+    let registry = resolved_path().map(|path| load_from(&path));
+    match registry {
+        Some(Ok(registry)) => {
+            if let Some(record) = registry.profiles.iter().find(|record| record.id == profile) {
+                slugs.insert(legacy_profile_store_slug(&record.name));
+            }
+        }
+        Some(Err(_)) => {
+            // If the registry itself cannot be read, we cannot prove which legacy
+            // name belongs to this id. Any leftover store is therefore evidence of
+            // an incomplete migration, and the trust read must fail closed.
+            let prefix = if pins { "tool-pins-" } else { "quarantine-" };
+            return std::fs::read_dir(&dir).is_ok_and(|entries| {
+                entries.flatten().any(|entry| {
+                    entry.file_name().to_str().is_some_and(|name| {
+                        name.starts_with(prefix)
+                            && !name.starts_with(&format!("{prefix}v2-"))
+                            && name.ends_with(".json")
+                    })
+                })
+            });
+        }
+        None => {}
     }
-    dir.join(format!(
-        "{}{slug}.json",
-        if pins { "tool-pins-" } else { "quarantine-" }
-    ))
-    .exists()
+    slugs
+        .into_iter()
+        .filter(|slug| !slug.is_empty())
+        .any(|slug| {
+            dir.join(format!(
+                "{}{slug}.json",
+                if pins { "tool-pins-" } else { "quarantine-" }
+            ))
+            .exists()
+        })
 }
 
 /// The lossy filename mapping used before profile stores were keyed by stable ids.
@@ -1066,7 +1095,10 @@ impl Registry {
             })
         };
         if let Some(active) = self.active_profile_id.clone() {
-            self.active_profile_id = Some(normalize(&active));
+            // A stale active profile is global state. Clear it so the existing
+            // first-profile fallback applies instead of persisting an invalid marker
+            // that empties every unscoped client's catalog.
+            self.active_profile_id = resolve(&active);
         }
         for scope in self.client_scopes.values_mut() {
             *scope = normalize(scope);
@@ -2408,9 +2440,7 @@ pub fn load_resolved() -> Result<Registry, String> {
         Some(path) => load_from(&path),
         None => Ok(Registry::default()),
     }?;
-    if let Err(error) = migrate_profile_stores(&registry) {
-        eprintln!("toolport: profile-store migration failed: {error}");
-    }
+    migrate_profile_stores(&registry)?;
     Ok(registry)
 }
 
@@ -3860,6 +3890,15 @@ mod tests {
     }
 
     #[test]
+    fn normalize_clears_a_stale_active_profile_for_first_profile_fallback() {
+        let mut registry = Registry::default();
+        registry.active_profile_id = Some("deleted-profile".into());
+        registry.normalize_profile_references();
+        assert_eq!(registry.active_profile_id, None);
+        assert_eq!(registry.active_profile_id(), DEFAULT_PROFILE_ID);
+    }
+
+    #[test]
     fn migrate_copies_unambiguous_legacy_files_and_fails_closed_on_slug_collisions() {
         let _lock = data_dir_test_lock();
         let dir = std::env::temp_dir().join(format!(
@@ -3963,15 +4002,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _override = DataDirOverride::set(&dir);
-        std::fs::write(dir.join("tool-pins-billing.json"), r#"{"x":{}}"#).unwrap();
-        assert!(unmigrated_legacy_profile_store("billing", true));
-        assert!(!unmigrated_legacy_profile_store("billing", false));
+        let mut registry = Registry::default();
+        let billing = registry.add_profile("Customer Billing");
+        save_to(&dir.join("registry.json"), &registry).unwrap();
+        std::fs::write(
+            dir.join("tool-pins-customer-billing.json"),
+            r#"{"x":{}}"#,
+        )
+        .unwrap();
+        assert!(unmigrated_legacy_profile_store(&billing, true));
+        assert!(!unmigrated_legacy_profile_store(&billing, false));
         let v2 = dir.join(format!(
             "tool-pins-v2-{}.json",
-            profile_store_key("billing")
+            profile_store_key(&billing)
         ));
         std::fs::write(&v2, "{}").unwrap();
-        assert!(!unmigrated_legacy_profile_store("billing", true));
+        assert!(!unmigrated_legacy_profile_store(&billing, true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

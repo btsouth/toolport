@@ -184,9 +184,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
 
   /** How many servers a given scope ("" = active profile, else a named profile)
    * resolves to, for the "scoped to X · N servers" summary. */
-  function scopeServerCount(scopeName: string): number {
-    const target = scopeName
-      ? profiles.find((p) => p.name.toLowerCase() === scopeName.toLowerCase())
+  function scopeServerCount(scopeRef: string): number {
+    const target = scopeRef
+      ? profiles.find(
+          (p) => p.id === scopeRef || p.name.toLowerCase() === scopeRef.toLowerCase(),
+        )
       : (profiles.find((p) => p.id === registry?.activeProfileId) ?? profiles[0]);
     if (!target) return 0;
     // Exclude Toolport's own gateway entry so the count matches the Servers list (which
@@ -199,9 +201,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
 
   /** The actual servers a scope resolves to, so a connected client shows WHAT it can
    * reach, not just a count. */
-  function scopeServers(scopeName: string): { id: string; name: string }[] {
-    const target = scopeName
-      ? profiles.find((p) => p.name.toLowerCase() === scopeName.toLowerCase())
+  function scopeServers(scopeRef: string): { id: string; name: string }[] {
+    const target = scopeRef
+      ? profiles.find(
+          (p) => p.id === scopeRef || p.name.toLowerCase() === scopeRef.toLowerCase(),
+        )
       : (profiles.find((p) => p.id === registry?.activeProfileId) ?? profiles[0]);
     if (!target) return [];
     const enabled = new Set(target.enabledServerIds);
@@ -864,7 +868,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                   <SelectContent>
                     <SelectItem value="__all__">Follow active profile</SelectItem>
                     {profiles.map((p) => (
-                      <SelectItem key={p.id} value={p.name}>
+                      <SelectItem key={p.id} value={p.id}>
                         Only: {p.name}
                       </SelectItem>
                     ))}

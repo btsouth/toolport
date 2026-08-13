@@ -2030,18 +2030,18 @@ fn build_tool_identities(
 /// pins by the CONDUIT_PROFILE it ran under (often None -> tool-pins.json), which need
 /// not equal the app's active profile. Empty until the gateway has pinned a baseline.
 #[tauri::command]
-fn list_tool_identities(state: State<RegistryState>) -> Vec<ToolIdentity> {
+fn list_tool_identities(state: State<RegistryState>) -> Result<Vec<ToolIdentity>, String> {
     let reg = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut ids = build_tool_identities(
-        &integrity::all_baselines(),
-        &integrity::all_quarantined_names(),
+        &integrity::all_baselines()?,
+        &integrity::all_quarantined_names()?,
         &reg.servers,
         &reg.profiles,
     );
     ids.sort_by(|a, b| b.last_changed.cmp(&a.last_changed).then(a.alias.cmp(&b.alias)));
-    ids
+    Ok(ids)
 }
 
 /// Toggle quarantine-on-drift. When enabled, the gateway hides and blocks a high-risk
@@ -2087,10 +2087,10 @@ fn set_pii_redaction(state: State<RegistryState>, on: bool) -> Result<Registry, 
 /// running" path. First call only seeds the seen-set so restarting the app with an
 /// already-quarantined tool does not re-notify.
 #[tauri::command]
-fn list_quarantined(app: AppHandle) -> Vec<serde_json::Value> {
-    let list = integrity::all_quarantined();
+fn list_quarantined(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    let list = integrity::all_quarantined()?;
     notify_new_quarantines(&app, &list);
-    list
+    Ok(list)
 }
 
 /// Keys of quarantine entries we have already observed this process. `None` = not

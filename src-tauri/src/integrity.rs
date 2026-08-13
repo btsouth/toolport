@@ -715,12 +715,12 @@ pub fn baselines(profile: Option<&str>) -> BTreeMap<String, ToolBaseline> {
 /// must union every profile's pins rather than guess a single one. For a tool seen in
 /// several profiles: earliest first_seen, latest last_changed, and the fingerprint from
 /// the most recent change.
-pub fn all_baselines() -> BTreeMap<String, ToolBaseline> {
+pub fn all_baselines() -> Result<BTreeMap<String, ToolBaseline>, String> {
     let mut merged: BTreeMap<String, ToolBaseline> = BTreeMap::new();
     let Some(dir) = crate::registry::conduit_dir() else {
-        return merged;
+        return Ok(merged);
     };
-    let registry = crate::registry::load_resolved().unwrap_or_default();
+    let registry = crate::registry::load_resolved()?;
     let mut paths = vec![dir.join("tool-pins.json")];
     paths.extend(registry.profiles.iter().filter_map(|profile| pins_path(Some(&profile.id))));
     for path in paths {
@@ -753,7 +753,7 @@ pub fn all_baselines() -> BTreeMap<String, ToolBaseline> {
                 .or_insert(base);
         }
     }
-    merged
+    Ok(merged)
 }
 
 /// The set of quarantined tool names across ALL profiles, for the identity view's badge.
@@ -767,12 +767,12 @@ fn is_legacy_added(rec: &Value) -> bool {
     rec.get("change").and_then(Value::as_str) == Some("added")
 }
 
-pub fn all_quarantined_names() -> BTreeSet<String> {
+pub fn all_quarantined_names() -> Result<BTreeSet<String>, String> {
     let mut out = BTreeSet::new();
     let Some(dir) = crate::registry::conduit_dir() else {
-        return out;
+        return Ok(out);
     };
-    let registry = crate::registry::load_resolved().unwrap_or_default();
+    let registry = crate::registry::load_resolved()?;
     let mut paths = vec![dir.join("quarantine.json")];
     paths.extend(registry.profiles.iter().filter_map(|profile| quarantine_path(Some(&profile.id))));
     for path in paths {
@@ -786,7 +786,7 @@ pub fn all_quarantined_names() -> BTreeSet<String> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 // ===== Quarantine: block high-risk tools after a drift until re-approved =====
@@ -1032,12 +1032,12 @@ pub fn quarantine_list(profile: Option<&str>) -> Vec<Value> {
 /// Every quarantined tool across all current stable-id profiles, each record tagged with its
 /// exact profile id (`""` for the distinct HTTP-union store), for the app UI. The
 /// `profile` tag is what `release` takes back to clear the right store.
-pub fn all_quarantined() -> Vec<Value> {
+pub fn all_quarantined() -> Result<Vec<Value>, String> {
     let Some(dir) = crate::registry::conduit_dir() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    let registry = crate::registry::load_resolved().unwrap_or_default();
+    let registry = crate::registry::load_resolved()?;
     let mut stores = vec![(String::new(), dir.join("quarantine.json"))];
     stores.extend(registry.profiles.iter().filter_map(|profile| {
         quarantine_path(Some(&profile.id)).map(|path| (profile.id.clone(), path))
@@ -1055,7 +1055,7 @@ pub fn all_quarantined() -> Vec<Value> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Re-approve a quarantined tool: drop it so the gateway re-exposes it on the next
@@ -2816,11 +2816,12 @@ mod tests {
         // filter or the UI keeps showing tools the gateway no longer blocks (the bug the
         // user hit: dozens of first-sight destructive tools still listed as quarantined).
         assert!(
-            !all_quarantined_names().contains(probe),
+            !all_quarantined_names().unwrap().contains(probe),
             "legacy added entry is dropped from the cross-profile enforcement set"
         );
         assert!(
             !all_quarantined()
+                .unwrap()
                 .iter()
                 .any(|r| r.get("tool").and_then(Value::as_str) == Some(probe)),
             "legacy added entry is dropped from the cross-profile display list"
@@ -3032,6 +3033,17 @@ mod tests {
         std::fs::write(&v2, record).unwrap();
         assert_eq!(quarantined_checked(Some("billing")).unwrap().len(), 1);
         assert_eq!(mandatory_quarantined_checked(Some("billing")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cross_profile_quarantine_view_surfaces_a_registry_load_failure() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data_dir = TestDataDir::new("aggregate-corrupt-registry");
+        std::fs::write(data_dir.path.join("registry.json"), "{ corrupt registry").unwrap();
+        assert!(
+            all_quarantined().is_err(),
+            "a corrupt registry must not become an authoritative empty cross-profile view"
+        );
     }
 
     #[test]
