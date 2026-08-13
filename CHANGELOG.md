@@ -120,6 +120,19 @@ app act on it. Each one now fails closed.
 - **Tray and update lifecycle**, including approval requests being delivered once rather
   than repeatedly. (SBS-146)
 
+### Thanks
+
+Two patches this cycle, one of them a code-mode feature listed above:
+
+- **[Vermitrude](https://github.com/Vermitrude)** - `toolport.checkpoint()`, the
+  script-declared resume marker a code-mode script sets alongside the automatic call
+  ledger (#689).
+- **[rohankumardubey](https://github.com/rohankumardubey)** - ran the headless Rust
+  suite across macOS, Linux and Windows in CI, where the no-desktop build had only been
+  exercised on one platform (#671).
+
+If we missed you, open an issue.
+
 ## [1.12.0] - 2026-08-09
 
 Two features ship for the first time. PII pseudonymization replaces personal data in

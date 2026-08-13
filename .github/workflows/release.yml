@@ -288,11 +288,38 @@ jobs:
       - name: Package the agent plugin
         run: cd packaging/agent-plugin && zip -r toolport-agent-plugin.zip toolport
 
+      # Deliberately duplicated from the build job rather than shared. This job is
+      # seconds long while a native build is tens of minutes, so it always creates
+      # the draft first - and the release action only applies `body_path` to a
+      # release it created, so whichever job gets there first is the only one whose
+      # notes ever land. v1.13.0 published with an empty body for exactly this
+      # reason. Both jobs must carry the notes; do not "clean this up" into one.
+      - name: Extract this version's changelog entry
+        id: notes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if grep -q '[^[:space:]]' release-notes.md; then
+            printf '\n---\n\n**Full changelog:** https://github.com/%s/blob/%s/CHANGELOG.md\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" >> release-notes.md
+            echo "have_notes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_notes=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No CHANGELOG section for $version; falling back to generated notes."
+          fi
+
       - name: Upload the agent plugin
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           draft: true
           name: Toolport ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.have_notes == 'true' && 'release-notes.md' || '' }}
+          generate_release_notes: ${{ steps.notes.outputs.have_notes != 'true' }}
           files: packaging/agent-plugin/toolport-agent-plugin.zip
 
   # Assemble the updater manifest from every platform's signature, after all
