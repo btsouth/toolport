@@ -8192,7 +8192,13 @@ fn watch_tick(
         // client's configured profile. So editing folder_profiles (a registry change)
         // re-applies routing live for a client already sitting in a mapped folder.
         let env_owned = env_profile.map(|s| s.to_string());
-        let resolved = effective_profile(&new_reg, client_id, &env_owned, root.as_deref());
+        // HTTP serves a union catalog. Never persist that into a profile namespace
+        // after a later registry reload (SBS-715).
+        let resolved = if http_mode {
+            None
+        } else {
+            effective_profile(&new_reg, client_id, &env_owned, root.as_deref())
+        };
         // Capture the profile we were serving before this reload so the log can
         // show the transition - the single most useful line when diagnosing
         // "why can't this client see server X": it pins down which profile is
@@ -21253,6 +21259,58 @@ mod tests {
 
         drop(_data_dir);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn watch_tick_http_mode_keeps_profile_none_after_registry_reload() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-http-profile-none-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let router = Arc::new(Mutex::new(Arc::new(Router::new())));
+        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default())));
+        let profile_slot = Arc::new(Mutex::new(None));
+        let downstream_dirty = Arc::new(AtomicU8::new(0));
+        let client_root = Arc::new(Mutex::new(None));
+        let server_handler: ServerRequestHandler = Arc::new(|_| None);
+        let rebuild_lock = Arc::new(Mutex::new(()));
+        let reg_path = dir.join("registry.json");
+        conduit_lib::registry::save_to(&reg_path, &Registry::default()).unwrap();
+        let mut state = WatchLoopState {
+            last_mtime: None,
+            last_relevant: json!({}),
+        };
+
+        let _ = watch_tick(
+            &reg_path,
+            &registry,
+            &router,
+            &stdout,
+            &cached_tools,
+            &profile_slot,
+            None,
+            Some("Default"),
+            true,
+            &downstream_dirty,
+            &server_handler,
+            &client_root,
+            None,
+            None,
+            None,
+            &rebuild_lock,
+            &mut state,
+        );
+        assert!(
+            profile_slot.lock().unwrap().is_none(),
+            "HTTP mode must not adopt the active profile after a registry reload"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

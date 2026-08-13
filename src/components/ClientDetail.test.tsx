@@ -192,11 +192,34 @@ describe("ClientDetail customized entry (SOU-406)", () => {
     await waitFor(() =>
       expect(installGateway).toHaveBeenCalledWith(
         "claude-desktop",
-        "Home",
+        "p2",
         false,
         "sharedHttp",
       ),
     );
+  });
+
+  it("selects a scope stored as a profile id", async () => {
+    const reg = emptyRegistry();
+    reg.profiles = [
+      { id: "p1", name: "Work", enabledServerIds: [] },
+      { id: "p2", name: "Home", enabledServerIds: [] },
+    ];
+    reg.clientScopes = { "claude-desktop": "p1" };
+    const connected = {
+      ...client(),
+      gatewayInstalled: true,
+      entryState: "managed" as const,
+    };
+    render(
+      <ClientDetail
+        client={connected}
+        registry={reg}
+        onChanged={() => {}}
+        onRegistryChange={() => {}}
+      />,
+    );
+    expect(screen.getAllByRole("combobox")[0]).toHaveTextContent("Only: Work");
   });
 });
 
@@ -255,7 +278,7 @@ describe("ClientDetail connect toast (SOU-317)", () => {
     await waitFor(() =>
       expect(installGateway).toHaveBeenCalledWith(
         "claude-desktop",
-        "Work",
+        "p1",
         false,
         "stdio",
       ),

@@ -781,6 +781,36 @@ pub fn profile_store_key(profile_id: &str) -> String {
     sha256_hex(&format!("toolport-profile-id-v1:{profile_id}"))
 }
 
+/// True when a v2 store is missing but a pre-migration name-slug file still exists
+/// for this profile. Live reads must fail closed rather than treat that as a
+/// first run (SBS-715).
+pub fn unmigrated_legacy_profile_store(profile: &str, pins: bool) -> bool {
+    let Some(dir) = conduit_dir() else {
+        return false;
+    };
+    let v2 = dir.join(format!(
+        "{}{}.json",
+        if pins {
+            "tool-pins-v2-"
+        } else {
+            "quarantine-v2-"
+        },
+        profile_store_key(profile)
+    ));
+    if v2.exists() {
+        return false;
+    }
+    let slug = legacy_profile_store_slug(profile);
+    if slug.is_empty() {
+        return false;
+    }
+    dir.join(format!(
+        "{}{slug}.json",
+        if pins { "tool-pins-" } else { "quarantine-" }
+    ))
+    .exists()
+}
+
 /// The lossy filename mapping used before profile stores were keyed by stable ids.
 fn legacy_profile_store_slug(profile_ref: &str) -> String {
     profile_ref
@@ -3916,6 +3946,32 @@ mod tests {
         // Legacy files stay as recovery evidence.
         assert!(dir.join("tool-cache-work-prod.json").exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unmigrated_legacy_pin_store_is_detected() {
+        let _lock = data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-sbs-715-unmigrated-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = DataDirOverride::set(&dir);
+        std::fs::write(dir.join("tool-pins-billing.json"), r#"{"x":{}}"#).unwrap();
+        assert!(unmigrated_legacy_profile_store("billing", true));
+        assert!(!unmigrated_legacy_profile_store("billing", false));
+        let v2 = dir.join(format!(
+            "tool-pins-v2-{}.json",
+            profile_store_key("billing")
+        ));
+        std::fs::write(&v2, "{}").unwrap();
+        assert!(!unmigrated_legacy_profile_store("billing", true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

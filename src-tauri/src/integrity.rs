@@ -280,6 +280,9 @@ fn load_pins(profile: Option<&str>) -> PinsLoad {
         return PinsLoad::Fresh;
     };
     if !path.exists() {
+        if profile.is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, true)) {
+            return PinsLoad::Corrupt;
+        }
         return PinsLoad::Fresh;
     }
     // Every connected client spawns its own gateway, and they all share this one pins file.
@@ -809,7 +812,16 @@ fn load_quarantine(profile: Option<&str>) -> Result<Quarantine, String> {
     };
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Quarantine::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if profile
+                .is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, false))
+            {
+                return Err(format!(
+                    "quarantine store at {path:?} was not migrated from a legacy file; refusing to treat that as empty"
+                ));
+            }
+            return Ok(Quarantine::new());
+        }
         Err(e) => {
             return Err(format!("quarantine store at {path:?} is unreadable: {e}"))
         }
@@ -2972,6 +2984,18 @@ mod tests {
         let still_blocked = mandatory_quarantined(profile).unwrap();
         assert!(!still_blocked.contains("alpha__read"));
         assert!(still_blocked.contains("beta__write"));
+    }
+
+    #[test]
+    fn load_pins_fails_closed_when_a_legacy_file_was_not_migrated() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data_dir = TestDataDir::new("legacy-pins-unmigrated");
+        std::fs::write(data_dir.path.join("tool-pins-billing.json"), r#"{"x":{}}"#)
+            .unwrap();
+        assert!(
+            matches!(load_pins(Some("billing")), PinsLoad::Corrupt),
+            "a leftover name-slug pin file is not a first run"
+        );
     }
 
     #[test]
