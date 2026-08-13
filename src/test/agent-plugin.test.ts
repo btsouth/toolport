@@ -102,6 +102,7 @@ describe("agent plugin MCP config (mcp.json)", () => {
       // placeholders and no embedded arguments.
       expect(server.command).toBe("node");
       expect(server.command).not.toMatch(/[\s$]/);
+      expect(server.args).toContain("${PLUGIN_ROOT}/bin/launch-gateway.mjs");
       for (const arg of server.args ?? []) {
         const m = /^\$\{PLUGIN_ROOT\}\/(.+)$/.exec(arg);
         if (m) {
@@ -119,6 +120,7 @@ describe("agent plugin MCP config (mcp.json)", () => {
     const servers = Object.values(claudeMcp.mcpServers as Record<string, McpServerEntry>);
     expect(servers.length).toBeGreaterThan(0);
     for (const server of servers) {
+      expect(server.args).toContain("${CLAUDE_PLUGIN_ROOT}/bin/launch-gateway.mjs");
       const launcherArg = (server.args ?? []).find((a) =>
         a.startsWith("${CLAUDE_PLUGIN_ROOT}/"),
       );

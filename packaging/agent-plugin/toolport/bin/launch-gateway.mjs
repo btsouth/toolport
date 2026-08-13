@@ -27,7 +27,8 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, posix, win32 } from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
+import { setTimeout } from "node:timers";
+import { fileURLToPath, URL } from "node:url";
 
 const GATEWAY = "toolport-gateway";
 const LEGACY_GATEWAY = "conduit-gateway";
