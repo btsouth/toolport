@@ -1266,10 +1266,24 @@ impl Router {
         if let Some(reason) = self.blocked.get(exposed_name) {
             return Err(format!("tool '{exposed_name}' is {reason}"));
         }
-        let (server_id, tool) = self
-            .routes
-            .get(exposed_name)
-            .ok_or_else(|| format!("no route for tool '{exposed_name}'"))?;
+        let (server_id, tool) = self.routes.get(exposed_name).ok_or_else(|| {
+            // Several client harnesses expose gateway tools to their model as
+            // `mcp__<gateway-alias>__<tool>`; models then reuse that spelling inside
+            // toolport_run_script and land here (observed with Codex, 2026-08-13).
+            // Point at the name that will actually route instead of a dead end.
+            let client_prefixed = exposed_name
+                .strip_prefix("mcp__")
+                .and_then(|rest| rest.split_once("__"))
+                .map(|(_, tool)| tool)
+                .filter(|candidate| self.routes.contains_key(*candidate));
+            match client_prefixed {
+                Some(real) => format!(
+                    "no route for tool '{exposed_name}'; that looks like a client-side alias - \
+                     inside Toolport the tool is named '{real}', call that instead"
+                ),
+                None => format!("no route for tool '{exposed_name}'"),
+            }
+        })?;
         let slot = self.slot_for(server_id)?;
         let (result, downstream_supports_tasks) = self.call_with_retry(&slot, |server| {
             let supports_tasks = server
@@ -1605,6 +1619,31 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn unrouted_client_prefixed_alias_error_names_the_real_tool() {
+        let mut router = Router::new();
+        router.routes.insert(
+            "deepwiki__read".to_string(),
+            ("s".to_string(), "read".to_string()),
+        );
+        let err = router
+            .route_call_with_cancel(
+                "mcp__toolport__deepwiki__read",
+                serde_json::json!({}),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(err.contains("'deepwiki__read'"), "{err}");
+        assert!(err.contains("client-side alias"), "{err}");
+
+        // No routed candidate behind the prefix: the plain message, no bad advice.
+        let plain = router
+            .route_call_with_cancel("mcp__unknown__tool", serde_json::json!({}), None, None)
+            .unwrap_err();
+        assert_eq!(plain, "no route for tool 'mcp__unknown__tool'");
+    }
 
     #[test]
     fn breaker_opens_after_threshold_then_half_opens_after_cooldown() {
