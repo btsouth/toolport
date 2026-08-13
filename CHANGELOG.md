@@ -4,6 +4,17 @@ All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 Entries before the rename below shipped under the project's former name, Conduit.
 
+## [Unreleased]
+
+### Added
+
+- **Agent plugin.** Toolport now ships as an [Agent Plugins 1.0](https://agent-plugins.org)
+  package (`toolport-agent-plugin.zip` on each release): one install connects VS Code,
+  GitHub Copilot CLI, the Copilot app, and other conformant clients — plus Claude Code
+  via the bundled dual layout — to the local gateway, with a skill teaching the agent
+  the search → call workflow. The plugin launches the gateway the desktop app already
+  installed, so plugin installs share your existing servers, credentials, and profiles.
+
 ## [1.12.0] - 2026-08-09
 
 Two features ship for the first time. PII pseudonymization replaces personal data in

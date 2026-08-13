@@ -9,6 +9,10 @@ Releases are built by CI on a version tag (`.github/workflows/release.yml`).
    - `package-lock.json` (root `version` fields)
    - `src-tauri/Cargo.lock` (the Cargo package is still named `conduit` for history;
      update that package's `version` entry)
+   - `packaging/agent-plugin/toolport/plugin.json` and
+     `packaging/agent-plugin/toolport/.claude-plugin/plugin.json` (`version`) —
+     a vitest check (`src/test/agent-plugin.test.ts`) fails CI if these drift
+     from `package.json`
    - `CHANGELOG.md` — move `[Unreleased]` entries into a dated section
    - `server.json` only when publishing a matching standalone gateway package
 2. Draft user-facing notes in `docs/release-notes/vX.Y.Z.md` (paste into the GitHub

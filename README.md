@@ -220,6 +220,20 @@ Integrations -> Open WebUI / HTTP endpoint** in the app (or run
 [docs/openwebui.md](docs/openwebui.md). The same endpoint serves
 any HTTP/OpenAPI MCP consumer (n8n, LibreChat, custom agents).
 
+### Agent plugin (Agent Plugins 1.0 and Claude Code)
+
+Clients that install [Agent Plugins 1.0](https://agent-plugins.org) packages
+(VS Code, GitHub Copilot CLI, the Copilot app, and other conformant agents) can
+connect to Toolport by installing one plugin instead of editing MCP config:
+download `toolport-agent-plugin.zip` from the
+[latest release](https://github.com/tsouth89/toolport/releases/latest) and point
+your client's plugin install flow at the unzipped folder. The plugin bundles the
+gateway's MCP server entry plus a skill that teaches the agent Toolport's
+search → call workflow, and the same folder also carries the Claude Code plugin
+layout. It launches the gateway already installed by the desktop app, so every
+plugin install shares your existing servers, credentials, and profiles. Details
+in [packaging/agent-plugin/toolport/README.md](packaging/agent-plugin/toolport/README.md).
+
 ### Headless / container / MCP over the network
 
 The same `--http` process also serves **MCP streamable-HTTP** at `POST /mcp`, including
