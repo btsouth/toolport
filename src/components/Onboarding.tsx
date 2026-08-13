@@ -834,7 +834,11 @@ function Done({
   const broken = (health ?? []).filter((r) => !r.ok && !r.authRequired);
 
   const configured = serverCount > 0 && connectedCount > 0;
-  const checkingHealth = serverCount > 0 && health === null && !probeFailed;
+  // Verification states only apply once setup is actually complete: with no client
+  // connected the step reports what's missing, and must not dress the finish button
+  // or the status blocks in "Checking…" / "couldn't verify" language.
+  const checkingHealth = configured && health === null && !probeFailed;
+  const verificationFailed = configured && probeFailed;
   const ready = configured && health !== null && !probeFailed;
   // The client to verify against: the first one Toolport is actually wired into.
   const verifyClient = clients.find((c) => c.gatewayInstalled) ?? null;
@@ -922,7 +926,7 @@ function Done({
         </div>
       )}
 
-      {probeFailed && (
+      {verificationFailed && (
         <div className="flex items-center gap-2 rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
           <span>
             Couldn&apos;t verify your servers started, the health check didn&apos;t run.
@@ -943,7 +947,7 @@ function Done({
       )}
 
       <Button onClick={onFinish} className="self-start">
-        {checkingHealth || (configured && probeFailed)
+        {checkingHealth || verificationFailed
           ? "Continue without verification"
           : ready
             ? "Start using Toolport"

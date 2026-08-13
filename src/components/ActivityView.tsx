@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -1496,6 +1496,12 @@ export function ActivityView({
   // refetch (they'd otherwise keep showing the just-deleted rows until the parent's
   // refreshKey next changes).
   const [reloadTick, setReloadTick] = useState(0);
+  // Invalidates audit reads that started BEFORE a successful clear: a live-tick
+  // getAuditLog can resolve after the file was wiped (its effect cleanup only runs
+  // at the next commit) and would restore the deleted rows — which a failed
+  // follow-up reload then preserves as "stale". Bumped on clear; both completion
+  // handlers ignore results from an older generation.
+  const auditGeneration = useRef(0);
 
   function retryLoads() {
     // Keep last-known rows visible while retrying. Only a never-successful load returns
@@ -1510,6 +1516,7 @@ export function ActivityView({
       await clearActivityLogs();
       // The next getAuditLog can fail (Windows file lock right after clear).
       // Do not keep the deleted rows as last-known after a successful wipe.
+      auditGeneration.current += 1;
       setEntries([]);
       setAuditLoadStatus("ready");
       toast.success("Cleared retained activity");
@@ -1539,14 +1546,15 @@ export function ActivityView({
 
   useEffect(() => {
     let alive = true;
+    const generation = auditGeneration.current;
     getAuditLog(200)
       .then((e) => {
-        if (!alive) return;
+        if (!alive || generation !== auditGeneration.current) return;
         setEntries(e);
         setAuditLoadStatus("ready");
       })
       .catch(() => {
-        if (!alive) return;
+        if (!alive || generation !== auditGeneration.current) return;
         // Never replace a last-known audit trail with a false empty state.
         setAuditLoadStatus((status) =>
           status === "ready" || status === "stale" ? "stale" : "error",

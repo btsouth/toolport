@@ -162,6 +162,42 @@ describe("ActivityView trust-state loading", () => {
     ).toBeInTheDocument();
   });
 
+  it("ignores an audit read that started before the clear and resolved after it", async () => {
+    const { toast } = await import("sonner");
+    clearActivityLogs.mockResolvedValue(undefined);
+    let resolveStale!: (rows: AuditEntry[]) => void;
+    getAuditLog
+      .mockResolvedValueOnce(initialLog)
+      .mockReturnValueOnce(
+        new Promise<AuditEntry[]>((res) => {
+          resolveStale = res;
+        }),
+      )
+      .mockRejectedValueOnce(new Error("locked"));
+
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(screen.getByText(/last 2/)).toBeInTheDocument();
+
+    // A live tick starts a refetch that is still in flight when the user clears.
+    await act(async () => {
+      vi.advanceTimersByTime(3000);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear activity" }));
+    // The pre-clear read resolves with the deleted rows in the same flush as the
+    // clear finishing, before its effect's cleanup has run.
+    resolveStale(initialLog);
+    await act(async () => {});
+
+    expect(toast.success).toHaveBeenCalledWith("Cleared retained activity");
+    expect(screen.queryByText(/last 2/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/can't verify that the log is still empty/i),
+    ).toBeInTheDocument();
+  });
+
   it("does not turn a last-known empty audit log into a current all-clear", async () => {
     getAuditLog.mockResolvedValueOnce([]).mockRejectedValueOnce(new Error("locked"));
 

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { Onboarding } from "./Onboarding";
 import type { DetectedClient, Registry } from "@/lib/types";
@@ -53,6 +53,31 @@ describe("Onboarding health verification", () => {
 
     probe.resolve([]);
     expect(await screen.findByText("You're set up")).toBeInTheDocument();
+  });
+
+  it("does not dress an unconfigured setup in verification language", async () => {
+    const probe = deferred<[]>();
+    const disconnected = { ...client, gatewayInstalled: false } as DetectedClient;
+    render(
+      <Onboarding {...props} clients={[disconnected]} onProbe={() => probe.promise} />,
+    );
+
+    // Servers exist but no client is connected: the step explains what's missing,
+    // so neither the probe's pending state nor its failure may relabel the finish
+    // button or show verification status blocks.
+    expect(await screen.findByText("Setup started")).toBeInTheDocument();
+    expect(screen.queryByText("Checking server health…")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Got it" })).toBeEnabled();
+
+    await act(async () => probe.reject(new Error("gateway not running")));
+
+    expect(screen.getByRole("button", { name: "Got it" })).toBeEnabled();
+    expect(
+      screen.queryByText(/couldn't verify your servers started/i),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Continue without verification" }),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps a failed probe unavailable and offers an authoritative retry", async () => {

@@ -331,7 +331,13 @@ describe("ShareDialog share links", () => {
         expect.stringContaining("fetch failed"),
       ),
     );
-    expect(screen.getByRole("button", { name: /review and import/i })).toBeDisabled();
+    // The failed fetch must leave no review to act on: no review view, no
+    // "Reviewing…" spinner stuck on, and nothing staged in the paste field.
+    // (The review-and-import button being disabled alone would also hold for the
+    // unrelated reason that opening the dialog cleared the paste field.)
+    expect(screen.queryByText("Review this setup")).not.toBeInTheDocument();
+    expect(screen.queryByText("Reviewing…")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Paste a shared setup")).toHaveValue("");
   });
 
   it("does not let an older import completion close a newer review", async () => {
