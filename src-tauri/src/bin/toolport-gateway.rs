@@ -14095,39 +14095,41 @@ mod tests {
         // client, it must win - that's what makes a profile switch apply without
         // restarting the client.
         let mut reg = Registry::default();
+        let billing = reg.add_profile("Billing");
         reg.set_client_scope("cursor", Some("Billing"));
         let env_profile = Some("Default".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            Some("Billing".to_string())
+            Some(billing)
         );
     }
 
     #[test]
     fn resolve_live_profile_falls_back_to_env_var_when_scope_unset() {
         // A client_id with no client_scopes entry yet (e.g. installed before
-        // CONDUIT_CLIENT_ID existed, or never re-scoped) keeps the bootstrap value.
+        // CONDUIT_CLIENT_ID existed, or never re-scoped) keeps the bootstrap value,
+        // resolved to the stable profile id so cache/pins/quarantine stay isolated.
         let reg = Registry::default();
         let env_profile = Some("Default".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            Some("Default".to_string())
+            Some(reg.active_profile_id())
         );
     }
 
     #[test]
     fn resolve_live_profile_explicit_unscope_overrides_frozen_env_var() {
         // Re-scoping a client to "all servers" records an explicit-unscoped marker
-        // (empty string), which must resolve to None (follow the active profile)
-        // rather than falling back to the CONDUIT_PROFILE this process booted with.
-        // Without this, switching from a named profile to unscoped wouldn't apply
-        // until the client restarted.
+        // (empty string), which must follow the live active profile rather than the
+        // CONDUIT_PROFILE this process booted with. Returning that id (not None)
+        // keeps the client's cache/pins on the active profile's isolated store
+        // instead of the shared HTTP-union fallback files.
         let mut reg = Registry::default();
         reg.set_client_unscoped("cursor");
         let env_profile = Some("Billing".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            None
+            Some(reg.active_profile_id())
         );
     }
 
@@ -14138,18 +14140,21 @@ mod tests {
         let env_profile = Some("Default".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            Some("Default".to_string())
+            Some(reg.active_profile_id())
         );
     }
 
     #[test]
     fn resolve_live_profile_unscoped_client_always_uses_env_profile() {
         // No client_id at all (unscoped install): never consult client_scopes.
-        // This path already resolves the active profile live elsewhere, via
-        // Registry::enabled_servers().
+        // Without a boot profile, isolate onto the active profile rather than
+        // the shared fallback files the HTTP union uses.
         let mut reg = Registry::default();
         reg.set_client_scope("cursor", Some("Billing"));
-        assert_eq!(resolve_live_profile(&reg, None, &None), None);
+        assert_eq!(
+            resolve_live_profile(&reg, None, &None),
+            Some(reg.active_profile_id())
+        );
     }
 
     #[test]
@@ -14157,15 +14162,17 @@ mod tests {
         // Simulates a profile switch mid-session: same client_id, registry
         // mutated in place (as the watcher would see across two poll ticks).
         let mut reg = Registry::default();
+        let billing = reg.add_profile("Billing");
+        let engineering = reg.add_profile("Engineering");
         reg.set_client_scope("cursor", Some("Billing"));
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &None),
-            Some("Billing".to_string())
+            Some(billing)
         );
         reg.set_client_scope("cursor", Some("Engineering"));
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &None),
-            Some("Engineering".to_string())
+            Some(engineering)
         );
     }
 

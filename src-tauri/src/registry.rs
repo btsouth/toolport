@@ -3776,6 +3776,150 @@ mod tests {
     }
 
     #[test]
+    fn profile_store_keys_do_not_collide_for_slug_equivalent_names() {
+        let work_prod = profile_store_key("work-prod");
+        let work_slash = profile_store_key("work/prod");
+        let work_space = profile_store_key("Work Prod");
+        assert_ne!(work_prod, work_slash);
+        assert_ne!(work_prod, work_space);
+        assert_ne!(work_slash, work_space);
+        assert_eq!(
+            legacy_profile_store_slug("Work Prod"),
+            legacy_profile_store_slug("Work/Prod")
+        );
+        assert_eq!(legacy_profile_store_slug("Work Prod"), "work-prod");
+    }
+
+    #[test]
+    fn canonical_profile_id_rejects_ambiguous_display_names() {
+        let mut registry = Registry::default();
+        let first = registry.add_profile("Work Prod");
+        let second = registry.add_profile("Work/Prod");
+        assert_eq!(registry.canonical_profile_id(&first).unwrap(), first);
+        assert_eq!(registry.canonical_profile_id("default").unwrap(), "default");
+        assert!(registry.canonical_profile_id("Work Prod").is_ok());
+        registry.profiles[1].name = "Work Prod".into();
+        registry.profiles[2].name = "Work Prod".into();
+        assert!(
+            registry.canonical_profile_id("Work Prod").is_err(),
+            "duplicate case-insensitive names must not resolve"
+        );
+        assert_eq!(registry.canonical_profile_id(&second).unwrap(), second);
+    }
+
+    #[test]
+    fn normalize_rewrites_unique_name_scope_and_leaves_ambiguous_dangling() {
+        let mut registry = Registry::default();
+        let work = registry.add_profile("Work");
+        registry
+            .client_scopes
+            .insert("cursor".into(), "work".into());
+        registry
+            .client_scopes
+            .insert("zed".into(), "Missing".into());
+        registry.normalize_profile_references();
+        assert_eq!(registry.client_scopes.get("cursor").unwrap(), &work);
+        assert!(
+            registry
+                .client_scopes
+                .get("zed")
+                .unwrap()
+                .starts_with(INVALID_PROFILE_REF_PREFIX),
+            "unknown names stay dangling instead of widening to the active profile"
+        );
+    }
+
+    #[test]
+    fn migrate_copies_unambiguous_legacy_files_and_fails_closed_on_slug_collisions() {
+        let _lock = data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-sbs-715-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = DataDirOverride::set(&dir);
+
+        let mut registry = Registry::default();
+        let work_space = registry.add_profile("Work Prod");
+        let work_slash = registry.add_profile("Work/Prod");
+        let solo = registry.add_profile("Solo");
+
+        std::fs::write(dir.join("tool-cache-work-prod.json"), r#"{"owner":"collided"}"#).unwrap();
+        std::fs::write(dir.join("tool-pins-work-prod.json"), r#"{"shared":{"fp":"x"}}"#).unwrap();
+        std::fs::write(
+            dir.join("quarantine-work-prod.json"),
+            r#"{"alpha__tool":{"tool":"alpha__tool","reason":"a"},"beta__tool":{"tool":"beta__tool","reason":"b"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("tool-cache-solo.json"), r#"{"owner":"solo"}"#).unwrap();
+        std::fs::write(dir.join("tool-pins-solo.json"), r#"{"solo":{"fp":"y"}}"#).unwrap();
+
+        migrate_profile_stores(&registry).unwrap();
+
+        let space_cache = dir.join(format!(
+            "tool-cache-v2-{}.json",
+            profile_store_key(&work_space)
+        ));
+        let slash_cache = dir.join(format!(
+            "tool-cache-v2-{}.json",
+            profile_store_key(&work_slash)
+        ));
+        let space_pins = dir.join(format!(
+            "tool-pins-v2-{}.json",
+            profile_store_key(&work_space)
+        ));
+        let slash_pins = dir.join(format!(
+            "tool-pins-v2-{}.json",
+            profile_store_key(&work_slash)
+        ));
+        let space_q = dir.join(format!(
+            "quarantine-v2-{}.json",
+            profile_store_key(&work_space)
+        ));
+        let slash_q = dir.join(format!(
+            "quarantine-v2-{}.json",
+            profile_store_key(&work_slash)
+        ));
+        let solo_cache = dir.join(format!("tool-cache-v2-{}.json", profile_store_key(&solo)));
+        let solo_pins = dir.join(format!("tool-pins-v2-{}.json", profile_store_key(&solo)));
+
+        assert!(!space_cache.exists(), "collided cache must not be copied");
+        assert!(!slash_cache.exists(), "collided cache must not be copied");
+        assert_eq!(
+            std::fs::read_to_string(&space_pins).unwrap(),
+            "ambiguous legacy profile pin store; re-approval required"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&slash_pins).unwrap(),
+            "ambiguous legacy profile pin store; re-approval required"
+        );
+        let space_quarantine: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&space_q).unwrap()).unwrap();
+        let slash_quarantine: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&slash_q).unwrap()).unwrap();
+        assert!(space_quarantine.get("alpha__tool").is_some());
+        assert!(space_quarantine.get("beta__tool").is_some());
+        assert_eq!(space_quarantine, slash_quarantine);
+        assert_eq!(
+            std::fs::read_to_string(&solo_cache).unwrap(),
+            r#"{"owner":"solo"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(&solo_pins).unwrap(),
+            r#"{"solo":{"fp":"y"}}"#
+        );
+        // Legacy files stay as recovery evidence.
+        assert!(dir.join("tool-cache-work-prod.json").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn data_dir_leaf_is_dev_in_debug_builds() {
         assert_eq!(
             crate::brand::data_dir_leaf_name(),
