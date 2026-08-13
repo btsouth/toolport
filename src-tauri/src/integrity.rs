@@ -245,25 +245,20 @@ fn server_of(namespaced: &str) -> &str {
 }
 
 fn pins_path(profile: Option<&str>) -> Option<PathBuf> {
-    profile_file(profile, "tool-pins-", "tool-pins.json")
+    profile_file(profile, "tool-pins-v2-", "tool-pins.json")
 }
 
 fn quarantine_path(profile: Option<&str>) -> Option<PathBuf> {
-    profile_file(profile, "quarantine-", "quarantine.json")
+    profile_file(profile, "quarantine-v2-", "quarantine.json")
 }
 
-/// Per-profile store file in the conduit dir. The profile name is slugged to
-/// `[a-z0-9-]` so it can't escape the directory; the no-profile case uses `fallback`.
+/// Per-profile store file in the conduit dir. Profile references are canonical
+/// stable ids before they reach this module; imported non-canonical ids receive a
+/// collision-resistant key. The no-profile case uses `fallback`.
 fn profile_file(profile: Option<&str>, prefix: &str, fallback: &str) -> Option<PathBuf> {
     let dir = crate::registry::conduit_dir()?;
     let file = match profile {
-        Some(p) if !p.is_empty() => {
-            let slug: String = p
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
-                .collect();
-            format!("{prefix}{slug}.json")
-        }
+        Some(p) if !p.is_empty() => format!("{prefix}{}.json", crate::registry::profile_store_key(p)),
         _ => fallback.to_string(),
     };
     Some(dir.join(file))
@@ -711,9 +706,9 @@ pub fn baselines(profile: Option<&str>) -> BTreeMap<String, ToolBaseline> {
     }
 }
 
-/// Aggregate baselines across ALL profile pin files (`tool-pins.json` +
-/// `tool-pins-<slug>.json`), merged by tool name. The gateway keys pins by the
-/// `CONDUIT_PROFILE` it ran under (often None -> `tool-pins.json`), so the identity view
+/// Aggregate baselines across current stable-id pin files, merged by tool name.
+/// The legacy fallback is also included for the distinct HTTP-union namespace, but retained
+/// pre-v2 name-derived files are migration evidence and must not affect live identity state.
 /// must union every profile's pins rather than guess a single one. For a tool seen in
 /// several profiles: earliest first_seen, latest last_changed, and the fingerprint from
 /// the most recent change.
@@ -722,16 +717,11 @@ pub fn all_baselines() -> BTreeMap<String, ToolBaseline> {
     let Some(dir) = crate::registry::conduit_dir() else {
         return merged;
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return merged;
-    };
-    for entry in entries.flatten() {
-        let fname = entry.file_name();
-        let Some(name) = fname.to_str() else { continue };
-        if !(name.starts_with("tool-pins") && name.ends_with(".json")) {
-            continue;
-        }
-        let Ok(s) = std::fs::read_to_string(entry.path()) else {
+    let registry = crate::registry::load_resolved().unwrap_or_default();
+    let mut paths = vec![dir.join("tool-pins.json")];
+    paths.extend(registry.profiles.iter().filter_map(|profile| pins_path(Some(&profile.id))));
+    for path in paths {
+        let Ok(s) = std::fs::read_to_string(path) else {
             continue;
         };
         let Ok(pins) = serde_json::from_str::<BTreeMap<String, PinRepr>>(&s) else {
@@ -779,20 +769,11 @@ pub fn all_quarantined_names() -> BTreeSet<String> {
     let Some(dir) = crate::registry::conduit_dir() else {
         return out;
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let fname = entry.file_name();
-        let Some(name) = fname.to_str() else { continue };
-        let is_q = name
-            .strip_prefix("quarantine")
-            .and_then(|r| r.strip_suffix(".json"))
-            .is_some();
-        if !is_q {
-            continue;
-        }
-        if let Ok(s) = std::fs::read_to_string(entry.path()) {
+    let registry = crate::registry::load_resolved().unwrap_or_default();
+    let mut paths = vec![dir.join("quarantine.json")];
+    paths.extend(registry.profiles.iter().filter_map(|profile| quarantine_path(Some(&profile.id))));
+    for path in paths {
+        if let Ok(s) = std::fs::read_to_string(path) {
             if let Ok(q) = serde_json::from_str::<Quarantine>(&s) {
                 for (name, rec) in q {
                     if !is_legacy_added(&rec) {
@@ -1021,35 +1002,27 @@ pub fn quarantine_list(profile: Option<&str>) -> Vec<Value> {
     }
 }
 
-/// Every quarantined tool across all profiles, each record tagged with its profile
-/// slug (`""` for the no-profile store), for the app UI which spans profiles. The
+/// Every quarantined tool across all current stable-id profiles, each record tagged with its
+/// exact profile id (`""` for the distinct HTTP-union store), for the app UI. The
 /// `profile` tag is what `release` takes back to clear the right store.
 pub fn all_quarantined() -> Vec<Value> {
     let Some(dir) = crate::registry::conduit_dir() else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let fname = entry.file_name();
-        let Some(name) = fname.to_str() else { continue };
-        // "quarantine.json" -> slug ""; "quarantine-<slug>.json" -> "<slug>".
-        let Some(rest) = name
-            .strip_prefix("quarantine")
-            .and_then(|r| r.strip_suffix(".json"))
-        else {
-            continue;
-        };
-        let slug = rest.strip_prefix('-').unwrap_or("");
-        if let Ok(s) = std::fs::read_to_string(entry.path()) {
+    let registry = crate::registry::load_resolved().unwrap_or_default();
+    let mut stores = vec![(String::new(), dir.join("quarantine.json"))];
+    stores.extend(registry.profiles.iter().filter_map(|profile| {
+        quarantine_path(Some(&profile.id)).map(|path| (profile.id.clone(), path))
+    }));
+    for (profile, path) in stores {
+        if let Ok(s) = std::fs::read_to_string(path) {
             if let Ok(q) = serde_json::from_str::<Quarantine>(&s) {
                 for mut rec in q.into_values() {
                     if is_legacy_added(&rec) {
                         continue;
                     }
-                    rec["profile"] = json!(slug);
+                    rec["profile"] = json!(profile);
                     out.push(rec);
                 }
             }

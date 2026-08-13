@@ -7888,24 +7888,14 @@ fn gtrace(msg: &str) {
     }
 }
 
-/// Cache file for a given profile. Scoped clients get their own file
-/// (`tool-cache-<profile>.json`) so a billing-scoped client never reads a
+/// Cache file for a given stable profile id. Scoped clients get their own file
+/// (`tool-cache-v2-<profile-id>.json`) so a billing-scoped client never reads a
 /// coding-scoped client's catalog - which would defeat the scoping.
 fn tool_cache_path(profile: Option<&str>) -> Option<PathBuf> {
     let dir = registry::conduit_dir()?;
     let file = match profile {
         Some(p) if !p.is_empty() => {
-            let slug: String = p
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() {
-                        c.to_ascii_lowercase()
-                    } else {
-                        '-'
-                    }
-                })
-                .collect();
-            format!("tool-cache-{slug}.json")
+            format!("tool-cache-v2-{}.json", registry::profile_store_key(p))
         }
         _ => "tool-cache.json".to_string(),
     };
@@ -7943,9 +7933,9 @@ fn save_tool_cache(tools: &[Value], profile: Option<&str>) {
 
 /// Resolve this client's live profile from `registry.client_scopes[client_id]`
 /// (kept current by `watch_registry` on every reload). Three cases:
-/// - a non-empty entry: this client is scoped to that named profile;
+/// - a non-empty entry: this client is scoped to that stable profile id;
 /// - an empty-string entry: this client is *explicitly* unscoped (follow the
-///   active profile now), so return `None` and do NOT fall back to the boot env
+///   active profile now), so return its id and do NOT fall back to the boot env
 ///   var - that's what makes a live re-scope to "all servers" take effect
 ///   without restarting the client (see `Registry::set_client_unscoped`);
 /// - no entry at all: fall back to the `CONDUIT_PROFILE` this process started
@@ -7959,11 +7949,16 @@ fn resolve_live_profile(
     client_id: Option<&str>,
     env_profile: &Option<String>,
 ) -> Option<String> {
-    match client_id.and_then(|id| reg.client_scopes.get(id)) {
-        Some(p) if p.trim().is_empty() => None,
-        Some(p) => Some(p.clone()),
-        None => env_profile.clone(),
-    }
+    let profile_ref = match client_id.and_then(|id| reg.client_scopes.get(id)) {
+        Some(p) if p.trim().is_empty() => return Some(reg.active_profile_id()),
+        Some(p) => Some(p.as_str()),
+        None => env_profile.as_deref(),
+    };
+    Some(
+        profile_ref
+            .map(|profile| reg.resolve_profile_id(profile))
+            .unwrap_or_else(|| reg.active_profile_id()),
+    )
 }
 
 /// The profile that actually governs a client's scope right now: a folder-scoped override
@@ -12626,7 +12621,13 @@ fn main() {
     // Resolve the live profile immediately from what's already on disk, rather than
     // waiting for the watcher's first tick: a scoped client re-launched after being
     // re-scoped should see the new profile from its very first request.
-    let resolved_profile = resolve_live_profile(&loaded, client_id.as_deref(), &env_profile);
+    // The HTTP bridge serves a union of several profiles and must never persist
+    // that union under the active profile's cache/pins/quarantine namespace.
+    let resolved_profile = if http_mode {
+        None
+    } else {
+        resolve_live_profile(&loaded, client_id.as_deref(), &env_profile)
+    };
     let registry = Arc::new(Mutex::new(loaded));
     // Empty router + cached catalog: the handshake and tools/list answer instantly
     // (from cache), while downstream servers connect in the background for the
