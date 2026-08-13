@@ -404,9 +404,9 @@ pub fn record_agent_toggle(
     ));
 }
 
-/// Append one entry as a single JSON line. A single `write_all` (not `writeln!`, which
-/// can issue several write syscalls) keeps the many client-spawned gateways that share
-/// this file from interleaving each other's bytes into corrupt JSON.
+/// Append one entry as a single JSON line. Every client-spawned gateway takes the
+/// same sibling-file lock through append, the size decision, and any rotation, so
+/// a rotator cannot replace a record another process just reported as written.
 fn write_line(entry: &Value) {
     let Some(path) = audit_path() else {
         return;
@@ -415,6 +415,20 @@ fn write_line(entry: &Value) {
 }
 
 fn write_line_at(path: &Path, entry: &Value) {
+    write_line_at_with_rotation_hook(path, entry, None);
+}
+
+fn write_line_at_with_rotation_hook(
+    path: &Path,
+    entry: &Value,
+    after_snapshot: Option<&mut dyn FnMut()>,
+) {
+    // Atomic replacement protects readers from partial files, but only this
+    // shared cross-process critical section prevents a stale rotation snapshot
+    // from replacing an append that completed in another gateway.
+    let Ok(_lock) = crate::registry::lock_at(path) else {
+        return;
+    };
     let open = || {
         std::fs::OpenOptions::new()
             .create(true)
@@ -446,17 +460,20 @@ fn write_line_at(path: &Path, entry: &Value) {
     // replace the log when the cap is crossed.
     let size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
     drop(file);
-    rotate_if_large(&path, size);
+    rotate_if_large(path, size, after_snapshot);
 }
 
 /// Trim the audit log to its most recent `KEEP_LINES` lines once it exceeds the
 /// size cap, so it stays bounded over months of use. Best-effort: a failure here
 /// never affects the call being logged.
-fn rotate_if_large(path: &Path, size: u64) {
+fn rotate_if_large(path: &Path, size: u64, after_snapshot: Option<&mut dyn FnMut()>) {
     if size <= MAX_AUDIT_BYTES {
         return;
     }
     if let Ok(content) = std::fs::read_to_string(path) {
+        if let Some(hook) = after_snapshot {
+            hook();
+        }
         let trimmed = trimmed_tail(&content, KEEP_LINES);
         // Atomic + unique temp: every client's gateway shares this file, so a
         // bespoke fixed temp name could let two rotations collide.
@@ -715,6 +732,42 @@ fn csv_cell(value: Option<&Value>) -> String {
 mod tests {
     use super::*;
 
+    fn oversized_audit_content() -> String {
+        let padding = "x".repeat(420);
+        let mut content = String::with_capacity(MAX_AUDIT_BYTES as usize + 512 * 1024);
+        for seq in 0..(KEEP_LINES * 2) {
+            content.push_str(&json!({"server":"old","seq":seq,"padding":padding}).to_string());
+            content.push('\n');
+        }
+        assert!(content.len() as u64 > MAX_AUDIT_BYTES);
+        content
+    }
+
+    fn wait_for_path(path: &Path, label: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(path.exists(), "timed out waiting for {label}");
+    }
+
+    fn wait_for_child(child: &mut std::process::Child, label: &str) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match child.try_wait().expect("poll audit child") {
+                Some(status) => return status,
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("timed out waiting for {label}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn to_csv_has_header_and_a_row() {
         let entries = vec![json!({
@@ -869,6 +922,199 @@ mod tests {
         let entry: Value = serde_json::from_str(content.trim()).expect("valid JSON");
         assert_eq!(entry["server"], "fixture");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn audit_rotation_sentinel_child() {
+        let Some(path) = std::env::var_os("TOOLPORT_AUDIT_SENTINEL_PATH") else {
+            return;
+        };
+        let ready = PathBuf::from(
+            std::env::var_os("TOOLPORT_AUDIT_SENTINEL_READY").expect("sentinel ready path"),
+        );
+        let go = PathBuf::from(
+            std::env::var_os("TOOLPORT_AUDIT_SENTINEL_GO").expect("sentinel go path"),
+        );
+        let attempting = PathBuf::from(
+            std::env::var_os("TOOLPORT_AUDIT_SENTINEL_ATTEMPTING")
+                .expect("sentinel attempting path"),
+        );
+        let done = PathBuf::from(
+            std::env::var_os("TOOLPORT_AUDIT_SENTINEL_DONE").expect("sentinel done path"),
+        );
+
+        std::fs::write(&ready, "ready").expect("signal sentinel child ready");
+        wait_for_path(&go, "sentinel start signal");
+        std::fs::write(&attempting, "attempting").expect("signal sentinel append attempt");
+        write_line_at(
+            Path::new(&path),
+            &json!({"server":"sentinel","marker":"between-snapshot-and-replace"}),
+        );
+        std::fs::write(done, "done").expect("signal sentinel append complete");
+    }
+
+    #[test]
+    fn rotation_serializes_a_sentinel_append_started_after_its_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "toolport-audit-sentinel-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("audit.jsonl");
+        let ready = root.join("ready");
+        let go = root.join("go");
+        let attempting = root.join("attempting");
+        let done = root.join("done");
+        std::fs::write(&path, oversized_audit_content()).unwrap();
+
+        let mut child = None;
+        let mut after_snapshot = || {
+            let spawned = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "audit::tests::audit_rotation_sentinel_child",
+                    "--nocapture",
+                ])
+                .env("TOOLPORT_AUDIT_SENTINEL_PATH", &path)
+                .env("TOOLPORT_AUDIT_SENTINEL_READY", &ready)
+                .env("TOOLPORT_AUDIT_SENTINEL_GO", &go)
+                .env("TOOLPORT_AUDIT_SENTINEL_ATTEMPTING", &attempting)
+                .env("TOOLPORT_AUDIT_SENTINEL_DONE", &done)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn independent sentinel appender");
+            child = Some(spawned);
+            wait_for_path(&ready, "sentinel child readiness");
+            std::fs::write(&go, "go").unwrap();
+            wait_for_path(&attempting, "sentinel append attempt");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                !done.exists(),
+                "a separate process must not append while rotation holds the lock"
+            );
+        };
+
+        write_line_at_with_rotation_hook(
+            &path,
+            &json!({"server":"rotator","marker":"snapshot-owner"}),
+            Some(&mut after_snapshot),
+        );
+        let status = wait_for_child(child.as_mut().expect("sentinel child"), "sentinel child");
+        assert!(status.success(), "sentinel child failed: {status}");
+        assert!(
+            done.exists(),
+            "sentinel append must finish after rotation unlocks"
+        );
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let entries: Vec<Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("retained audit JSONL must stay valid"))
+            .collect();
+        assert_eq!(entries.len(), KEEP_LINES + 1);
+        assert!(entries
+            .iter()
+            .any(|entry| entry["marker"] == "snapshot-owner"));
+        assert!(entries
+            .iter()
+            .any(|entry| entry["marker"] == "between-snapshot-and-replace"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn multiprocess_append_and_rotation_preserve_every_new_record() {
+        const CHILDREN: usize = 4;
+        const RECORDS_PER_CHILD: usize = 100;
+
+        if let Some(child_id) = std::env::var_os("TOOLPORT_AUDIT_STRESS_CHILD") {
+            let path = PathBuf::from(
+                std::env::var_os("TOOLPORT_AUDIT_STRESS_PATH").expect("stress audit path"),
+            );
+            let ready = PathBuf::from(
+                std::env::var_os("TOOLPORT_AUDIT_STRESS_READY").expect("stress ready path"),
+            );
+            let go = PathBuf::from(
+                std::env::var_os("TOOLPORT_AUDIT_STRESS_GO").expect("stress go path"),
+            );
+            std::fs::write(&ready, "ready").expect("signal stress child ready");
+            wait_for_path(&go, "multiprocess stress start signal");
+            let child_id = child_id.to_string_lossy();
+            for seq in 0..RECORDS_PER_CHILD {
+                write_line_at(
+                    &path,
+                    &json!({"server":"stress","newId":format!("{child_id}-{seq}")}),
+                );
+            }
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "toolport-audit-multiprocess-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("audit.jsonl");
+        let go = root.join("go");
+        std::fs::write(&path, oversized_audit_content()).unwrap();
+
+        let executable = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for child_id in 0..CHILDREN {
+            let ready = root.join(format!("ready-{child_id}"));
+            children.push(
+                std::process::Command::new(&executable)
+                    .args([
+                        "--exact",
+                        "audit::tests::multiprocess_append_and_rotation_preserve_every_new_record",
+                        "--nocapture",
+                    ])
+                    .env("TOOLPORT_AUDIT_STRESS_CHILD", child_id.to_string())
+                    .env("TOOLPORT_AUDIT_STRESS_PATH", &path)
+                    .env("TOOLPORT_AUDIT_STRESS_READY", ready)
+                    .env("TOOLPORT_AUDIT_STRESS_GO", &go)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn independent audit appender"),
+            );
+        }
+        for child_id in 0..CHILDREN {
+            wait_for_path(
+                &root.join(format!("ready-{child_id}")),
+                "audit stress child readiness",
+            );
+        }
+        std::fs::write(&go, "go").unwrap();
+        for (child_id, child) in children.iter_mut().enumerate() {
+            let status = wait_for_child(child, "audit stress child");
+            assert!(
+                status.success(),
+                "audit stress child {child_id} failed: {status}"
+            );
+        }
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let entries: Vec<Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("stress output must remain valid JSONL"))
+            .collect();
+        let new_ids: std::collections::HashSet<&str> = entries
+            .iter()
+            .filter_map(|entry| entry.get("newId").and_then(Value::as_str))
+            .collect();
+        assert_eq!(new_ids.len(), CHILDREN * RECORDS_PER_CHILD);
+        for child_id in 0..CHILDREN {
+            for seq in 0..RECORDS_PER_CHILD {
+                let expected = format!("{child_id}-{seq}");
+                assert!(new_ids.contains(expected.as_str()), "missing {expected}");
+            }
+        }
+        assert!(entries.len() <= KEEP_LINES + CHILDREN * RECORDS_PER_CHILD);
+        assert!(std::fs::metadata(&path).unwrap().len() <= MAX_AUDIT_BYTES);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
