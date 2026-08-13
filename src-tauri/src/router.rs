@@ -31,6 +31,27 @@ const TASK_HANDLE_PREFIX: &str = "toolport-task:v1:";
 const TASK_HANDLE_NONCE_LEN: usize = 24;
 const MCP_APPS_EXTENSION: &str = "io.modelcontextprotocol/ui";
 const MCP_APP_HTML_MIME: &str = "text/html;profile=mcp-app";
+/// Retry-After waits observe upstream cancellation within this bound.
+const RETRY_CANCEL_POLL: Duration = Duration::from_millis(25);
+
+fn wait_for_retry_or_cancel(
+    wait: Duration,
+    cancel: Option<&CancelContext>,
+) -> Result<(), TransportError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if cancel.is_some_and(CancelContext::is_cancelled) {
+            return Err(TransportError::Cancelled(
+                "request cancelled during downstream retry wait".to_string(),
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::park_timeout(remaining.min(RETRY_CANCEL_POLL));
+    }
+}
 
 fn supports_mcp_app_html(extensions: &serde_json::Map<String, Value>) -> bool {
     extensions
@@ -1124,10 +1145,21 @@ impl Router {
     /// Retry wrapper that releases the per-server Mutex during the backoff sleep
     /// so concurrent calls to the same server aren't blocked while one call waits
     /// for a rate-limit or connection-retry delay.
-    fn call_with_retry<T, F>(&self, slot: &Arc<ServerSlot>, mut f: F) -> Result<T, String>
+    fn call_with_retry<T, F>(
+        &self,
+        slot: &Arc<ServerSlot>,
+        cancel: Option<&CancelContext>,
+        dispatch_cancelled_continuation: bool,
+        mut f: F,
+    ) -> Result<T, String>
     where
         F: FnMut(&mut DownstreamServer) -> Result<T, TransportError>,
     {
+        if !dispatch_cancelled_continuation
+            && cancel.is_some_and(CancelContext::is_cancelled)
+        {
+            return Err("request cancelled before downstream attempt".to_string());
+        }
         // Circuit breaker: a server that just failed repeatedly is fast-failed here,
         // BEFORE taking its `inner` lock, so a dead/hung server neither pays its full
         // read timeout again nor queues callers behind an in-flight timing-out call.
@@ -1152,6 +1184,11 @@ impl Router {
         };
         let mut attempt = 0u32;
         loop {
+            if !dispatch_cancelled_continuation
+                && cancel.is_some_and(CancelContext::is_cancelled)
+            {
+                return Err("request cancelled before downstream attempt".to_string());
+            }
             let result = {
                 let mut server = slot.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 f(&mut server)
@@ -1167,7 +1204,7 @@ impl Router {
                 Err(TransportError::Retry { retry_after, message }) if attempt < HTTP_MAX_RETRIES => {
                     let wait = retry_wait(retry_after, attempt);
                     eprintln!("conduit: retrying downstream call after {wait:?}: {message}");
-                    std::thread::sleep(wait);
+                    wait_for_retry_or_cancel(wait, cancel).map_err(|error| error.to_string())?;
                     attempt += 1;
                 }
                 Err(e) => {
@@ -1182,7 +1219,10 @@ impl Router {
                         // self-heal only fires when EVERY server is dead). Gated on the
                         // probe so a live server is never re-spawned on a transient blip.
                         if is_probe {
-                            if let Some(v) = self.reconnect_and_retry(slot, &mut f) {
+                            if cancel.is_some_and(CancelContext::is_cancelled) {
+                                return Err("request cancelled before downstream reconnect".to_string());
+                            }
+                            if let Some(v) = self.reconnect_and_retry(slot, cancel, &mut f) {
                                 return v;
                             }
                         }
@@ -1202,7 +1242,12 @@ impl Router {
     /// stops), or `None` when the slot has no reconnect factory (fall through to the
     /// normal breaker-failure path). The spawn runs without holding the `inner` lock so
     /// a slow re-spawn doesn't wedge other callers to the same server.
-    fn reconnect_and_retry<T, F>(&self, slot: &Arc<ServerSlot>, f: &mut F) -> Option<Result<T, String>>
+    fn reconnect_and_retry<T, F>(
+        &self,
+        slot: &Arc<ServerSlot>,
+        cancel: Option<&CancelContext>,
+        f: &mut F,
+    ) -> Option<Result<T, String>>
     where
         F: FnMut(&mut DownstreamServer) -> Result<T, TransportError>,
     {
@@ -1212,6 +1257,11 @@ impl Router {
             eprintln!("conduit: re-spawn of '{}' failed; leaving it fast-failed", slot.id);
             return None; // still unreachable: fall through to record_failure
         };
+        if cancel.is_some_and(CancelContext::is_cancelled) {
+            return Some(Err(
+                "request cancelled before retrying the reconnected downstream".to_string(),
+            ));
+        }
         let retry = {
             let mut server = slot.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             *server = fresh; // swap the live child/connection for the fresh one
@@ -1228,7 +1278,9 @@ impl Router {
                 Ok(v)
             }
             Err(e) => {
-                breaker.record_failure(Instant::now());
+                if e.is_health_failure() {
+                    breaker.record_failure(Instant::now());
+                }
                 Err(e.to_string())
             }
         })
@@ -1285,7 +1337,11 @@ impl Router {
             }
         })?;
         let slot = self.slot_for(server_id)?;
-        let (result, downstream_supports_tasks) = self.call_with_retry(&slot, |server| {
+        let (result, downstream_supports_tasks) = self.call_with_retry(
+            &slot,
+            cancel.as_ref(),
+            mrtr.is_some_and(|request| !request.is_empty()),
+            |server| {
             let supports_tasks = server
                 .extensions()
                 .contains_key("io.modelcontextprotocol/tasks");
@@ -1298,7 +1354,8 @@ impl Router {
                     mrtr,
                 )
                 .map(|result| (result, supports_tasks))
-        })?;
+            },
+        )?;
         if result.get("resultType").and_then(Value::as_str) == Some("task") {
             if !client_supports_tasks(meta) {
                 return Err(
@@ -1350,7 +1407,7 @@ impl Router {
         let slot = self.slot_for(&server_id)?;
         let mut forwarded = params;
         forwarded["taskId"] = json!(native_task_id);
-        let result = self.call_with_retry(&slot, |server| {
+        let result = self.call_with_retry(&slot, cancel.as_ref(), false, |server| {
             server.task_request(method, forwarded.clone(), cancel.clone(), meta)
         })?;
         let mut result = result;
@@ -1511,9 +1568,14 @@ impl Router {
             .ok_or_else(|| format!("no server owns resource '{uri}'"))?
             .to_string();
         let slot = self.slot_for(&server_id)?;
-        self.call_with_retry(&slot, |server| {
+        self.call_with_retry(
+            &slot,
+            cancel.as_ref(),
+            mrtr.is_some_and(|request| !request.is_empty()),
+            |server| {
             server.read_resource_with_cancel_and_mrtr(uri, cancel.clone(), meta, mrtr)
-        })
+            },
+        )
     }
 
     /// Subscribe to resource-updated notifications on the owning downstream
@@ -1525,7 +1587,7 @@ impl Router {
             .ok_or_else(|| format!("no server owns resource '{uri}'"))?
             .to_string();
         let slot = self.slot_for(&server_id)?;
-        self.call_with_retry(&slot, |server| server.subscribe_resource(uri))
+        self.call_with_retry(&slot, None, false, |server| server.subscribe_resource(uri))
     }
 
     /// Unsubscribe from resource-updated notifications on the owning downstream
@@ -1550,7 +1612,7 @@ impl Router {
         uri: &str,
     ) -> Result<Value, String> {
         let slot = self.slot_for(server_id)?;
-        self.call_with_retry(&slot, |server| server.unsubscribe_resource(uri))
+        self.call_with_retry(&slot, None, false, |server| server.unsubscribe_resource(uri))
     }
 
     /// Get a prompt by its exposed name, forwarding the server's real name.
@@ -1583,7 +1645,11 @@ impl Router {
             .cloned()
             .ok_or_else(|| format!("no route for prompt '{exposed_name}'"))?;
         let slot = self.slot_for(&server_id)?;
-        self.call_with_retry(&slot, |server| {
+        self.call_with_retry(
+            &slot,
+            cancel.as_ref(),
+            mrtr.is_some_and(|request| !request.is_empty()),
+            |server| {
             server.get_prompt_with_cancel_and_mrtr(
                 &name,
                 arguments.clone(),
@@ -1591,7 +1657,8 @@ impl Router {
                 meta,
                 mrtr,
             )
-        })
+            },
+        )
     }
 
     /// Forward `completion/complete` to the owning downstream server, remapping
@@ -1607,7 +1674,7 @@ impl Router {
     ) -> Result<Value, String> {
         let (server_id, forwarded) = self.resolve_completion(&params)?;
         let slot = self.slot_for(&server_id)?;
-        self.call_with_retry(&slot, |server| {
+        self.call_with_retry(&slot, cancel.as_ref(), false, |server| {
             server.complete_with_cancel(forwarded.clone(), cancel.clone())
         })
     }
@@ -2355,7 +2422,7 @@ mod tests {
         let router = Router::new();
         // Factory hands back a healthy connection, mirroring a re-spawn that succeeds.
         let slot = dead_slot(Some(Box::new(|| Some(mock_server("s")))));
-        let out = router.reconnect_and_retry(&slot, &mut |ds| ds.call("echo", json!({})));
+        let out = router.reconnect_and_retry(&slot, None, &mut |ds| ds.call("echo", json!({})));
         // The probe re-spawned the server and the retried call went through.
         let value = out.expect("reconnect attempted").expect("call recovered");
         assert!(serde_json::to_string(&value).unwrap().contains("s:echo"));
@@ -2372,8 +2439,68 @@ mod tests {
         // caller must fall through to record the failure.
         let slot = dead_slot(Some(Box::new(|| None)));
         let out: Option<Result<Value, String>> =
-            router.reconnect_and_retry(&slot, &mut |ds| ds.call("echo", json!({})));
+            router.reconnect_and_retry(&slot, None, &mut |ds| ds.call("echo", json!({})));
         assert!(out.is_none(), "a failed re-spawn falls through to the breaker");
+    }
+
+    #[test]
+    fn cancellation_during_reconnect_prevents_the_retried_call() {
+        let router = Router::new();
+        let cancellations = CancelRegistry::new();
+        assert!(cancellations.begin_client_request("reconnect-cancel".to_string()));
+        let cancel = cancellations.context("reconnect-cancel".to_string());
+        let cancel_from_factory = cancellations.clone();
+        let slot = dead_slot(Some(Box::new(move || {
+            assert!(cancel_from_factory.cancel("reconnect-cancel", Some("user pressed stop")));
+            Some(mock_server("s"))
+        })));
+        let retried_calls = Arc::new(AtomicU32::new(0));
+        let calls = Arc::clone(&retried_calls);
+
+        let result = router
+            .reconnect_and_retry(&slot, Some(&cancel), &mut move |ds| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ds.call("echo", json!({}))
+            })
+            .expect("reconnect was attempted")
+            .unwrap_err();
+
+        assert!(result.contains("cancelled"), "unexpected error: {result}");
+        assert_eq!(
+            retried_calls.load(Ordering::SeqCst),
+            0,
+            "a reconnect that races cancellation must not emit the retry"
+        );
+        cancellations.finish_client_request("reconnect-cancel");
+    }
+
+    #[test]
+    fn cancellation_from_reconnected_attempt_does_not_penalize_breaker() {
+        let router = Router::new();
+        let cancellations = CancelRegistry::new();
+        assert!(cancellations.begin_client_request("retry-cancel".to_string()));
+        let cancel = cancellations.context("retry-cancel".to_string());
+        let cancel_from_retry = cancellations.clone();
+        let slot = dead_slot(Some(Box::new(|| Some(mock_server("s")))));
+
+        let result: Result<Value, String> = router
+            .reconnect_and_retry(&slot, Some(&cancel), &mut move |_server| {
+                assert!(cancel_from_retry.cancel("retry-cancel", Some("user pressed stop")));
+                Err(TransportError::Cancelled(
+                    "request cancelled during reconnected call".to_string(),
+                ))
+            })
+            .expect("reconnect was attempted");
+
+        assert!(result.unwrap_err().contains("cancelled"));
+        let mut breaker = slot
+            .breaker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(breaker.consecutive_failures, 0);
+        assert!(breaker.open_remaining(Instant::now()).is_none());
+        drop(breaker);
+        cancellations.finish_client_request("retry-cancel");
     }
 
     #[test]
@@ -2383,7 +2510,7 @@ mod tests {
         // reconnect is skipped and the breaker path handles the failure.
         let slot = dead_slot(None);
         let out: Option<Result<Value, String>> =
-            router.reconnect_and_retry(&slot, &mut |ds| ds.call("echo", json!({})));
+            router.reconnect_and_retry(&slot, None, &mut |ds| ds.call("echo", json!({})));
         assert!(out.is_none());
     }
 
@@ -2618,7 +2745,7 @@ mod tests {
             "server": "srv", "tool": "search", "change": "poison", "severity": "high"
         })];
         assert!(
-            integrity::apply_quarantine(profile, &current, &events),
+            integrity::apply_quarantine(profile, &current, &events).unwrap(),
             "a poison drift on a renamed tool must quarantine it"
         );
 
@@ -2638,7 +2765,10 @@ mod tests {
         assert!(err.contains("quarantine"), "a call to a quarantined rename must block: {err}");
 
         // Re-approve: release clears the persisted set and the router restores the tool.
-        assert!(integrity::release(profile, "search"), "release must clear the entry");
+        assert!(
+            integrity::release(profile, "search").unwrap(),
+            "release must clear the entry"
+        );
         let after = integrity::quarantined(profile).expect("quarantine store readable");
         assert!(!after.contains("search"), "a released tool leaves the persisted set");
         router.requarantine(after);
@@ -3496,5 +3626,47 @@ mod tests {
             entries.load(Ordering::SeqCst) >= 3,
             "expected >=3 tool/call lock acquisitions"
         );
+    }
+
+    #[test]
+    fn cancellation_during_backoff_prevents_the_retry_attempt() {
+        let (server, entries) = retry_server_inspectable("cancel-retry", 1);
+        let mut router = Router::new();
+        router.add(server);
+        let router = Arc::new(router);
+        let cancellations = CancelRegistry::new();
+        assert!(cancellations.begin_client_request("cancel-retry-1".to_string()));
+        let cancel = cancellations.context("cancel-retry-1".to_string());
+
+        let worker_router = Arc::clone(&router);
+        let handle = std::thread::spawn(move || {
+            worker_router.route_call_with_cancel(
+                "cancel_retry__flaky",
+                json!({}),
+                Some(cancel),
+                None,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while entries.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(entries.load(Ordering::SeqCst), 1, "first attempt must run once");
+        assert!(cancellations.cancel("cancel-retry-1", Some("user pressed stop")));
+
+        let error = handle.join().unwrap().unwrap_err();
+        assert!(error.contains("cancelled"), "unexpected error: {error}");
+        assert_eq!(
+            entries.load(Ordering::SeqCst),
+            1,
+            "no downstream attempt may be emitted after cancellation"
+        );
+        let breaker = router.servers[0].breaker.lock().unwrap();
+        assert_eq!(
+            breaker.consecutive_failures, 0,
+            "upstream cancellation must not count as a downstream health failure"
+        );
+        assert!(breaker.open_until.is_none(), "cancellation must leave the breaker closed");
+        cancellations.finish_client_request("cancel-retry-1");
     }
 }

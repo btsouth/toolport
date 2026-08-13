@@ -684,29 +684,31 @@ export function openDataDir(): Promise<void> {
 /** Serialize the user's servers into a shareable setup (no secret values),
  * optionally labelled with a name + description. */
 export function exportConfig(
-  name?: string,
-  description?: string,
-  serverNames?: string[],
+  name: string | undefined,
+  description: string | undefined,
+  // Required snapshot. `[]` means share nothing; never omit this or default it
+  // to empty, or a caller would silently export zero servers.
+  serverIds: string[],
 ): Promise<string> {
   return invoke<string>("export_config", {
     name: name ?? null,
     description: description ?? null,
-    serverNames: serverNames ?? null,
+    serverIds,
   });
 }
 
 /** Write the shareable setup to a file on disk (path from a save dialog). */
 export function exportConfigToPath(
   path: string,
-  name?: string,
-  description?: string,
-  serverNames?: string[],
+  name: string | undefined,
+  description: string | undefined,
+  serverIds: string[],
 ): Promise<void> {
   return invoke<void>("export_config_to_path", {
     path,
     name: name ?? null,
     description: description ?? null,
-    serverNames: serverNames ?? null,
+    serverIds,
   });
 }
 
@@ -728,6 +730,11 @@ export function fetchSharedSetup(id: string): Promise<string> {
 /** Claim a share id captured from a deep link before the UI was listening. */
 export function takePendingShared(): Promise<string | null> {
   return invoke<string | null>("take_pending_shared");
+}
+
+/** Claim a tray approvals request captured before the frontend was listening. */
+export function takePendingTrayApprovals(): Promise<boolean> {
+  return invoke<boolean>("take_pending_tray_approvals");
 }
 
 /** Import a shared setup, adding servers not already present. */

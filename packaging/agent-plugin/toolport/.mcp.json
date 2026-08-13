@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "toolport": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/launch-gateway.mjs"]
+    }
+  }
+}

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -257,6 +257,81 @@ function SecurityResting() {
         watches every tool for tampering (rug pulls), poisoned definitions, and injected
         output (agentjacking). No issues right now.
       </span>
+    </div>
+  );
+}
+
+type LoadStatus = "loading" | "ready" | "error" | "stale";
+
+/** Security data is part of the trust boundary: a failed read is unknown, never an
+ * all-clear. Keep this state visible until a successful read verifies the current log. */
+function SecurityLoadNotice({
+  status,
+  onRetry,
+}: {
+  status: Exclude<LoadStatus, "ready">;
+  onRetry: () => void;
+}) {
+  if (status === "loading") {
+    return (
+      <div
+        role="status"
+        className="mb-4 flex items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-2.5 text-xs text-muted-foreground"
+      >
+        <ShieldCheck className="size-4 shrink-0" />
+        <span>Checking protection status…</span>
+      </div>
+    );
+  }
+
+  const stale = status === "stale";
+  return (
+    <div
+      role="alert"
+      className="mb-4 flex items-center gap-3 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs"
+    >
+      <AlertTriangle className="size-4 shrink-0 text-warning" />
+      <span className="text-muted-foreground">
+        <span className="font-medium text-foreground">
+          {stale
+            ? "Security status may be out of date."
+            : "Couldn't verify protection status."}
+        </span>{" "}
+        {stale
+          ? "Showing the last security events Toolport read successfully; the latest check failed."
+          : "Toolport couldn't read security events, so this is not an all-clear."}
+      </span>
+      <button
+        type="button"
+        onClick={onRetry}
+        aria-label="Retry protection status"
+        className="ml-auto shrink-0 rounded-md border px-2.5 py-1 font-medium text-foreground transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+      >
+        Retry
+      </button>
+    </div>
+  );
+}
+
+function AuditStaleNotice({ onRetry }: { onRetry: () => void }) {
+  return (
+    <div
+      role="alert"
+      className="mb-4 flex items-center gap-3 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs"
+    >
+      <AlertTriangle className="size-4 shrink-0 text-warning" />
+      <span className="text-muted-foreground">
+        <span className="font-medium text-foreground">Activity may be out of date.</span>{" "}
+        Showing the last calls Toolport read successfully; the latest refresh failed.
+      </span>
+      <button
+        type="button"
+        onClick={onRetry}
+        aria-label="Retry activity log"
+        className="ml-auto shrink-0 rounded-md border px-2.5 py-1 font-medium text-foreground transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+      >
+        Retry
+      </button>
     </div>
   );
 }
@@ -612,6 +687,46 @@ function ServerRow({ s }: { s: ServerStat }) {
 /** One recent-call row. A failed call with a captured error message expands to
  * show why it failed; latency is shown inline. Args/results aren't recorded in
  * the audit log (it's an append-only governance record), so they're not shown. */
+/** What the PII pass did on this call: a count, and a warning when it did not fully
+ * apply (SBS-607).
+ *
+ * Renders nothing when redaction was off (no `piiReplaced`) AND when it ran but matched
+ * nothing. The audit record keeps those two apart, and the export still does; the row
+ * does not, because a badge on every call of a busy log is noise that buries the two
+ * cases worth looking at. Whether the feature is on is a setting the user set; whether it
+ * did something, or quietly failed to, is what a per-call row can tell them.
+ *
+ * The count is the whole payload. Pseudonymization exists to keep values away from the
+ * model, so surfacing one here to explain the count would defeat it. */
+function PiiBadge({ entry }: { entry: AuditEntry }) {
+  const replaced = entry.piiReplaced;
+  if (replaced === undefined) return null;
+  // Redaction fails OPEN: a full session map or an over-cap result leaves values in the
+  // clear. That case gets warning styling because the honest reading of the row is "some
+  // of this reached the model unredacted", not "N were handled".
+  if (entry.piiIncomplete) {
+    return (
+      <span
+        className="flex shrink-0 items-center gap-1 rounded bg-warning/15 px-1.5 py-0.5 text-[10px] text-warning"
+        title={`${replaced} value${replaced === 1 ? "" : "s"} pseudonymized, but the pass did not fully apply — some values reached the model in the clear (the session map was full, or the result exceeded the scan cap).`}
+      >
+        <ShieldAlert aria-hidden="true" className="size-3" />
+        {replaced} pseudonymized, incomplete
+      </span>
+    );
+  }
+  if (replaced === 0) return null;
+  return (
+    <span
+      className="flex shrink-0 items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+      title={`${replaced} value${replaced === 1 ? "" : "s"} in this result were replaced with pseudonyms before the model saw them. The values themselves are never logged.`}
+    >
+      <ShieldCheck aria-hidden="true" className="size-3" />
+      {replaced} pseudonymized
+    </span>
+  );
+}
+
 function CallRow({ e }: { e: AuditEntry }) {
   const [open, setOpen] = useState(false);
   const hasDetail = !e.ok && !!e.error;
@@ -665,6 +780,7 @@ function CallRow({ e }: { e: AuditEntry }) {
             {e.client}
           </span>
         )}
+        <PiiBadge entry={e} />
         <span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">
           {fmtMs(e.durationMs ?? e.heldMs ?? null)}
         </span>
@@ -1368,21 +1484,41 @@ export function ActivityView({
   // surfaces the true error rate, and the toggle is right there for triage.
   const [errorsOnly, setErrorsOnly] = useState(false);
   const [security, setSecurity] = useState<SecurityEvent[]>([]);
+  const [securityLoadStatus, setSecurityLoadStatus] = useState<LoadStatus>("loading");
   const [dismissed, setDismissed] = useState<Set<string>>(loadDismissed);
   const [logOpen, setLogOpen] = useState(false);
   // Distinguish a load FAILURE (gateway unreachable / audit log unreadable) from a
   // genuinely empty log: both leave `entries` empty, but only one is an error. Without
   // this, a first-run backend failure renders the friendly "No tool calls yet" state
   // and hides that anything is wrong.
-  const [loadError, setLoadError] = useState(false);
+  const [auditLoadStatus, setAuditLoadStatus] = useState<LoadStatus>("loading");
   // Local reload trigger: bumped after a "Clear retained activity" so the panels
   // refetch (they'd otherwise keep showing the just-deleted rows until the parent's
   // refreshKey next changes).
   const [reloadTick, setReloadTick] = useState(0);
+  // Invalidates audit reads that started BEFORE a successful clear: a live-tick
+  // getAuditLog can resolve after the file was wiped (its effect cleanup only runs
+  // at the next commit) and would restore the deleted rows — which a failed
+  // follow-up reload then preserves as "stale". Bumped on clear; both completion
+  // handlers ignore results from an older generation.
+  const auditGeneration = useRef(0);
+
+  function retryLoads() {
+    // Keep last-known rows visible while retrying. Only a never-successful load returns
+    // to the full loading state; stale data remains explicitly marked stale.
+    setAuditLoadStatus((status) => (status === "error" ? "loading" : status));
+    setSecurityLoadStatus((status) => (status === "error" ? "loading" : status));
+    setReloadTick((tick) => tick + 1);
+  }
 
   async function clearActivity() {
     try {
       await clearActivityLogs();
+      // The next getAuditLog can fail (Windows file lock right after clear).
+      // Do not keep the deleted rows as last-known after a successful wipe.
+      auditGeneration.current += 1;
+      setEntries([]);
+      setAuditLoadStatus("ready");
       toast.success("Cleared retained activity");
       setReloadTick((t) => t + 1);
     } catch (e) {
@@ -1410,16 +1546,19 @@ export function ActivityView({
 
   useEffect(() => {
     let alive = true;
+    const generation = auditGeneration.current;
     getAuditLog(200)
       .then((e) => {
-        if (!alive) return;
+        if (!alive || generation !== auditGeneration.current) return;
         setEntries(e);
-        setLoadError(false);
+        setAuditLoadStatus("ready");
       })
       .catch(() => {
-        if (!alive) return;
-        setEntries([]);
-        setLoadError(true);
+        if (!alive || generation !== auditGeneration.current) return;
+        // Never replace a last-known audit trail with a false empty state.
+        setAuditLoadStatus((status) =>
+          status === "ready" || status === "stale" ? "stale" : "error",
+        );
       });
     getAuditStats()
       .then((s) => alive && setStats(s))
@@ -1428,8 +1567,19 @@ export function ActivityView({
       .then((s) => alive && setSavings(s))
       .catch(() => alive && setSavings(null));
     getSecurityEvents(50)
-      .then((s) => alive && setSecurity(s))
-      .catch(() => alive && setSecurity([]));
+      .then((s) => {
+        if (!alive) return;
+        setSecurity(s);
+        setSecurityLoadStatus("ready");
+      })
+      .catch(() => {
+        if (!alive) return;
+        // A failed refresh must preserve prior findings and must never produce the
+        // reassuring verified-empty state.
+        setSecurityLoadStatus((status) =>
+          status === "ready" || status === "stale" ? "stale" : "error",
+        );
+      });
     return () => {
       alive = false;
     };
@@ -1491,11 +1641,14 @@ export function ActivityView({
   const banner = (
     <>
       {/* Loud lane: the only thing here that may need a decision. */}
+      {securityLoadStatus !== "ready" ? (
+        <SecurityLoadNotice status={securityLoadStatus} onRetry={retryLoads} />
+      ) : null}
       {highSecurity.length > 0 ? (
         <SecurityNotices events={highSecurity} onDismiss={dismissSecurity} />
-      ) : (
+      ) : securityLoadStatus === "ready" ? (
         <SecurityResting />
-      )}
+      ) : null}
       {infoSecurity.length > 0 ? (
         <QuietDriftHistory
           events={infoSecurity}
@@ -1522,7 +1675,7 @@ export function ActivityView({
     (e) => (!serverFilter || e.server === serverFilter) && (!errorsOnly || !e.ok),
   );
 
-  if (entries === null) {
+  if (entries === null && auditLoadStatus === "loading") {
     return (
       <div>
         {banner}
@@ -1533,7 +1686,7 @@ export function ActivityView({
     );
   }
 
-  if (loadError && entries.length === 0) {
+  if (entries === null && auditLoadStatus === "error") {
     return (
       <div>
         {banner}
@@ -1544,6 +1697,46 @@ export function ActivityView({
             <p className="max-w-md text-sm text-muted-foreground">
               Toolport couldn't reach the gateway or read the audit log. This is not an
               empty log, if the gateway isn't running, start it and refresh.
+            </p>
+            <button
+              type="button"
+              onClick={retryLoads}
+              aria-label="Retry activity log"
+              className="mt-3 rounded-md border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+            >
+              Retry
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Defensive fallback for an impossible state transition: unknown audit data must
+  // still render as an error, never as a verified empty log.
+  if (entries === null) {
+    return (
+      <div>
+        {banner}
+        <div className="flex items-center justify-center py-24 text-sm text-destructive">
+          Activity status is unavailable. Retry the activity log.
+        </div>
+      </div>
+    );
+  }
+
+  if (entries.length === 0 && auditLoadStatus === "stale") {
+    return (
+      <div>
+        {banner}
+        <AuditStaleNotice onRetry={retryLoads} />
+        <div className="flex flex-col items-center justify-center gap-3 py-20 text-center">
+          <AlertTriangle className="size-10 text-warning/70" />
+          <div>
+            <p className="font-medium">No current activity status</p>
+            <p className="max-w-md text-sm text-muted-foreground">
+              The last successful read found no calls, but the latest refresh failed, so
+              Toolport can't verify that the log is still empty.
             </p>
           </div>
         </div>
@@ -1572,6 +1765,7 @@ export function ActivityView({
   return (
     <div>
       {banner}
+      {auditLoadStatus === "stale" && <AuditStaleNotice onRetry={retryLoads} />}
       {stats && <StatsPanel stats={stats} />}
 
       <div className="mb-2 flex items-center gap-2">

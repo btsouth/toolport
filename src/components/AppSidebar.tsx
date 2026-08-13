@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   ArrowUpCircle,
   ChevronRight,
@@ -37,7 +38,7 @@ import {
   openDataDir,
 } from "@/lib/api";
 import { fmtTokens } from "@/lib/utils";
-import { checkForUpdate, installUpdate } from "@/lib/updater";
+import { checkForUpdate, installUpdate, type UpdateProgress } from "@/lib/updater";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -48,6 +49,23 @@ const FOCUS_RING =
   "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
 const NAV_ITEM = `flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors hover:bg-accent ${FOCUS_RING}`;
 const ICON_BTN = `rounded text-muted-foreground transition hover:text-foreground ${FOCUS_RING}`;
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+function updateProgressLabel(progress: UpdateProgress | null): string {
+  if (!progress) return "Preparing update…";
+  if (progress.phase === "installing") return "Installing…";
+  if (progress.totalBytes && progress.totalBytes > 0) {
+    const percent = Math.min(
+      100,
+      Math.round((progress.downloadedBytes / progress.totalBytes) * 100),
+    );
+    return `Downloading ${percent}%`;
+  }
+  const megabytes = progress.downloadedBytes / (1024 * 1024);
+  return megabytes > 0
+    ? `Downloading ${megabytes.toFixed(megabytes >= 10 ? 0 : 1)} MB…`
+    : "Downloading…";
+}
 
 /** Footer showing the running version, and an in-app update button when a newer
  * release is published. The check is best-effort: any failure (dev build,
@@ -63,62 +81,126 @@ function VersionFooter({
   const [version, setVersion] = useState("");
   const [update, setUpdate] = useState<Update | null>(null);
   const [installing, setInstalling] = useState(false);
+  const [installProgress, setInstallProgress] = useState<UpdateProgress | null>(null);
   const [checking, setChecking] = useState(false);
   const [showNotes, setShowNotes] = useState(false);
+  const mountedRef = useRef(false);
+  const checkingRef = useRef(false);
+  const announceCheckRef = useRef(false);
+  const installingRef = useRef(false);
+  const lastCheckRef = useRef(0);
 
   useEffect(() => {
-    let alive = true;
+    mountedRef.current = true;
     getVersion()
       .then((v) => {
-        if (alive) setVersion(v);
+        if (mountedRef.current) setVersion(v);
       })
       .catch(() => {
         // Never let a failed version lookup hide the whole footer toolbar.
-        if (alive) setVersion("?");
+        if (mountedRef.current) setVersion("?");
       });
-    checkForUpdate()
-      .then((r) => {
-        if (alive && r.kind === "update") setUpdate(r.update);
-      })
-      .catch(() => {});
     return () => {
-      alive = false;
+      mountedRef.current = false;
     };
   }, []);
 
-  async function manualCheck() {
-    if (checking || installing) return;
-    setChecking(true);
+  const runUpdateCheck = useCallback(async (announce: boolean, force = false) => {
+    const now = Date.now();
+    if (checkingRef.current) {
+      // A tray/manual request can arrive while the quiet startup/visibility check
+      // is already in flight. Upgrade that request to an announced result instead
+      // of dropping the user's explicit action or starting a duplicate request.
+      if (announce) announceCheckRef.current = true;
+      return;
+    }
+    if (installingRef.current) {
+      if (announce) toast.info("An update is already in progress");
+      return;
+    }
+    if (
+      !force &&
+      lastCheckRef.current !== 0 &&
+      now - lastCheckRef.current < UPDATE_CHECK_INTERVAL_MS
+    ) {
+      return;
+    }
+    checkingRef.current = true;
+    if (mountedRef.current) setChecking(true);
     try {
-      const r = await checkForUpdate();
-      if (r.kind === "update") {
-        setUpdate(r.update);
-        setShowNotes(true);
-      } else if (r.kind === "current") {
-        toast.success("You're on the latest version");
-      } else {
+      const result = await checkForUpdate();
+      if (result.kind !== "error") lastCheckRef.current = Date.now();
+      if (!mountedRef.current) return;
+      const shouldAnnounce = announce || announceCheckRef.current;
+      announceCheckRef.current = false;
+      if (result.kind === "update") {
+        setUpdate(result.update);
+        if (shouldAnnounce) setShowNotes(true);
+      } else if (result.kind === "current") {
+        setUpdate(null);
+        if (shouldAnnounce) toast.success("You're on the latest version");
+      } else if (shouldAnnounce) {
         toastError("Couldn't check for updates", {
           description: "You may be offline. Try again in a moment.",
         });
       }
     } finally {
-      setChecking(false);
+      checkingRef.current = false;
+      if (mountedRef.current) setChecking(false);
     }
+  }, []);
+
+  useEffect(() => {
+    void runUpdateCheck(false);
+    const interval = window.setInterval(
+      () => void runUpdateCheck(false),
+      UPDATE_CHECK_INTERVAL_MS,
+    );
+    const visibleUnlisten = listen<boolean>("team-window-visible", (event) => {
+      if (event.payload) void runUpdateCheck(false);
+    });
+    const trayUnlisten = listen("tray-check-updates", () => {
+      void runUpdateCheck(true, true);
+    });
+    return () => {
+      window.clearInterval(interval);
+      void visibleUnlisten.then((unlisten) => unlisten());
+      void trayUnlisten.then((unlisten) => unlisten());
+    };
+  }, [runUpdateCheck]);
+
+  async function manualCheck() {
+    await runUpdateCheck(true, true);
   }
 
   async function applyUpdate() {
     if (!update) return;
+    installingRef.current = true;
     setInstalling(true);
+    setInstallProgress(null);
     toast.info(`Updating to v${update.version}…`, {
       description:
-        "Stopping gateway processes so the installer can replace files. MCP clients may disconnect briefly; your editors can stay open.",
+        "Downloading first; MCP clients stay connected until the installer is ready to replace files.",
     });
     try {
-      await installUpdate(update);
+      await installUpdate(update, (progress) => {
+        if (mountedRef.current) setInstallProgress(progress);
+      });
     } catch (e) {
+      installingRef.current = false;
       setInstalling(false);
-      toastError(`Update failed: ${e}`, {
-        description: "You can download it manually from the releases page.",
+      setInstallProgress(null);
+      const message = e instanceof Error ? e.message : String(e);
+      const recoveryAdvice =
+        e &&
+        typeof e === "object" &&
+        "recoveryAdvice" in e &&
+        typeof e.recoveryAdvice === "string"
+          ? e.recoveryAdvice
+          : null;
+      toastError(`Update failed: ${message}`, {
+        description:
+          recoveryAdvice || "You can download it manually from the releases page.",
         action: {
           label: "Open",
           onClick: () =>
@@ -127,6 +209,8 @@ function VersionFooter({
       });
     }
   }
+
+  const progressLabel = updateProgressLabel(installProgress);
 
   if (!version) return null;
   return (
@@ -143,7 +227,7 @@ function VersionFooter({
             <ArrowUpCircle className="size-3.5 shrink-0" />
           )}
           <span className="truncate">
-            {installing ? "Updating…" : `Update to v${update.version}`}
+            {installing ? progressLabel : `Update to v${update.version}`}
           </span>
         </button>
       ) : (
@@ -162,6 +246,7 @@ function VersionFooter({
         onOpenChange={setShowNotes}
         update={update}
         installing={installing}
+        progressLabel={progressLabel}
         onInstall={applyUpdate}
       />
       <div className="flex shrink-0 items-center gap-2">
@@ -220,12 +305,14 @@ function UpdateNotes({
   onOpenChange,
   update,
   installing,
+  progressLabel,
   onInstall,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   update: Update | null;
   installing: boolean;
+  progressLabel: string;
   onInstall: () => void;
 }) {
   if (!update) return null;
@@ -252,7 +339,7 @@ function UpdateNotes({
             <Button onClick={onInstall} disabled={installing}>
               {installing ? (
                 <>
-                  <Loader2 className="size-4 animate-spin" /> Installing…
+                  <Loader2 className="size-4 animate-spin" /> {progressLabel}
                 </>
               ) : (
                 <>

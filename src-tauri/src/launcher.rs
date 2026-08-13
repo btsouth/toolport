@@ -820,6 +820,41 @@ mod tests {
         );
     }
 
+    /// npm publishes `1.4.0-rc.1` *before* `1.4.0`, so both can sit in the cache. A
+    /// plain numeric compare would call them equal and let the prerelease win by
+    /// arrival order.
+    #[test]
+    fn a_release_sorts_above_its_own_prereleases() {
+        let release = Version::parse("1.4.0");
+        for pre in ["1.4.0-rc.1", "1.4.0-rc.10", "1.4.0-beta", "1.4.0-alpha.0"] {
+            assert!(
+                release > Version::parse(pre),
+                "1.4.0 must outrank {pre}, got {release:?} vs {:?}",
+                Version::parse(pre)
+            );
+        }
+        // The numeric core still dominates: a later prerelease beats an earlier release.
+        assert!(Version::parse("1.5.0-rc.1") > Version::parse("1.4.0"));
+        // Build metadata is not a prerelease marker.
+        assert!(Version::parse("1.4.0+build.7") > Version::parse("1.4.0-rc.1"));
+    }
+
+    #[test]
+    fn a_cached_prerelease_never_beats_the_cached_release() {
+        let fx = Fixture::new("prerelease");
+        fx.package("rc", "srv", "1.4.0-rc.1", serde_json::json!("index.js"));
+        fx.package("rel", "srv", "1.4.0", serde_json::json!("index.js"));
+        let node = fx.node();
+
+        let direct =
+            resolve_in("npx", &s(&["srv"]), &fx.roots(), &node).expect("cached package resolves");
+        assert!(
+            direct.args[0].replace('\\', "/").contains("/rel/"),
+            "expected the 1.4.0 release copy, got {}",
+            direct.args[0]
+        );
+    }
+
     #[test]
     fn an_exact_version_request_must_match_the_cached_copy() {
         let fx = Fixture::new("version");

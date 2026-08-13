@@ -6,13 +6,14 @@ import type { DetectedClient, Registry } from "@/lib/types";
 
 const installGateway = vi.fn();
 const uninstallGateway = vi.fn();
+const migrateClient = vi.fn();
 const toastSuccess = vi.fn();
 const toastError = vi.fn();
 
 vi.mock("@/lib/api", () => ({
   installGateway: (...a: unknown[]) => installGateway(...a),
   uninstallGateway: (...a: unknown[]) => uninstallGateway(...a),
-  migrateClient: vi.fn(),
+  migrateClient: (...a: unknown[]) => migrateClient(...a),
   setClientDiscovery: vi.fn(),
   addServer: vi.fn(),
 }));
@@ -59,6 +60,7 @@ function emptyRegistry(): Registry {
 beforeEach(() => {
   installGateway.mockReset();
   uninstallGateway.mockReset();
+  migrateClient.mockReset();
   toastSuccess.mockReset();
   toastError.mockReset();
 });
@@ -192,9 +194,77 @@ describe("ClientDetail customized entry (SOU-406)", () => {
     await waitFor(() =>
       expect(installGateway).toHaveBeenCalledWith(
         "claude-desktop",
-        "Home",
+        "p2",
         false,
         "sharedHttp",
+      ),
+    );
+  });
+
+  it("selects a scope stored as a profile id", async () => {
+    const reg = emptyRegistry();
+    reg.profiles = [
+      { id: "p1", name: "Work", enabledServerIds: [] },
+      { id: "p2", name: "Home", enabledServerIds: [] },
+    ];
+    reg.clientScopes = { "claude-desktop": "p1" };
+    const connected = {
+      ...client(),
+      gatewayInstalled: true,
+      entryState: "managed" as const,
+    };
+    render(
+      <ClientDetail
+        client={connected}
+        registry={reg}
+        onChanged={() => {}}
+        onRegistryChange={() => {}}
+      />,
+    );
+    expect(screen.getAllByRole("combobox")[0]).toHaveTextContent("Only: Work");
+  });
+
+  it("passes a stable profile id from the migrate dialog", async () => {
+    const reg = emptyRegistry();
+    reg.profiles = [
+      { id: "p1", name: "Work", enabledServerIds: [] },
+      { id: "p2", name: "Home", enabledServerIds: [] },
+    ];
+    migrateClient.mockResolvedValue({ registry: reg, moved: ["calendar"] });
+    render(
+      <ClientDetail
+        client={client({
+          servers: [
+            {
+              name: "calendar",
+              transport: "stdio",
+              command: "calendar-mcp",
+              args: [],
+              envKeys: [],
+              url: null,
+            },
+          ],
+        })}
+        registry={reg}
+        onChanged={() => {}}
+        onRegistryChange={() => {}}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /move into gateway/i }));
+    const dialog = screen.getByRole("dialog");
+    const scopeSelect = dialog.querySelector('[role="combobox"]');
+    expect(scopeSelect).not.toBeNull();
+    await userEvent.click(scopeSelect!);
+    await userEvent.click(await screen.findByRole("option", { name: /Only: Home/i }));
+    await userEvent.click(screen.getByRole("button", { name: /move 1 into toolport/i }));
+
+    await waitFor(() =>
+      expect(migrateClient).toHaveBeenCalledWith(
+        "claude-desktop",
+        "p2",
+        undefined,
+        "stdio",
       ),
     );
   });
@@ -253,12 +323,7 @@ describe("ClientDetail connect toast (SOU-317)", () => {
     await userEvent.click(screen.getByRole("button", { name: /connect to toolport/i }));
 
     await waitFor(() =>
-      expect(installGateway).toHaveBeenCalledWith(
-        "claude-desktop",
-        "Work",
-        false,
-        "stdio",
-      ),
+      expect(installGateway).toHaveBeenCalledWith("claude-desktop", "p1", false, "stdio"),
     );
     expect(toastSuccess).toHaveBeenCalledWith(
       "Connected Toolport to Claude Desktop",

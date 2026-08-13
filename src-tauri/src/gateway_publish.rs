@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const MANIFEST_FILE: &str = "gateway-manifest.json";
 
@@ -85,6 +86,57 @@ fn file_size(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.len())
 }
 
+fn file_sha256(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let digest = digest.finalize();
+    Ok(format!("{digest:x}"))
+}
+
+fn existing_file_sha256(path: &Path) -> std::io::Result<Option<String>> {
+    match file_sha256(path) {
+        Ok(digest) => Ok(Some(digest)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// A second build of the same Cargo version can differ from the gateway already
+/// published under the version-only filename. On Windows that old image is commonly
+/// locked by Codex/Claude, so replacing it in place fails. Give the rebuilt image a
+/// content-addressed leaf instead; the manifest/repoint path can then migrate clients
+/// without fighting the running executable.
+fn content_addressed_dest(dest: &Path, digest: &str) -> PathBuf {
+    let stem = dest
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "toolport-gateway".into());
+    let ext = dest
+        .extension()
+        .map(|s| format!(".{}", s.to_string_lossy()))
+        .unwrap_or_default();
+    let short = &digest[..digest.len().min(12)];
+    dest.with_file_name(format!("{stem}-{short}{ext}"))
+}
+
+fn select_publish_dest(base_dest: &Path, src_digest: &str) -> PathBuf {
+    match existing_file_sha256(base_dest) {
+        Ok(Some(dest_digest)) if dest_digest == src_digest => base_dest.to_path_buf(),
+        Ok(Some(_)) | Err(_) => content_addressed_dest(base_dest, src_digest),
+        Ok(None) => base_dest.to_path_buf(),
+    }
+}
+
 /// Copy the install-dir gateway into `Toolport/bin` when needed and write the manifest.
 pub fn publish_bundled_gateway() -> Option<PathBuf> {
     if !should_publish_client_gateway() {
@@ -92,18 +144,25 @@ pub fn publish_bundled_gateway() -> Option<PathBuf> {
     }
     let src = bundled_gateway_source()?;
     let version = env!("CARGO_PKG_VERSION").to_string();
-    let dest = versioned_dest(&version)?;
+    let base_dest = versioned_dest(&version)?;
     let src_size = file_size(&src)?;
+    let src_digest = file_sha256(&src).ok()?;
 
-    let needs_copy = match file_size(&dest) {
-        Some(dest_size) => dest_size != src_size,
-        None => true,
-    };
-    if needs_copy {
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).ok()?;
+    // Never overwrite a different same-version image in place. Besides being unsafe
+    // for a running executable on Unix, Windows rejects it with a sharing violation.
+    let dest = select_publish_dest(&base_dest, &src_digest);
+    match existing_file_sha256(&dest) {
+        Ok(Some(dest_digest)) if dest_digest == src_digest => {}
+        Ok(Some(_)) | Err(_) => return None,
+        Ok(None) => {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).ok()?;
+            }
+            std::fs::copy(&src, &dest).ok()?;
+            if file_sha256(&dest).ok().as_deref() != Some(src_digest.as_str()) {
+                return None;
+            }
         }
-        std::fs::copy(&src, &dest).ok()?;
     }
 
     let manifest = GatewayManifest {
@@ -227,13 +286,28 @@ pub enum ReapDecision {
 /// that produced the advice, which is how #542 shipped a panel that erased
 /// itself (see [`RestartAdvice`](../desktop/struct.RestartAdvice.html) for the
 /// merge that keeps it).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReapReport {
     pub killed: Vec<String>,
     pub kept: Vec<String>,
     pub failed: Vec<String>,
+    /// Processes that still matched the kill plan after both termination passes.
+    /// A successful OS kill call is not proof that the process exited, so updater
+    /// callers must gate installation on this final observation too.
+    pub remaining: Vec<String>,
     /// Apps still launching an obsolete gateway, from this pass's pre-kill snapshot.
     pub needs_restart: Vec<ClientNeedingRestart>,
+    /// External client applications whose gateway accepted a stop request. When an
+    /// update later aborts, these apps may need restarting to recreate their stdio
+    /// connection. Toolport itself cannot safely recreate a client-owned pipe.
+    pub restart_clients: Vec<ClientNeedingRestart>,
+    /// Stopped gateways whose parent is provably an external application but
+    /// whose executable identity was not readable enough to safely name that
+    /// application. Orphans, init-owned helpers, and Toolport-owned processes do
+    /// not belong here; updater guidance must not infer external ownership from
+    /// the broad `killed` list.
+    pub unattributed_external_stopped: Vec<String>,
 }
 
 impl ReapReport {
@@ -408,7 +482,15 @@ fn basename_matches_current_version(name: &str, version: &str) -> bool {
     let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
     let want_tp = format!("toolport-gateway-{version}").to_ascii_lowercase();
     let want_cd = format!("conduit-gateway-{version}").to_ascii_lowercase();
-    stem == want_tp || stem == want_cd
+    [want_tp, want_cd].iter().any(|want| {
+        stem == want
+            || stem
+                .strip_prefix(&format!("{want}-"))
+                .map(|suffix| {
+                    suffix.len() == 12 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .unwrap_or(false)
+    })
 }
 
 /// Path looks like a cargo `target/...` dev binary — keep under stale mode so
@@ -647,6 +729,52 @@ fn label_process(proc: &GatewayProcess) -> String {
     }
 }
 
+/// Recovery target for a gateway stopped on behalf of the updater.
+///
+/// Only attribute a process when both its executable and parent were inspectable.
+/// That is the same trust boundary as stale-gateway restart advice: an unreadable
+/// process may belong to another user session, and naming its parent would turn
+/// weak basename evidence into confident recovery guidance.
+fn restart_client_for(proc: &GatewayProcess) -> Option<ClientNeedingRestart> {
+    proc.path.as_ref()?;
+    let parent = proc.parent.as_ref()?;
+    if is_our_own_process(&parent.basename) || is_init_like(parent) {
+        return None;
+    }
+    Some(ClientNeedingRestart {
+        client: parent.basename.clone(),
+        client_pid: parent.pid,
+        gateway: proc.basename.clone(),
+    })
+}
+
+fn record_restart_client(report: &mut ReapReport, proc: &GatewayProcess) {
+    let Some(client) = restart_client_for(proc) else {
+        let provably_external = proc
+            .parent
+            .as_ref()
+            .is_some_and(|parent| !is_our_own_process(&parent.basename) && !is_init_like(parent));
+        if provably_external {
+            let label = label_process(proc);
+            if !report
+                .unattributed_external_stopped
+                .iter()
+                .any(|existing| existing == &label)
+            {
+                report.unattributed_external_stopped.push(label);
+            }
+        }
+        return;
+    };
+    if !report
+        .restart_clients
+        .iter()
+        .any(|existing| existing.client_pid == client.client_pid)
+    {
+        report.restart_clients.push(client);
+    }
+}
+
 fn reap_with_context(ctx: &ReapContext) -> ReapReport {
     reap_listed(ctx, list_gateway_processes)
 }
@@ -670,6 +798,9 @@ fn reap_listed(ctx: &ReapContext, list: impl Fn() -> Vec<GatewayProcess>) -> Rea
         let label = label_process(&proc);
         if kill_gateway_process(&proc) {
             report.killed.push(label);
+            if ctx.kill_all {
+                record_restart_client(&mut report, &proc);
+            }
         } else {
             report.failed.push(label);
         }
@@ -682,14 +813,37 @@ fn reap_listed(ctx: &ReapContext, list: impl Fn() -> Vec<GatewayProcess>) -> Rea
             if decide_reap(&proc, ctx) == ReapDecision::Kill {
                 let label = label_process(&proc);
                 if kill_gateway_process(&proc) {
+                    // A first termination attempt may fail transiently. Once the
+                    // retry is accepted, do not leave a stale failure that would
+                    // incorrectly block the updater; the final observation below
+                    // is authoritative about whether the process actually exited.
+                    report.failed.retain(|failed| failed != &label);
                     if !report.killed.iter().any(|k| k == &label) {
                         report.killed.push(format!("{label} [retry]"));
                     }
+                    if ctx.kill_all {
+                        record_restart_client(&mut report, &proc);
+                    }
                 } else if !report.failed.iter().any(|f| f == &label) {
-                    report.failed.push(format!("{label} [still running]"));
+                    report.failed.push(label);
                 }
             }
         }
+
+        // A kill API reporting success only means the signal/request was accepted.
+        // Re-enumerate once more so update installation never races a process that
+        // still has the gateway binary open.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        report.remaining = list()
+            .into_iter()
+            .filter(|proc| decide_reap(proc, ctx) == ReapDecision::Kill)
+            .map(|proc| label_process(&proc))
+            .collect();
+
+        // Keep failed termination attempts even when the final enumerator no longer
+        // sees the pid. Enumeration is best-effort on every platform; only a later
+        // successful kill is strong enough evidence to clear a failure. Updaters
+        // must fail closed rather than replace files after an ambiguous shutdown.
     }
     report
 }
@@ -709,12 +863,20 @@ fn log_reap_report(kind: &str, report: &ReapReport) {
             report.failed.join("; ")
         );
     }
+    if !report.remaining.is_empty() {
+        eprintln!(
+            "toolport: {kind} still sees {} gateway process(es) alive: {}",
+            report.remaining.len(),
+            report.remaining.join("; ")
+        );
+    }
 }
 
 /// Terminate every Toolport/Conduit gateway process (all platforms). Used before
 /// in-app update so locked binaries can be replaced. Does not touch parent apps.
-/// Returns how many processes were successfully killed.
-pub fn stop_spawned_gateways() -> u32 {
+/// Returns the complete shutdown report. The updater must refuse installation
+/// while either `failed` or `remaining` is non-empty.
+pub fn stop_spawned_gateways() -> ReapReport {
     let ctx = ReapContext {
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         keep_paths: Vec::new(),
@@ -724,7 +886,7 @@ pub fn stop_spawned_gateways() -> u32 {
     };
     let report = reap_with_context(&ctx);
     log_reap_report("updater reaper", &report);
-    report.killed.len() as u32
+    report
 }
 
 /// Terminate gateway processes that are not the current install. Safe on every
@@ -1545,6 +1707,78 @@ mod tests {
     }
 
     #[test]
+    fn updater_report_serializes_complete_shutdown_and_recovery_evidence() {
+        let client = ClientNeedingRestart {
+            client: "Cursor.exe".into(),
+            client_pid: 77,
+            gateway: "toolport-gateway.exe".into(),
+        };
+        let report = ReapReport {
+            killed: vec!["toolport-gateway.exe (pid 10)".into()],
+            kept: vec![],
+            failed: vec!["toolport-gateway.exe (pid 11)".into()],
+            remaining: vec!["toolport-gateway.exe (pid 11)".into()],
+            needs_restart: vec![],
+            restart_clients: vec![client],
+            unattributed_external_stopped: vec!["toolport-gateway.exe (pid 12)".into()],
+        };
+
+        let value = serde_json::to_value(report).expect("serialize updater reaper report");
+        assert_eq!(value["killed"][0], "toolport-gateway.exe (pid 10)");
+        assert_eq!(value["failed"][0], "toolport-gateway.exe (pid 11)");
+        assert_eq!(value["remaining"][0], "toolport-gateway.exe (pid 11)");
+        assert_eq!(value["restartClients"][0]["client"], "Cursor.exe");
+        assert_eq!(value["restartClients"][0]["clientPid"], 77);
+        assert_eq!(
+            value["unattributedExternalStopped"][0],
+            "toolport-gateway.exe (pid 12)"
+        );
+    }
+
+    #[test]
+    fn updater_recovery_names_only_safely_attributed_external_clients() {
+        let external = proc_with_parent(
+            10,
+            "toolport-gateway.exe",
+            Some(r"C:\Toolport\toolport-gateway.exe"),
+            77,
+            "Cursor.exe",
+        );
+        assert_eq!(
+            restart_client_for(&external),
+            Some(ClientNeedingRestart {
+                client: "Cursor.exe".into(),
+                client_pid: 77,
+                gateway: "toolport-gateway.exe".into(),
+            })
+        );
+
+        let unreadable = proc_with_parent(11, "toolport-gateway.exe", None, 78, "Claude.exe");
+        assert!(restart_client_for(&unreadable).is_none());
+        let mut report = ReapReport::default();
+        record_restart_client(&mut report, &unreadable);
+        assert_eq!(
+            report.unattributed_external_stopped,
+            vec!["toolport-gateway.exe (pid 11)"]
+        );
+
+        let supervised = proc_with_parent(
+            12,
+            "toolport-gateway.exe",
+            Some(r"C:\Toolport\toolport-gateway.exe"),
+            79,
+            "toolport.exe",
+        );
+        assert!(restart_client_for(&supervised).is_none());
+        record_restart_client(&mut report, &supervised);
+        assert_eq!(report.unattributed_external_stopped.len(), 1);
+
+        let orphan = proc(13, "toolport-gateway.exe", None);
+        record_restart_client(&mut report, &orphan);
+        assert_eq!(report.unattributed_external_stopped.len(), 1);
+    }
+
+    #[test]
     fn unversioned_install_path_detected() {
         assert!(is_unversioned_install_gateway_path(
             r"C:\Users\me\AppData\Local\Toolport\toolport-gateway.exe"
@@ -1571,6 +1805,25 @@ mod tests {
                 &c
             ),
             ReapDecision::Keep
+        );
+    }
+
+    #[test]
+    fn decide_keeps_current_content_addressed_basename_without_a_path() {
+        let c = ctx("1.9.6", &[], false);
+        assert_eq!(
+            decide_reap(
+                &proc(10, "toolport-gateway-1.9.6-0123456789ab.exe", None),
+                &c
+            ),
+            ReapDecision::Keep
+        );
+        assert!(
+            !basename_matches_current_version(
+                "toolport-gateway-1.9.6-not-a-digest.exe",
+                "1.9.6"
+            ),
+            "only the publisher's 12-hex content suffix is current"
         );
     }
 
@@ -1949,6 +2202,34 @@ mod tests {
         let json = serde_json::to_string(&m).unwrap();
         let back: GatewayManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn same_version_rebuild_gets_content_addressed_leaf() {
+        let base = PathBuf::from(
+            r"C:\Users\u\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe",
+        );
+        assert_eq!(
+            content_addressed_dest(
+                &base,
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            ),
+            PathBuf::from(
+                r"C:\Users\u\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0-0123456789ab.exe"
+            )
+        );
+    }
+
+    #[test]
+    fn unreadable_same_version_destination_uses_content_addressed_leaf() {
+        let dir = ScratchDir::new("publish-unreadable-base");
+        let base = dir.join("toolport-gateway-1.12.0.exe");
+        std::fs::create_dir(&base).expect("directory stand-in should be unreadable as a file");
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            select_publish_dest(&base, digest),
+            dir.join("toolport-gateway-1.12.0-0123456789ab.exe")
+        );
     }
 
     /// A small, long-running binary to stand in for a gateway image.
@@ -2749,6 +3030,13 @@ mod tests {
             decide_prune(&bin(&dir, "toolport-gateway-1.10.0.exe"), &ctx),
             PruneDecision::Keep(_)
         ));
+        assert_eq!(
+            decide_prune(
+                &bin(&dir, "toolport-gateway-1.10.0-0123456789ab.exe"),
+                &ctx
+            ),
+            PruneDecision::Keep("current version")
+        );
     }
 
     /// The exact situation from the SOU-484 report: on the machine where this was

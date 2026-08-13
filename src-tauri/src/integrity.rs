@@ -245,25 +245,20 @@ fn server_of(namespaced: &str) -> &str {
 }
 
 fn pins_path(profile: Option<&str>) -> Option<PathBuf> {
-    profile_file(profile, "tool-pins-", "tool-pins.json")
+    profile_file(profile, "tool-pins-v2-", "tool-pins.json")
 }
 
 fn quarantine_path(profile: Option<&str>) -> Option<PathBuf> {
-    profile_file(profile, "quarantine-", "quarantine.json")
+    profile_file(profile, "quarantine-v2-", "quarantine.json")
 }
 
-/// Per-profile store file in the conduit dir. The profile name is slugged to
-/// `[a-z0-9-]` so it can't escape the directory; the no-profile case uses `fallback`.
+/// Per-profile store file in the conduit dir. Profile references are canonical
+/// stable ids before they reach this module; imported non-canonical ids receive a
+/// collision-resistant key. The no-profile case uses `fallback`.
 fn profile_file(profile: Option<&str>, prefix: &str, fallback: &str) -> Option<PathBuf> {
     let dir = crate::registry::conduit_dir()?;
     let file = match profile {
-        Some(p) if !p.is_empty() => {
-            let slug: String = p
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
-                .collect();
-            format!("{prefix}{slug}.json")
-        }
+        Some(p) if !p.is_empty() => format!("{prefix}{}.json", crate::registry::profile_store_key(p)),
         _ => fallback.to_string(),
     };
     Some(dir.join(file))
@@ -285,6 +280,9 @@ fn load_pins(profile: Option<&str>) -> PinsLoad {
         return PinsLoad::Fresh;
     };
     if !path.exists() {
+        if profile.is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, true)) {
+            return PinsLoad::Corrupt;
+        }
         return PinsLoad::Fresh;
     }
     // Every connected client spawns its own gateway, and they all share this one pins file.
@@ -331,27 +329,46 @@ fn load_pins(profile: Option<&str>) -> PinsLoad {
     PinsLoad::Corrupt
 }
 
-fn save_pins(profile: Option<&str>, pins: &Pins) -> bool {
-    let Some(path) = pins_path(profile) else {
-        return false;
-    };
-    let Ok(s) = serde_json::to_string(pins) else {
-        return false;
-    };
-    crate::registry::atomic_write(&path, &s).is_ok()
+fn save_pins_with(
+    profile: Option<&str>,
+    pins: &Pins,
+    write: impl FnOnce(&Path, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let path = pins_path(profile).ok_or_else(|| {
+        "Could not resolve the integrity pin-store path; the baseline was not updated".to_string()
+    })?;
+    let serialized = serde_json::to_string(pins)
+        .map_err(|e| format!("Could not serialize the integrity pin store at {path:?}: {e}"))?;
+    write(&path, &serialized)
+        .map_err(|e| format!("Could not persist the integrity pin store at {path:?}: {e}"))
+}
+
+fn save_pins(profile: Option<&str>, pins: &Pins) -> Result<(), String> {
+    save_pins_with(profile, pins, crate::registry::atomic_write)
 }
 
 /// Run a load-modify-save of an on-disk integrity store while holding the cross-process lock
 /// that guards `path` (its sibling `<path>.lock`), so two Toolport gateways detecting drift at
 /// the same moment serialize instead of read-modify-writing over each other. Without it a stale
 /// writer can clobber a peer's quarantine set and silently un-block a just-quarantined tool, or
-/// lose a peer's pin re-baseline (SOU-165). Best-effort: if the lock can't be acquired (a peer
-/// held it past the deadline) we log and run anyway, so this never regresses below today's
-/// atomic-but-unlocked write.
-fn with_store_lock<T>(path: &Path, f: impl FnOnce() -> T) -> T {
-    let _lock = crate::registry::lock_at(path)
-        .map_err(|e| eprintln!("conduit: proceeding without the integrity lock on {path:?}: {e}"))
-        .ok();
+/// lose a peer's pin re-baseline (SOU-165). Lock acquisition is mandatory: running the
+/// mutation unlocked would let a stale writer silently undo a peer's security decision.
+/// When locks must be nested, always acquire quarantine first and pins second (as `release`
+/// does); never acquire a quarantine lock while already holding a pin-store lock.
+fn with_store_lock<T>(
+    path: &Path,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    with_store_lock_using(path, crate::registry::lock_at, f)
+}
+
+fn with_store_lock_using<T>(
+    path: &Path,
+    acquire: impl FnOnce(&Path) -> Result<crate::registry::FileLock, String>,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _lock = acquire(path)
+        .map_err(|e| format!("Could not lock the integrity store at {path:?}: {e}"))?;
     f()
 }
 
@@ -359,16 +376,47 @@ fn with_store_lock<T>(path: &Path, f: impl FnOnce() -> T) -> T {
 /// security event for each drift. Returns the drift events (also written to
 /// `security.jsonl`). A tool whose server has never been pinned is treated as a
 /// fresh baseline (no drift); only servers we've already seen can "drift".
-pub fn check(profile: Option<&str>, current: &[Value]) -> Vec<Value> {
-    // Serialize the pin baseline's load-modify-save so a concurrent gateway's re-baseline can't
-    // clobber this one (SOU-165). No pins path (no config dir) = nothing to persist, run direct.
-    match pins_path(profile) {
-        Some(path) => with_store_lock(&path, || check_inner(profile, current)),
-        None => check_inner(profile, current),
-    }
+pub fn check(profile: Option<&str>, current: &[Value]) -> Result<Vec<Value>, String> {
+    check_with_pin_policy(profile, current, false)
 }
 
-fn check_inner(profile: Option<&str>, current: &[Value]) -> Vec<Value> {
+/// Detect drift while deferring high-risk pin changes until their quarantine record is durable.
+/// The gateway follows a successful quarantine write with [`accept_quarantined_pins`]. If that
+/// write fails, the old pin remains in place and the same drift is detected again on retry.
+pub fn check_staged(profile: Option<&str>, current: &[Value]) -> Result<Vec<Value>, String> {
+    check_with_pin_policy(profile, current, true)
+}
+
+fn check_with_pin_policy(
+    profile: Option<&str>,
+    current: &[Value],
+    defer_quarantine_candidates: bool,
+) -> Result<Vec<Value>, String> {
+    // Serialize the pin baseline's load-modify-save so a concurrent gateway's re-baseline can't
+    // clobber this one (SOU-165). If the path or lock is unavailable, do not perform a baseline
+    // mutation that cannot be made durable.
+    let path = pins_path(profile).ok_or_else(|| {
+        "Could not resolve the integrity pin-store path; the baseline check was not run".to_string()
+    })?;
+    with_store_lock(&path, || {
+        check_inner(profile, current, defer_quarantine_candidates)
+    })
+}
+
+fn check_inner(
+    profile: Option<&str>,
+    current: &[Value],
+    defer_quarantine_candidates: bool,
+) -> Result<Vec<Value>, String> {
+    check_inner_with(profile, current, defer_quarantine_candidates, save_pins)
+}
+
+fn check_inner_with(
+    profile: Option<&str>,
+    current: &[Value],
+    defer_quarantine_candidates: bool,
+    save: impl FnOnce(Option<&str>, &Pins) -> Result<(), String>,
+) -> Result<Vec<Value>, String> {
     let mut events: Vec<Value> = Vec::new();
     let pins = match load_pins(profile) {
         PinsLoad::Loaded(p) => p,
@@ -379,7 +427,7 @@ fn check_inner(profile: Option<&str>, current: &[Value]) -> Vec<Value> {
             // tool establishes its pin before the router exposes it again.
             let event = pins_tamper_event();
             record_event(&event);
-            return vec![event];
+            return Ok(vec![event]);
         }
     };
     // Servers we've already established a baseline for.
@@ -461,14 +509,169 @@ fn check_inner(profile: Option<&str>, current: &[Value]) -> Vec<Value> {
             Pin { first_seen, last_changed, ..fresh.clone() },
         );
     }
-    if updated != pins {
-        let _ = save_pins(profile, &updated);
+    if defer_quarantine_candidates {
+        for name in quarantine_candidates(current, &events) {
+            match pins.get(&name) {
+                Some(old) => {
+                    updated.insert(name, old.clone());
+                }
+                None => {
+                    updated.remove(&name);
+                }
+            }
+        }
     }
-
+    // Record the detected drift even when the pin-store update fails. The gateway will
+    // fail closed on that error, and the security log must still explain why it did so.
     for e in &events {
         record_event(e);
     }
-    events
+    if updated != pins {
+        save(profile, &updated)?;
+    }
+    Ok(events)
+}
+
+/// Persist the current definitions for high-risk events after their quarantine records have
+/// been written. This is deliberately separate from [`check_staged`] so a quarantine write
+/// failure cannot consume the old baseline and make the drift disappear on retry/restart.
+pub fn accept_staged_pins(
+    profile: Option<&str>,
+    current: &[Value],
+    events: &[Value],
+) -> Result<(), String> {
+    let names = quarantine_candidates(current, events);
+    if names.is_empty() || baseline_tamper_detected(events) {
+        return Ok(());
+    }
+    let path = pins_path(profile).ok_or_else(|| {
+        "Could not resolve the integrity pin-store path; quarantined definitions were not pinned"
+            .to_string()
+    })?;
+    with_store_lock(&path, || {
+        let pins = match load_pins(profile) {
+            PinsLoad::Loaded(p) => p,
+            PinsLoad::Fresh => Pins::new(),
+            PinsLoad::Corrupt => {
+                return Err(
+                    "The integrity pin store is corrupt; refusing to overwrite the lost trust root"
+                        .to_string(),
+                );
+            }
+        };
+        let stamp = epoch_millis();
+        let mut updated = pins.clone();
+        for tool in current {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if !names.contains(name) {
+                continue;
+            }
+            let fresh = pin_of(tool);
+            updated.insert(name.to_string(), merge_pending_pin(pins.get(name), fresh, stamp));
+        }
+        if updated != pins {
+            save_pins(profile, &updated)?;
+        }
+        Ok(())
+    })
+}
+
+fn merge_pending_pin(previous: Option<&Pin>, fresh: Pin, stamp: u64) -> Pin {
+    let (first_seen, last_changed) = match previous {
+        Some(old) => (
+            if old.first_seen == 0 { stamp } else { old.first_seen },
+            if old.fp == fresh.fp && old.last_changed != 0 {
+                old.last_changed
+            } else {
+                stamp
+            },
+        ),
+        None => (stamp, stamp),
+    };
+    Pin { first_seen, last_changed, ..fresh }
+}
+
+/// Finish staged pin acceptance from durable ordinary quarantine records. This does not depend
+/// on the current router catalog, because quarantined tools are intentionally filtered out of it.
+/// Keeping the captured pin on the quarantine record until the pin write is durable makes retry
+/// idempotent after a write failure or a process exit between the two stores.
+pub fn accept_quarantined_pins(profile: Option<&str>) -> Result<(), String> {
+    accept_quarantined_pins_with(profile, save_pins, save_quarantine)
+}
+
+fn accept_quarantined_pins_with(
+    profile: Option<&str>,
+    save_pin: impl FnOnce(Option<&str>, &Pins) -> Result<(), String>,
+    save_quarantine: impl FnOnce(Option<&str>, &Quarantine) -> Result<(), String>,
+) -> Result<(), String> {
+    let quarantine_path = quarantine_path(profile).ok_or_else(|| {
+        "Could not resolve the quarantine-store path; staged pins were not accepted".to_string()
+    })?;
+    with_store_lock(&quarantine_path, || {
+        let mut quarantine = load_quarantine(profile)
+            .map_err(|e| format!("{e}; staged pins were not accepted"))?;
+        let mut pending = Vec::new();
+        for (name, record) in &quarantine {
+            if !matches!(
+                record.get("change").and_then(Value::as_str),
+                Some("changed" | "poison")
+            ) {
+                continue;
+            }
+            let Some(value) = record.get("pending_pin").cloned() else {
+                // Compatibility: releases created before staged acceptance have no captured pin
+                // because their baseline was already advanced before quarantine was written.
+                continue;
+            };
+            let pin = serde_json::from_value::<Pin>(value).map_err(|_| {
+                format!("The quarantine record for {name} has an invalid captured pin")
+            })?;
+            pending.push((name.clone(), pin));
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let pin_path = pins_path(profile).ok_or_else(|| {
+            "Could not resolve the integrity pin-store path; staged pins were not accepted"
+                .to_string()
+        })?;
+        with_store_lock(&pin_path, || {
+            let pins = match load_pins(profile) {
+                PinsLoad::Loaded(pins) => pins,
+                PinsLoad::Fresh => Pins::new(),
+                PinsLoad::Corrupt => {
+                    return Err(
+                        "The integrity pin store is corrupt; refusing to overwrite the lost trust root"
+                            .to_string(),
+                    );
+                }
+            };
+            let stamp = epoch_millis();
+            let mut updated = pins.clone();
+            for (name, fresh) in &pending {
+                updated.insert(
+                    name.clone(),
+                    merge_pending_pin(pins.get(name), fresh.clone(), stamp),
+                );
+            }
+            if updated != pins {
+                save_pin(profile, &updated)?;
+            }
+            Ok(())
+        })?;
+
+        // Pins are durable now. Clear the recovery markers second; if this write fails or the
+        // process exits, the markers remain and the next retry repeats the idempotent pin merge.
+        for (name, _) in &pending {
+            if let Some(record) = quarantine.get_mut(name).and_then(Value::as_object_mut) {
+                record.remove("pending_pin");
+            }
+        }
+        save_quarantine(profile, &quarantine)
+    })
 }
 
 /// A tool's pinned identity baseline, exposed for the capability-provenance view.
@@ -506,27 +709,22 @@ pub fn baselines(profile: Option<&str>) -> BTreeMap<String, ToolBaseline> {
     }
 }
 
-/// Aggregate baselines across ALL profile pin files (`tool-pins.json` +
-/// `tool-pins-<slug>.json`), merged by tool name. The gateway keys pins by the
-/// `CONDUIT_PROFILE` it ran under (often None -> `tool-pins.json`), so the identity view
+/// Aggregate baselines across current stable-id pin files, merged by tool name.
+/// The legacy fallback is also included for the distinct HTTP-union namespace, but retained
+/// pre-v2 name-derived files are migration evidence and must not affect live identity state.
 /// must union every profile's pins rather than guess a single one. For a tool seen in
 /// several profiles: earliest first_seen, latest last_changed, and the fingerprint from
 /// the most recent change.
-pub fn all_baselines() -> BTreeMap<String, ToolBaseline> {
+pub fn all_baselines() -> Result<BTreeMap<String, ToolBaseline>, String> {
     let mut merged: BTreeMap<String, ToolBaseline> = BTreeMap::new();
     let Some(dir) = crate::registry::conduit_dir() else {
-        return merged;
+        return Ok(merged);
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return merged;
-    };
-    for entry in entries.flatten() {
-        let fname = entry.file_name();
-        let Some(name) = fname.to_str() else { continue };
-        if !(name.starts_with("tool-pins") && name.ends_with(".json")) {
-            continue;
-        }
-        let Ok(s) = std::fs::read_to_string(entry.path()) else {
+    let registry = crate::registry::load_resolved()?;
+    let mut paths = vec![dir.join("tool-pins.json")];
+    paths.extend(registry.profiles.iter().filter_map(|profile| pins_path(Some(&profile.id))));
+    for path in paths {
+        let Ok(s) = std::fs::read_to_string(path) else {
             continue;
         };
         let Ok(pins) = serde_json::from_str::<BTreeMap<String, PinRepr>>(&s) else {
@@ -555,7 +753,7 @@ pub fn all_baselines() -> BTreeMap<String, ToolBaseline> {
                 .or_insert(base);
         }
     }
-    merged
+    Ok(merged)
 }
 
 /// The set of quarantined tool names across ALL profiles, for the identity view's badge.
@@ -569,25 +767,16 @@ fn is_legacy_added(rec: &Value) -> bool {
     rec.get("change").and_then(Value::as_str) == Some("added")
 }
 
-pub fn all_quarantined_names() -> BTreeSet<String> {
+pub fn all_quarantined_names() -> Result<BTreeSet<String>, String> {
     let mut out = BTreeSet::new();
     let Some(dir) = crate::registry::conduit_dir() else {
-        return out;
+        return Ok(out);
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let fname = entry.file_name();
-        let Some(name) = fname.to_str() else { continue };
-        let is_q = name
-            .strip_prefix("quarantine")
-            .and_then(|r| r.strip_suffix(".json"))
-            .is_some();
-        if !is_q {
-            continue;
-        }
-        if let Ok(s) = std::fs::read_to_string(entry.path()) {
+    let registry = crate::registry::load_resolved()?;
+    let mut paths = vec![dir.join("quarantine.json")];
+    paths.extend(registry.profiles.iter().filter_map(|profile| quarantine_path(Some(&profile.id))));
+    for path in paths {
+        if let Ok(s) = std::fs::read_to_string(path) {
             if let Ok(q) = serde_json::from_str::<Quarantine>(&s) {
                 for (name, rec) in q {
                     if !is_legacy_added(&rec) {
@@ -597,7 +786,7 @@ pub fn all_quarantined_names() -> BTreeSet<String> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 // ===== Quarantine: block high-risk tools after a drift until re-approved =====
@@ -623,7 +812,16 @@ fn load_quarantine(profile: Option<&str>) -> Result<Quarantine, String> {
     };
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Quarantine::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if profile
+                .is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, false))
+            {
+                return Err(format!(
+                    "quarantine store at {path:?} was not migrated from a legacy file; refusing to treat that as empty"
+                ));
+            }
+            return Ok(Quarantine::new());
+        }
         Err(e) => {
             return Err(format!("quarantine store at {path:?} is unreadable: {e}"))
         }
@@ -655,14 +853,25 @@ fn parse_quarantine_raw(raw: &str, path: &Path) -> Result<Quarantine, String> {
     }
 }
 
-fn save_quarantine(profile: Option<&str>, q: &Quarantine) {
-    if let Some(path) = quarantine_path(profile) {
-        if let Ok(s) = serde_json::to_string(q) {
-            let _ = crate::registry::atomic_write(&path, &s);
-            // Invalidate the mtime cache so the next reconcile re-reads (SOU-303).
-            clear_quarantine_read_cache_for(&path);
-        }
-    }
+fn save_quarantine(profile: Option<&str>, q: &Quarantine) -> Result<(), String> {
+    save_quarantine_with(profile, q, crate::registry::atomic_write)
+}
+
+fn save_quarantine_with(
+    profile: Option<&str>,
+    q: &Quarantine,
+    write: impl FnOnce(&Path, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let path = quarantine_path(profile).ok_or_else(|| {
+        "Could not resolve the quarantine-store path; the quarantine was not updated".to_string()
+    })?;
+    let serialized = serde_json::to_string(q)
+        .map_err(|e| format!("Could not serialize the quarantine store at {path:?}: {e}"))?;
+    write(&path, &serialized)
+        .map_err(|e| format!("Could not persist the quarantine store at {path:?}: {e}"))?;
+    // Invalidate the mtime cache only after the new contents are durable (SOU-303).
+    clear_quarantine_read_cache_for(&path);
+    Ok(())
 }
 
 /// Namespaced names of the tools currently quarantined for `profile`, for the router
@@ -680,6 +889,14 @@ pub fn quarantined_checked(profile: Option<&str>) -> Result<BTreeSet<String>, St
         // place, so an empty set is the truth here rather than a failure.
         return Ok(BTreeSet::new());
     };
+    // A missing v2 store with a leftover legacy slug file means migration failed;
+    // reporting "empty" would let the watcher reconcile the live set down to nothing
+    // and re-expose previously quarantined tools (SBS-715).
+    if profile.is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, false)) {
+        return Err(format!(
+            "quarantine store at {path:?} was not migrated from a legacy file; refusing to treat that as empty"
+        ));
+    }
     quarantined_checked_at(&path)
 }
 
@@ -692,9 +909,25 @@ pub fn mandatory_quarantined(profile: Option<&str>) -> Result<BTreeSet<String>, 
 
 /// Cached enforcement read for [`mandatory_quarantined`], used by the gateway watcher.
 pub fn mandatory_quarantined_checked(profile: Option<&str>) -> Result<BTreeSet<String>, String> {
+    // A failed mandatory-tamper quarantine write leaves only the gateway's live fail-closed set.
+    // While the pin trust root is still corrupt, report the durable enforcement state as unknown
+    // so the watcher cannot reconcile that live set down to empty and re-expose tools.
+    if matches!(load_pins(profile), PinsLoad::Corrupt) {
+        return Err(
+            "The integrity pin store is corrupt; retaining the live mandatory quarantine set"
+                .to_string(),
+        );
+    }
     let Some(path) = quarantine_path(profile) else {
         return Ok(BTreeSet::new());
     };
+    // Same unmigrated-legacy guard as `quarantined_checked`: a failed migration must
+    // not read as "no mandatory quarantine" (SBS-715).
+    if profile.is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, false)) {
+        return Err(format!(
+            "quarantine store at {path:?} was not migrated from a legacy file; refusing to treat that as empty"
+        ));
+    }
     Ok(quarantined_sets_checked_at(&path)?.1)
 }
 
@@ -796,109 +1029,116 @@ pub fn quarantine_list(profile: Option<&str>) -> Vec<Value> {
     }
 }
 
-/// Every quarantined tool across all profiles, each record tagged with its profile
-/// slug (`""` for the no-profile store), for the app UI which spans profiles. The
+/// Every quarantined tool across all current stable-id profiles, each record tagged with its
+/// exact profile id (`""` for the distinct HTTP-union store), for the app UI. The
 /// `profile` tag is what `release` takes back to clear the right store.
-pub fn all_quarantined() -> Vec<Value> {
+pub fn all_quarantined() -> Result<Vec<Value>, String> {
     let Some(dir) = crate::registry::conduit_dir() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let fname = entry.file_name();
-        let Some(name) = fname.to_str() else { continue };
-        // "quarantine.json" -> slug ""; "quarantine-<slug>.json" -> "<slug>".
-        let Some(rest) = name
-            .strip_prefix("quarantine")
-            .and_then(|r| r.strip_suffix(".json"))
-        else {
-            continue;
-        };
-        let slug = rest.strip_prefix('-').unwrap_or("");
-        if let Ok(s) = std::fs::read_to_string(entry.path()) {
+    let registry = crate::registry::load_resolved()?;
+    let mut stores = vec![(String::new(), dir.join("quarantine.json"))];
+    stores.extend(registry.profiles.iter().filter_map(|profile| {
+        quarantine_path(Some(&profile.id)).map(|path| (profile.id.clone(), path))
+    }));
+    for (profile, path) in stores {
+        if let Ok(s) = std::fs::read_to_string(path) {
             if let Ok(q) = serde_json::from_str::<Quarantine>(&s) {
                 for mut rec in q.into_values() {
                     if is_legacy_added(&rec) {
                         continue;
                     }
-                    rec["profile"] = json!(slug);
+                    rec["profile"] = json!(profile);
                     out.push(rec);
                 }
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Re-approve a quarantined tool: drop it so the gateway re-exposes it on the next
-/// rebuild. Ordinary drift was already re-baselined by `check`; after baseline tamper,
-/// this first saves the definition captured while the tool was blocked. Returns whether
-/// the tool was actually quarantined.
-pub fn release(profile: Option<&str>, tool: &str) -> bool {
-    let Some(path) = quarantine_path(profile) else { return false };
+/// rebuild. Before removing the block, this saves any definition captured when quarantine was
+/// applied. That recovery step covers both baseline tamper and an interrupted staged-pin accept.
+/// Returns whether the tool was actually quarantined. Store/lock failures are returned separately
+/// from the idempotent `Ok(false)` case so callers never present a failed write as a successful
+/// release.
+pub fn release(profile: Option<&str>, tool: &str) -> Result<bool, String> {
+    let path = quarantine_path(profile).ok_or_else(|| {
+        "Could not resolve the quarantine-store path; the tool remains quarantined".to_string()
+    })?;
     // Under the cross-process lock so a concurrent gateway's quarantine write can't clobber this
     // release (or vice versa) via a stale read-modify-write (SOU-165).
     with_store_lock(&path, || {
-        // Fail closed: do not treat a corrupt store as empty and save `{}` (that would
-        // permanently clear every quarantine entry).
-        let mut q = match load_quarantine(profile) {
-            Ok(q) => q,
-            Err(e) => {
-                eprintln!("toolport: {e}; refusing to release until the store is fixed");
-                return false;
-            }
-        };
-        let Some(record) = q.get(tool).cloned() else {
-            return false;
-        };
-        if record.get("change").and_then(Value::as_str) == Some("tamper") {
-            // The baseline was deliberately left corrupt. Establish the exact definition
-            // captured when this tool was quarantined before removing the router block, so
-            // re-approval cannot create a window where an unpinned tool is exposed.
-            let Some(mut pending) = record
-                .get("pending_pin")
-                .cloned()
-                .and_then(|v| serde_json::from_value::<Pin>(v).ok())
-            else {
-                eprintln!(
-                    "toolport: refusing to release {tool}; the tamper quarantine has no valid captured pin"
-                );
-                return false;
-            };
-            let stamp = epoch_millis();
-            if pending.first_seen == 0 {
-                pending.first_seen = stamp;
-            }
-            if pending.last_changed == 0 {
-                pending.last_changed = stamp;
-            }
-            let Some(pin_path) = pins_path(profile) else {
-                return false;
-            };
-            let saved = with_store_lock(&pin_path, || {
-                let mut pins = match load_pins(profile) {
-                    PinsLoad::Loaded(p) => p,
-                    PinsLoad::Fresh | PinsLoad::Corrupt => Pins::new(),
-                };
-                pins.insert(tool.to_string(), pending);
-                save_pins(profile, &pins)
-            });
-            if !saved {
-                eprintln!(
-                    "toolport: refusing to release {tool}; its accepted pin could not be saved"
-                );
-                return false;
-            }
-        }
-        if q.remove(tool).is_some() {
-            save_quarantine(profile, &q);
-            return true;
-        }
-        false
+        release_inner(profile, tool, save_pins, save_quarantine)
     })
+}
+
+fn release_inner(
+    profile: Option<&str>,
+    tool: &str,
+    save_pin: impl FnOnce(Option<&str>, &Pins) -> Result<(), String>,
+    save_quarantine: impl FnOnce(Option<&str>, &Quarantine) -> Result<(), String>,
+) -> Result<bool, String> {
+    // Fail closed: do not treat a corrupt store as empty and save `{}` (that would
+    // permanently clear every quarantine entry).
+    let mut q = load_quarantine(profile)
+        .map_err(|e| format!("{e}; refusing to release until the store is fixed"))?;
+    let Some(record) = q.get(tool).cloned() else {
+        return Ok(false);
+    };
+    let tamper = record.get("change").and_then(Value::as_str) == Some("tamper");
+    let pending = match record.get("pending_pin").cloned() {
+        Some(value) => Some(serde_json::from_value::<Pin>(value).map_err(|_| {
+            format!("Refusing to release {tool}; the quarantine has no valid captured pin")
+        })?),
+        None if tamper => {
+            return Err(format!(
+                "Refusing to release {tool}; the tamper quarantine has no valid captured pin"
+            ));
+        }
+        None => None,
+    };
+    if let Some(pending) = pending {
+        // Establish the exact definition captured when this tool was quarantined before
+        // removing the router block. For ordinary drift this is the recovery path when the
+        // quarantine write succeeded but the subsequent staged-pin save failed or was skipped
+        // by a crash; for baseline tamper it repairs the lost trust root.
+        let pin_path = pins_path(profile).ok_or_else(|| {
+            format!("Refusing to release {tool}; the integrity pin-store path is unavailable")
+        })?;
+        with_store_lock(&pin_path, || {
+            let pins = match load_pins(profile) {
+                PinsLoad::Loaded(p) => p,
+                PinsLoad::Fresh => Pins::new(),
+                PinsLoad::Corrupt if tamper => Pins::new(),
+                PinsLoad::Corrupt => {
+                    return Err(
+                        "the integrity pin store is corrupt; refusing to overwrite the lost trust root"
+                            .to_string(),
+                    );
+                }
+            };
+            let mut updated = pins.clone();
+            updated.insert(
+                tool.to_string(),
+                merge_pending_pin(pins.get(tool), pending, epoch_millis()),
+            );
+            if updated != pins {
+                save_pin(profile, &updated)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| {
+            format!("Refusing to release {tool}; its accepted pin could not be saved: {e}")
+        })?;
+    }
+    if q.remove(tool).is_some() {
+        save_quarantine(profile, &q)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// From `check`'s drift `events` and the `current` tool list, quarantine the HIGH-RISK
@@ -906,24 +1146,64 @@ pub fn release(profile: Option<&str>, tool: &str) -> bool {
 /// whose definition changed or newly appeared. A benign change to a non-destructive
 /// tool is left exposed (detection still logged it). Returns whether anything new was
 /// blocked. (High-risk-by-auth — a drift on a credential-bearing server — is a later
-/// pass; it needs server-secret context the integrity layer doesn't hold here.)
-pub fn apply_quarantine(profile: Option<&str>, current: &[Value], events: &[Value]) -> bool {
-    let Some(path) = quarantine_path(profile) else { return false };
+/// pass; it needs server-secret context the integrity layer doesn't hold here.) Store/lock
+/// failures are returned distinctly so the gateway can retain its live blocked set.
+pub fn apply_quarantine(
+    profile: Option<&str>,
+    current: &[Value],
+    events: &[Value],
+) -> Result<bool, String> {
+    let path = quarantine_path(profile).ok_or_else(|| {
+        "Could not resolve the quarantine-store path; quarantine was not applied".to_string()
+    })?;
     // Under the cross-process lock so two gateways quarantining a drift at the same moment
     // serialize instead of one clobbering the other's set (SOU-165).
     with_store_lock(&path, || apply_quarantine_inner(profile, current, events))
 }
 
-fn apply_quarantine_inner(profile: Option<&str>, current: &[Value], events: &[Value]) -> bool {
+fn is_high_risk_drift(event: &Value) -> bool {
+    event.get("severity").and_then(Value::as_str) == Some(SEV_HIGH)
+        && matches!(
+            event.get("change").and_then(Value::as_str),
+            Some("changed" | "poison")
+        )
+}
+
+/// Tool names an integrity failure must keep blocked in memory until their quarantine record is
+/// durable. Baseline tamper invalidates the whole catalog; ordinary enforcement shares the exact
+/// same high-risk predicate as persistence in [`apply_quarantine_inner_with`].
+pub fn quarantine_candidates(current: &[Value], events: &[Value]) -> BTreeSet<String> {
+    if baseline_tamper_detected(events) {
+        return current
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect();
+    }
+    events
+        .iter()
+        .filter(|event| is_high_risk_drift(event))
+        .filter_map(|event| event.get("tool").and_then(Value::as_str).map(str::to_string))
+        .collect()
+}
+
+fn apply_quarantine_inner(
+    profile: Option<&str>,
+    current: &[Value],
+    events: &[Value],
+) -> Result<bool, String> {
+    apply_quarantine_inner_with(profile, current, events, save_quarantine)
+}
+
+fn apply_quarantine_inner_with(
+    profile: Option<&str>,
+    current: &[Value],
+    events: &[Value],
+    save: impl FnOnce(Option<&str>, &Quarantine) -> Result<(), String>,
+) -> Result<bool, String> {
     // Fail closed: do not load a corrupt store as empty and rewrite it with only the
     // new entries (that would drop every previously quarantined tool).
-    let mut q = match load_quarantine(profile) {
-        Ok(q) => q,
-        Err(e) => {
-            eprintln!("toolport: {e}; refusing to apply quarantine until the store is fixed");
-            return false;
-        }
-    };
+    let mut q = load_quarantine(profile)
+        .map_err(|e| format!("{e}; refusing to apply quarantine until the store is fixed"))?;
     let mut added = false;
 
     // A corrupt baseline invalidates every trust decision in the current catalog. This
@@ -932,6 +1212,18 @@ fn apply_quarantine_inner(profile: Option<&str>, current: &[Value], events: &[Va
     // before exposure. Existing ordinary quarantine records are upgraded to tamper records
     // so their release cannot bypass baseline repair.
     if baseline_tamper_detected(events) {
+        // The router may already have filtered ordinary quarantines out of `current`. Upgrade
+        // those durable records too; otherwise disabling optional drift quarantine could expose
+        // them while the pin trust root is corrupt. A legacy record without a captured pin stays
+        // blocked and requires repair rather than being released without a trustworthy baseline.
+        for record in q.values_mut() {
+            if record.get("change").and_then(Value::as_str) != Some("tamper") {
+                record["change"] = json!("tamper");
+                record["reason"] =
+                    json!("the integrity baseline was corrupt or tampered with");
+                added = true;
+            }
+        }
         for tool in current {
             let Some(name) = tool.get("name").and_then(Value::as_str) else {
                 continue;
@@ -963,9 +1255,9 @@ fn apply_quarantine_inner(profile: Option<&str>, current: &[Value], events: &[Va
             added = true;
         }
         if added {
-            save_quarantine(profile, &q);
+            save(profile, &q)?;
         }
-        return added;
+        return Ok(added);
     }
 
     for e in events {
@@ -980,7 +1272,7 @@ fn apply_quarantine_inner(profile: Option<&str>, current: &[Value], events: &[Va
         // downgrade (a tool shedding readOnlyHint/destructiveHint) - the exact
         // privilege-escalation case we want quarantined even though the tool isn't
         // itself marked destructive. A poison flag is always high.
-        if e.get("severity").and_then(Value::as_str) != Some(SEV_HIGH) {
+        if !is_high_risk_drift(e) {
             continue;
         }
         let reason = match change {
@@ -996,12 +1288,22 @@ fn apply_quarantine_inner(profile: Option<&str>, current: &[Value], events: &[Va
         };
         if !q.contains_key(tool) {
             let server = e.get("server").and_then(Value::as_str).unwrap_or("?");
+            let pending = current
+                .iter()
+                .find(|candidate| candidate.get("name").and_then(Value::as_str) == Some(tool))
+                .map(pin_of)
+                .ok_or_else(|| {
+                    format!(
+                        "Refusing to quarantine {tool}; its current definition could not be captured"
+                    )
+                })?;
             let mut rec = json!({
                 "ts": epoch_millis(),
                 "server": server,
                 "tool": tool,
                 "reason": reason,
                 "change": change,
+                "pending_pin": pending,
             });
             // Concrete annotation prior→new (SOU-305). Optional: older events / poison
             // rows omit these; the UI falls back to `reason` alone.
@@ -1018,9 +1320,9 @@ fn apply_quarantine_inner(profile: Option<&str>, current: &[Value], events: &[Va
         }
     }
     if added {
-        save_quarantine(profile, &q);
+        save(profile, &q)?;
     }
-    added
+    Ok(added)
 }
 
 /// Whether the tool named `name` in `current` is destructive (MCP annotations).
@@ -2043,23 +2345,337 @@ mod tests {
             event("srv", "srv__wipe", "changed", SEV_HIGH),
             poison_event("srv", "srv__read", &["instruction-override".to_string()], 0.9, None),
         ];
-        assert!(apply_quarantine(profile, &current, &events));
+        assert!(apply_quarantine(profile, &current, &events).unwrap());
         let q = quarantined(profile).expect("store readable");
         assert!(q.contains("srv__wipe"), "destructive change is quarantined");
         assert!(q.contains("srv__read"), "poison flag is quarantined");
         assert_eq!(q.len(), 2, "benign change to a safe tool is not quarantined");
 
         // Re-detecting the same drift adds nothing new.
-        assert!(!apply_quarantine(profile, &current, &events));
+        assert!(!apply_quarantine(profile, &current, &events).unwrap());
 
         // Re-approval restores the tool, and is idempotent.
-        assert!(release(profile, "srv__wipe"));
+        assert!(release(profile, "srv__wipe").unwrap());
         assert!(!quarantined(profile).expect("store readable").contains("srv__wipe"));
-        assert!(!release(profile, "srv__wipe"), "releasing twice is a no-op");
+        assert!(!release(profile, "srv__wipe").unwrap(), "releasing twice is a no-op");
 
         if let Some(p) = quarantine_path(profile) {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    #[test]
+    fn integrity_store_lock_contention_never_runs_the_mutation_unlocked() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("lock-fail-closed-sbs714");
+        let path = quarantine_path(Some("sbs714-lock")).expect("quarantine path");
+        let held = crate::registry::lock_at(&path).expect("first holder acquires the OS lock");
+        let ran = std::cell::Cell::new(false);
+
+        let result = with_store_lock_using(
+            &path,
+            |path| crate::registry::lock_at_for(path, std::time::Duration::from_millis(60)),
+            || {
+                ran.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err(), "contention must be a structured error");
+        assert!(!ran.get(), "the mutation must never run without the lock");
+        drop(held);
+    }
+
+    #[test]
+    fn integrity_lock_holder_child() {
+        let Some(path) = std::env::var_os("TOOLPORT_SBS714_LOCK_PATH") else {
+            return;
+        };
+        let ready = PathBuf::from(
+            std::env::var_os("TOOLPORT_SBS714_LOCK_READY").expect("child ready path"),
+        );
+        let release = PathBuf::from(
+            std::env::var_os("TOOLPORT_SBS714_LOCK_RELEASE").expect("child release path"),
+        );
+        let _held = crate::registry::lock_at(Path::new(&path)).expect("child acquires store lock");
+        std::fs::write(&ready, "ready").expect("child signals acquired lock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !release.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(release.exists(), "parent did not release the child lock holder");
+    }
+
+    #[test]
+    fn another_process_holding_the_store_lock_cannot_trigger_an_unlocked_mutation() {
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-integrity-multiprocess-sbs714-{}-{}",
+            std::process::id(),
+            TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("quarantine.json");
+        let ready = dir.join("ready");
+        let release = dir.join("release");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "integrity::tests::integrity_lock_holder_child",
+                "--nocapture",
+            ])
+            .env("TOOLPORT_SBS714_LOCK_PATH", &path)
+            .env("TOOLPORT_SBS714_LOCK_READY", &ready)
+            .env("TOOLPORT_SBS714_LOCK_RELEASE", &release)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn independent lock holder process");
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() && std::time::Instant::now() < ready_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child process did not acquire the integrity lock");
+        }
+
+        let ran = std::cell::Cell::new(false);
+        let result = with_store_lock_using(
+            &path,
+            |path| crate::registry::lock_at_for(path, std::time::Duration::from_millis(100)),
+            || {
+                ran.set(true);
+                Ok(())
+            },
+        );
+        std::fs::write(&release, "release").unwrap();
+        let status = child.wait().expect("wait for lock holder child");
+
+        assert!(status.success(), "lock holder child failed: {status}");
+        assert!(result.is_err(), "cross-process contention must return an error");
+        assert!(!ran.get(), "the mutation must not run unlocked after timeout");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quarantine_write_failure_is_an_error_and_preserves_the_durable_set() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("q-write-failure-sbs714");
+        let profile = Some("sbs714-apply-write");
+        let path = quarantine_path(profile).expect("quarantine path");
+        let mut existing = Quarantine::new();
+        existing.insert(
+            "srv__already_blocked".to_string(),
+            json!({"tool":"srv__already_blocked","change":"changed"}),
+        );
+        save_quarantine(profile, &existing).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let current = vec![destructive_tool("srv__wipe", "Wipe everything.")];
+        let events = vec![event("srv", "srv__wipe", "changed", SEV_HIGH)];
+
+        let result = apply_quarantine_inner_with(profile, &current, &events, |_, _| {
+            Err("injected disk-full failure".to_string())
+        });
+
+        let error = result.expect_err("a failed atomic write cannot report success");
+        assert!(error.contains("injected disk-full failure"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(quarantined(profile).unwrap(), existing.into_keys().collect());
+        assert_eq!(
+            quarantine_candidates(&current, &events),
+            BTreeSet::from(["srv__wipe".to_string()]),
+            "the gateway can keep the failed candidate blocked in memory"
+        );
+    }
+
+    #[test]
+    fn release_write_failure_is_an_error_and_keeps_the_tool_quarantined() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("release-write-failure-sbs714");
+        let profile = Some("sbs714-release-write");
+        let mut q = Quarantine::new();
+        q.insert(
+            "srv__wipe".to_string(),
+            json!({"tool":"srv__wipe","change":"changed"}),
+        );
+        save_quarantine(profile, &q).unwrap();
+
+        let result = release_inner(
+            profile,
+            "srv__wipe",
+            |_, _| Ok(()),
+            |_, _| Err("injected read-only filesystem".to_string()),
+        );
+
+        let error = result.expect_err("a failed release write cannot report success");
+        assert!(error.contains("injected read-only filesystem"));
+        assert!(
+            quarantined(profile).unwrap().contains("srv__wipe"),
+            "the durable block survives the failed release"
+        );
+    }
+
+    #[test]
+    fn pin_write_failure_is_propagated_without_creating_a_baseline() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("pin-write-failure-sbs714");
+        let profile = Some("sbs714-pin-write");
+        let current = vec![tool("srv__read", "Read records.")];
+
+        let result = check_inner_with(profile, &current, false, |_, _| {
+            Err("injected pin write failure".to_string())
+        });
+
+        let error = result.expect_err("a failed pin write cannot report a completed check");
+        assert!(error.contains("injected pin write failure"));
+        assert!(baselines(profile).is_empty(), "no false-success baseline was created");
+    }
+
+    #[test]
+    fn failed_pin_save_still_records_the_detected_security_event() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("pin-write-event-sbs714");
+        let profile = Some("sbs714-pin-write-event");
+        let original = vec![destructive_tool("srv__wipe", "Wipe records.")];
+        check(profile, &original).unwrap();
+        let original_fp = baselines(profile)["srv__wipe"].fingerprint.clone();
+        let changed = vec![destructive_tool("srv__wipe", "Wipe every record.")];
+
+        let result = check_inner_with(profile, &changed, false, |_, _| {
+            Err("injected pin write failure".to_string())
+        });
+
+        assert!(result.is_err(), "the failed baseline write must still propagate");
+        assert_eq!(
+            baselines(profile)["srv__wipe"].fingerprint,
+            original_fp,
+            "the failed write must not advance the durable baseline"
+        );
+        let log = std::fs::read_to_string(security_path().expect("security log path"))
+            .expect("drift event was written");
+        assert!(log.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|event| {
+                event.get("tool").and_then(Value::as_str) == Some("srv__wipe")
+                    && event.get("change").and_then(Value::as_str) == Some("changed")
+            })
+        }));
+    }
+
+    #[test]
+    fn failed_quarantine_write_does_not_consume_the_staged_drift_baseline() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("staged-baseline-sbs714");
+        let profile = Some("sbs714-staged-baseline");
+        let original = vec![destructive_tool("srv__wipe", "Wipe records.")];
+        check(profile, &original).unwrap();
+        let original_fp = baselines(profile)["srv__wipe"].fingerprint.clone();
+        let changed = vec![destructive_tool("srv__wipe", "Wipe every record.")];
+
+        let first_events = check_staged(profile, &changed).unwrap();
+        assert_eq!(baselines(profile)["srv__wipe"].fingerprint, original_fp);
+        assert!(
+            apply_quarantine_inner_with(profile, &changed, &first_events, |_, _| {
+                Err("injected quarantine failure".to_string())
+            })
+            .is_err()
+        );
+
+        let retry_events = check_staged(profile, &changed).unwrap();
+        assert!(
+            retry_events.iter().any(|event| {
+                event.get("tool").and_then(Value::as_str) == Some("srv__wipe")
+                    && event.get("change").and_then(Value::as_str) == Some("changed")
+            }),
+            "the old baseline must make the failed drift detectable again"
+        );
+        assert!(apply_quarantine(profile, &changed, &retry_events).unwrap());
+        accept_staged_pins(profile, &changed, &retry_events).unwrap();
+        assert_ne!(baselines(profile)["srv__wipe"].fingerprint, original_fp);
+        assert!(quarantined(profile).unwrap().contains("srv__wipe"));
+    }
+
+    #[test]
+    fn durable_quarantine_recovers_a_failed_pin_accept_without_the_filtered_catalog() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("staged-accept-recovery-sbs714");
+        let profile = Some("sbs714-staged-accept-recovery");
+        let original = vec![destructive_tool("srv__wipe", "Wipe records.")];
+        check(profile, &original).unwrap();
+        let original = match load_pins(profile) {
+            PinsLoad::Loaded(pins) => pins["srv__wipe"].clone(),
+            _ => panic!("original baseline must be readable"),
+        };
+        let changed = vec![destructive_tool("srv__wipe", "Wipe every record.")];
+        let events = check_staged(profile, &changed).unwrap();
+        assert!(apply_quarantine(profile, &changed, &events).unwrap());
+        assert!(
+            load_quarantine(profile).unwrap()["srv__wipe"]
+                .get("pending_pin")
+                .is_some(),
+            "ordinary quarantine must durably capture the definition before pin acceptance"
+        );
+
+        let error = accept_quarantined_pins_with(
+            profile,
+            |_, _| Err("injected pin acceptance failure".to_string()),
+            save_quarantine,
+        )
+        .expect_err("the injected pin failure must propagate");
+        assert!(error.contains("injected pin acceptance failure"));
+        assert_eq!(
+            baselines(profile)["srv__wipe"].fingerprint,
+            original.fp,
+            "failed acceptance leaves the old baseline durable"
+        );
+        assert!(
+            load_quarantine(profile).unwrap()["srv__wipe"]
+                .get("pending_pin")
+                .is_some(),
+            "failed acceptance must leave the durable retry marker intact"
+        );
+
+        // A restarted gateway sees a catalog with this tool filtered out. Recovery therefore
+        // receives no current tools or events and must use only the durable quarantine record.
+        accept_quarantined_pins(profile).unwrap();
+        let repaired = match load_pins(profile) {
+            PinsLoad::Loaded(pins) => pins["srv__wipe"].clone(),
+            _ => panic!("recovered baseline must be readable"),
+        };
+        assert_eq!(repaired.fp, pin_of(&changed[0]).fp);
+        assert_eq!(repaired.first_seen, original.first_seen);
+        assert!(
+            load_quarantine(profile).unwrap()["srv__wipe"]
+                .get("pending_pin")
+                .is_none(),
+            "the retry marker is cleared only after the pin becomes durable"
+        );
+
+        assert!(release(profile, "srv__wipe").unwrap());
+        assert!(
+            check_staged(profile, &changed).unwrap().is_empty(),
+            "one release must leave the recovered definition exposed without re-quarantining"
+        );
+    }
+
+    #[test]
+    fn release_repairs_an_ordinary_staged_pin_before_unblocking() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("staged-release-recovery-sbs714");
+        let profile = Some("sbs714-staged-release-recovery");
+        let original = vec![destructive_tool("srv__wipe", "Wipe records.")];
+        check(profile, &original).unwrap();
+        let first_seen = baselines(profile)["srv__wipe"].first_seen;
+        let changed = vec![destructive_tool("srv__wipe", "Wipe every record.")];
+        let events = check_staged(profile, &changed).unwrap();
+        assert!(apply_quarantine(profile, &changed, &events).unwrap());
+
+        // Simulate exiting after the quarantine write but before automatic staged acceptance.
+        assert!(release(profile, "srv__wipe").unwrap());
+        let repaired = &baselines(profile)["srv__wipe"];
+        assert_eq!(repaired.fingerprint, pin_of(&changed[0]).fp);
+        assert_eq!(repaired.first_seen, first_seen);
+        assert!(check_staged(profile, &changed).unwrap().is_empty());
     }
 
     #[test]
@@ -2073,7 +2689,7 @@ mod tests {
 
         let current = vec![destructive_tool("srv__wipe", "Wipe everything.")];
         let events = vec![event("srv", "srv__wipe", "changed", SEV_HIGH)];
-        assert!(apply_quarantine(profile, &current, &events));
+        assert!(apply_quarantine(profile, &current, &events).unwrap());
 
         QUARANTINE_READ_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
         let first = quarantined_checked(profile).expect("readable store");
@@ -2092,7 +2708,7 @@ mod tests {
             "unchanged mtime+len must skip the re-read"
         );
 
-        assert!(release(profile, "srv__wipe"));
+        assert!(release(profile, "srv__wipe").unwrap());
         let third = quarantined_checked(profile).expect("release rewrites the store");
         assert!(third.is_empty());
         assert_eq!(
@@ -2125,7 +2741,7 @@ mod tests {
 
         let current = vec![destructive_tool("srv__wipe", "Wipe everything.")];
         let events = vec![event("srv", "srv__wipe", "changed", SEV_HIGH)];
-        assert!(apply_quarantine(profile, &current, &events));
+        assert!(apply_quarantine(profile, &current, &events).unwrap());
         assert!(quarantined(profile)
             .expect("readable")
             .contains("srv__wipe"));
@@ -2145,11 +2761,11 @@ mod tests {
             "must not create a .corrupt sidecar that makes the next read look empty"
         );
         assert!(
-            !apply_quarantine(profile, &current, &events),
+            apply_quarantine(profile, &current, &events).is_err(),
             "apply must refuse to rewrite a corrupt store"
         );
         assert!(
-            !release(profile, "srv__wipe"),
+            release(profile, "srv__wipe").is_err(),
             "release must refuse to clear via a corrupt store"
         );
         // File still unreadable for enforcement.
@@ -2171,7 +2787,7 @@ mod tests {
         // it must never be quarantined (the block/confirm/approval gates cover the call).
         let events = vec![event("srv", "srv__delete_all", "added", SEV_HIGH)];
         assert!(
-            !apply_quarantine(profile, &current, &events),
+            !apply_quarantine(profile, &current, &events).unwrap(),
             "an added tool is never quarantined"
         );
         assert!(
@@ -2189,7 +2805,7 @@ mod tests {
             probe.to_string(),
             json!({ "tool": probe, "server": "srv", "change": "added" }),
         );
-        save_quarantine(profile, &legacy);
+        save_quarantine(profile, &legacy).unwrap();
         assert!(
             quarantined(profile)
                 .expect("store readable")
@@ -2200,11 +2816,12 @@ mod tests {
         // filter or the UI keeps showing tools the gateway no longer blocks (the bug the
         // user hit: dozens of first-sight destructive tools still listed as quarantined).
         assert!(
-            !all_quarantined_names().contains(probe),
+            !all_quarantined_names().unwrap().contains(probe),
             "legacy added entry is dropped from the cross-profile enforcement set"
         );
         assert!(
             !all_quarantined()
+                .unwrap()
                 .iter()
                 .any(|r| r.get("tool").and_then(Value::as_str) == Some(probe)),
             "legacy added entry is dropped from the cross-profile display list"
@@ -2259,14 +2876,14 @@ mod tests {
 
         // First check pins the tool: first_seen and last_changed are both set to now.
         let v1 = vec![tool("srv__a", "First.")];
-        check(profile, &v1);
+        check(profile, &v1).unwrap();
         let b1 = baselines(profile);
         let a1 = b1.get("srv__a").expect("tool should be pinned").clone();
         assert!(a1.first_seen > 0, "first_seen set on first pin");
         assert_eq!(a1.first_seen, a1.last_changed, "fresh pin: first_seen == last_changed");
 
         // Re-checking the SAME definition moves neither timestamp.
-        check(profile, &v1);
+        check(profile, &v1).unwrap();
         let a2 = baselines(profile)["srv__a"].clone();
         assert_eq!(a2.first_seen, a1.first_seen, "first_seen stable across checks");
         assert_eq!(a2.last_changed, a1.last_changed, "last_changed stable when unchanged");
@@ -2274,7 +2891,7 @@ mod tests {
         // Changing the definition advances last_changed but preserves first_seen.
         std::thread::sleep(std::time::Duration::from_millis(5));
         let v2 = vec![tool("srv__a", "Changed description.")];
-        check(profile, &v2);
+        check(profile, &v2).unwrap();
         let a3 = baselines(profile)["srv__a"].clone();
         assert_ne!(a3.fingerprint, a1.fingerprint, "fingerprint changed");
         assert_eq!(a3.first_seen, a1.first_seen, "first_seen unchanged on drift");
@@ -2334,7 +2951,7 @@ mod tests {
             tool("alpha__read", "Read records."),
             tool("beta__write", "Write records."),
         ];
-        let events = check(profile, &current);
+        let events = check(profile, &current).unwrap();
         assert!(baseline_tamper_detected(&events));
         assert_eq!(events.len(), 1, "drift checks freeze at the lost trust root");
         assert_eq!(
@@ -2343,7 +2960,7 @@ mod tests {
             "check must not replace the corrupt baseline with the live catalog"
         );
 
-        assert!(apply_quarantine(profile, &current, &events));
+        assert!(apply_quarantine(profile, &current, &events).unwrap());
         let blocked = quarantined(profile).expect("quarantine readable");
         assert_eq!(
             blocked,
@@ -2364,10 +2981,10 @@ mod tests {
             tool("alpha__read", "Read records with filters."),
             tool("beta__write", "Write records."),
         ];
-        let refreshed_events = check(profile, &refreshed);
-        assert!(apply_quarantine(profile, &refreshed, &refreshed_events));
+        let refreshed_events = check(profile, &refreshed).unwrap();
+        assert!(apply_quarantine(profile, &refreshed, &refreshed_events).unwrap());
 
-        assert!(release(profile, "alpha__read"));
+        assert!(release(profile, "alpha__read").unwrap());
         let PinsLoad::Loaded(repaired) = load_pins(profile) else {
             panic!("re-approval must establish a readable baseline")
         };
@@ -2383,6 +3000,85 @@ mod tests {
         let still_blocked = mandatory_quarantined(profile).unwrap();
         assert!(!still_blocked.contains("alpha__read"));
         assert!(still_blocked.contains("beta__write"));
+    }
+
+    #[test]
+    fn load_pins_fails_closed_when_a_legacy_file_was_not_migrated() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data_dir = TestDataDir::new("legacy-pins-unmigrated");
+        std::fs::write(data_dir.path.join("tool-pins-billing.json"), r#"{"x":{}}"#)
+            .unwrap();
+        assert!(
+            matches!(load_pins(Some("billing")), PinsLoad::Corrupt),
+            "a leftover name-slug pin file is not a first run"
+        );
+    }
+
+    #[test]
+    fn quarantine_reads_fail_closed_when_a_legacy_file_was_not_migrated() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data_dir = TestDataDir::new("legacy-quarantine-unmigrated");
+        let record = r#"{"srv__wipe":{"server":"srv","tool":"wipe","change":"tamper"}}"#;
+        std::fs::write(data_dir.path.join("quarantine-billing.json"), record).unwrap();
+        assert!(
+            load_quarantine(Some("billing")).is_err(),
+            "a leftover name-slug quarantine file is not a first run"
+        );
+        // The watcher's cached reads must also refuse: `Ok(empty)` would reconcile
+        // the router's live quarantine set down to nothing.
+        assert!(quarantined_checked(Some("billing")).is_err());
+        assert!(mandatory_quarantined_checked(Some("billing")).is_err());
+        // Once the v2 store exists the same reads recover.
+        let v2 = quarantine_path(Some("billing")).expect("data dir override is set");
+        std::fs::write(&v2, record).unwrap();
+        assert_eq!(quarantined_checked(Some("billing")).unwrap().len(), 1);
+        assert_eq!(mandatory_quarantined_checked(Some("billing")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cross_profile_quarantine_view_surfaces_a_registry_load_failure() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data_dir = TestDataDir::new("aggregate-corrupt-registry");
+        std::fs::write(data_dir.path.join("registry.json"), "{ corrupt registry").unwrap();
+        assert!(
+            all_quarantined().is_err(),
+            "a corrupt registry must not become an authoritative empty cross-profile view"
+        );
+    }
+
+    #[test]
+    fn corrupt_pins_upgrade_filtered_ordinary_quarantine_to_mandatory() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("corrupt-pins-filtered-quarantine-sbs714");
+        let profile = Some("corrupt-pins-filtered-quarantine");
+        let tool = destructive_tool("srv__wipe", "Wipe every record.");
+        let mut quarantine = Quarantine::new();
+        quarantine.insert(
+            "srv__wipe".to_string(),
+            json!({
+                "tool": "srv__wipe",
+                "change": "changed",
+                "pending_pin": pin_of(&tool),
+            }),
+        );
+        save_quarantine(profile, &quarantine).unwrap();
+        let path = pins_path(profile).expect("pin path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ corrupt baseline").unwrap();
+
+        // The existing ordinary quarantine means the live router supplies no current tool.
+        let events = check_staged(profile, &[]).unwrap();
+        assert!(baseline_tamper_detected(&events));
+        assert!(apply_quarantine(profile, &[], &events).unwrap());
+        assert_eq!(
+            mandatory_quarantined(profile).unwrap(),
+            BTreeSet::from(["srv__wipe".to_string()]),
+            "baseline loss must make a previously filtered ordinary block mandatory"
+        );
+        assert_eq!(load_quarantine(profile).unwrap()["srv__wipe"]["change"], "tamper");
+
+        assert!(release(profile, "srv__wipe").unwrap());
+        assert_eq!(baselines(profile)["srv__wipe"].fingerprint, pin_of(&tool).fp);
     }
 
     #[test]
@@ -3054,7 +3750,7 @@ mod tests {
         };
         let new = pin_of(&current[0]);
         let events = vec![changed_event("db", "db__query", SEV_HIGH, &old, &new)];
-        assert!(apply_quarantine(profile, &current, &events));
+        assert!(apply_quarantine(profile, &current, &events).unwrap());
         assert!(quarantined(profile)
             .expect("store readable")
             .contains("db__query"));
@@ -3072,9 +3768,9 @@ mod tests {
         );
 
         // A benign (info) change to the same tool would NOT quarantine.
-        assert!(release(profile, "db__query"));
+        assert!(release(profile, "db__query").unwrap());
         let benign = vec![event("db", "db__query", "changed", SEV_INFO)];
-        assert!(!apply_quarantine(profile, &current, &benign));
+        assert!(!apply_quarantine(profile, &current, &benign).unwrap());
 
         if let Some(p) = quarantine_path(profile) {
             let _ = std::fs::remove_file(p);

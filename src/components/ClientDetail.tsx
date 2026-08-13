@@ -115,8 +115,13 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   // profile). Keep the picker in sync with it as the selected client changes.
   const currentScope = registry?.clientScopes?.[client.id] ?? "";
   useEffect(() => {
-    setProfile(currentScope);
-  }, [currentScope, client.id]);
+    if (!currentScope) {
+      setProfile("");
+      return;
+    }
+    const match = profiles.find((p) => p.id === currentScope || p.name === currentScope);
+    setProfile(match?.id ?? currentScope);
+  }, [currentScope, client.id, registry?.profiles]);
   useEffect(() => {
     setTransport(managedTransport);
   }, [managedTransport, client.id]);
@@ -179,9 +184,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
 
   /** How many servers a given scope ("" = active profile, else a named profile)
    * resolves to, for the "scoped to X · N servers" summary. */
-  function scopeServerCount(scopeName: string): number {
-    const target = scopeName
-      ? profiles.find((p) => p.name.toLowerCase() === scopeName.toLowerCase())
+  function scopeServerCount(scopeRef: string): number {
+    const target = scopeRef
+      ? profiles.find(
+          (p) => p.id === scopeRef || p.name.toLowerCase() === scopeRef.toLowerCase(),
+        )
       : (profiles.find((p) => p.id === registry?.activeProfileId) ?? profiles[0]);
     if (!target) return 0;
     // Exclude Toolport's own gateway entry so the count matches the Servers list (which
@@ -194,9 +201,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
 
   /** The actual servers a scope resolves to, so a connected client shows WHAT it can
    * reach, not just a count. */
-  function scopeServers(scopeName: string): { id: string; name: string }[] {
-    const target = scopeName
-      ? profiles.find((p) => p.name.toLowerCase() === scopeName.toLowerCase())
+  function scopeServers(scopeRef: string): { id: string; name: string }[] {
+    const target = scopeRef
+      ? profiles.find(
+          (p) => p.id === scopeRef || p.name.toLowerCase() === scopeRef.toLowerCase(),
+        )
       : (profiles.find((p) => p.id === registry?.activeProfileId) ?? profiles[0]);
     if (!target) return [];
     const enabled = new Set(target.enabledServerIds);
@@ -220,9 +229,10 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       await installGateway(client.id, profile || undefined, false, transport);
       // Rescope rewrites the client's MCP config the same way Connect does; without a
       // restart hint the change is invisible until the next cold start (SOU-317).
+      const scopeName = profiles.find((p) => p.id === profile)?.name ?? profile;
       toast.success(
         profile
-          ? `${client.name} scoped to "${profile}".`
+          ? `${client.name} scoped to "${scopeName}".`
           : `${client.name} now follows the active profile.`,
         { description: clientRestartHint(client.name, client.id) },
       );
@@ -407,7 +417,9 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               transport === "sharedHttp"
                 ? "Uses the shared HTTP bridge (one gateway process)."
                 : null,
-              profile ? `Scoped to the "${profile}" profile.` : null,
+              profile
+                ? `Scoped to the "${profiles.find((p) => p.id === profile)?.name ?? profile}" profile.`
+                : null,
               !profile && outcome.backup ? "Previous config backed up." : null,
             ],
             client.id,
@@ -507,7 +519,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               <SelectContent>
                 <SelectItem value="__all__">Follow active profile</SelectItem>
                 {profiles.map((p) => (
-                  <SelectItem key={p.id} value={p.name}>
+                  <SelectItem key={p.id} value={p.id}>
                     Only: {p.name}
                   </SelectItem>
                 ))}
@@ -856,7 +868,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                   <SelectContent>
                     <SelectItem value="__all__">Follow active profile</SelectItem>
                     {profiles.map((p) => (
-                      <SelectItem key={p.id} value={p.name}>
+                      <SelectItem key={p.id} value={p.id}>
                         Only: {p.name}
                       </SelectItem>
                     ))}

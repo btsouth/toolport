@@ -73,6 +73,14 @@ export interface AuditEntry {
   /** The registered HTTP client that made the call, when known. Absent for the
    * local desktop client and legacy/open tokens. */
   client?: string;
+  /** How many values this call's result had pseudonymized. Absent when PII redaction was
+   * off for the call — which is deliberately distinct from `0` ("it ran, found nothing").
+   * A count only; the values themselves never enter the audit log. */
+  piiReplaced?: number;
+  /** Present (and always `true`) when the pass left values in the clear: the session map
+   * hit its cap, or the result exceeded the scan cap. Pseudonymization fails OPEN by
+   * design, so this is the case the row most needs to show. */
+  piiIncomplete?: boolean;
 }
 
 /** One live-inspection capture: a tool call's request args and response, plus timing.
@@ -368,7 +376,8 @@ export interface PendingApproval {
     | "destructive"
     | "untrusted_source"
     | "destructive_and_untrusted"
-    | "persistent_code_write";
+    | "persistent_code_write"
+    | "pii_cross_server";
   arguments: unknown;
   /** A screened URL-mode elicitation brokered by the desktop because the MCP host
    * did not declare URL elicitation support. */
@@ -376,6 +385,16 @@ export interface PendingApproval {
     url: string;
     origin: string;
     message: string;
+  } | null;
+  /** Pseudonymized values this call would send to a server that never produced them.
+   * Present only for `reason: "pii_cross_server"`.
+   *
+   * `value` is REAL, un-pseudonymized PII. It reaches this window and nowhere else —
+   * a person cannot judge the release without seeing what is being released. It must
+   * never be logged, persisted, or echoed anywhere the model can read. */
+  piiRelease?: {
+    server: string;
+    values: { token: string; value: string; origins: string[] }[];
   } | null;
   /** Wall-clock epoch-ms when this call auto-denies; the overlay counts down to it. */
   deadlineMs: number;

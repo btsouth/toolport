@@ -85,6 +85,22 @@ fn sweep(map: &mut HashMap<String, Cached>) {
     map.retain(|_, c| c.at.elapsed() < CACHE_TTL);
 }
 
+/// Bound memory: evict oldest until the entry count and total bytes leave room for
+/// a `new_entry_size`-byte result (or the cache empties, keeping one over-cap
+/// result). Each entry's `size` is precomputed, so this sum is O(n) adds, not O(n)
+/// JSON re-serializations, on every iteration.
+fn evict_to_fit(map: &mut HashMap<String, Cached>, new_entry_size: usize) {
+    while !map.is_empty()
+        && (map.len() >= MAX_CACHE_ENTRIES
+            || map.values().map(|c| c.size).sum::<usize>() + new_entry_size > MAX_CACHE_BYTES)
+    {
+        let Some(oldest) = map.iter().min_by_key(|(_, c)| c.at).map(|(k, _)| k.clone()) else {
+            break;
+        };
+        map.remove(&oldest);
+    }
+}
+
 /// Concatenate the model-facing text of an MCP tool result's content blocks, then
 /// fold in `structuredContent` so nothing is lost when the structured payload is
 /// the bloat.
@@ -171,6 +187,18 @@ fn is_text_representable(result: &Value) -> bool {
 /// A `budget` of 0 disables shaping. Lossless: the full body stays fetchable via
 /// [`fetch_result`].
 pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> bool {
+    shape_result_preserving_prefix(result, budget, owner, 0)
+}
+
+/// Shape a result while retaining at least `min_head_bytes` from the start of
+/// its text projection. If the protected prefix and marker cannot fit, leave the
+/// result whole instead of silently truncating recovery-critical data.
+pub fn shape_result_preserving_prefix(
+    result: &mut Value,
+    budget: usize,
+    owner: Option<&str>,
+    min_head_bytes: usize,
+) -> bool {
     if budget == 0 {
         return false;
     }
@@ -217,7 +245,10 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
     // floor won whenever `budget - reserve - preserved` fell below it. The final
     // fit-check below is what actually enforces the contract; this is only the
     // starting estimate.
-    let mut head_byte_limit = budget.saturating_sub(512 + preserved_bytes);
+    let min_head_bytes = min_head_bytes.min(body.len());
+    let mut head_byte_limit = budget
+        .saturating_sub(512 + preserved_bytes)
+        .max(min_head_bytes);
     let head = head_within_bytes(&body, head_byte_limit).to_string();
     let is_error = result
         .get("isError")
@@ -272,7 +303,9 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
             break;
         }
         let overage = shaped_size - budget;
-        head_byte_limit = head_byte_limit.saturating_sub(overage.max(1));
+        head_byte_limit = head_byte_limit
+            .saturating_sub(overage.max(1))
+            .max(min_head_bytes);
         head = head_within_bytes(&body, head_byte_limit).to_string();
         shaped = build(&head);
     }
@@ -292,19 +325,7 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
         let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
         sweep(&mut map);
 
-        // Bound memory: evict oldest until the entry count and total bytes leave
-        // room for this cached result (or the cache empties, keeping one over-cap
-        // result). Each entry's `size` is precomputed, so this sum is O(n) adds, not
-        // O(n) JSON re-serializations, on every iteration.
-        while !map.is_empty()
-            && (map.len() >= MAX_CACHE_ENTRIES
-                || map.values().map(|c| c.size).sum::<usize>() + new_entry_size > MAX_CACHE_BYTES)
-        {
-            let Some(oldest) = map.iter().min_by_key(|(_, c)| c.at).map(|(k, _)| k.clone()) else {
-                break;
-            };
-            map.remove(&oldest);
-        }
+        evict_to_fit(&mut map, new_entry_size);
 
         map.insert(
             cursor.clone(),
@@ -847,6 +868,124 @@ mod tests {
             "cache grew to {} entries",
             map.len()
         );
+    }
+
+    // A cache entry with a given recorded `size` and age, without allocating a body
+    // of that size: the eviction loop reads `Cached.size`, never the body itself, so
+    // multi-megabyte entries cost a few bytes here. `secs_ago` fixes the insertion
+    // order deterministically rather than relying on clock resolution between calls.
+    fn cached_entry(size: usize, secs_ago: u64) -> Cached {
+        Cached {
+            body: String::new(),
+            structured: None,
+            size,
+            at: Instant::now() - Duration::from_secs(secs_ago),
+            owner: None,
+        }
+    }
+
+    #[test]
+    fn cache_byte_cap_evicts_oldest_first() {
+        // The ENTRY cap is covered by `cache_is_bounded`; this is the BYTE cap, which
+        // a burst of a few huge results hits long before 64 entries. Sizes are
+        // recorded, not allocated, so the 64 MiB path costs nothing to exercise.
+        // Three of these sum to 72 MiB, past the 64 MiB cap; dropping the oldest
+        // leaves 48 MiB, so exactly one eviction is required for a 1 MiB arrival.
+        const HUGE: usize = 24 * 1024 * 1024;
+        let mut map: HashMap<String, Cached> = HashMap::new();
+        map.insert("oldest".to_string(), cached_entry(HUGE, 60));
+        map.insert("middle".to_string(), cached_entry(HUGE, 40));
+        map.insert("newest".to_string(), cached_entry(HUGE, 20));
+        assert!(map.len() < MAX_CACHE_ENTRIES, "must exercise the byte cap, not the entry cap");
+
+        let new_entry_size = 1024 * 1024;
+        evict_to_fit(&mut map, new_entry_size);
+        map.insert("incoming".to_string(), cached_entry(new_entry_size, 0));
+
+        let total: usize = map.values().map(|c| c.size).sum();
+        assert!(
+            total <= MAX_CACHE_BYTES,
+            "cached bytes grew to {total}, past the {MAX_CACHE_BYTES} cap"
+        );
+        // Oldest-by-insertion-time goes first, and only as far as needed.
+        assert!(!map.contains_key("oldest"), "the oldest entry must be evicted first");
+        assert!(map.contains_key("middle"), "eviction must stop once the new body fits");
+        assert!(map.contains_key("newest"));
+        assert!(map.contains_key("incoming"));
+    }
+
+    #[test]
+    fn cache_keeps_one_over_cap_body_rather_than_dropping_it() {
+        // Documented behaviour (see MAX_CACHE_BYTES): evict until it fits OR the
+        // cache is empty, so a single body larger than the cap is still retained
+        // rather than dropping the result the caller just produced.
+        let mut map: HashMap<String, Cached> = HashMap::new();
+        map.insert("stale".to_string(), cached_entry(1024, 60));
+
+        evict_to_fit(&mut map, MAX_CACHE_BYTES + 1);
+        assert!(map.is_empty(), "everything older must be evicted to make room");
+
+        // Eviction stops at an empty cache, so the caller's own over-cap result is
+        // still inserted rather than discarded. It is over the cap by construction;
+        // the next oversized call is what evicts it.
+        map.insert("incoming".to_string(), cached_entry(MAX_CACHE_BYTES + 1, 0));
+        assert!(
+            map.contains_key("incoming"),
+            "an over-cap body is kept, not dropped, when it is the only entry"
+        );
+        let mut map2 = map;
+        evict_to_fit(&mut map2, 1);
+        assert!(
+            map2.is_empty(),
+            "the retained over-cap entry must be evicted by the next arrival"
+        );
+    }
+
+    #[test]
+    fn cached_size_records_body_plus_structured_bytes() {
+        // The eviction loop trusts `Cached.size` instead of re-serializing, so a
+        // size recorded as 0 (or body-only) would silently disable the byte cap.
+        let structured = json!({ "rows": ["y".repeat(3_000)] });
+        let mut r = json!({
+            "content": [{ "type": "text", "text": "x".repeat(5_000) }],
+            "structuredContent": structured,
+            "isError": false
+        });
+        assert!(shape_result(&mut r, 2048, None));
+        let cursor = cursor_of(&r);
+
+        let map = cache().lock().unwrap_or_else(|e| e.into_inner());
+        let entry = map.get(&cursor).expect("the shaped result is cached under its cursor");
+        assert_eq!(
+            entry.size,
+            entry.body.len() + entry.structured.as_ref().map(value_size).unwrap_or(0),
+            "recorded size must cover the body and the stashed structuredContent"
+        );
+        assert!(entry.size >= 8_000, "recorded size was {}", entry.size);
+    }
+
+    #[test]
+    fn shaping_preserves_is_error_on_oversized_failures() {
+        // A failure big enough to shape is still a failure. Dropping `isError` here
+        // would turn a downstream error into an apparent success for the model, and
+        // the marker must survive too so the failure detail stays pageable.
+        let mut r = json!({
+            "content": [{ "type": "text", "text": "boom: ".to_string() + &"e".repeat(10_000) }],
+            "isError": true
+        });
+        assert!(shape_result(&mut r, 2048, None));
+
+        // The JSON value itself, so a dropped or nulled field fails rather than
+        // silently reading as "not true".
+        assert_eq!(
+            r["isError"],
+            json!(true),
+            "shaped failure lost its isError flag: {}",
+            r
+        );
+        let text = r["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Toolport shaped this result"));
+        assert!(text.contains("\"cursor\":\"r"), "the failure must stay pageable");
     }
 
     #[test]

@@ -36,6 +36,10 @@ use crate::vendors;
 
 type RegistryState = Mutex<Registry>;
 
+struct TrayMenuState {
+    pending_approvals: MenuItem<tauri::Wry>,
+}
+
 const OAUTH_LOCK_LEASE_SECS: u64 = 180;
 const OAUTH_LOCK_WAIT_SECS: u64 = 30;
 const OAUTH_LOCK_POLL_MS: u64 = 250;
@@ -43,6 +47,16 @@ const OAUTH_LOCK_POLL_MS: u64 = 250;
 struct OAuthFlowLock {
     path: std::path::PathBuf,
     attempt_id: String,
+}
+
+struct AuthMutationLock {
+    path: std::path::PathBuf,
+}
+
+impl Drop for AuthMutationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl Drop for OAuthFlowLock {
@@ -191,6 +205,78 @@ fn oauth_lock_path(server_id: &str, url: &str) -> Result<std::path::PathBuf, Str
     Ok(locks.join(format!("{}.lock", oauth_lock_key(server_id, url))))
 }
 
+fn auth_mutation_lock_path(server_id: &str) -> Result<std::path::PathBuf, String> {
+    let dir = registry::conduit_dir().ok_or("could not resolve the data directory")?;
+    let locks = dir.join("oauth-locks");
+    std::fs::create_dir_all(&locks)
+        .map_err(|e| format!("could not create oauth lock directory: {e}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(server_id.as_bytes());
+    Ok(locks.join(format!("auth-write-{:x}.lock", hasher.finalize())))
+}
+
+fn try_acquire_auth_mutation_lock(
+    path: &std::path::Path,
+) -> Result<Option<AuthMutationLock>, String> {
+    let mutation_id = oauth_attempt_id();
+    let contents = format!(
+        "mutation_id={mutation_id}\npid={}\nstarted={}\nlease_secs={}\n",
+        std::process::id(),
+        now_unix_secs(),
+        OAUTH_LOCK_LEASE_SECS
+    );
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(contents.as_bytes())
+                .map_err(|e| format!("could not write auth mutation lock file: {e}"))?;
+            Ok(Some(AuthMutationLock {
+                path: path.to_path_buf(),
+            }))
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            let Some(observed) = read_oauth_lock_snapshot(path)? else {
+                return Ok(None);
+            };
+            if lock_snapshot_is_expired(&observed)
+                && try_replace_stale_lock(
+                    path,
+                    &observed,
+                    &contents,
+                    &mutation_id,
+                )?
+            {
+                return Ok(Some(AuthMutationLock {
+                    path: path.to_path_buf(),
+                }));
+            }
+            Ok(None)
+        }
+        Err(e) => Err(format!("could not create auth mutation lock file: {e}")),
+    }
+}
+
+fn acquire_auth_mutation_lock(server_id: &str) -> Result<AuthMutationLock, String> {
+    let path = auth_mutation_lock_path(server_id)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(OAUTH_LOCK_WAIT_SECS);
+    loop {
+        if let Some(lock) = try_acquire_auth_mutation_lock(&path)? {
+            return Ok(lock);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                "another Toolport process is updating credentials for this server; timed out waiting for it to finish"
+                    .to_string(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(OAUTH_LOCK_POLL_MS));
+    }
+}
+
 fn try_acquire_oauth_lock(path: &std::path::Path) -> Result<Option<OAuthFlowLock>, String> {
     let attempt_id = oauth_attempt_id();
     let contents = oauth_lock_contents(&attempt_id);
@@ -270,6 +356,69 @@ struct HttpBridge {
     token: Option<String>,
 }
 type HttpBridgeState = Mutex<HttpBridge>;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateHttpBridgeIntent {
+    port: u16,
+    token: String,
+}
+
+fn update_http_bridge_intent_path() -> Option<std::path::PathBuf> {
+    registry::resolved_path()?
+        .parent()
+        .map(|dir| dir.join("http-bridge-update-resume.json"))
+}
+
+fn save_update_http_bridge_intent(intent: &UpdateHttpBridgeIntent) -> Result<(), String> {
+    let path = update_http_bridge_intent_path()
+        .ok_or_else(|| "could not resolve the HTTP bridge update state path".to_string())?;
+    save_update_http_bridge_intent_to(&path, intent)
+}
+
+fn save_update_http_bridge_intent_to(
+    path: &std::path::Path,
+    intent: &UpdateHttpBridgeIntent,
+) -> Result<(), String> {
+    let json = serde_json::to_string(intent).map_err(|error| error.to_string())?;
+    registry::atomic_write(path, &json)
+}
+
+fn load_update_http_bridge_intent() -> Result<Option<UpdateHttpBridgeIntent>, String> {
+    let Some(path) = update_http_bridge_intent_path() else {
+        return Ok(None);
+    };
+    load_update_http_bridge_intent_from(&path)
+}
+
+fn load_update_http_bridge_intent_from(
+    path: &std::path::Path,
+) -> Result<Option<UpdateHttpBridgeIntent>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).map(Some).map_err(|error| {
+            format!("could not read the HTTP bridge update state: {error}")
+        }),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("could not read the HTTP bridge update state: {error}")),
+    }
+}
+
+fn clear_update_http_bridge_intent() -> Result<(), String> {
+    let Some(path) = update_http_bridge_intent_path() else {
+        return Ok(());
+    };
+    clear_update_http_bridge_intent_at(&path)
+}
+
+fn clear_update_http_bridge_intent_at(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not clear the HTTP bridge update state: {error}"
+        )),
+    }
+}
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1153,7 +1302,7 @@ fn set_client_credentials(
     // require re-entering the credential. Resolve it here but do not write yet.
     let secret_to_store = supplied_secret(client_secret);
     if secret_to_store.is_none()
-        && secrets::get_secret(&server_id, secrets::CLIENT_SECRET_KEY).is_none()
+        && secrets::get_secret_result(&server_id, secrets::CLIENT_SECRET_KEY)?.is_none()
     {
         return Err("no client secret is stored for this server yet; enter one".into());
     }
@@ -1226,8 +1375,8 @@ fn clear_client_credentials(
 /// Whether a client secret is vaulted for this server, so the UI can show
 /// "configured" without ever reading the value back.
 #[tauri::command]
-fn has_client_secret(server_id: String) -> bool {
-    secrets::get_secret(&server_id, secrets::CLIENT_SECRET_KEY).is_some()
+fn has_client_secret(server_id: String) -> Result<bool, String> {
+    Ok(secrets::get_secret_result(&server_id, secrets::CLIENT_SECRET_KEY)?.is_some())
 }
 
 /// The most recent tool-call audit entries (newest first).
@@ -2037,22 +2186,18 @@ fn build_tool_identities(
 /// pins by the CONDUIT_PROFILE it ran under (often None -> tool-pins.json), which need
 /// not equal the app's active profile. Empty until the gateway has pinned a baseline.
 #[tauri::command]
-fn list_tool_identities(state: State<RegistryState>) -> Vec<ToolIdentity> {
+fn list_tool_identities(state: State<RegistryState>) -> Result<Vec<ToolIdentity>, String> {
     let reg = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut ids = build_tool_identities(
-        &integrity::all_baselines(),
-        &integrity::all_quarantined_names(),
+        &integrity::all_baselines()?,
+        &integrity::all_quarantined_names()?,
         &reg.servers,
         &reg.profiles,
     );
-    ids.sort_by(|a, b| {
-        b.last_changed
-            .cmp(&a.last_changed)
-            .then(a.alias.cmp(&b.alias))
-    });
-    ids
+    ids.sort_by(|a, b| b.last_changed.cmp(&a.last_changed).then(a.alias.cmp(&b.alias)));
+    Ok(ids)
 }
 
 /// Toggle quarantine-on-drift. When enabled, the gateway hides and blocks a high-risk
@@ -2098,10 +2243,10 @@ fn set_pii_redaction(state: State<RegistryState>, on: bool) -> Result<Registry, 
 /// running" path. First call only seeds the seen-set so restarting the app with an
 /// already-quarantined tool does not re-notify.
 #[tauri::command]
-fn list_quarantined(app: AppHandle) -> Vec<serde_json::Value> {
-    let list = integrity::all_quarantined();
+fn list_quarantined(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    let list = integrity::all_quarantined()?;
     notify_new_quarantines(&app, &list);
-    list
+    Ok(list)
 }
 
 /// Keys of quarantine entries we have already observed this process. `None` = not
@@ -2183,7 +2328,9 @@ fn release_quarantine(
     } else {
         Some(profile.as_str())
     };
-    if !integrity::release(prof, &tool) {
+    if !integrity::release(prof, &tool)
+        .map_err(|e| format!("Could not re-approve {tool}: {e}"))?
+    {
         // Idempotent across app/gateway instances: another process may have released the
         // same tool after this UI last polled. Only report failure when the persisted store
         // still says it is blocked (or cannot be read), which also preserves the useful
@@ -2658,6 +2805,7 @@ fn set_auth_token(
     server_id: String,
     token: String,
 ) -> Result<(), String> {
+    let _mutation = acquire_auth_mutation_lock(&server_id)?;
     // A manually pasted bearer replaces any prior OAuth session. Keeping stale
     // refresh metadata could otherwise overwrite the user's token later.
     remote::clear_oauth_state(&server_id)?;
@@ -2668,6 +2816,7 @@ fn set_auth_token(
 
 #[tauri::command]
 fn clear_auth_token(state: State<RegistryState>, server_id: String) -> Result<(), String> {
+    let _mutation = acquire_auth_mutation_lock(&server_id)?;
     // Remove refresh metadata first so a second-write failure cannot leave state
     // that silently recreates the bearer token the user asked to delete.
     remote::clear_oauth_state(&server_id)?;
@@ -2707,7 +2856,10 @@ async fn authenticate_oauth(
     let res = tauri::async_runtime::spawn_blocking(move || oauth::authenticate(&url))
         .await
         .map_err(|e| e.to_string())??;
-    secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &res.access_token)?;
+    let _mutation = acquire_auth_mutation_lock(&server_id)?;
+    // Persist refresh metadata first. If the access-token write then fails, the
+    // next refresh still has the new state and can recover; the reverse order can
+    // strand a new access token beside an invalidated old refresh token.
     remote::store_oauth_state(
         &server_id,
         Some(res.issuer),
@@ -2719,6 +2871,7 @@ async fn authenticate_oauth(
         res.issued_at,
         res.expires_at,
     )?;
+    secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &res.access_token)?;
     bump_secrets_generation(state.inner());
     Ok(())
 }
@@ -2784,14 +2937,14 @@ fn export_config(
     state: State<RegistryState>,
     name: Option<String>,
     description: Option<String>,
-    server_names: Option<Vec<String>>,
+    server_ids: Option<Vec<String>>,
 ) -> Result<String, String> {
     let reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     serde_json::to_string_pretty(&build_export(
         &reg,
         name.as_deref(),
         description.as_deref(),
-        server_names.as_deref(),
+        server_ids.as_deref(),
     ))
     .map_err(|e| e.to_string())
 }
@@ -2804,7 +2957,7 @@ fn export_config_to_path(
     path: String,
     name: Option<String>,
     description: Option<String>,
-    server_names: Option<Vec<String>>,
+    server_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
     let json = {
         let reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2812,7 +2965,7 @@ fn export_config_to_path(
             &reg,
             name.as_deref(),
             description.as_deref(),
-            server_names.as_deref(),
+            server_ids.as_deref(),
         ))
         .map_err(|e| e.to_string())?
     };
@@ -2868,6 +3021,40 @@ async fn share_stack(setup_json: String) -> Result<String, String> {
 /// that arrived before the UI was ready (cold start). The frontend claims it on mount.
 type PendingShare = Mutex<Option<String>>;
 
+/// Remembers an approvals tray request that arrived before the frontend listener.
+#[derive(Default)]
+struct PendingTrayApprovals(Mutex<TrayApprovalsDelivery>);
+
+#[derive(Default)]
+struct TrayApprovalsDelivery {
+    frontend_ready: bool,
+    pending: bool,
+}
+
+/// Queue a request until the frontend is ready, or tell the caller it is safe
+/// to emit live. The decision and state change are atomic with the readiness claim.
+fn should_emit_tray_approvals(state: &PendingTrayApprovals) -> bool {
+    let mut delivery = state
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if delivery.frontend_ready {
+        true
+    } else {
+        delivery.pending = true;
+        false
+    }
+}
+
+fn claim_pending_tray_approvals(state: &PendingTrayApprovals) -> bool {
+    let mut delivery = state
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    delivery.frontend_ready = true;
+    std::mem::take(&mut delivery.pending)
+}
+
 /// Parse a `toolport://import?s=<id>` (or legacy `conduit://…`) deep link into its
 /// share id. Tolerates an optional trailing slash after the host; the id must look
 /// like a share id.
@@ -2922,16 +3109,21 @@ fn take_pending_shared(state: State<PendingShare>) -> Option<String> {
         .take()
 }
 
+/// Claim an approvals tray request captured before the UI was listening.
+#[tauri::command]
+fn take_pending_tray_approvals(state: State<PendingTrayApprovals>) -> bool {
+    claim_pending_tray_approvals(state.inner())
+}
+
 /// Deliver a shared-stack id from a deep link to the UI: stash it so a cold start
-/// can claim it on mount, focus the window, and emit the live event for a running
-/// app. Idempotent enough that delivering the same id twice just re-opens it.
+/// can claim it on mount, reveal the window from every tray/minimized state, and
+/// emit the live event for a running app. Idempotent enough that delivering the
+/// same id twice just re-opens it.
 fn deliver_shared_import(handle: &tauri::AppHandle, id: String) {
     if let Some(st) = handle.try_state::<PendingShare>() {
         *st.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.clone());
     }
-    if let Some(w) = handle.get_webview_window("main") {
-        let _ = w.set_focus();
-    }
+    show_main_window(handle);
     let _ = handle.emit("import-shared", id);
 }
 
@@ -3042,12 +3234,12 @@ fn build_export(
     reg: &Registry,
     name: Option<&str>,
     description: Option<&str>,
-    server_names: Option<&[String]>,
+    server_ids: Option<&[String]>,
 ) -> serde_json::Value {
-    // When a selection is given, share only those servers (by name); otherwise
+    // When a selection is given, share only those servers (by stable id); otherwise
     // share them all. Lets a user share a focused "stack" instead of everything.
     let include: Option<std::collections::HashSet<&str>> =
-        server_names.map(|names| names.iter().map(String::as_str).collect());
+        server_ids.map(|ids| ids.iter().map(String::as_str).collect());
     let servers: Vec<ServerEntry> = reg
         .servers
         .iter()
@@ -3055,7 +3247,7 @@ fn build_export(
         .filter(|s| {
             include
                 .as_ref()
-                .map(|set| set.contains(s.name.as_str()))
+                .map(|set| set.contains(s.id.as_str()))
                 .unwrap_or(true)
         })
         .map(|s| {
@@ -3174,9 +3366,153 @@ fn http_bridge_alive(bridge: &mut HttpBridge) -> bool {
 
 /// Stop client-spawned gateway processes before an in-app update (all platforms).
 /// MCP clients stay open; only `toolport-gateway` / `conduit-gateway` children exit.
+///
+/// The supervised HTTP endpoint is the one gateway Toolport can recreate itself.
+/// Capture its port before reaping so a failed install can explicitly recover it;
+/// client-owned stdio gateways must be recreated by their owning applications.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateShutdownReport {
+    #[serde(flatten)]
+    reaper: crate::gateway_publish::ReapReport,
+    http_bridge_port: Option<u16>,
+    /// Failures managing Toolport's owned HTTP child or its durable recovery
+    /// marker. Kept separate from `ReapReport::failed`, whose entries are
+    /// external process labels and drive different user guidance.
+    lifecycle_errors: Vec<String>,
+}
+
 #[tauri::command]
-fn stop_spawned_gateways() -> u32 {
-    crate::gateway_publish::stop_spawned_gateways()
+fn stop_spawned_gateways(bridge: State<HttpBridgeState>) -> UpdateShutdownReport {
+    enum OwnedBridgeStop {
+        Absent,
+        Stopped(u16),
+        FailedWithIntent { port: u16, error: String },
+        FailedBeforeIntent(String),
+    }
+
+    let owned_bridge = {
+        let mut bridge = bridge
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if http_bridge_alive(&mut bridge) {
+            match (bridge.port, bridge.token.clone()) {
+                (Some(port), Some(token)) => {
+                    let intent = UpdateHttpBridgeIntent { port, token };
+                    match save_update_http_bridge_intent(&intent) {
+                        Ok(()) => {
+                            let mut child = bridge.child.take().expect("live bridge has a child");
+                            let stopped = match child.kill() {
+                                Ok(()) => child.wait().map(|_| ()),
+                                Err(kill_error) => match child.try_wait() {
+                                    Ok(Some(_)) => Ok(()),
+                                    Ok(None) => Err(kill_error),
+                                    Err(wait_error) => Err(wait_error),
+                                },
+                            };
+                            match stopped {
+                                Ok(()) => {
+                                    bridge.port = None;
+                                    bridge.token = None;
+                                    OwnedBridgeStop::Stopped(port)
+                                }
+                                Err(error) => {
+                                    bridge.child = Some(child);
+                                    OwnedBridgeStop::FailedWithIntent {
+                                        port,
+                                        error: format!(
+                                            "Toolport HTTP endpoint on port {port}: {error}"
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => OwnedBridgeStop::FailedBeforeIntent(error),
+                    }
+                }
+                _ => OwnedBridgeStop::FailedBeforeIntent(
+                    "live HTTP endpoint is missing its port or token".to_string(),
+                ),
+            }
+        } else {
+            OwnedBridgeStop::Absent
+        }
+    };
+
+    // Never launch the kill-all pass when Toolport could not first persist the
+    // exact recovery identity for its owned endpoint. The global enumerator can
+    // see and kill that child too; proceeding would destroy connectivity without
+    // a trustworthy port/token from which to recover it.
+    if let OwnedBridgeStop::FailedBeforeIntent(error) = &owned_bridge {
+        return UpdateShutdownReport {
+            reaper: crate::gateway_publish::ReapReport {
+                ..Default::default()
+            },
+            http_bridge_port: None,
+            lifecycle_errors: vec![error.clone()],
+        };
+    }
+
+    let reaper = crate::gateway_publish::stop_spawned_gateways();
+    let mut lifecycle_errors = Vec::new();
+    let http_bridge_port = match owned_bridge {
+        OwnedBridgeStop::Absent => None,
+        OwnedBridgeStop::Stopped(port) => Some(port),
+        OwnedBridgeStop::FailedWithIntent { port, error } => {
+            lifecycle_errors.push(error);
+            // The durable intent was written before touching the owned child.
+            // Keep it on a partial shutdown failure: the global reaper may still
+            // stop that process, and recovery must then restore the exact port
+            // and bearer token. If it stayed live, recovery verifies the same
+            // endpoint and can safely clear the intent.
+            Some(port)
+        }
+        OwnedBridgeStop::FailedBeforeIntent(_) => unreachable!("returned before global reaper"),
+    };
+    UpdateShutdownReport {
+        reaper,
+        http_bridge_port,
+        lifecycle_errors,
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateRecoveryReport {
+    /// True only when an HTTP endpoint existed before shutdown and is available
+    /// again. External stdio clients are deliberately not represented as restored.
+    http_bridge_recovered: bool,
+    /// Endpoint availability and marker cleanup are separate facts. A failed
+    /// delete must not turn a verified live endpoint into a false "not restored"
+    /// message, but the retained marker still needs to be surfaced.
+    cleanup_warning: Option<String>,
+}
+
+/// Restore the transport Toolport owns after an update aborts. External clients
+/// own their gateway stdin/stdout pipes, so fabricating replacement children here
+/// would create disconnected processes and a false recovery claim.
+#[tauri::command]
+fn recover_update_gateways(
+    bridge: State<HttpBridgeState>,
+    http_bridge_port: Option<u16>,
+) -> Result<UpdateRecoveryReport, String> {
+    let Some(port) = http_bridge_port else {
+        return Ok(UpdateRecoveryReport::default());
+    };
+    let intent = load_update_http_bridge_intent()?
+        .ok_or_else(|| "HTTP bridge update state is missing; start it again from Settings".to_string())?;
+    if intent.port != port {
+        return Err(format!(
+            "HTTP bridge update state expected port {}, not {port}",
+            intent.port
+        ));
+    }
+    ensure_http_bridge_at(bridge.inner(), port, Some(intent.token))?;
+    let cleanup_warning = clear_update_http_bridge_intent().err();
+    Ok(UpdateRecoveryReport {
+        http_bridge_recovered: true,
+        cleanup_warning,
+    })
 }
 
 /// Apps still launching an obsolete gateway, accumulated across reaper passes.
@@ -3340,50 +3676,111 @@ fn reap_stale_and_restore_bridge(bridge: &HttpBridgeState, advice: &RestartAdvic
     // to restore and the reaper's outcome is final.
     let was_serving = {
         let mut b = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        http_bridge_alive(&mut b).then(|| b.port).flatten()
+        http_bridge_alive(&mut b).then(|| (b.port, b.token.clone()))
     };
     let report = crate::gateway_publish::reap_stale(&extra_keep);
     // Merged from this pass's pre-kill snapshot, which is the only moment it can be
     // known. Union, not replace: see `RestartAdvice`.
+    let mut failed = report.failed.clone();
+    for remaining in &report.remaining {
+        if !failed.contains(remaining) {
+            failed.push(remaining.clone());
+        }
+    }
     let outcome = ReapOutcome {
         killed: report.killed.clone(),
-        failed: report.failed.clone(),
+        // Include the final alive set in the existing failure surface so Settings
+        // cannot report success merely because the OS accepted a termination request.
+        failed,
         needs_restart: advice.merge(report.needs_restart),
     };
-    if let Some(port) = was_serving {
+    if let Some((Some(port), token)) = was_serving {
         let still_serving = {
             let mut b = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             http_bridge_alive(&mut b)
         };
         if !still_serving {
-            // The just-killed child may not have released the port yet, and
-            // `start_http_bridge_at` deliberately fails fast on a taken port (a
-            // user-initiated start must not report success against someone else's
-            // listener). Retry briefly so a teardown race does not turn into a
-            // spurious "could not be restarted".
-            let mut last = String::new();
-            for attempt in 0..5 {
-                match start_http_bridge_at(bridge, Some(port)) {
-                    Ok(_) => {
-                        eprintln!(
-                            "toolport: restarted the HTTP endpoint on port {port} after the stale \
-                             reaper stopped its previous (replaced) binary"
-                        );
-                        return outcome;
-                    }
-                    Err(e) => last = e,
-                }
-                if attempt < 4 {
-                    std::thread::sleep(Duration::from_millis(200));
-                }
+            match ensure_http_bridge_at(bridge, port, token) {
+                Ok(()) => eprintln!(
+                    "toolport: restarted the HTTP endpoint on port {port} after the stale \
+                     reaper stopped its previous (replaced) binary"
+                ),
+                Err(last) => eprintln!(
+                    "toolport: the stale reaper stopped the HTTP endpoint on port {port} and it \
+                     could not be restarted: {last}. Start it again from Settings."
+                ),
             }
-            eprintln!(
-                "toolport: the stale reaper stopped the HTTP endpoint on port {port} and it could \
-                 not be restarted: {last}. Start it again from Settings."
-            );
         }
     }
     outcome
+}
+
+/// Ensure the supervised HTTP bridge is available on its previous port. The
+/// just-stopped child may need a moment to release the listener, so retry within a
+/// short, deterministic bound. Idempotent when the tracked bridge is already alive.
+fn ensure_http_bridge_at(
+    state: &HttpBridgeState,
+    port: u16,
+    token: Option<String>,
+) -> Result<(), String> {
+    let tracked_live = {
+        let mut bridge = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if http_bridge_alive(&mut bridge) {
+            if bridge.port == Some(port)
+                && token
+                    .as_ref()
+                    .is_none_or(|expected| bridge.token.as_ref() == Some(expected))
+            {
+                true
+            } else {
+                return Err(format!(
+                    "another Toolport HTTP endpoint is already running on port {}",
+                    bridge.port.unwrap_or_default()
+                ));
+            }
+        } else {
+            false
+        }
+    };
+    if tracked_live {
+        let expected = token.as_deref().ok_or_else(|| {
+            "could not verify the tracked HTTP endpoint without its bearer token".to_string()
+        })?;
+        return http_bridge_identity_ready(port, expected)
+            .then_some(())
+            .ok_or_else(|| {
+                format!(
+                    "the tracked Toolport HTTP endpoint on port {port} did not pass authenticated readiness"
+                )
+            });
+    }
+
+    let mut last = String::new();
+    for attempt in 0..5 {
+        match start_http_bridge_with_token_at(state, Some(port), token.clone()) {
+            Ok(status)
+                if status.port == Some(port)
+                    && token
+                        .as_ref()
+                        .is_none_or(|expected| status.token.as_ref() == Some(expected)) =>
+            {
+                return Ok(());
+            }
+            Ok(status) => {
+                return Err(format!(
+                    "another Toolport HTTP endpoint is already running on port {}",
+                    status.port.unwrap_or_default()
+                ));
+            }
+            Err(error) => last = error,
+        }
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    Err(last)
 }
 
 /// Start `toolport-gateway --http <port>` as a supervised child so HTTP/OpenAPI
@@ -3402,6 +3799,38 @@ fn start_http_bridge(
 fn start_http_bridge_at(
     state: &HttpBridgeState,
     port: Option<u16>,
+) -> Result<HttpBridgeStatus, String> {
+    // Every ordinary/user-initiated start supersedes an interrupted-update
+    // marker, including install/migration paths that call this helper directly.
+    // Recovery paths use the token-preserving lower-level function instead.
+    clear_update_http_bridge_intent()?;
+    start_http_bridge_with_token_at(state, port, None)
+}
+
+fn http_bridge_identity_ready(port: u16, token: &str) -> bool {
+    use std::io::Read as _;
+
+    let response = match ureq::get(&format!("http://127.0.0.1:{port}/"))
+        .timeout(Duration::from_millis(300))
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Ok(response) if response.status() == 200 => response,
+        _ => return false,
+    };
+    let mut body = String::new();
+    response
+        .into_reader()
+        .take(4 * 1024)
+        .read_to_string(&mut body)
+        .is_ok()
+        && body.starts_with("Toolport gateway (HTTP mode).")
+}
+
+fn start_http_bridge_with_token_at(
+    state: &HttpBridgeState,
+    port: Option<u16>,
+    token: Option<String>,
 ) -> Result<HttpBridgeStatus, String> {
     let port = port.unwrap_or(8765);
     let mut bridge = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3422,9 +3851,15 @@ fn start_http_bridge_at(
     // Auto-generate a bearer token the client must send on every request.
     // Without it, any local process (including a web page open in the user's
     // browser) could POST to the port and run their tools.
-    let mut tok = [0u8; 24];
-    getrandom::getrandom(&mut tok).map_err(|e| format!("could not generate a token: {e}"))?;
-    let token: String = tok.iter().map(|b| format!("{b:02x}")).collect();
+    let token = match token {
+        Some(token) => token,
+        None => {
+            let mut tok = [0u8; 24];
+            getrandom::getrandom(&mut tok)
+                .map_err(|e| format!("could not generate a token: {e}"))?;
+            tok.iter().map(|b| format!("{b:02x}")).collect()
+        }
+    };
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg("--http")
         .arg(port.to_string())
@@ -3444,9 +3879,10 @@ fn start_http_bridge_at(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("could not start the HTTP bridge: {e}"))?;
-    // Confirm it actually came up rather than dying on startup (bind race,
-    // bad binary, etc.). Poll the port; if the child exits or never answers,
-    // surface a real error instead of a false success.
+    // Confirm the spawned process is the authenticated Toolport gateway, not
+    // merely that some listener won a bind race on this port. The preserved
+    // bearer is high-entropy identity evidence and the fixed root response proves
+    // the peer completed Toolport's auth and routing path.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if let Ok(Some(status)) = child.try_wait() {
@@ -3454,11 +3890,12 @@ fn start_http_bridge_at(
                 "The HTTP endpoint exited on startup ({status}). Is port {port} already in use?"
             ));
         }
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break; // it's listening
+        if http_bridge_identity_ready(port, &token) {
+            break;
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
+            let _ = child.wait();
             return Err(format!(
                 "The HTTP endpoint did not come up on port {port} within 5s."
             ));
@@ -3475,6 +3912,10 @@ fn start_http_bridge_at(
 #[tauri::command]
 fn stop_http_bridge(state: State<HttpBridgeState>) -> Result<HttpBridgeStatus, String> {
     let mut bridge = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Clear the resume marker before stopping the live endpoint. If cleanup is
+    // denied, leave the endpoint running and report the error; otherwise a later
+    // launch could silently resurrect something the user explicitly disabled.
+    clear_update_http_bridge_intent()?;
     if let Some(mut child) = bridge.child.take() {
         let _ = child.kill();
         let _ = child.wait();
@@ -3482,6 +3923,19 @@ fn stop_http_bridge(state: State<HttpBridgeState>) -> Result<HttpBridgeStatus, S
     bridge.port = None;
     bridge.token = None;
     Ok(HttpBridgeStatus::new(None, None))
+}
+
+fn resume_http_bridge_after_update(state: &HttpBridgeState) -> Result<bool, String> {
+    let Some(intent) = load_update_http_bridge_intent()? else {
+        return Ok(false);
+    };
+    ensure_http_bridge_at(state, intent.port, Some(intent.token))?;
+    if let Err(error) = clear_update_http_bridge_intent() {
+        eprintln!(
+            "toolport: restored the HTTP endpoint, but could not clear its update resume state: {error}"
+        );
+    }
+    Ok(true)
 }
 
 /// Report whether the HTTP bridge is running, reaping it if it has exited.
@@ -3545,6 +3999,11 @@ fn update_tray_tooltip(app: &AppHandle) {
         .try_state::<approval_broker::ApprovalBroker>()
         .map(|b| b.list().len())
         .unwrap_or(0);
+    if let Some(menu) = app.try_state::<TrayMenuState>() {
+        let _ = menu
+            .pending_approvals
+            .set_text(format!("Pending approvals ({pending})"));
+    }
     if let Some(tray) = app.tray_by_id("main") {
         let tip = if pending > 0 {
             format!(
@@ -3581,15 +4040,36 @@ fn maybe_show_tray_hint(app: &AppHandle) {
         .show();
 }
 
-/// Build the system-tray (Windows) / menu-bar (macOS) icon: left-click opens the app,
-/// right-click shows an Open/Quit menu. Quit fully exits (the run-loop's Exit handler
-/// tears down the HTTP bridge); closing the window only hides it (see the window-event
+/// Build the system-tray (Windows) / menu-bar (macOS) icon. The menu exposes the two
+/// background actions users need without hunting through a hidden window: pending
+/// approvals and update checks. Quit fully exits (the run-loop's Exit handler tears
+/// down the HTTP bridge); closing the window only hides it (see the window-event
 /// handler), so the gateway/broker keep running and HITL stays live.
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "tray_open", "Open Toolport", true, None::<&str>)?;
+    let approvals = MenuItem::with_id(
+        app,
+        "tray_approvals",
+        "Pending approvals (0)",
+        true,
+        None::<&str>,
+    )?;
+    let check_updates = MenuItem::with_id(
+        app,
+        "tray_check_updates",
+        "Check for updates",
+        true,
+        None::<&str>,
+    )?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "tray_quit", "Quit Toolport", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &sep, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&open, &approvals, &check_updates, &sep, &quit],
+    )?;
+    app.manage(TrayMenuState {
+        pending_approvals: approvals,
+    });
 
     let mut builder = TrayIconBuilder::with_id("main")
         .tooltip("Toolport")
@@ -3597,6 +4077,19 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "tray_open" => show_main_window(app),
+            "tray_approvals" => {
+                let should_emit = app
+                    .try_state::<PendingTrayApprovals>()
+                    .is_none_or(|state| should_emit_tray_approvals(state.inner()));
+                show_main_window(app);
+                if should_emit {
+                    let _ = app.emit("tray-open-approvals", ());
+                }
+            }
+            "tray_check_updates" => {
+                show_main_window(app);
+                let _ = app.emit("tray-check-updates", ());
+            }
             "tray_quit" => app.exit(0),
             _ => {}
         })
@@ -3730,6 +4223,7 @@ pub fn run() {
         .manage(Mutex::new(registry))
         .manage(Mutex::new(HttpBridge::default()))
         .manage(PendingShare::default())
+        .manage(PendingTrayApprovals::default())
         .manage(RestartAdvice::default())
         .invoke_handler(tauri::generate_handler![
             detect_clients,
@@ -3828,6 +4322,7 @@ pub fn run() {
             share_stack,
             fetch_shared_setup,
             take_pending_shared,
+            take_pending_tray_approvals,
             import_config,
             read_setup_file,
             preview_import,
@@ -3835,6 +4330,7 @@ pub fn run() {
             stop_http_bridge,
             http_bridge_status,
             stop_spawned_gateways,
+            recover_update_gateways,
             stop_stale_gateways,
             clients_needing_restart,
         ])
@@ -3911,6 +4407,21 @@ pub fn run() {
                         published.display()
                     );
                 }
+                // An in-app update deliberately stops the supervised HTTP child
+                // before replacing files. The durable intent carries its exact
+                // port and bearer across relaunch, so the newly installed app
+                // restores connectivity without rotating credentials.
+                match resume_http_bridge_after_update(
+                    migrate_handle.state::<HttpBridgeState>().inner(),
+                ) {
+                    Ok(true) => eprintln!(
+                        "toolport: restored the HTTP endpoint after the in-app update"
+                    ),
+                    Ok(false) => {}
+                    Err(error) => eprintln!(
+                        "toolport: could not restore the HTTP endpoint after the in-app update: {error}"
+                    ),
+                }
                 // Ownership map from disk (this launch thread has no RegistryState handle).
                 let managed_snapshot = registry::load()
                     .map(|r| r.client_managed_entries)
@@ -3940,6 +4451,23 @@ pub fn run() {
                         "toolport: left {} client config(s) alone (custom configuration): {}",
                         repoint.customized.len(),
                         repoint.customized.join(", ")
+                    );
+                }
+                if !repoint.failed.is_empty() {
+                    // A client that needed migrating and could not be written stays
+                    // on a superseded gateway until someone notices. Keep it
+                    // distinguishable from "nothing to do" at the call site too,
+                    // not just in the gateway log.
+                    eprintln!(
+                        "toolport: FAILED to re-point {} client config(s); they will keep \
+                         launching their previous gateway: {}",
+                        repoint.failed.len(),
+                        repoint
+                            .failed
+                            .iter()
+                            .map(|(id, why)| format!("{id} ({why})"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
                 // Stop obsolete gateway processes. Path-based identity on all OS
@@ -4123,6 +4651,83 @@ mod tests {
     use crate::{arg_looks_secret, redact_url_userinfo};
     use registry::EnvVar;
 
+    fn unique_update_test_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "toolport-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn update_http_bridge_intent_round_trips_exact_token_and_clear_failures_surface() {
+        let dir = unique_update_test_dir("update-bridge-intent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("resume.json");
+        let intent = UpdateHttpBridgeIntent {
+            port: 9876,
+            token: "preserved-secret-token".to_string(),
+        };
+
+        save_update_http_bridge_intent_to(&path, &intent).unwrap();
+        let loaded = load_update_http_bridge_intent_from(&path)
+            .unwrap()
+            .expect("intent exists");
+        assert_eq!(loaded.port, intent.port);
+        assert_eq!(loaded.token, intent.token);
+        clear_update_http_bridge_intent_at(&path).unwrap();
+        assert!(load_update_http_bridge_intent_from(&path).unwrap().is_none());
+
+        let directory_marker = dir.join("not-a-file");
+        std::fs::create_dir(&directory_marker).unwrap();
+        assert!(clear_update_http_bridge_intent_at(&directory_marker).is_err());
+        std::fs::remove_dir(&directory_marker).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn update_http_bridge_readiness_requires_the_exact_bearer_and_identity() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let request = server.recv().unwrap();
+                let authorized = request.headers().iter().any(|header| {
+                    header.field.equiv("Authorization")
+                        && header.value.as_str() == "Bearer exact-secret"
+                });
+                let response = if authorized {
+                    tiny_http::Response::from_string("Toolport gateway (HTTP mode).\n")
+                        .with_status_code(200)
+                } else {
+                    tiny_http::Response::from_string("not authorized").with_status_code(401)
+                };
+                request.respond(response).unwrap();
+            }
+        });
+
+        assert!(!http_bridge_identity_ready(port, "wrong-secret"));
+        assert!(http_bridge_identity_ready(port, "exact-secret"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn tray_approvals_requests_choose_exactly_one_delivery_mode() {
+        let pending = PendingTrayApprovals::default();
+
+        // Before the frontend claims readiness, queue without emitting.
+        assert!(!should_emit_tray_approvals(&pending));
+        assert!(claim_pending_tray_approvals(&pending));
+        assert!(!claim_pending_tray_approvals(&pending));
+
+        // Once ready, deliver live without leaving a queued duplicate.
+        assert!(should_emit_tray_approvals(&pending));
+        assert!(!claim_pending_tray_approvals(&pending));
+    }
+
     #[test]
     fn registry_startup_failure_is_blocking_and_preserves_the_real_path_and_error() {
         let path = std::path::Path::new(r"C:\Toolport\registry.json");
@@ -4131,6 +4736,21 @@ mod tests {
         assert!(message.contains(r"C:\Toolport\registry.json"));
         assert!(message.contains("Corrupt registry: bad json"));
         assert!(message.contains("Your registry was not replaced"));
+    }
+
+    /// A failed keychain read must surface as an error, never as "no secret
+    /// stored": `Ok(false)` sends the UI down the first-time path and blocks a
+    /// user whose secret really is vaulted (SBS-722). The reserved internal
+    /// namespace is the one deterministic way to make `get_secret_result` fail
+    /// on every platform, and `secrets::get_secret` swallows exactly that error
+    /// into `None` -- which is the regression this pins against.
+    #[test]
+    fn has_client_secret_reports_a_failed_read_as_an_error_not_missing() {
+        let result = has_client_secret("__toolport_internal__".to_string());
+        assert!(
+            result.is_err(),
+            "a failed secret read must propagate, not resolve to a boolean: {result:?}"
+        );
     }
 
     fn github_with_secret() -> ServerEntry {
@@ -4406,6 +5026,30 @@ mod tests {
     }
 
     #[test]
+    fn auth_mutation_lock_serializes_token_and_oauth_writes() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("toolport-auth-write-{unique}.lock"));
+        let first = try_acquire_auth_mutation_lock(&path)
+            .expect("first mutation lock should not fail")
+            .expect("first mutation lock should be acquired");
+        assert!(
+            try_acquire_auth_mutation_lock(&path)
+                .expect("second mutation lock should not fail")
+                .is_none(),
+            "a concurrent manual-token or OAuth write must wait"
+        );
+        drop(first);
+        let second = try_acquire_auth_mutation_lock(&path)
+            .expect("lock reacquisition should not fail")
+            .expect("lock should be available after release");
+        drop(second);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn oauth_lock_key_is_stable_and_scoped() {
         let a = oauth_lock_key("srv-1", "https://mcp.example.com");
         let b = oauth_lock_key("srv-1", "https://mcp.example.com");
@@ -4569,13 +5213,55 @@ mod tests {
         assert_eq!(doc["name"], "Team setup");
         assert_eq!(doc["description"], "Our shared servers");
 
-        // Selective share: a name filter includes only the matching servers, so a
+        // Selective share: an id filter includes only the matching servers, so a
         // user can share a focused stack instead of their whole setup.
-        let shared_name = servers[0]["name"].as_str().unwrap().to_string();
-        let subset = build_export(&reg, None, None, Some(&[shared_name]));
+        let shared_id = reg
+            .servers
+            .iter()
+            .find(|server| server.name == "GitHub")
+            .unwrap()
+            .id
+            .clone();
+        let subset = build_export(&reg, None, None, Some(&[shared_id]));
         assert_eq!(subset["servers"].as_array().unwrap().len(), 1);
         let empty = build_export(&reg, None, None, Some(&["does-not-exist".to_string()]));
         assert_eq!(empty["servers"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn export_selection_uses_stable_ids_and_an_explicit_snapshot() {
+        let mut reg = Registry::default();
+        let mut first = github_with_secret();
+        first.name = "Duplicate".into();
+        first.command = Some("first-command".into());
+        reg.add_server(first);
+        let mut second = github_with_secret();
+        second.name = "Duplicate".into();
+        second.command = Some("second-command".into());
+        reg.add_server(second);
+
+        let first_id = reg
+            .servers
+            .iter()
+            .find(|server| server.command.as_deref() == Some("first-command"))
+            .unwrap()
+            .id
+            .clone();
+        let snapshot = vec![first_id];
+
+        // A same-name server is not accidentally selected, and a later registry
+        // addition cannot widen the explicit snapshot.
+        let mut later = github_with_secret();
+        later.name = "Added later".into();
+        later.command = Some("later-command".into());
+        reg.add_server(later);
+        let doc = build_export(&reg, None, None, Some(&snapshot));
+        let exported = doc["servers"].as_array().unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0]["command"], "first-command");
+
+        let empty = build_export(&reg, None, None, Some(&[]));
+        assert!(empty["servers"].as_array().unwrap().is_empty());
     }
 
     #[test]

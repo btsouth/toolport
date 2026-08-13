@@ -98,7 +98,9 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/sonner";
 import { useTheme } from "@/lib/theme";
 import { fmtTs } from "@/lib/utils";
+import { createSingleFlight } from "@/lib/singleFlight";
 import { resolveShortcut, shortcutHelp } from "@/lib/shortcuts";
+import { subscribeToTrayApprovals } from "@/lib/trayApprovals";
 
 /** Above this many servers, "Disable all" asks for confirmation first. */
 const BULK_DISABLE_CONFIRM_MIN = 3;
@@ -150,48 +152,60 @@ function App() {
   const [resumeAtConnect, setResumeAtConnect] = useState(false);
 
   const lastProbeRef = useRef(0);
-  const probingRef = useRef(false);
-  // Whether the most recent probe threw (vs. returned results or was skipped). Lets
-  // the manual Refresh distinguish "health check failed" from "nothing to report" so
-  // a thrown probe doesn't masquerade as a green success toast.
-  const probeErroredRef = useRef(false);
+  const probeFlightRef = useRef(createSingleFlight<ProbeResult[]>());
   const loadedOnce = useRef(false);
 
   // Probe health quietly (no toast). Used on load and after authenticating, so
   // each server's status badge reflects reality without the user clicking around.
-  const reprobe = useCallback(async (): Promise<ProbeResult[]> => {
-    probeErroredRef.current = false;
-    // Never stack probes. A probe spawns/reads every server (and on macOS can
-    // trigger keychain prompts); overlapping runs amplify that into a storm,
-    // especially since each dismissed prompt returns focus and could re-trigger.
-    if (probingRef.current) return [];
-    probingRef.current = true;
-    lastProbeRef.current = Date.now();
-    setProbing(true);
-    try {
-      const results = await probeServers();
-      setHealth(Object.fromEntries(results.map((r) => [r.serverId, r])));
-      setBackendReachable(true);
-      return results;
-    } catch {
-      // Non-fatal: badges just stay in "checking". Record that it threw so a manual
-      // refresh reports the failure instead of a false success (both return []), and
-      // surface a persistent banner so the stale badges aren't read as real status.
-      probeErroredRef.current = true;
-      setBackendReachable(false);
-      return [];
-    } finally {
-      setProbing(false);
-      probingRef.current = false;
-    }
+  const reprobe = useCallback((): Promise<ProbeResult[]> => {
+    // A second caller receives the SAME promise, not an invented empty result.
+    // This prevents onboarding, enablement, and refresh from treating in-flight
+    // work as an authoritative "zero problems" response (SBS-720).
+    return probeFlightRef.current.run(async () => {
+      lastProbeRef.current = Date.now();
+      setProbing(true);
+      try {
+        const results = await probeServers();
+        setHealth(Object.fromEntries(results.map((r) => [r.serverId, r])));
+        setBackendReachable(true);
+        return results;
+      } catch (error) {
+        setBackendReachable(false);
+        throw error;
+      } finally {
+        setProbing(false);
+      }
+    });
   }, []);
+
+  // Registry/auth mutations need a probe that starts after any older snapshot.
+  // Multiple mutations during one active probe share a single trailing run.
+  const reprobeAfterMutation = useCallback(
+    (): Promise<ProbeResult[]> =>
+      probeFlightRef.current.runAfterCurrent(async () => {
+        lastProbeRef.current = Date.now();
+        setProbing(true);
+        try {
+          const results = await probeServers();
+          setHealth(Object.fromEntries(results.map((r) => [r.serverId, r])));
+          setBackendReachable(true);
+          return results;
+        } catch (error) {
+          setBackendReachable(false);
+          throw error;
+        } finally {
+          setProbing(false);
+        }
+      }),
+    [],
+  );
 
   // Refresh statuses when the user returns to the window, so a server that came
   // up (or went down) while they were away reflects reality without a manual
   // refresh. Guarded so rapid alt-tabbing doesn't re-spawn every server.
   useEffect(() => {
     const onFocus = () => {
-      if (Date.now() - lastProbeRef.current > 20_000) void reprobe();
+      if (Date.now() - lastProbeRef.current > 20_000) void reprobe().catch(() => {});
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
@@ -228,21 +242,19 @@ function App() {
         loadedOnce.current = true;
         setActivityKey((k) => k + 1);
         if (announce) {
-          const results = await reprobe();
-          if (results.length > 0) {
-            const up = results.filter((r) => r.ok).length;
-            toast.success(`${up} of ${results.length} servers healthy`);
-          } else if (probeErroredRef.current) {
-            // The registry/clients reloaded, but the health probe itself threw.
-            // Don't dress that up as a green success.
+          try {
+            const results = await reprobeAfterMutation();
+            if (results.length > 0) {
+              const up = results.filter((r) => r.ok).length;
+              toast.success(`${up} of ${results.length} servers healthy`);
+            } else {
+              toast.success("Refreshed");
+            }
+          } catch {
             toast.warning("Refreshed, but couldn't check server health");
-          } else {
-            // Registry/clients still reloaded; give feedback even when the probe
-            // was skipped (already in flight) or there are no servers to report.
-            toast.success("Refreshed");
           }
         } else {
-          void reprobe();
+          void reprobe().catch(() => {});
         }
       } catch (e) {
         // After the first successful load, a refresh failure shouldn't blow away a
@@ -256,7 +268,7 @@ function App() {
         setLoading(false);
       }
     },
-    [reprobe],
+    [reprobe, reprobeAfterMutation],
   );
 
   useEffect(() => {
@@ -273,6 +285,30 @@ function App() {
     });
     return () => {
       void unlisten.then((f) => f());
+    };
+  }, []);
+
+  // The tray remains available while the window is hidden. Its approvals entry
+  // should reveal the app at the exact place where the waiting calls can be
+  // inspected, rather than merely opening whichever screen was last visible.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    const openApprovals = () => {
+      if (cancelled) return;
+      setSelectedClientId(null);
+      setView("activity");
+      setActivityKey((key) => key + 1);
+    };
+    subscribeToTrayApprovals(openApprovals)
+      .then((remove) => {
+        if (cancelled) remove();
+        else unlisten = remove;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
     };
   }, []);
 
@@ -607,7 +643,7 @@ function App() {
       // Enabling adds a server with no health entry yet, so its card would sit on
       // "Checking…" until a manual refresh. Probe now to resolve it. (Disabling
       // moves it to the disabled group, no probe needed.)
-      if (enabled) void reprobe();
+      if (enabled) void reprobeAfterMutation().catch(() => {});
     } catch (e) {
       toastError(`Couldn't toggle: ${e}`);
     } finally {
@@ -633,7 +669,7 @@ function App() {
     setTogglingAll(true);
     try {
       setRegistry(await setAllEnabled(profileId, enable));
-      if (enable) void reprobe();
+      if (enable) void reprobeAfterMutation().catch(() => {});
       toast.success(enable ? "Enabled all servers" : "Disabled all servers");
     } catch (e) {
       toastError(`Couldn't update servers: ${e}`);
@@ -689,7 +725,7 @@ function App() {
       onToggle={(en) => handleToggle(server.id, en)}
       onRemove={() => handleRemove(server.id, server.name)}
       onRegistryChange={setRegistry}
-      onReprobe={reprobe}
+      onReprobe={() => void reprobeAfterMutation().catch(() => {})}
     />
   );
 
@@ -867,7 +903,7 @@ function App() {
                 variant="outline"
                 size="sm"
                 className="shrink-0"
-                onClick={() => void reprobe()}
+                onClick={() => void reprobe().catch(() => {})}
                 disabled={probing}
               >
                 Retry

@@ -293,6 +293,10 @@ pub struct ScriptOutcome {
     /// Serialized size of the final aggregate. The outcome already owns `value`; callers
     /// can use this aggregate without retaining another copy of the result.
     pub final_result_bytes: usize,
+    /// Last value the script passed to `toolport.checkpoint()`, if any. Author-chosen,
+    /// so unlike `progress` this can safely carry script-relevant state — the script
+    /// decides what's safe to surface. `None` if the script never called it. See #663.
+    pub checkpoint: Option<Value>,
     /// `Some(message)` if the script threw, hit a limit, or failed to compile. Fail-closed:
     /// the caller surfaces this to the agent as an error result.
     pub error: Option<String>,
@@ -343,11 +347,57 @@ struct HostState {
     /// `calls_made` is. Appended after the host binding returns, never before, so
     /// it records committed work rather than intent (#646).
     executed: Rc<RefCell<Vec<CallRecord>>>,
+    /// Last checkpoint value the script recorded via `toolport.checkpoint(value)`.
+    /// Last-write-wins — a fresh call overwrites, it doesn't append (#663).
+    checkpoint: Rc<RefCell<Option<Value>>>,
+    /// Maximum serialized checkpoint size for this run. This is capped against
+    /// the active result budget so an accepted checkpoint can always be surfaced
+    /// immediately when the script fails.
+    max_checkpoint_bytes: usize,
     max_calls: usize,
     max_parallel: usize,
     deadline: Instant,
     /// Queued `callAsync` work; drained with bounded host-side parallelism.
     pending: Rc<RefCell<VecDeque<PendingCall>>>,
+}
+
+/// A checkpoint is a resume marker, not a payload. Keep it bounded so even a
+/// failure response can surface it without becoming an unbounded escape hatch.
+const MAX_CHECKPOINT_BYTES: usize = 4096;
+
+/// Space reserved for the failure prefix, shaping marker, and MCP result
+/// envelope. The remainder of the active result budget is available to the
+/// checkpoint itself.
+const CHECKPOINT_RESPONSE_RESERVE_BYTES: usize = 1024;
+
+fn checkpoint_limit_for_result_budget(result_budget: usize) -> usize {
+    if result_budget == 0 {
+        MAX_CHECKPOINT_BYTES
+    } else {
+        MAX_CHECKPOINT_BYTES.min(result_budget.saturating_sub(CHECKPOINT_RESPONSE_RESERVE_BYTES))
+    }
+}
+
+fn store_checkpoint(
+    checkpoint: &RefCell<Option<Value>>,
+    raw: &str,
+    max_bytes: usize,
+) -> Result<(), JsError> {
+    if raw.len() > max_bytes {
+        return Err(JsError::from_native(JsNativeError::error().with_message(
+            format!(
+                "toolport.checkpoint value exceeds {max_bytes} bytes for the active result budget"
+            ),
+        )));
+    }
+    let parsed: Value = serde_json::from_str(raw).map_err(|error| {
+        JsError::from_native(
+            JsNativeError::error()
+                .with_message(format!("toolport.checkpoint received invalid JSON: {error}")),
+        )
+    })?;
+    *checkpoint.borrow_mut() = Some(parsed);
+    Ok(())
 }
 
 /// Capture for `__toolport_fetch_result` (no GC refs). Shares the same call
@@ -373,6 +423,8 @@ impl Clone for HostState {
             call: Arc::clone(&self.call),
             calls_made: Rc::clone(&self.calls_made),
             executed: Rc::clone(&self.executed),
+            checkpoint: Rc::clone(&self.checkpoint),
+            max_checkpoint_bytes: self.max_checkpoint_bytes,
             max_calls: self.max_calls,
             max_parallel: self.max_parallel,
             deadline: self.deadline,
@@ -425,6 +477,9 @@ globalThis.toolport = {
     call: function (name, args) {
         var payload = (args === undefined || args === null) ? {} : args;
         return JSON.parse(__toolport_call(String(name), JSON.stringify(payload)));
+    },
+    checkpoint: function (value) {
+        __toolport_checkpoint(JSON.stringify(value === undefined ? null : value));
     },
     callAsync: function (name, args) {
         var payload = (args === undefined || args === null) ? {} : args;
@@ -658,6 +713,9 @@ pub fn run_script_with_input(
 ) -> ScriptOutcome {
     let calls_made = Rc::new(Cell::new(0usize));
     let executed = Rc::new(RefCell::new(Vec::new()));
+    let checkpoint = Rc::new(RefCell::new(None::<Value>));
+    let (result_budget, _warning) = crate::shaping::budget();
+    let max_checkpoint_bytes = checkpoint_limit_for_result_budget(result_budget);
     let pending = Rc::new(RefCell::new(VecDeque::new()));
     let deadline = Instant::now() + limits.wall_clock;
     let executor = Rc::new(BoundedJobExecutor::new(deadline, limits.max_promise_jobs));
@@ -669,9 +727,8 @@ pub fn run_script_with_input(
                 calls: 0,
                 progress: Vec::new(),
                 final_result_bytes: 0,
-                error: Some(format!(
-                    "toolport code mode: failed to create JS context: {e}"
-                )),
+                checkpoint: None,
+                error: Some(format!("toolport code mode: failed to create JS context: {e}")),
             };
         }
     };
@@ -688,6 +745,8 @@ pub fn run_script_with_input(
         call,
         calls_made: calls_made.clone(),
         executed: executed.clone(),
+        checkpoint: checkpoint.clone(),
+        max_checkpoint_bytes,
         max_calls: limits.max_calls,
         max_parallel: limits.max_parallel.max(1),
         deadline,
@@ -734,14 +793,36 @@ pub fn run_script_with_input(
         state.clone(),
     );
 
+    let checkpoint_native = NativeFunction::from_copy_closure_with_captures(
+        |_this: &JsValue, args: &[JsValue], state: &HostState, _ctx: &mut Context| {
+            // No reserve_call_slot: this makes no downstream call, so it costs
+            // nothing against max_calls or the wall clock (#663).
+            let raw = args
+                .first()
+                .and_then(JsValue::as_string)
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_else(|| "null".to_string());
+            store_checkpoint(&state.checkpoint, &raw, state.max_checkpoint_bytes)?;
+            Ok(JsValue::undefined())
+        },
+        state.clone(),
+    );
+
     if let Err(e) = context.register_global_callable(js_string!("__toolport_call"), 2, sync_native)
     {
-        return fail(calls_made.get(), executed.take(), e);
+        return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
     }
     if let Err(e) =
         context.register_global_callable(js_string!("__toolport_call_async"), 2, async_native)
     {
-        return fail(calls_made.get(), executed.take(), e);
+        return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
+    }
+    if let Err(e) = context.register_global_callable(
+        js_string!("__toolport_checkpoint"),
+        1,
+        checkpoint_native,
+    ) {
+        return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
     }
 
     // Fetch binding: pages shaped results by cursor. Absent binding fails closed.
@@ -805,7 +886,7 @@ pub fn run_script_with_input(
     if let Err(e) =
         context.register_global_callable(js_string!("__toolport_fetch_result"), 1, fetch_native)
     {
-        return fail(calls_made.get(), executed.take(), e);
+        return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
     }
 
     let (global_name, value, attributes, freeze) = match input {
@@ -819,10 +900,10 @@ pub fn run_script_with_input(
                 v,
                 attributes,
             ) {
-                return fail(calls_made.get(), executed.take(), e);
+                return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
             }
         }
-        Err(e) => return fail(calls_made.get(), executed.take(), e),
+        Err(e) => return fail(calls_made.get(), executed.take(), checkpoint.take(), e),
     }
 
     if freeze {
@@ -839,25 +920,25 @@ pub fn run_script_with_input(
             })(input);
         "#;
         if let Err(e) = context.eval(Source::from_bytes(DEEP_FREEZE_INPUT)) {
-            return fail(calls_made.get(), executed.take(), e);
+            return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
         }
     }
 
     if let Err(e) = context.eval(Source::from_bytes(PRELUDE)) {
-        return fail(calls_made.get(), executed.take(), e);
+        return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
     }
 
     // Typed `servers.*` surface from the scoped catalog (after toolport bindings exist).
     let servers_js = build_servers_prelude(catalog);
     if let Err(e) = context.eval(Source::from_bytes(servers_js.as_bytes())) {
-        return fail(calls_made.get(), executed.take(), e);
+        return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
     }
 
     // Async IIFE: top-level `return` and `await` both work; the result is always a Promise.
     let wrapped = format!("(async function () {{\n{script}\n}})()");
     let top = match context.eval(Source::from_bytes(wrapped.as_bytes())) {
         Ok(v) => v,
-        Err(e) => return fail(calls_made.get(), executed.take(), e),
+        Err(e) => return fail(calls_made.get(), executed.take(), checkpoint.take(), e),
     };
 
     match drive_to_completion(&mut context, &state, top) {
@@ -866,9 +947,10 @@ pub fn run_script_with_input(
             value,
             calls: calls_made.get(),
             progress: executed.take(),
+            checkpoint: checkpoint.take(),
             error: None,
         },
-        Err(e) => fail(calls_made.get(), executed.take(), e),
+        Err(e) => fail(calls_made.get(), executed.take(), checkpoint.take(), e),
     }
 }
 
@@ -1117,12 +1199,13 @@ fn run_calls_parallel(call: &CallBinding, items: Vec<(String, Value)>) -> Vec<Va
 /// runtime-limit errors (loop/recursion caps) panic when converted to an opaque JS value,
 /// and `Display` yields a usable message (`Uncaught Error: ...`, `RuntimeLimit: ...`) for
 /// every error kind.
-fn fail(calls: usize, progress: Vec<CallRecord>, err: JsError) -> ScriptOutcome {
+fn fail(calls: usize, progress: Vec<CallRecord>, checkpoint: Option<Value>, err: JsError) -> ScriptOutcome {
     ScriptOutcome {
         value: json!(null),
         calls,
         progress,
         final_result_bytes: 0,
+        checkpoint,
         error: Some(err.to_string()),
     }
 }
@@ -2076,5 +2159,125 @@ mod tests {
             err.contains("promise-job budget") || err.contains("wall-clock"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn checkpoint_is_last_write_wins() {
+        // #663: repeated calls overwrite, they don't accumulate a history.
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let out = run(
+            r#"
+                toolport.checkpoint({ step: 1 });
+                toolport.checkpoint({ step: 2 });
+                toolport.checkpoint({ step: 3 });
+                return 'done';
+            "#,
+            json!({}),
+            call,
+            Limits::default(),
+        );
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(out.checkpoint, Some(json!({ "step": 3 })));
+    }
+
+    #[test]
+    fn checkpoint_survives_on_the_error_path() {
+        // The whole point of #663: a script that records progress and then dies
+        // must still report where it got to.
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let out = run(
+            r#"
+                toolport.checkpoint({ lastInsertedId: 41 });
+                throw new Error('boom');
+            "#,
+            json!({}),
+            call,
+            Limits::default(),
+        );
+        assert!(out.error.is_some(), "script was supposed to throw");
+        assert_eq!(out.checkpoint, Some(json!({ "lastInsertedId": 41 })));
+    }
+
+    #[test]
+    fn checkpoint_is_none_when_the_script_never_calls_it() {
+        let out = returns("return 'ok';");
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(out.checkpoint, None);
+    }
+
+    #[test]
+    fn checkpoint_is_none_on_a_script_that_never_compiles() {
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let out = run("this is not ( valid javascript", json!({}), call, Limits::default());
+        assert!(out.error.is_some());
+        assert_eq!(out.checkpoint, None);
+    }
+
+    #[test]
+    fn checkpoint_oversized_value_is_rejected_without_dropping_the_prior_one() {
+        // A checkpoint is a resume marker, not a payload: a script cannot smuggle a
+        // large blob out through the one path (the failure text) that isn't subject
+        // to max_calls.
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let out = run(
+            r#"
+                toolport.checkpoint({ ok: true });
+                toolport.checkpoint({ blob: 'x'.repeat(5000) });
+            "#,
+            json!({}),
+            call,
+            Limits::default(),
+        );
+        let err = out.error.expect("an oversized checkpoint must fail closed");
+        assert!(err.contains("4096"), "error should name the byte cap: {err}");
+        // The prior good checkpoint is untouched by the rejected call.
+        assert_eq!(out.checkpoint, Some(json!({ "ok": true })));
+    }
+
+    #[test]
+    fn malformed_checkpoint_json_is_rejected_without_dropping_the_prior_one() {
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let out = run(
+            r#"
+                toolport.checkpoint({ safe: true });
+                try {
+                    __toolport_checkpoint('{not-json');
+                } catch (_) {}
+                return 'done';
+            "#,
+            json!({}),
+            call,
+            Limits::default(),
+        );
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(
+            out.checkpoint,
+            Some(json!({ "safe": true })),
+            "malformed direct-binding input must not replace the last good checkpoint"
+        );
+    }
+
+    #[test]
+    fn checkpoint_costs_nothing_against_the_call_budget() {
+        // Per #663: checkpoint makes no downstream call, so it must not be gated by
+        // reserve_call_slot / max_calls, unlike toolport.call.
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let limits = Limits {
+            max_calls: 0,
+            ..Limits::default()
+        };
+        let out = run(
+            r#"
+                toolport.checkpoint({ a: 1 });
+                toolport.checkpoint({ a: 2 });
+                return 'done';
+            "#,
+            json!({}),
+            call,
+            limits,
+        );
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(out.calls, 0, "checkpoint must not count against max_calls");
+        assert_eq!(out.checkpoint, Some(json!({ "a": 2 })));
     }
 }

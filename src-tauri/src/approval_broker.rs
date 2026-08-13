@@ -27,8 +27,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::approval::{
-    ApprovalDecision, ApprovalReason, ApprovalRequest, EndpointDescriptor, UrlElicitationRequest,
-    DEFAULT_TIMEOUT_SECS, ENDPOINT_FILE,
+    ApprovalDecision, ApprovalReason, ApprovalRequest, EndpointDescriptor, PiiReleaseRequest,
+    UrlElicitationRequest, DEFAULT_TIMEOUT_SECS, ENDPOINT_FILE,
 };
 
 /// A pending approval as the UI sees it. The auth token is deliberately NOT included.
@@ -44,6 +44,10 @@ pub struct PendingView {
     pub arguments: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url_elicitation: Option<UrlElicitationRequest>,
+    /// Real values this call would release to a server that never produced them, for the
+    /// approver to look at. Never persisted and never sent anywhere but this local UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pii_release: Option<PiiReleaseRequest>,
     /// Wall-clock epoch-millis when this call auto-denies (park time + the fail-closed
     /// timeout). The UI counts down to this exactly, instead of approximating from when
     /// it first saw the request. App and broker share one clock, so it's accurate.
@@ -431,6 +435,54 @@ pub fn clear_endpoint() {
     }
 }
 
+/// What the broker can settle about a request before a human is involved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Preflight {
+    /// Unauthenticated: answer `Denied` and hang up.
+    Deny,
+    /// Covered by a fingerprint-bound allow: answer `Approved` without prompting.
+    AutoApprove,
+    /// Park it and wait for the person (or the fail-closed timeout).
+    AskHuman,
+}
+
+/// The authentication + auto-approve decision for one request, with no I/O so it can be
+/// exercised without a Tauri `AppHandle`. `is_allowed` answers whether a
+/// fingerprint-bound allow key is on the session or registry allowlist; it is consulted
+/// only for a key this function builds, which is why a legacy broad `server/tool` entry
+/// can never match (see the comment below).
+fn preflight(
+    req: &ApprovalRequest,
+    broker_token: &str,
+    is_allowed: impl Fn(&str) -> bool,
+) -> Preflight {
+    // Authenticate: only a process holding our token may register an approval. The empty
+    // check is not redundant with `token_eq`: if getrandom failed at startup our own token
+    // is empty, and without it every tokenless caller would authenticate.
+    if req.token.is_empty() || !token_eq(&req.token, broker_token) {
+        return Preflight::Deny;
+    }
+
+    // Auto-approve only if the current tool definition matches a fingerprint-bound allow.
+    // Legacy broad `server/tool` entries are intentionally ignored: a tool definition that
+    // changed since approval should re-prompt instead of inheriting a stale bypass. A
+    // request with no fingerprint at all likewise never auto-approves.
+    // A PII release is excluded for a stronger reason than a URL elicitation: the allow key
+    // binds a TOOL definition, and "this tool may run unprompted" is not consent to hand a
+    // particular customer's address to a server that never had it. Auto-approving here would
+    // let one earlier "always allow" quietly release every future value to that server.
+    if req.url_elicitation.is_none() && req.pii_release.is_none() {
+        if let Some(fp) = req.tool_fingerprint.as_deref() {
+            let key = crate::approval::fingerprint_allow_key(&req.server, &req.tool, fp);
+            if is_allowed(&key) {
+                return Preflight::AutoApprove;
+            }
+        }
+    }
+
+    Preflight::AskHuman
+}
+
 /// Serve one gateway connection: read the request, authenticate it, park it for a human
 /// decision (or a fail-closed timeout), and write the decision back.
 fn handle_conn(stream: TcpStream, broker: ApprovalBroker, app: AppHandle) {
@@ -482,28 +534,23 @@ fn handle_conn(stream: TcpStream, broker: ApprovalBroker, app: AppHandle) {
         );
     };
 
-    // Authenticate: only a process holding our token may register an approval.
-    if req.token.is_empty() || !token_eq(&req.token, &broker.inner.token) {
-        deny(&mut out);
-        return;
-    }
-
-    // Auto-approve only if the current tool definition matches a fingerprint-bound allow.
-    // Legacy broad `server/tool` entries are intentionally ignored: a tool definition that
-    // changed since approval should re-prompt instead of inheriting a stale bypass.
-    if req.url_elicitation.is_none() {
-        if let Some(fp) = req.tool_fingerprint.as_deref() {
-            let key = crate::approval::fingerprint_allow_key(&req.server, &req.tool, fp);
-            if broker.session_contains(&key) || registry_allows(&app, &key) {
-                let _ = out.set_write_timeout(Some(Duration::from_secs(10)));
-                let _ = writeln!(
-                    out,
-                    "{}",
-                    serde_json::to_string(&ApprovalDecision::Approved).unwrap_or_default()
-                );
-                return;
-            }
+    match preflight(&req, &broker.inner.token, |key| {
+        broker.session_contains(key) || registry_allows(&app, key)
+    }) {
+        Preflight::Deny => {
+            deny(&mut out);
+            return;
         }
+        Preflight::AutoApprove => {
+            let _ = out.set_write_timeout(Some(Duration::from_secs(10)));
+            let _ = writeln!(
+                out,
+                "{}",
+                serde_json::to_string(&ApprovalDecision::Approved).unwrap_or_default()
+            );
+            return;
+        }
+        Preflight::AskHuman => {}
     }
 
     let view = PendingView {
@@ -515,6 +562,7 @@ fn handle_conn(stream: TcpStream, broker: ApprovalBroker, app: AppHandle) {
         reason: req.reason,
         arguments: req.arguments.clone(),
         url_elicitation: req.url_elicitation.clone(),
+        pii_release: req.pii_release.clone(),
         // Stamp the deadline now, right before we park on `recv_timeout` below.
         deadline_ms: deadline_ms_from_now(),
     };
@@ -723,6 +771,7 @@ mod tests {
             reason: ApprovalReason::Destructive,
             arguments: serde_json::json!({}),
             url_elicitation: None,
+            pii_release: None,
             deadline_ms: deadline_ms_from_now(),
         };
         b.inner
@@ -825,6 +874,116 @@ mod tests {
         permits.push(try_acquire_connection(&active).expect("released permit is reusable"));
         drop(permits);
         assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    /// A fingerprinted request as a gateway sends it, carrying `token`.
+    fn request(token: &str, fingerprint: Option<&str>) -> ApprovalRequest {
+        ApprovalRequest {
+            token: token.into(),
+            id: "req-1".into(),
+            client: None,
+            server: "db".into(),
+            tool: "drop_table".into(),
+            reason: ApprovalReason::Destructive,
+            arguments: serde_json::json!({}),
+            tool_fingerprint: fingerprint.map(str::to_string),
+            url_elicitation: None,
+            pii_release: None,
+        }
+    }
+
+    /// The allowlist probe `handle_conn` passes to `preflight`, backed by a fixed key set.
+    fn allowing(keys: &[String]) -> impl Fn(&str) -> bool + '_ {
+        move |key: &str| keys.iter().any(|k| k == key)
+    }
+
+    #[test]
+    fn preflight_denies_a_wrong_or_empty_token() {
+        let allow_nothing = allowing(&[]);
+        assert_eq!(
+            preflight(&request("nope", Some("v2:abc")), "tok", &allow_nothing),
+            Preflight::Deny
+        );
+        assert_eq!(
+            preflight(&request("", Some("v2:abc")), "tok", &allow_nothing),
+            Preflight::Deny
+        );
+        // Fail closed when getrandom failed at startup and our own token is empty: an
+        // empty-vs-empty compare would otherwise authenticate every caller.
+        assert_eq!(
+            preflight(&request("", Some("v2:abc")), "", &allow_nothing),
+            Preflight::Deny
+        );
+        // Sanity: the same request with the right token gets past auth.
+        assert_eq!(
+            preflight(&request("tok", Some("v2:abc")), "tok", &allow_nothing),
+            Preflight::AskHuman
+        );
+    }
+
+    #[test]
+    fn preflight_auto_approves_only_a_fingerprint_allow() {
+        let fp_key = crate::approval::fingerprint_allow_key("db", "drop_table", "v2:abc");
+        let allowed = [fp_key];
+        assert_eq!(
+            preflight(&request("tok", Some("v2:abc")), "tok", allowing(&allowed)),
+            Preflight::AutoApprove
+        );
+        // A different tool definition is a different key, so it re-prompts.
+        assert_eq!(
+            preflight(&request("tok", Some("v2:xyz")), "tok", allowing(&allowed)),
+            Preflight::AskHuman
+        );
+    }
+
+    #[test]
+    fn preflight_ignores_a_legacy_server_tool_allow() {
+        // The pre-fingerprint broad key must NOT grant a bypass to a fingerprinted call:
+        // a tool definition that changed since approval has to be re-approved.
+        let legacy = [crate::approval::allow_key("db", "drop_table")];
+        assert_eq!(
+            preflight(&request("tok", Some("v2:abc")), "tok", allowing(&legacy)),
+            Preflight::AskHuman
+        );
+    }
+
+    #[test]
+    fn preflight_never_auto_approves_an_unfingerprinted_request() {
+        // No fingerprint means we cannot prove the definition is the approved one, so no
+        // allowlist entry of any shape may bypass the human.
+        let every_key = |_: &str| true;
+        assert_eq!(
+            preflight(&request("tok", None), "tok", every_key),
+            Preflight::AskHuman
+        );
+        // Still denied first on a bad token.
+        assert_eq!(
+            preflight(&request("bad", None), "tok", every_key),
+            Preflight::Deny
+        );
+    }
+
+    #[test]
+    fn preflight_never_auto_approves_a_pii_release() {
+        // SBS-696: the allow key binds a TOOL DEFINITION. "This tool may run unprompted" is
+        // not consent to hand a specific customer's address to a server that never had it,
+        // so an existing allow must not silently release every later value to it.
+        let mut req = request("tok", Some("v2:abc"));
+        req.reason = ApprovalReason::PiiCrossServer;
+        req.pii_release = Some(crate::approval::PiiReleaseRequest {
+            server: "mailer".into(),
+            values: vec![crate::approval::PiiReleaseValue {
+                token: "⟦EMAIL_1⟧".into(),
+                value: "ada@example.com".into(),
+                origins: vec!["crm".into()],
+            }],
+        });
+
+        // Every key allowed, and it still asks.
+        assert_eq!(preflight(&req, "tok", |_: &str| true), Preflight::AskHuman);
+        // Authentication still comes first.
+        req.token = "bad".into();
+        assert_eq!(preflight(&req, "tok", |_: &str| true), Preflight::Deny);
     }
 
     #[test]

@@ -165,6 +165,91 @@ describe("SecretsDialog client credentials (SBS-524)", () => {
     await waitFor(() => expect(clearClientCredentials).toHaveBeenCalledWith("srv-1"));
   });
 
+  it("does not treat a failed secret probe as a missing secret", async () => {
+    hasClientSecret.mockRejectedValue(new Error("keychain unavailable"));
+    const user = await openDialog(
+      server({ clientCredentials: { clientId: "client-abc" } }),
+    );
+    await waitFor(() => expect(hasClientSecret).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByText(/Couldn't check the stored secret/)).toBeInTheDocument(),
+    );
+
+    await user.type(screen.getByPlaceholderText(/Scopes \(optional/i), "mcp:read");
+    await user.click(screen.getByRole("button", { name: "Save client credentials" }));
+
+    await waitFor(() =>
+      expect(setClientCredentials).toHaveBeenCalledWith(
+        "srv-1",
+        "client-abc",
+        "",
+        null,
+        "mcp:read",
+      ),
+    );
+    expect(toastError).not.toHaveBeenCalledWith(
+      "Enter the client secret issued by your authorization server.",
+    );
+    await waitFor(() => expect(screen.getByText(/secret stored/i)).toBeInTheDocument());
+    expect(
+      screen.queryByText(/Couldn't check the stored secret/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("retries the secret probe without wiping typed fields", async () => {
+    hasClientSecret
+      .mockRejectedValueOnce(new Error("keychain unavailable"))
+      .mockResolvedValueOnce(false);
+    const user = await openDialog(server());
+    await user.click(
+      screen.getByText(/No browser available\? Use a client id and secret/i),
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/Couldn't check the stored secret/)).toBeInTheDocument(),
+    );
+    await user.type(screen.getByPlaceholderText("Client ID"), "typed-id");
+    await user.click(screen.getByRole("button", { name: "Retry the secret check" }));
+    await waitFor(() => expect(hasClientSecret).toHaveBeenCalledTimes(2));
+    expect(screen.getByPlaceholderText("Client ID")).toHaveValue("typed-id");
+    expect(
+      screen.queryByText(/Couldn't check the stored secret/),
+    ).not.toBeInTheDocument();
+  });
+
+  /// Reopening the dialog for a different server must not show the previous
+  /// server's "secret stored" badge while the new probe is still in flight.
+  it("does not carry the stored badge across servers while the probe is pending", async () => {
+    hasClientSecret.mockResolvedValueOnce(true);
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <SecretsDialog
+        server={server({ clientCredentials: { clientId: "a-id" } })}
+        onSaved={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button"));
+    await waitFor(() => expect(screen.getByText(/secret stored/i)).toBeInTheDocument());
+    await user.keyboard("{Escape}");
+
+    // Server B's probe never settles inside this test.
+    hasClientSecret.mockImplementation(() => new Promise(() => {}));
+    rerender(
+      <SecretsDialog
+        server={server({
+          id: "srv-2",
+          name: "Other MCP",
+          clientCredentials: { clientId: "b-id" },
+        })}
+        onSaved={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /Other MCP/ }));
+    await waitFor(() =>
+      expect(screen.getByPlaceholderText("Client ID")).toHaveValue("b-id"),
+    );
+    expect(screen.queryByText(/secret stored/i)).not.toBeInTheDocument();
+  });
+
   it("refuses to save without a client id instead of calling the backend", async () => {
     const user = await openDialog(server());
     await user.click(

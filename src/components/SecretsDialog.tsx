@@ -99,10 +99,11 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   const [ccOpen, setCcOpen] = useState(false);
   const [ccBusy, setCcBusy] = useState(false);
   const [ccSecretSet, setCcSecretSet] = useState(false);
-  // Whether the `hasClientSecret` probe has settled. The "secret required" guard
-  // below must not fire while this is unknown, or a fast click after opening
-  // would demand a credential that is already vaulted.
+  // Whether the `hasClientSecret` probe succeeded. Failure must stay unknown:
+  // treating it as "not stored" blocks a real vaulted secret with a first-time
+  // prompt (SBS-722).
   const [ccSecretKnown, setCcSecretKnown] = useState(false);
+  const [ccSecretProbeError, setCcSecretProbeError] = useState(false);
   const [ccClientId, setCcClientId] = useState("");
   const [ccSecret, setCcSecret] = useState("");
   const [ccScope, setCcScope] = useState("");
@@ -147,18 +148,45 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       setCcMethod(cc?.tokenEndpointAuthMethod ?? "");
       setCcSecret("");
       setCcOpen(cc != null);
+      setCcSecretSet(false);
       setCcSecretKnown(false);
+      setCcSecretProbeError(false);
       hasClientSecret(server.id)
-        .then((v) => fresh() && setCcSecretSet(v))
-        .catch(() => {})
-        // Settled either way: on failure the backend stays authoritative.
-        .finally(() => fresh() && setCcSecretKnown(true));
+        .then((v) => {
+          if (!fresh()) return;
+          setCcSecretSet(v);
+          setCcSecretKnown(true);
+          setCcSecretProbeError(false);
+        })
+        .catch(() => {
+          if (!fresh()) return;
+          setCcSecretSet(false);
+          setCcSecretKnown(false);
+          setCcSecretProbeError(true);
+        });
       setProbing(true);
       setAuthInfo(null);
       probeAuth(server.url)
         .then((v) => fresh() && setAuthInfo(v))
         .catch(() => {})
         .finally(() => fresh() && setProbing(false));
+    }
+  }
+
+  async function retrySecretProbe() {
+    const runId = ++runIdRef.current;
+    setCcSecretKnown(false);
+    setCcSecretProbeError(false);
+    try {
+      const present = await hasClientSecret(server.id);
+      if (runId !== runIdRef.current) return;
+      setCcSecretSet(present);
+      setCcSecretKnown(true);
+    } catch {
+      if (runId !== runIdRef.current) return;
+      setCcSecretSet(false);
+      setCcSecretKnown(false);
+      setCcSecretProbeError(true);
     }
   }
 
@@ -223,6 +251,8 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
         ),
       );
       setCcSecretSet(true);
+      setCcSecretKnown(true);
+      setCcSecretProbeError(false);
       setCcSecret("");
       toast.success("Saved client credentials", {
         description: "The next connection will request a token. No browser needed.",
@@ -240,6 +270,8 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
     try {
       onSaved(await clearClientCredentials(server.id));
       setCcSecretSet(false);
+      setCcSecretKnown(true);
+      setCcSecretProbeError(false);
       setCcClientId("");
       setCcSecret("");
       setCcScope("");
@@ -510,6 +542,11 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                               <Check className="size-3" /> secret stored
                             </span>
                           )}
+                          {ccSecretProbeError && (
+                            <span className="text-[11px] text-warning">
+                              Couldn&apos;t check the stored secret
+                            </span>
+                          )}
                         </div>
                         <p className="text-[11px] text-muted-foreground">
                           For servers that authenticate the application rather than a
@@ -546,7 +583,19 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                           {ccSecretSet
                             ? " It cannot be shown again; leave the field blank to keep it."
                             : ""}
+                          {ccSecretProbeError
+                            ? " Toolport couldn't check whether one is already stored, so it will not assume the field is empty. Retry or save and let the backend decide."
+                            : ""}
                         </p>
+                        {ccSecretProbeError && (
+                          <button
+                            type="button"
+                            className="text-[11px] font-medium text-primary hover:underline"
+                            onClick={() => void retrySecretProbe()}
+                          >
+                            Retry the secret check
+                          </button>
+                        )}
                         <div className="flex gap-2">
                           <Button
                             size="sm"

@@ -254,7 +254,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         http("Notion", "Search and edit Notion pages and databases.", "https://mcp.notion.com/mcp", "https://developers.notion.com"),
         http("Composio", "Connect AI agents to 1,000+ apps (Gmail, Slack, GitHub, Notion, Linear, and more).", "https://connect.composio.dev/mcp", "https://composio.dev"),
         http("Linear", "Issues, projects, and cycles in Linear.", "https://mcp.linear.app/mcp", "https://linear.app/docs"),
-        http("Atlassian", "Jira issues and Confluence pages.", "https://mcp.atlassian.com/v1/mcp", "https://support.atlassian.com/atlassian-rovo-mcp-server/"),
+        http("Atlassian", "Jira issues and Confluence pages.", "https://mcp.atlassian.com/v1/mcp/authv2", "https://support.atlassian.com/atlassian-rovo-mcp-server/"),
         http("Asana", "Tasks, projects, and portfolios in Asana.", "https://mcp.asana.com/mcp", "https://developers.asana.com/docs/mcp-server"),
         cmd("Airtable", "Read and write records in your Airtable bases.", "npx", &["-y", "airtable-mcp-server"], &["AIRTABLE_API_KEY"], "https://github.com/domdomegg/airtable-mcp-server"),
         cmd("Todoist", "Manage Todoist tasks and projects.", "npx", &["-y", "@abhiz123/todoist-mcp-server"], &["TODOIST_API_TOKEN"], "https://github.com/abhiz123/todoist-mcp-server"),
@@ -587,6 +587,18 @@ mod tests {
     }
 
     #[test]
+    fn atlassian_uses_the_authv2_endpoint() {
+        let atlassian = curated()
+            .into_iter()
+            .find(|entry| entry.name == "Atlassian")
+            .expect("Atlassian must remain in the curated catalog");
+        assert_eq!(
+            atlassian.url.as_deref(),
+            Some("https://mcp.atlassian.com/v1/mcp/authv2")
+        );
+    }
+
+    #[test]
     fn filter_catalog_matches_category_headings() {
         let c = curated();
         let databases = filter_catalog(c.clone(), "databases");
@@ -696,6 +708,101 @@ mod tests {
         assert_eq!(e.command.as_deref(), Some("npx"));
         assert_eq!(e.args, vec!["-y", "@acme/widget-mcp@1.2.3"]);
         assert_eq!(e.env_keys, vec!["ACME_API_KEY"]);
+    }
+
+    #[test]
+    fn maps_a_pypi_package_to_uvx() {
+        let server = json!({
+            "name": "io.github.acme/pytool",
+            "description": "A python server.",
+            "packages": [{
+                "registryType": "pypi",
+                "identifier": "acme-mcp",
+                "version": "0.4.2"
+            }]
+        });
+        let e = map_server(&server).unwrap();
+        assert_eq!(e.transport, "stdio");
+        assert_eq!(e.command.as_deref(), Some("uvx"));
+        // uvx takes the spec alone — no `-y`-style prefix.
+        assert_eq!(e.args, vec!["acme-mcp@0.4.2"]);
+
+        // `latest` is a dist-tag, not a version, so the bare identifier is used.
+        let latest = json!({ "name": "io.github.acme/pytool", "title": "Pytool",
+            "packages": [{ "registryType": "pypi", "identifier": "acme-mcp", "version": "latest" }] });
+        let e = map_server(&latest).unwrap();
+        assert_eq!(e.command.as_deref(), Some("uvx"));
+        assert_eq!(e.args, vec!["acme-mcp"]);
+
+        // Same for a missing version.
+        let bare = json!({ "name": "io.github.acme/pytool", "title": "Pytool",
+            "packages": [{ "registryType": "pypi", "identifier": "acme-mcp" }] });
+        assert_eq!(map_server(&bare).unwrap().args, vec!["acme-mcp"]);
+    }
+
+    #[test]
+    fn maps_container_packages_to_a_docker_run() {
+        // "oci" and "docker" are the two spellings the registry uses for the same thing.
+        for registry_type in ["oci", "docker"] {
+            let server = json!({
+                "name": "io.github.acme/boxed",
+                "description": "A containerized server.",
+                "packages": [{
+                    "registryType": registry_type,
+                    "identifier": "ghcr.io/acme/boxed-mcp",
+                    "version": "1.2.3",
+                    "environmentVariables": [{ "name": "ACME_API_KEY" }]
+                }]
+            });
+            let e = map_server(&server).unwrap();
+            assert_eq!(e.transport, "stdio");
+            assert_eq!(e.command.as_deref(), Some("docker"), "{registry_type}");
+            // stdio needs the container's stdin held open and the container reaped,
+            // so `-i --rm` must precede the image spec.
+            assert_eq!(
+                e.args,
+                vec!["run", "-i", "--rm", "ghcr.io/acme/boxed-mcp@1.2.3"],
+                "{registry_type}"
+            );
+            assert_eq!(e.env_keys, vec!["ACME_API_KEY"], "{registry_type}");
+        }
+
+        // No version: the image spec is the bare identifier.
+        let bare = json!({ "name": "io.github.acme/boxed", "title": "Boxed",
+            "packages": [{ "registryType": "oci", "identifier": "ghcr.io/acme/boxed-mcp" }] });
+        assert_eq!(
+            map_server(&bare).unwrap().args,
+            vec!["run", "-i", "--rm", "ghcr.io/acme/boxed-mcp"]
+        );
+    }
+
+    #[test]
+    fn map_server_rejects_unsafe_specs_for_every_registry_type() {
+        // The safety gate runs before the registry_type match, so uvx and docker get
+        // the same treatment npx does.
+        for registry_type in ["pypi", "oci", "docker"] {
+            // Leading-dash identifier (flag injection into uvx/docker) is dropped.
+            let flag = json!({ "name": "io.x/y", "title": "Y",
+                "packages": [{ "registryType": registry_type, "identifier": "--unsafe-flag" }] });
+            assert!(
+                map_server(&flag).is_none(),
+                "{registry_type}: flag-injection identifier must be dropped"
+            );
+            // Shell metacharacters in the version are dropped.
+            let meta = json!({ "name": "io.x/z", "title": "Z",
+                "packages": [{ "registryType": registry_type, "identifier": "pkg", "version": "1; rm -rf /" }] });
+            assert!(
+                map_server(&meta).is_none(),
+                "{registry_type}: shell metachars must be dropped"
+            );
+            // An empty identifier has nothing to install.
+            let empty = json!({ "name": "io.x/w", "title": "W",
+                "packages": [{ "registryType": registry_type, "identifier": "" }] });
+            assert!(
+                map_server(&empty).is_none(),
+                "{registry_type}: empty identifier must be dropped"
+            );
+        }
     }
 
     #[test]

@@ -805,6 +805,7 @@ function Done({
   // servers healthy": swallowing it to health=[] would show a confident "you're
   // set up" over servers we never actually checked, so track it separately.
   const [probeFailed, setProbeFailed] = useState(false);
+  const [probeAttempt, setProbeAttempt] = useState(0);
   useEffect(() => {
     if (serverCount === 0) {
       setHealth([]);
@@ -812,6 +813,8 @@ function Done({
       return;
     }
     let alive = true;
+    setHealth(null);
+    setProbeFailed(false);
     onProbe()
       .then((r) => {
         if (!alive) return;
@@ -820,18 +823,23 @@ function Done({
       })
       .catch(() => {
         if (!alive) return;
-        setHealth([]);
         setProbeFailed(true);
       });
     return () => {
       alive = false;
     };
-  }, [serverCount, onProbe]);
+  }, [serverCount, onProbe, probeAttempt]);
 
   const nameFor = (id: string) => registry.servers.find((s) => s.id === id)?.name ?? id;
   const broken = (health ?? []).filter((r) => !r.ok && !r.authRequired);
 
-  const ready = serverCount > 0 && connectedCount > 0;
+  const configured = serverCount > 0 && connectedCount > 0;
+  // Verification states only apply once setup is actually complete: with no client
+  // connected the step reports what's missing, and must not dress the finish button
+  // or the status blocks in "Checking…" / "couldn't verify" language.
+  const checkingHealth = configured && health === null && !probeFailed;
+  const verificationFailed = configured && probeFailed;
+  const ready = configured && health !== null && !probeFailed;
   // The client to verify against: the first one Toolport is actually wired into.
   const verifyClient = clients.find((c) => c.gatewayInstalled) ?? null;
   const missing = [
@@ -844,7 +852,15 @@ function Done({
     <>
       <StepHeader
         icon={<Check className="size-5" />}
-        title={ready ? "You're set up" : "Setup started"}
+        title={
+          ready
+            ? "You're set up"
+            : configured && checkingHealth
+              ? "Checking your setup"
+              : configured && probeFailed
+                ? "Setup couldn't be verified"
+                : "Setup started"
+        }
       >
         {ready ? (
           <>
@@ -856,6 +872,15 @@ function Done({
             success. And Toolport watches every server for tampering and prompt injection,
             see Activity.
           </>
+        ) : configured && checkingHealth ? (
+          <>
+            Toolport is checking that your servers can start before marking setup ready.
+          </>
+        ) : configured && probeFailed ? (
+          <>
+            Your servers and client are connected, but Toolport could not verify server
+            health. Retry the check below or continue without verification.
+          </>
         ) : (
           <>
             You haven't {missing} yet. You can do both any time from the main screen: add
@@ -863,6 +888,16 @@ function Done({
           </>
         )}
       </StepHeader>
+
+      {checkingHealth && (
+        <div
+          role="status"
+          className="flex items-center gap-2 rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+        >
+          <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+          Checking server health…
+        </div>
+      )}
 
       {broken.length > 0 && (
         <div className="flex flex-col gap-2 rounded-md bg-warning/10 px-3 py-2 text-sm">
@@ -891,10 +926,19 @@ function Done({
         </div>
       )}
 
-      {probeFailed && (
-        <div className="rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          Couldn&apos;t verify your servers started, the health check didn&apos;t run.
-          Open the main screen to see each server&apos;s live status.
+      {verificationFailed && (
+        <div className="flex items-center gap-2 rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          <span>
+            Couldn&apos;t verify your servers started, the health check didn&apos;t run.
+          </span>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => setProbeAttempt((attempt) => attempt + 1)}
+          >
+            Retry
+          </Button>
         </div>
       )}
 
@@ -903,7 +947,11 @@ function Done({
       )}
 
       <Button onClick={onFinish} className="self-start">
-        {ready ? "Start using Toolport" : "Got it"}
+        {checkingHealth || verificationFailed
+          ? "Continue without verification"
+          : ready
+            ? "Start using Toolport"
+            : "Got it"}
         <ArrowRight className="size-4" />
       </Button>
     </>
@@ -926,23 +974,32 @@ export function VerifyCall({
   timeoutMs?: number;
 }) {
   const prompt = "List the tools you can use through Toolport.";
-  const [status, setStatus] = useState<"waiting" | "success" | "timeout">("waiting");
+  const [status, setStatus] = useState<
+    "snapshot" | "waiting" | "success" | "timeout" | "snapshot-failed"
+  >("snapshot");
   const [hit, setHit] = useState<AuditEntry | null>(null);
+  const [snapshotAttempt, setSnapshotAttempt] = useState(0);
 
   useEffect(() => {
     let alive = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = Date.now() + timeoutMs;
+    setHit(null);
+    setStatus("snapshot");
     void (async () => {
-      // Snapshot the newest existing call so only a call made from here on counts. Compare
-      // audit ts to audit ts (unit-agnostic); the deadline uses wall-clock independently.
+      // Snapshot must succeed before anything can count. A failed read used to
+      // leave since=0, so the next poll could celebrate retained history.
       let since = 0;
       try {
         const recent = await getAuditLog(1);
+        if (!alive) return;
         if (recent[0]) since = recent[0].ts;
       } catch {
-        // No log yet is fine: `since` stays 0, so the first-ever call still counts.
+        if (alive) setStatus("snapshot-failed");
+        return;
       }
+      if (!alive) return;
+      setStatus("waiting");
       const poll = async () => {
         if (!alive) return;
         try {
@@ -954,7 +1011,7 @@ export function VerifyCall({
             return;
           }
         } catch {
-          // Transient read error: keep polling until the deadline.
+          // Transient read error after a good baseline: keep polling.
         }
         if (Date.now() > deadline) {
           setStatus("timeout");
@@ -968,7 +1025,7 @@ export function VerifyCall({
       alive = false;
       if (timer) clearTimeout(timer);
     };
-  }, [pollMs, timeoutMs]);
+  }, [pollMs, timeoutMs, snapshotAttempt]);
 
   async function copyPrompt() {
     try {
@@ -990,42 +1047,65 @@ export function VerifyCall({
         <div className="flex items-start gap-2 rounded-md bg-success/10 px-3 py-2 text-sm">
           <Check className="mt-0.5 size-4 shrink-0 text-success" />
           <span>
-            <span className="font-medium text-success">It works.</span> A call just
-            reached Toolport: <code className="text-xs">{hit.tool}</code>
+            <span className="font-medium text-success">It works.</span> A call reached
+            Toolport after this check started: <code className="text-xs">{hit.tool}</code>
             {hit.server ? (
               <>
                 {" "}
                 on <code className="text-xs">{hit.server}</code>
               </>
             ) : null}
-            .
+            . Local stdio calls are not tagged with a client, so this is not proof it came
+            from {client.name}.
           </span>
         </div>
       ) : (
         <>
-          <p className="text-xs text-muted-foreground">
-            In {client.name}, ask your agent to run this. It's read-only, it just lists
-            your tools through Toolport.
-          </p>
-          <div className="flex items-center gap-2 rounded border bg-background px-2 py-1.5">
-            <code className="min-w-0 flex-1 truncate text-xs">{prompt}</code>
-            <button
-              type="button"
-              onClick={() => void copyPrompt()}
-              aria-label="Copy the prompt"
-              className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-            >
-              <Copy className="size-3.5" />
-            </button>
-          </div>
+          {status === "waiting" && (
+            <>
+              <p className="text-xs text-muted-foreground">
+                In {client.name}, ask your agent to run this. It's read-only, it just
+                lists your tools through Toolport.
+              </p>
+              <div className="flex items-center gap-2 rounded border bg-background px-2 py-1.5">
+                <code className="min-w-0 flex-1 truncate text-xs">{prompt}</code>
+                <button
+                  type="button"
+                  onClick={() => void copyPrompt()}
+                  aria-label="Copy the prompt"
+                  className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                >
+                  <Copy className="size-3.5" />
+                </button>
+              </div>
+            </>
+          )}
 
-          {status === "waiting" ? (
+          {status === "snapshot" || status === "waiting" ? (
             <div className="flex items-start gap-2 text-xs text-muted-foreground">
               <Loader2 className="mt-0.5 size-3.5 shrink-0 animate-spin" />
               <span>
-                Waiting for the first call from {client.name}. Just connected it?{" "}
-                {clientRestartHint(client.name, client.id)}
+                {status === "snapshot"
+                  ? "Reading the audit log so older calls cannot count as proof."
+                  : `Waiting for a new call after this check started. Just connected ${client.name}? ${clientRestartHint(client.name, client.id)}`}
               </span>
+            </div>
+          ) : status === "snapshot-failed" ? (
+            <div className="flex flex-col gap-1.5 rounded-md bg-warning/10 px-3 py-2 text-xs">
+              <span className="font-medium text-warning">
+                Couldn&apos;t read the audit log, so this check did not start.
+              </span>
+              <span className="text-muted-foreground">
+                An older or unrelated call will not be treated as proof. Retry when the
+                log is available, or use the Playground.
+              </span>
+              <button
+                type="button"
+                onClick={() => setSnapshotAttempt((n) => n + 1)}
+                className="self-start font-medium text-primary hover:underline"
+              >
+                Retry the check
+              </button>
             </div>
           ) : (
             <div className="flex flex-col gap-1.5 rounded-md bg-warning/10 px-3 py-2 text-xs">

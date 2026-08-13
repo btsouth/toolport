@@ -55,6 +55,9 @@ dist-ssr
 # kept local; the README's demo.mp4/.gif/.srt stay tracked.
 /docs/conduit-llmstudio-demo*.mp4
 /captions.srt
+# Standalone HTML animations rendered for individual posts/videos.
+/mcp-usb-animation.html
+/toolport-cta-end-card.html
 
 # Stray test artifacts (e.g. share/export test exports)
 /src-tauri/test.json
@@ -96,6 +99,8 @@ license-signing.keycd
 /docs/SITE-MESSAGING.md
 /docs/specs/
 /docs/drafts/
+# Captured design direction, explicitly "not a committed spec".
+/docs/HIL-TEAMS-MOBILE.md
 
 # Agent/session scratch (never commit)
 _poll_pr.py

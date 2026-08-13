@@ -353,8 +353,47 @@ fn resolve_client_config_path(
     Some(path)
 }
 
+/// Claude Code relocates its whole config tree - `.claude.json` included - when
+/// `CLAUDE_CONFIG_DIR` is set, so the default `~/.claude.json` is not always the
+/// file it reads.
+///
+/// Resolving only the default is not a cosmetic miss: Toolport rewrites the
+/// gateway path in this file on every upgrade, so a relocated config keeps
+/// pinning whichever versioned binary was current when it was written. The
+/// client then respawns that obsolete gateway forever, and the "app is still
+/// launching an old gateway" reaper cannot win - it stops the process, and the
+/// config Toolport never updated starts it again.
+///
+/// Taken from Toolport's own environment, which covers a user who exports the
+/// variable. It does NOT cover a launcher that sets the variable only for the
+/// child process it spawns - Toolport cannot see that, and such a config stays
+/// stale. Kept split from the pure path table so tests stay env-free.
+fn claude_config_dir_override() -> Option<PathBuf> {
+    claude_config_dir_from(std::env::var_os("CLAUDE_CONFIG_DIR"))
+}
+
+/// The env-free half of [`claude_config_dir_override`], so the validation rules
+/// are testable without mutating process environment from a parallel test.
+fn claude_config_dir_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let dir = PathBuf::from(raw?);
+    // An empty or relative value is a misconfiguration, not an instruction to
+    // write somewhere surprising: fall back to the documented default rather
+    // than resolving against whatever cwd Toolport happens to have.
+    dir.is_absolute().then_some(dir)
+}
+
+/// The `.claude.json` a Claude Code process reads, given its config dir.
+fn claude_code_config_path(config_dir: &std::path::Path) -> PathBuf {
+    config_dir.join(".claude.json")
+}
+
 fn client_config_path(client_id: &str) -> Option<PathBuf> {
     let home = home()?;
+    if client_id == "claude-code" {
+        if let Some(dir) = claude_config_dir_override() {
+            return Some(claude_code_config_path(&dir));
+        }
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         return resolve_client_config_path_linux(client_id, &home);
@@ -2491,7 +2530,24 @@ pub fn detect_clients() -> Vec<DetectedClient> {
 /// still match without storing tokens on the registry (SOU-406/407).
 fn managed_matches_detected(server: &McpServer, rec: &ManagedEntry) -> bool {
     let cmd = server.command.as_deref().unwrap_or("");
-    if cmd != rec.command {
+    // A command that differs only by *which of our gateway binaries* it names is
+    // path drift, not a user taking the entry over.
+    //
+    // Requiring byte equality here made the ownership record a trap: anything that
+    // rewrote the path out from under it - a republish under a content-addressed
+    // filename, a data-dir move, a support fix applied by hand - silently
+    // reclassified the entry as Customized, and `repoint_stale_gateways` skips
+    // Customized entries. The client was then abandoned on whatever binary it
+    // happened to hold, permanently, and the only evidence was an eprintln the
+    // desktop app writes to a stderr nobody reads.
+    //
+    // Issue #487 is preserved exactly: an entry repointed at npx / docker / a
+    // wrapper script fails `command_is_gateway_binary` and is still Customized.
+    // Only the "still ours, different path" case is forgiven, and args/env/url
+    // below stay byte-strict so a genuine customization anywhere else still counts.
+    if cmd != rec.command
+        && !(command_is_gateway_binary(cmd) && command_is_gateway_binary(&rec.command))
+    {
         return false;
     }
     let server_args = crate::registry::strip_auth_header_args(&server.args);
@@ -2588,6 +2644,14 @@ pub struct RepointOutcome {
     pub repointed: Vec<(String, ManagedEntry)>,
     /// Client ids left alone because their entry is user-customized.
     pub customized: Vec<String>,
+    /// Clients that needed a re-point and could not be written, with the reason.
+    ///
+    /// Previously an `install_gateway` error here was dropped on the floor by an
+    /// `if let Ok(..)`, which made a client that failed to migrate look exactly
+    /// like one that never needed to - no log line, no retry, no surface in the
+    /// UI. Six clients on this developer's machine sat on a superseded gateway
+    /// for days with nothing anywhere recording why.
+    pub failed: Vec<(String, String)>,
 }
 
 fn find_def(client_id: &str) -> Option<ClientDef> {
@@ -4609,8 +4673,14 @@ fn read_gateway_profile(client_id: &str) -> Option<String> {
 /// never be re-pointed onto a current binary. Deleting one out from under a plugin
 /// entry leaves a reference nothing will ever repair.
 pub fn referenced_gateway_paths() -> Option<Vec<PathBuf>> {
+    referenced_gateway_paths_in(&detect_clients())
+}
+
+/// The pure half of [`referenced_gateway_paths`], over an already-probed client list so
+/// the fail-closed and plugin-reference rules are testable without touching real configs.
+fn referenced_gateway_paths_in(clients: &[DetectedClient]) -> Option<Vec<PathBuf>> {
     let mut out: Vec<PathBuf> = Vec::new();
-    for client in detect_clients() {
+    for client in clients {
         if client.error.is_some() {
             return None;
         }
@@ -4685,19 +4755,103 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
             .as_deref()
             .and_then(profile_from_config_text)
             .or_else(|| read_gateway_profile(&client.id));
-        if let Ok(write) = install_gateway(&client.id, profile.as_deref()) {
-            if let Some(m) = write.managed {
-                outcome.repointed.push((client.id.clone(), m));
+        match install_gateway(&client.id, profile.as_deref()) {
+            Ok(write) => match write.managed {
+                Some(m) => outcome.repointed.push((client.id.clone(), m)),
+                // Written, but no ownership snapshot came back, so the registry
+                // would keep the superseded command and read this entry as
+                // Customized on the next pass - i.e. we would stop maintaining a
+                // client we just rewrote. Worth recording rather than assuming.
+                None => outcome.failed.push((
+                    client.id.clone(),
+                    "config was written but returned no ownership record".to_string(),
+                )),
+            },
+            Err(error) => {
+                let msg = format!(
+                    "toolport: could not re-point {}'s gateway entry from {} to {}: {error}",
+                    client.id,
+                    if stored.is_empty() { "none" } else { stored },
+                    current,
+                );
+                eprintln!("{msg}");
+                crate::gatewaylog::append(&msg);
+                outcome.failed.push((client.id.clone(), error.to_string()));
             }
         }
     }
+    log_repoint_outcome(&current, &outcome);
     outcome
+}
+
+/// Record a re-point pass in the gateway log.
+///
+/// This runs in the desktop app, whose stderr no one ever sees, so until now a
+/// re-point left no durable trace at all: a pass that migrated every client and a
+/// pass that silently skipped six of them produced identical evidence. The log is
+/// what `gather_diagnostics` bundles, so a stale-gateway report can be answered
+/// from it instead of reconstructed from file mtimes.
+fn log_repoint_outcome(current: &str, outcome: &RepointOutcome) {
+    if outcome.repointed.is_empty() && outcome.customized.is_empty() && outcome.failed.is_empty() {
+        return;
+    }
+    let ids = |pairs: &[(String, ManagedEntry)]| {
+        pairs
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    crate::gatewaylog::append(&format!(
+        "toolport: re-point pass against {current}: {} re-pointed [{}], {} customized [{}], {} failed [{}]",
+        outcome.repointed.len(),
+        ids(&outcome.repointed),
+        outcome.customized.len(),
+        outcome.customized.join(", "),
+        outcome.failed.len(),
+        outcome
+            .failed
+            .iter()
+            .map(|(id, why)| format!("{id}: {why}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+    ));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::registry::EnvVar;
+
+    #[test]
+    fn claude_code_config_follows_a_relocated_config_dir() {
+        // Claude Code moves `.claude.json` when CLAUDE_CONFIG_DIR is set. Resolving
+        // only `~/.claude.json` leaves the relocated copy pinned to whichever
+        // versioned gateway binary was current when it was last written, and the
+        // client then respawns that obsolete gateway indefinitely.
+        let relocated = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\someone\.claude-work")
+        } else {
+            PathBuf::from("/home/someone/.claude-work")
+        };
+        assert_eq!(
+            claude_config_dir_from(Some(relocated.clone().into_os_string())),
+            Some(relocated.clone())
+        );
+        assert_eq!(
+            claude_code_config_path(&relocated),
+            relocated.join(".claude.json")
+        );
+    }
+
+    #[test]
+    fn an_unset_or_unusable_claude_config_dir_falls_back_to_the_default() {
+        assert_eq!(claude_config_dir_from(None), None);
+        assert_eq!(claude_config_dir_from(Some("".into())), None);
+        // Relative: resolving it would depend on Toolport's cwd, which has nothing
+        // to do with where the client reads its config.
+        assert_eq!(claude_config_dir_from(Some("relative/dir".into())), None);
+    }
 
     fn sample_gateway(profile: Option<&str>, client_id: &str) -> ServerEntry {
         let mut env = vec![EnvVar {
@@ -5787,6 +5941,103 @@ bad = "not-a-table"
         }
     }
 
+    /// A detected client with no servers, no error, and a config file present.
+    fn detected(id: &str) -> DetectedClient {
+        DetectedClient {
+            id: id.into(),
+            name: id.into(),
+            uses_connectors: false,
+            config_path: format!("/tmp/{id}.json"),
+            config_exists: true,
+            app_present: true,
+            servers: Vec::new(),
+            plugin_servers: Vec::new(),
+            gateway_installed: true,
+            entry_state: GatewayEntryState::Managed,
+            error: None,
+        }
+    }
+
+    fn gateway_server(name: &str, command: &str) -> McpServer {
+        McpServer {
+            name: name.into(),
+            transport: "stdio".into(),
+            command: Some(command.into()),
+            args: vec![],
+            env_keys: vec![],
+            url: None,
+        }
+    }
+
+    #[test]
+    fn referenced_gateway_paths_fails_closed_on_an_unreadable_client() {
+        // An unreadable config means that client's references are UNKNOWN, and an unknown
+        // reference must never be read as an absent one - the caller skips the whole prune.
+        let mut broken = detected("claude-desktop");
+        broken.error = Some("permission denied".into());
+        assert_eq!(referenced_gateway_paths_in(&[broken.clone()]), None);
+
+        // ...and it still fails closed alongside a client we CAN read, rather than
+        // handing back a partial list that would make the other binary look unreferenced.
+        let mut healthy = detected("cursor");
+        healthy.servers = vec![gateway_server(
+            GATEWAY_ENTRY_NAME,
+            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.5.exe",
+        )];
+        assert_eq!(
+            referenced_gateway_paths_in(&[healthy.clone(), broken.clone()]),
+            None,
+            "one unreadable client must veto the whole set, not yield a partial list"
+        );
+        assert_eq!(referenced_gateway_paths_in(&[broken, healthy]), None);
+    }
+
+    #[test]
+    fn referenced_gateway_paths_includes_plugin_and_customized_entries() {
+        let plugin_path = r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.8.0.exe";
+        // Plugin servers live outside the main config and can never be re-pointed, so a
+        // binary only they name must still survive the prune.
+        let mut plugin_only = detected("cursor");
+        plugin_only.plugin_servers = vec![gateway_server(GATEWAY_ENTRY_NAME, plugin_path)];
+        assert_eq!(
+            referenced_gateway_paths_in(&[plugin_only.clone()]),
+            Some(vec![PathBuf::from(plugin_path)])
+        );
+
+        // A customized entry (repoint leaves it alone) still names a binary the client
+        // will spawn, so it is included too.
+        let customized_path = r"C:\Users\me\custom\toolport-gateway-1.7.0.exe";
+        let mut customized = detected("windsurf");
+        customized.entry_state = GatewayEntryState::Customized;
+        customized.servers = vec![gateway_server(GATEWAY_ENTRY_NAME, customized_path)];
+        assert_eq!(
+            referenced_gateway_paths_in(&[customized.clone()]),
+            Some(vec![PathBuf::from(customized_path)])
+        );
+
+        // Both together, de-duplicated, and unrelated servers ignored.
+        let mut noise = detected("cline");
+        noise.servers = vec![gateway_server("github", "npx")];
+        let mut dupe = detected("claude-code");
+        dupe.servers = vec![gateway_server(GATEWAY_ENTRY_NAME, plugin_path)];
+        assert_eq!(
+            referenced_gateway_paths_in(&[plugin_only, customized, noise, dupe]),
+            Some(vec![
+                PathBuf::from(plugin_path),
+                PathBuf::from(customized_path),
+            ])
+        );
+    }
+
+    #[test]
+    fn referenced_gateway_paths_skips_clients_without_a_config() {
+        // No config file is a KNOWN-empty reference set, unlike an error: keep going.
+        let mut absent = detected("zed");
+        absent.config_exists = false;
+        absent.servers = vec![gateway_server(GATEWAY_ENTRY_NAME, "toolport-gateway-9.9.9")];
+        assert_eq!(referenced_gateway_paths_in(&[absent]), Some(vec![]));
+    }
+
     #[test]
     fn entry_state_from_record_and_heuristic() {
         // SOU-406: ownership record when present; SOU-405 basename heuristic when not.
@@ -5852,6 +6103,82 @@ bad = "not-a-table"
                 Some(&rec)
             ),
             GatewayEntryState::Absent
+        );
+    }
+
+    fn managed_record(command: &str) -> ManagedEntry {
+        ManagedEntry {
+            command: command.to_string(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            transport: "stdio".to_string(),
+            url: None,
+            updated_at: 0,
+        }
+    }
+
+    fn detected_server(command: &str) -> McpServer {
+        McpServer {
+            name: GATEWAY_ENTRY_NAME.to_string(),
+            transport: "stdio".to_string(),
+            command: Some(command.to_string()),
+            args: Vec::new(),
+            env_keys: Vec::new(),
+            url: None,
+        }
+    }
+
+    #[test]
+    fn a_drifted_gateway_path_stays_managed() {
+        // The ownership record must not become a trap. When a republish moves our
+        // binary to a content-addressed filename, the config and the record
+        // disagree on the path while both still name OUR gateway. Reading that as
+        // Customized makes repoint_stale_gateways skip the client forever, which
+        // is how six clients on a real machine sat on a superseded gateway.
+        let record = managed_record(
+            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe",
+        );
+        let drifted = detected_server(
+            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0-140f0e8d8cfa.exe",
+        );
+        assert_eq!(
+            resolve_entry_state(&[drifted], Some(&record)),
+            GatewayEntryState::Managed,
+            "a path-only drift between two of our own binaries is not customization"
+        );
+    }
+
+    #[test]
+    fn a_user_owned_command_is_still_customized() {
+        // The other side of the same rule: #487 must keep working. A record exists,
+        // but the command now names something that is not our binary, so the user
+        // has taken the entry over and we stand down.
+        let record = managed_record(
+            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe",
+        );
+        for taken_over in ["npx", "docker", r"C:\Users\me\bin\my-wrapper.cmd"] {
+            assert_eq!(
+                resolve_entry_state(&[detected_server(taken_over)], Some(&record)),
+                GatewayEntryState::Customized,
+                "{taken_over} is not ours and must stay customized"
+            );
+        }
+    }
+
+    #[test]
+    fn a_drifted_path_with_changed_args_is_still_customized() {
+        // Only the command path is forgiven. Anything else the user touched still
+        // counts as customization.
+        let record = managed_record(
+            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe",
+        );
+        let mut server = detected_server(
+            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0-140f0e8d8cfa.exe",
+        );
+        server.args = vec!["--their-flag".to_string()];
+        assert_eq!(
+            resolve_entry_state(&[server], Some(&record)),
+            GatewayEntryState::Customized
         );
     }
 
@@ -7896,6 +8223,12 @@ command = "npx"
         // kimi_code_path() honors KIMI_CODE_HOME; clear it so the wrapper matches
         // the static resolver used for the expected path.
         let _kimi_home = EnvRestore::set("KIMI_CODE_HOME", Path::new(""));
+        // This asserts the documented default table, so neutralize the Claude Code
+        // config-dir override the host may have exported (a Claude Code session
+        // running these tests has it set, which legitimately relocates
+        // `.claude.json`). The override itself is covered by
+        // `claude_code_config_follows_a_relocated_config_dir`.
+        let _claude_config_dir = EnvRestore::set("CLAUDE_CONFIG_DIR", Path::new(""));
         let home = home().expect("home dir should be available in tests");
         let platform = Platform::current();
         for client in defs() {

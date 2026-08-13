@@ -1245,31 +1245,13 @@ pub fn client_credentials_token(
     // `agent_no_redirect`: a 302 on a credential-bearing POST could hand the
     // client secret to a host named by an attacker-influenceable metadata
     // document. Same reasoning as the code exchange and refresh.
-    let request = agent_no_redirect(block_private).post(token_endpoint);
-    let response = match method {
-        ClientAuthMethod::ClientSecretBasic => {
-            // RFC 6749 §2.3.1: client_id and secret are form-urlencoded before
-            // base64, not sent raw. Skipping that corrupts any secret containing
-            // a `+`, `:` or `/`, which is common in generated credentials.
-            let credentials = format!(
-                "{}:{}",
-                urlencoding::encode(client_id),
-                urlencoding::encode(client_secret)
-            );
-            let header = format!(
-                "Basic {}",
-                base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes())
-            );
-            request.set("Authorization", &header).send_form(&form)
-        }
-        ClientAuthMethod::ClientSecretPost => {
-            let mut form = form.clone();
-            form.push(("client_id", client_id));
-            form.push(("client_secret", client_secret));
-            request.send_form(&form)
-        }
-        ClientAuthMethod::PrivateKeyJwt => unreachable!("rejected above"),
-    };
+    let mut request = agent_no_redirect(block_private).post(token_endpoint);
+    let authentication = client_authentication(method, client_id, client_secret);
+    if let Some(header) = &authentication.authorization {
+        request = request.set("Authorization", header);
+    }
+    form.extend_from_slice(&authentication.form_fields);
+    let response = request.send_form(&form);
 
     let resp: TokenResponse = response
         .map_err(|e| redact_secret(&e.to_string(), client_secret))?
@@ -1288,6 +1270,55 @@ pub fn client_credentials_token(
     // this flow is that re-authentication is cheap and non-interactive.
     tokens.refresh_token = None;
     Ok(tokens)
+}
+
+/// How the client proves its identity on a client-credentials token request:
+/// an `Authorization` header, extra form fields, or (per method) exactly one.
+struct ClientAuthentication<'a> {
+    authorization: Option<String>,
+    form_fields: Vec<(&'a str, &'a str)>,
+}
+
+/// Split out of [`client_credentials_token`] so the encoding rules are checkable
+/// without a network round trip: the credential encoding is the part that silently
+/// corrupts real secrets, and a live token endpoint is the worst possible place to
+/// discover that.
+fn client_authentication<'a>(
+    method: ClientAuthMethod,
+    client_id: &'a str,
+    client_secret: &'a str,
+) -> ClientAuthentication<'a> {
+    match method {
+        ClientAuthMethod::ClientSecretBasic => ClientAuthentication {
+            authorization: Some(client_secret_basic_header(client_id, client_secret)),
+            form_fields: Vec::new(),
+        },
+        // The secret rides in the body for this method, which is why the transport
+        // error path redacts it: it is quotable in a way the Basic header is not.
+        ClientAuthMethod::ClientSecretPost => ClientAuthentication {
+            authorization: None,
+            form_fields: vec![("client_id", client_id), ("client_secret", client_secret)],
+        },
+        ClientAuthMethod::PrivateKeyJwt => unreachable!("rejected above"),
+    }
+}
+
+/// Build the `client_secret_basic` credential header.
+///
+/// RFC 6749 §2.3.1: client_id and secret are form-urlencoded before base64, not
+/// sent raw. Skipping that corrupts any secret containing a `+`, `:` or `/`, which
+/// is common in generated credentials — and a `:` in the id would additionally
+/// move the field boundary the server splits on.
+fn client_secret_basic_header(client_id: &str, client_secret: &str) -> String {
+    let credentials = format!(
+        "{}:{}",
+        urlencoding::encode(client_id),
+        urlencoding::encode(client_secret)
+    );
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes())
+    )
 }
 
 /// Strip a credential out of text that is about to be surfaced or logged.
@@ -1849,6 +1880,134 @@ mod tests {
             .expect_err("an empty authorization code must not reach token exchange");
         client.join().unwrap();
         assert!(error.contains("empty authorization code"));
+    }
+
+    /// Drive `wait_for_code` against a real loopback listener, feeding it the
+    /// given request targets one connection at a time.
+    ///
+    /// Each request is fully written and its response read to EOF before the next
+    /// connection opens, so the order `wait_for_code` sees is the order given here
+    /// and no test needs a sleep to synchronize.
+    fn callback_result(targets: &[&str], expected_state: &str) -> Result<String, String> {
+        use std::io::Write;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests: Vec<String> = targets.iter().map(|t| (*t).to_string()).collect();
+        let client = std::thread::spawn(move || {
+            for target in requests {
+                // `wait_for_code` may return before consuming every request (that is
+                // the point of some of these cases), so nothing here may block
+                // forever waiting for a reply that is never coming.
+                let Ok(mut stream) = std::net::TcpStream::connect(address) else {
+                    break;
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                if stream
+                    .write_all(format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes())
+                    .is_err()
+                {
+                    break;
+                }
+                // The server closes after replying, so this returns once the request
+                // has been handled - the handoff that keeps the ordering exact
+                // without a sleep.
+                let mut response = String::new();
+                let _ = stream.read_to_string(&mut response);
+            }
+        });
+
+        let result = wait_for_code(&listener, expected_state, "https://auth.example.com", false);
+        client.join().unwrap();
+        result
+    }
+
+    /// SBS-657: the `state` parameter is the only thing standing between the user
+    /// and an attacker-injected authorization code being redeemed against their
+    /// session, so a mismatch must abort rather than exchange the code.
+    #[test]
+    fn callback_rejects_a_code_carrying_the_wrong_state() {
+        let error = callback_result(&["/callback?code=attacker-code&state=wrong"], "expected")
+            .expect_err("a code arriving with the wrong state must not be redeemed");
+
+        assert!(
+            error.contains("state mismatch") && error.contains("CSRF"),
+            "the refusal has to name the reason: {error}"
+        );
+        assert!(
+            !error.contains("attacker-code"),
+            "the rejected code must not be echoed back: {error}"
+        );
+    }
+
+    /// A callback with no `state` at all is the same attack without the guesswork.
+    #[test]
+    fn callback_rejects_a_code_with_no_state_at_all() {
+        let error = callback_result(&["/callback?code=attacker-code"], "expected")
+            .expect_err("a missing state is not a matching state");
+        assert!(error.contains("state mismatch"), "{error}");
+    }
+
+    /// The happy path, so the callback suite is not failure-only: a matching state
+    /// and a non-empty code still complete the flow.
+    #[test]
+    fn callback_accepts_a_code_with_the_matching_state() {
+        let code = callback_result(&["/callback?code=good-code&state=expected"], "expected")
+            .expect("a matching state and a real code must complete the flow");
+        assert_eq!(code, "good-code");
+    }
+
+    /// SBS-659: browsers hit the loopback redirect with /favicon.ico and other
+    /// stray requests. Treating the first connection as the authorization response
+    /// would fail the sign-in with "empty authorization code" while the real
+    /// redirect was still in flight right behind it.
+    #[test]
+    fn callback_ignores_stray_requests_and_waits_for_the_real_redirect() {
+        let result = callback_result(
+            &[
+                "/favicon.ico",
+                "/callback",
+                "/?utm_source=browser",
+                "/callback?code=good-code&state=expected",
+            ],
+            "expected",
+        );
+
+        match result {
+            Ok(code) => assert_eq!(code, "good-code"),
+            Err(e) => panic!("a stray request must not end the wait: {e}"),
+        }
+    }
+
+    /// A stray request must not be mistaken for a state mismatch either: it carries
+    /// no state, and rejecting it would abort the flow before the real redirect.
+    #[test]
+    fn callback_stray_request_is_not_treated_as_a_csrf_failure() {
+        let result = callback_result(
+            &["/favicon.ico?v=2", "/callback?code=good-code&state=expected"],
+            "expected",
+        );
+        match result {
+            Ok(code) => assert_eq!(code, "good-code"),
+            Err(e) => panic!("a stray request must not be read as a CSRF failure: {e}"),
+        }
+    }
+
+    /// An `error` response is still acted on once state checks out - the stray-request
+    /// skip must not swallow a genuine denial and leave the user waiting.
+    #[test]
+    fn callback_surfaces_an_authorization_error_after_a_stray_request() {
+        let error = callback_result(
+            &[
+                "/favicon.ico",
+                "/callback?error=access_denied&error_description=nope&state=expected",
+            ],
+            "expected",
+        )
+        .expect_err("a denial must end the wait");
+        assert!(error.contains("access_denied"), "{error}");
+        assert!(error.contains("nope"), "{error}");
     }
 
     #[test]
@@ -2675,6 +2834,78 @@ mod tests {
             Ok(_) => panic!("private_key_jwt must be refused before any request"),
         };
         assert!(err.contains("SBS-599"), "{err}");
+    }
+
+    /// Decode a `Basic <b64>` header back to the credential string the server sees.
+    fn decode_basic(header: &str) -> String {
+        let encoded = header
+            .strip_prefix("Basic ")
+            .unwrap_or_else(|| panic!("not a Basic header: {header}"));
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("a Basic header must be valid base64");
+        String::from_utf8(raw).expect("credentials are ASCII once encoded")
+    }
+
+    /// RFC 6749 §2.3.1. Generated secrets routinely contain `+`, `:` and `/`, and
+    /// sending the raw pair is the failure this encoding exists to prevent: a `:`
+    /// moves the field boundary the server splits on, and `+` decodes back to a
+    /// space at any server that form-decodes the halves.
+    #[test]
+    fn client_secret_basic_form_encodes_the_credential_pair() {
+        let header = client_secret_basic_header("client:id", "s+cr:et/1");
+
+        // Written out literally rather than via `urlencoding::encode`, which would
+        // just restate the implementation and pass for any encoding at all.
+        assert_eq!(decode_basic(&header), "client%3Aid:s%2Bcr%3Aet%2F1");
+        // The only unescaped `:` is the field separator RFC 6749 defines.
+        assert_eq!(decode_basic(&header).matches(':').count(), 1);
+        assert_ne!(
+            decode_basic(&header),
+            "client:id:s+cr:et/1",
+            "the raw pair must never be what the server receives"
+        );
+    }
+
+    /// Credentials with no reserved characters must survive untouched, or the
+    /// encoding would break the common case to fix the rare one.
+    #[test]
+    fn client_secret_basic_leaves_unreserved_credentials_alone() {
+        assert_eq!(
+            decode_basic(&client_secret_basic_header("client-abc", "s3cret_value.1~x")),
+            "client-abc:s3cret_value.1~x"
+        );
+    }
+
+    /// `client_secret_post` puts the secret in the body, not the header. If it ever
+    /// grew an Authorization header too, the secret would be sent twice and the
+    /// redaction in the error path would no longer cover every copy.
+    #[test]
+    fn client_secret_post_sends_the_secret_in_the_form_body_only() {
+        let auth = client_authentication(
+            ClientAuthMethod::ClientSecretPost,
+            "client:id",
+            "s+cr:et/1",
+        );
+
+        assert!(
+            auth.authorization.is_none(),
+            "client_secret_post must not also send a Basic header"
+        );
+        assert_eq!(
+            auth.form_fields,
+            vec![("client_id", "client:id"), ("client_secret", "s+cr:et/1")],
+            "form fields are urlencoded by the form encoder, so they ride verbatim"
+        );
+
+        // And the Basic method is the mirror image: header only, nothing in the body.
+        let basic =
+            client_authentication(ClientAuthMethod::ClientSecretBasic, "client:id", "s+cr:et/1");
+        assert!(basic.form_fields.is_empty(), "the secret must not ride twice");
+        assert_eq!(
+            basic.authorization.as_deref(),
+            Some(client_secret_basic_header("client:id", "s+cr:et/1").as_str())
+        );
     }
 
     /// A secret can appear in a transport error that quotes the request body.

@@ -319,7 +319,26 @@ fn client_credentials_resource_changed(server_id: &str, url: &str) -> bool {
     else {
         return false;
     };
-    state.resource.trim() != url.trim()
+    resource_binding_changed(&state.resource, url)
+}
+
+/// The comparison [`client_credentials_resource_changed`] is built on, split out so
+/// the case-sensitivity rule is checkable without a vault round trip.
+///
+/// Deliberately NOT `eq_ignore_ascii_case`: see the doc comment above.
+fn resource_binding_changed(vaulted_resource: &str, url: &str) -> bool {
+    vaulted_resource.trim() != url.trim()
+}
+
+/// Is the vaulted client-credentials state stale for the entry being connected?
+///
+/// Split out of [`connect_remote_with_handler`] so the decision is reachable
+/// without a live connect. Two ways state goes stale, both reached by editing the
+/// server outside `set_client_credentials`: the config was removed, or the URL
+/// changed out from under an RFC 8707 resource binding.
+fn client_credentials_state_is_stale(server: &ServerEntry, server_id: &str, url: &str) -> bool {
+    secrets::get_secret(server_id, CC_STATE_KEY).is_some()
+        && (!uses_client_credentials(server) || client_credentials_resource_changed(server_id, url))
 }
 
 /// Expiry of the vaulted client-credentials token, if this server uses that flow.
@@ -863,9 +882,7 @@ pub fn connect_remote_with_handler(
     //
     // Handled here because this is the only place that sees both the current entry
     // and the vault; the reacquire seam takes just a server id by design.
-    if secrets::get_secret(server_id, CC_STATE_KEY).is_some()
-        && (!uses_client_credentials(server) || client_credentials_resource_changed(server_id, url))
-    {
+    if client_credentials_state_is_stale(server, server_id, url) {
         // Not ignored: leaving stale state would silently keep using the wrong
         // flow, or the wrong resource binding, for the rest of the session.
         reset_client_credentials(server_id)?;
@@ -1399,5 +1416,183 @@ mod tests {
         .unwrap();
         assert_eq!(minimal.expires_at, None);
         assert_eq!(minimal.scope, None);
+    }
+
+    // ----- SBS-615: exact resource rebinding after a URL edit ------------------
+
+    /// The comparison is EXACT, and that is the whole point: RFC 8707 binds the
+    /// token to the resource string, and a URL path is case-sensitive, so
+    /// `/MCP` and `/mcp` are different resources. Folding case here would keep a
+    /// token minted for the old one and the user's edit would appear to do nothing.
+    #[test]
+    fn resource_rebinding_compares_the_url_exactly() {
+        let vaulted = "https://mcp.example.com/MCP";
+
+        assert!(
+            !resource_binding_changed(vaulted, "https://mcp.example.com/MCP"),
+            "the same URL must not force a pointless re-acquisition"
+        );
+        assert!(
+            resource_binding_changed(vaulted, "https://mcp.example.com/mcp"),
+            "a path differing only in case is a different resource"
+        );
+        // Case anywhere else counts as changed too. Over-reporting is the safe
+        // direction: re-acquiring is cheap and non-interactive by construction.
+        assert!(resource_binding_changed(vaulted, "https://MCP.example.com/MCP"));
+        assert!(resource_binding_changed(vaulted, "https://mcp.example.com/MCP/v2"));
+    }
+
+    /// Surrounding whitespace is not a resource change: a URL pasted with a
+    /// trailing newline would otherwise re-acquire on every single connect.
+    #[test]
+    fn resource_rebinding_ignores_surrounding_whitespace_only() {
+        assert!(!resource_binding_changed(
+            "  https://mcp.example.com/MCP\n",
+            "https://mcp.example.com/MCP"
+        ));
+        assert!(!resource_binding_changed(
+            "https://mcp.example.com/MCP",
+            "\thttps://mcp.example.com/MCP  "
+        ));
+        // Trimming must not reach inside the URL and mask a real edit.
+        assert!(resource_binding_changed(
+            "  https://mcp.example.com/MCP  ",
+            "  https://mcp.example.com/mcp  "
+        ));
+    }
+
+    /// Points the vault at a scratch dir and the file backend at a known key, so a
+    /// test can write real `ClientCredentialsState` and read it back.
+    ///
+    /// Holds `data_dir_test_lock` for the whole test: the data-dir override and the
+    /// backend-selecting env var are both process-global.
+    struct VaultFixture {
+        _data_dir_lock: std::sync::MutexGuard<'static, ()>,
+        _override: crate::registry::DataDirOverride,
+        dir: std::path::PathBuf,
+        previous_key: Option<String>,
+    }
+
+    impl VaultFixture {
+        fn new(name: &str) -> Self {
+            let lock = crate::registry::data_dir_test_lock();
+            let dir = std::env::temp_dir().join(format!(
+                "toolport-sbs615-{name}-{}-{}",
+                std::process::id(),
+                now_epoch_seconds()
+            ));
+            std::fs::create_dir_all(&dir).expect("scratch data dir");
+            let over = crate::registry::DataDirOverride::set(&dir);
+            let previous_key = std::env::var("TOOLPORT_SECRET_KEY").ok();
+            std::env::set_var("TOOLPORT_SECRET_KEY", "sbs-615-unit-test-passphrase");
+            Self {
+                _data_dir_lock: lock,
+                _override: over,
+                dir,
+                previous_key,
+            }
+        }
+
+        fn vault_state(&self, server_id: &str, resource: &str) {
+            let state = ClientCredentialsState {
+                issuer: "https://auth.example.com".into(),
+                token_endpoint: "https://auth.example.com/token".into(),
+                client_id: "client-abc".into(),
+                method: "client_secret_basic".into(),
+                scope: None,
+                resource: resource.into(),
+                expires_at: Some(9_999_999_999),
+            };
+            secrets::set_secret(
+                server_id,
+                CC_STATE_KEY,
+                &serde_json::to_string(&state).expect("state serializes"),
+            )
+            .expect("scratch vault write");
+        }
+    }
+
+    impl Drop for VaultFixture {
+        fn drop(&mut self) {
+            match self.previous_key.take() {
+                Some(v) => std::env::set_var("TOOLPORT_SECRET_KEY", v),
+                None => std::env::remove_var("TOOLPORT_SECRET_KEY"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// End to end over the real vault: state pinned to `/MCP`, entry edited to
+    /// `/mcp`. The connect path must call this stale and reset, or the next
+    /// acquisition would keep presenting a token bound to the old resource.
+    #[test]
+    fn a_url_edit_that_only_changes_path_case_rebinds_the_credential() {
+        let vault = VaultFixture::new("rebind");
+        let mut server = http_server("sbs615-rebind", Some(cc("client-abc")));
+        server.url = Some("https://mcp.example.com/MCP".into());
+        let server_id = server.id.clone();
+        vault.vault_state(&server_id, "https://mcp.example.com/MCP");
+
+        // Unchanged URL: nothing to reset, or every connect would re-acquire.
+        assert!(!client_credentials_resource_changed(
+            &server_id,
+            "https://mcp.example.com/MCP"
+        ));
+        assert!(!client_credentials_state_is_stale(
+            &server,
+            &server_id,
+            "https://mcp.example.com/MCP"
+        ));
+
+        // The edit: same host, same everything but the path case.
+        let edited = "https://mcp.example.com/mcp";
+        server.url = Some(edited.into());
+        assert!(client_credentials_resource_changed(&server_id, edited));
+        assert!(
+            client_credentials_state_is_stale(&server, &server_id, edited),
+            "the connect path must treat the vaulted state as stale"
+        );
+
+        // What the connect path then does. After it, nothing is left to reuse, so
+        // the next acquisition binds to the URL actually being contacted.
+        reset_client_credentials(&server_id).expect("reset");
+        assert!(secrets::get_secret(&server_id, CC_STATE_KEY).is_none());
+        assert!(secrets::get_secret(&server_id, secrets::HTTP_AUTH_KEY).is_none());
+    }
+
+    /// Removing the config is the other way state goes stale, and it must not
+    /// depend on the URL having changed.
+    #[test]
+    fn vaulted_state_without_a_configured_flow_is_stale_at_the_same_url() {
+        let vault = VaultFixture::new("deconfigured");
+        let url = "https://mcp.example.com/MCP";
+        let server = http_server("sbs615-deconfigured", None);
+        let server_id = server.id.clone();
+        vault.vault_state(&server_id, url);
+
+        assert!(!client_credentials_resource_changed(&server_id, url));
+        assert!(
+            client_credentials_state_is_stale(&server, &server_id, url),
+            "state for a server no longer configured for the flow must be discarded"
+        );
+    }
+
+    /// No vaulted state means nothing to rebind: a server being configured for the
+    /// first time must not report a change and must not attempt a reset.
+    #[test]
+    fn an_empty_vault_reports_no_resource_change() {
+        let _vault = VaultFixture::new("empty");
+        let server = http_server("sbs615-empty", Some(cc("client-abc")));
+        let server_id = server.id.clone();
+
+        assert!(!client_credentials_resource_changed(
+            &server_id,
+            "https://mcp.example.com/mcp"
+        ));
+        assert!(!client_credentials_state_is_stale(
+            &server,
+            &server_id,
+            "https://mcp.example.com/mcp"
+        ));
     }
 }

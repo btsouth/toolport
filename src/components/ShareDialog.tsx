@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ArrowLeft,
   Check,
@@ -43,6 +43,8 @@ interface Props {
   onImported: (registry: Registry) => void;
 }
 
+type LoadState = "idle" | "loading" | "ready" | "error";
+
 /** Share a curated server set with a teammate (and import theirs). Secret values
  * are never included - each person vaults their own keys after importing. This is
  * the no-backend version of "push a setup to your team".
@@ -66,32 +68,65 @@ export function ShareDialog({ trigger, onImported }: Props) {
   const [preview, setPreview] = useState<ImportItem[] | null>(null);
   const [pendingJson, setPendingJson] = useState("");
   // The user's servers and which to include in the shared stack (default all).
-  const [servers, setServers] = useState<{ name: string; transport: string }[]>([]);
+  const [servers, setServers] = useState<
+    { id: string; name: string; transport: string }[]
+  >([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [registryState, setRegistryState] = useState<LoadState>("idle");
+  const [registryError, setRegistryError] = useState("");
+  const [exportState, setExportState] = useState<LoadState>("idle");
+  const [exportError, setExportError] = useState("");
+  const [exportRetry, setExportRetry] = useState(0);
   // A generated share link (toolport.app/s/...), cleared when the export changes.
   const [shareLink, setShareLink] = useState("");
   const [linkCopied, setLinkCopied] = useState(false);
   const [linking, setLinking] = useState(false);
+  const [saving, setSaving] = useState(false);
+  // Request generations make close/reopen, retry, and out-of-order completions inert.
+  const registryRequest = useRef(0);
+  const exportRequest = useRef(0);
+  const linkRequest = useRef(0);
+  const previewRequest = useRef(0);
 
-  // Load the server list on open so the user can choose a subset to share.
-  useEffect(() => {
-    if (!open) return;
-    getRegistry()
-      .then((reg) => {
-        const list = reg.servers
-          .filter((s) => !isGatewayServer(s))
-          .map((s) => ({ name: s.name, transport: s.transport }));
-        setServers(list);
-        setSelected(new Set(list.map((s) => s.name)));
-      })
-      .catch(() => {});
-  }, [open]);
+  const invalidateShareOutput = useCallback((nextState: LoadState = "loading") => {
+    exportRequest.current += 1;
+    linkRequest.current += 1;
+    setExported("");
+    setExportState(nextState);
+    setExportError("");
+    setShareLink("");
+    setLinkCopied(false);
+    setLinking(false);
+    setCopied(false);
+  }, []);
 
-  // Selection passed to the backend: undefined = share everything (also the
-  // pre-load state), otherwise just the chosen subset.
-  const allSelected = servers.length > 0 && selected.size === servers.length;
-  const shareFilter =
-    servers.length === 0 || allSelected ? undefined : Array.from(selected);
+  const loadServers = useCallback(async () => {
+    const request = ++registryRequest.current;
+    invalidateShareOutput("idle");
+    setRegistryState("loading");
+    setRegistryError("");
+    setServers([]);
+    setSelected(new Set());
+    try {
+      const reg = await getRegistry();
+      if (request !== registryRequest.current) return;
+      const list = reg.servers
+        .filter((s) => !isGatewayServer(s))
+        .map((s) => ({ id: s.id, name: s.name, transport: s.transport }));
+      invalidateShareOutput();
+      setServers(list);
+      setSelected(new Set(list.map((s) => s.id)));
+      setRegistryState("ready");
+    } catch (e) {
+      if (request !== registryRequest.current) return;
+      setRegistryState("error");
+      setRegistryError(String(e));
+    }
+  }, [invalidateShareOutput]);
+
+  // Always pass the exact stable-ID snapshot, including for All and verified empty.
+  // This prevents duplicate names or a server added after load from widening a share.
+  const shareFilter = useMemo(() => Array.from(selected), [selected]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -103,52 +138,76 @@ export function ShareDialog({ trigger, onImported }: Props) {
   }, [name, description]);
 
   useEffect(() => {
-    if (!open) return;
-    setShareLink(""); // the export changed, so any prior link is stale
-    // Guard against out-of-order responses: this effect re-fires on every keystroke
-    // of name/description, and two in-flight exportConfig calls can resolve in either
-    // order. Without this, a slower earlier response could overwrite the preview with
-    // stale content. Only the latest effect run is allowed to commit its result.
-    let cancelled = false;
+    if (!open || registryState !== "ready") return;
+    const request = ++exportRequest.current;
+    linkRequest.current += 1;
     exportConfig(debouncedName, debouncedDescription, shareFilter)
       .then((v) => {
-        if (!cancelled) setExported(v);
+        if (request !== exportRequest.current) return;
+        setExported(v);
+        setExportState("ready");
       })
-      .catch(() => {
-        if (!cancelled) setExported("");
+      .catch((e) => {
+        if (request !== exportRequest.current) return;
+        setExported("");
+        setExportState("error");
+        setExportError(String(e));
       });
     return () => {
-      cancelled = true;
+      if (request === exportRequest.current) exportRequest.current += 1;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, debouncedName, debouncedDescription, selected, servers]);
+  }, [
+    debouncedDescription,
+    debouncedName,
+    exportRetry,
+    open,
+    registryState,
+    shareFilter,
+  ]);
 
-  function onOpenChange(next: boolean) {
-    setOpen(next);
-    if (next) {
-      setPaste("");
-      setCopied(false);
-      setPreview(null);
-      setPendingJson("");
-    }
-  }
+  const onOpenChange = useCallback(
+    (next: boolean) => {
+      setOpen(next);
+      previewRequest.current += 1;
+      setBusyAction(null);
+      if (next) {
+        setPaste("");
+        setCopied(false);
+        setPreview(null);
+        setPendingJson("");
+        void loadServers();
+      } else {
+        registryRequest.current += 1;
+        setRegistryState("idle");
+        setRegistryError("");
+        invalidateShareOutput("idle");
+      }
+    },
+    [invalidateShareOutput, loadServers],
+  );
 
   async function createLink() {
+    const request = ++linkRequest.current;
+    const setup = exported;
     setLinking(true);
     try {
-      const url = await shareStack(exported);
+      const url = await shareStack(setup);
+      if (request !== linkRequest.current) return;
       setShareLink(url);
       try {
         await navigator.clipboard.writeText(url);
+        if (request !== linkRequest.current) return;
         toast.success("Share link created and copied");
       } catch {
+        if (request !== linkRequest.current) return;
         toast.success("Share link created");
         toastError("Couldn't copy automatically. Select the link and copy it.");
       }
     } catch (e) {
+      if (request !== linkRequest.current) return;
       toastError(`Couldn't create a link: ${e}`);
     } finally {
-      setLinking(false);
+      if (request === linkRequest.current) setLinking(false);
     }
   }
 
@@ -173,6 +232,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
   }
 
   async function saveToFile() {
+    setSaving(true);
     try {
       const path = await save({
         title: "Save Toolport setup",
@@ -184,24 +244,35 @@ export function ShareDialog({ trigger, onImported }: Props) {
       toast.success("Saved setup to file");
     } catch (e) {
       toastError(`Couldn't save: ${e}`);
+    } finally {
+      setSaving(false);
     }
   }
 
   // Parse + preview a candidate setup (paste or file) before importing anything.
-  async function startPreview(json: string, source: "preview-paste" | "preview-file") {
+  async function startPreview(
+    json: string,
+    source: "preview-paste" | "preview-file",
+    existingRequest?: number,
+  ) {
+    const request = existingRequest ?? ++previewRequest.current;
     setBusyAction(source);
     try {
       const items = await previewImport(json);
+      if (request !== previewRequest.current) return;
       setPendingJson(json);
       setPreview(items);
     } catch (e) {
+      if (request !== previewRequest.current) return;
       toastError(`Couldn't read that setup: ${e}`);
     } finally {
-      setBusyAction(null);
+      if (request === previewRequest.current) setBusyAction(null);
     }
   }
 
   async function loadFromFile() {
+    const request = ++previewRequest.current;
+    setBusyAction("preview-file");
     try {
       const path = await openFile({
         title: "Open a Toolport setup",
@@ -209,26 +280,39 @@ export function ShareDialog({ trigger, onImported }: Props) {
         directory: false,
         filters: [{ name: "Toolport setup", extensions: ["json"] }],
       });
-      if (!path || typeof path !== "string") return;
+      if (request !== previewRequest.current || !path || typeof path !== "string") return;
       const json = await readSetupFile(path);
-      await startPreview(json, "preview-file");
+      if (request !== previewRequest.current) return;
+      await startPreview(json, "preview-file", request);
     } catch (e) {
+      if (request !== previewRequest.current) return;
       toastError(`Couldn't open that file: ${e}`);
+    } finally {
+      if (request === previewRequest.current) setBusyAction(null);
     }
   }
 
   async function confirmImport() {
+    const request = previewRequest.current;
+    const json = pendingJson;
     setBusyAction("import");
     try {
-      onImported(await importConfig(pendingJson));
+      const imported = await importConfig(json);
+      // The write already happened. Always update the parent registry.
+      onImported(imported);
+      if (request !== previewRequest.current) {
+        toast.success("Imported the setup you already confirmed");
+        return;
+      }
       toast.success("Imported shared setup", {
         description: "Add any API keys each server needs, then enable them.",
       });
-      setOpen(false);
+      onOpenChange(false);
     } catch (e) {
+      if (request !== previewRequest.current) return;
       toastError(`Couldn't import: ${e}`);
     } finally {
-      setBusyAction(null);
+      if (request === previewRequest.current) setBusyAction(null);
     }
   }
 
@@ -238,13 +322,20 @@ export function ShareDialog({ trigger, onImported }: Props) {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     async function openShared(id: string) {
+      // Immediately invalidate and hide any older command-bearing review. The
+      // incoming setup is a new review session even while its payload is fetching.
+      onOpenChange(true);
+      const request = ++previewRequest.current;
+      setBusyAction("preview-paste");
       try {
         const json = await fetchSharedSetup(id);
-        if (cancelled) return;
-        setOpen(true);
-        await startPreview(json, "preview-paste");
+        if (cancelled || request !== previewRequest.current) return;
+        await startPreview(json, "preview-paste", request);
       } catch (e) {
+        if (cancelled || request !== previewRequest.current) return;
         toastError(`Couldn't open that shared stack: ${e}`);
+      } finally {
+        if (!cancelled && request === previewRequest.current) setBusyAction(null);
       }
     }
     takePendingShared()
@@ -264,9 +355,16 @@ export function ShareDialog({ trigger, onImported }: Props) {
       cancelled = true;
       unlisten?.();
     };
-  }, []);
+  }, [onOpenChange]);
 
   const newCount = preview?.filter((i) => i.isNew).length ?? 0;
+  const hasSelection = selected.size > 0 || servers.length === 0;
+  const shareReady =
+    registryState === "ready" &&
+    exportState === "ready" &&
+    exported.length > 0 &&
+    hasSelection;
+  const shareActionDisabled = !shareReady || linking || saving;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -327,13 +425,19 @@ export function ShareDialog({ trigger, onImported }: Props) {
               <div className="grid grid-cols-2 gap-2">
                 <Input
                   value={name}
-                  onChange={(e) => setName(e.target.value)}
+                  onChange={(e) => {
+                    invalidateShareOutput();
+                    setName(e.target.value);
+                  }}
                   placeholder="Name (optional)"
                   className="h-8 text-sm"
                 />
                 <Input
                   value={description}
-                  onChange={(e) => setDescription(e.target.value)}
+                  onChange={(e) => {
+                    invalidateShareOutput();
+                    setDescription(e.target.value);
+                  }}
                   placeholder="Description (optional)"
                   className="h-8 text-sm"
                 />
@@ -349,14 +453,20 @@ export function ShareDialog({ trigger, onImported }: Props) {
                       <button
                         type="button"
                         className="text-muted-foreground hover:text-foreground"
-                        onClick={() => setSelected(new Set(servers.map((s) => s.name)))}
+                        onClick={() => {
+                          invalidateShareOutput();
+                          setSelected(new Set(servers.map((s) => s.id)));
+                        }}
                       >
                         All
                       </button>
                       <button
                         type="button"
                         className="text-muted-foreground hover:text-foreground"
-                        onClick={() => setSelected(new Set())}
+                        onClick={() => {
+                          invalidateShareOutput();
+                          setSelected(new Set());
+                        }}
                       >
                         None
                       </button>
@@ -364,19 +474,20 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   </div>
                   <div className="flex flex-wrap gap-1.5">
                     {servers.map((s) => {
-                      const on = selected.has(s.name);
+                      const on = selected.has(s.id);
                       return (
                         <button
-                          key={s.name}
+                          key={s.id}
                           type="button"
-                          onClick={() =>
+                          onClick={() => {
+                            invalidateShareOutput();
                             setSelected((prev) => {
                               const next = new Set(prev);
-                              if (on) next.delete(s.name);
-                              else next.add(s.name);
+                              if (on) next.delete(s.id);
+                              else next.add(s.id);
                               return next;
-                            })
-                          }
+                            });
+                          }}
                           className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${
                             on
                               ? "border-success/50 bg-success/10 text-success"
@@ -388,6 +499,46 @@ export function ShareDialog({ trigger, onImported }: Props) {
                       );
                     })}
                   </div>
+                </div>
+              )}
+
+              {registryState === "loading" && (
+                <p role="status" className="text-xs text-muted-foreground">
+                  Loading servers…
+                </p>
+              )}
+              {registryState === "error" && (
+                <div
+                  role="alert"
+                  className="flex items-center justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-2.5 py-2 text-xs text-destructive"
+                >
+                  <span>Couldn&apos;t load your servers: {registryError}</span>
+                  <Button size="sm" variant="outline" onClick={() => void loadServers()}>
+                    Retry
+                  </Button>
+                </div>
+              )}
+              {registryState === "ready" && exportState === "loading" && (
+                <p role="status" className="text-xs text-muted-foreground">
+                  Updating setup…
+                </p>
+              )}
+              {registryState === "ready" && exportState === "error" && (
+                <div
+                  role="alert"
+                  className="flex items-center justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-2.5 py-2 text-xs text-destructive"
+                >
+                  <span>Couldn&apos;t build this setup: {exportError}</span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      invalidateShareOutput();
+                      setExportRetry((value) => value + 1);
+                    }}
+                  >
+                    Retry
+                  </Button>
                 </div>
               )}
 
@@ -403,9 +554,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   size="sm"
                   className="h-8"
                   onClick={createLink}
-                  disabled={
-                    linking || !exported || (servers.length > 0 && selected.size === 0)
-                  }
+                  disabled={shareActionDisabled}
                 >
                   {linking ? (
                     <>
@@ -422,7 +571,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   variant="outline"
                   className="h-8"
                   onClick={copy}
-                  disabled={!exported || (servers.length > 0 && selected.size === 0)}
+                  disabled={shareActionDisabled}
                 >
                   {copied ? (
                     <>
@@ -439,9 +588,17 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   variant="outline"
                   className="h-8"
                   onClick={saveToFile}
-                  disabled={!exported || (servers.length > 0 && selected.size === 0)}
+                  disabled={shareActionDisabled}
                 >
-                  <FileDown className="size-3.5" /> Save to file
+                  {saving ? (
+                    <>
+                      <Loader2 className="size-3.5 animate-spin" /> Saving…
+                    </>
+                  ) : (
+                    <>
+                      <FileDown className="size-3.5" /> Save to file
+                    </>
+                  )}
                 </Button>
               </div>
               {shareLink && (

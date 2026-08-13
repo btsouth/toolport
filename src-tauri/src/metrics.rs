@@ -20,7 +20,10 @@ pub fn render() -> String {
         .get("tokensSaved")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let quarantined = crate::integrity::all_quarantined().len() as u64;
+    let quarantined = match crate::integrity::all_quarantined() {
+        Ok(entries) => entries.len() as u64,
+        Err(error) => return format!("# Toolport metrics unavailable: {error}\n"),
+    };
     render_from_parts(&entries, tokens_saved, quarantined)
 }
 

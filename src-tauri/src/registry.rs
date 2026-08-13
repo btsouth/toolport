@@ -8,7 +8,7 @@
 //! Secrets are never stored here. Env vars marked `secret` keep their value in
 //! the OS keychain; this file only records that a secret exists.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -136,6 +136,7 @@ fn atomic_write_with_ops(
     Ok(())
 }
 const DEFAULT_PROFILE_ID: &str = "default";
+const INVALID_PROFILE_REF_PREFIX: &str = "__toolport_invalid_profile_ref__:";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -844,6 +845,254 @@ fn slugify(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// A filesystem-safe, collision-resistant key for a stable profile id.
+/// Every id uses the same SHA-256 domain so no readable/non-readable branch can
+/// collide with another id's literal text (SBS-715).
+pub fn profile_store_key(profile_id: &str) -> String {
+    sha256_hex(&format!("toolport-profile-id-v1:{profile_id}"))
+}
+
+/// True when a v2 store is missing but a pre-migration name-slug file still exists
+/// for this profile. Live reads must fail closed rather than treat that as a
+/// first run (SBS-715).
+pub fn unmigrated_legacy_profile_store(profile: &str, pins: bool) -> bool {
+    let Some(dir) = conduit_dir() else {
+        return false;
+    };
+    let v2 = dir.join(format!(
+        "{}{}.json",
+        if pins {
+            "tool-pins-v2-"
+        } else {
+            "quarantine-v2-"
+        },
+        profile_store_key(profile)
+    ));
+    if v2.exists() {
+        return false;
+    }
+    let mut slugs = BTreeSet::from([legacy_profile_store_slug(profile)]);
+    // Live callers use stable ids, while pre-v2 files were usually named from the
+    // profile's display name. Read the registry without invoking migration again so
+    // both historical references are checked (SBS-715 / CodeRabbit).
+    let registry = resolved_path().map(|path| load_from(&path));
+    match registry {
+        Some(Ok(registry)) => {
+            if let Some(record) = registry.profiles.iter().find(|record| record.id == profile) {
+                slugs.insert(legacy_profile_store_slug(&record.name));
+            }
+        }
+        Some(Err(_)) => {
+            // If the registry itself cannot be read, we cannot prove which legacy
+            // name belongs to this id. Any leftover store is therefore evidence of
+            // an incomplete migration, and the trust read must fail closed.
+            let prefix = if pins { "tool-pins-" } else { "quarantine-" };
+            return std::fs::read_dir(&dir).is_ok_and(|entries| {
+                entries.flatten().any(|entry| {
+                    entry.file_name().to_str().is_some_and(|name| {
+                        name.starts_with(prefix)
+                            && !name.starts_with(&format!("{prefix}v2-"))
+                            && name.ends_with(".json")
+                    })
+                })
+            });
+        }
+        None => {}
+    }
+    slugs
+        .into_iter()
+        .filter(|slug| !slug.is_empty())
+        .any(|slug| {
+            dir.join(format!(
+                "{}{slug}.json",
+                if pins { "tool-pins-" } else { "quarantine-" }
+            ))
+            .exists()
+        })
+}
+
+/// The lossy filename mapping used before profile stores were keyed by stable ids.
+fn legacy_profile_store_slug(profile_ref: &str) -> String {
+    profile_ref
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProfileStoreKind {
+    Cache,
+    Pins,
+    Quarantine,
+}
+
+impl ProfileStoreKind {
+    fn legacy_prefix(self) -> &'static str {
+        match self {
+            Self::Cache => "tool-cache-",
+            Self::Pins => "tool-pins-",
+            Self::Quarantine => "quarantine-",
+        }
+    }
+
+    fn stable_prefix(self) -> &'static str {
+        match self {
+            Self::Cache => "tool-cache-v2-",
+            Self::Pins => "tool-pins-v2-",
+            Self::Quarantine => "quarantine-v2-",
+        }
+    }
+
+    fn fallback_file(self) -> &'static str {
+        match self {
+            Self::Cache => "tool-cache.json",
+            Self::Pins => "tool-pins.json",
+            Self::Quarantine => "quarantine.json",
+        }
+    }
+}
+
+fn write_new_profile_store(path: &Path, contents: &str) -> Result<(), String> {
+    let _lock = lock_at(path)
+        .map_err(|e| format!("could not lock profile store {} for migration: {e}", path.display()))?;
+    if path.exists() {
+        return Ok(());
+    }
+    atomic_write(path, contents)
+        .map_err(|e| format!("could not migrate profile store {}: {e}", path.display()))
+}
+
+fn merge_legacy_quarantines(paths: &[PathBuf]) -> Result<String, String> {
+    let mut merged = serde_json::Map::new();
+    for path in paths {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("could not read legacy quarantine {}: {e}", path.display()))?;
+        let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            format!("could not parse legacy quarantine {} during migration: {e}", path.display())
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            format!("legacy quarantine {} is not an object", path.display())
+        })?;
+        for (tool, record) in object {
+            // Every record blocks the same namespaced tool. Keeping the first
+            // record is conservative; ambiguity is resolved by the corrupt-pin
+            // marker, which forces a fresh tamper quarantine before trust resumes.
+            merged.entry(tool.clone()).or_insert_with(|| record.clone());
+        }
+    }
+    serde_json::to_string_pretty(&serde_json::Value::Object(merged)).map_err(|e| e.to_string())
+}
+
+/// Copy legacy name-derived profile stores into stable-id-derived files.
+///
+/// Legacy files are retained as recovery evidence. A source filename claimed by
+/// more than one profile is never trusted as a cache or pin baseline: caches are
+/// rebuilt, pin stores receive an intentionally invalid marker (so integrity
+/// fails closed), and quarantine records are unioned into every claimant.
+pub fn migrate_profile_stores(registry: &Registry) -> Result<(), String> {
+    let Some(dir) = conduit_dir() else { return Ok(()) };
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    let mut claims: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut profile_slugs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for profile in &registry.profiles {
+        let slugs = [
+            legacy_profile_store_slug(&profile.name),
+            legacy_profile_store_slug(&profile.id),
+        ]
+        .into_iter()
+        .filter(|slug| !slug.is_empty())
+        .collect::<BTreeSet<_>>();
+        for slug in &slugs {
+            claims.entry(slug.clone()).or_default().insert(profile.id.clone());
+        }
+        profile_slugs.insert(profile.id.clone(), slugs);
+    }
+
+    for profile in &registry.profiles {
+        let Some(slugs) = profile_slugs.get(&profile.id) else { continue };
+        for kind in [ProfileStoreKind::Cache, ProfileStoreKind::Pins, ProfileStoreKind::Quarantine]
+        {
+            let target = dir.join(format!(
+                "{}{}.json",
+                kind.stable_prefix(),
+                profile_store_key(&profile.id)
+            ));
+            if target.exists() {
+                continue;
+            }
+            let mut sources = slugs
+                .iter()
+                .map(|slug| {
+                    (Some(slug), dir.join(format!("{}{slug}.json", kind.legacy_prefix())))
+                })
+                .filter(|(_, path)| path.exists())
+                .collect::<Vec<_>>();
+            let fallback = dir.join(kind.fallback_file());
+            if fallback.exists() {
+                // The fallback followed whichever profile was active. With more
+                // than one profile its ownership is unknowable, so every profile
+                // treats it as an ambiguous legacy source and fails closed.
+                sources.push((None, fallback));
+            }
+            if sources.is_empty() {
+                continue;
+            }
+            let mut source_paths = sources.iter().map(|(_, path)| path.clone()).collect::<Vec<_>>();
+            source_paths.sort();
+            source_paths.dedup();
+            let _source_locks = if kind == ProfileStoreKind::Cache {
+                Vec::new()
+            } else {
+                source_paths
+                    .iter()
+                    .map(|path| {
+                        lock_at(path).map_err(|e| {
+                            format!(
+                                "could not lock legacy profile store {} for migration: {e}",
+                                path.display()
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let unambiguous = sources.len() == 1
+                && match sources[0].0 {
+                    Some(slug) => claims.get(slug).is_some_and(|owners| owners.len() == 1),
+                    None => registry.profiles.len() == 1,
+                };
+            if unambiguous {
+                let raw = std::fs::read_to_string(&sources[0].1).map_err(|e| {
+                    format!("could not read legacy profile store {}: {e}", sources[0].1.display())
+                })?;
+                write_new_profile_store(&target, &raw)?;
+                continue;
+            }
+
+            match kind {
+                ProfileStoreKind::Cache => {
+                    // A cache can be rebuilt. Copying an ambiguous catalog could
+                    // disclose another profile's tools during cold startup.
+                }
+                ProfileStoreKind::Pins => {
+                    write_new_profile_store(
+                        &target,
+                        "ambiguous legacy profile pin store; re-approval required",
+                    )?;
+                }
+                ProfileStoreKind::Quarantine => {
+                    let paths = sources.into_iter().map(|(_, path)| path).collect::<Vec<_>>();
+                    let merged = merge_legacy_quarantines(&paths)?;
+                    write_new_profile_store(&target, &merged)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn unique_id(base: &str, existing: &[String]) -> String {
     let base = if base.is_empty() { "item" } else { base };
     if !existing.iter().any(|e| e == base) {
@@ -860,6 +1109,79 @@ pub(crate) fn unique_id(base: &str, existing: &[String]) -> String {
 }
 
 impl Registry {
+    fn profile_id_for_ref(&self, profile_ref: &str) -> Option<String> {
+        let profile_ref = profile_ref.trim();
+        if profile_ref.is_empty() {
+            return None;
+        }
+        if let Some(profile) = self.profiles.iter().find(|p| p.id == profile_ref) {
+            return Some(profile.id.clone());
+        }
+        let mut matches = self
+            .profiles
+            .iter()
+            .filter(|p| p.name.eq_ignore_ascii_case(profile_ref));
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            // A legacy name reference shared by multiple profiles cannot be
+            // resolved safely. Leave it dangling so server scope fails closed.
+            return None;
+        }
+        Some(first.id.clone())
+    }
+
+    /// Resolve a user/API supplied profile reference to a stable id, rejecting
+    /// stale and ambiguous names instead of creating another name-keyed binding.
+    pub fn canonical_profile_id(&self, profile_ref: &str) -> Result<String, String> {
+        self.profile_id_for_ref(profile_ref)
+            .ok_or_else(|| format!("No unique profile matches '{profile_ref}'"))
+    }
+
+    /// Rewrite every persisted profile reference to the stable profile id when
+    /// it resolves unambiguously. Unknown or ambiguous legacy references remain
+    /// dangling and therefore fail closed.
+    fn normalize_profile_references(&mut self) {
+        let profiles = self.profiles.clone();
+        let resolve = |profile_ref: &str| {
+            let profile_ref = profile_ref.trim();
+            if profile_ref.is_empty() {
+                return None;
+            }
+            if let Some(profile) = profiles.iter().find(|p| p.id == profile_ref) {
+                return Some(profile.id.clone());
+            }
+            let mut matches = profiles
+                .iter()
+                .filter(|p| p.name.eq_ignore_ascii_case(profile_ref));
+            let first = matches.next()?;
+            matches.next().is_none().then(|| first.id.clone())
+        };
+
+        let normalize = |profile_ref: &str| {
+            if profile_ref.trim().is_empty() {
+                return String::new();
+            }
+            resolve(profile_ref).unwrap_or_else(|| {
+                format!("{INVALID_PROFILE_REF_PREFIX}{}", sha256_hex(profile_ref.trim()))
+            })
+        };
+        if let Some(active) = self.active_profile_id.clone() {
+            // A stale active profile is global state. Clear it so the existing
+            // first-profile fallback applies instead of persisting an invalid marker
+            // that empties every unscoped client's catalog.
+            self.active_profile_id = resolve(&active);
+        }
+        for scope in self.client_scopes.values_mut() {
+            *scope = normalize(scope);
+        }
+        for mapping in &mut self.folder_profiles {
+            mapping.profile = normalize(&mapping.profile);
+        }
+        for client in &mut self.http_clients {
+            client.profile = normalize(&client.profile);
+        }
+    }
+
     fn server_ids(&self) -> Vec<String> {
         self.servers.iter().map(|s| s.id.clone()).collect()
     }
@@ -1252,10 +1574,7 @@ impl Registry {
         if profile_ref.trim().is_empty() {
             return self.active_profile_id();
         }
-        self.profiles
-            .iter()
-            .find(|p| p.id == profile_ref || p.name.eq_ignore_ascii_case(profile_ref))
-            .map(|p| p.id.clone())
+        self.profile_id_for_ref(profile_ref)
             .unwrap_or_else(|| profile_ref.to_string())
     }
 
@@ -1289,7 +1608,7 @@ impl Registry {
                 path_is_within(&base, &root).then_some((base.len(), fp.profile.clone()))
             })
             .max_by_key(|(len, _)| *len)
-            .map(|(_, profile)| profile)
+            .map(|(_, profile)| self.resolve_profile_id(&profile))
     }
 
     /// Replace the folder -> profile routing mappings (the UI edits the list wholesale). Drops
@@ -1299,6 +1618,10 @@ impl Registry {
         self.folder_profiles = mappings
             .into_iter()
             .filter(|m| !m.path.trim().is_empty() && !m.profile.trim().is_empty())
+            .map(|mut mapping| {
+                mapping.profile = self.resolve_profile_id(&mapping.profile);
+                mapping
+            })
             .collect();
     }
 
@@ -1345,7 +1668,8 @@ impl Registry {
     pub fn set_client_scope(&mut self, client_id: &str, profile: Option<&str>) {
         match profile.map(str::trim).filter(|p| !p.is_empty()) {
             Some(p) => {
-                self.client_scopes.insert(client_id.to_string(), p.to_string());
+                self.client_scopes
+                    .insert(client_id.to_string(), self.resolve_profile_id(p));
             }
             None => {
                 self.client_scopes.remove(client_id);
@@ -1969,7 +2293,7 @@ fn quarantine_unreadable(path: &Path, content: &str) -> Option<PathBuf> {
 }
 
 fn load_from_inner(path: &Path) -> Result<Registry, String> {
-    match read_registry_file(path) {
+    let mut registry = match read_registry_file(path) {
         // Genuinely missing or empty (not a rename race - read_registry_file
         // already waited that out): recover the last-known-good from the .bak
         // sibling if one survived, else this is a first run.
@@ -1997,7 +2321,9 @@ fn load_from_inner(path: &Path) -> Result<Registry, String> {
                 }
             }
         },
-    }
+    }?;
+    registry.normalize_profile_references();
+    Ok(registry)
 }
 
 /// Load an explicit registry while holding its cross-process lock across the full
@@ -2194,10 +2520,12 @@ pub fn resolved_path() -> Option<PathBuf> {
 /// Load honoring the `TOOLPORT_REGISTRY` / `CONDUIT_REGISTRY` env override (used
 /// by the gateway and tests), falling back to the default path.
 pub fn load_resolved() -> Result<Registry, String> {
-    match resolved_path() {
+    let registry = match resolved_path() {
         Some(path) => load_from(&path),
         None => Ok(Registry::default()),
-    }
+    }?;
+    migrate_profile_stores(&registry)?;
+    Ok(registry)
 }
 
 /// True when a command argument looks like it carries a secret: an inline
@@ -3691,6 +4019,192 @@ mod tests {
         for candidate in [&path, &bak, &sequence_path, &generation] {
             std::fs::remove_file(candidate).ok();
         }
+    }
+
+    #[test]
+    fn profile_store_keys_do_not_collide_for_slug_equivalent_names() {
+        let work_prod = profile_store_key("work-prod");
+        let work_slash = profile_store_key("work/prod");
+        let work_space = profile_store_key("Work Prod");
+        assert_ne!(work_prod, work_slash);
+        assert_ne!(work_prod, work_space);
+        assert_ne!(work_slash, work_space);
+        assert_eq!(
+            legacy_profile_store_slug("Work Prod"),
+            legacy_profile_store_slug("Work/Prod")
+        );
+        assert_eq!(legacy_profile_store_slug("Work Prod"), "work-prod");
+    }
+
+    #[test]
+    fn canonical_profile_id_rejects_ambiguous_display_names() {
+        let mut registry = Registry::default();
+        let first = registry.add_profile("Work Prod");
+        let second = registry.add_profile("Work/Prod");
+        assert_eq!(registry.canonical_profile_id(&first).unwrap(), first);
+        assert_eq!(registry.canonical_profile_id("default").unwrap(), "default");
+        assert!(registry.canonical_profile_id("Work Prod").is_ok());
+        registry.profiles[1].name = "Work Prod".into();
+        registry.profiles[2].name = "Work Prod".into();
+        assert!(
+            registry.canonical_profile_id("Work Prod").is_err(),
+            "duplicate case-insensitive names must not resolve"
+        );
+        assert_eq!(registry.canonical_profile_id(&second).unwrap(), second);
+    }
+
+    #[test]
+    fn normalize_rewrites_unique_name_scope_and_leaves_ambiguous_dangling() {
+        let mut registry = Registry::default();
+        let work = registry.add_profile("Work");
+        registry
+            .client_scopes
+            .insert("cursor".into(), "work".into());
+        registry
+            .client_scopes
+            .insert("zed".into(), "Missing".into());
+        registry.normalize_profile_references();
+        assert_eq!(registry.client_scopes.get("cursor").unwrap(), &work);
+        assert!(
+            registry
+                .client_scopes
+                .get("zed")
+                .unwrap()
+                .starts_with(INVALID_PROFILE_REF_PREFIX),
+            "unknown names stay dangling instead of widening to the active profile"
+        );
+    }
+
+    #[test]
+    fn normalize_clears_a_stale_active_profile_for_first_profile_fallback() {
+        let mut registry = Registry::default();
+        registry.active_profile_id = Some("deleted-profile".into());
+        registry.normalize_profile_references();
+        assert_eq!(registry.active_profile_id, None);
+        assert_eq!(registry.active_profile_id(), DEFAULT_PROFILE_ID);
+    }
+
+    #[test]
+    fn migrate_copies_unambiguous_legacy_files_and_fails_closed_on_slug_collisions() {
+        let _lock = data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-sbs-715-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = DataDirOverride::set(&dir);
+
+        let mut registry = Registry::default();
+        let work_space = registry.add_profile("Work Prod");
+        let work_slash = registry.add_profile("Work/Prod");
+        let solo = registry.add_profile("Solo");
+
+        std::fs::write(dir.join("tool-cache-work-prod.json"), r#"{"owner":"collided"}"#).unwrap();
+        std::fs::write(dir.join("tool-pins-work-prod.json"), r#"{"shared":{"fp":"x"}}"#).unwrap();
+        std::fs::write(
+            dir.join("quarantine-work-prod.json"),
+            r#"{"alpha__tool":{"tool":"alpha__tool","reason":"a"},"beta__tool":{"tool":"beta__tool","reason":"b"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("tool-cache-solo.json"), r#"{"owner":"solo"}"#).unwrap();
+        std::fs::write(dir.join("tool-pins-solo.json"), r#"{"solo":{"fp":"y"}}"#).unwrap();
+
+        migrate_profile_stores(&registry).unwrap();
+
+        let space_cache = dir.join(format!(
+            "tool-cache-v2-{}.json",
+            profile_store_key(&work_space)
+        ));
+        let slash_cache = dir.join(format!(
+            "tool-cache-v2-{}.json",
+            profile_store_key(&work_slash)
+        ));
+        let space_pins = dir.join(format!(
+            "tool-pins-v2-{}.json",
+            profile_store_key(&work_space)
+        ));
+        let slash_pins = dir.join(format!(
+            "tool-pins-v2-{}.json",
+            profile_store_key(&work_slash)
+        ));
+        let space_q = dir.join(format!(
+            "quarantine-v2-{}.json",
+            profile_store_key(&work_space)
+        ));
+        let slash_q = dir.join(format!(
+            "quarantine-v2-{}.json",
+            profile_store_key(&work_slash)
+        ));
+        let solo_cache = dir.join(format!("tool-cache-v2-{}.json", profile_store_key(&solo)));
+        let solo_pins = dir.join(format!("tool-pins-v2-{}.json", profile_store_key(&solo)));
+
+        assert!(!space_cache.exists(), "collided cache must not be copied");
+        assert!(!slash_cache.exists(), "collided cache must not be copied");
+        assert_eq!(
+            std::fs::read_to_string(&space_pins).unwrap(),
+            "ambiguous legacy profile pin store; re-approval required"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&slash_pins).unwrap(),
+            "ambiguous legacy profile pin store; re-approval required"
+        );
+        let space_quarantine: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&space_q).unwrap()).unwrap();
+        let slash_quarantine: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&slash_q).unwrap()).unwrap();
+        assert!(space_quarantine.get("alpha__tool").is_some());
+        assert!(space_quarantine.get("beta__tool").is_some());
+        assert_eq!(space_quarantine, slash_quarantine);
+        assert_eq!(
+            std::fs::read_to_string(&solo_cache).unwrap(),
+            r#"{"owner":"solo"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(&solo_pins).unwrap(),
+            r#"{"solo":{"fp":"y"}}"#
+        );
+        // Legacy files stay as recovery evidence.
+        assert!(dir.join("tool-cache-work-prod.json").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unmigrated_legacy_pin_store_is_detected() {
+        let _lock = data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-sbs-715-unmigrated-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = DataDirOverride::set(&dir);
+        let mut registry = Registry::default();
+        let billing = registry.add_profile("Customer Billing");
+        save_to(&dir.join("registry.json"), &registry).unwrap();
+        std::fs::write(
+            dir.join("tool-pins-customer-billing.json"),
+            r#"{"x":{}}"#,
+        )
+        .unwrap();
+        assert!(unmigrated_legacy_profile_store(&billing, true));
+        assert!(!unmigrated_legacy_profile_store(&billing, false));
+        let v2 = dir.join(format!(
+            "tool-pins-v2-{}.json",
+            profile_store_key(&billing)
+        ));
+        std::fs::write(&v2, "{}").unwrap();
+        assert!(!unmigrated_legacy_profile_store(&billing, true));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

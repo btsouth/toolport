@@ -275,6 +275,26 @@ jobs:
             src-tauri/target/release/bundle/appimage/*.AppImage
             src-tauri/target/release/bundle/appimage/*.AppImage.sig
 
+  # The plugin is plain files and should still ship if a native installer build
+  # fails. Keep this job independent of the build matrix and upload its asset to
+  # the same draft release.
+  agent-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Package the agent plugin
+        run: cd packaging/agent-plugin && zip -r toolport-agent-plugin.zip toolport
+
+      - name: Upload the agent plugin
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
+        with:
+          draft: true
+          name: Toolport ${{ github.ref_name }}
+          files: packaging/agent-plugin/toolport-agent-plugin.zip
+
   # Assemble the updater manifest from every platform's signature, after all
   # installers are uploaded to the draft. If this job fails the draft still has
   # working installers - only auto-update is affected.
