@@ -71,4 +71,31 @@ describe("PendingApprovals persistent routine writes", () => {
     await user.click(screen.getByRole("button", { name: "Approve" }));
     expect(mocks.decideApproval).toHaveBeenCalledWith("routine-save-1", true, "once");
   });
+
+  it("hides the synthesized-provenance banner for real immutable runs", async () => {
+    render(<PendingApprovals />);
+    await screen.findByText("daily-report");
+    expect(screen.queryByText(/Synthesized by Toolport/)).not.toBeInTheDocument();
+  });
+
+  it("discloses synthesized provenance so the user knows the glue never executed", async () => {
+    const [approval] = await mocks.listPendingApprovals();
+    mocks.listPendingApprovals.mockResolvedValue([
+      {
+        ...approval,
+        arguments: {
+          ...approval.arguments,
+          provenance: "synthesized_from_observed_calls",
+        },
+      },
+    ]);
+    render(<PendingApprovals />);
+    await screen.findByText("daily-report");
+    expect(
+      screen.getByText(/Synthesized by Toolport from observed direct calls/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/statically validated, not yet executed/),
+    ).toBeInTheDocument();
+  });
 });

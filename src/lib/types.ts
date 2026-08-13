@@ -381,6 +381,27 @@ export interface PendingApproval {
   deadlineMs: number;
 }
 
+/** A strong, repeated orchestration pattern the gateway queued for the passive save
+ * area in Settings. Self-contained: approving persists from this payload alone. */
+export interface RoutineSuggestion {
+  suggestedName: string;
+  source: string;
+  inputSchema: unknown;
+  limits: Record<string, unknown>;
+  definitionFingerprint: string;
+  evidence: {
+    sourceRunId: string;
+    executedAtMs: number;
+    calls: number;
+    observedDependencies: { name: string; toolFingerprint?: string | null }[];
+    validationVersion: number;
+    riskClass: string;
+    /** Absent = immutable_run (the source really executed). */
+    provenance?: "immutable_run" | "synthesized_from_observed_calls";
+  };
+  intermediateBytes: number;
+}
+
 /** A tool the user allowed to skip human approval (Settings "Allowed tools" list). */
 export interface AllowedTool {
   key: string;

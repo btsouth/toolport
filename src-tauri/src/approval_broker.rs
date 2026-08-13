@@ -66,11 +66,21 @@ struct Inner {
     /// persistent list lives in the registry). "Approve for this session" adds here; "Always
     /// allow" adds here AND to the registry.
     session_allow: Mutex<HashSet<String>>,
+    /// Passive routine-save suggestions published by gateways (strong, promotion-available
+    /// candidates). Deduped by definition fingerprint, bounded, in-memory only: this is a
+    /// display queue the user acts on at leisure, never a popup and never a durable store.
+    suggestions: Mutex<Vec<crate::routines::RoutineSuggestion>>,
+    /// Fingerprints the user dismissed this app run; a re-publish of the same definition
+    /// stays out of the list instead of nagging.
+    dismissed_suggestions: Mutex<HashSet<String>>,
 }
 
 /// Cap on simultaneously-pending approvals, so a misbehaving client can't grow the
 /// queue without bound. Beyond this, new requests are denied immediately.
 const MAX_PENDING: usize = 64;
+/// Cap on parked routine-save suggestions; oldest are evicted first. Suggestions are
+/// re-published on later strong bursts, so an evicted one can come back on real use.
+const MAX_SUGGESTIONS: usize = 16;
 /// Bound unauthenticated request memory before a gateway proves it has the token.
 const MAX_APPROVAL_REQUEST_BYTES: usize = 1024 * 1024;
 /// Pending approvals occupy workers while awaiting a decision. Keep bounded
@@ -238,6 +248,80 @@ impl ApprovalBroker {
             .unwrap_or_else(PoisonError::into_inner)
             .contains(key)
     }
+
+    /// Park a gateway-published routine suggestion for the passive UI area.
+    /// Dedupes by definition fingerprint (a re-publish refreshes the entry),
+    /// respects the user's dismissals for this app run, and evicts oldest beyond
+    /// [`MAX_SUGGESTIONS`]. Returns whether the list changed (worth an event).
+    pub fn push_suggestion(&self, suggestion: crate::routines::RoutineSuggestion) -> bool {
+        if suggestion.validate().is_err() {
+            return false;
+        }
+        if self
+            .inner
+            .dismissed_suggestions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&suggestion.definition_fingerprint)
+        {
+            return false;
+        }
+        let mut suggestions = self
+            .inner
+            .suggestions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        suggestions.retain(|existing| {
+            existing.definition_fingerprint != suggestion.definition_fingerprint
+        });
+        suggestions.push(suggestion);
+        while suggestions.len() > MAX_SUGGESTIONS {
+            suggestions.remove(0);
+        }
+        true
+    }
+
+    /// Snapshot the suggestion queue for the UI, newest first.
+    pub fn list_suggestions(&self) -> Vec<crate::routines::RoutineSuggestion> {
+        let suggestions = self
+            .inner
+            .suggestions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        suggestions.iter().rev().cloned().collect()
+    }
+
+    /// The suggestion behind a fingerprint, for the approve path. The entry stays in
+    /// the queue until [`Self::remove_suggestion`], so a failed persist keeps it
+    /// visible instead of silently losing the user's material.
+    pub fn suggestion(&self, fingerprint: &str) -> Option<crate::routines::RoutineSuggestion> {
+        self.inner
+            .suggestions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|suggestion| suggestion.definition_fingerprint == fingerprint)
+            .cloned()
+    }
+
+    /// Drop a suggestion after a successful persist (or equivalent-exists outcome).
+    pub fn remove_suggestion(&self, fingerprint: &str) {
+        self.inner
+            .suggestions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|suggestion| suggestion.definition_fingerprint != fingerprint);
+    }
+
+    /// User said no: drop it and keep the same definition out for this app run.
+    pub fn dismiss_suggestion(&self, fingerprint: &str) {
+        self.remove_suggestion(fingerprint);
+        self.inner
+            .dismissed_suggestions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(fingerprint.to_string());
+    }
 }
 
 /// Start the broker: generate a token, bind a loopback port, publish the endpoint
@@ -256,6 +340,8 @@ pub fn start(app: AppHandle) -> ApprovalBroker {
             token: token.clone(),
             pending: Mutex::new(HashMap::new()),
             session_allow: Mutex::new(HashSet::new()),
+            suggestions: Mutex::new(Vec::new()),
+            dismissed_suggestions: Mutex::new(HashSet::new()),
         }),
     };
 
@@ -358,6 +444,29 @@ fn handle_conn(stream: TcpStream, broker: ApprovalBroker, app: AppHandle) {
         Ok(line) => line,
         Err(_) => return,
     };
+
+    // A routine-save suggestion rides the same authenticated endpoint but is
+    // fire-and-forget: store, notify the UI, acknowledge, done. Nothing parks and
+    // no human decision is awaited - the user acts on the passive list at leisure.
+    #[derive(serde::Deserialize)]
+    struct SuggestionEnvelope {
+        token: String,
+        suggestion: crate::routines::RoutineSuggestion,
+    }
+    if let Ok(envelope) = serde_json::from_slice::<SuggestionEnvelope>(&line) {
+        let mut out = stream;
+        let _ = out.set_write_timeout(Some(Duration::from_secs(10)));
+        if envelope.token.is_empty() || !token_eq(&envelope.token, &broker.inner.token) {
+            let _ = writeln!(out, "\"denied\"");
+            return;
+        }
+        if broker.push_suggestion(envelope.suggestion) {
+            let _ = app.emit("routine-suggestion", serde_json::json!({}));
+        }
+        let _ = writeln!(out, "\"ok\"");
+        return;
+    }
+
     let req: ApprovalRequest = match serde_json::from_slice(&line) {
         Ok(r) => r,
         Err(_) => return,
@@ -525,8 +634,82 @@ mod tests {
                 token: "tok".into(),
                 pending: Mutex::new(HashMap::new()),
                 session_allow: Mutex::new(HashSet::new()),
+                suggestions: Mutex::new(Vec::new()),
+                dismissed_suggestions: Mutex::new(HashSet::new()),
             }),
         }
+    }
+
+    fn suggestion(marker: &str) -> crate::routines::RoutineSuggestion {
+        let source = format!("// {marker}\nreturn input.items;");
+        let input_schema = serde_json::json!({
+            "type": "object",
+            "properties": { "items": { "type": "array", "minItems": 1 } },
+            "required": ["items"],
+            "additionalProperties": false
+        });
+        let limits = crate::routines::RoutineLimits::default();
+        let definition_fingerprint =
+            crate::routines::definition_fingerprint(&source, &input_schema, &limits).unwrap();
+        let dependency =
+            crate::routines::ObservedDependency::new("s__work".into(), Some("v2:x".into()))
+                .unwrap();
+        let evidence = crate::routines::PromotionEvidence::new(
+            format!("run_{}", "b".repeat(32)),
+            1,
+            3,
+            vec![dependency],
+            crate::routines::RoutineRiskClass::Low,
+        )
+        .unwrap();
+        crate::routines::RoutineSuggestion {
+            suggested_name: format!("batch-{marker}"),
+            source,
+            input_schema,
+            limits,
+            definition_fingerprint,
+            evidence,
+            intermediate_bytes: 4096,
+        }
+    }
+
+    #[test]
+    fn suggestions_dedupe_by_fingerprint_respect_dismissal_and_stay_bounded() {
+        let b = broker();
+        assert!(b.push_suggestion(suggestion("one")));
+        // Same definition again: replaces rather than duplicates, still one entry.
+        assert!(b.push_suggestion(suggestion("one")));
+        assert_eq!(b.list_suggestions().len(), 1);
+
+        // A tampered payload (fingerprint not matching the definition) never parks.
+        let mut forged = suggestion("two");
+        forged.definition_fingerprint = "sha256:forged".into();
+        assert!(!b.push_suggestion(forged));
+        assert_eq!(b.list_suggestions().len(), 1);
+
+        // Dismissal removes and keeps the same definition out for this app run.
+        let fingerprint = b.list_suggestions()[0].definition_fingerprint.clone();
+        b.dismiss_suggestion(&fingerprint);
+        assert!(b.list_suggestions().is_empty());
+        assert!(!b.push_suggestion(suggestion("one")), "dismissed stays out");
+
+        // Capacity: oldest evicted first, newest survive.
+        for index in 0..MAX_SUGGESTIONS + 4 {
+            b.push_suggestion(suggestion(&format!("cap{index}")));
+        }
+        let listed = b.list_suggestions();
+        assert_eq!(listed.len(), MAX_SUGGESTIONS);
+        assert_eq!(
+            listed[0].suggested_name,
+            format!("batch-cap{}", MAX_SUGGESTIONS + 3)
+        );
+
+        // The approve path reads without consuming; removal is explicit.
+        let fingerprint = listed[0].definition_fingerprint.clone();
+        assert!(b.suggestion(&fingerprint).is_some());
+        assert!(b.suggestion(&fingerprint).is_some());
+        b.remove_suggestion(&fingerprint);
+        assert!(b.suggestion(&fingerprint).is_none());
     }
 
     fn park(b: &ApprovalBroker, id: &str) -> std::sync::mpsc::Receiver<ApprovalDecision> {

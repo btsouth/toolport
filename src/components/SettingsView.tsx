@@ -31,10 +31,14 @@ import {
   isEnabled as isAutostartEnabled,
 } from "@tauri-apps/plugin-autostart";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import { toastError } from "@/lib/toast";
 import { Button } from "@/components/ui/button";
 import {
   addHttpClient,
+  approveRoutineSuggestion,
+  dismissRoutineSuggestion,
+  listRoutineSuggestions,
   clearInspectLog,
   httpBridgeStatus,
   listAllowedTools,
@@ -65,7 +69,13 @@ import {
   type HttpBridgeStatus,
   type QuarantinedTool,
 } from "@/lib/api";
-import type { AllowedTool, FolderProfile, Profile, Registry } from "@/lib/types";
+import type {
+  AllowedTool,
+  FolderProfile,
+  Profile,
+  Registry,
+  RoutineSuggestion,
+} from "@/lib/types";
 import { isGatewayServer } from "@/lib/types";
 import { useTheme, type Theme } from "@/lib/theme";
 import { Switch } from "@/components/ui/switch";
@@ -76,6 +86,152 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+
+/** Strong, repeated orchestration patterns the gateway queued for saving. Passive by
+ * design: injection-hardened models measurably ignore save directives placed in tool
+ * results (0/7 conversions, 2026-08-13), so the human converts here instead. One click
+ * persists - the card carries the same disclosure the approval prompt would, so the
+ * click IS the persistence authorization and no second prompt fires. */
+function RoutineSuggestions() {
+  const [suggestions, setSuggestions] = useState<RoutineSuggestion[]>([]);
+  const [names, setNames] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setSuggestions(await listRoutineSuggestions());
+    } catch {
+      // An unreachable backend renders as an empty queue; the section hides itself.
+      setSuggestions([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    // Event bridge may be absent (tests, plain-browser dev); polling refresh on
+    // mount already covered the initial state, so a failed subscribe is benign.
+    const unlisten = listen("routine-suggestion", () => void refresh()).catch(
+      () => () => {},
+    );
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, [refresh]);
+
+  async function save(suggestion: RoutineSuggestion) {
+    const fingerprint = suggestion.definitionFingerprint;
+    setBusy(fingerprint);
+    try {
+      await approveRoutineSuggestion(
+        fingerprint,
+        names[fingerprint]?.trim() || suggestion.suggestedName,
+      );
+      await refresh();
+    } catch (e) {
+      toastError(`Couldn't save the routine: ${e}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function dismiss(fingerprint: string) {
+    setBusy(fingerprint);
+    try {
+      await dismissRoutineSuggestion(fingerprint);
+      await refresh();
+    } catch (e) {
+      toastError(`Couldn't dismiss the suggestion: ${e}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  if (suggestions.length === 0) return null;
+  return (
+    <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
+      <div className="flex items-center gap-2 text-xs">
+        <Braces className="size-3.5 shrink-0 text-warning" />
+        <span className="font-medium">Suggested routines</span>
+        <span className="rounded-full bg-muted px-1.5 py-0.5 text-muted-foreground">
+          {suggestions.length}
+        </span>
+        <span className="ml-auto text-muted-foreground">
+          repeated patterns Toolport verified; saving advertises them to every client
+        </span>
+      </div>
+      <ul className="mt-2 space-y-2">
+        {suggestions.map((suggestion) => {
+          const fingerprint = suggestion.definitionFingerprint;
+          const synthesized =
+            suggestion.evidence.provenance === "synthesized_from_observed_calls";
+          return (
+            <li
+              key={fingerprint}
+              className="space-y-2 rounded-md border border-border/60 bg-background/60 p-2.5 text-sm"
+            >
+              <input
+                aria-label="Routine name"
+                className="w-full rounded border border-border/60 bg-background px-2 py-1 text-sm font-medium"
+                value={names[fingerprint] ?? suggestion.suggestedName}
+                onChange={(e) =>
+                  setNames((prev) => ({ ...prev, [fingerprint]: e.target.value }))
+                }
+              />
+              {synthesized && (
+                <div className="rounded border border-warning/40 bg-warning/10 px-2 py-1 text-xs leading-relaxed text-warning">
+                  Synthesized by Toolport from observed direct calls: every listed call
+                  really ran, but the surrounding script was generated and statically
+                  validated, not yet executed.
+                </div>
+              )}
+              <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                <span>Risk: {suggestion.evidence.riskClass}</span>
+                <span>Calls: {suggestion.evidence.calls}</span>
+                <span>
+                  Dependencies:{" "}
+                  {suggestion.evidence.observedDependencies
+                    .map((dependency) => dependency.name)
+                    .join(", ")}
+                </span>
+                <span>
+                  ~{Math.max(1, Math.round(suggestion.intermediateBytes / 1024))} KB/run
+                  kept out of context
+                </span>
+              </div>
+              <details>
+                <summary className="cursor-pointer text-xs font-medium text-muted-foreground hover:text-foreground">
+                  Source and schema
+                </summary>
+                <pre className="mt-2 max-h-36 overflow-auto rounded border border-border/60 bg-background/60 p-2 font-mono text-[0.7rem] leading-relaxed">
+                  {suggestion.source}
+                  {"\n\n"}
+                  {JSON.stringify(suggestion.inputSchema, null, 2)}
+                </pre>
+              </details>
+              <div className="flex justify-end gap-2">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={busy === fingerprint}
+                  onClick={() => void dismiss(fingerprint)}
+                >
+                  Dismiss
+                </Button>
+                <Button
+                  size="sm"
+                  disabled={busy === fingerprint}
+                  onClick={() => void save(suggestion)}
+                >
+                  Save routine
+                </Button>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
 
 /** The set of tools pinned as lazy-discovery prerequisites, with one-click unpin.
  * Pinning happens contextually (a tool's card in Playground); this is where you see
@@ -1005,6 +1161,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               "allow-routine-writes",
             )
           : null}
+        {/* Rendered independently of the writes toggle: a suggestion queued while
+            writes were on stays actionable (the user is the authority here), and the
+            section hides itself entirely when the queue is empty. */}
+        <RoutineSuggestions />
       </section>
       <section className="flex flex-col gap-2">
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">

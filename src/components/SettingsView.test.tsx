@@ -4,8 +4,15 @@ import userEvent from "@testing-library/user-event";
 
 import { ThemeProvider } from "@/lib/theme";
 import { SettingsView } from "./SettingsView";
-import { listServerTools, setAllowRoutineWrites, setCodeMode } from "@/lib/api";
-import type { Registry } from "@/lib/types";
+import {
+  approveRoutineSuggestion,
+  dismissRoutineSuggestion,
+  listRoutineSuggestions,
+  listServerTools,
+  setAllowRoutineWrites,
+  setCodeMode,
+} from "@/lib/api";
+import type { Registry, RoutineSuggestion } from "@/lib/types";
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
@@ -15,12 +22,21 @@ vi.mock("@/lib/api", async (importOriginal) => {
     listServerTools: vi.fn(),
     setAllowRoutineWrites: vi.fn(),
     setCodeMode: vi.fn(),
+    listRoutineSuggestions: vi.fn().mockResolvedValue([]),
+    approveRoutineSuggestion: vi.fn(),
+    dismissRoutineSuggestion: vi.fn(),
   };
 });
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+}));
 
 const mockedListServerTools = vi.mocked(listServerTools);
 const mockedSetAllowRoutineWrites = vi.mocked(setAllowRoutineWrites);
 const mockedSetCodeMode = vi.mocked(setCodeMode);
+const mockedListRoutineSuggestions = vi.mocked(listRoutineSuggestions);
+const mockedApproveRoutineSuggestion = vi.mocked(approveRoutineSuggestion);
+const mockedDismissRoutineSuggestion = vi.mocked(dismissRoutineSuggestion);
 
 const registry: Registry = {
   version: 1,
@@ -244,5 +260,73 @@ describe("SettingsView routine writes", () => {
     expect(
       screen.queryByRole("switch", { name: /allow routine writes/i }),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("SettingsView routine suggestions", () => {
+  const suggestion: RoutineSuggestion = {
+    suggestedName: "batch-deepwiki-ask-question",
+    source:
+      "// Synthesized by Toolport from observed deepwiki__ask_question calls.\nreturn input.items;",
+    inputSchema: { type: "object" },
+    limits: {},
+    definitionFingerprint: "sha256:fp1",
+    evidence: {
+      sourceRunId: `run_${"a".repeat(32)}`,
+      executedAtMs: 1,
+      calls: 3,
+      observedDependencies: [{ name: "deepwiki__ask_question" }],
+      validationVersion: 1,
+      riskClass: "medium",
+      provenance: "synthesized_from_observed_calls",
+    },
+    intermediateBytes: 24_576,
+  };
+
+  it("saves a queued pattern with the edited name and no second prompt", async () => {
+    const user = userEvent.setup();
+    mockedListRoutineSuggestions
+      .mockResolvedValueOnce([suggestion])
+      .mockResolvedValueOnce([]);
+    mockedApproveRoutineSuggestion.mockResolvedValueOnce({});
+
+    renderSettings();
+
+    expect(await screen.findByText("Suggested routines")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Synthesized by Toolport from observed direct calls/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Calls: 3")).toBeInTheDocument();
+
+    const name = screen.getByRole("textbox", { name: /routine name/i });
+    await user.clear(name);
+    await user.type(name, "ask-many-repos");
+    await user.click(screen.getByRole("button", { name: /save routine/i }));
+
+    expect(mockedApproveRoutineSuggestion).toHaveBeenCalledWith(
+      "sha256:fp1",
+      "ask-many-repos",
+    );
+    await waitFor(() =>
+      expect(screen.queryByText("Suggested routines")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("dismisses a suggestion for the rest of the app run", async () => {
+    const user = userEvent.setup();
+    mockedListRoutineSuggestions
+      .mockResolvedValueOnce([suggestion])
+      .mockResolvedValueOnce([]);
+    mockedDismissRoutineSuggestion.mockResolvedValueOnce(undefined);
+
+    renderSettings();
+
+    await screen.findByText("Suggested routines");
+    await user.click(screen.getByRole("button", { name: /dismiss/i }));
+
+    expect(mockedDismissRoutineSuggestion).toHaveBeenCalledWith("sha256:fp1");
+    await waitFor(() =>
+      expect(screen.queryByText("Suggested routines")).not.toBeInTheDocument(),
+    );
   });
 });

@@ -25,6 +25,7 @@ use crate::registry::{
 };
 use crate::remote;
 use crate::router;
+use crate::routines;
 use crate::savings;
 use crate::searchtrace;
 use crate::secrets;
@@ -1692,6 +1693,66 @@ fn decide_approval(
         }
     }
     Ok(())
+}
+
+/// Strong routine candidates the gateway queued for the passive Settings area.
+/// Polled by the frontend; the `routine-suggestion` event prompts a refresh.
+#[tauri::command]
+fn list_routine_suggestions(
+    broker: State<approval_broker::ApprovalBroker>,
+) -> Vec<routines::RoutineSuggestion> {
+    broker.list_suggestions()
+}
+
+/// Persist a queued suggestion. The user's click IS the persistence authorization:
+/// the card showed the same disclosure the approval prompt would (name, dependencies,
+/// risk, provenance, collapsible source), so no second prompt fires. Everything still
+/// passes the store's own validation and the equivalence dedupe, and the routine
+/// watcher advertises the result to every client.
+#[tauri::command]
+fn approve_routine_suggestion(
+    broker: State<approval_broker::ApprovalBroker>,
+    fingerprint: String,
+    name: String,
+    description: Option<String>,
+) -> Result<routines::RoutineDefinition, String> {
+    let suggestion = broker
+        .suggestion(&fingerprint)
+        .ok_or_else(|| "no queued suggestion with that fingerprint".to_string())?;
+    suggestion.validate()?;
+    let started = std::time::Instant::now();
+    // Equivalent-definition dedupe: an agent-initiated save may have landed the same
+    // definition already; treat that as success rather than a duplicate.
+    if let Some(existing) = routines::find_by_definition_fingerprint(&fingerprint)? {
+        broker.remove_suggestion(&fingerprint);
+        return Ok(existing);
+    }
+    let definition = routines::new_promoted_definition(
+        name,
+        description.filter(|text| !text.trim().is_empty()),
+        suggestion.source,
+        suggestion.input_schema,
+        suggestion.limits,
+        suggestion.evidence,
+    )?;
+    let saved = routines::append_immutable(definition)?;
+    audit::record_routine(
+        "save",
+        saved.id(),
+        saved.content_hash(),
+        true,
+        Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+        Some("app_suggestion"),
+        None,
+    );
+    broker.remove_suggestion(&fingerprint);
+    Ok(saved)
+}
+
+/// Drop a queued suggestion and keep the same definition out for this app run.
+#[tauri::command]
+fn dismiss_routine_suggestion(broker: State<approval_broker::ApprovalBroker>, fingerprint: String) {
+    broker.dismiss_suggestion(&fingerprint);
 }
 
 /// A tool allowed to skip human approval, for the Settings "Allowed tools" list.
@@ -3718,6 +3779,9 @@ pub fn run() {
             set_human_approval,
             list_pending_approvals,
             decide_approval,
+            list_routine_suggestions,
+            approve_routine_suggestion,
+            dismiss_routine_suggestion,
             list_allowed_tools,
             revoke_allowed_tool,
             set_tool_override,

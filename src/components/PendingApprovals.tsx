@@ -37,6 +37,7 @@ function routineApprovalView(value: unknown) {
     risk: typeof payload.riskClass === "string" ? payload.riskClass : "unknown",
     calls: evidence?.calls,
     dependencies: Array.isArray(dependencies) ? dependencies : [],
+    synthesized: payload.provenance === "synthesized_from_observed_calls",
     technical: payload,
   };
 }
@@ -277,6 +278,13 @@ export function PendingApprovals() {
                           {routine.description && (
                             <div className="text-xs leading-relaxed text-muted-foreground">
                               {routine.description}
+                            </div>
+                          )}
+                          {routine.synthesized && (
+                            <div className="rounded border border-warning/40 bg-warning/10 px-2 py-1 text-xs leading-relaxed text-warning">
+                              Synthesized by Toolport from observed direct calls: every
+                              listed call really ran, but the surrounding script was
+                              generated and statically validated, not yet executed.
                             </div>
                           )}
                           <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
