@@ -407,13 +407,17 @@ fn synthesize(tool: &str, arguments: &[&Map<String, Value>], split: &ArgSplit) -
     // No occurrence-specific material (like the observed call count) may enter the
     // source: the definition fingerprint hashes it, and repetition detection needs a
     // burst of 3 and a burst of 5 to resolve to the SAME definition.
+    //
+    // The tool name appears ONLY as the escaped callAsync argument, never in the
+    // comment: it comes from a downstream server, and a name containing a newline
+    // would otherwise terminate the comment and inject the rest as executable
+    // source into a definition a human is asked to approve.
     let source = format!(
-        "// Synthesized by Toolport from observed {tool} calls.\n\
+        "// Synthesized by Toolport from observed calls to the tool named below.\n\
          const results = await Promise.all(input.items.map((item) => toolport.callAsync({tool_name}, {{\n\
          {args}\n\
          }})));\n\
          return results;",
-        tool = tool,
         tool_name = js_string(tool),
         args = lines.join(",\n"),
     );
