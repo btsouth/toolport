@@ -2751,14 +2751,14 @@ fn export_config(
     state: State<RegistryState>,
     name: Option<String>,
     description: Option<String>,
-    server_names: Option<Vec<String>>,
+    server_ids: Option<Vec<String>>,
 ) -> Result<String, String> {
     let reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     serde_json::to_string_pretty(&build_export(
         &reg,
         name.as_deref(),
         description.as_deref(),
-        server_names.as_deref(),
+        server_ids.as_deref(),
     ))
     .map_err(|e| e.to_string())
 }
@@ -2771,7 +2771,7 @@ fn export_config_to_path(
     path: String,
     name: Option<String>,
     description: Option<String>,
-    server_names: Option<Vec<String>>,
+    server_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
     let json = {
         let reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2779,7 +2779,7 @@ fn export_config_to_path(
             &reg,
             name.as_deref(),
             description.as_deref(),
-            server_names.as_deref(),
+            server_ids.as_deref(),
         ))
         .map_err(|e| e.to_string())?
     };
@@ -3046,12 +3046,12 @@ fn build_export(
     reg: &Registry,
     name: Option<&str>,
     description: Option<&str>,
-    server_names: Option<&[String]>,
+    server_ids: Option<&[String]>,
 ) -> serde_json::Value {
-    // When a selection is given, share only those servers (by name); otherwise
+    // When a selection is given, share only those servers (by stable id); otherwise
     // share them all. Lets a user share a focused "stack" instead of everything.
     let include: Option<std::collections::HashSet<&str>> =
-        server_names.map(|names| names.iter().map(String::as_str).collect());
+        server_ids.map(|ids| ids.iter().map(String::as_str).collect());
     let servers: Vec<ServerEntry> = reg
         .servers
         .iter()
@@ -3059,7 +3059,7 @@ fn build_export(
         .filter(|s| {
             include
                 .as_ref()
-                .map(|set| set.contains(s.name.as_str()))
+                .map(|set| set.contains(s.id.as_str()))
                 .unwrap_or(true)
         })
         .map(|s| {
@@ -4666,13 +4666,55 @@ mod tests {
         assert_eq!(doc["name"], "Team setup");
         assert_eq!(doc["description"], "Our shared servers");
 
-        // Selective share: a name filter includes only the matching servers, so a
+        // Selective share: an id filter includes only the matching servers, so a
         // user can share a focused stack instead of their whole setup.
-        let shared_name = servers[0]["name"].as_str().unwrap().to_string();
-        let subset = build_export(&reg, None, None, Some(&[shared_name]));
+        let shared_id = reg
+            .servers
+            .iter()
+            .find(|server| server.name == "GitHub")
+            .unwrap()
+            .id
+            .clone();
+        let subset = build_export(&reg, None, None, Some(&[shared_id]));
         assert_eq!(subset["servers"].as_array().unwrap().len(), 1);
         let empty = build_export(&reg, None, None, Some(&["does-not-exist".to_string()]));
         assert_eq!(empty["servers"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn export_selection_uses_stable_ids_and_an_explicit_snapshot() {
+        let mut reg = Registry::default();
+        let mut first = github_with_secret();
+        first.name = "Duplicate".into();
+        first.command = Some("first-command".into());
+        reg.add_server(first);
+        let mut second = github_with_secret();
+        second.name = "Duplicate".into();
+        second.command = Some("second-command".into());
+        reg.add_server(second);
+
+        let first_id = reg
+            .servers
+            .iter()
+            .find(|server| server.command.as_deref() == Some("first-command"))
+            .unwrap()
+            .id
+            .clone();
+        let snapshot = vec![first_id];
+
+        // A same-name server is not accidentally selected, and a later registry
+        // addition cannot widen the explicit snapshot.
+        let mut later = github_with_secret();
+        later.name = "Added later".into();
+        later.command = Some("later-command".into());
+        reg.add_server(later);
+        let doc = build_export(&reg, None, None, Some(&snapshot));
+        let exported = doc["servers"].as_array().unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0]["command"], "first-command");
+
+        let empty = build_export(&reg, None, None, Some(&[]));
+        assert!(empty["servers"].as_array().unwrap().is_empty());
     }
 
     #[test]

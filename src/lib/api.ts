@@ -656,12 +656,14 @@ export function openDataDir(): Promise<void> {
 export function exportConfig(
   name?: string,
   description?: string,
-  serverNames?: string[],
+  // Required snapshot. `[]` means share nothing; never omit this or default it
+  // to empty, or a caller would silently export zero servers.
+  serverIds: string[],
 ): Promise<string> {
   return invoke<string>("export_config", {
     name: name ?? null,
     description: description ?? null,
-    serverNames: serverNames ?? null,
+    serverIds,
   });
 }
 
@@ -670,13 +672,13 @@ export function exportConfigToPath(
   path: string,
   name?: string,
   description?: string,
-  serverNames?: string[],
+  serverIds: string[],
 ): Promise<void> {
   return invoke<void>("export_config_to_path", {
     path,
     name: name ?? null,
     description: description ?? null,
-    serverNames: serverNames ?? null,
+    serverIds,
   });
 }
 

@@ -261,6 +261,81 @@ function SecurityResting() {
   );
 }
 
+type LoadStatus = "loading" | "ready" | "error" | "stale";
+
+/** Security data is part of the trust boundary: a failed read is unknown, never an
+ * all-clear. Keep this state visible until a successful read verifies the current log. */
+function SecurityLoadNotice({
+  status,
+  onRetry,
+}: {
+  status: Exclude<LoadStatus, "ready">;
+  onRetry: () => void;
+}) {
+  if (status === "loading") {
+    return (
+      <div
+        role="status"
+        className="mb-4 flex items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-2.5 text-xs text-muted-foreground"
+      >
+        <ShieldCheck className="size-4 shrink-0" />
+        <span>Checking protection status…</span>
+      </div>
+    );
+  }
+
+  const stale = status === "stale";
+  return (
+    <div
+      role="alert"
+      className="mb-4 flex items-center gap-3 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs"
+    >
+      <AlertTriangle className="size-4 shrink-0 text-warning" />
+      <span className="text-muted-foreground">
+        <span className="font-medium text-foreground">
+          {stale
+            ? "Security status may be out of date."
+            : "Couldn't verify protection status."}
+        </span>{" "}
+        {stale
+          ? "Showing the last security events Toolport read successfully; the latest check failed."
+          : "Toolport couldn't read security events, so this is not an all-clear."}
+      </span>
+      <button
+        type="button"
+        onClick={onRetry}
+        aria-label="Retry protection status"
+        className="ml-auto shrink-0 rounded-md border px-2.5 py-1 font-medium text-foreground transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+      >
+        Retry
+      </button>
+    </div>
+  );
+}
+
+function AuditStaleNotice({ onRetry }: { onRetry: () => void }) {
+  return (
+    <div
+      role="alert"
+      className="mb-4 flex items-center gap-3 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs"
+    >
+      <AlertTriangle className="size-4 shrink-0 text-warning" />
+      <span className="text-muted-foreground">
+        <span className="font-medium text-foreground">Activity may be out of date.</span>{" "}
+        Showing the last calls Toolport read successfully; the latest refresh failed.
+      </span>
+      <button
+        type="button"
+        onClick={onRetry}
+        aria-label="Retry activity log"
+        className="ml-auto shrink-0 rounded-md border px-2.5 py-1 font-medium text-foreground transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+      >
+        Retry
+      </button>
+    </div>
+  );
+}
+
 /** Surfaces tool security events: a tool you approved changed (rug-pull signal),
  * a known server added one, a tool definition contains injection-like content
  * (poisoning), or a tool returned data that looks like injected instructions
@@ -1409,17 +1484,26 @@ export function ActivityView({
   // surfaces the true error rate, and the toggle is right there for triage.
   const [errorsOnly, setErrorsOnly] = useState(false);
   const [security, setSecurity] = useState<SecurityEvent[]>([]);
+  const [securityLoadStatus, setSecurityLoadStatus] = useState<LoadStatus>("loading");
   const [dismissed, setDismissed] = useState<Set<string>>(loadDismissed);
   const [logOpen, setLogOpen] = useState(false);
   // Distinguish a load FAILURE (gateway unreachable / audit log unreadable) from a
   // genuinely empty log: both leave `entries` empty, but only one is an error. Without
   // this, a first-run backend failure renders the friendly "No tool calls yet" state
   // and hides that anything is wrong.
-  const [loadError, setLoadError] = useState(false);
+  const [auditLoadStatus, setAuditLoadStatus] = useState<LoadStatus>("loading");
   // Local reload trigger: bumped after a "Clear retained activity" so the panels
   // refetch (they'd otherwise keep showing the just-deleted rows until the parent's
   // refreshKey next changes).
   const [reloadTick, setReloadTick] = useState(0);
+
+  function retryLoads() {
+    // Keep last-known rows visible while retrying. Only a never-successful load returns
+    // to the full loading state; stale data remains explicitly marked stale.
+    setAuditLoadStatus((status) => (status === "error" ? "loading" : status));
+    setSecurityLoadStatus((status) => (status === "error" ? "loading" : status));
+    setReloadTick((tick) => tick + 1);
+  }
 
   async function clearActivity() {
     try {
@@ -1455,12 +1539,14 @@ export function ActivityView({
       .then((e) => {
         if (!alive) return;
         setEntries(e);
-        setLoadError(false);
+        setAuditLoadStatus("ready");
       })
       .catch(() => {
         if (!alive) return;
-        setEntries([]);
-        setLoadError(true);
+        // Never replace a last-known audit trail with a false empty state.
+        setAuditLoadStatus((status) =>
+          status === "ready" || status === "stale" ? "stale" : "error",
+        );
       });
     getAuditStats()
       .then((s) => alive && setStats(s))
@@ -1469,8 +1555,19 @@ export function ActivityView({
       .then((s) => alive && setSavings(s))
       .catch(() => alive && setSavings(null));
     getSecurityEvents(50)
-      .then((s) => alive && setSecurity(s))
-      .catch(() => alive && setSecurity([]));
+      .then((s) => {
+        if (!alive) return;
+        setSecurity(s);
+        setSecurityLoadStatus("ready");
+      })
+      .catch(() => {
+        if (!alive) return;
+        // A failed refresh must preserve prior findings and must never produce the
+        // reassuring verified-empty state.
+        setSecurityLoadStatus((status) =>
+          status === "ready" || status === "stale" ? "stale" : "error",
+        );
+      });
     return () => {
       alive = false;
     };
@@ -1532,11 +1629,14 @@ export function ActivityView({
   const banner = (
     <>
       {/* Loud lane: the only thing here that may need a decision. */}
+      {securityLoadStatus !== "ready" ? (
+        <SecurityLoadNotice status={securityLoadStatus} onRetry={retryLoads} />
+      ) : null}
       {highSecurity.length > 0 ? (
         <SecurityNotices events={highSecurity} onDismiss={dismissSecurity} />
-      ) : (
+      ) : securityLoadStatus === "ready" ? (
         <SecurityResting />
-      )}
+      ) : null}
       {infoSecurity.length > 0 ? (
         <QuietDriftHistory
           events={infoSecurity}
@@ -1563,7 +1663,7 @@ export function ActivityView({
     (e) => (!serverFilter || e.server === serverFilter) && (!errorsOnly || !e.ok),
   );
 
-  if (entries === null) {
+  if (entries === null && auditLoadStatus === "loading") {
     return (
       <div>
         {banner}
@@ -1574,7 +1674,7 @@ export function ActivityView({
     );
   }
 
-  if (loadError && entries.length === 0) {
+  if (entries === null && auditLoadStatus === "error") {
     return (
       <div>
         {banner}
@@ -1585,6 +1685,46 @@ export function ActivityView({
             <p className="max-w-md text-sm text-muted-foreground">
               Toolport couldn't reach the gateway or read the audit log. This is not an
               empty log, if the gateway isn't running, start it and refresh.
+            </p>
+            <button
+              type="button"
+              onClick={retryLoads}
+              aria-label="Retry activity log"
+              className="mt-3 rounded-md border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+            >
+              Retry
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Defensive fallback for an impossible state transition: unknown audit data must
+  // still render as an error, never as a verified empty log.
+  if (entries === null) {
+    return (
+      <div>
+        {banner}
+        <div className="flex items-center justify-center py-24 text-sm text-destructive">
+          Activity status is unavailable. Retry the activity log.
+        </div>
+      </div>
+    );
+  }
+
+  if (entries.length === 0 && auditLoadStatus === "stale") {
+    return (
+      <div>
+        {banner}
+        <AuditStaleNotice onRetry={retryLoads} />
+        <div className="flex flex-col items-center justify-center gap-3 py-20 text-center">
+          <AlertTriangle className="size-10 text-warning/70" />
+          <div>
+            <p className="font-medium">No current activity status</p>
+            <p className="max-w-md text-sm text-muted-foreground">
+              The last successful read found no calls, but the latest refresh failed, so
+              Toolport can't verify that the log is still empty.
             </p>
           </div>
         </div>
@@ -1613,6 +1753,7 @@ export function ActivityView({
   return (
     <div>
       {banner}
+      {auditLoadStatus === "stale" && <AuditStaleNotice onRetry={retryLoads} />}
       {stats && <StatsPanel stats={stats} />}
 
       <div className="mb-2 flex items-center gap-2">
