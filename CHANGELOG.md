@@ -15,8 +15,8 @@ value to one server, so the workflow it used to dead-end now has an answer.
 
 Most of the rest of this release is one defect wearing different faces: code that
 read a failed probe as good news. A failed audit baseline, health check, security
-read, integrity load, or Windows credential read could each come back looking like
-"all clear" and let the app act on it. Each one now fails closed.
+read, or integrity load could each come back looking like "all clear" and let the
+app act on it. Each one now fails closed.
 
 ### Added
 
@@ -61,7 +61,13 @@ read, integrity load, or Windows credential read could each come back looking li
   remote icon URL is not a picture but a request the app makes to a server-chosen host
   on every paint, reporting when Toolport is open and from what IP with no tool call
   involved. (SEP-973)
-- **URL-mode elicitation.** (SBS-707)
+- **URL-mode elicitation**, so a server that needs you to finish something in a browser
+  works even with a client that does not support it: Toolport brokers the prompt in the
+  desktop app instead of letting the call fail. A server-provided link is a phishing and
+  internal-network primitive, so only credential-free HTTPS URLs resolving exclusively to
+  public addresses are allowed, under the same host boundary as Toolport's SSRF defenses,
+  and the origin shown to you is derived from the parsed URL rather than from anything the
+  server says about itself. (SBS-707)
 
 ### Fixed
 
