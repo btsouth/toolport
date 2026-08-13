@@ -889,6 +889,14 @@ pub fn quarantined_checked(profile: Option<&str>) -> Result<BTreeSet<String>, St
         // place, so an empty set is the truth here rather than a failure.
         return Ok(BTreeSet::new());
     };
+    // A missing v2 store with a leftover legacy slug file means migration failed;
+    // reporting "empty" would let the watcher reconcile the live set down to nothing
+    // and re-expose previously quarantined tools (SBS-715).
+    if profile.is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, false)) {
+        return Err(format!(
+            "quarantine store at {path:?} was not migrated from a legacy file; refusing to treat that as empty"
+        ));
+    }
     quarantined_checked_at(&path)
 }
 
@@ -913,6 +921,13 @@ pub fn mandatory_quarantined_checked(profile: Option<&str>) -> Result<BTreeSet<S
     let Some(path) = quarantine_path(profile) else {
         return Ok(BTreeSet::new());
     };
+    // Same unmigrated-legacy guard as `quarantined_checked`: a failed migration must
+    // not read as "no mandatory quarantine" (SBS-715).
+    if profile.is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, false)) {
+        return Err(format!(
+            "quarantine store at {path:?} was not migrated from a legacy file; refusing to treat that as empty"
+        ));
+    }
     Ok(quarantined_sets_checked_at(&path)?.1)
 }
 
@@ -2996,6 +3011,27 @@ mod tests {
             matches!(load_pins(Some("billing")), PinsLoad::Corrupt),
             "a leftover name-slug pin file is not a first run"
         );
+    }
+
+    #[test]
+    fn quarantine_reads_fail_closed_when_a_legacy_file_was_not_migrated() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data_dir = TestDataDir::new("legacy-quarantine-unmigrated");
+        let record = r#"{"srv__wipe":{"server":"srv","tool":"wipe","change":"tamper"}}"#;
+        std::fs::write(data_dir.path.join("quarantine-billing.json"), record).unwrap();
+        assert!(
+            load_quarantine(Some("billing")).is_err(),
+            "a leftover name-slug quarantine file is not a first run"
+        );
+        // The watcher's cached reads must also refuse: `Ok(empty)` would reconcile
+        // the router's live quarantine set down to nothing.
+        assert!(quarantined_checked(Some("billing")).is_err());
+        assert!(mandatory_quarantined_checked(Some("billing")).is_err());
+        // Once the v2 store exists the same reads recover.
+        let v2 = quarantine_path(Some("billing")).expect("data dir override is set");
+        std::fs::write(&v2, record).unwrap();
+        assert_eq!(quarantined_checked(Some("billing")).unwrap().len(), 1);
+        assert_eq!(mandatory_quarantined_checked(Some("billing")).unwrap().len(), 1);
     }
 
     #[test]

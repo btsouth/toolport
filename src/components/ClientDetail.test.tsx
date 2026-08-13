@@ -276,12 +276,7 @@ describe("ClientDetail connect toast (SOU-317)", () => {
     await userEvent.click(screen.getByRole("button", { name: /connect to toolport/i }));
 
     await waitFor(() =>
-      expect(installGateway).toHaveBeenCalledWith(
-        "claude-desktop",
-        "p1",
-        false,
-        "stdio",
-      ),
+      expect(installGateway).toHaveBeenCalledWith("claude-desktop", "p1", false, "stdio"),
     );
     expect(toastSuccess).toHaveBeenCalledWith(
       "Connected Toolport to Claude Desktop",
