@@ -1659,20 +1659,24 @@ pub fn screen_url_elicitation_request(
 }
 
 fn screen_input_required(result: &mut Value) -> Result<(), TransportError> {
-    let Some(requests) = result.get_mut("inputRequests").and_then(Value::as_object_mut) else {
+    let Some(requests) = result
+        .get_mut("inputRequests")
+        .and_then(Value::as_object_mut)
+    else {
         return Ok(());
     };
     for request in requests.values_mut() {
         screen_url_elicitation_request(request).map_err(|message| {
-            TransportError::Fatal(format!("Toolport refused unsafe URL elicitation: {message}"))
+            TransportError::Fatal(format!(
+                "Toolport refused unsafe URL elicitation: {message}"
+            ))
         })?;
     }
     Ok(())
 }
 
 fn modern_client_supports_input_request(meta: Option<&Value>, request: &Value) -> bool {
-    let capabilities = meta
-        .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"));
+    let capabilities = meta.and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"));
     match request.get("method").and_then(Value::as_str) {
         Some("roots/list") => capabilities.and_then(|caps| caps.get("roots")).is_some(),
         Some("sampling/createMessage") => {
@@ -2163,6 +2167,12 @@ pub fn screen_spawn_command(command: &str, args: &[String]) -> Result<(), String
         // host-namespace sharing escalate past a normal host process (a plain `-v`
         // mount does not, and stays allowed; see container_escape_flag).
         "docker" | "podman" | "nerdctl" => container_escape_flag(args),
+        // Package launchers look like `npx -y @scope/pkg`, which is allowed, but
+        // `-c`/`--call` run a shell string and `--node-arg`/`-n` are `node -e`
+        // by another name. The rewriter documents these and falls through to
+        // spawn-as-is (SBS-783).
+        "npx" => npx_dangerous(args),
+        "npm" => npm_dangerous(args),
         _ => None,
     };
     match dangerous {
@@ -2477,6 +2487,34 @@ fn pwsh_dangerous(args: &[String]) -> Option<&str> {
         .map(|a| a.as_str())
 }
 
+/// npx flags that run attacker-supplied code instead of a cached package.
+/// `-c`/`--call` execute a shell string; `--node-arg`/`-n` are extra node
+/// argv (so `--node-arg=-e` is the `node -e` case this guard already blocks);
+/// `--shell` picks the shell `-c` runs in.
+fn npx_dangerous(args: &[String]) -> Option<&str> {
+    first_flag(args, &["-c", "--call", "-n", "--node-arg", "--shell"]).or_else(|| {
+        // `npx -- node -e …` / `npm exec -- node -e …`: tokens after `--` are a
+        // command, not package args. Screen that inner program with the same guard.
+        let idx = args.iter().position(|a| a == "--")?;
+        let tail = args.get(idx + 1..)?;
+        let (cmd, rest) = tail.split_first()?;
+        match screen_spawn_command(cmd, rest) {
+            Err(_) => rest.first().map(|s| s.as_str()).or(Some(cmd.as_str())),
+            Ok(()) => None,
+        }
+    })
+}
+
+/// `npm exec` / `npm x` is npx. Other npm subcommands are not MCP launchers; still
+/// screen them for the same eval flags so `npm -c` cannot slip through.
+fn npm_dangerous(args: &[String]) -> Option<&str> {
+    let rest = match args.first().map(String::as_str) {
+        Some("exec") | Some("x") => args.get(1..).unwrap_or(&[]),
+        _ => args,
+    };
+    npx_dangerous(rest)
+}
+
 fn first_flag<'a>(args: &'a [String], flags: &[&str]) -> Option<&'a str> {
     args.iter()
         .find(|a| {
@@ -2583,6 +2621,66 @@ fn container_escape_flag(args: &[String]) -> Option<&str> {
         }
     }
     None
+}
+
+/// For docker/podman/nerdctl, `-e KEY` (no value) copies KEY from the CLI process
+/// env into the container. Vaulted secrets already ride on the CLI via `.envs()`;
+/// without `-e` they stay on the host docker process and the container starts
+/// with empty credentials (SBS-785). Values stay off argv so `ps` cannot leak them.
+fn inject_container_env(command: &str, args: &[String], env: &[(String, String)]) -> Vec<String> {
+    let base = command_basename(command);
+    let family = interpreter_family(&base);
+    if !matches!(family, "docker" | "podman" | "nerdctl") || env.is_empty() {
+        return args.to_vec();
+    }
+    let already: std::collections::HashSet<String> = {
+        let mut set = std::collections::HashSet::new();
+        let mut i = 0;
+        while i < args.len() {
+            let a = args[i].as_str();
+            let al = a.to_ascii_lowercase();
+            if al == "-e" || al == "--env" {
+                if let Some(val) = args.get(i + 1) {
+                    set.insert(val.split('=').next().unwrap_or(val).to_string());
+                    i += 2;
+                    continue;
+                }
+            } else if al.starts_with("--env=") || al.starts_with("-e=") {
+                if let Some((_, rest)) = a.split_once('=') {
+                    set.insert(rest.split('=').next().unwrap_or(rest).to_string());
+                }
+            }
+            i += 1;
+        }
+        set
+    };
+    let mut extras: Vec<String> = Vec::new();
+    for (key, _) in env {
+        if key.is_empty() || key.starts_with('-') {
+            continue;
+        }
+        if already.contains(key) {
+            continue;
+        }
+        extras.push("-e".to_string());
+        extras.push(key.clone());
+    }
+    if extras.is_empty() {
+        return args.to_vec();
+    }
+    let mut out = Vec::with_capacity(args.len() + extras.len());
+    if args
+        .first()
+        .is_some_and(|s| s.eq_ignore_ascii_case("run") || s.eq_ignore_ascii_case("create"))
+    {
+        out.push(args[0].clone());
+        out.extend(extras);
+        out.extend(args[1..].iter().cloned());
+    } else {
+        out.extend(extras);
+        out.extend(args.iter().cloned());
+    }
+    out
 }
 
 /// Talks to a downstream MCP server over its stdio (a spawned child process).
@@ -2966,6 +3064,8 @@ impl StdioTransport {
             Some(d) => (d.command.as_str(), d.args.as_slice()),
             None => (command, args),
         };
+        let container_args = inject_container_env(spawn_command, spawn_args, env);
+        let spawn_args = container_args.as_slice();
         let resolved = resolve_command(spawn_command);
         let mut cmd = Command::new(&resolved);
         cmd.args(spawn_args)
@@ -3166,9 +3266,7 @@ impl Transport for StdioTransport {
         params: Value,
         cancel: Option<CancelContext>,
     ) -> Result<Value, TransportError> {
-        if self.pending_mrtr.is_some()
-            && cancel.as_ref().is_some_and(CancelContext::is_cancelled)
-        {
+        if self.pending_mrtr.is_some() && cancel.as_ref().is_some_and(CancelContext::is_cancelled) {
             if let Some(cancel) = cancel.as_ref() {
                 self.cancel_matching_pending_request(method, &params, cancel);
             }
@@ -3338,7 +3436,10 @@ impl Transport for StdioTransport {
         if pending.response_for_retry(method, params).is_err() {
             return false;
         }
-        let pending = self.pending_mrtr.take().expect("matching pending request exists");
+        let pending = self
+            .pending_mrtr
+            .take()
+            .expect("matching pending request exists");
         CancelEntry {
             stdin: Arc::clone(&self.stdin),
             downstream_id: pending.downstream_request_id,
@@ -4665,7 +4766,10 @@ impl Transport for HttpTransport {
         if pending.common.response_for_retry(method, params).is_err() {
             return false;
         }
-        let pending = self.pending_mrtr.take().expect("matching pending request exists");
+        let pending = self
+            .pending_mrtr
+            .take()
+            .expect("matching pending request exists");
         self.forward_cancel_async(pending.common.downstream_request_id, cancel);
         true
     }
@@ -5317,9 +5421,7 @@ impl DownstreamServer {
                 });
                 let response = match handler(&request) {
                     Some(ServerRequestAction::Respond(response)) => response,
-                    Some(ServerRequestAction::InputRequired) => {
-                        return Ok(None)
-                    }
+                    Some(ServerRequestAction::InputRequired) => return Ok(None),
                     None => {
                         return Err(TransportError::Fatal(format!(
                             "upstream client did not handle input request '{key}' ({method})"
@@ -6079,11 +6181,11 @@ fn fetch_paginated_list(
 #[cfg(test)]
 mod tests {
     use super::{
-        cwd_validation_error, empty_cwd_variables, expand_cwd, fetch_paginated_list,
-        file_uri_to_path, protocol_meta_for, resolve_command, resolve_project_root,
-        resolve_root_token, screen_resolved_addrs, screen_spawn_command, screen_spawn_env,
-        validate_cwd, CacheHint, CancelRegistry, DownstreamServer, HttpTransport, MrtrRequest,
-        apply_catalog_refresh, is_implausible_shrink, RootSource, ServerRequestAction,
+        apply_catalog_refresh, cwd_validation_error, empty_cwd_variables, expand_cwd,
+        fetch_paginated_list, file_uri_to_path, is_implausible_shrink, protocol_meta_for,
+        resolve_command, resolve_project_root, resolve_root_token, screen_resolved_addrs,
+        screen_spawn_command, screen_spawn_env, validate_cwd, CacheHint, CancelRegistry,
+        DownstreamServer, HttpTransport, MrtrRequest, RootSource, ServerRequestAction,
         ServerRequestHandler, Transport, TransportError, Truncation, MODERN_PROTOCOL_VERSION,
         OAUTH_CLIENT_CREDENTIALS_EXTENSION,
     };
@@ -6324,7 +6426,9 @@ mod tests {
             let mut hint = CacheHint::default();
             apply_catalog_refresh(
                 &mut tools,
-                (0..new_len).map(|i| json!({"name": format!("t{i}")})).collect(),
+                (0..new_len)
+                    .map(|i| json!({"name": format!("t{i}")}))
+                    .collect(),
                 &mut streak,
                 &mut hint,
                 CacheHint::default(),
@@ -7632,9 +7736,7 @@ mod tests {
             }
         }))]);
         let mut server = DownstreamServer::connect("modern".into(), Box::new(transport)).unwrap();
-        server.set_server_request_handler(Arc::new(|_| {
-            Some(ServerRequestAction::InputRequired)
-        }));
+        server.set_server_request_handler(Arc::new(|_| Some(ServerRequestAction::InputRequired)));
         let meta = json!({
             "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
             "io.modelcontextprotocol/clientCapabilities": { "elicitation": { "url": {} } }
@@ -8383,6 +8485,62 @@ mod tests {
         );
         // A plain binary server.
         assert!(screen_spawn_command("/usr/local/bin/my-mcp", &argv(&["--stdio"])).is_ok());
+        assert!(screen_spawn_command("npm", &argv(&["exec", "-y", "@some/mcp-server"])).is_ok());
+    }
+
+    #[test]
+    fn spawn_guard_blocks_npx_eval_flags() {
+        // SBS-783: npx/npm eval flags were falling through to allow.
+        assert!(screen_spawn_command("npx", &argv(&["-c", "calc"])).is_err());
+        assert!(screen_spawn_command("npx", &argv(&["--call", "x"])).is_err());
+        assert!(screen_spawn_command("npx", &argv(&["-ccalc"])).is_err());
+        assert!(screen_spawn_command(
+            "npx",
+            &argv(&["--node-arg=-e", "require('fs')", "-y", "pkg"])
+        )
+        .is_err());
+        assert!(screen_spawn_command("npx", &argv(&["-n", "-e", "-y", "pkg"])).is_err());
+        assert!(screen_spawn_command("npx", &argv(&["--shell", "bash", "-c", "x"])).is_err());
+        assert!(screen_spawn_command("npm", &argv(&["exec", "-c", "x"])).is_err());
+        assert!(screen_spawn_command("npm", &argv(&["x", "--call=x"])).is_err());
+        assert!(screen_spawn_command("npx", &argv(&["--", "node", "-e", "x"])).is_err());
+        assert!(screen_spawn_command("npm", &argv(&["exec", "--", "node", "-e", "x"])).is_err());
+        // Normal package install is still the allow-path.
+        assert!(screen_spawn_command("npx", &argv(&["-y", "@scope/mcp"])).is_ok());
+    }
+
+    #[test]
+    fn inject_container_env_adds_dash_e_before_the_image() {
+        let env = vec![("ACME_API_KEY".to_string(), "secret".to_string())];
+        assert_eq!(
+            super::inject_container_env(
+                "docker",
+                &argv(&["run", "-i", "--rm", "ghcr.io/acme/boxed-mcp:1.2.3"]),
+                &env,
+            ),
+            argv(&[
+                "run",
+                "-e",
+                "ACME_API_KEY",
+                "-i",
+                "--rm",
+                "ghcr.io/acme/boxed-mcp:1.2.3"
+            ])
+        );
+        // Value stays off argv; npx is unchanged.
+        assert_eq!(
+            super::inject_container_env("npx", &argv(&["-y", "pkg"]), &env),
+            argv(&["-y", "pkg"])
+        );
+        // Already-present -e is not duplicated.
+        assert_eq!(
+            super::inject_container_env(
+                "docker",
+                &argv(&["run", "-e", "ACME_API_KEY", "img"]),
+                &env,
+            ),
+            argv(&["run", "-e", "ACME_API_KEY", "img"])
+        );
     }
 
     #[test]
@@ -8955,7 +9113,10 @@ mod tests {
     fn bearer_header_adds_scheme_once() {
         assert_eq!(super::bearer_header("sk-123"), "Bearer sk-123");
         assert_eq!(super::bearer_header("Bearer sk-123"), "Bearer sk-123");
-        assert_eq!(super::bearer_header("Basic ZW1haWw6dG9rZW4="), "Basic ZW1haWw6dG9rZW4=");
+        assert_eq!(
+            super::bearer_header("Basic ZW1haWw6dG9rZW4="),
+            "Basic ZW1haWw6dG9rZW4="
+        );
         assert_eq!(super::bearer_header("bearer sk-123"), "bearer sk-123");
     }
 
@@ -10980,11 +11141,9 @@ mod tests {
                 "id": body["id"],
                 "result": { "recovered": true }
             });
-            let content_type = tiny_http::Header::from_bytes(
-                &b"Content-Type"[..],
-                &b"application/json"[..],
-            )
-            .unwrap();
+            let content_type =
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                    .unwrap();
             request
                 .respond(
                     tiny_http::Response::from_string(response.to_string())
@@ -11036,7 +11195,10 @@ mod tests {
 
             let mut cancellation = server.recv().expect("receive MRTR cancellation");
             let mut cancel_body = String::new();
-            cancellation.as_reader().read_to_string(&mut cancel_body).unwrap();
+            cancellation
+                .as_reader()
+                .read_to_string(&mut cancel_body)
+                .unwrap();
             cancel_tx
                 .send(serde_json::from_str::<Value>(&cancel_body).unwrap())
                 .unwrap();
@@ -11140,7 +11302,10 @@ mod tests {
             assert_eq!(value["method"], "notifications/cancelled");
             assert_eq!(value["params"]["requestId"], 41);
             assert!(
-                server.recv_timeout(Duration::from_millis(150)).unwrap().is_none(),
+                server
+                    .recv_timeout(Duration::from_millis(150))
+                    .unwrap()
+                    .is_none(),
                 "pre-cancellation must not send the inline continuation POST"
             );
         });
