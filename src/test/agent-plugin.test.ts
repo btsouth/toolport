@@ -6,7 +6,12 @@
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, posix, win32 } from "node:path";
+import {
+  gatewayCandidates,
+  spawnFirst,
+  validateGatewayOverride,
+} from "../../packaging/agent-plugin/toolport/bin/launch-gateway.mjs";
 
 // Not import.meta.url: under the jsdom environment vitest serves modules from
 // an http:// URL, so file-relative resolution breaks. Vitest's cwd is the repo
@@ -22,6 +27,10 @@ const mcp = readJson("mcp.json");
 const claudeManifest = readJson(".claude-plugin", "plugin.json");
 const claudeMcp = readJson(".mcp.json");
 const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
+const releaseWorkflow = readFileSync(
+  join(repoRoot, ".github", "workflows", "release.yml"),
+  "utf8",
+);
 
 // Spec 1.0.0: name is 1-64 chars of [a-z0-9.-], alphanumeric at both ends, no
 // consecutive hyphens or periods.
@@ -145,5 +154,112 @@ describe("agent plugin components", () => {
       "--check",
       join(pluginRoot, "bin", "launch-gateway.mjs"),
     ]);
+  });
+});
+
+describe("agent plugin gateway launcher", () => {
+  const blindFs = {
+    readFileSync: () => {
+      throw new Error("hidden");
+    },
+    readdirSync: () => {
+      throw new Error("hidden");
+    },
+    statSync: () => {
+      throw new Error("hidden");
+    },
+  };
+
+  it("tries constructed Windows paths even when filesystem probes are hidden", () => {
+    const candidates = gatewayCandidates({
+      platform: "win32",
+      home: "C:\\Users\\me",
+      env: { APPDATA: "R:\\Roaming", LOCALAPPDATA: "L:\\Local" },
+      fsOps: blindFs,
+      version: pkg.version,
+    });
+    expect(candidates).toContain(
+      win32.join("L:\\Local", "Toolport", "toolport-gateway.exe"),
+    );
+    expect(candidates).toContain(
+      win32.join("R:\\Roaming", "Toolport", "bin", `toolport-gateway-${pkg.version}.exe`),
+    );
+  });
+
+  it("keeps legacy Conduit gateway layouts on every desktop OS", () => {
+    expect(
+      gatewayCandidates({
+        platform: "win32",
+        home: "C:\\Users\\me",
+        env: { APPDATA: "R:\\Roaming", LOCALAPPDATA: "L:\\Local" },
+        fsOps: blindFs,
+      }),
+    ).toContain(win32.join("L:\\Local", "Conduit", "conduit-gateway.exe"));
+    expect(
+      gatewayCandidates({
+        platform: "darwin",
+        home: "/Users/me",
+        env: {},
+        fsOps: blindFs,
+      }),
+    ).toContain(
+      posix.join("/Applications", "Conduit.app", "Contents", "MacOS", "conduit-gateway"),
+    );
+    expect(
+      gatewayCandidates({
+        platform: "linux",
+        home: "/home/me",
+        env: {},
+        fsOps: blindFs,
+      }),
+    ).toContain(posix.join("/home/me", ".config", "Conduit", "bin", "conduit-gateway"));
+  });
+
+  it("finds an older versioned Conduit gateway when its manifest is unreadable", () => {
+    const legacyBin = win32.join("R:\\Roaming", "Conduit", "bin");
+    const fsOps = {
+      readFileSync: () => {
+        throw new Error("unreadable manifest");
+      },
+      readdirSync: (path: string) =>
+        path === legacyBin ? ["conduit-gateway-1.11.0.exe"] : [],
+      statSync: () => ({ mtimeMs: 1 }),
+    };
+    expect(
+      gatewayCandidates({
+        platform: "win32",
+        home: "C:\\Users\\me",
+        env: { APPDATA: "R:\\Roaming", LOCALAPPDATA: "L:\\Local" },
+        fsOps,
+      }),
+    ).toContain(win32.join(legacyBin, "conduit-gateway-1.11.0.exe"));
+  });
+
+  it("falls through an unspawnable candidate to a working binary", async () => {
+    await expect(
+      spawnFirst([join(repoRoot, "missing-gateway"), process.execPath], {
+        args: ["-e", "process.exit(0)"],
+        stdio: "ignore",
+      }),
+    ).resolves.toBe(0);
+  });
+
+  it("reports a missing candidate and rejects relative overrides", async () => {
+    await expect(
+      spawnFirst([join(repoRoot, "missing-gateway")], { stdio: "ignore" }),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect(() => validateGatewayOverride("./gateway")).toThrow(
+      "TOOLPORT_GATEWAY must be an absolute path",
+    );
+  });
+
+  it("packages and uploads the zip independently of native builds", () => {
+    const job = releaseWorkflow
+      .split("\n  agent-plugin:\n")[1]
+      ?.split("\n  updater-manifest:\n")[0];
+    expect(job).toBeDefined();
+    expect(job).not.toMatch(/^\s+needs:/m);
+    expect(job).toContain("toolport-agent-plugin.zip");
+    expect(job).toContain("Upload the agent plugin");
   });
 });

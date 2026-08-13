@@ -23,32 +23,47 @@
 // instead of dying silently.
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, posix, win32 } from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 const GATEWAY = "toolport-gateway";
 const LEGACY_GATEWAY = "conduit-gateway";
-const EXE = process.platform === "win32" ? ".exe" : "";
+const defaultFs = { readFileSync, readdirSync, statSync };
+
+function pluginVersion(fsOps) {
+  try {
+    return JSON.parse(
+      fsOps.readFileSync(new URL("../plugin.json", import.meta.url), "utf8"),
+    ).version;
+  } catch {
+    return null;
+  }
+}
 
 /** Newest gateway binary in a published bin dir, by modification time.
  *  Matches both plain versioned (`toolport-gateway-1.12.0.exe`) and
  *  content-addressed (`...-1.12.0-<digest>.exe`) names. */
-function newestPublished(binDir) {
+function newestPublished(binDir, fsOps, pathImpl, exe) {
   let best = null;
   let bestMtime = 0;
   let entries;
   try {
-    entries = readdirSync(binDir);
+    entries = fsOps.readdirSync(binDir);
   } catch {
     return null;
   }
   for (const name of entries) {
-    if (!name.startsWith(`${GATEWAY}-`) || !name.endsWith(EXE || ".exe")) continue;
-    const full = join(binDir, name);
+    if (
+      ![GATEWAY, LEGACY_GATEWAY].some((prefix) => name.startsWith(`${prefix}-`)) ||
+      !name.endsWith(exe || ".exe")
+    )
+      continue;
+    const full = pathImpl.join(binDir, name);
     try {
-      const mtime = statSync(full).mtimeMs;
+      const mtime = fsOps.statSync(full).mtimeMs;
       if (mtime > bestMtime) {
         best = full;
         bestMtime = mtime;
@@ -61,61 +76,95 @@ function newestPublished(binDir) {
 }
 
 /** The path recorded by the app in gateway-manifest.json, when still present. */
-function manifestPath(binDir) {
+function manifestPath(binDir, fsOps, pathImpl) {
   try {
     const manifest = JSON.parse(
-      readFileSync(join(binDir, "gateway-manifest.json"), "utf8"),
+      fsOps.readFileSync(pathImpl.join(binDir, "gateway-manifest.json"), "utf8"),
     );
-    if (typeof manifest.path === "string" && existsSync(manifest.path))
-      return manifest.path;
+    // Do not preflight with existsSync: MSIX filesystem virtualization can hide a
+    // host path from stat/read APIs even though CreateProcess can launch it.
+    if (typeof manifest.path === "string") return manifest.path;
   } catch {
     /* no manifest, or unreadable: fall through to scanning */
   }
   return null;
 }
 
-function candidates() {
-  const home = homedir();
+export function gatewayCandidates({
+  platform = process.platform,
+  env = process.env,
+  home = homedir(),
+  fsOps = defaultFs,
+  version,
+} = {}) {
+  const pathImpl = platform === "win32" ? win32 : posix;
+  const exe = platform === "win32" ? ".exe" : "";
   const found = [];
-  if (process.platform === "win32") {
-    const roaming = process.env.APPDATA || join(home, "AppData", "Roaming");
-    const local = process.env.LOCALAPPDATA || join(home, "AppData", "Local");
+  if (platform === "win32") {
+    const roaming = env.APPDATA || pathImpl.join(home, "AppData", "Roaming");
+    const local = env.LOCALAPPDATA || pathImpl.join(home, "AppData", "Local");
     for (const leaf of ["Toolport", "Conduit"]) {
-      const binDir = join(roaming, leaf, "bin");
-      const fromManifest = manifestPath(binDir);
+      const binDir = pathImpl.join(roaming, leaf, "bin");
+      const fromManifest = manifestPath(binDir, fsOps, pathImpl);
       if (fromManifest) found.push(fromManifest);
-      const published = newestPublished(binDir);
+      // The normal published filename can be constructed from this plugin's
+      // lockstep version even when MSIX hides the directory and manifest.
+      const candidateVersion = version ?? pluginVersion(fsOps);
+      if (candidateVersion) {
+        found.push(
+          pathImpl.join(binDir, `${GATEWAY}-${candidateVersion}${exe}`),
+          pathImpl.join(binDir, `${LEGACY_GATEWAY}-${candidateVersion}${exe}`),
+        );
+      }
+      const published = newestPublished(binDir, fsOps, pathImpl, exe);
       if (published) found.push(published);
     }
     for (const leaf of ["Toolport", "Conduit"]) {
       for (const name of [GATEWAY, LEGACY_GATEWAY]) {
-        found.push(join(local, leaf, `${name}${EXE}`));
+        found.push(pathImpl.join(local, leaf, `${name}${exe}`));
       }
     }
-  } else if (process.platform === "darwin") {
-    for (const appsDir of ["/Applications", join(home, "Applications")]) {
-      const contents = join(appsDir, "Toolport.app", "Contents");
-      found.push(
-        join(contents, "Helpers", "ToolportGateway.app", "Contents", "MacOS", GATEWAY),
-        join(
-          contents,
-          "Helpers",
-          "ConduitGateway.app",
-          "Contents",
-          "MacOS",
-          LEGACY_GATEWAY,
-        ),
-        join(contents, "MacOS", GATEWAY),
-      );
+  } else if (platform === "darwin") {
+    for (const appsDir of ["/Applications", pathImpl.join(home, "Applications")]) {
+      for (const leaf of ["Toolport", "Conduit"]) {
+        const contents = pathImpl.join(appsDir, `${leaf}.app`, "Contents");
+        found.push(
+          pathImpl.join(
+            contents,
+            "Helpers",
+            "ToolportGateway.app",
+            "Contents",
+            "MacOS",
+            GATEWAY,
+          ),
+          pathImpl.join(
+            contents,
+            "Helpers",
+            "ConduitGateway.app",
+            "Contents",
+            "MacOS",
+            LEGACY_GATEWAY,
+          ),
+          pathImpl.join(contents, "MacOS", GATEWAY),
+          pathImpl.join(contents, "MacOS", LEGACY_GATEWAY),
+        );
+      }
     }
   } else {
-    found.push(join("/usr/bin", GATEWAY), join("/usr/local/bin", GATEWAY));
-    const configBase = process.env.XDG_CONFIG_HOME || join(home, ".config");
+    for (const dir of ["/usr/bin", "/usr/local/bin"]) {
+      found.push(pathImpl.join(dir, GATEWAY), pathImpl.join(dir, LEGACY_GATEWAY));
+    }
+    const configBase = env.XDG_CONFIG_HOME || pathImpl.join(home, ".config");
     for (const leaf of ["Toolport", "Conduit"]) {
-      found.push(join(configBase, leaf, "bin", GATEWAY));
+      found.push(
+        pathImpl.join(configBase, leaf, "bin", GATEWAY),
+        pathImpl.join(configBase, leaf, "bin", LEGACY_GATEWAY),
+      );
     }
   }
-  return found;
+  // Let the OS search PATH only after every absolute candidate has failed.
+  found.push(GATEWAY, LEGACY_GATEWAY);
+  return [...new Set(found)];
 }
 
 /** Speak just enough JSON-RPC to surface a useful error in the client's UI,
@@ -153,31 +202,65 @@ function failNotInstalled(detail) {
   setTimeout(() => process.exit(1), 30_000);
 }
 
-function run(binary, isLastResort) {
-  const child = spawn(binary, process.argv.slice(2), {
-    stdio: "inherit",
-    windowsHide: true,
+export function spawnFirst(
+  binaries,
+  {
+    args = process.argv.slice(2),
+    spawnImpl = spawn,
+    stdio = "inherit",
+    windowsHide = true,
+  } = {},
+) {
+  return new Promise((resolve, reject) => {
+    let lastError = null;
+    const attempt = (index) => {
+      if (index >= binaries.length) {
+        reject(lastError ?? new Error("no gateway candidates"));
+        return;
+      }
+      const child = spawnImpl(binaries[index], args, { stdio, windowsHide });
+      let started = false;
+      child.once("spawn", () => {
+        started = true;
+        for (const signal of ["SIGINT", "SIGTERM"]) {
+          process.once(signal, () => child.kill(signal));
+        }
+      });
+      child.once("error", (error) => {
+        if (started) reject(error);
+        else {
+          lastError = error;
+          attempt(index + 1);
+        }
+      });
+      child.once("exit", (code, signal) => resolve(signal ? 1 : (code ?? 1)));
+    };
+    attempt(0);
   });
-  child.on("error", (err) => {
-    if (isLastResort)
-      failNotInstalled(err.code === "ENOENT" ? "not on PATH either" : err.message);
-    else failNotInstalled(err.message);
-  });
-  child.on("exit", (code, signal) => process.exit(signal ? 1 : (code ?? 1)));
-  for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.on(signal, () => child.kill(signal));
+}
+
+export function validateGatewayOverride(override) {
+  if (!override) return null;
+  if (!isAbsolute(override)) {
+    throw new Error("TOOLPORT_GATEWAY must be an absolute path");
+  }
+  return override;
+}
+
+async function main() {
+  let override;
+  try {
+    override = validateGatewayOverride(process.env.TOOLPORT_GATEWAY);
+  } catch (error) {
+    failNotInstalled(error.message);
+    return;
+  }
+  const binaries = override ? [override] : gatewayCandidates();
+  try {
+    process.exit(await spawnFirst(binaries));
+  } catch (error) {
+    failNotInstalled(error?.code === "ENOENT" ? "not on PATH either" : error?.message);
   }
 }
 
-const override = process.env.TOOLPORT_GATEWAY;
-if (override) {
-  // An explicit override is used as-is, never silently substituted: if it is
-  // wrong, the spawn error surfaces through failNotInstalled.
-  run(override, false);
-} else {
-  const resolved = candidates().find((p) => existsSync(p));
-  if (resolved) run(resolved, false);
-  // Last resort: let the OS search PATH (covers a from-source `cargo install`
-  // or a user who added the binary to PATH themselves).
-  else run(GATEWAY, true);
-}
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) void main();

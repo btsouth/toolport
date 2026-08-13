@@ -227,7 +227,8 @@ Clients that install [Agent Plugins 1.0](https://agent-plugins.org) packages
 connect to Toolport by installing one plugin instead of editing MCP config:
 download `toolport-agent-plugin.zip` from the
 [latest release](https://github.com/tsouth89/toolport/releases/latest) and point
-your client's plugin install flow at the unzipped folder. The plugin bundles the
+your client's plugin install flow at the unzipped `toolport/` directory—the folder
+that contains `plugin.json`. The plugin bundles the
 gateway's MCP server entry plus a skill that teaches the agent Toolport's
 search → call workflow, and the same folder also carries the Claude Code plugin
 layout. It launches the gateway already installed by the desktop app, so every
