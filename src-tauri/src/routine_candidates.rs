@@ -13,7 +13,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::routines::{
-    self, ObservedDependency, PromotionEvidence, RoutineLimits, RoutineRiskClass,
+    self, EvidenceProvenance, ObservedDependency, PromotionEvidence, RoutineLimits,
+    RoutineRiskClass,
 };
 
 pub const MAX_CANDIDATES: usize = 64;
@@ -53,6 +54,7 @@ pub enum ReasonCode {
     IntermediateResultsCompressed,
     RepeatedDefinition,
     EquivalentRoutineExists,
+    SynthesizedFromObservedCalls,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +72,9 @@ pub struct CodeRunEvidence {
     pub input_schema: Option<Value>,
     pub limits: RoutineLimits,
     pub immutable_input: bool,
+    /// For [`EvidenceProvenance::ImmutableRun`], the script really ran to the end.
+    /// For synthesized evidence the glue never executed; the caller sets this to the
+    /// static validation verdict and `provenance` discloses the difference everywhere.
     pub script_succeeded: bool,
     pub issued_calls: usize,
     pub receipts: Vec<ToolReceipt>,
@@ -77,6 +82,7 @@ pub struct CodeRunEvidence {
     pub writes_enabled: bool,
     pub caller: String,
     pub equivalent_routine_exists: bool,
+    pub provenance: EvidenceProvenance,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +99,7 @@ pub struct CandidateAssessment {
     pub reason_codes: Vec<ReasonCode>,
     pub risk_class: RoutineRiskClass,
     pub expires_at_ms: Option<u128>,
+    pub provenance: EvidenceProvenance,
 }
 
 #[derive(Debug, Clone)]
@@ -108,17 +115,19 @@ pub struct PromotionDraft {
     pub observed_dependencies: Vec<ObservedDependency>,
     pub risk_class: RoutineRiskClass,
     pub recommendation: Recommendation,
+    pub provenance: EvidenceProvenance,
 }
 
 impl PromotionDraft {
     pub fn evidence(&self) -> Result<PromotionEvidence, String> {
-        PromotionEvidence::new(
+        Ok(PromotionEvidence::new(
             self.run_id.clone(),
             self.executed_at_ms,
             self.calls,
             self.observed_dependencies.clone(),
             self.risk_class,
-        )
+        )?
+        .with_provenance(self.provenance))
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -172,8 +181,9 @@ struct State {
 }
 
 /// Keeps a tracking map bounded: before inserting `key` for the first time, evicts the
-/// oldest still-present entries until there is room. Entries already removed elsewhere
-/// (refunds, `clear_session`) are drained from `order` as ghosts during eviction.
+/// oldest entries until there is room. Every removal path (refunds, `clear_session`, and
+/// eviction here) keeps `order` in step with `map`, so the queue front is always the oldest
+/// live entry; the in-loop `remove` of an already-absent key is defensive only.
 fn reserve_tracked_key<K, V>(map: &mut HashMap<K, V>, order: &mut VecDeque<K>, cap: usize, key: &K)
 where
     K: Eq + std::hash::Hash + Clone,
@@ -328,6 +338,13 @@ impl CandidateRegistry {
             *count >= 2
         });
 
+        if matches!(
+            evidence.provenance,
+            EvidenceProvenance::SynthesizedFromObservedCalls
+        ) {
+            reason_codes.push(ReasonCode::SynthesizedFromObservedCalls);
+        }
+
         let recommendation = if matches!(
             risk_class,
             RoutineRiskClass::High | RoutineRiskClass::Unknown
@@ -396,6 +413,7 @@ impl CandidateRegistry {
                     observed_dependencies: dependencies,
                     risk_class,
                     recommendation,
+                    provenance: evidence.provenance,
                 },
                 expires_at_ms: expires,
                 retained_bytes,
@@ -425,6 +443,7 @@ impl CandidateRegistry {
             reason_codes,
             risk_class,
             expires_at_ms,
+            provenance: evidence.provenance,
         }
     }
 
@@ -525,14 +544,15 @@ impl CandidateRegistry {
         outcome: PromotionOutcome,
     ) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        remove_candidate(&mut state, run_id);
+        let state = &mut *state;
+        remove_candidate(state, run_id);
         let key = (caller.to_string(), fingerprint.to_string());
         match outcome {
             // The user never made a decision (equivalent short-circuit, internal error, or an
             // unreachable approval broker): refund the fingerprint suppression and the prompt
             // budget so a later run may still ask once.
             PromotionOutcome::Equivalent | PromotionOutcome::Stale => {
-                state.suppressions.remove(&key);
+                remove_suppression(state, &key);
                 if let Some(count) = state.prompt_counts.get_mut(caller) {
                     *count = count.saturating_sub(1);
                 }
@@ -540,7 +560,7 @@ impl CandidateRegistry {
             // The user approved but the state went stale before the write: allow a fresh run
             // to prompt again, but keep the budget consumed - a prompt was actually shown.
             PromotionOutcome::Expired => {
-                state.suppressions.remove(&key);
+                remove_suppression(state, &key);
             }
             PromotionOutcome::Denied => {
                 state.suppressions.insert(key, Suppression::Denied);
@@ -651,6 +671,15 @@ fn remove_candidate(state: &mut State, run_id: &str) {
     state.order.retain(|candidate_id| candidate_id != run_id);
 }
 
+/// Remove a refunded suppression together with its `suppression_order` entry. A stale order
+/// entry would let the same key re-enter the queue on a later prompt; once the map reaches
+/// capacity, that ghost at the queue front would evict the key's newer, real suppression
+/// (even a user's explicit denial) instead of the actual oldest entry.
+fn remove_suppression(state: &mut State, key: &(String, String)) {
+    state.suppressions.remove(key);
+    state.suppression_order.retain(|tracked| tracked != key);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,7 +709,40 @@ mod tests {
             writes_enabled: true,
             caller: caller.to_string(),
             equivalent_routine_exists: false,
+            provenance: EvidenceProvenance::ImmutableRun,
         }
+    }
+
+    #[test]
+    fn synthesized_evidence_is_disclosed_end_to_end() {
+        let registry = CandidateRegistry::default();
+        let mut synthesized = evidence("caller-synth");
+        synthesized.provenance = EvidenceProvenance::SynthesizedFromObservedCalls;
+        let assessment = registry.assess_run(synthesized);
+        assert!(assessment.eligible);
+        assert_eq!(
+            assessment.provenance,
+            EvidenceProvenance::SynthesizedFromObservedCalls
+        );
+        assert!(assessment
+            .reason_codes
+            .contains(&ReasonCode::SynthesizedFromObservedCalls));
+
+        // Provenance survives the draft and lands in the persistable evidence, so the
+        // approval payload and the store both see it.
+        let lease = registry
+            .begin_promotion(&assessment.run_id, "caller-synth")
+            .unwrap();
+        assert_eq!(
+            lease.draft().provenance,
+            EvidenceProvenance::SynthesizedFromObservedCalls
+        );
+        let persistable = lease.draft().evidence().unwrap();
+        assert_eq!(
+            persistable.provenance(),
+            EvidenceProvenance::SynthesizedFromObservedCalls
+        );
+        lease.finish(PromotionOutcome::Persisted);
     }
 
     #[test]
@@ -849,6 +911,47 @@ mod tests {
             .begin_promotion(&second.run_id, "caller")
             .unwrap_err()
             .contains("already prompted"));
+    }
+
+    #[test]
+    fn refunds_keep_suppression_order_in_step_with_the_map() {
+        let registry = CandidateRegistry::default();
+        let order_and_map_len = || {
+            let state = registry
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            (state.suppression_order.len(), state.suppressions.len())
+        };
+
+        // Every refunding outcome must clear the order entry along with the map entry.
+        // A ghost left at the queue front would, at capacity, evict this key's next real
+        // suppression (even an explicit denial) instead of the actual oldest entry.
+        for outcome in [
+            PromotionOutcome::Stale,
+            PromotionOutcome::Equivalent,
+            PromotionOutcome::Expired,
+            PromotionOutcome::Stale,
+        ] {
+            let assessment = registry.assess_run(evidence("caller"));
+            let lease = registry
+                .begin_promotion(&assessment.run_id, "caller")
+                .unwrap();
+            lease.finish(outcome);
+            assert_eq!(
+                order_and_map_len(),
+                (0, 0),
+                "refund via {outcome:?} left a ghost order entry"
+            );
+        }
+
+        // A real denial tracks exactly one entry in both structures.
+        let assessment = registry.assess_run(evidence("caller"));
+        registry
+            .begin_promotion(&assessment.run_id, "caller")
+            .unwrap()
+            .finish(PromotionOutcome::Denied);
+        assert_eq!(order_and_map_len(), (1, 1));
     }
 
     #[test]

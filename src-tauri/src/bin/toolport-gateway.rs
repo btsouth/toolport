@@ -41,9 +41,13 @@ use conduit_lib::pii;
 use conduit_lib::registry::{self, Registry, ServerEntry};
 use conduit_lib::remote;
 use conduit_lib::router::{is_destructive, sanitize_segment, Reconnect, Router, ToolPolicy};
-use conduit_lib::routine_candidates::{CandidateRegistry, CodeRunEvidence, ToolReceipt};
+use conduit_lib::routine_advisor::{self, AdvisorLedger, HintSlot};
+use conduit_lib::routine_candidates::{
+    CandidateRegistry, CodeRunEvidence, Recommendation, ToolReceipt,
+};
 use conduit_lib::routine_catalog::{self, DependencyStatus};
 use conduit_lib::routines;
+use conduit_lib::routines::EvidenceProvenance;
 use conduit_lib::savings;
 use conduit_lib::searchtrace;
 use conduit_lib::secrets;
@@ -1157,7 +1161,7 @@ fn confirm_tool_def() -> Value {
     })
 }
 
-const ROUTINE_AGENT_INSTRUCTIONS: &str = "Before authoring a new parameterizable Code Mode orchestration with multiple MCP calls or significant local transformation, search saved routines even when the user did not mention reuse. Use a Routine only when its description and input schema match the goal and every required argument can be supplied confidently; otherwise fall back to Code Mode. For a new reusable pattern, run Code Mode with immutable input plus an explicit inputSchema. After a successful eligible run, independently judge whether the pattern is stable, fully parameterized, useful, and plausibly reusable. Call toolport_save_routine directly with runId, name, and description only when promotionAvailable is true and either the recommendation is strong (repeated evidence) or the user asked to persist or reuse this work; when you do, tell the user in one short sentence that a save-approval prompt is coming - a statement, not a question. When the recommendation is suggest, mention at most once that the run could be saved as a reusable routine and save only if the user agrees. Toolport's approval UI remains the only persistence decision point. Do not retry after denial or timeout, and never promote high or unknown risk candidates. Every Routine execution re-enters current governance and receives no future permission from promotion approval.";
+const ROUTINE_AGENT_INSTRUCTIONS: &str = "Saved routines are advertised directly as `toolport_routine_*` tools; prefer one whose description matches the task over re-orchestrating the same steps. If no advertised Routine is a confident match, toolport_list_routines remains a catalog fallback before authoring a new parameterizable Code Mode orchestration with multiple MCP calls or significant local transformation. Use a Routine only when its description and input schema match the goal and every required argument can be supplied confidently; otherwise fall back to Code Mode. For a new reusable pattern, run Code Mode with immutable input plus an explicit inputSchema. When a tool result carries a `[Toolport advisor: ...]` note about repeated similar calls, prefer fetching the prepared draft with toolport_fetch_result and running it as one toolport_run_script call over continuing one-by-one. Only call toolport_save_routine when the user asks to persist or reuse this work: pass the runId from the run result or advisor note, and tell the user in one short sentence that a save-approval prompt is coming - a statement, not a question. Toolport also queues strong repeated patterns in the Toolport app where the user saves them directly; you never need to campaign for saving. Do not retry a save after denial or timeout. Every Routine execution re-enters current governance and receives no future permission from promotion approval.";
 
 /// The `toolport_run_script` "code mode" meta-tool (advertised only when
 /// [`code_mode_enabled`]). One script replaces many round-trips.
@@ -1270,6 +1274,129 @@ fn append_routine_tool_defs(tools: &mut Vec<Value>, allow_writes: bool) {
     if allow_writes {
         tools.push(save_routine_tool_def());
     }
+    tools.extend(flattened_routine_tool_defs());
+}
+
+/// Model-facing alias prefix for one saved routine. It stays inside Toolport's
+/// `toolport_` meta namespace so scoped clients keep it (meta-tools pass
+/// `scope_tools` unrouted).
+const ROUTINE_TOOL_PREFIX: &str = "toolport_routine_";
+/// Keep virtual Routine tools compatible with clients that enforce the common
+/// 64-character function-name limit, even though Routine display names may be longer.
+const ROUTINE_TOOL_NAME_MAX_CHARS: usize = 64;
+/// Direct advertisement stays bounded so a large long-lived Routine Store cannot undo
+/// lazy discovery's context savings. Older definitions remain reachable via the Catalog.
+const MAX_FLATTENED_ROUTINE_TOOLS: usize = 32;
+
+/// The advertised tool name for a saved routine. A short readable slug helps weak models
+/// and logs, while the stable id tail prevents two different display names that sanitize
+/// alike from colliding. Collapsing underscores also guarantees these gateway-owned names
+/// never contain the downstream `server__tool` namespace separator.
+fn routine_tool_name(routine: &routines::RoutineDefinition) -> String {
+    let mut slug = String::new();
+    let mut previous_was_separator = false;
+    for character in sanitize_segment(routine.name()).chars() {
+        if character == '_' {
+            if !slug.is_empty() && !previous_was_separator {
+                slug.push('_');
+            }
+            previous_was_separator = true;
+        } else {
+            slug.push(character);
+            previous_was_separator = false;
+        }
+    }
+    let slug = slug.trim_matches('_');
+    let id_tail = routine
+        .id()
+        .strip_prefix("routine_")
+        .unwrap_or_else(|| routine.id());
+    let slug_budget =
+        ROUTINE_TOOL_NAME_MAX_CHARS.saturating_sub(ROUTINE_TOOL_PREFIX.len() + 1 + id_tail.len());
+    let slug = slug.chars().take(slug_budget).collect::<String>();
+    let slug = slug.trim_end_matches('_');
+    if slug.is_empty() {
+        format!("{ROUTINE_TOOL_PREFIX}{id_tail}")
+    } else {
+        format!("{ROUTINE_TOOL_PREFIX}{slug}_{id_tail}")
+    }
+}
+
+/// Advertise each saved routine as a first-class tool so the model can select it by
+/// description, like any other tool, instead of the user having to name it. This closes
+/// the discovery gap where a lexical `toolport_list_routines` query shares no tokens
+/// with the task wording and returns nothing. The meta-tools above stay for search,
+/// explicit runs, and promotion; execution routes through the same governed
+/// `run_routine` path either way. Newest-first `routines::list()` order means an exact
+/// display name shared by several immutable definitions resolves to the newest one, both
+/// here and in [`resolve_flattened_routine_id`].
+fn flattened_routine_tool_defs() -> Vec<Value> {
+    let Ok(saved) = routines::list() else {
+        return Vec::new();
+    };
+    let mut defs = Vec::new();
+    let mut seen_display_names = std::collections::HashSet::new();
+    for routine in saved {
+        if defs.len() >= MAX_FLATTENED_ROUTINE_TOOLS {
+            break;
+        }
+        if !seen_display_names.insert(routine.name().to_string()) {
+            continue;
+        }
+        let name = routine_tool_name(&routine);
+        let dependencies = routine
+            .evidence()
+            .observed_dependencies()
+            .iter()
+            .map(|dependency| dependency.name().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let description = format!(
+            "Saved Toolport routine \"{}\"{} A verified, immutable orchestration using: {}. \
+             Prefer this over re-orchestrating the same steps. Arguments are validated \
+             against its schema and every internal call re-enters current scope, approval, \
+             and audit governance.",
+            routine.name(),
+            routine
+                .description()
+                .map(|text| format!(": {text}."))
+                .unwrap_or_else(|| String::from(".")),
+            if dependencies.is_empty() {
+                "no recorded tools".to_string()
+            } else {
+                dependencies
+            },
+        );
+        defs.push(json!({
+            "name": name,
+            "description": description,
+            "inputSchema": routine.input_schema(),
+        }));
+    }
+    defs
+}
+
+/// Map an advertised `toolport_routine_*` tool name back to the routine id it fronts,
+/// with the same newest-wins duplicate handling as [`flattened_routine_tool_defs`].
+fn resolve_flattened_routine_id(tool_name: &str) -> Option<String> {
+    if !tool_name.starts_with(ROUTINE_TOOL_PREFIX) {
+        return None;
+    }
+    let saved = routines::list().ok()?;
+    let mut seen_display_names = std::collections::HashSet::new();
+    for routine in saved {
+        if seen_display_names.len() >= MAX_FLATTENED_ROUTINE_TOOLS {
+            break;
+        }
+        if !seen_display_names.insert(routine.name().to_string()) {
+            continue;
+        }
+        let name = routine_tool_name(&routine);
+        if name == tool_name {
+            return Some(routine.id().to_string());
+        }
+    }
+    None
 }
 
 fn fetch_result_tool_def() -> Value {
@@ -5028,6 +5155,385 @@ fn candidate_caller(client: Option<&str>) -> String {
     )
 }
 
+/// Observe one direct, model-visible downstream call for the routine advisor. When a
+/// fan-out pattern first crosses the threshold, synthesize a parameterized draft,
+/// statically validate it, mint a synthesized-provenance candidate from the observed
+/// calls, and append one bounded hint to the result.
+///
+/// The gateway is the only party that sees this repetition: the model has already
+/// (rationally) chosen direct calls, and static instructions cannot argue with a
+/// decision it has no numbers for. The hint supplies the numbers and the material at
+/// exactly the moment they are true. Purely additive: the tool's own result is never
+/// altered, hints are budgeted per caller, and persisting still requires the standard
+/// promotion approval.
+#[allow(clippy::too_many_arguments)]
+fn advise_after_direct_call(
+    router: &Router,
+    cached: &[Value],
+    client: Option<&str>,
+    allowed: Option<&std::collections::HashSet<String>>,
+    candidates: Option<&CandidateRegistry>,
+    advisor: &AdvisorLedger,
+    name: &str,
+    arguments: Value,
+    mut result: Value,
+) -> Value {
+    // The advisor's whole output is Code Mode material; with the kill switch off the
+    // hint would point at a disabled door.
+    if !code_mode_enabled() {
+        return result;
+    }
+    let ok = !result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // Shaped size = what this call actually cost the model's context, which is the
+    // number the hint quotes.
+    let result_bytes = serde_json::to_vec(&result)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
+    let caller = candidate_caller(client);
+    let Some(pattern) = advisor.record(
+        &caller,
+        routine_advisor::ObservedCall {
+            tool: name.to_string(),
+            arguments,
+            ok,
+            result_bytes,
+        },
+    ) else {
+        return result;
+    };
+
+    // A draft that fails its own dry run is a synthesis bug; advertising it would
+    // teach the model to distrust every future hint. Stay silent instead.
+    let validation = validate_script(
+        &pattern.draft.source,
+        codemode::ScriptInput::ImmutableInput(pattern.draft.input_example.clone()),
+        codemode::Limits::default(),
+        cached,
+        allowed,
+    );
+    let validated = validation.outcome.error.is_none() && validation.unresolved.is_empty();
+    if !validated {
+        eprintln!(
+            "toolport: routine advisor draft for {} failed validation; hint suppressed",
+            pattern.tool
+        );
+        return result;
+    }
+
+    // Mint a candidate whose evidence is the observed calls themselves: every
+    // downstream call really happened and succeeded; only the glue is synthetic, and
+    // `provenance` discloses that in the assessment, audit, approval, and store.
+    let limits = routines::RoutineLimits::default();
+    let tool_fingerprint = tool_fingerprint_for(&pattern.tool, cached, router);
+    let risk_class = tool_risk_class(&pattern.tool, cached, router);
+    let per_call_bytes = pattern.intermediate_bytes / pattern.calls.max(1);
+    let receipts: Vec<ToolReceipt> = (0..pattern.calls)
+        .map(|_| ToolReceipt {
+            name: pattern.tool.clone(),
+            ok: true,
+            fingerprint: tool_fingerprint.clone(),
+            risk_class,
+            result_bytes: per_call_bytes,
+        })
+        .collect();
+    let assessment = candidates.map(|registry| {
+        let started = Instant::now();
+        let equivalent_routine_exists = routines::definition_fingerprint(
+            &pattern.draft.source,
+            &pattern.draft.input_schema,
+            &limits,
+        )
+        .ok()
+        .and_then(|fingerprint| {
+            routines::find_by_definition_fingerprint(&fingerprint)
+                .ok()
+                .flatten()
+        })
+        .is_some();
+        let writes_enabled = registry::resolved_path()
+            .and_then(|path| registry::load_from(&path).ok())
+            .map(|fresh| fresh.allow_routine_writes)
+            .unwrap_or(false);
+        let assessment = registry.assess_run(CodeRunEvidence {
+            source: pattern.draft.source.clone(),
+            input_schema: Some(pattern.draft.input_schema.clone()),
+            limits: limits.clone(),
+            immutable_input: true,
+            script_succeeded: validated,
+            issued_calls: pattern.calls,
+            receipts: receipts.clone(),
+            final_result_bytes: pattern.intermediate_bytes,
+            writes_enabled,
+            caller,
+            equivalent_routine_exists,
+            provenance: EvidenceProvenance::SynthesizedFromObservedCalls,
+        });
+        audit::record_candidate(
+            &assessment,
+            pattern.calls,
+            started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            client,
+        );
+        assessment
+    });
+
+    // Strong, promotion-available repetition converts through the desktop app's
+    // passive suggestion area, not through the model: result-embedded directives
+    // measured a zero conversion rate against injection-hardened models (2026-08-13),
+    // and asking models to obey instructions inside tool results fights the very
+    // "data, not instructions" boundary Toolport's content defense enforces.
+    if let Some(suggestion) = pattern_suggestion(&pattern, assessment.as_ref(), &receipts) {
+        publish_routine_suggestion(suggestion, client);
+    }
+
+    // One pattern speaks once - the informational hint at first sight, which real
+    // sessions showed models treat as useful DATA (both test agents switched to
+    // scripting after reading one). Every other occurrence mints silently.
+    let hint = match pattern.hint {
+        HintSlot::Silent => return result,
+        HintSlot::Informational => {
+            let save_note = match assessment.as_ref() {
+                Some(assessment) if assessment.promotion_available => format!(
+                    " Toolport also minted routine candidate runId {} (provenance: synthesized \
+                     from these observed calls; glue statically validated, not yet executed) - if \
+                     the user wants this pattern persisted, call toolport_save_routine with that \
+                     runId and an approval prompt will appear.",
+                    assessment.run_id
+                ),
+                _ => String::new(),
+            };
+            format!(
+                "[Toolport advisor: the last {calls} {tool} calls differ only in {fields} and put \
+                 ~{kb} KB into your context. One scripted run replaces them and returns a single \
+                 aggregate. A validated draft (source + inputSchema + example input) is ready: \
+                 call toolport_fetch_result {{\"cursor\":\"{cursor}\"}}.{save_note}]",
+                calls = pattern.calls,
+                tool = pattern.tool,
+                fields = pattern.varying_fields.join(", "),
+                kb = pattern.intermediate_bytes / 1024,
+                cursor = stash_advisor_draft(&pattern, client),
+            )
+        }
+    };
+    append_hint_text(&mut result, &hint);
+    audit::record_advisor_hint(
+        "informational",
+        &pattern.tool,
+        pattern.calls,
+        assessment
+            .as_ref()
+            .map(|assessment| assessment.run_id.as_str()),
+        client,
+    );
+    result
+}
+
+/// The app-facing suggestion for a strong, promotion-available pattern assessment, or
+/// `None` when the assessment does not justify surfacing one. Pure, so the publish
+/// decision is testable without a live broker endpoint.
+fn pattern_suggestion(
+    pattern: &routine_advisor::FanOutPattern,
+    assessment: Option<&conduit_lib::routine_candidates::CandidateAssessment>,
+    receipts: &[ToolReceipt],
+) -> Option<routines::RoutineSuggestion> {
+    let assessment = assessment.filter(|assessment| {
+        assessment.promotion_available
+            && matches!(assessment.recommendation, Recommendation::Strong)
+    })?;
+    let limits = routines::RoutineLimits::default();
+    let definition_fingerprint = routines::definition_fingerprint(
+        &pattern.draft.source,
+        &pattern.draft.input_schema,
+        &limits,
+    )
+    .ok()?;
+    let evidence = routines::PromotionEvidence::new(
+        assessment.run_id.clone(),
+        epoch_millis_now(),
+        pattern.calls,
+        dedup_dependencies(receipts),
+        assessment.risk_class,
+    )
+    .ok()?
+    .with_provenance(EvidenceProvenance::SynthesizedFromObservedCalls);
+    Some(routines::RoutineSuggestion {
+        suggested_name: suggested_routine_name(&pattern.tool),
+        source: pattern.draft.source.clone(),
+        input_schema: pattern.draft.input_schema.clone(),
+        limits,
+        definition_fingerprint,
+        evidence,
+        intermediate_bytes: pattern.intermediate_bytes,
+    })
+}
+
+/// The app-facing suggestion for a repeated immutable run, or `None` when the
+/// assessment does not justify one. Provenance stays the default `ImmutableRun`:
+/// this source really executed, end to end, at least twice.
+fn immutable_run_suggestion(
+    assessment: &conduit_lib::routine_candidates::CandidateAssessment,
+    script: &str,
+    input_schema: Option<Value>,
+    limits: codemode::Limits,
+    receipts: &[ToolReceipt],
+) -> Option<routines::RoutineSuggestion> {
+    if !(assessment.promotion_available
+        && matches!(assessment.recommendation, Recommendation::Strong))
+    {
+        return None;
+    }
+    let input_schema = input_schema?;
+    let limits = routines::RoutineLimits::from(limits);
+    let definition_fingerprint =
+        routines::definition_fingerprint(script, &input_schema, &limits).ok()?;
+    let evidence = routines::PromotionEvidence::new(
+        assessment.run_id.clone(),
+        epoch_millis_now(),
+        receipts.len().max(1),
+        dedup_dependencies(receipts),
+        assessment.risk_class,
+    )
+    .ok()?;
+    let name_tool = receipts
+        .first()
+        .map(|receipt| receipt.name.as_str())
+        .unwrap_or("orchestration");
+    Some(routines::RoutineSuggestion {
+        suggested_name: suggested_routine_name(name_tool),
+        source: script.to_string(),
+        input_schema,
+        limits,
+        definition_fingerprint,
+        evidence,
+        intermediate_bytes: receipts.iter().map(|receipt| receipt.result_bytes).sum(),
+    })
+}
+
+/// Deterministic display-name proposal for a suggestion; the user edits it in the app.
+fn suggested_routine_name(tool: &str) -> String {
+    let slug: String = tool
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-').replace("--", "-");
+    format!("batch-{slug}")
+}
+
+/// Observed dependencies for suggestion evidence: one entry per unique tool, first
+/// receipt's fingerprint wins (they are all the same tool definition within one burst).
+fn dedup_dependencies(receipts: &[ToolReceipt]) -> Vec<routines::ObservedDependency> {
+    let mut seen = std::collections::HashSet::new();
+    let mut dependencies = Vec::new();
+    for receipt in receipts {
+        if seen.insert(receipt.name.clone()) {
+            if let Ok(dependency) =
+                routines::ObservedDependency::new(receipt.name.clone(), receipt.fingerprint.clone())
+            {
+                dependencies.push(dependency);
+            }
+        }
+    }
+    dependencies
+}
+
+fn epoch_millis_now() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0)
+}
+
+/// Deliver a suggestion to the desktop app's passive area over the approval broker
+/// endpoint. Fire-and-forget on a detached thread: a tool result never waits on this,
+/// and an absent app (closed, headless) just drops the message - the candidate stays
+/// in the registry for the agent-initiated save path regardless.
+fn publish_routine_suggestion(suggestion: routines::RoutineSuggestion, client: Option<&str>) {
+    audit::record_suggestion_published(
+        &suggestion.definition_fingerprint,
+        suggestion.evidence.calls(),
+        suggestion.evidence.provenance(),
+        client,
+    );
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+        let Some(desc) = read_endpoint_descriptor() else {
+            return;
+        };
+        let Ok(mut stream) = TcpStream::connect(&desc.endpoint) else {
+            return;
+        };
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let envelope = json!({ "token": desc.token, "suggestion": suggestion });
+        let Ok(line) = serde_json::to_string(&envelope) else {
+            return;
+        };
+        if stream.write_all(line.as_bytes()).is_err() || stream.write_all(b"\n").is_err() {
+            return;
+        }
+        let mut reply = String::new();
+        let _ = BufReader::new(stream).read_line(&mut reply);
+    });
+}
+
+/// Append advisor text INTO the result's last text block rather than as a new block,
+/// mirroring the shaping marker. Real clients differ in how they surface multi-block
+/// content to their model (2026-08-13: Codex acted on none of four strong signals,
+/// consistent with extra blocks never reaching the model); amending the block that
+/// demonstrably gets read is the compatible delivery path.
+fn append_hint_text(result: &mut Value, hint: &str) {
+    if let Some(last_text) = result
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| {
+            blocks
+                .iter_mut()
+                .rev()
+                .find(|block| block.get("text").is_some_and(Value::is_string))
+        })
+        .and_then(|block| block.get_mut("text"))
+    {
+        let mut amended = last_text.as_str().unwrap_or_default().to_string();
+        amended.push_str("\n\n");
+        amended.push_str(hint);
+        *last_text = Value::String(amended);
+    } else if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
+        content.push(json!({ "type": "text", "text": hint }));
+    }
+}
+
+/// Stash the synthesized draft behind a fetch_result cursor. The bulky material
+/// travels through the existing stash; the marker itself carries tool names, counts,
+/// and sizes - never argument values.
+fn stash_advisor_draft(pattern: &routine_advisor::FanOutPattern, client: Option<&str>) -> String {
+    let draft_body = json!({
+        "advisorDraft": {
+            "tool": pattern.tool,
+            "observedCalls": pattern.calls,
+            "source": pattern.draft.source,
+            "inputSchema": pattern.draft.input_schema,
+            "inputExample": pattern.draft.input_example,
+            "howToRun": "Call toolport_run_script with { script: source, input, inputSchema }. \
+                         Every internal call re-enters current scope, approval, and audit governance.",
+        }
+    });
+    shaping::stash_payload(
+        serde_json::to_string_pretty(&draft_body).unwrap_or_default(),
+        Some(draft_body),
+        client,
+    )
+}
+
 /// Dispatch a `toolport_run_script` "code mode" call: run the agent's script in the boa
 /// sandbox with a `toolport.call()` binding that re-enters [`execute_call`] for each
 /// downstream call, so every call passes the identical scope + approval gates a direct call
@@ -5313,6 +5819,7 @@ fn execute_script_dispatch_with_candidate(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let schema_for_suggestion = context.input_schema.clone();
         let equivalent_routine_exists = context
             .input_schema
             .as_ref()
@@ -5330,19 +5837,33 @@ fn execute_script_dispatch_with_candidate(
                     .flatten()
             })
             .is_some();
-        context.registry.assess_run(CodeRunEvidence {
+        let assessment = context.registry.assess_run(CodeRunEvidence {
             source: script.to_string(),
             input_schema: context.input_schema,
             limits: routines::RoutineLimits::from(limits),
             immutable_input: context.immutable_input,
             script_succeeded: outcome.error.is_none(),
             issued_calls: outcome.calls,
-            receipts,
+            receipts: receipts.clone(),
             final_result_bytes: outcome.final_result_bytes,
             writes_enabled: context.writes_enabled,
             caller: context.caller,
             equivalent_routine_exists,
-        })
+            provenance: EvidenceProvenance::ImmutableRun,
+        });
+        // Repeated immutable runs convert through the desktop app's passive
+        // suggestion area, same as advisor patterns: the in-result strong directive
+        // this replaces measured zero conversions against injection-hardened models.
+        if let Some(suggestion) = immutable_run_suggestion(
+            &assessment,
+            script,
+            schema_for_suggestion,
+            limits,
+            &receipts,
+        ) {
+            publish_routine_suggestion(suggestion, client);
+        }
+        assessment
     });
     if let Some(assessment) = candidate_assessment.as_ref() {
         audit::record_candidate(
@@ -5528,6 +6049,7 @@ fn routine_summary(routine: &routines::RoutineDefinition) -> Value {
         "contentHash": routine.content_hash(),
         "observedDependencies": routine.evidence().observed_dependencies(),
         "riskClass": routine.evidence().risk_class(),
+        "provenance": routine.evidence().provenance(),
         "createdAtMs": routine.created_at_ms(),
     })
 }
@@ -5631,6 +6153,47 @@ fn list_routines_dispatch(arguments: &Value, client: Option<&str>) -> Value {
     result
 }
 
+/// Save-specific refusal for a promotion approval that ended without approval.
+///
+/// The generic [`refused_call_result`] tells the model to retry the same call. That is
+/// right for an ordinary held call (retrying re-requests approval) but wrong here:
+/// `PromotionLease::finish` consumes the candidate on every non-approved outcome, so
+/// retrying the same `runId` can only ever return "candidate is missing or expired".
+/// Unreachable refunds the suppression, so a fresh run may save again; timeout keeps it
+/// consumed. A human denial keeps the generic wording, which is accurate and already
+/// carries no retry guidance.
+fn refused_promotion_result(decision: approval::ApprovalDecision) -> Value {
+    if matches!(decision, approval::ApprovalDecision::Denied) {
+        return refused_call_result("toolport_save_routine", decision, "persistent_code_write");
+    }
+    let (why, guidance) = if matches!(decision, approval::ApprovalDecision::Unreachable) {
+        (
+            "the save of toolport_save_routine could not be approved because the Toolport \
+             approval service was unreachable (is the Toolport app running?)",
+            " The run's candidate was discarded, so retrying this runId cannot succeed: \
+             start the Toolport app, re-run the same immutable-input script for a fresh \
+             runId, then save that run.",
+        )
+    } else {
+        (
+            "the save of toolport_save_routine was not approved in time (the Toolport app \
+             may be closed)",
+            " The candidate was discarded and this definition is suppressed for this \
+             session; do not retry unless the user asks to persist it again.",
+        )
+    };
+    json!({
+        "content": [{ "type": "text", "text":
+            format!("Toolport: {why}, so nothing was persisted.{guidance}") }],
+        "isError": true,
+        "structuredContent": {
+            "toolportDecision": decision_token(decision),
+            "reason": "persistent_code_write",
+            "retriable": false,
+        }
+    })
+}
+
 fn save_routine_promotion_dispatch(
     reg: &Registry,
     candidates: &CandidateRegistry,
@@ -5722,6 +6285,7 @@ fn save_routine_promotion_dispatch(
         "evidence": definition.evidence(),
         "recommendation": lease.draft().recommendation,
         "riskClass": lease.draft().risk_class,
+        "provenance": lease.draft().provenance,
     });
     let approval_hash = audit::args_hash(&approval_payload);
     let started = Instant::now();
@@ -5767,7 +6331,7 @@ fn save_routine_promotion_dispatch(
         } else {
             lease.finish(PromotionOutcome::Denied);
         }
-        return refused_call_result("toolport_save_routine", decision, "persistent_code_write");
+        return refused_promotion_result(decision);
     }
 
     let fresh_writes_enabled = registry::resolved_path()
@@ -5835,10 +6399,18 @@ fn save_routine_promotion_dispatch(
         None,
         client,
     );
+    let advertised = routine_tool_name(&saved);
     json!({
-        "content": [{ "type": "text", "text": format!("Saved routine {} ({})", saved.name(), saved.id()) }],
+        "content": [{ "type": "text", "text": format!(
+            "Saved routine {} ({}). It is now advertised as the tool `{advertised}`; clients see it after their next tools/list refresh.",
+            saved.name(), saved.id()
+        ) }],
         "isError": false,
-        "structuredContent": { "routine": routine_summary(&saved), "promotedFromRunId": run_id }
+        "structuredContent": {
+            "routine": routine_summary(&saved),
+            "promotedFromRunId": run_id,
+            "advertisedAs": advertised
+        }
     })
 }
 
@@ -6271,6 +6843,7 @@ fn handle_request(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -6303,6 +6876,10 @@ fn handle_request_with_cancel(
     // passes `Some(&state.router)`; tests may omit it.
     live_router: Option<&Arc<Mutex<Arc<Router>>>>,
     candidates: Option<&CandidateRegistry>,
+    // Session ledger behind the routine advisor's fan-out hints. `None` (the test
+    // wrapper's default) disables observation for this request, so tests that make
+    // many direct calls under the shared "stdio:process" caller never cross-talk.
+    advisor: Option<&AdvisorLedger>,
 ) -> Option<Value> {
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
@@ -7029,6 +7606,36 @@ fn handle_request_with_cancel(
                 return Some(success(id, result));
             }
 
+            // A flattened `toolport_routine_*` alias fronts one saved routine (see
+            // `flattened_routine_tool_defs`). Rewrap the call and run it through the
+            // exact same governed dispatch as an explicit `toolport_run_routine`.
+            if name.starts_with(ROUTINE_TOOL_PREFIX) && !name.contains("__") {
+                if !code_mode_enabled() {
+                    return Some(success(
+                        id,
+                        routine_error(
+                            "Code Mode is disabled. Enable it in Settings before using routines.",
+                        ),
+                    ));
+                }
+                let result = match resolve_flattened_routine_id(&name) {
+                    Some(routine_id) => run_routine_dispatch(
+                        reg,
+                        router_arc,
+                        cached,
+                        client,
+                        allowed,
+                        cancel,
+                        &json!({ "id": routine_id, "arguments": arguments }),
+                        live_router,
+                    ),
+                    None => routine_error(format!(
+                        "no saved routine is advertised as `{name}`; call toolport_list_routines for the current catalog."
+                    )),
+                };
+                return Some(success(id, result));
+            }
+
             // toolport_call_tool dispatches a discovered tool: unwrap to its real
             // name + arguments, then run it through the shared execute path (scope,
             // approval, confirm, shaping) that a code-mode toolport.call() also uses.
@@ -7043,6 +7650,10 @@ fn handle_request_with_cancel(
                 && router
                     .route_of(&name)
                     .is_some_and(|(server, _)| server_supports_mcp_app_html(router, server));
+            // Only namespaced downstream calls feed the advisor ledger; the clone is
+            // gated so meta-tool traffic never pays it.
+            let advisor_arguments =
+                (advisor.is_some() && name.contains("__")).then(|| arguments.clone());
             let mrtr = MrtrRequest::from_params(params);
             let result = execute_call(
                 reg,
@@ -7079,6 +7690,12 @@ fn handle_request_with_cancel(
                     }
                 }));
             }
+            let result = match (advisor, advisor_arguments) {
+                (Some(advisor), Some(arguments)) => advise_after_direct_call(
+                    router, cached, client, allowed, candidates, advisor, &name, arguments, result,
+                ),
+                _ => result,
+            };
             Some(success(id, result))
         }
         "resources/list" => {
@@ -8747,6 +9364,9 @@ fn router_relevant(reg: &Registry) -> Value {
 struct WatchLoopState {
     /// Last observed registry-file mtime (None if missing).
     last_mtime: Option<SystemTime>,
+    /// Last observed Routine Catalog mtime. Routine writes change the advertised tool
+    /// surface but never require rebuilding downstream servers.
+    last_routines_mtime: Option<SystemTime>,
     /// Router-relevant slice of the last applied registry (excludes team metadata).
     last_relevant: Value,
 }
@@ -8794,6 +9414,7 @@ fn watch_registry(
     eprintln!("toolport: watching registry at {}", path.display());
     let mut state = WatchLoopState {
         last_mtime: mtime(&path),
+        last_routines_mtime: routines::routines_path().and_then(|path| mtime(&path)),
         // Router-relevant slice (everything except the `team` block) as of the initial build,
         // so a team-metadata-only rewrite from the desktop sync loop doesn't force a rebuild.
         last_relevant: router_relevant(
@@ -8877,12 +9498,23 @@ fn watch_tick(
         live.expired_cache_kinds()
     };
     let downstream_changed = downstream_notified | cache_expired;
+    let current_routines_mtime = routines::routines_path().and_then(|path| mtime(&path));
+    let routine_catalog_changed = current_routines_mtime != state.last_routines_mtime;
+    if routine_catalog_changed {
+        state.last_routines_mtime = current_routines_mtime;
+    }
     let current = mtime(path);
     let file_changed = current != state.last_mtime;
     if !file_changed && downstream_changed == 0 {
+        if routine_catalog_changed {
+            notify_tools_changed(stdout, mcp_sessions);
+            eprintln!(
+                "toolport: routine catalog changed; notified clients without rebuilding downstream servers"
+            );
+        }
         return TickOutcome {
             quarantine_changed,
-            idle_after_quarantine: true,
+            idle_after_quarantine: !routine_catalog_changed,
         };
     }
 
@@ -8930,10 +9562,10 @@ fn watch_tick(
             *registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = new_reg;
-            if routine_surface_changed {
+            if routine_surface_changed || routine_catalog_changed {
                 notify_tools_changed(stdout, mcp_sessions);
                 eprintln!(
-                    "toolport: routine-write tool surface changed; notified clients without rebuilding downstream servers"
+                    "toolport: routine tool surface changed; notified clients without rebuilding downstream servers"
                 );
             } else {
                 eprintln!("toolport: registry changed (team metadata only); skipped rebuild");
@@ -9131,6 +9763,7 @@ struct GatewayState {
     router: Arc<Mutex<Arc<Router>>>,
     cached_tools: SharedCatalog,
     routine_candidates: CandidateRegistry,
+    routine_advisor: AdvisorLedger,
     stdout: Arc<Mutex<std::io::Stdout>>,
     ready: Arc<AtomicBool>,
     downstream_dirty: Arc<AtomicU8>,
@@ -10930,6 +11563,7 @@ fn process_request(
         // Swappable slot for post-HITL rebind (SOU-321); distinct from the snapshot above.
         Some(&state.router),
         Some(&state.routine_candidates),
+        Some(&state.routine_advisor),
     )
 }
 
@@ -13539,6 +14173,7 @@ fn main() {
         router: Arc::clone(&router),
         cached_tools: Arc::clone(&cached_tools),
         routine_candidates: CandidateRegistry::default(),
+        routine_advisor: AdvisorLedger::default(),
         stdout: Arc::clone(&stdout),
         ready: Arc::clone(&ready),
         downstream_dirty: Arc::clone(&downstream_dirty),
@@ -15930,6 +16565,10 @@ mod tests {
 
     #[test]
     fn immutable_code_run_returns_promotion_candidate_without_retaining_input() {
+        // ENV_LOCK serializes every DataDirOverride site (see registry::DataDirOverride):
+        // without it, this test's override drop mid-way through a parallel test redirected
+        // that test's routine writes into the developer's REAL data directory.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _code_mode = CodeModeGuard::acquire();
         set_code_mode_flag(true);
         let dir = std::env::temp_dir().join(format!(
@@ -16368,6 +17007,7 @@ mod tests {
             Some(&router),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(refused["result"]["isError"].as_bool(), Some(true));
@@ -16391,6 +17031,7 @@ mod tests {
             None,
             Some(&search_index),
             Some(&router),
+            None,
             None,
             None,
         )
@@ -16522,6 +17163,580 @@ mod tests {
                 "OpenAPI missing /{expected}"
             );
         }
+    }
+
+    #[test]
+    fn flattened_routine_tools_are_advertised_and_run() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _code_mode = CodeModeGuard::acquire();
+        let _discovery = DiscoveryModeGuard::acquire();
+        set_code_mode_flag(true);
+        set_discovery_mode(DiscoveryMode::Lazy);
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-routine-flatten-{}",
+            routines::generate_id().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        let schema = json!({
+            "type": "object",
+            "properties": { "value": { "type": "integer" } },
+            "required": ["value"],
+            "additionalProperties": false
+        });
+        // Two immutable definitions sharing a display name: the newest owns the alias.
+        let older = routines::new_definition(
+            "flatten-work".to_string(),
+            Some("Run one parameterized work call".to_string()),
+            "return toolport.call('s__work', { value: input.value });".to_string(),
+            schema.clone(),
+        )
+        .unwrap();
+        routines::append_immutable(older).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        let newer = routines::new_definition(
+            "flatten-work".to_string(),
+            None,
+            "// newer\nreturn toolport.call('s__work', { value: input.value });".to_string(),
+            schema,
+        )
+        .unwrap();
+        routines::append_immutable(newer.clone()).unwrap();
+        // A fully non-ASCII display name falls back to the stable id tail.
+        let cjk = routines::new_definition(
+            "查文档".to_string(),
+            None,
+            "return input;".to_string(),
+            json!({ "type": "object" }),
+        )
+        .unwrap();
+        routines::append_immutable(cjk.clone()).unwrap();
+        let punctuation = routines::new_definition(
+            "same-name".to_string(),
+            None,
+            "// punctuation slug\nreturn input;".to_string(),
+            json!({ "type": "object" }),
+        )
+        .unwrap();
+        routines::append_immutable(punctuation.clone()).unwrap();
+        let underscore = routines::new_definition(
+            "same_name".to_string(),
+            None,
+            "// distinct definition\nreturn input;".to_string(),
+            json!({ "type": "object" }),
+        )
+        .unwrap();
+        routines::append_immutable(underscore.clone()).unwrap();
+        let long_name = routines::new_definition(
+            format!("{}__", "long_name_".repeat(12)),
+            None,
+            "// long display name\nreturn input;".to_string(),
+            json!({ "type": "object" }),
+        )
+        .unwrap();
+        routines::append_immutable(long_name.clone()).unwrap();
+
+        let (router, calls, catalog) = counting_router(false);
+        let reg = Registry::default();
+        let search_index = CatalogSearchIndex::build(&catalog);
+        let list = |req: &Value| {
+            handle_request_with_cancel(
+                req,
+                &reg,
+                &router,
+                &catalog,
+                true,
+                None,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                None,
+                None,
+                None,
+                Some(&search_index),
+                Some(&router),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        let listed = list(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
+        let tools = listed["result"]["tools"].as_array().unwrap().clone();
+        let flattened: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .filter(|name| name.starts_with(ROUTINE_TOOL_PREFIX))
+            .collect();
+        let work_alias = routine_tool_name(&newer);
+        assert!(work_alias.ends_with(newer.id().trim_start_matches("routine_")));
+        assert_eq!(
+            flattened.iter().filter(|name| **name == work_alias).count(),
+            1,
+            "duplicate display names must advertise exactly once: {flattened:?}"
+        );
+        let cjk_alias = routine_tool_name(&cjk);
+        assert!(
+            flattened.contains(&cjk_alias.as_str()),
+            "non-ASCII name must fall back to the id tail: {flattened:?}"
+        );
+        assert!(flattened.iter().all(|name| name.len() <= 64));
+        assert!(flattened.iter().all(|name| !name.contains("__")));
+        assert_ne!(
+            routine_tool_name(&punctuation),
+            routine_tool_name(&underscore)
+        );
+        assert!(flattened.contains(&routine_tool_name(&punctuation).as_str()));
+        assert!(flattened.contains(&routine_tool_name(&underscore).as_str()));
+        assert!(flattened.contains(&routine_tool_name(&long_name).as_str()));
+        let def = tools
+            .iter()
+            .find(|tool| tool["name"] == work_alias)
+            .unwrap();
+        assert_eq!(def["inputSchema"], *newer.input_schema());
+        assert!(def["description"].as_str().unwrap().contains("test__tool"));
+
+        // Calling the alias runs the NEWEST definition through the governed path.
+        let called = list(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": work_alias, "arguments": { "value": 7 } }
+        }));
+        assert_eq!(
+            called["result"]["isError"], false,
+            "flattened call failed: {called}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            called["result"]["structuredContent"]["toolportRoutine"]["id"],
+            newer.id()
+        );
+
+        // Schema-invalid arguments are rejected before any downstream call.
+        let rejected = list(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": work_alias, "arguments": { "value": "nope" } }
+        }));
+        assert_eq!(rejected["result"]["isError"], true);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "schema rejection must not reach downstream"
+        );
+
+        // An unknown alias fails closed with catalog guidance.
+        let missing = list(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": { "name": "toolport_routine_missing", "arguments": {} }
+        }));
+        assert_eq!(missing["result"]["isError"], true);
+        assert!(missing["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("toolport_list_routines"));
+
+        // Code Mode off hides the flattened aliases entirely.
+        set_code_mode_flag(false);
+        let hidden = list(&json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list" }));
+        assert!(
+            !hidden["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .any(|name| name.starts_with(ROUTINE_TOOL_PREFIX)),
+            "code mode off must hide flattened routine tools"
+        );
+
+        drop(_data_dir);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn flattened_routine_advertisement_is_bounded() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-routine-flatten-cap-{}",
+            routines::generate_id().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        for index in 0..(MAX_FLATTENED_ROUTINE_TOOLS + 5) {
+            let routine = routines::new_definition(
+                format!("bounded-{index}"),
+                None,
+                format!("// bounded {index}\nreturn input;"),
+                json!({ "type": "object" }),
+            )
+            .unwrap();
+            routines::append_immutable(routine).unwrap();
+        }
+
+        let definitions = flattened_routine_tool_defs();
+        assert_eq!(definitions.len(), MAX_FLATTENED_ROUTINE_TOOLS);
+        assert_eq!(
+            definitions
+                .iter()
+                .filter_map(|definition| definition["name"].as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            MAX_FLATTENED_ROUTINE_TOOLS
+        );
+
+        drop(_data_dir);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn advisor_fan_out_hint_mints_synthesized_candidate_and_persists_via_approval() {
+        // ENV_LOCK serializes the DataDirOverride below (see registry::DataDirOverride).
+        let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _code_mode = CodeModeGuard::acquire();
+        set_code_mode_flag(true);
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-advisor-e2e-{}",
+            routines::generate_id().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        let mut reg = Registry::default();
+        reg.allow_routine_writes = true;
+        registry::save_to(&dir.join("registry.json"), &reg).unwrap();
+
+        let (router, _calls, catalog) = counting_router(false);
+        let advisor = AdvisorLedger::default();
+        let candidates = CandidateRegistry::default();
+        let search_index = CatalogSearchIndex::build(&catalog);
+        let direct = |id: usize, value: &str| {
+            handle_request_with_cancel(
+                &json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": { "name": "s__work", "arguments": { "value": value } }
+                }),
+                &reg,
+                &router,
+                &catalog,
+                true,
+                None,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                None,
+                None,
+                None,
+                Some(&search_index),
+                Some(&router),
+                None,
+                Some(&candidates),
+                Some(&advisor),
+            )
+            .unwrap()
+        };
+        let advisor_note = |response: &Value| -> Option<String> {
+            response["result"]["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|block| block["text"].as_str())
+                .filter(|text| text.contains("[Toolport advisor:"))
+                .map(|text| text[text.find("[Toolport advisor:").unwrap()..].to_string())
+                .next()
+        };
+
+        // Two same-shape calls stay silent; the third crosses the threshold exactly once.
+        assert!(advisor_note(&direct(1, "alpha")).is_none());
+        assert!(advisor_note(&direct(2, "beta")).is_none());
+        let third = direct(3, "gamma");
+        let note = advisor_note(&third).expect("third same-shape call must carry the hint");
+        assert!(note.contains("3 s__work calls"), "hint: {note}");
+        assert!(
+            !note.contains("alpha"),
+            "argument values must never leak: {note}"
+        );
+        assert!(
+            advisor_note(&direct(4, "delta")).is_none(),
+            "one hint per pattern"
+        );
+
+        // The hint's cursor serves the full validated draft through fetch_result.
+        let cursor_pattern = regex::Regex::new(r#"\{"cursor":"(r\d+)"\}"#).unwrap();
+        let cursor = cursor_pattern.captures(&note).expect("cursor in hint")[1].to_string();
+        let draft_page = shaping::fetch_result(&cursor, 0, 1_000_000, None, None);
+        let draft_text = draft_page["content"][0]["text"].as_str().unwrap();
+        assert!(draft_text.contains("advisorDraft"));
+        assert!(draft_text.contains("toolport.callAsync(\\\"s__work\\\""));
+        assert!(
+            draft_text.contains("gamma"),
+            "input example carries observed values"
+        );
+
+        // The minted candidate is save-able through the untouched promotion path, and
+        // the persisted definition discloses its synthesized provenance.
+        let run_id_pattern = regex::Regex::new(r"run_[0-9a-f]{32}").unwrap();
+        let run_id = run_id_pattern
+            .find(&note)
+            .expect("promotion-available candidate in hint")
+            .as_str()
+            .to_string();
+        let (broker, requests) =
+            spawn_approval_broker(&dir, approval::ApprovalDecision::Approved, None);
+        let promoted = save_routine_promotion_dispatch(
+            &reg,
+            &candidates,
+            None,
+            &json!({
+                "runId": run_id,
+                "name": "fan-out-work",
+                "description": "Run one parameterized work call per item"
+            }),
+        );
+        let approval = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        broker.join().unwrap();
+        assert_eq!(promoted["isError"], false, "promotion failed: {promoted}");
+        assert_eq!(
+            approval.arguments["provenance"], "synthesized_from_observed_calls",
+            "the approval card must disclose provenance"
+        );
+        let saved = routines::list().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].evidence().provenance(),
+            routines::EvidenceProvenance::SynthesizedFromObservedCalls
+        );
+        assert!(saved[0].source().contains("toolport.callAsync"));
+
+        drop(_data_dir);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn advisor_second_burst_publishes_a_suggestion_instead_of_talking_to_the_model() {
+        // ENV_LOCK serializes the DataDirOverride below (see registry::DataDirOverride).
+        let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _code_mode = CodeModeGuard::acquire();
+        set_code_mode_flag(true);
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-advisor-strong-{}",
+            routines::generate_id().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        let mut reg = Registry::default();
+        reg.allow_routine_writes = true;
+        registry::save_to(&dir.join("registry.json"), &reg).unwrap();
+
+        let (router, _calls, catalog) = counting_router(false);
+        let advisor = AdvisorLedger::default();
+        let candidates = CandidateRegistry::default();
+        let observe = |value: &str, is_error: bool| {
+            advise_after_direct_call(
+                &router,
+                &catalog,
+                None,
+                None,
+                Some(&candidates),
+                &advisor,
+                "s__work",
+                json!({ "value": value }),
+                json!({
+                    "content": [{ "type": "text", "text": "ok" }],
+                    "isError": is_error
+                }),
+            )
+        };
+        let note = |result: &Value| -> Option<String> {
+            result["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|block| block["text"].as_str())
+                .filter(|text| text.contains("[Toolport advisor:"))
+                .map(|text| text[text.find("[Toolport advisor:").unwrap()..].to_string())
+                .next()
+        };
+
+        // Burst one: informational hint, and no publish (silent recommendation).
+        observe("a", false);
+        observe("b", false);
+        let first = note(&observe("c", false)).expect("informational hint");
+        assert!(first.contains("differ only in value"), "hint: {first}");
+        assert!(!first.contains("recommendation: strong"));
+
+        // A failed call breaks the run; a fresh burst is genuine repetition. The model
+        // hears NOTHING (result-embedded directives measured zero conversions), but
+        // the strong candidate is published to the desktop app's suggestion area.
+        assert!(note(&observe("broken", true)).is_none());
+        observe("d", false);
+        observe("e", false);
+        assert!(
+            note(&observe("f", false)).is_none(),
+            "repetition must stay silent toward the model"
+        );
+        let audit_log = std::fs::read_to_string(dir.join("audit.jsonl")).expect("audit log exists");
+        let published: Vec<&str> = audit_log
+            .lines()
+            .filter(|line| line.contains("suggestion_published"))
+            .collect();
+        assert_eq!(
+            published.len(),
+            1,
+            "one publish per strong burst: {audit_log}"
+        );
+        assert!(
+            published[0].contains("synthesized_from_observed_calls"),
+            "publish event discloses provenance: {}",
+            published[0]
+        );
+
+        // The published payload itself is well-formed and value-free: rebuild it via
+        // the same pure builder the publish path used.
+        let strong_run = audit_log
+            .lines()
+            .filter(|line| line.contains("candidate_assessed") && line.contains("strong"))
+            .last()
+            .expect("strong assessment recorded");
+        assert!(strong_run.contains("\"promotionAvailable\":true"));
+
+        drop(_data_dir);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn pattern_suggestion_requires_strong_and_available_and_carries_no_values() {
+        let ledger = AdvisorLedger::default();
+        let mut pattern = None;
+        for value in ["alpha", "beta", "gamma"] {
+            pattern = ledger.record(
+                "caller",
+                conduit_lib::routine_advisor::ObservedCall {
+                    tool: "s__work".to_string(),
+                    arguments: json!({ "value": value }),
+                    ok: true,
+                    result_bytes: 2048,
+                },
+            );
+        }
+        let pattern = pattern.expect("fan-out pattern");
+        let receipts = vec![ToolReceipt {
+            name: "s__work".to_string(),
+            ok: true,
+            fingerprint: Some("v2:abc".to_string()),
+            risk_class: routines::RoutineRiskClass::Low,
+            result_bytes: 2048,
+        }];
+        let assessment =
+            |recommendation, available| conduit_lib::routine_candidates::CandidateAssessment {
+                run_id: format!("run_{}", "a".repeat(32)),
+                source_hash: "sha256:x".to_string(),
+                eligible: true,
+                promotion_available: available,
+                promotion_unavailable_reason: None,
+                recommendation,
+                observed_tools: vec!["s__work".to_string()],
+                reason_codes: Vec::new(),
+                risk_class: routines::RoutineRiskClass::Low,
+                expires_at_ms: None,
+                provenance: EvidenceProvenance::SynthesizedFromObservedCalls,
+            };
+
+        // Only strong + available yields a suggestion.
+        assert!(pattern_suggestion(
+            &pattern,
+            Some(&assessment(Recommendation::Silent, true)),
+            &receipts
+        )
+        .is_none());
+        assert!(pattern_suggestion(
+            &pattern,
+            Some(&assessment(Recommendation::Strong, false)),
+            &receipts
+        )
+        .is_none());
+        assert!(pattern_suggestion(&pattern, None, &receipts).is_none());
+
+        let suggestion = pattern_suggestion(
+            &pattern,
+            Some(&assessment(Recommendation::Strong, true)),
+            &receipts,
+        )
+        .expect("strong + available publishes");
+        assert!(suggestion.validate().is_ok(), "self-consistent payload");
+        assert_eq!(suggestion.suggested_name, "batch-s-work");
+        assert_eq!(
+            suggestion.evidence.provenance(),
+            routines::EvidenceProvenance::SynthesizedFromObservedCalls
+        );
+        // Observed values ride only in the session-scoped example, never the payload.
+        let serialized = serde_json::to_string(&suggestion).unwrap();
+        assert!(
+            !serialized.contains("alpha"),
+            "payload leaked a value: {serialized}"
+        );
+    }
+
+    #[test]
+    fn advisor_stays_silent_without_a_ledger_or_with_code_mode_off() {
+        let _code_mode = CodeModeGuard::acquire();
+        set_code_mode_flag(false);
+        let advisor = AdvisorLedger::default();
+        let (router, _calls, catalog) = counting_router(false);
+        // Code mode off: the ledger is consulted but never hints at a disabled door.
+        for value in ["a", "b", "c", "d"] {
+            let result = advise_after_direct_call(
+                &router,
+                &catalog,
+                None,
+                None,
+                None,
+                &advisor,
+                "s__work",
+                json!({ "value": value }),
+                json!({ "content": [{ "type": "text", "text": "ok" }], "isError": false }),
+            );
+            let blocks = result["content"].as_array().unwrap();
+            assert_eq!(blocks.len(), 1, "no hint while code mode is off");
+        }
+    }
+
+    #[test]
+    fn routine_prefix_does_not_intercept_a_namespaced_downstream_tool() {
+        let _code_mode = CodeModeGuard::acquire();
+        set_code_mode_flag(true);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let downstream = DownstreamServer::connect(
+            "toolport_routine_backend".to_string(),
+            Box::new(CountingRoute {
+                calls: Arc::clone(&calls),
+                destructive: false,
+            }),
+        )
+        .unwrap();
+        let mut router = Router::new();
+        router.add(downstream);
+        let router = Arc::new(router);
+        let catalog = router.aggregated_tools();
+        let response = handle_request(
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "toolport_routine_backend__work",
+                    "arguments": { "value": 7 }
+                }
+            }),
+            &Registry::default(),
+            &router,
+            &catalog,
+            false,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -16671,6 +17886,46 @@ mod tests {
             drop(data_dir);
             std::fs::remove_dir_all(dir).ok();
         }
+    }
+
+    #[test]
+    fn refused_promotion_result_never_tells_the_model_to_retry_a_consumed_candidate() {
+        // PromotionLease::finish consumes the candidate on every non-approved outcome, so
+        // the generic "then retry" guidance would send the model into a guaranteed
+        // "candidate is missing or expired" loop.
+        let unreachable = refused_promotion_result(approval::ApprovalDecision::Unreachable);
+        let text = unreachable["content"][0]["text"].as_str().unwrap();
+        assert_eq!(unreachable["isError"], true);
+        assert_eq!(unreachable["structuredContent"]["retriable"], false);
+        assert!(
+            !text.contains("then retry"),
+            "misleading retry guidance: {text}"
+        );
+        assert!(
+            text.contains("fresh") && text.contains("runId"),
+            "must point at a new run, not a retry: {text}"
+        );
+
+        let timeout = refused_promotion_result(approval::ApprovalDecision::Timeout);
+        let text = timeout["content"][0]["text"].as_str().unwrap();
+        assert_eq!(timeout["structuredContent"]["retriable"], false);
+        assert!(
+            !text.contains("then retry"),
+            "misleading retry guidance: {text}"
+        );
+        assert!(
+            text.contains("do not retry"),
+            "timeout also consumes the suppression: {text}"
+        );
+
+        // A human denial keeps the generic wording: accurate, retriable:false, and no
+        // retry guidance.
+        let denied = refused_promotion_result(approval::ApprovalDecision::Denied);
+        assert_eq!(denied["structuredContent"]["retriable"], false);
+        assert!(denied["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("denied by a human reviewer"));
     }
 
     #[test]
@@ -17164,6 +18419,7 @@ mod tests {
             router: Arc::new(Mutex::new(Arc::new(Router::new()))),
             cached_tools: Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
             routine_candidates: CandidateRegistry::default(),
+            routine_advisor: AdvisorLedger::default(),
             stdout,
             ready: Arc::new(AtomicBool::new(true)),
             downstream_dirty: Arc::new(AtomicU8::new(0)),
@@ -21983,6 +23239,7 @@ mod tests {
         std::fs::write(&reg_path, "{}").unwrap();
         let mut state = WatchLoopState {
             last_mtime: mtime(&reg_path),
+            last_routines_mtime: routines::routines_path().and_then(|path| mtime(&path)),
             last_relevant: router_relevant(&registry.lock().unwrap()),
         };
 
@@ -22112,6 +23369,7 @@ mod tests {
         let mut state = WatchLoopState {
             // Force this fixture's first tick to consume the already-written file.
             last_mtime: None,
+            last_routines_mtime: routines::routines_path().and_then(|path| mtime(&path)),
             last_relevant: router_relevant(&Registry::default()),
         };
 
@@ -22140,6 +23398,48 @@ mod tests {
         assert!(
             Arc::ptr_eq(&router.lock().unwrap(), &original_router),
             "the downstream router must not be replaced for a fixed meta-tool change"
+        );
+        assert!(session
+            .outbound
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message.json.contains("notifications/tools/list_changed")));
+
+        // Saving a Routine changes routines.json rather than registry.json. The watcher
+        // must still invalidate clients' tool catalogs without rebuilding the Router.
+        session.outbound.lock().unwrap().clear();
+        let routine = routines::new_definition(
+            "watch-catalog".to_string(),
+            None,
+            "return input;".to_string(),
+            json!({ "type": "object" }),
+        )
+        .unwrap();
+        routines::append_immutable(routine).unwrap();
+        let catalog_change = watch_tick(
+            &path,
+            &registry,
+            &router,
+            &stdout,
+            &cached_tools,
+            &profile,
+            None,
+            None,
+            false,
+            &downstream_dirty,
+            &server_handler,
+            &client_root,
+            Some(&mcp_sessions),
+            None,
+            None,
+            &rebuild_lock,
+            &mut state,
+        );
+        assert!(!catalog_change.idle_after_quarantine);
+        assert!(
+            Arc::ptr_eq(&router.lock().unwrap(), &original_router),
+            "a Routine Catalog change must not replace the downstream Router"
         );
         assert!(session
             .outbound

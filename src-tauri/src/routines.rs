@@ -59,6 +59,28 @@ impl ObservedDependency {
     }
 }
 
+/// How the promoted source came to be trusted.
+///
+/// `ImmutableRun` is the original standard: the exact source really executed once,
+/// end to end. `SynthesizedFromObservedCalls` covers advisor-built definitions: every
+/// downstream call in the evidence really happened (as direct calls), but the glue
+/// script around them was generated deterministically and only statically validated,
+/// never executed. Approval UI and audit must disclose the difference; it is not a
+/// hidden implementation detail.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceProvenance {
+    #[default]
+    ImmutableRun,
+    SynthesizedFromObservedCalls,
+}
+
+impl EvidenceProvenance {
+    fn is_default(&self) -> bool {
+        matches!(self, EvidenceProvenance::ImmutableRun)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PromotionEvidence {
@@ -68,6 +90,11 @@ pub struct PromotionEvidence {
     observed_dependencies: Vec<ObservedDependency>,
     validation_version: u32,
     risk_class: RoutineRiskClass,
+    // Skipped when default so every pre-provenance record keeps its serialized form,
+    // and therefore its contentHash, byte-identical. Only synthesized definitions pay
+    // the new field into their hash.
+    #[serde(default, skip_serializing_if = "EvidenceProvenance::is_default")]
+    provenance: EvidenceProvenance,
 }
 
 impl PromotionEvidence {
@@ -100,7 +127,17 @@ impl PromotionEvidence {
             observed_dependencies,
             validation_version: 1,
             risk_class,
+            provenance: EvidenceProvenance::ImmutableRun,
         })
+    }
+
+    pub fn with_provenance(mut self, provenance: EvidenceProvenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
+    pub fn provenance(&self) -> EvidenceProvenance {
+        self.provenance
     }
 
     pub fn source_run_id(&self) -> &str {
@@ -417,6 +454,49 @@ pub fn new_promoted_definition(
     Ok(definition)
 }
 
+/// A strong, promotion-available candidate published by a gateway to the desktop app's
+/// passive suggestion area. Self-contained: everything needed to persist a definition
+/// travels in the message, so approving it does not depend on the publishing gateway
+/// process (or its in-memory candidate) still being alive.
+///
+/// Carries NO observed argument values: synthesized sources and schemas are value-free
+/// by construction, and immutable-run sources are the agent-authored script. The input
+/// example never rides along - it stays in the session-scoped fetch cursor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RoutineSuggestion {
+    pub suggested_name: String,
+    pub source: String,
+    pub input_schema: Value,
+    pub limits: RoutineLimits,
+    pub definition_fingerprint: String,
+    pub evidence: PromotionEvidence,
+    /// Bytes the observed calls put into the model's context; card-display material.
+    pub intermediate_bytes: usize,
+}
+
+impl RoutineSuggestion {
+    /// Fail-closed shape check before a suggestion enters the app's store: the
+    /// fingerprint must really describe this source/schema/limits, and the evidence
+    /// must be internally valid. Keeps a bad (or tampered) message from parking
+    /// persistable-looking material in the UI.
+    pub fn validate(&self) -> Result<(), String> {
+        let fingerprint = definition_fingerprint(&self.source, &self.input_schema, &self.limits)?;
+        if fingerprint != self.definition_fingerprint {
+            return Err("suggestion fingerprint does not match its definition".to_string());
+        }
+        if self.suggested_name.trim().is_empty() {
+            return Err("suggestion name must not be empty".to_string());
+        }
+        self.evidence.validate()
+    }
+}
+
+/// Test fixture: a definition with fabricated promotion evidence. Debug-only so a
+/// release binary physically cannot mint evidence-free definitions - `cfg(test)` alone
+/// cannot cover it because the gateway binary's tests link this library without the
+/// library's own test cfg.
+#[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn new_definition(
     name: String,
@@ -556,7 +636,8 @@ pub fn validate_arguments(schema: &Value, arguments: &Value) -> Result<(), Strin
 /// High-confidence credential patterns that should never be persisted in a routine.
 /// This is deliberately narrow: it blocks obvious literal credentials, not legitimate reads
 /// such as `input.token`, and is not represented as proof that arbitrary JavaScript is clean.
-fn contains_obvious_credentials(value: &str) -> bool {
+/// Shared with the routine advisor so a synthesized draft never inlines one either.
+pub(crate) fn contains_obvious_credentials(value: &str) -> bool {
     static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     PATTERN
         .get_or_init(|| {

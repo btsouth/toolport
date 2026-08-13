@@ -1471,11 +1471,13 @@ pub fn conduit_dir_resolution() -> DirResolution {
 
 /// Process-global test override for [`conduit_dir`]. See [`DataDirOverride`].
 ///
-/// The `AtomicBool` is a fast path so production never pays for the lock: it is only
+/// The `AtomicBool` is a fast path so debug runs barely pay for the lock: it is only
 /// ever flipped by a test, so a normal run does one relaxed load per lookup and skips
-/// the `RwLock` entirely.
+/// the `RwLock` entirely. Release builds compile the whole mechanism out.
+#[cfg(debug_assertions)]
 static DATA_DIR_OVERRIDE_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(debug_assertions)]
 static DATA_DIR_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 #[cfg(test)]
 static DATA_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1502,15 +1504,19 @@ pub(crate) fn data_dir_test_lock() -> std::sync::MutexGuard<'static, ()> {
 ///
 /// Deliberately not `#[cfg(test)]`-gated: the gateway binary's tests link this library
 /// compiled WITHOUT `cfg(test)`, so a cfg-gated hook would be invisible in exactly the
-/// place that needs it.
+/// place that needs it. Gated on `debug_assertions` instead, so a RELEASE binary
+/// physically cannot have its data directory redirected through this hook (tests all
+/// run in debug profiles).
 ///
 /// The override is process-global. Every test in the same test binary that resolves
 /// [`conduit_dir`] directly or indirectly must hold `data_dir_test_lock`, whether
 /// or not that test installs an override itself.
+#[cfg(debug_assertions)]
 #[doc(hidden)]
 #[must_use = "the override is reverted when the guard drops, so it must be bound"]
 pub struct DataDirOverride(());
 
+#[cfg(debug_assertions)]
 impl DataDirOverride {
     pub fn set(path: impl Into<PathBuf>) -> Self {
         *DATA_DIR_OVERRIDE
@@ -1521,6 +1527,7 @@ impl DataDirOverride {
     }
 }
 
+#[cfg(debug_assertions)]
 impl Drop for DataDirOverride {
     fn drop(&mut self) {
         // Clear the flag first so a lookup racing the drop falls through to the real
@@ -1542,7 +1549,9 @@ impl Drop for DataDirOverride {
 /// otherwise a pre-migration resolution would keep pointing at the old path.
 fn resolve_conduit_dir() -> (Option<PathBuf>, DirResolution) {
     // Checked ahead of the memoized value so a test can redirect the dir even after
-    // something else in the process has already resolved it.
+    // something else in the process has already resolved it. Debug-only: release
+    // builds have no override mechanism at all.
+    #[cfg(debug_assertions)]
     if DATA_DIR_OVERRIDE_ACTIVE.load(Ordering::SeqCst) {
         if let Some(p) = DATA_DIR_OVERRIDE
             .read()

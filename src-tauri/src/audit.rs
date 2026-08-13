@@ -212,6 +212,60 @@ pub fn record_routine(
 
 /// Record objective Code Run promotion evidence without retaining source, input, arguments,
 /// intermediate results, final results, or approval tokens.
+/// One advisor hint actually rendered into a tool result. Carries tool names, counts,
+/// and the candidate runId - never argument values or draft source - so hint-shown →
+/// save conversion is measurable from the audit log alone.
+pub fn record_advisor_hint(
+    tier: &str,
+    tool: &str,
+    calls: usize,
+    run_id: Option<&str>,
+    client: Option<&str>,
+) {
+    let mut entry = json!({
+        "ts": epoch_millis() as u64,
+        "server": "toolport",
+        "tool": "routine.advisor.hint_shown",
+        "kind": "routine",
+        "action": "hint_shown",
+        "tier": tier,
+        "patternTool": tool,
+        "calls": calls,
+    });
+    if let Some(run_id) = run_id {
+        entry["runId"] = json!(run_id);
+    }
+    if let Some(client) = client.filter(|client| !client.is_empty()) {
+        entry["client"] = json!(client);
+    }
+    write_line(&entry);
+}
+
+/// A strong candidate was handed to the desktop app's passive suggestion area. The
+/// decision is recorded at publish time (delivery is fire-and-forget), carrying only
+/// identity and counts - never source, schema, or argument values.
+pub fn record_suggestion_published(
+    definition_fingerprint: &str,
+    calls: usize,
+    provenance: crate::routines::EvidenceProvenance,
+    client: Option<&str>,
+) {
+    let mut entry = json!({
+        "ts": epoch_millis() as u64,
+        "server": "toolport",
+        "tool": "routine.suggestion.published",
+        "kind": "routine",
+        "action": "suggestion_published",
+        "definitionFingerprint": definition_fingerprint,
+        "calls": calls,
+        "provenance": provenance,
+    });
+    if let Some(client) = client.filter(|client| !client.is_empty()) {
+        entry["client"] = json!(client);
+    }
+    write_line(&entry);
+}
+
 pub fn record_candidate(
     assessment: &crate::routine_candidates::CandidateAssessment,
     calls: usize,
@@ -232,6 +286,7 @@ pub fn record_candidate(
         "reasonCodes": assessment.reason_codes,
         "observedTools": assessment.observed_tools,
         "riskClass": assessment.risk_class,
+        "provenance": assessment.provenance,
         "calls": calls,
         "durationMs": duration_ms,
     });

@@ -322,6 +322,37 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
     true
 }
 
+/// Stash a Toolport-authored payload and return a cursor readable through
+/// `toolport_fetch_result`, with the same owner scoping, TTL, and bounds as shaped
+/// results. This lets a small marker in a tool result point at bulkier material (the
+/// routine advisor's synthesized draft) without inflating the result it rides on.
+pub fn stash_payload(body: String, structured: Option<Value>, owner: Option<&str>) -> String {
+    let cursor = next_cursor();
+    let size = body.len() + structured.as_ref().map(value_size).unwrap_or(0);
+    let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
+    sweep(&mut map);
+    while !map.is_empty()
+        && (map.len() >= MAX_CACHE_ENTRIES
+            || map.values().map(|c| c.size).sum::<usize>() + size > MAX_CACHE_BYTES)
+    {
+        let Some(oldest) = map.iter().min_by_key(|(_, c)| c.at).map(|(k, _)| k.clone()) else {
+            break;
+        };
+        map.remove(&oldest);
+    }
+    map.insert(
+        cursor.clone(),
+        Cached {
+            body,
+            structured,
+            size,
+            at: Instant::now(),
+            owner: owner.map(str::to_string),
+        },
+    );
+    cursor
+}
+
 /// Return the next slice of a cached shaped result, by cursor + character offset.
 /// `len` of 0 means "use the current budget".
 pub fn fetch_result(cursor: &str, offset: usize, len: usize, requester: Option<&str>, projection: Option<&str>,) -> Value {
