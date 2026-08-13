@@ -58,11 +58,15 @@ function newestPublished(binDir, fsOps, pathImpl, exe) {
   }
   for (const name of entries) {
     const prefix = [GATEWAY, LEGACY_GATEWAY].find((p) => name.startsWith(`${p}-`));
-    // Published leaves are `<gateway>-<version>[-<digest>]<exe>`. Require a digit
-    // after the prefix so sidecars (a `.sig`, a manifest) can never win, and test
-    // `exe` as a plain suffix: it is "" off Windows, not ".exe".
-    if (!prefix || !/^\d/.test(name.slice(prefix.length + 1)) || !name.endsWith(exe))
-      continue;
+    if (!prefix || !name.endsWith(exe)) continue;
+    // Mirror the publisher's own rule (gateway_publish.rs::looks_like_version_suffix)
+    // rather than a looser one: leading digit, contains a dot, version-ish chars
+    // only. A copy Explorer made ("...-1.12.0 - Copy.exe", "...-1.12.0 (1).exe")
+    // can never be something we published, and would otherwise win on mtime and
+    // hide the real newest binary, since only one scanned path is returned.
+    // `exe` is a plain suffix here: it is "" off Windows, not ".exe".
+    const version = name.slice(prefix.length + 1, name.length - exe.length);
+    if (!/^\d[A-Za-z0-9._+-]*$/.test(version) || !version.includes(".")) continue;
     const full = pathImpl.join(binDir, name);
     try {
       const mtime = fsOps.statSync(full).mtimeMs;

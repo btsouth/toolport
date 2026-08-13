@@ -236,9 +236,10 @@ Code plugin layout. It launches the gateway already installed by the desktop
 app, so every plugin install shares your existing servers, credentials, and
 profiles.
 
-If the Toolport app already manages that client's MCP config (VS Code and Claude
-Code both), remove or disable the app-managed entry first. Otherwise the client
-connects to the gateway twice and every meta-tool shows up in duplicate. Details
+If you already connected that client in the app's Clients view, disconnect it
+there first. VS Code, Claude Code, and GitHub Copilot CLI are all managed there,
+and leaving both in place connects the gateway twice and shows every meta-tool
+in duplicate. Details
 in [packaging/agent-plugin/toolport/README.md](packaging/agent-plugin/toolport/README.md).
 
 ### Headless / container / MCP over the network

@@ -40,12 +40,13 @@ credentials, and profiles. That's the point of Toolport.
 
 ### Don't install it twice into one client
 
-The Toolport app writes MCP config directly for VS Code and Claude Code. If you
-install this plugin into a client the app already manages, that client gets two
+The Toolport app writes MCP config directly for most of the clients above, VS
+Code, Claude Code, and GitHub Copilot CLI included. If you install the plugin
+into a client the app already connected, that client gets two
 `toolport` server entries, spawns two gateway processes, and shows every
-meta-tool twice. Pick one: either turn the client off in the Toolport app's
-Clients view before installing the plugin, or skip the plugin for that client.
-Clients the app does not manage have nothing to disable.
+meta-tool twice. Pick one: either disconnect the client in the Toolport app's
+Clients view before installing the plugin, or skip the plugin for that client
+and let the app keep managing it.
 
 ## Configuration
 
