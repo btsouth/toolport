@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 #
 # Toolport installer. One-liner:
-#   curl -fsSL https://raw.githubusercontent.com/tsouth89/toolport/main/scripts/install.sh | bash
+#   curl -fsSL https://toolport.app/install.sh | bash
+#
+# HEADS UP, IF YOU EDIT THIS FILE: toolport.app/install.sh redirects to a PINNED
+# COMMIT of this script, not to main, because it is piped into a shell and a movable
+# URL there means anything that lands on main runs on users' machines. A change here
+# does NOT reach that URL until INSTALL_SCRIPTS_REF in the site repo's
+# worker/index.js is moved to the commit containing it. Ship both, or the fix you
+# just made will not reach anyone using the short URL.
 #
 # Installs the latest signed release for your OS/arch:
 #   - Linux (x86_64): the .deb via apt where available, else the portable AppImage

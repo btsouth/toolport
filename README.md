@@ -308,12 +308,15 @@ namespaced per server, so the two never collide even in the same profile.
 brew install --cask tsouth89/toolport/toolport
 
 # macOS or Linux (script: .deb via apt where available, else AppImage; Mac copies the app)
-curl -fsSL https://raw.githubusercontent.com/tsouth89/toolport/main/scripts/install.sh | bash
+curl -fsSL https://toolport.app/install.sh | bash
 ```
 
 ```powershell
+# Windows (winget, once the package is published)
+winget install Toolport.Toolport
+
 # Windows (PowerShell: downloads the signed installer, verifies its checksum, installs per-user)
-irm https://raw.githubusercontent.com/tsouth89/toolport/main/scripts/install.ps1 | iex
+irm https://toolport.app/install.ps1 | iex
 ```
 
 The Windows script installs **silently** and needs no administrator rights. It

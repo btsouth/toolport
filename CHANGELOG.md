@@ -6,6 +6,16 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Added
+
+- **Short install commands.** `irm https://toolport.app/install.ps1 | iex` on Windows and
+  `curl -fsSL https://toolport.app/install.sh | bash` on macOS and Linux, replacing the
+  86-character raw.githubusercontent URLs. Both redirect to a pinned commit rather than
+  a branch: these are piped into a shell, so the content behind them should not be able
+  to change without a reviewed change on both sides.
+- **winget package.** `winget install Toolport.Toolport` on Windows once the manifest is
+  published, and each release submits its own update.
+
 ## [1.13.0] - 2026-08-13
 
 Toolport installs two new ways: as an agent plugin any conformant client can pick up,

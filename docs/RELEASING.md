@@ -15,6 +15,10 @@ Releases are built by CI on a version tag (`.github/workflows/release.yml`).
      from `package.json`
    - `CHANGELOG.md` — move `[Unreleased]` entries into a dated section
    - `server.json` only when publishing a matching standalone gateway package
+   - `scripts/install.ps1` / `scripts/install.sh` only if you changed them, in which
+     case also move `INSTALL_SCRIPTS_REF` in the site repo's `worker/index.js`, since
+     `toolport.app/install.*` redirects to a pinned commit and will otherwise keep
+     serving the old script
 2. The `CHANGELOG.md` section from step 1 becomes the release body: CI extracts the
    lines under `## [X.Y.Z]` and falls back to generated notes if that heading is
    missing or empty. Write it there rather than anywhere else. (`docs/release-notes/`
@@ -32,6 +36,13 @@ CI builds installers for **Windows** (NSIS), **macOS** (dmg), and **Linux**
 (deb + AppImage), each with the gateway bundled, plus `toolport-agent-plugin.zip`,
 and attaches them to a **draft** release titled `Toolport vX.Y.Z` whose body is the
 changelog section. Review the draft, then click **Publish**.
+
+Publishing is also what triggers **winget** (`winget.yml`): it submits a manifest
+update to `microsoft/winget-pkgs` for the new version. It runs on publish rather
+than on the tag because winget's validation downloads the installer URL, which 404s
+while the release is still a draft. It no-ops with a warning unless the
+`WINGET_TOKEN` secret (a PAT with `public_repo`) is set, so it can never fail a
+release. To submit by hand instead, the manifests are in `packaging/winget`.
 
 The **gateway container image** (`ghcr.io/tsouth89/toolport-gateway`) publishes
 separately on every push to `main` via `docker-publish.yml` — no tag required.

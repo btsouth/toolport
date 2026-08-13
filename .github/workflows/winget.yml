@@ -1,0 +1,58 @@
+name: winget
+
+# Submits a manifest update to microsoft/winget-pkgs after a release is PUBLISHED.
+#
+# Not on the version tag, deliberately: release.yml builds into a DRAFT release,
+# and winget's validation downloads the installer URL, which 404s while the
+# release is still a draft. `released` fires when the draft is published, which
+# is also the first moment the asset is fetchable.
+on:
+  release:
+    types: [released]
+
+permissions:
+  contents: read
+
+jobs:
+  submit:
+    # Prereleases are not what `winget install` should hand people.
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: windows-latest
+    env:
+      # A PAT with `public_repo`, because GITHUB_TOKEN cannot push to the
+      # winget-pkgs fork this submits from. Until the secret exists the step
+      # below no-ops, so adding this workflow cannot fail a release. Same
+      # gating style as the Azure signing steps in release.yml.
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Submit the manifest update
+        if: ${{ env.WINGET_TOKEN != '' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:TAG -replace '^v', ''
+          $url = "https://github.com/${{ github.repository }}/releases/download/$env:TAG/Toolport_${version}_x64-setup.exe"
+
+          # Fail before touching winget-pkgs if the asset is not actually there,
+          # so a rename in release.yml surfaces here rather than as a rejected
+          # upstream PR days later.
+          $head = Invoke-WebRequest -Uri $url -Method Head -MaximumRedirection 5 -SkipHttpErrorCheck
+          if ($head.StatusCode -ne 200) {
+            throw "Installer not downloadable ($($head.StatusCode)): $url"
+          }
+
+          # wingetcreate is Microsoft's own tool, so this adds no third-party
+          # action to a workflow that holds a push token.
+          Invoke-WebRequest -Uri https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          .\wingetcreate.exe update Toolport.Toolport `
+            --version $version `
+            --urls "$url|x64|user" `
+            --submit `
+            --token $env:WINGET_TOKEN
+
+      - name: Say why nothing was submitted
+        if: ${{ env.WINGET_TOKEN == '' }}
+        shell: pwsh
+        run: |
+          Write-Output "::warning::WINGET_TOKEN is not set, so no winget manifest was submitted for $env:TAG. Add the secret (PAT with public_repo) to enable this, or submit by hand from packaging/winget."

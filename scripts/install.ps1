@@ -1,5 +1,12 @@
 # Toolport installer for Windows. One-liner:
-#   irm https://raw.githubusercontent.com/tsouth89/toolport/main/scripts/install.ps1 | iex
+#   irm https://toolport.app/install.ps1 | iex
+#
+# HEADS UP, IF YOU EDIT THIS FILE: toolport.app/install.ps1 redirects to a PINNED
+# COMMIT of this script, not to main, because it is piped into `iex` and a movable
+# URL there means anything that lands on main runs on users' machines. A change
+# here does NOT reach that URL until INSTALL_SCRIPTS_REF in the site repo's
+# worker/index.js is moved to the commit containing it. Ship both, or the fix you
+# just made will not reach anyone using the short URL.
 #
 # Downloads the NSIS installer for the latest release, verifies it against the
 # SHA-256 GitHub publishes for that asset, and runs it silently (per-user, no
@@ -12,7 +19,7 @@
 #   -AllowUnverified     TOOLPORT_ALLOW_UNVERIFIED=1  install even with no published checksum
 #
 # To pass parameters through the one-liner:
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/tsouth89/toolport/main/scripts/install.ps1))) -Version 1.12.0
+#   & ([scriptblock]::Create((irm https://toolport.app/install.ps1))) -Version 1.13.0
 
 param(
     [string]$Version,
