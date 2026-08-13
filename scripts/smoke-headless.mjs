@@ -456,6 +456,7 @@ async function testRoutinePersistsAcrossGatewayRestart() {
   );
 
   let routineId;
+  let routineToolName;
   const firstPort = await availablePort("127.0.0.1");
   const first = startGateway({ port: firstPort, host: "127.0.0.1", authToken: token });
   try {
@@ -522,7 +523,14 @@ async function testRoutinePersistsAcrossGatewayRestart() {
     });
     const approval = await broker.requestReceived;
     routineId = saved.json?.result?.structuredContent?.routine?.id;
-    if (!routineId || saved.json?.result?.isError) {
+    routineToolName = saved.json?.result?.structuredContent?.advertisedAs;
+    if (
+      !routineId ||
+      !/^toolport_routine_[A-Za-z0-9_]+$/.test(routineToolName ?? "") ||
+      routineToolName.length > 64 ||
+      routineToolName.includes("__") ||
+      saved.json?.result?.isError
+    ) {
       throw new Error(`save_routine failed: ${JSON.stringify(saved.json)}`);
     }
     const savedHash = saved.json?.result?.structuredContent?.routine?.contentHash;
@@ -571,7 +579,7 @@ async function testRoutinePersistsAcrossGatewayRestart() {
     await new Promise((resolve) => broker.server.close(resolve));
   }
 
-  if (!routineId) return;
+  if (!routineId || !routineToolName) return;
   const secondPort = await availablePort("127.0.0.1");
   const second = startGateway({ port: secondPort, host: "127.0.0.1", authToken: token });
   try {
@@ -581,9 +589,28 @@ async function testRoutinePersistsAcrossGatewayRestart() {
         `restarted gateway did not start: ${ready.last}; ${second.stderr()}`,
       );
     const sessionId = await initializeMcp(secondPort);
-    const listed = await mcpRequest({
+    const toolList = await mcpRequest({
       port: secondPort,
       id: 2,
+      method: "tools/list",
+      sessionId,
+    });
+    const virtualTool = toolList.json?.result?.tools?.find(
+      (tool) => tool.name === routineToolName,
+    );
+    if (
+      !virtualTool ||
+      !isDeepStrictEqual(virtualTool.inputSchema, routineInputSchema) ||
+      !virtualTool.description?.includes("real-process restart fixture")
+    ) {
+      throw new Error(
+        `saved routine was not advertised as a first-class tool: ${JSON.stringify(toolList.json)}`,
+      );
+    }
+
+    const listed = await mcpRequest({
+      port: secondPort,
+      id: 3,
       method: "tools/call",
       sessionId,
       params: {
@@ -602,12 +629,12 @@ async function testRoutinePersistsAcrossGatewayRestart() {
     }
     const run = await mcpRequest({
       port: secondPort,
-      id: 3,
+      id: 4,
       method: "tools/call",
       sessionId,
       params: {
-        name: "toolport_run_routine",
-        arguments: { id: routineId, arguments: { value: "after-restart" } },
+        name: routineToolName,
+        arguments: { value: "after-restart" },
       },
     });
     const result = run.json?.result?.structuredContent?.result;
@@ -616,9 +643,13 @@ async function testRoutinePersistsAcrossGatewayRestart() {
       result?.value !== "after-restart" ||
       result?.frozen !== true
     ) {
-      throw new Error(`run_routine failed after restart: ${JSON.stringify(run.json)}`);
+      throw new Error(
+        `virtual Routine tool failed after restart: ${JSON.stringify(run.json)}`,
+      );
     }
-    pass("Routine persists and runs through MCP after Gateway restart");
+    pass(
+      "Routine is advertised and runs as a first-class MCP tool after Gateway restart",
+    );
   } catch (error) {
     fail(`Routine restart verification failed: ${error.message}`);
   } finally {
