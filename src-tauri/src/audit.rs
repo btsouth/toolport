@@ -426,8 +426,15 @@ fn write_line_at_with_rotation_hook(
     // Atomic replacement protects readers from partial files, but only this
     // shared cross-process critical section prevents a stale rotation snapshot
     // from replacing an append that completed in another gateway.
-    let Ok(_lock) = crate::registry::lock_at(path) else {
-        return;
+    let _lock = match crate::registry::lock_at(path) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!(
+                "toolport: audit record dropped because the lock for '{}' could not be acquired: {error}",
+                path.display()
+            );
+            return;
+        }
     };
     let open = || {
         std::fs::OpenOptions::new()
@@ -768,6 +775,33 @@ mod tests {
         }
     }
 
+    struct AuditProcessFixture {
+        root: PathBuf,
+        children: Vec<std::process::Child>,
+    }
+
+    impl AuditProcessFixture {
+        fn new(root: PathBuf) -> Self {
+            std::fs::create_dir_all(&root).unwrap();
+            Self {
+                root,
+                children: Vec::new(),
+            }
+        }
+    }
+
+    impl Drop for AuditProcessFixture {
+        fn drop(&mut self) {
+            for child in &mut self.children {
+                if !matches!(child.try_wait(), Ok(Some(_))) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[test]
     fn to_csv_has_header_and_a_row() {
         let entries = vec![json!({
@@ -960,7 +994,7 @@ mod tests {
             std::process::id(),
             epoch_millis()
         ));
-        std::fs::create_dir_all(&root).unwrap();
+        let mut fixture = AuditProcessFixture::new(root.clone());
         let path = root.join("audit.jsonl");
         let ready = root.join("ready");
         let go = root.join("go");
@@ -968,40 +1002,42 @@ mod tests {
         let done = root.join("done");
         std::fs::write(&path, oversized_audit_content()).unwrap();
 
-        let mut child = None;
-        let mut after_snapshot = || {
-            let spawned = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "audit::tests::audit_rotation_sentinel_child",
-                    "--nocapture",
-                ])
-                .env("TOOLPORT_AUDIT_SENTINEL_PATH", &path)
-                .env("TOOLPORT_AUDIT_SENTINEL_READY", &ready)
-                .env("TOOLPORT_AUDIT_SENTINEL_GO", &go)
-                .env("TOOLPORT_AUDIT_SENTINEL_ATTEMPTING", &attempting)
-                .env("TOOLPORT_AUDIT_SENTINEL_DONE", &done)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("spawn independent sentinel appender");
-            child = Some(spawned);
-            wait_for_path(&ready, "sentinel child readiness");
-            std::fs::write(&go, "go").unwrap();
-            wait_for_path(&attempting, "sentinel append attempt");
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            assert!(
-                !done.exists(),
-                "a separate process must not append while rotation holds the lock"
-            );
-        };
+        {
+            let mut after_snapshot = || {
+                fixture.children.push(
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "audit::tests::audit_rotation_sentinel_child",
+                            "--nocapture",
+                        ])
+                        .env("TOOLPORT_AUDIT_SENTINEL_PATH", &path)
+                        .env("TOOLPORT_AUDIT_SENTINEL_READY", &ready)
+                        .env("TOOLPORT_AUDIT_SENTINEL_GO", &go)
+                        .env("TOOLPORT_AUDIT_SENTINEL_ATTEMPTING", &attempting)
+                        .env("TOOLPORT_AUDIT_SENTINEL_DONE", &done)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .expect("spawn independent sentinel appender"),
+                );
+                wait_for_path(&ready, "sentinel child readiness");
+                std::fs::write(&go, "go").unwrap();
+                wait_for_path(&attempting, "sentinel append attempt");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                assert!(
+                    !done.exists(),
+                    "a separate process must not append while rotation holds the lock"
+                );
+            };
 
-        write_line_at_with_rotation_hook(
-            &path,
-            &json!({"server":"rotator","marker":"snapshot-owner"}),
-            Some(&mut after_snapshot),
-        );
-        let status = wait_for_child(child.as_mut().expect("sentinel child"), "sentinel child");
+            write_line_at_with_rotation_hook(
+                &path,
+                &json!({"server":"rotator","marker":"snapshot-owner"}),
+                Some(&mut after_snapshot),
+            );
+        }
+        let status = wait_for_child(&mut fixture.children[0], "sentinel child");
         assert!(status.success(), "sentinel child failed: {status}");
         assert!(
             done.exists(),
@@ -1020,7 +1056,6 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| entry["marker"] == "between-snapshot-and-replace"));
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1055,16 +1090,15 @@ mod tests {
             std::process::id(),
             epoch_millis()
         ));
-        std::fs::create_dir_all(&root).unwrap();
+        let mut fixture = AuditProcessFixture::new(root.clone());
         let path = root.join("audit.jsonl");
         let go = root.join("go");
         std::fs::write(&path, oversized_audit_content()).unwrap();
 
         let executable = std::env::current_exe().unwrap();
-        let mut children = Vec::new();
         for child_id in 0..CHILDREN {
             let ready = root.join(format!("ready-{child_id}"));
-            children.push(
+            fixture.children.push(
                 std::process::Command::new(&executable)
                     .args([
                         "--exact",
@@ -1088,7 +1122,7 @@ mod tests {
             );
         }
         std::fs::write(&go, "go").unwrap();
-        for (child_id, child) in children.iter_mut().enumerate() {
+        for (child_id, child) in fixture.children.iter_mut().enumerate() {
             let status = wait_for_child(child, "audit stress child");
             assert!(
                 status.success(),
@@ -1114,7 +1148,6 @@ mod tests {
         }
         assert!(entries.len() <= KEEP_LINES + CHILDREN * RECORDS_PER_CHILD);
         assert!(std::fs::metadata(&path).unwrap().len() <= MAX_AUDIT_BYTES);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
