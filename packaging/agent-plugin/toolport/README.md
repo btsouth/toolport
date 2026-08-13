@@ -1,8 +1,8 @@
 # Toolport agent plugin
 
-Connect any [Agent Plugins 1.0](https://agent-plugins.org) client — VS Code,
-GitHub Copilot CLI, the Copilot app, and other conformant agents — or Claude
-Code to your local [Toolport](https://toolport.app) gateway with one install.
+Connect any [Agent Plugins 1.0](https://agent-plugins.org) client (VS Code,
+GitHub Copilot CLI, the Copilot app, and other conformant agents), or Claude
+Code, to your local [Toolport](https://toolport.app) gateway with one install.
 
 The plugin bundles:
 
@@ -12,9 +12,9 @@ The plugin bundles:
 - **A skill** (`skills/toolport/`) teaching the agent Toolport's
   search → call workflow, code mode, shaped results, and the approval flow.
 
-Both manifest layouts ship in this one folder: `plugin.json` + `mcp.json` at
-the root (Agent Plugins 1.0) and `.claude-plugin/plugin.json` + `.mcp.json`
-(Claude Code), so the same directory installs into either ecosystem.
+Both manifest layouts ship in this one folder (`plugin.json` + `mcp.json` at
+the root for Agent Plugins 1.0, `.claude-plugin/plugin.json` + `.mcp.json` for
+Claude Code), so the same directory installs into either ecosystem.
 
 ## Requirements
 
@@ -25,9 +25,10 @@ the root (Agent Plugins 1.0) and `.claude-plugin/plugin.json` + `.mcp.json`
 
 ## Install
 
-Download `toolport-agent-plugin.zip` from the
-[latest release](https://github.com/tsouth89/toolport/releases/latest) and
-unzip it, or use this directory straight from a checkout.
+Use this directory straight from a checkout, or download
+`toolport-agent-plugin.zip` and unzip it. That asset is attached to every
+release tagged after the packaging job shipped, so on older releases the
+checkout is the only source.
 
 - **VS Code / Copilot CLI / Copilot app:** follow your client's "install a
   local agent plugin" flow and point it at the unzipped `toolport/` folder.
@@ -35,7 +36,16 @@ unzip it, or use this directory straight from a checkout.
   repo, or add the folder as a local plugin.
 
 Every client you install the plugin into shares the same gateway, servers,
-credentials, and profiles — that's the point of Toolport.
+credentials, and profiles. That's the point of Toolport.
+
+### Don't install it twice into one client
+
+The Toolport app writes MCP config directly for VS Code and Claude Code. If you
+install this plugin into a client the app already manages, that client gets two
+`toolport` server entries, spawns two gateway processes, and shows every
+meta-tool twice. Pick one: either turn the client off in the Toolport app's
+Clients view before installing the plugin, or skip the plugin for that client.
+Clients the app does not manage have nothing to disable.
 
 ## Configuration
 

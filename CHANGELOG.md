@@ -10,8 +10,8 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 - **Agent plugin.** Toolport now ships as an [Agent Plugins 1.0](https://agent-plugins.org)
   package (`toolport-agent-plugin.zip` on each release): one install connects VS Code,
-  GitHub Copilot CLI, the Copilot app, and other conformant clients — plus Claude Code
-  via the bundled dual layout — to the local gateway, with a skill teaching the agent
+  GitHub Copilot CLI, the Copilot app, and other conformant clients (plus Claude Code,
+  via the bundled dual layout) to the local gateway, with a skill teaching the agent
   the search → call workflow. The plugin launches the gateway the desktop app already
   installed, so plugin installs share your existing servers, credentials, and profiles.
 

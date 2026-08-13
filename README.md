@@ -224,15 +224,21 @@ any HTTP/OpenAPI MCP consumer (n8n, LibreChat, custom agents).
 
 Clients that install [Agent Plugins 1.0](https://agent-plugins.org) packages
 (VS Code, GitHub Copilot CLI, the Copilot app, and other conformant agents) can
-connect to Toolport by installing one plugin instead of editing MCP config:
-download `toolport-agent-plugin.zip` from the
-[latest release](https://github.com/tsouth89/toolport/releases/latest) and point
-your client's plugin install flow at the unzipped `toolport/` directory—the folder
-that contains `plugin.json`. The plugin bundles the
-gateway's MCP server entry plus a skill that teaches the agent Toolport's
-search → call workflow, and the same folder also carries the Claude Code plugin
-layout. It launches the gateway already installed by the desktop app, so every
-plugin install shares your existing servers, credentials, and profiles. Details
+connect to Toolport by installing one plugin instead of editing MCP config.
+Point your client's plugin install flow at
+[packaging/agent-plugin/toolport/](packaging/agent-plugin/toolport) from a
+checkout (the folder that contains `plugin.json`). From the first release tagged
+after this lands, the same folder also ships as `toolport-agent-plugin.zip` on
+the [releases page](https://github.com/tsouth89/toolport/releases). The plugin
+bundles the gateway's MCP server entry plus a skill that teaches the agent
+Toolport's search → call workflow, and the same folder also carries the Claude
+Code plugin layout. It launches the gateway already installed by the desktop
+app, so every plugin install shares your existing servers, credentials, and
+profiles.
+
+If the Toolport app already manages that client's MCP config (VS Code and Claude
+Code both), remove or disable the app-managed entry first. Otherwise the client
+connects to the gateway twice and every meta-tool shows up in duplicate. Details
 in [packaging/agent-plugin/toolport/README.md](packaging/agent-plugin/toolport/README.md).
 
 ### Headless / container / MCP over the network
