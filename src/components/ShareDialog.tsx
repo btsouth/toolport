@@ -297,8 +297,13 @@ export function ShareDialog({ trigger, onImported }: Props) {
     const json = pendingJson;
     setBusyAction("import");
     try {
-      onImported(await importConfig(json));
-      if (request !== previewRequest.current) return;
+      const imported = await importConfig(json);
+      // The write already happened. Always update the parent registry.
+      onImported(imported);
+      if (request !== previewRequest.current) {
+        toast.success("Imported the setup you already confirmed");
+        return;
+      }
       toast.success("Imported shared setup", {
         description: "Add any API keys each server needs, then enable them.",
       });

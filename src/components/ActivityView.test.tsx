@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, act } from "@testing-library/react";
+import { render, screen, act, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ActivityView } from "./ActivityView";
 import type { AuditEntry, SearchTrace } from "@/lib/types";
@@ -8,8 +8,10 @@ const getAuditLog = vi.fn();
 const getSearchTraces = vi.fn();
 const getSecurityEvents = vi.fn();
 
+const clearActivityLogs = vi.fn();
+
 vi.mock("@/lib/api", () => ({
-  clearActivityLogs: vi.fn(),
+  clearActivityLogs: (...a: unknown[]) => clearActivityLogs(...a),
   exportAuditToPath: vi.fn(),
   getAuditLog: (...a: unknown[]) => getAuditLog(...a),
   getAuditStats: vi.fn(() => Promise.resolve(null)),
@@ -135,6 +137,28 @@ describe("ActivityView trust-state loading", () => {
     expect(screen.queryByText("Protection active.")).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Retry protection status" }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not restore cleared calls when the post-clear refetch fails", async () => {
+    const { toast } = await import("sonner");
+    clearActivityLogs.mockResolvedValue(undefined);
+    getAuditLog
+      .mockResolvedValueOnce(initialLog)
+      .mockRejectedValueOnce(new Error("locked"));
+
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(screen.getByText(/last 2/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear activity" }));
+    await act(async () => {});
+
+    expect(toast.success).toHaveBeenCalledWith("Cleared retained activity");
+    expect(screen.queryByText(/last 2/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/can't verify that the log is still empty/i),
     ).toBeInTheDocument();
   });
 

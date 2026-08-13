@@ -46,7 +46,9 @@ describe("Onboarding health verification", () => {
     render(<Onboarding {...props} onProbe={() => probe.promise} />);
 
     expect(await screen.findByText("Checking server health…")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Checking…" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Continue without verification" }),
+    ).toBeEnabled();
     expect(screen.queryByText("You're set up")).not.toBeInTheDocument();
 
     probe.resolve([]);

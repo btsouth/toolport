@@ -347,7 +347,8 @@ describe("ShareDialog share links", () => {
     mocks.previewImport.mockResolvedValue([item]);
     mocks.importConfig.mockReturnValueOnce(importing.promise);
 
-    render(<ShareDialog trigger={<button>Share</button>} onImported={vi.fn()} />);
+    const onImported = vi.fn();
+    render(<ShareDialog trigger={<button>Share</button>} onImported={onImported} />);
     await userEvent.click(screen.getByRole("button", { name: "Share" }));
     fireEvent.change(screen.getByLabelText("Paste a shared setup"), {
       target: { value: '{"name":"a","servers":[]}' },
@@ -361,5 +362,9 @@ describe("ShareDialog share links", () => {
     await act(async () => importing.resolve({ servers: [] }));
     expect(screen.getByText("Review this setup")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Import 1 server" })).toBeEnabled();
+    expect(onImported).toHaveBeenCalledWith({ servers: [] });
+    expect(mocks.success).toHaveBeenCalledWith(
+      "Imported the setup you already confirmed",
+    );
   });
 });

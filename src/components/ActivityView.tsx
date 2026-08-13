@@ -1508,6 +1508,10 @@ export function ActivityView({
   async function clearActivity() {
     try {
       await clearActivityLogs();
+      // The next getAuditLog can fail (Windows file lock right after clear).
+      // Do not keep the deleted rows as last-known after a successful wipe.
+      setEntries([]);
+      setAuditLoadStatus("ready");
       toast.success("Cleared retained activity");
       setReloadTick((t) => t + 1);
     } catch (e) {

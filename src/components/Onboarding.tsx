@@ -942,14 +942,12 @@ function Done({
         <VerifyCall client={verifyClient} onOpenPlayground={onOpenPlayground} />
       )}
 
-      <Button onClick={onFinish} className="self-start" disabled={checkingHealth}>
-        {checkingHealth
-          ? "Checking…"
+      <Button onClick={onFinish} className="self-start">
+        {checkingHealth || (configured && probeFailed)
+          ? "Continue without verification"
           : ready
             ? "Start using Toolport"
-            : configured && probeFailed
-              ? "Continue without verification"
-              : "Got it"}
+            : "Got it"}
         <ArrowRight className="size-4" />
       </Button>
     </>

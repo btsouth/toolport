@@ -1032,7 +1032,7 @@ function App() {
               setResumeAtConnect(true);
               selectView("catalog");
             }}
-            onProbe={reprobeAfterMutation}
+            onProbe={reprobe}
             onOpenPlayground={() => {
               setShowOnboarding(false);
               selectView("playground");
