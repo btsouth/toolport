@@ -15,8 +15,10 @@ Releases are built by CI on a version tag (`.github/workflows/release.yml`).
      from `package.json`
    - `CHANGELOG.md` — move `[Unreleased]` entries into a dated section
    - `server.json` only when publishing a matching standalone gateway package
-2. Draft user-facing notes in `docs/release-notes/vX.Y.Z.md` (paste into the GitHub
-   release body when publishing the draft CI creates).
+2. The `CHANGELOG.md` section from step 1 becomes the release body: CI extracts the
+   lines under `## [X.Y.Z]` and falls back to generated notes if that heading is
+   missing or empty. Write it there rather than anywhere else. (`docs/release-notes/`
+   holds hand-written notes from before this was automated; nothing reads it.)
 3. Commit the bump (e.g. `chore(release): 1.6.0`).
 4. Merge to `main`, then tag and push:
 
@@ -27,9 +29,9 @@ Releases are built by CI on a version tag (`.github/workflows/release.yml`).
    ```
 
 CI builds installers for **Windows** (NSIS), **macOS** (dmg), and **Linux**
-(deb + AppImage), each with the gateway bundled, and attaches them to a **draft**
-release with auto-generated notes. Replace or augment the body with
-`docs/release-notes/vX.Y.Z.md`, then click **Publish**.
+(deb + AppImage), each with the gateway bundled, plus `toolport-agent-plugin.zip`,
+and attaches them to a **draft** release titled `Toolport vX.Y.Z` whose body is the
+changelog section. Review the draft, then click **Publish**.
 
 The **gateway container image** (`ghcr.io/tsouth89/toolport-gateway`) publishes
 separately on every push to `main` via `docker-publish.yml` — no tag required.

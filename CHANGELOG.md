@@ -6,6 +6,18 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-08-13
+
+Toolport installs two new ways: as an agent plugin any conformant client can pick up,
+and on Windows through a one-line command instead of a trip to the Releases page.
+Pseudonymization gains the piece it was missing, a way for a human to release one
+value to one server, so the workflow it used to dead-end now has an answer.
+
+Most of the rest of this release is one defect wearing different faces: code that
+read a failed probe as good news. A failed audit baseline, health check, security
+read, integrity load, or Windows credential read could each come back looking like
+"all clear" and let the app act on it. Each one now fails closed.
+
 ### Added
 
 - **Agent plugin.** Toolport now ships as an [Agent Plugins 1.0](https://agent-plugins.org)
@@ -14,6 +26,93 @@ Entries before the rename below shipped under the project's former name, Conduit
   via the bundled dual layout) to the local gateway, with a skill teaching the agent
   the search → call workflow. The plugin launches the gateway the desktop app already
   installed, so plugin installs share your existing servers, credentials, and profiles.
+  If the app already manages that client, disconnect it there first or the gateway
+  connects twice.
+- **Windows one-line install.**
+  `irm https://raw.githubusercontent.com/tsouth89/toolport/main/scripts/install.ps1 | iex`,
+  matching the macOS and Linux one-liners. It resolves the release through the GitHub
+  API, picks the NSIS asset for the machine's architecture, and refuses to install
+  anything it cannot verify against the per-asset digest (`-AllowUnverified` is the
+  explicit override). A signature that disagrees with the file is fatal; a missing one
+  is a warning, since builds before Azure signing shipped unsigned. (#610)
+- **Release one pseudonymized value to one server.** Scoping rehydration to the minting
+  server closed a cross-server exfiltration channel but left a legitimate workflow with
+  no path at all: read a customer from a CRM, mail them through a different server, and
+  the call simply failed. Refusal is still the default, with a human decision as the
+  remedy. The prompt names the destination, each token, and its real value, and grants
+  that one value to that one server. There is deliberately no blanket per-server grant,
+  an "always allow" on a tool can never release a later value, and a headless gateway
+  with nobody to ask refuses exactly as before. Audited by hashing the arguments, so
+  released values never reach the log. (SBS-696)
+- **Pseudonymization counts in the audit log, CSV export, and Activity.** This path
+  fails open: a full session map or an over-cap result leaves values in the clear, and
+  a call where redaction quietly did not apply used to be indistinguishable from a clean
+  one. `piiReplaced` is absent when redaction was off and present-and-zero when it ran
+  and matched nothing, and `piiIncomplete` is written only when true, so the fail-open
+  case is greppable. Activity shows "N pseudonymized" with a warning badge when the pass
+  did not fully apply. Counts only; values never leave the session map. CSV columns are
+  appended at the end, so positional consumers keep working. (SBS-607)
+- **`toolport.checkpoint()` in code mode.** A last-write-wins resume marker a script
+  sets itself, alongside the automatic call ledger. Unlike `progress`, which is
+  positional, this holds author-chosen state (`{ lastInsertedId: row.id }`). Costs
+  nothing against `max_calls`, capped at 4096 bytes, and surfaces in the failure text
+  and in `structuredContent.toolportScript.checkpoint`. (#663)
+- **Server-declared tool icons** render in the tool browser. `data:` sources only: a
+  remote icon URL is not a picture but a request the app makes to a server-chosen host
+  on every paint, reporting when Toolport is open and from what IP with no tool call
+  involved. (SEP-973)
+- **URL-mode elicitation.** (SBS-707)
+
+### Fixed
+
+- **A failed read no longer looks like success.** Onboarding needs a successful audit
+  baseline before anything counts and stays in checking or unavailable until an
+  authoritative health result exists, with concurrent probes sharing one promise instead
+  of returning an empty list. Activity keeps the last known security events across a
+  failed refresh and never shows Protection active without an authoritative read. A
+  rejected client-secret probe stays unknown instead of reporting "no secret stored",
+  which was blocking scope edits for secrets that were already vaulted. Integrity-store
+  failures fail closed, and interrupted pin updates recover. (SBS-718, SBS-719, SBS-720,
+  SBS-721, SBS-722, #697)
+- **The HTTP bridge validates `Origin`, not just `Sec-Fetch-Site`.** Under DNS rebinding
+  the attacker's domain resolves to loopback, so the browser calls it same-origin and the
+  old guard waved it through, worst under `--insecure-open` where there is no token.
+  Absent `Origin` stays allowed, so curl and Open WebUI's backend are unaffected, and a
+  deliberately exposed bridge can still serve its own browser UI by matching the bound
+  address or listing hosts in `TOOLPORT_HTTP_ALLOWED_ORIGINS`. No name resolution is
+  involved, so a domain that merely resolves to the bridge stays foreign. (SBS-452)
+- **Folder scoping keeps working as Roots is deprecated.** Roots was the only input
+  folder-scoped auto-routing ever had, so a client that never sent it, or stopped
+  mid-session, silently dropped to the unscoped profile and reached more servers than
+  intended. The project root now resolves from `TOOLPORT_ROOT`, then the client's roots
+  for the whole deprecation window, then the gateway's working directory. (SEP-2577)
+- **Stale gateway and catalog state can no longer become permanent.** `CLAUDE_CONFIG_DIR`
+  is honored instead of hardcoding `~/.claude.json`. A downstream that answers
+  `tools/list` with a truncated catalog no longer becomes cached truth for every gateway
+  started afterwards. A republish under a content-addressed filename no longer flips a
+  managed client to Customized, which had pinned it to a superseded gateway permanently
+  (npx, docker, and wrapper scripts are still Customized). A confirmed rebuild collapse
+  can now land instead of being held forever. (#698)
+- **Profiles with similar names no longer share state.** Per-profile stores were named by
+  a lossy slug of the display name, so "Work Prod" and "Work/Prod" shared cache, pins,
+  and quarantine. Files are keyed by a hashed profile id now, unambiguous legacy files
+  migrate, and a slug collision fails closed rather than merging two profiles. (SBS-715)
+- **A Windows credential being replaced no longer reads as missing.** Windows reports the
+  base credential absent for the instant a replace is in flight, which surfaced as a
+  spurious "not authenticated" during OAuth refresh, since the app writes these and the
+  gateway reads them from another process. Absence now only counts once it survives
+  bounded retries with a real backoff. A mitigation rather than a guarantee: measured
+  over 9,600 racing reads, 37 torn reads became 4. (SBS-711)
+- **Atlassian OAuth on Windows**, plus a longer refresh-lock wait so a slow refresh is
+  not abandoned. (#685, SBS-705)
+- **Cancellation is honored end to end.** The HTTP transport aborts or forwards
+  cancellation and retry backoff observes it, so abandoned work releases its per-server
+  slot. The updater refuses to install while gateways are still running and recovers the
+  HTTP bridge if an install fails after shutdown. (SBS-716, SBS-717)
+- **PII session maps are cleared when sessions end.** (SBS-704)
+- **Requests with no transport fail closed** instead of proceeding. (SBS-551)
+- **Tray and update lifecycle**, including approval requests being delivered once rather
+  than repeatedly. (SBS-146)
 
 ## [1.12.0] - 2026-08-09
 
