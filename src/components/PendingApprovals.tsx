@@ -305,7 +305,16 @@ export function PendingApprovals() {
                   ) : a.reason === "persistent_code_write" ? (
                     (() => {
                       const routine = routineApprovalView(a.arguments);
-                      if (!routine) return null;
+                      // Fail visible: a payload the structured view cannot render
+                      // must still be shown raw - never an empty card with a live
+                      // Approve button on a persistent write.
+                      if (!routine) {
+                        return (
+                          <pre className="max-h-36 overflow-auto rounded-md border border-border/60 bg-muted/40 p-2.5 font-mono text-xs leading-relaxed">
+                            {JSON.stringify(a.arguments, null, 2)}
+                          </pre>
+                        );
+                      }
                       return (
                         <div className="space-y-2 rounded-md border border-border/60 bg-muted/40 p-2.5 text-sm">
                           <div className="font-medium text-foreground">
