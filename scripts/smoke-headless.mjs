@@ -200,14 +200,16 @@ async function mcpRequest({ port, id, method, params, sessionId }) {
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) }),
   });
+  if (response.status !== 200) {
+    throw new Error(`${method} returned HTTP ${response.status}: ${response.body}`);
+  }
   let json;
   try {
     json = JSON.parse(response.body);
   } catch (error) {
-    throw new Error(`${method} returned invalid JSON: ${error.message}`);
-  }
-  if (response.status !== 200) {
-    throw new Error(`${method} returned HTTP ${response.status}: ${response.body}`);
+    throw new Error(`${method} returned invalid JSON: ${error.message}`, {
+      cause: error,
+    });
   }
   return { response, json };
 }
@@ -234,9 +236,22 @@ async function startApprovalBroker() {
   const approvalToken = "routine-smoke-approval-token";
   let resolveRequest;
   let rejectRequest;
+  // Bounded: if the gateway never dials the broker (an approval-wiring
+  // regression), fail the assertion instead of hanging until the CI job timeout.
   const requestReceived = new Promise((resolve, reject) => {
-    resolveRequest = resolve;
-    rejectRequest = reject;
+    const timer = setTimeout(
+      () => reject(new Error("approval broker received no request within 15s")),
+      15_000,
+    );
+    timer.unref?.();
+    resolveRequest = (value) => {
+      clearTimeout(timer);
+      resolve(value);
+    };
+    rejectRequest = (error) => {
+      clearTimeout(timer);
+      reject(error);
+    };
   });
   const server = net.createServer((socket) => {
     let buffer = "";
