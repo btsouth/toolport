@@ -1238,51 +1238,61 @@ async fn migrate_client(
 /// Store a secret env value in the OS keychain and mark it on the server entry
 /// (the value itself never enters the registry file).
 #[tauri::command]
-fn set_secret(
-    state: State<RegistryState>,
+async fn set_secret(
+    app: AppHandle,
     server_id: String,
     key: String,
     value: String,
 ) -> Result<Registry, String> {
-    // Keychain write first (external to the registry, so outside the lock), then record
-    // that the secret exists + bump the generation on the FRESH value under the lock.
-    secrets::set_secret(&server_id, &key, &value)?;
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        if let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) {
-            match server.env.iter_mut().find(|e| e.key == key) {
-                Some(ev) => {
-                    ev.secret = true;
-                    ev.value = None;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        // Keychain write first (external to the registry, so outside the lock), then record
+        // that the secret exists + bump the generation on the FRESH value under the lock.
+        secrets::set_secret(&server_id, &key, &value)?;
+        let (reg, _) = write_registry(state.inner(), |reg| {
+            if let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) {
+                match server.env.iter_mut().find(|e| e.key == key) {
+                    Some(ev) => {
+                        ev.secret = true;
+                        ev.value = None;
+                    }
+                    None => server.env.push(registry::EnvVar {
+                        key,
+                        value: None,
+                        secret: true,
+                    }),
                 }
-                None => server.env.push(registry::EnvVar {
-                    key,
-                    value: None,
-                    secret: true,
-                }),
             }
-        }
-        reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
-        Ok(())
-    })?;
-    Ok(reg)
+            reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
+            Ok(())
+        })?;
+        Ok(reg)
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 /// Remove a secret from the keychain and drop the env var from the server entry.
 #[tauri::command]
-fn delete_secret(
-    state: State<RegistryState>,
+async fn delete_secret(
+    app: AppHandle,
     server_id: String,
     key: String,
 ) -> Result<Registry, String> {
-    secrets::delete_secret(&server_id, &key)?;
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        if let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) {
-            server.env.retain(|e| e.key != key);
-        }
-        reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
-        Ok(())
-    })?;
-    Ok(reg)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        secrets::delete_secret(&server_id, &key)?;
+        let (reg, _) = write_registry(state.inner(), |reg| {
+            if let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) {
+                server.env.retain(|e| e.key != key);
+            }
+            reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
+            Ok(())
+        })?;
+        Ok(reg)
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 /// Did the user supply a new client secret, and what exactly should be stored?
@@ -1304,8 +1314,24 @@ fn supplied_secret(input: Option<String>) -> Option<String> {
 /// [`set_secret`], which records an env var: this credential is not an env var,
 /// and surfacing it as one would put it in the server's environment listing.
 #[tauri::command]
-fn set_client_credentials(
-    state: State<RegistryState>,
+async fn set_client_credentials(
+    app: AppHandle,
+    server_id: String,
+    client_id: String,
+    client_secret: Option<String>,
+    token_endpoint_auth_method: Option<String>,
+    scope: Option<String>,
+) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        set_client_credentials_blocking(&state, server_id, client_id, client_secret, token_endpoint_auth_method, scope)
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
+}
+
+fn set_client_credentials_blocking(
+    state: &RegistryState,
     server_id: String,
     client_id: String,
     client_secret: Option<String>,
@@ -1361,7 +1387,7 @@ fn set_client_credentials(
     // Any config change invalidates a token minted under the old settings.
     remote::reset_client_credentials(&server_id)?;
 
-    let (reg, _) = write_registry(state.inner(), |reg| {
+    let (reg, _) = write_registry(state, |reg| {
         // Fail loudly on an unknown id. The keychain write above already happened,
         // so silently skipping the registry half would leave a stored secret with
         // no configuration pointing at it, and report success.
@@ -1396,8 +1422,20 @@ fn set_client_credentials(
 /// Remove client-credentials auth from a server: the vaulted secret, the minted
 /// access token, and the registry config.
 #[tauri::command]
-fn clear_client_credentials(
-    state: State<RegistryState>,
+async fn clear_client_credentials(
+    app: AppHandle,
+    server_id: String,
+) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        clear_client_credentials_blocking(&state, server_id)
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
+}
+
+fn clear_client_credentials_blocking(
+    state: &RegistryState,
     server_id: String,
 ) -> Result<Registry, String> {
     // Reset first, so a failure here preserves the credential and the removal can
@@ -1412,7 +1450,7 @@ fn clear_client_credentials(
     // stale keychain entry with nothing pointing at it, and Remove can be run
     // again; that is strictly better than losing a credential the user cannot get
     // back.
-    let (reg, _) = write_registry(state.inner(), |reg| {
+    let (reg, _) = write_registry(state, |reg| {
         let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) else {
             return Err(format!("no server with id {server_id:?}"));
         };
@@ -1427,36 +1465,53 @@ fn clear_client_credentials(
 /// Whether a client secret is vaulted for this server, so the UI can show
 /// "configured" without ever reading the value back.
 #[tauri::command]
-fn has_client_secret(server_id: String) -> Result<bool, String> {
-    Ok(secrets::get_secret_result(&server_id, secrets::CLIENT_SECRET_KEY)?.is_some())
+async fn has_client_secret(server_id: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(secrets::get_secret_result(&server_id, secrets::CLIENT_SECRET_KEY)?.is_some())
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 /// The most recent tool-call audit entries (newest first).
 #[tauri::command]
-fn get_audit_log(limit: usize) -> Vec<serde_json::Value> {
-    audit::read_recent(limit)
+async fn get_audit_log(limit: usize) -> Vec<serde_json::Value> {
+    // Async, like every polled reader here: Activity invokes these every few
+    // seconds, and as sync commands the file reads ran on the GTK main loop,
+    // where a large log made window controls intermittently dead on Linux
+    // (SBS-813). A join failure only means the worker panicked; return the
+    // benign empty shape rather than poisoning the poll loop.
+    tauri::async_runtime::spawn_blocking(move || audit::read_recent(limit))
+        .await
+        .unwrap_or_default()
 }
 
 /// Aggregate the full retained audit log into per-server call/error/latency stats for
 /// the observability dashboard. Bounded by the log's byte cap, so totals are real.
 #[tauri::command]
-fn audit_stats() -> serde_json::Value {
-    audit::stats()
+async fn audit_stats() -> serde_json::Value {
+    tauri::async_runtime::spawn_blocking(audit::stats)
+        .await
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// Recent tool-definition integrity events (newest first): a previously-approved
 /// tool whose definition changed (rug-pull signal) or a known server that added a
 /// tool. Powers the in-app security notices.
 #[tauri::command]
-fn get_security_events(limit: usize) -> Vec<serde_json::Value> {
-    integrity::read_recent(limit)
+async fn get_security_events(limit: usize) -> Vec<serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(move || integrity::read_recent(limit))
+        .await
+        .unwrap_or_default()
 }
 
 /// Cumulative tool-definition tokens that lazy discovery has kept out of clients'
 /// context, summed from the local savings log for the in-app counter.
 #[tauri::command]
-fn savings_summary() -> serde_json::Value {
-    savings::summary()
+async fn savings_summary() -> serde_json::Value {
+    tauri::async_runtime::spawn_blocking(savings::summary)
+        .await
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// How many trailing gateway-log lines the diagnostics bundle includes.
@@ -1467,7 +1522,13 @@ const DIAG_LOG_LINES: usize = 200;
 /// Safe to paste into a public issue, secret values live in the OS keychain and
 /// are never included; env vars are listed by key name only.
 #[tauri::command]
-fn gather_diagnostics() -> String {
+async fn gather_diagnostics() -> String {
+    tauri::async_runtime::spawn_blocking(gather_diagnostics_blocking)
+        .await
+        .unwrap_or_else(|e| format!("diagnostics task join failed: {e}"))
+}
+
+fn gather_diagnostics_blocking() -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let _ = writeln!(out, "Toolport diagnostics");
@@ -2103,8 +2164,10 @@ fn set_live_inspect(state: State<RegistryState>, enabled: bool) -> Result<Regist
 /// The most recent live-inspection captures (newest first): each tool call's args and
 /// result, only present while live inspection has been on. Empty when off/unused.
 #[tauri::command]
-fn get_inspect_log(limit: usize) -> Vec<serde_json::Value> {
-    inspect::read_recent(limit)
+async fn get_inspect_log(limit: usize) -> Vec<serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(move || inspect::read_recent(limit))
+        .await
+        .unwrap_or_default()
 }
 
 /// Clear the live-inspection ring (delete `inspect.jsonl`), so no captured args/results
@@ -2120,8 +2183,10 @@ fn clear_inspect_log() -> Result<(), String> {
 /// the whole catalog. The in-path proof that lazy discovery is working. Empty when
 /// nothing has searched yet.
 #[tauri::command]
-fn get_search_traces(limit: usize) -> Vec<serde_json::Value> {
-    searchtrace::read_recent(limit)
+async fn get_search_traces(limit: usize) -> Vec<serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(move || searchtrace::read_recent(limit))
+        .await
+        .unwrap_or_default()
 }
 
 /// Clear the search-trace log (delete `search-trace.jsonl`).
@@ -2308,10 +2373,14 @@ fn set_pii_redaction(state: State<RegistryState>, on: bool) -> Result<Registry, 
 /// running" path. First call only seeds the seen-set so restarting the app with an
 /// already-quarantined tool does not re-notify.
 #[tauri::command]
-fn list_quarantined(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
-    let list = integrity::all_quarantined()?;
-    notify_new_quarantines(&app, &list);
-    Ok(list)
+async fn list_quarantined(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let list = integrity::all_quarantined()?;
+        notify_new_quarantines(&app, &list);
+        Ok(list)
+    })
+    .await
+    .map_err(|e| format!("quarantine read task join failed: {e}"))?
 }
 
 /// Keys of quarantine entries we have already observed this process. `None` = not
@@ -2865,36 +2934,44 @@ fn take_registry_recovery_notice() -> Option<registry::RegistryRecoveryNotice> {
 
 /// Store a bearer token for an http server (used as `Authorization: Bearer ...`).
 #[tauri::command]
-fn set_auth_token(
-    state: State<RegistryState>,
-    server_id: String,
-    token: String,
-) -> Result<(), String> {
-    let _mutation = acquire_auth_mutation_lock(&server_id)?;
-    // A manually pasted bearer replaces any prior OAuth session. Keeping stale
-    // refresh metadata could otherwise overwrite the user's token later.
-    remote::clear_oauth_state(&server_id)?;
-    secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &token)?;
-    bump_secrets_generation(state.inner());
-    Ok(())
+async fn set_auth_token(app: AppHandle, server_id: String, token: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation = acquire_auth_mutation_lock(&server_id)?;
+        // A manually pasted bearer replaces any prior OAuth session. Keeping stale
+        // refresh metadata could otherwise overwrite the user's token later.
+        remote::clear_oauth_state(&server_id)?;
+        secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &token)?;
+        bump_secrets_generation(app.state::<RegistryState>().inner());
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 #[tauri::command]
-fn clear_auth_token(state: State<RegistryState>, server_id: String) -> Result<(), String> {
-    let _mutation = acquire_auth_mutation_lock(&server_id)?;
-    // Remove refresh metadata first so a second-write failure cannot leave state
-    // that silently recreates the bearer token the user asked to delete.
-    remote::clear_oauth_state(&server_id)?;
-    secrets::delete_secret(&server_id, secrets::HTTP_AUTH_KEY)?;
-    bump_secrets_generation(state.inner());
-    Ok(())
+async fn clear_auth_token(app: AppHandle, server_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation = acquire_auth_mutation_lock(&server_id)?;
+        // Remove refresh metadata first so a second-write failure cannot leave state
+        // that silently recreates the bearer token the user asked to delete.
+        remote::clear_oauth_state(&server_id)?;
+        secrets::delete_secret(&server_id, secrets::HTTP_AUTH_KEY)?;
+        bump_secrets_generation(app.state::<RegistryState>().inner());
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 /// Errs on a failed vault read instead of reporting `false` (SBS-789): a locked
 /// keychain must not make a vaulted token look like "never authenticated".
 #[tauri::command]
-fn has_auth_token(server_id: String) -> Result<bool, String> {
-    Ok(secrets::get_secret_result(&server_id, secrets::HTTP_AUTH_KEY)?.is_some())
+async fn has_auth_token(server_id: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(secrets::get_secret_result(&server_id, secrets::HTTP_AUTH_KEY)?.is_some())
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 /// Figure out what a remote server needs to connect (none / oauth / token) and
@@ -2967,13 +3044,21 @@ async fn search_catalog(query: String) -> Result<Vec<catalog::CatalogEntry>, Str
 
 /// Which of a server's env keys currently have a value stored in the keychain.
 #[tauri::command]
-fn secret_status(server_id: String, keys: Vec<String>) -> Vec<(String, bool)> {
-    keys.into_iter()
-        .map(|k| {
-            let present = secrets::get_secret(&server_id, &k).is_some();
-            (k, present)
-        })
-        .collect()
+async fn secret_status(server_id: String, keys: Vec<String>) -> Vec<(String, bool)> {
+    // Async, like every keychain command here: a Secret Service read is a
+    // synchronous D-Bus round trip that can stall for seconds on a locked or
+    // slow keyring, and as sync commands they ran on the GTK main loop,
+    // freezing window controls while a dialog probed the vault (SBS-813).
+    tauri::async_runtime::spawn_blocking(move || {
+        keys.into_iter()
+            .map(|k| {
+                let present = secrets::get_secret(&server_id, &k).is_some();
+                (k, present)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Open Toolport's data directory (registry, logs, audit) in the OS file manager,
