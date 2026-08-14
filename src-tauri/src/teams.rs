@@ -67,9 +67,18 @@ fn require_secure_team_url(server_url: &str) -> Result<(), String> {
 /// Public team hosts must not rebind onto the LAN; loopback/LAN team URLs (local
 /// `conduit-teams`) still connect. Link-local / cloud-metadata is always refused
 /// inside [`crate::oauth::screened_resolve`].
+///
+/// Switching the rebind guard OFF is granting LAN trust, so it needs
+/// [`crate::oauth::host_is_definitely_private`], not the negation of
+/// [`crate::oauth::host_is_private`]. That is the issue #422 inversion `oauth.rs`
+/// documents: `host_is_private` fails CLOSED, returning true for an empty,
+/// unresolvable, or mixed-answer host, which is correct for refusing and backwards
+/// for granting. Negated, an attacker serving NXDOMAIN for their own name - or a
+/// public name whose first lookup merely fails - turned the guard off and let the
+/// connection land on RFC1918.
 fn block_private_for_team_url(server_url: &str) -> bool {
     let host = crate::oauth::host_of_url(server_url).unwrap_or_default();
-    !crate::oauth::host_is_private(&host)
+    !crate::oauth::host_is_definitely_private(&host)
 }
 
 /// A ureq agent with a connect + read timeout. The team commands run on the Tauri
@@ -2732,13 +2741,26 @@ mod tests {
 
     #[test]
     fn public_team_url_blocks_private_redirect_targets() {
-        // Literal public IPs so this does not depend on DNS (host_is_private
-        // fails closed on NXDOMAIN, which would invert the flag).
         assert!(block_private_for_team_url("https://1.2.3.4"));
         assert!(block_private_for_team_url("https://8.8.8.8"));
         assert!(!block_private_for_team_url("http://127.0.0.1:8787"));
         assert!(!block_private_for_team_url("http://localhost:8787"));
         assert!(!block_private_for_team_url("http://[::1]:8787"));
+    }
+
+    /// Issue #422, on the team path: switching the rebind guard off is GRANTING LAN
+    /// trust, so it needs positive confirmation. Under `!host_is_private` an
+    /// unresolvable host came back "private" (that function fails closed, which is
+    /// correct for refusing), the flag inverted, and the guard turned itself off for
+    /// exactly the host an attacker controls the DNS for.
+    #[test]
+    fn an_unresolvable_team_host_still_blocks_private_targets() {
+        // `.invalid` is reserved never to resolve (RFC 2606), so this is the NXDOMAIN
+        // case with no network dependency.
+        assert!(block_private_for_team_url("https://no-such-host-422.invalid"));
+        // An empty or unparseable host must not grant LAN trust either.
+        assert!(block_private_for_team_url("https://"));
+        assert!(block_private_for_team_url("not a url"));
     }
 
     #[test]

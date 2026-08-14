@@ -372,6 +372,51 @@ fn is_remote_package_spec(spec: &str) -> bool {
         || lower.starts_with("https:")
 }
 
+/// npm-only: specs that make `npx -y` fetch code from somewhere other than the named
+/// registry, in the spellings npm accepts BEYOND a leading protocol.
+///
+/// [`is_remote_package_spec`] only inspects the start of the combined
+/// `identifier@version` string, so every form here reached `npx -y` from a malicious or
+/// MITM'd registry entry: `attacker/payload` (npm reads an unscoped slash name as
+/// GitHub shorthand), `lodash@github:attacker/payload` (a hosted-git alias as the
+/// version range), `github.com/attacker/payload`, and `git@github.com:attacker/x.git`.
+///
+/// Applied on the npm path only. `user/image:tag` is a normal Docker reference, so the
+/// slash rule cannot be global without dropping valid OCI entries.
+fn npm_spec_escapes_registry(spec: &str) -> bool {
+    let lower = spec.to_ascii_lowercase();
+    // SCP-style git, which carries no `://` for is_remote_package_spec to catch.
+    if lower.starts_with("git@") {
+        return true;
+    }
+    // A hosted-git alias ANYWHERE, not just as a prefix: npm resolves it from the
+    // version half too.
+    if ["github:", "gitlab:", "bitbucket:", "gist:", "git+"]
+        .iter()
+        .any(|alias| lower.contains(alias))
+    {
+        return true;
+    }
+    // Hosted URLs with the scheme left off.
+    if ["github.com/", "gitlab.com/", "bitbucket.org/"]
+        .iter()
+        .any(|host| lower.starts_with(host) || lower.contains(&format!("@{host}")))
+    {
+        return true;
+    }
+    // An unscoped `user/repo` is GitHub shorthand to npm, while `@scope/name` is a
+    // real package. Judge the NAME half: a scoped name's own `@` must not be mistaken
+    // for the version separator.
+    let name = match lower.strip_prefix('@') {
+        Some(rest) => match rest.find('@') {
+            Some(i) => &lower[..=i],
+            None => lower.as_str(),
+        },
+        None => lower.split('@').next().unwrap_or(&lower),
+    };
+    !name.starts_with('@') && name.contains('/')
+}
+
 /// A registry package spec safe to pass as an npx/uvx/docker argument: non-empty, no
 /// leading dash (flag injection), bounded length, and only the characters real
 /// package names use. Nothing that could become a separate flag, a shell token,
@@ -488,7 +533,15 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
                     spec,
                 ],
             ),
-            _ => ("npx".to_string(), vec!["-y".to_string(), spec]),
+            _ => {
+                // npm-only, and deliberately here rather than in is_safe_package_id:
+                // `user/image:tag` is an ordinary Docker reference, so the slash rule
+                // below would drop legitimate OCI entries if applied globally.
+                if npm_spec_escapes_registry(&spec) {
+                    return None;
+                }
+                ("npx".to_string(), vec!["-y".to_string(), spec])
+            }
         };
         let env_keys = pkg
             .get("environmentVariables")
@@ -822,6 +875,58 @@ mod tests {
                 "{registry_type}: empty identifier must be dropped"
             );
         }
+    }
+
+    /// npm accepts several spellings of "fetch this from a git host" that carry no
+    /// `://` and no leading alias, so a prefix-only check let a malicious or MITM'd
+    /// registry entry one-click-install code from outside the named registry.
+    #[test]
+    fn map_server_rejects_npm_specs_that_escape_the_registry() {
+        let npm = |identifier: &str, version: Option<&str>| {
+            let mut pkg = json!({ "registryType": "npm", "identifier": identifier });
+            if let Some(v) = version {
+                pkg["version"] = json!(v);
+            }
+            json!({ "name": "io.x/y", "title": "Y", "packages": [pkg] })
+        };
+        for (identifier, version) in [
+            // Unscoped slash name: GitHub shorthand to npm.
+            ("attacker/payload", None),
+            // Hosted-git alias smuggled in as the version range.
+            ("lodash", Some("github:attacker/payload")),
+            ("lodash", Some("gitlab:attacker/payload")),
+            // Hosted URL with the scheme left off.
+            ("github.com/attacker/payload", None),
+            // SCP-style git, which has no `://` to catch.
+            ("git@github.com:attacker/payload.git", None),
+        ] {
+            assert!(
+                map_server(&npm(identifier, version)).is_none(),
+                "npm spec {identifier}@{version:?} must not reach npx -y"
+            );
+        }
+
+        // Real npm packages still install, including scoped names whose own `@` must
+        // not be read as the version separator.
+        for (identifier, version) in [
+            ("@scope/name", None),
+            ("@scope/name", Some("1.2.3")),
+            ("express", Some("4.18.0")),
+        ] {
+            let entry = map_server(&npm(identifier, version));
+            assert!(
+                entry.is_some(),
+                "npm spec {identifier}@{version:?} is legitimate and must still map"
+            );
+        }
+
+        // The slash rule is npm-only: a Docker reference is not GitHub shorthand.
+        let docker = json!({ "name": "io.x/d", "title": "D", "packages": [
+            { "registryType": "oci", "identifier": "user/image", "version": "tag" }] });
+        assert!(
+            map_server(&docker).is_some(),
+            "a docker user/image:tag reference must still map"
+        );
     }
 
     #[test]
