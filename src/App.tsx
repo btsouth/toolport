@@ -63,6 +63,7 @@ import { ServerDialog } from "@/components/ServerDialog";
 import {
   ImportReviewDialog,
   needsTeamEnableReview,
+  sameReviewedDefinition,
 } from "@/components/ImportReviewDialog";
 
 // Secondary destinations are code-split so the initial bundle only carries the
@@ -639,11 +640,11 @@ function App() {
     setOnboardingStep(0);
   }
 
-  async function applyToggle(serverId: string, enabled: boolean) {
+  async function applyToggle(serverId: string, enabled: boolean, reviewed = false) {
     if (!profileId) return;
     setBusyId(serverId);
     try {
-      setRegistry(await setServerEnabled(profileId, serverId, enabled));
+      setRegistry(await setServerEnabled(profileId, serverId, enabled, reviewed));
       // Enabling adds a server with no health entry yet, so its card would sit on
       // "Checking…" until a manual refresh. Probe now to resolve it. (Disabling
       // moves it to the disabled group, no probe needed.)
@@ -1107,7 +1108,25 @@ function App() {
         confirmLabel="Enable"
         onConfirm={() => {
           if (!confirmEnableTeam) return;
-          return applyToggle(confirmEnableTeam.id, true);
+          // Re-check the definition against the one that was reviewed. Team sync runs
+          // on a timer, so a push landing while this dialog is open would otherwise
+          // enable a command or URL the member never saw - the confirmation carried
+          // only the id. If it changed under them, re-open review on the new one
+          // instead of enabling it.
+          const live = registry?.servers.find((s) => s.id === confirmEnableTeam.id);
+          if (!live) {
+            setConfirmEnableTeam(null);
+            toastError("That server is no longer in your registry.");
+            return;
+          }
+          if (!sameReviewedDefinition(confirmEnableTeam, live)) {
+            setConfirmEnableTeam(live);
+            toastError(
+              "This server changed while you were reviewing it. Check it again.",
+            );
+            return;
+          }
+          return applyToggle(confirmEnableTeam.id, true, true);
         }}
       />
       {/* Ctrl+N. Mounted only while open so `autoOpen` fires each time, and unmounted

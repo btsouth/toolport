@@ -740,13 +740,35 @@ fn remove_server(state: State<RegistryState>, id: String) -> Result<Registry, St
     Ok(reg)
 }
 
+/// `reviewed` is the caller asserting the member saw the Teams review dialog for
+/// THIS definition. It defaults to false, which is the point: `set_all_enabled`
+/// already filters these out (`Registry::set_all_enabled`), but this single-server
+/// path had no gate at all, so the renderer's `needsTeamEnableReview` was the only
+/// thing standing between a team-pushed local command and a running process. That
+/// check cannot resolve DNS, so it missed a LAN URL written as a hostname, and any
+/// future caller of this command would have inherited the same hole. Deciding it
+/// here means the frontend heuristic is now an affordance rather than the boundary.
 #[tauri::command]
 fn set_server_enabled(
     state: State<RegistryState>,
     profile_id: String,
     server_id: String,
     enabled: bool,
+    reviewed: Option<bool>,
 ) -> Result<Registry, String> {
+    if enabled && !reviewed.unwrap_or(false) {
+        let reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reg
+            .servers
+            .iter()
+            .any(|s| s.id == server_id && s.needs_team_enable_review())
+        {
+            return Err(
+                "this team server runs a local command or private address; enable it from Teams after review"
+                    .into(),
+            );
+        }
+    }
     let (reg, _) = write_registry(state.inner(), |reg| {
         reg.set_server_enabled(&profile_id, &server_id, enabled)
     })?;

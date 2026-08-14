@@ -6,7 +6,9 @@ import {
   runsShell,
   isPrivateHostUrl,
   needsTeamEnableReview,
+  sameReviewedDefinition,
 } from "./ImportReviewDialog";
+import type { ReviewedFields } from "./ImportReviewDialog";
 import type { ImportItem } from "@/lib/types";
 
 function items(): ImportItem[] {
@@ -251,5 +253,64 @@ describe("needsTeamEnableReview", () => {
         url: "https://mcp.example.com/mcp",
       }),
     ).toBe(false);
+  });
+
+  // A renderer cannot resolve DNS, so a hostname that points at the LAN reads as
+  // public here. Rust's host_is_private resolves it and this dialog is the consent
+  // gate, so anything it cannot positively call public gets asked about.
+  it.each([
+    ["a bare intranet hostname", "http://internal-service/mcp"],
+    ["the same host over https", "https://internal-service/mcp"],
+    ["an mDNS name", "https://nas.local/mcp"],
+    ["a cloud-internal name", "https://svc.internal/mcp"],
+    ["plaintext http to a public name", "http://mcp.example.com/mcp"],
+    ["an unparseable url", "not-a-url"],
+  ])("flags %s", (_label, url) => {
+    expect(
+      needsTeamEnableReview({
+        source: "team:t1",
+        transport: "http",
+        command: null,
+        url,
+      }),
+    ).toBe(true);
+  });
+});
+
+// The confirmation carries only a server id, so a team push landing while the
+// dialog is open would otherwise enable a command the member never read.
+describe("sameReviewedDefinition", () => {
+  const reviewed: ReviewedFields = {
+    transport: "stdio",
+    command: "npx",
+    args: ["-y", "@team/mcp"],
+    url: null,
+  };
+
+  it("accepts the definition that was reviewed", () => {
+    expect(sameReviewedDefinition(reviewed, { ...reviewed })).toBe(true);
+    // Absent and empty args are the same definition, not a change.
+    expect(
+      sameReviewedDefinition(
+        { transport: "http", command: null, args: [], url: "https://a.example.com" },
+        {
+          transport: "http",
+          command: null,
+          args: undefined,
+          url: "https://a.example.com",
+        },
+      ),
+    ).toBe(true);
+  });
+
+  const swaps: [string, ReviewedFields][] = [
+    ["the command", { ...reviewed, command: "curl" }],
+    ["an argument", { ...reviewed, args: ["-y", "@attacker/mcp"] }],
+    ["an added argument", { ...reviewed, args: ["-y", "@team/mcp", "--evil"] }],
+    ["the transport", { ...reviewed, transport: "http" }],
+    ["the url", { ...reviewed, url: "https://attacker.example.com" }],
+  ];
+  it.each(swaps)("rejects a swap of %s", (_label, live) => {
+    expect(sameReviewedDefinition(reviewed, live)).toBe(false);
   });
 });

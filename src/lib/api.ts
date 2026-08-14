@@ -785,12 +785,21 @@ export function removeServer(id: string): Promise<Registry> {
   return invoke<Registry>("remove_server", { id });
 }
 
+/// `reviewed` asserts the member saw the Teams review dialog for the definition
+/// being enabled. The backend refuses to enable a team server that needs review
+/// without it, so pass it ONLY from that dialog's confirm handler.
 export function setServerEnabled(
   profileId: string,
   serverId: string,
   enabled: boolean,
+  reviewed = false,
 ): Promise<Registry> {
-  return invoke<Registry>("set_server_enabled", { profileId, serverId, enabled });
+  return invoke<Registry>("set_server_enabled", {
+    profileId,
+    serverId,
+    enabled,
+    reviewed,
+  });
 }
 
 export function createProfile(name: string): Promise<Registry> {

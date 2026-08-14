@@ -103,8 +103,13 @@ fn agent_with_timeout(server_url: &str, secs: u64) -> ureq::Agent {
         .build()
 }
 
+/// `300 Multiple Choices` is a redirect too, and excluding it made it read as
+/// SUCCESS: `post_usage_day` returned `Ok(true)` without the server having recorded
+/// anything, so the caller persisted a receipt and suppressed the retry, and
+/// `post_call_events` advanced its cursor past events that were never sent. Silent
+/// data loss, not just a missed hop.
 fn is_redirect_status(status: u16) -> bool {
-    matches!(status, 301 | 302 | 303 | 307 | 308)
+    matches!(status, 300 | 301 | 302 | 303 | 307 | 308)
 }
 
 /// ureq with `redirects(0)` returns 3xx as a successful response. Treat those as

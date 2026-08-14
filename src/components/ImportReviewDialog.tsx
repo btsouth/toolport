@@ -216,13 +216,60 @@ export function isPrivateHostUrl(url: string | null | undefined): boolean {
 
 /** Team-synced local commands and LAN URLs stay off until the member confirms.
  * Mirrors `ServerEntry::needs_team_enable_review` so the Servers Switch and
- * Enable all cannot skip the Teams review dialog. */
+ * Enable all cannot skip the Teams review dialog.
+ *
+ * Deliberately an AFFORDANCE, not the security boundary. It cannot match the Rust
+ * check exactly: `host_is_private` resolves named hosts (and treats an unresolvable
+ * one as private), and a renderer cannot do DNS, so `http://internal-service/mcp`
+ * pointing at 10.0.0.5 reads as public here. `set_server_enabled` decides for real
+ * and refuses without an explicit reviewed flag, so a miss here costs a clear error
+ * rather than an unreviewed enable. */
 export function needsTeamEnableReview(
   server: Pick<ServerEntry, "source" | "transport" | "command" | "url">,
 ): boolean {
   if (!server.source?.startsWith("team:")) return false;
   if (server.transport === "stdio" || !!server.command) return true;
-  return isPrivateHostUrl(server.url);
+  // Anything that is not a plain https:// URL to a dotted public name is treated as
+  // needing review: a bare hostname is an intranet name far more often than not, and
+  // over-prompting is the safe direction for a dialog whose whole job is consent.
+  return isPrivateHostUrl(server.url) || !isPublicLookingHttpsUrl(server.url);
+}
+
+/** True only for `https://` URLs whose host is a dotted name or a public literal IP.
+ * A bare hostname (`https://internal-service/mcp`) and any plaintext `http://` fall
+ * to false, so [`needsTeamEnableReview`] asks. */
+function isPublicLookingHttpsUrl(url: string | null | undefined): boolean {
+  if (!url) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") return false;
+  const host = parsed.hostname.replace(/^\[|\]$/g, "");
+  if (isPrivateHostUrl(url)) return false;
+  return host.includes(".") && !host.endsWith(".local") && !host.endsWith(".internal");
+}
+
+/** The fields a member actually reviews before enabling a team server. `args` is
+ * optional so an entry that omits it compares equal to one with an empty list. */
+export type ReviewedFields = {
+  transport: ServerEntry["transport"];
+  command: ServerEntry["command"];
+  args?: ServerEntry["args"];
+  url: ServerEntry["url"];
+};
+
+/** Compared on confirm so a team push landing mid-dialog cannot swap the definition
+ * underneath the member (the confirmation carries only the server id). */
+export function sameReviewedDefinition(a: ReviewedFields, b: ReviewedFields): boolean {
+  return (
+    a.transport === b.transport &&
+    (a.command ?? "") === (b.command ?? "") &&
+    (a.url ?? "") === (b.url ?? "") &&
+    JSON.stringify(a.args ?? []) === JSON.stringify(b.args ?? [])
+  );
 }
 
 /** Mirror src-tauri/src/oauth.rs ip_is_private for IPv4. */
