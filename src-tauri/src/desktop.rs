@@ -4126,15 +4126,71 @@ fn nudge_wayland_input_region(w: &tauri::WebviewWindow) {
     if std::env::var("WAYLAND_DISPLAY").is_err() {
         return; // X11 sessions are unaffected.
     }
-    // Resizing a maximized window would unmaximize it — and maximized windows
-    // already have a fresh configure, which is why the buttons work there.
-    if w.is_maximized().unwrap_or(false) {
-        return;
-    }
-    if let Ok(size) = w.outer_size() {
-        let _ = w.set_size(tauri::PhysicalSize::new(size.width, size.height + 1));
-        let _ = w.set_size(tauri::PhysicalSize::new(size.width, size.height));
-    }
+    // The reconfigure only heals a MAPPED surface, and `show()` has not mapped
+    // it yet when this runs — an immediate resize is a no-op for the bug. Give
+    // the compositor a beat to map the window first, off the main thread so a
+    // slow map never delays the reveal itself.
+    let w = w.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // A maximized window already has a fresh configure (that's why the
+        // manual maximize/restore workaround heals the buttons) — and it's
+        // also the state we must not disturb.
+        if w.is_maximized().unwrap_or(false) {
+            return;
+        }
+        // A plain 1px resize was tested and does NOT heal the input region;
+        // only the maximize state change does. The flick can be briefly
+        // visible — the lesser evil next to dead window controls.
+        //
+        // Unmaximize restores broken geometry on this compositor (oversized,
+        // titlebar off-screen), so remember the real size and put it back
+        // explicitly, then re-center (a no-op where the compositor owns
+        // placement, correct everywhere else).
+        let prior = w.inner_size().ok();
+        let _ = w.maximize();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let _ = w.unmaximize();
+        // Unmaximize completes asynchronously (a compositor configure
+        // round-trip), and its restore geometry lands AFTER any set_size
+        // issued immediately — overwriting it with a broken oversized frame.
+        // Wait for the state to actually flip before enforcing a size.
+        let mut settled = false;
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if !w.is_maximized().unwrap_or(true) {
+                settled = true;
+                break;
+            }
+        }
+        if !settled {
+            return;
+        }
+        // Clamp the remembered size to the current monitor's usable area. The
+        // window-state plugin can hold a size that no longer fits (a broken
+        // restore geometry persisted on quit, or a saved state from a larger
+        // monitor); restoring it verbatim opens the window below the fold.
+        // Clamping here also heals the persisted state: the plugin saves the
+        // clamped size on the next quit.
+        let target = prior.map(|mut s| {
+            if let Ok(Some(mon)) = w.current_monitor() {
+                let m = mon.size();
+                s.width = s.width.min(m.width * 95 / 100);
+                s.height = s.height.min(m.height * 85 / 100);
+            }
+            s
+        });
+        if let Some(size) = target {
+            for _ in 0..10 {
+                let _ = w.set_size(size);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if w.inner_size().map(|s| s == size).unwrap_or(false) {
+                    break;
+                }
+            }
+        }
+        let _ = w.center();
+    });
 }
 
 #[cfg(not(target_os = "linux"))]
