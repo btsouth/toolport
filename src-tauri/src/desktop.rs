@@ -1246,6 +1246,13 @@ async fn set_secret(
 ) -> Result<Registry, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<RegistryState>();
+        // Serialize the whole keychain+registry pair, not just the registry half.
+        // These commands used to be synchronous and therefore ran one at a time on
+        // the GTK main loop; on the blocking pool they are genuinely concurrent, so
+        // a `delete_secret` landing between this keychain write and the registry
+        // write below would leave the registry advertising a secret the keychain no
+        // longer holds. Same keyed lock `set_auth_token` already uses.
+        let _mutation = acquire_auth_mutation_lock(&server_id)?;
         // Keychain write first (external to the registry, so outside the lock), then record
         // that the secret exists + bump the generation on the FRESH value under the lock.
         secrets::set_secret(&server_id, &key, &value)?;
@@ -1281,6 +1288,8 @@ async fn delete_secret(
 ) -> Result<Registry, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<RegistryState>();
+        // Held across both halves: see the note in `set_secret`.
+        let _mutation = acquire_auth_mutation_lock(&server_id)?;
         secrets::delete_secret(&server_id, &key)?;
         let (reg, _) = write_registry(state.inner(), |reg| {
             if let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) {
@@ -1338,6 +1347,12 @@ fn set_client_credentials_blocking(
     token_endpoint_auth_method: Option<String>,
     scope: Option<String>,
 ) -> Result<Registry, String> {
+    // The reset/registry/keychain ordering below is deliberate, and on the
+    // blocking pool a concurrent `clear_client_credentials` can interleave with
+    // it -- clearing the registry entry before this call's final keychain write,
+    // which would strand a client secret with nothing pointing at it. Taken here
+    // rather than in the command so a direct caller cannot skip it.
+    let _mutation = acquire_auth_mutation_lock(&server_id)?;
     let client_id = client_id.trim().to_string();
     if client_id.is_empty() {
         return Err("a client id is required for client-credentials auth".into());
@@ -1438,6 +1453,8 @@ fn clear_client_credentials_blocking(
     state: &RegistryState,
     server_id: String,
 ) -> Result<Registry, String> {
+    // Paired with `set_client_credentials_blocking`: see the note there.
+    let _mutation = acquire_auth_mutation_lock(&server_id)?;
     // Reset first, so a failure here preserves the credential and the removal can
     // be retried.
     remote::reset_client_credentials(&server_id)?;
@@ -3044,11 +3061,17 @@ async fn search_catalog(query: String) -> Result<Vec<catalog::CatalogEntry>, Str
 
 /// Which of a server's env keys currently have a value stored in the keychain.
 #[tauri::command]
-async fn secret_status(server_id: String, keys: Vec<String>) -> Vec<(String, bool)> {
+async fn secret_status(server_id: String, keys: Vec<String>) -> Result<Vec<(String, bool)>, String> {
     // Async, like every keychain command here: a Secret Service read is a
     // synchronous D-Bus round trip that can stall for seconds on a locked or
     // slow keyring, and as sync commands they ran on the GTK main loop,
     // freezing window controls while a dialog probed the vault (SBS-813).
+    //
+    // Errs rather than returning an empty list on a worker failure, for the same
+    // reason `has_auth_token` errs (SBS-789): the dialog treats a resolved list
+    // as authoritative and would mark every key unvaulted, while its `catch`
+    // leaves the badges alone. The polled readers below can absorb a panic as an
+    // empty result because they run again in seconds; this is a one-shot probe.
     tauri::async_runtime::spawn_blocking(move || {
         keys.into_iter()
             .map(|k| {
@@ -3058,7 +3081,7 @@ async fn secret_status(server_id: String, keys: Vec<String>) -> Vec<(String, boo
             .collect()
     })
     .await
-    .unwrap_or_default()
+    .map_err(|e| format!("keychain task join failed: {e}"))
 }
 
 /// Open Toolport's data directory (registry, logs, audit) in the OS file manager,
@@ -4135,8 +4158,11 @@ fn nudge_wayland_input_region(w: &tauri::WebviewWindow) {
         std::thread::sleep(std::time::Duration::from_millis(150));
         // A maximized window already has a fresh configure (that's why the
         // manual maximize/restore workaround heals the buttons) — and it's
-        // also the state we must not disturb.
-        if w.is_maximized().unwrap_or(false) {
+        // also the state we must not disturb. Fullscreen is the same story with
+        // a worse failure: maximize/unmaximize on a fullscreen surface drops
+        // fullscreen and leaves the user in a windowed frame they never asked
+        // for. Both states are already configured, so there is nothing to heal.
+        if w.is_maximized().unwrap_or(false) || w.is_fullscreen().unwrap_or(false) {
             return;
         }
         // A plain 1px resize was tested and does NOT heal the input region;

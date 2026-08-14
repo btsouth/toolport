@@ -121,8 +121,19 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   const keyHint = primaryKey ? KEY_HINTS[primaryKey] : undefined;
 
   // Bumped each open so a slow status fetch from a previous open can't apply
-  // after a newer one (or after the dialog closed).
+  // after a newer one (or after the dialog closed), and before each mutation so
+  // an in-flight probe can't apply after it.
   const runIdRef = useRef(0);
+
+  // The vault probes (secret_status, has_auth_token, has_client_secret) used to
+  // block the whole window while they ran, so nothing could be saved or cleared
+  // mid-probe. They no longer do, and on a locked or slow keyring they take
+  // seconds - long enough for the user to Save or Remove first. Retiring the run
+  // id makes any probe still in flight stale, so its older answer cannot land on
+  // top of the badge the completed mutation just set.
+  function retireInFlightProbes() {
+    runIdRef.current += 1;
+  }
 
   async function refreshStatus() {
     const runId = ++runIdRef.current;
@@ -208,6 +219,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
 
   async function saveAuth() {
     if (!authInput) return;
+    retireInFlightProbes();
     setBusyKey("auth");
     try {
       await setAuthToken(server.id, authInput);
@@ -226,6 +238,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   }
 
   async function clearAuth() {
+    retireInFlightProbes();
     setBusyKey("auth-clear");
     try {
       await clearAuthToken(server.id);
@@ -253,6 +266,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       toastError("Enter the client secret issued by your authorization server.");
       return;
     }
+    retireInFlightProbes();
     setCcBusy(true);
     try {
       onSaved(
@@ -280,6 +294,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   }
 
   async function removeClientCredentials() {
+    retireInFlightProbes();
     setCcBusy(true);
     try {
       onSaved(await clearClientCredentials(server.id));
@@ -302,6 +317,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
 
   async function doOauth() {
     if (!server.url) return;
+    retireInFlightProbes();
     setOauthBusy(true);
     toast.info("Opening your browser…", {
       description:
@@ -328,6 +344,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
 
   async function save(key: string, value: string) {
     if (!value) return;
+    retireInFlightProbes();
     setBusyKey(key);
     try {
       onSaved(await setSecret(server.id, key, value));
@@ -343,9 +360,11 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   }
 
   async function remove(key: string) {
+    retireInFlightProbes();
     setBusyKey(`remove:${key}`);
     try {
       onSaved(await deleteSecret(server.id, key));
+      setVaulted((v) => ({ ...v, [key]: false }));
       toast.success(`Removed ${key}`);
       onChanged?.();
     } catch (e) {
@@ -358,6 +377,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   async function addNew() {
     const k = newKey.trim();
     if (!k || !newValue) return;
+    retireInFlightProbes();
     setBusyKey("add");
     try {
       onSaved(await setSecret(server.id, k, newValue));
