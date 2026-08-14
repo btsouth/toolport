@@ -2492,13 +2492,38 @@ fn pwsh_dangerous(args: &[String]) -> Option<&str> {
 /// argv (so `--node-arg=-e` is the `node -e` case this guard already blocks);
 /// `--shell` picks the shell `-c` runs in.
 fn npx_dangerous(args: &[String]) -> Option<&str> {
-    first_flag(args, &["-c", "--call", "-n", "--node-arg", "--shell"])
-        // `-yc '<shell>'` is `-y -c '<shell>'`: the same getopt clustering this file
-        // already closes for `sh -ec` and `node -pe`, and the same threat, since a
-        // team-pushed config can swap `-c` for `-yc`. `y`/`q` are npx's booleans; `n`
-        // takes a value, so it bails the walk rather than reading as an eval.
-        .or_else(|| clustered_eval(args, NPX_EVAL, NPX_BOOL))
-        .or_else(|| npx_launched_dangerous(args))
+    let launcher_args = npx_launcher_args(args);
+    first_flag(
+        launcher_args,
+        &["-c", "--call", "-n", "--node-arg", "--shell"],
+    )
+    // `-yc '<shell>'` is `-y -c '<shell>'`: the same getopt clustering this file
+    // already closes for `sh -ec` and `node -pe`, and the same threat, since a
+    // team-pushed config can swap `-c` for `-yc`. `y`/`q` are npx's booleans; `n`
+    // takes a value, so it bails the walk rather than reading as an eval.
+    .or_else(|| clustered_eval(launcher_args, NPX_EVAL, NPX_BOOL))
+    .or_else(|| npx_launched_dangerous(args))
+}
+
+/// The part of argv parsed by npx itself. Package arguments after the first positional
+/// or `--` may legitimately be named `-c`, `--call`, or `--shell`; treating those as
+/// launcher flags breaks otherwise safe servers. `-p/--package` is the one supported
+/// launcher option whose value is positional-looking, so skip it before finding the
+/// command boundary.
+fn npx_launcher_args(args: &[String]) -> &[String] {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" || !arg.starts_with('-') {
+            break;
+        }
+        if matches!(arg, "-p" | "--package") {
+            i = (i + 2).min(args.len());
+        } else {
+            i += 1;
+        }
+    }
+    &args[..i]
 }
 
 /// npx short flags that take no value, so an eval flag can cluster behind them.
@@ -2667,14 +2692,31 @@ fn inject_container_env(command: &str, args: &[String], env: &[(String, String)]
     if !matches!(family, "docker" | "podman" | "nerdctl") || env.is_empty() {
         return args.to_vec();
     }
+    let Some(at) = args
+        .iter()
+        .position(|a| a.eq_ignore_ascii_case("run") || a.eq_ignore_ascii_case("create"))
+    else {
+        // No subcommand that accepts `-e` (e.g. `docker build`). There is nowhere
+        // correct to put it, so leave argv untouched rather than corrupt it.
+        return args.to_vec();
+    };
+    // Only inspect the option prefix after run/create. Once the first non-option
+    // operand appears it may be the image (or an option value); stopping early can
+    // cause a harmless duplicate, while scanning farther can mistake an application's
+    // own `-e KEY` argument for a container option and omit the vaulted secret.
+    let option_tail = &args[at + 1..];
+    let prefix_end = option_tail
+        .iter()
+        .position(|a| !a.starts_with('-'))
+        .unwrap_or(option_tail.len());
     let already: std::collections::HashSet<String> = {
         let mut set = std::collections::HashSet::new();
         let mut i = 0;
-        while i < args.len() {
-            let a = args[i].as_str();
+        while i < prefix_end {
+            let a = option_tail[i].as_str();
             let al = a.to_ascii_lowercase();
             if al == "-e" || al == "--env" {
-                if let Some(val) = args.get(i + 1) {
+                if let Some(val) = option_tail.get(i + 1) {
                     set.insert(val.split('=').next().unwrap_or(val).to_string());
                     i += 2;
                     continue;
@@ -2683,6 +2725,9 @@ fn inject_container_env(command: &str, args: &[String], env: &[(String, String)]
                 if let Some((_, rest)) = a.split_once('=') {
                     set.insert(rest.split('=').next().unwrap_or(rest).to_string());
                 }
+            } else if al.starts_with("-e") && al.len() > 2 {
+                let rest = &a[2..];
+                set.insert(rest.split('=').next().unwrap_or(rest).to_string());
             }
             i += 1;
         }
@@ -2709,14 +2754,6 @@ fn inject_container_env(command: &str, args: &[String], env: &[(String, String)]
     // `docker -e KEY compose run …` and the CLI refused it with
     // "unknown shorthand flag: 'e'" - so a server that used to start stopped starting
     // the moment it was given a vaulted secret.
-    let Some(at) = args
-        .iter()
-        .position(|a| a.eq_ignore_ascii_case("run") || a.eq_ignore_ascii_case("create"))
-    else {
-        // No subcommand that accepts `-e` (e.g. `docker build`). There is nowhere
-        // correct to put it, so leave argv untouched rather than corrupt it.
-        return args.to_vec();
-    };
     let mut out = Vec::with_capacity(args.len() + extras.len());
     out.extend(args[..=at].iter().cloned());
     out.extend(extras);
@@ -8562,12 +8599,20 @@ mod tests {
         // value, where a `--`-anchored parse never looks.
         assert!(screen_spawn_command("npx", &argv(&["node", "-e", "x"])).is_err());
         assert!(screen_spawn_command("npx", &argv(&["-p", "pkg", "node", "-e", "x"])).is_err());
-        assert!(screen_spawn_command("npm", &argv(&["exec", "sh", "--", "-c", "curl|sh"])).is_err());
+        assert!(
+            screen_spawn_command("npm", &argv(&["exec", "sh", "--", "-c", "curl|sh"])).is_err()
+        );
         // A package name is not an interpreter, so over-screening positionals costs
         // nothing: these must still install and run.
         assert!(screen_spawn_command("npx", &argv(&["-y", "@scope/mcp", "--port", "1"])).is_ok());
         assert!(screen_spawn_command("npx", &argv(&["-p", "pkg", "server", "--flag"])).is_ok());
         assert!(screen_spawn_command("npm", &argv(&["exec", "--", "mcp-server", "--x"])).is_ok());
+        // These are arguments to the launched package, not npx's own eval flags.
+        assert!(screen_spawn_command("npx", &argv(&["-y", "pkg", "-c", "config.yaml"])).is_ok());
+        assert!(screen_spawn_command("npx", &argv(&["-y", "pkg", "--", "--call", "safe"])).is_ok());
+        assert!(
+            screen_spawn_command("npm", &argv(&["exec", "pkg", "--", "--shell", "safe"])).is_ok()
+        );
     }
 
     /// `-yc '<shell>'` is `-y -c '<shell>'`. Same getopt clustering this file already
@@ -8616,6 +8661,15 @@ mod tests {
             ),
             argv(&["run", "-e", "ACME_API_KEY", "img"])
         );
+        // Docker's compact spelling is recognized too.
+        assert_eq!(
+            super::inject_container_env(
+                "docker",
+                &argv(&["run", "-eACME_API_KEY=old", "img"]),
+                &env,
+            ),
+            argv(&["run", "-eACME_API_KEY=old", "img"])
+        );
     }
 
     /// `-e` is a run/create option, not a docker global. Leading argv with it produced
@@ -8643,6 +8697,20 @@ mod tests {
         assert_eq!(
             inject(&["create", "--name", "x", "img"]),
             argv(&["create", "-e", "ACME_API_KEY", "--name", "x", "img"])
+        );
+        // An application argument after the image is not a Docker env option. It
+        // must not suppress propagation of the vaulted value into the container.
+        assert_eq!(
+            inject(&["run", "img", "server", "-e", "ACME_API_KEY"]),
+            argv(&[
+                "run",
+                "-e",
+                "ACME_API_KEY",
+                "img",
+                "server",
+                "-e",
+                "ACME_API_KEY"
+            ])
         );
         // Nothing here accepts `-e`, so argv is left alone rather than corrupted.
         assert_eq!(inject(&["build", "."]), argv(&["build", "."]));

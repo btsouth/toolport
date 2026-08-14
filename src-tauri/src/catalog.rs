@@ -451,7 +451,11 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
                 // npm/PyPI pin with `@`. Docker treats `@` as a content digest
                 // (`image@sha256:…`), so OCI tags must use `identifier:version` (SBS-784).
                 if matches!(registry_type, "oci" | "docker") {
-                    format!("{identifier}:{v}")
+                    if v.contains(':') {
+                        format!("{identifier}@{v}")
+                    } else {
+                        format!("{identifier}:{v}")
+                    }
                 } else {
                     format!("{identifier}@{v}")
                 }
@@ -781,6 +785,23 @@ mod tests {
         assert_eq!(
             map_server(&bare).unwrap().args,
             vec!["run", "-i", "--rm", "ghcr.io/acme/boxed-mcp"]
+        );
+
+        // OCI digests use @; a colon is only the separator for a tag.
+        let digest = json!({ "name": "io.github.acme/boxed", "title": "Boxed",
+            "packages": [{
+                "registryType": "oci",
+                "identifier": "ghcr.io/acme/boxed-mcp",
+                "version": "sha256:abcdef0123456789"
+            }] });
+        assert_eq!(
+            map_server(&digest).unwrap().args,
+            vec![
+                "run",
+                "-i",
+                "--rm",
+                "ghcr.io/acme/boxed-mcp@sha256:abcdef0123456789"
+            ]
         );
     }
 
