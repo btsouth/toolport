@@ -42,7 +42,16 @@ update to `microsoft/winget-pkgs` for the new version. It runs on publish rather
 than on the tag because winget's validation downloads the installer URL, which 404s
 while the release is still a draft. It no-ops with a warning unless the
 `WINGET_TOKEN` secret (a PAT with `public_repo`) is set, so it can never fail a
-release. To submit by hand instead, the manifests are in `packaging/winget`.
+release.
+
+To submit by hand instead, copy `packaging/winget` to a new
+`manifests/t/Toolport/Toolport/<version>/` directory in a fork of
+`microsoft/winget-pkgs` and update it for the release first: `PackageVersion`
+in all three files, plus `InstallerUrl`, `InstallerSha256`, `ReleaseDate` and
+`ReleaseNotesUrl`. The copy in this repo stays pinned to whatever version last
+shipped, so submitting it unchanged re-submits that version's metadata and the new
+release never reaches winget. Check it with `winget validate --manifest <dir>`
+before opening the PR.
 
 The **gateway container image** (`ghcr.io/tsouth89/toolport-gateway`) publishes
 separately on every push to `main` via `docker-publish.yml` — no tag required.
