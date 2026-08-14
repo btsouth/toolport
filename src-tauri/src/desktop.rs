@@ -4115,6 +4115,31 @@ fn set_dock_icon_visible(app: &AppHandle, visible: bool) {
 #[cfg(not(target_os = "macos"))]
 fn set_dock_icon_visible(_app: &AppHandle, _visible: bool) {}
 
+/// Wayland workaround (SBS-813): a window created hidden and shown later has a
+/// stale input region under tao 0.35, so the native titlebar buttons ignore
+/// clicks until something forces a surface reconfigure (the user's repro:
+/// maximize + restore heals it). Nudge the size by one pixel and back to force
+/// that reconfigure invisibly. Fixed upstream in tao 0.36 (tauri-apps/tao#1218,
+/// ships with Tauri 2.12) — remove this when the dependency bump lands.
+#[cfg(target_os = "linux")]
+fn nudge_wayland_input_region(w: &tauri::WebviewWindow) {
+    if std::env::var("WAYLAND_DISPLAY").is_err() {
+        return; // X11 sessions are unaffected.
+    }
+    // Resizing a maximized window would unmaximize it — and maximized windows
+    // already have a fresh configure, which is why the buttons work there.
+    if w.is_maximized().unwrap_or(false) {
+        return;
+    }
+    if let Ok(size) = w.outer_size() {
+        let _ = w.set_size(tauri::PhysicalSize::new(size.width, size.height + 1));
+        let _ = w.set_size(tauri::PhysicalSize::new(size.width, size.height));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn nudge_wayland_input_region(_w: &tauri::WebviewWindow) {}
+
 /// Bring the main window back to the foreground (from the tray, a re-launch, or an
 /// approval). Un-hides, un-minimizes, and focuses so it works from every hidden state.
 fn show_main_window(app: &AppHandle) {
@@ -4124,6 +4149,7 @@ fn show_main_window(app: &AppHandle) {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
+        nudge_wayland_input_region(&w);
         // Tell the frontend the window is visible again so the team-sync loop resumes and does
         // an immediate catch-up poll. The webview's Page Visibility API doesn't report Tauri
         // tray show/hide on Windows, so this event is the authoritative signal (see the
