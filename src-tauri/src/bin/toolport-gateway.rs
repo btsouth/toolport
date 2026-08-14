@@ -9733,6 +9733,8 @@ fn reconcile_to(
 fn persist_and_emit_with_sessions(
     tools: &[Value],
     cached_tools: &SharedCatalog,
+    router: &Arc<Mutex<Arc<Router>>>,
+    previous_router: Option<&Router>,
     stdout: &Arc<Mutex<std::io::Stdout>>,
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
     profile: Option<&str>,
@@ -9746,6 +9748,19 @@ fn persist_and_emit_with_sessions(
                 .clone();
             preserve_collapsed_servers_guarded(tools.to_vec(), &current.tools)
         };
+        // A guarded rebuild keeps the previous catalog for a collapsed server in
+        // the cache, but the router was already published from the degraded
+        // connect, so its routes map misses every restored tool while the cache
+        // still advertises it. Re-adopt those routes from the pre-rebuild router
+        // (authoritative (server, original) mapping -- never re-derived by
+        // splitting the exposed name) so route_of resolves what tools/list
+        // advertises (issue #700).
+        if let Some(prev) = previous_router {
+            let mut guard = router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Arc::make_mut(&mut guard).adopt_restored_routes(prev, &tools);
+        }
         let next = Arc::new(CatalogSnapshot::new(tools.clone()));
         let index_bytes = next.search.estimated_auxiliary_bytes();
         *cached_tools
@@ -10158,6 +10173,15 @@ fn watch_tick(
         }
         let server_count = new_router.server_count();
         let tools = new_router.aggregated_tools();
+        // Snapshot the pre-rebuild router BEFORE publishing the new one: its
+        // routes map is the authoritative (server, original) source for tools a
+        // guarded rebuild keeps from the previous catalog (issue #700).
+        let previous_router = {
+            let guard = router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (**guard).clone()
+        };
         *registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = new_reg;
@@ -10168,6 +10192,8 @@ fn watch_tick(
         persist_and_emit_with_sessions(
             &tools,
             cached_tools,
+            router,
+            Some(&previous_router),
             stdout,
             mcp_sessions,
             resolved.as_deref(),
@@ -10227,6 +10253,11 @@ fn watch_tick(
             persist_and_emit_with_sessions(
                 &tools,
                 cached_tools,
+                router,
+                // In-place refresh keeps the previous catalog per slot when a
+                // list implausibly shrinks, so the refreshed router routes what
+                // the cache advertises -- nothing to re-adopt.
+                None,
                 stdout,
                 mcp_sessions,
                 resolved.as_deref(),
@@ -11739,6 +11770,15 @@ fn rebuild_router_for_root(state: &GatewayState) {
     );
     reestablish_all_resource_subscriptions(&new_router, &state.resource_subs);
     let tools = new_router.aggregated_tools();
+    // Snapshot the pre-rebuild router before publishing: authoritative routes
+    // for tools a guarded rebuild keeps from the previous catalog (issue #700).
+    let previous_router = {
+        let guard = state
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (**guard).clone()
+    };
     *state
         .router
         .lock()
@@ -11747,6 +11787,8 @@ fn rebuild_router_for_root(state: &GatewayState) {
     persist_and_emit_with_sessions(
         &tools,
         &state.cached_tools,
+        &state.router,
+        Some(&previous_router),
         &state.stdout,
         Some(&state.mcp_sessions),
         profile.as_deref(),
@@ -12004,6 +12046,15 @@ fn process_request(
             if built.server_count() > 0 {
                 reestablish_all_resource_subscriptions(&built, &state.resource_subs);
                 let tools = built.aggregated_tools();
+                // Snapshot the pre-rebuild router before publishing: authoritative
+                // routes for tools the guard keeps from the previous catalog.
+                let previous_router = {
+                    let guard = state
+                        .router
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    (**guard).clone()
+                };
                 *state
                     .router
                     .lock()
@@ -12018,6 +12069,15 @@ fn process_request(
                         .clone();
                     preserve_collapsed_servers_guarded(tools, &current.tools)
                 };
+                // Re-adopt routes the guard kept from the previous catalog so the
+                // published router routes what the cache advertises (issue #700).
+                {
+                    let mut guard = state
+                        .router
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    Arc::make_mut(&mut guard).adopt_restored_routes(&previous_router, &tools);
+                }
                 if !tools.is_empty() {
                     *state
                         .cached_tools
@@ -14680,6 +14740,14 @@ fn main() {
                 tools.len(),
                 built.server_count()
             ));
+            // Snapshot the pre-rebuild router before publishing: authoritative
+            // routes for tools the guard keeps from the previous catalog.
+            let previous_router = {
+                let guard = router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (**guard).clone()
+            };
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(built);
@@ -14697,6 +14765,14 @@ fn main() {
                         .clone();
                     preserve_collapsed_servers_guarded(tools, &current.tools)
                 };
+                // Re-adopt routes the guard kept from the previous catalog so the
+                // published router routes what the cache advertises (issue #700).
+                {
+                    let mut guard = router
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    Arc::make_mut(&mut guard).adopt_restored_routes(&previous_router, &tools);
+                }
                 *cached_tools
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
