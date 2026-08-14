@@ -492,11 +492,11 @@ impl RoutineSuggestion {
     }
 }
 
-/// Test fixture: a definition with fabricated promotion evidence. Debug-only so a
-/// release binary physically cannot mint evidence-free definitions - `cfg(test)` alone
-/// cannot cover it because the gateway binary's tests link this library without the
-/// library's own test cfg.
-#[cfg(debug_assertions)]
+/// Test fixture: a definition with fabricated promotion evidence. Absent from
+/// production release binaries. `cfg(test)` alone is not enough: the gateway
+/// binary's tests link this library without the library's own test cfg, so
+/// release-profile binary tests also need `--features test-support`.
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn new_definition(
     name: String,

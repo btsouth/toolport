@@ -28,6 +28,11 @@ desktop = [
     "dep:tauri-plugin-single-instance",
     "dep:tauri-plugin-window-state",
 ]
+# Test-only hooks (data-dir override, fixture definition constructors). Never
+# enable in a shipped binary. `cargo test --release --bin toolport-gateway`
+# needs it because the library is compiled without `cfg(test)` when linked
+# into the binary; docker-publish rebuilds without this feature before upload.
+test-support = []
 
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary

@@ -53,8 +53,14 @@ jobs:
       - name: Build toolport-gateway
         run: cargo build --release --bin toolport-gateway --manifest-path src-tauri/Cargo.toml --no-default-features
 
+      # Binary tests link the library without the library's `cfg(test)`, so
+      # release-profile tests need the test-support hooks. Rebuild without the
+      # feature afterwards so the uploaded artifact is a production binary.
       - name: Test toolport-gateway
-        run: cargo test --release --bin toolport-gateway --manifest-path src-tauri/Cargo.toml --no-default-features
+        run: cargo test --release --bin toolport-gateway --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support
+
+      - name: Rebuild production gateway binary
+        run: cargo build --release --bin toolport-gateway --manifest-path src-tauri/Cargo.toml --no-default-features
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
