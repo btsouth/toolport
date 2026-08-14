@@ -2492,17 +2492,51 @@ fn pwsh_dangerous(args: &[String]) -> Option<&str> {
 /// argv (so `--node-arg=-e` is the `node -e` case this guard already blocks);
 /// `--shell` picks the shell `-c` runs in.
 fn npx_dangerous(args: &[String]) -> Option<&str> {
-    first_flag(args, &["-c", "--call", "-n", "--node-arg", "--shell"]).or_else(|| {
-        // `npx -- node -e …` / `npm exec -- node -e …`: tokens after `--` are a
-        // command, not package args. Screen that inner program with the same guard.
-        let idx = args.iter().position(|a| a == "--")?;
-        let tail = args.get(idx + 1..)?;
-        let (cmd, rest) = tail.split_first()?;
-        match screen_spawn_command(cmd, rest) {
-            Err(_) => rest.first().map(|s| s.as_str()).or(Some(cmd.as_str())),
-            Ok(()) => None,
+    first_flag(args, &["-c", "--call", "-n", "--node-arg", "--shell"])
+        // `-yc '<shell>'` is `-y -c '<shell>'`: the same getopt clustering this file
+        // already closes for `sh -ec` and `node -pe`, and the same threat, since a
+        // team-pushed config can swap `-c` for `-yc`. `y`/`q` are npx's booleans; `n`
+        // takes a value, so it bails the walk rather than reading as an eval.
+        .or_else(|| clustered_eval(args, NPX_EVAL, NPX_BOOL))
+        .or_else(|| npx_launched_dangerous(args))
+}
+
+/// npx short flags that take no value, so an eval flag can cluster behind them.
+const NPX_BOOL: &[char] = &['y', 'q'];
+/// npx short flags that run an attacker-supplied string instead of a cached package.
+const NPX_EVAL: &[char] = &['c'];
+
+/// Screen the program `npx`/`npm exec` will actually execute.
+///
+/// `--` separates npx's own options from the command's arguments; it does NOT introduce
+/// the command. In `npm exec node -- -e <code>` the executable is the positional `node`
+/// BEFORE the separator and `-e <code>` are its arguments, so taking the first token
+/// after `--` as the program screened `-e` - not an interpreter, allowed - and let the
+/// real `node -e` straight through the guard.
+///
+/// So screen every positional as a candidate command with the tokens that follow it,
+/// which covers all three spellings without a table of npx's value-taking options:
+/// `npx node -e …`, `npx -- node -e …`, `npm exec node -- -e …`, and `-p pkg node -e …`
+/// where the executable trails a flag's value. Over-screening a package name is
+/// harmless: a name that is not an interpreter basename passes immediately, and a
+/// package literally named `node` followed by `-e` is the case we mean to stop.
+fn npx_launched_dangerous(args: &[String]) -> Option<&str> {
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--" || arg.starts_with('-') {
+            continue;
         }
-    })
+        let rest = args.get(i + 1..).unwrap_or(&[]);
+        if screen_spawn_command(arg, rest).is_err() {
+            // Name the offending token where we can, so the error points at the eval
+            // flag rather than at the interpreter that merely hosts it.
+            return rest
+                .iter()
+                .find(|a| a.starts_with('-') && *a != "--")
+                .map(|a| a.as_str())
+                .or(Some(arg.as_str()));
+        }
+    }
+    None
 }
 
 /// `npm exec` / `npm x` is npx. Other npm subcommands are not MCP launchers; still
@@ -8507,6 +8541,40 @@ mod tests {
         assert!(screen_spawn_command("npm", &argv(&["exec", "--", "node", "-e", "x"])).is_err());
         // Normal package install is still the allow-path.
         assert!(screen_spawn_command("npx", &argv(&["-y", "@scope/mcp"])).is_ok());
+    }
+
+    /// `--` separates npx's own options from the command's arguments; it does not
+    /// introduce the command. Reading the token after it as the program screened `-e`
+    /// (not an interpreter, allowed) while npm actually ran `node -e <code>`.
+    #[test]
+    fn spawn_guard_screens_the_program_npx_actually_runs() {
+        // The reported bypass: the executable is the positional BEFORE `--`.
+        assert!(screen_spawn_command("npm", &argv(&["exec", "node", "--", "-e", "x"])).is_err());
+        assert!(screen_spawn_command("npx", &argv(&["node", "--", "-e", "x"])).is_err());
+        // Same shape without a separator, and with the executable trailing a flag's
+        // value, where a `--`-anchored parse never looks.
+        assert!(screen_spawn_command("npx", &argv(&["node", "-e", "x"])).is_err());
+        assert!(screen_spawn_command("npx", &argv(&["-p", "pkg", "node", "-e", "x"])).is_err());
+        assert!(screen_spawn_command("npm", &argv(&["exec", "sh", "--", "-c", "curl|sh"])).is_err());
+        // A package name is not an interpreter, so over-screening positionals costs
+        // nothing: these must still install and run.
+        assert!(screen_spawn_command("npx", &argv(&["-y", "@scope/mcp", "--port", "1"])).is_ok());
+        assert!(screen_spawn_command("npx", &argv(&["-p", "pkg", "server", "--flag"])).is_ok());
+        assert!(screen_spawn_command("npm", &argv(&["exec", "--", "mcp-server", "--x"])).is_ok());
+    }
+
+    /// `-yc '<shell>'` is `-y -c '<shell>'`. Same getopt clustering this file already
+    /// closes for `sh -ec` and `node -pe`, and the same threat: a team-pushed config
+    /// swaps `-c` for `-yc` and the operand runs.
+    #[test]
+    fn spawn_guard_blocks_clustered_npx_call() {
+        assert!(screen_spawn_command("npx", &argv(&["-yc", "calc"])).is_err());
+        assert!(screen_spawn_command("npx", &argv(&["-qyc", "calc"])).is_err());
+        assert!(screen_spawn_command("npm", &argv(&["exec", "-yc", "calc"])).is_err());
+        // `n` takes a value, so the walk bails there rather than reading a later
+        // character as an eval flag.
+        assert!(screen_spawn_command("npx", &argv(&["-y", "@scope/mcp"])).is_ok());
+        assert!(screen_spawn_command("npx", &argv(&["-qy", "@scope/mcp"])).is_ok());
     }
 
     #[test]
