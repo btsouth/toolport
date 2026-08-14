@@ -106,3 +106,10 @@ license-signing.keycd
 _poll_pr.py
 _cr*.txt
 src-tauri/rate_limit_counters.test.json
+
+# TypeScript build output. `tsc` writes these next to their sources whenever the
+# typecheck runs, so they show up untracked after any `npm run build` or bare
+# `tsc -p`. Only `vite.config.ts` is source; the .js/.d.ts beside it are emitted.
+*.tsbuildinfo
+/vite.config.js
+/vite.config.d.ts
