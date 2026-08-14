@@ -4924,7 +4924,10 @@ mod tests {
     /// into `None` -- which is the regression this pins against.
     #[test]
     fn has_client_secret_reports_a_failed_read_as_an_error_not_missing() {
-        let result = has_client_secret("__toolport_internal__".to_string());
+        // The command went async (SBS-813); the probe semantics under test are
+        // unchanged, so drive the future to completion on the runtime.
+        let result =
+            tauri::async_runtime::block_on(has_client_secret("__toolport_internal__".to_string()));
         assert!(
             result.is_err(),
             "a failed secret read must propagate, not resolve to a boolean: {result:?}"
