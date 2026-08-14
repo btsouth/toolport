@@ -2702,18 +2702,25 @@ fn inject_container_env(command: &str, args: &[String], env: &[(String, String)]
     if extras.is_empty() {
         return args.to_vec();
     }
+    // `-e` is a `run`/`create` option, not a docker/podman/nerdctl GLOBAL one, so it
+    // has to follow that subcommand rather than lead argv. `docker compose run`,
+    // `docker container run`, and a global like `docker --context x run` all put the
+    // subcommand later than argv[0], where prepending produced
+    // `docker -e KEY compose run …` and the CLI refused it with
+    // "unknown shorthand flag: 'e'" - so a server that used to start stopped starting
+    // the moment it was given a vaulted secret.
+    let Some(at) = args
+        .iter()
+        .position(|a| a.eq_ignore_ascii_case("run") || a.eq_ignore_ascii_case("create"))
+    else {
+        // No subcommand that accepts `-e` (e.g. `docker build`). There is nowhere
+        // correct to put it, so leave argv untouched rather than corrupt it.
+        return args.to_vec();
+    };
     let mut out = Vec::with_capacity(args.len() + extras.len());
-    if args
-        .first()
-        .is_some_and(|s| s.eq_ignore_ascii_case("run") || s.eq_ignore_ascii_case("create"))
-    {
-        out.push(args[0].clone());
-        out.extend(extras);
-        out.extend(args[1..].iter().cloned());
-    } else {
-        out.extend(extras);
-        out.extend(args.iter().cloned());
-    }
+    out.extend(args[..=at].iter().cloned());
+    out.extend(extras);
+    out.extend(args[at + 1..].iter().cloned());
     out
 }
 
@@ -8609,6 +8616,37 @@ mod tests {
             ),
             argv(&["run", "-e", "ACME_API_KEY", "img"])
         );
+    }
+
+    /// `-e` is a run/create option, not a docker global. Leading argv with it produced
+    /// `docker -e KEY compose run …`, which the CLI rejects with
+    /// "unknown shorthand flag: 'e'", so a server that started fine stopped starting
+    /// as soon as it had a vaulted secret.
+    #[test]
+    fn inject_container_env_follows_the_subcommand_not_argv0() {
+        let env = vec![("ACME_API_KEY".to_string(), "secret".to_string())];
+        let inject = |args: &[&str]| super::inject_container_env("docker", &argv(args), &env);
+
+        assert_eq!(
+            inject(&["compose", "run", "--rm", "svc"]),
+            argv(&["compose", "run", "-e", "ACME_API_KEY", "--rm", "svc"])
+        );
+        assert_eq!(
+            inject(&["container", "run", "img"]),
+            argv(&["container", "run", "-e", "ACME_API_KEY", "img"])
+        );
+        // A global option before the subcommand is the same shape.
+        assert_eq!(
+            inject(&["--context", "remote", "run", "img"]),
+            argv(&["--context", "remote", "run", "-e", "ACME_API_KEY", "img"])
+        );
+        assert_eq!(
+            inject(&["create", "--name", "x", "img"]),
+            argv(&["create", "-e", "ACME_API_KEY", "--name", "x", "img"])
+        );
+        // Nothing here accepts `-e`, so argv is left alone rather than corrupted.
+        assert_eq!(inject(&["build", "."]), argv(&["build", "."]));
+        assert_eq!(inject(&["ps"]), argv(&["ps"]));
     }
 
     #[test]
