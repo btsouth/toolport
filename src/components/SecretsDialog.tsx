@@ -121,27 +121,36 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   const keyHint = primaryKey ? KEY_HINTS[primaryKey] : undefined;
 
   // Bumped each open so a slow status fetch from a previous open can't apply
-  // after a newer one (or after the dialog closed), and before each mutation so
-  // an in-flight probe can't apply after it.
+  // after a newer one (or after the dialog closed).
   const runIdRef = useRef(0);
 
-  // The vault probes (secret_status, has_auth_token, has_client_secret) used to
-  // block the whole window while they ran, so nothing could be saved or cleared
-  // mid-probe. They no longer do, and on a locked or slow keyring they take
-  // seconds - long enough for the user to Save or Remove first. Retiring the run
-  // id makes any probe still in flight stale, so its older answer cannot land on
-  // top of the badge the completed mutation just set.
-  function retireInFlightProbes() {
-    runIdRef.current += 1;
+  // Bumped each open AND before each mutation. The vault probes (secret_status,
+  // has_auth_token, has_client_secret) used to block the whole window while they
+  // ran, so nothing could be saved or cleared mid-probe. They no longer do, and
+  // on a locked or slow keyring they take seconds - long enough for the user to
+  // Save or Remove first, and have the probe's older answer then land on top of
+  // the badge the mutation just set.
+  //
+  // Deliberately separate from `runIdRef`: only the vault-presence answers are
+  // superseded by a mutation. `probeAuth` describes the server's own auth
+  // requirements, is unrelated to what is vaulted, and owns the `probing`
+  // spinner - retiring it here would strand that spinner on "Checking what this
+  // server needs..." until the dialog was reopened.
+  const vaultRunIdRef = useRef(0);
+
+  function retireInFlightVaultProbes() {
+    vaultRunIdRef.current += 1;
   }
 
   async function refreshStatus() {
     const runId = ++runIdRef.current;
+    const vaultRunId = ++vaultRunIdRef.current;
     const fresh = () => runId === runIdRef.current;
+    const vaultFresh = () => vaultRunId === vaultRunIdRef.current;
     if (secretKeys.length > 0) {
       try {
         const pairs = await secretStatus(server.id, secretKeys);
-        if (fresh()) setVaulted(Object.fromEntries(pairs));
+        if (vaultFresh()) setVaulted(Object.fromEntries(pairs));
       } catch {
         /* non-fatal */
       }
@@ -151,14 +160,14 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
     if (isRemote && server.url) {
       hasAuthToken(server.id)
         .then((v) => {
-          if (!fresh()) return;
+          if (!vaultFresh()) return;
           setAuthSet(v);
           setAuthProbeError(false);
         })
         .catch(() => {
           // Unknown ≠ absent (SBS-789): drop any stale badge and say the check
           // failed rather than asserting either presence or absence.
-          if (!fresh()) return;
+          if (!vaultFresh()) return;
           setAuthSet(false);
           setAuthProbeError(true);
         });
@@ -175,13 +184,13 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       setCcSecretProbeError(false);
       hasClientSecret(server.id)
         .then((v) => {
-          if (!fresh()) return;
+          if (!vaultFresh()) return;
           setCcSecretSet(v);
           setCcSecretKnown(true);
           setCcSecretProbeError(false);
         })
         .catch(() => {
-          if (!fresh()) return;
+          if (!vaultFresh()) return;
           setCcSecretSet(false);
           setCcSecretKnown(false);
           setCcSecretProbeError(true);
@@ -196,16 +205,18 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   }
 
   async function retrySecretProbe() {
-    const runId = ++runIdRef.current;
+    // A vault probe, so it rides the vault generation: a mutation started while
+    // this retry is in flight must win.
+    const vaultRunId = ++vaultRunIdRef.current;
     setCcSecretKnown(false);
     setCcSecretProbeError(false);
     try {
       const present = await hasClientSecret(server.id);
-      if (runId !== runIdRef.current) return;
+      if (vaultRunId !== vaultRunIdRef.current) return;
       setCcSecretSet(present);
       setCcSecretKnown(true);
     } catch {
-      if (runId !== runIdRef.current) return;
+      if (vaultRunId !== vaultRunIdRef.current) return;
       setCcSecretSet(false);
       setCcSecretKnown(false);
       setCcSecretProbeError(true);
@@ -219,7 +230,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
 
   async function saveAuth() {
     if (!authInput) return;
-    retireInFlightProbes();
+    retireInFlightVaultProbes();
     setBusyKey("auth");
     try {
       await setAuthToken(server.id, authInput);
@@ -238,7 +249,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   }
 
   async function clearAuth() {
-    retireInFlightProbes();
+    retireInFlightVaultProbes();
     setBusyKey("auth-clear");
     try {
       await clearAuthToken(server.id);
@@ -266,7 +277,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       toastError("Enter the client secret issued by your authorization server.");
       return;
     }
-    retireInFlightProbes();
+    retireInFlightVaultProbes();
     setCcBusy(true);
     try {
       onSaved(
@@ -294,7 +305,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   }
 
   async function removeClientCredentials() {
-    retireInFlightProbes();
+    retireInFlightVaultProbes();
     setCcBusy(true);
     try {
       onSaved(await clearClientCredentials(server.id));
@@ -317,7 +328,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
 
   async function doOauth() {
     if (!server.url) return;
-    retireInFlightProbes();
+    retireInFlightVaultProbes();
     setOauthBusy(true);
     toast.info("Opening your browser…", {
       description:
@@ -344,7 +355,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
 
   async function save(key: string, value: string) {
     if (!value) return;
-    retireInFlightProbes();
+    retireInFlightVaultProbes();
     setBusyKey(key);
     try {
       onSaved(await setSecret(server.id, key, value));
@@ -360,7 +371,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   }
 
   async function remove(key: string) {
-    retireInFlightProbes();
+    retireInFlightVaultProbes();
     setBusyKey(`remove:${key}`);
     try {
       onSaved(await deleteSecret(server.id, key));
@@ -377,7 +388,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   async function addNew() {
     const k = newKey.trim();
     if (!k || !newValue) return;
-    retireInFlightProbes();
+    retireInFlightVaultProbes();
     setBusyKey("add");
     try {
       onSaved(await setSecret(server.id, k, newValue));

@@ -4145,9 +4145,24 @@ fn set_dock_icon_visible(_app: &AppHandle, _visible: bool) {}
 /// that reconfigure invisibly. Fixed upstream in tao 0.36 (tauri-apps/tao#1218,
 /// ships with Tauri 2.12) — remove this when the dependency bump lands.
 #[cfg(target_os = "linux")]
+static WAYLAND_NUDGE_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
 fn nudge_wayland_input_region(w: &tauri::WebviewWindow) {
+    use std::sync::atomic::Ordering;
+
     if std::env::var("WAYLAND_DISPLAY").is_err() {
         return; // X11 sessions are unaffected.
+    }
+    // One nudge at a time. `show_main_window` runs on every tray click, second
+    // instance, and approval reveal, and each nudge drives the window through
+    // maximize -> unmaximize -> set_size over about a second. Overlapping runs
+    // would fight each other: one reads `prior` while another has the window
+    // maximized, then restores that maximized size as the "real" one. A window
+    // already visible enough to be re-shown does not need a second heal anyway.
+    if WAYLAND_NUDGE_RUNNING.swap(true, Ordering::AcqRel) {
+        return;
     }
     // The reconfigure only heals a MAPPED surface, and `show()` has not mapped
     // it yet when this runs — an immediate resize is a no-op for the bug. Give
@@ -4155,6 +4170,15 @@ fn nudge_wayland_input_region(w: &tauri::WebviewWindow) {
     // slow map never delays the reveal itself.
     let w = w.clone();
     std::thread::spawn(move || {
+        // Cleared however this thread leaves, including the early returns below.
+        struct Done;
+        impl Drop for Done {
+            fn drop(&mut self) {
+                WAYLAND_NUDGE_RUNNING
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _done = Done;
         std::thread::sleep(std::time::Duration::from_millis(150));
         // A maximized window already has a fresh configure (that's why the
         // manual maximize/restore workaround heals the buttons) — and it's
@@ -4182,14 +4206,25 @@ fn nudge_wayland_input_region(w: &tauri::WebviewWindow) {
         // issued immediately — overwriting it with a broken oversized frame.
         // Wait for the state to actually flip before enforcing a size.
         let mut settled = false;
-        for _ in 0..20 {
+        for attempt in 0..20 {
             std::thread::sleep(std::time::Duration::from_millis(50));
             if !w.is_maximized().unwrap_or(true) {
                 settled = true;
                 break;
             }
+            // Re-issue periodically: the maximize has already happened, so
+            // giving up here would leave the user staring at a maximized window
+            // they never asked for. A dropped request is the likely cause, and
+            // unmaximize on an already-restored window is a no-op.
+            if attempt % 5 == 4 {
+                let _ = w.unmaximize();
+            }
         }
         if !settled {
+            // Out of retries. Restoring the size is unsafe now (the window is
+            // still maximized, so the geometry would be wrong), but leaving it
+            // maximized is not an option either: one last request, then stop.
+            let _ = w.unmaximize();
             return;
         }
         // Clamp the remembered size to the current monitor's usable area. The
