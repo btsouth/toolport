@@ -66,6 +66,47 @@ describe("TeamsView shared-server update", () => {
     expect(await screen.findByText(/now version 8/i)).toBeInTheDocument();
   });
 
+  it("passes reviewed=true when the member confirms enabling a review server", async () => {
+    const withReviewServer: Registry = {
+      ...registry,
+      servers: [
+        {
+          id: "team-tool",
+          name: "Team tool",
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "some-tool"],
+          env: [],
+          url: null,
+          source: "team:team-1",
+        },
+      ] as Registry["servers"],
+    };
+    api.setServerEnabled.mockResolvedValue(withReviewServer);
+
+    render(<TeamsView registry={withReviewServer} onRegistryChange={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Enable" }));
+    // The ConfirmDialog's confirm button carries the same label as the trigger;
+    // the dialog copy shows the exact command being consented to (the row also
+    // renders the command, so anchor on dialog-only copy).
+    expect(await screen.findByText(/recognize this command/)).toBeInTheDocument();
+    const confirm = screen
+      .getAllByRole("button", { name: "Enable" })
+      .at(-1) as HTMLElement;
+    await userEvent.click(confirm);
+
+    // The fourth arg is the backend's consent assertion: without it the gate
+    // in set_server_enabled refuses and Teams enable silently breaks.
+    await waitFor(() =>
+      expect(api.setServerEnabled).toHaveBeenCalledWith(
+        "default",
+        "team-tool",
+        true,
+        true,
+      ),
+    );
+  });
+
   it("discards a stale confirmation and requires a fresh preview", async () => {
     const preview = {
       baseVersion: 7,

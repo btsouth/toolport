@@ -108,8 +108,10 @@ fn agent_with_timeout(server_url: &str, secs: u64) -> ureq::Agent {
 /// anything, so the caller persisted a receipt and suppressed the retry, and
 /// `post_call_events` advanced its cursor past events that were never sent. Silent
 /// data loss, not just a missed hop.
+/// 305/306 are deprecated but still 3xx-with-Location; 304 stays out because it
+/// carries no Location and means "unchanged", not "go elsewhere".
 fn is_redirect_status(status: u16) -> bool {
-    matches!(status, 300 | 301 | 302 | 303 | 307 | 308)
+    matches!(status, 300 | 301 | 302 | 303 | 305 | 306 | 307 | 308)
 }
 
 /// ureq with `redirects(0)` returns 3xx as a successful response. Treat those as
@@ -2770,7 +2772,7 @@ mod tests {
 
     #[test]
     fn redirect_statuses_are_refused() {
-        for status in [301u16, 302, 303, 307, 308] {
+        for status in [300u16, 301, 302, 303, 305, 306, 307, 308] {
             assert!(is_redirect_status(status), "{status} must be a redirect");
         }
         for status in [200u16, 204, 304, 400, 401, 404] {

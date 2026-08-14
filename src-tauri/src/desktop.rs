@@ -756,23 +756,38 @@ fn set_server_enabled(
     enabled: bool,
     reviewed: Option<bool>,
 ) -> Result<Registry, String> {
-    if enabled && !reviewed.unwrap_or(false) {
-        let reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if reg
-            .servers
-            .iter()
-            .any(|s| s.id == server_id && s.needs_team_enable_review())
-        {
-            return Err(
-                "this team server runs a local command or private address; enable it from Teams after review"
-                    .into(),
-            );
-        }
-    }
+    let reviewed = reviewed.unwrap_or(false);
     let (reg, _) = write_registry(state.inner(), |reg| {
+        // Checked inside the write closure so it sees the registry that will be
+        // persisted: a team_sync_wait replace landing between a pre-lock check and
+        // this write could swap the entry for one that needs review.
+        refuse_unreviewed_team_enable(reg, &server_id, enabled, reviewed)?;
         reg.set_server_enabled(&profile_id, &server_id, enabled)
     })?;
     Ok(reg)
+}
+
+/// The gate half of `set_server_enabled`, split out so the write-closure behavior
+/// is unit-testable without a Tauri `State`.
+fn refuse_unreviewed_team_enable(
+    reg: &Registry,
+    server_id: &str,
+    enabled: bool,
+    reviewed: bool,
+) -> Result<(), String> {
+    if enabled
+        && !reviewed
+        && reg
+            .servers
+            .iter()
+            .any(|s| s.id == server_id && s.needs_team_enable_review())
+    {
+        return Err(
+            "this team server runs a local command or private address; enable it from Teams after review"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -4701,6 +4716,23 @@ mod tests {
         );
         assert!(!r.ok);
         assert_eq!(r.server_id, "bogus");
+    }
+
+    #[test]
+    fn unreviewed_team_stdio_enable_is_refused_in_write_closure() {
+        let mut reg = Registry::default();
+        let mut s = plain_server("team-tool", "Team tool");
+        s.source = Some("team:acme".into());
+        reg.servers.push(s);
+
+        let err = refuse_unreviewed_team_enable(&reg, "team-tool", true, false)
+            .expect_err("stdio team server must not enable without review");
+        assert!(err.contains("enable it from Teams after review"), "{err}");
+        // The consent path (reviewed=true), disabling, and non-team servers pass.
+        assert!(refuse_unreviewed_team_enable(&reg, "team-tool", true, true).is_ok());
+        assert!(refuse_unreviewed_team_enable(&reg, "team-tool", false, false).is_ok());
+        reg.servers[0].source = None;
+        assert!(refuse_unreviewed_team_enable(&reg, "team-tool", true, false).is_ok());
     }
 
     fn plain_server(id: &str, name: &str) -> ServerEntry {

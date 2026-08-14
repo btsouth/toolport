@@ -1124,7 +1124,10 @@ function App() {
             toastError(
               "This server changed while you were reviewing it. Check it again.",
             );
-            return;
+            // Reject so ConfirmDialog skips its setOpen(false) - a normal return
+            // would close the dialog and onOpenChange(false) would null out the
+            // `live` entry we just swapped in, so the re-review never appears.
+            throw new Error("definition changed");
           }
           return applyToggle(confirmEnableTeam.id, true, true);
         }}

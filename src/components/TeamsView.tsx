@@ -252,7 +252,9 @@ export function TeamsView({
     run("enable", async () => {
       const pid = registry ? activeProfile(registry)?.id : undefined;
       if (!pid) throw new Error("No active profile to enable into.");
-      onRegistryChange(await setServerEnabled(pid, serverId, true));
+      // reviewed=true: this runs only from the ConfirmDialog below, which showed
+      // the member the exact command/URL. The backend refuses without it.
+      onRegistryChange(await setServerEnabled(pid, serverId, true, true));
       setNotice("Enabled. That server now runs in your active profile.");
     });
 
