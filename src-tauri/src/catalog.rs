@@ -355,11 +355,27 @@ pub fn search(query: &str) -> Result<Vec<CatalogEntry>, String> {
     Ok(out)
 }
 
-/// Turn one registry `server` object into a catalog entry. Prefers a hosted
-/// remote (simplest to connect), else the first installable package.
+/// npm/yarn/pnpm remote specs that `npx -y` will fetch outside the registry.
+/// `:` itself stays allowed so docker `host:port/image` and OCI `image:tag` work.
+fn is_remote_package_spec(spec: &str) -> bool {
+    let lower = spec.to_ascii_lowercase();
+    lower.contains("://")
+        || lower.starts_with("github:")
+        || lower.starts_with("gitlab:")
+        || lower.starts_with("bitbucket:")
+        || lower.starts_with("gist:")
+        || lower.starts_with("git+")
+        || lower.starts_with("npm:")
+        || lower.starts_with("jsr:")
+        || lower.starts_with("file:")
+        || lower.starts_with("http:")
+        || lower.starts_with("https:")
+}
+
 /// A registry package spec safe to pass as an npx/uvx/docker argument: non-empty, no
 /// leading dash (flag injection), bounded length, and only the characters real
-/// package names use. Nothing that could become a separate flag or a shell token.
+/// package names use. Nothing that could become a separate flag, a shell token,
+/// or a github:/URL install that bypasses the named registry.
 fn is_safe_package_id(spec: &str) -> bool {
     !spec.is_empty()
         && !spec.starts_with('-')
@@ -367,8 +383,11 @@ fn is_safe_package_id(spec: &str) -> bool {
         && spec.chars().all(|c| {
             c.is_ascii_alphanumeric() || matches!(c, '@' | '/' | '-' | '_' | '.' | '+' | ':')
         })
+        && !is_remote_package_spec(spec)
 }
 
+/// Turn one registry `server` object into a catalog entry. Prefers a hosted
+/// remote (simplest to connect), else the first installable package.
 fn map_server(server: &Value) -> Option<CatalogEntry> {
     let id = server.get("name").and_then(|v| v.as_str()).unwrap_or("");
     // Friendly title when present; fall back to the namespaced id.
@@ -836,6 +855,22 @@ mod tests {
             map_server(&scheme).is_none(),
             "non-http remote must be dropped"
         );
+        // github:/URL/git+ specs would make npx fetch outside npm. Colon stays
+        // allowed for docker host:port and OCI tags (see maps_container_packages).
+        for identifier in [
+            "github:attacker/payload",
+            "https://evil.example/pkg.tgz",
+            "http://evil.example/pkg.tgz",
+            "git+https://github.com/attacker/payload.git",
+            "npm:evil",
+        ] {
+            let remote = json!({ "name": "io.x/r", "title": "R",
+                "packages": [{ "registryType": "npm", "identifier": identifier }] });
+            assert!(
+                map_server(&remote).is_none(),
+                "{identifier}: remote package spec must be dropped"
+            );
+        }
     }
 
     // Self-hosted catalog coverage (url_hint / setup_hint invariants), contributed by

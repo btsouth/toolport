@@ -137,6 +137,26 @@ pub struct ServerEntry {
     pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
+impl ServerEntry {
+    /// Team-synced local commands and LAN URLs stay off until the member enables
+    /// them after review. Enable-all and the playground must not skip that gate.
+    pub fn needs_team_enable_review(&self) -> bool {
+        let Some(src) = self.source.as_deref() else {
+            return false;
+        };
+        if !src.starts_with("team:") {
+            return false;
+        }
+        if self.transport == "stdio" || self.command.is_some() {
+            return true;
+        }
+        match self.url.as_deref().and_then(crate::oauth::host_of_url) {
+            Some(host) => crate::oauth::host_is_private(&host),
+            None => false,
+        }
+    }
+}
+
 /// Non-secret configuration for the OAuth client-credentials flow (SBS-524).
 ///
 /// Deliberately holds no secret. The client secret lives in the OS vault under
@@ -1199,14 +1219,34 @@ impl Registry {
     }
 
     /// Enable or disable every server in a profile at once.
+    ///
+    /// Enabling skips team-review servers (local command / LAN URL). Those stay
+    /// as they were so Enable all cannot bypass the Teams confirm, and so a
+    /// server the member already consented to is not wiped.
     pub fn set_all_enabled(&mut self, profile_id: &str, enabled: bool) -> Result<(), String> {
-        let ids: Vec<String> = self.servers.iter().map(|s| s.id.clone()).collect();
+        let ids: Vec<String> = if enabled {
+            self.servers
+                .iter()
+                .filter(|s| !s.needs_team_enable_review())
+                .map(|s| s.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let profile = self
             .profiles
             .iter_mut()
             .find(|p| p.id == profile_id)
             .ok_or_else(|| format!("No profile with id '{profile_id}'"))?;
-        profile.enabled_server_ids = if enabled { ids } else { Vec::new() };
+        if enabled {
+            for id in ids {
+                if !profile.enabled_server_ids.contains(&id) {
+                    profile.enabled_server_ids.push(id);
+                }
+            }
+        } else {
+            profile.enabled_server_ids = Vec::new();
+        }
         Ok(())
     }
 
@@ -2753,6 +2793,49 @@ mod tests {
         assert_eq!(r.enabled_servers().len(), 1);
         r.set_server_enabled(&profile, &id, false).unwrap();
         assert!(r.enabled_servers().is_empty());
+    }
+
+    #[test]
+    fn set_all_enabled_skips_unreviewed_team_servers() {
+        let mut r = Registry::default();
+        let own = r.add_server(sample_server("github"));
+        let mut team_cmd = sample_server("team-npx");
+        team_cmd.source = Some("team:t1".into());
+        let team_cmd_id = r.add_server(team_cmd);
+        let mut team_lan = sample_server("team-lan");
+        team_lan.transport = "http".into();
+        team_lan.command = None;
+        team_lan.args = vec![];
+        team_lan.url = Some("http://10.0.0.5:8080/mcp".into());
+        team_lan.source = Some("team:t1".into());
+        let team_lan_id = r.add_server(team_lan);
+        let mut team_public = sample_server("team-public");
+        team_public.transport = "http".into();
+        team_public.command = None;
+        team_public.args = vec![];
+        team_public.url = Some("https://1.2.3.4/mcp".into());
+        team_public.source = Some("team:t1".into());
+        let team_public_id = r.add_server(team_public);
+
+        r.set_all_enabled("default", true).unwrap();
+        assert!(r.is_enabled("default", &own));
+        assert!(r.is_enabled("default", &team_public_id));
+        assert!(
+            !r.is_enabled("default", &team_cmd_id),
+            "team stdio stays off until explicit enable"
+        );
+        assert!(
+            !r.is_enabled("default", &team_lan_id),
+            "team LAN URL stays off until explicit enable"
+        );
+
+        r.set_server_enabled("default", &team_cmd_id, true).unwrap();
+        r.set_all_enabled("default", true).unwrap();
+        assert!(
+            r.is_enabled("default", &team_cmd_id),
+            "consented review server stays on"
+        );
+        assert!(!r.is_enabled("default", &team_lan_id));
     }
 
     #[test]

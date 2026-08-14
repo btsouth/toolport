@@ -60,7 +60,10 @@ import { PendingApprovals } from "@/components/PendingApprovals";
 import { QuarantineAlert } from "@/components/QuarantineAlert";
 import { RegistryServerRow } from "@/components/RegistryServerRow";
 import { ServerDialog } from "@/components/ServerDialog";
-import { ImportReviewDialog } from "@/components/ImportReviewDialog";
+import {
+  ImportReviewDialog,
+  needsTeamEnableReview,
+} from "@/components/ImportReviewDialog";
 
 // Secondary destinations are code-split so the initial bundle only carries the
 // default Servers view and the app chrome. Each mounts behind a Suspense
@@ -118,6 +121,7 @@ function App() {
   // Gates the "Disable all" bulk action behind a confirm when it turns off more
   // than a couple of servers, so one menu click can't silently kill a big set.
   const [confirmDisableAll, setConfirmDisableAll] = useState(false);
+  const [confirmEnableTeam, setConfirmEnableTeam] = useState<ServerEntry | null>(null);
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
   const [view, setView] = useState<View>("servers");
   const [activityKey, setActivityKey] = useState(0);
@@ -635,7 +639,7 @@ function App() {
     setOnboardingStep(0);
   }
 
-  async function handleToggle(serverId: string, enabled: boolean) {
+  async function applyToggle(serverId: string, enabled: boolean) {
     if (!profileId) return;
     setBusyId(serverId);
     try {
@@ -649,6 +653,17 @@ function App() {
     } finally {
       setBusyId(null);
     }
+  }
+
+  async function handleToggle(serverId: string, enabled: boolean) {
+    if (enabled) {
+      const server = servers.find((s) => s.id === serverId);
+      if (server && needsTeamEnableReview(server)) {
+        setConfirmEnableTeam(server);
+        return;
+      }
+    }
+    await applyToggle(serverId, enabled);
   }
 
   async function handleRemove(serverId: string, name: string) {
@@ -666,11 +681,31 @@ function App() {
   async function handleToggleAll() {
     if (!profileId || togglingAll) return;
     const enable = enabledCount < servers.length;
+    const pendingReview =
+      enable && registry
+        ? servers.filter((s) => needsTeamEnableReview(s) && !isEnabled(registry, s.id))
+            .length
+        : 0;
+    if (enable && pendingReview > 0 && pendingReview === servers.length - enabledCount) {
+      toast.message(
+        pendingReview === 1
+          ? "That team server still needs review in Teams."
+          : `${pendingReview} team servers still need review in Teams.`,
+      );
+      return;
+    }
     setTogglingAll(true);
     try {
       setRegistry(await setAllEnabled(profileId, enable));
       if (enable) void reprobeAfterMutation().catch(() => {});
-      toast.success(enable ? "Enabled all servers" : "Disabled all servers");
+      let message = enable ? "Enabled all servers" : "Disabled all servers";
+      if (enable && pendingReview > 0) {
+        message =
+          pendingReview === 1
+            ? "Enabled servers. 1 team server still needs review."
+            : `Enabled servers. ${pendingReview} team servers still need review.`;
+      }
+      toast.success(message);
     } catch (e) {
       toastError(`Couldn't update servers: ${e}`);
     } finally {
@@ -1053,6 +1088,27 @@ function App() {
         confirmLabel="Disable all"
         destructive
         onConfirm={handleToggleAll}
+      />
+      <ConfirmDialog
+        open={confirmEnableTeam !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmEnableTeam(null);
+        }}
+        title={
+          confirmEnableTeam ? `Enable "${confirmEnableTeam.name}"?` : "Enable server?"
+        }
+        description={
+          confirmEnableTeam
+            ? confirmEnableTeam.transport === "stdio" || confirmEnableTeam.command
+              ? `This runs a local command on your machine: ${[confirmEnableTeam.command, ...(confirmEnableTeam.args ?? [])].join(" ")}. Only enable it if you trust your team and recognize this command.`
+              : `This connects Toolport to ${confirmEnableTeam.url ?? ""}, a private/LAN address. Only enable it if you trust your team.`
+            : undefined
+        }
+        confirmLabel="Enable"
+        onConfirm={() => {
+          if (!confirmEnableTeam) return;
+          return applyToggle(confirmEnableTeam.id, true);
+        }}
       />
       {/* Ctrl+N. Mounted only while open so `autoOpen` fires each time, and unmounted
           on close so the next press starts from a clean form. */}

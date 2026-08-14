@@ -1,7 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { ImportReviewDialog, runsShell, isPrivateHostUrl } from "./ImportReviewDialog";
+import {
+  ImportReviewDialog,
+  runsShell,
+  isPrivateHostUrl,
+  needsTeamEnableReview,
+} from "./ImportReviewDialog";
 import type { ImportItem } from "@/lib/types";
 
 function items(): ImportItem[] {
@@ -200,5 +205,51 @@ describe("isPrivateHostUrl", () => {
     ["", false],
   ])("classifies %j as %s", (url, expected) => {
     expect(isPrivateHostUrl(url)).toBe(expected);
+  });
+});
+
+describe("needsTeamEnableReview", () => {
+  it("ignores personal servers even with a local command", () => {
+    expect(
+      needsTeamEnableReview({
+        source: "manual",
+        transport: "stdio",
+        command: "npx",
+        url: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("flags a team stdio server", () => {
+    expect(
+      needsTeamEnableReview({
+        source: "team:t1",
+        transport: "stdio",
+        command: "npx",
+        url: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("flags a team LAN URL", () => {
+    expect(
+      needsTeamEnableReview({
+        source: "team:t1",
+        transport: "http",
+        command: null,
+        url: "http://10.0.0.5:8080/mcp",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not flag a team public HTTPS remote", () => {
+    expect(
+      needsTeamEnableReview({
+        source: "team:t1",
+        transport: "http",
+        command: null,
+        url: "https://mcp.example.com/mcp",
+      }),
+    ).toBe(false);
   });
 });

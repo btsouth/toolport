@@ -697,6 +697,9 @@ fn add_server(state: State<RegistryState>, entry: ServerEntry) -> Result<Registr
 /// then the package is already in the launcher's cache, which is the whole point.
 /// The connect result is deliberately ignored; the real probe reports health.
 fn prewarm_launcher(server: &ServerEntry) {
+    if server.needs_team_enable_review() {
+        return;
+    }
     let Some(command) = server.command.clone() else {
         return;
     };
@@ -1583,13 +1586,26 @@ async fn probe_servers(
 }
 
 /// Snapshot one server out of the registry by id (dropping the lock before I/O).
-fn server_by_id(state: &RegistryState, server_id: &str) -> Result<ServerEntry, String> {
+/// Playground connects must not spawn a team-review server the member has not
+/// enabled — the Teams confirm is otherwise frontend-only.
+fn playground_server(state: &RegistryState, server_id: &str) -> Result<ServerEntry, String> {
     let reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    reg.servers
+    let server = reg
+        .servers
         .iter()
         .find(|s| s.id == server_id)
         .cloned()
-        .ok_or_else(|| format!("server '{server_id}' not found"))
+        .ok_or_else(|| format!("server '{server_id}' not found"))?;
+    if server.needs_team_enable_review() {
+        let pid = reg.active_profile_id();
+        if !reg.is_enabled(&pid, &server.id) {
+            return Err(
+                "this team server runs a local command or private address; enable it from Teams after review"
+                    .into(),
+            );
+        }
+    }
+    Ok(server)
 }
 
 /// List the tools one server exposes (raw MCP tool objects: name, description,
@@ -1600,7 +1616,7 @@ async fn list_server_tools(
     state: State<'_, RegistryState>,
     server_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let server = server_by_id(state.inner(), &server_id)?;
+    let server = playground_server(state.inner(), &server_id)?;
     tauri::async_runtime::spawn_blocking(move || connect_server(&server).map(|ds| ds.tools))
         .await
         .map_err(|e| e.to_string())?
@@ -1616,7 +1632,7 @@ async fn call_tool(
     tool: String,
     arguments: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let server = server_by_id(state.inner(), &server_id)?;
+    let server = playground_server(state.inner(), &server_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut ds = connect_server(&server)?;
         let started = std::time::Instant::now();
@@ -1648,7 +1664,7 @@ async fn list_server_resources(
     state: State<'_, RegistryState>,
     server_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let server = server_by_id(state.inner(), &server_id)?;
+    let server = playground_server(state.inner(), &server_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         connect_server(&server).map(|mut ds| {
             ds.load_resources_prompts();
@@ -1667,7 +1683,7 @@ async fn list_server_prompts(
     state: State<'_, RegistryState>,
     server_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let server = server_by_id(state.inner(), &server_id)?;
+    let server = playground_server(state.inner(), &server_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         connect_server(&server).map(|mut ds| {
             ds.load_resources_prompts();
@@ -1686,7 +1702,7 @@ async fn read_resource(
     server_id: String,
     uri: String,
 ) -> Result<serde_json::Value, String> {
-    let server = server_by_id(state.inner(), &server_id)?;
+    let server = playground_server(state.inner(), &server_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut ds = connect_server(&server)?;
         ds.read_resource(&uri).map_err(|e| e.to_string())
@@ -1704,7 +1720,7 @@ async fn get_prompt(
     name: String,
     arguments: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let server = server_by_id(state.inner(), &server_id)?;
+    let server = playground_server(state.inner(), &server_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut ds = connect_server(&server)?;
         ds.get_prompt(&name, arguments).map_err(|e| e.to_string())

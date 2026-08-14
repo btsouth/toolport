@@ -428,13 +428,13 @@ fn screen_addrs(addrs: &[std::net::SocketAddr], block_private: bool) -> std::io:
         if ip_is_link_local(&sa.ip()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("OAuth SSRF guard: refusing link-local / cloud-metadata address {}", sa.ip()),
+                format!("SSRF guard: refusing link-local / cloud-metadata address {}", sa.ip()),
             ));
         }
         if block_private && ip_is_private(&sa.ip()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("OAuth SSRF guard: refusing private/loopback address {} for a public server", sa.ip()),
+                format!("SSRF guard: refusing private/loopback address {} for a public server", sa.ip()),
             ));
         }
     }
@@ -449,7 +449,7 @@ fn screen_addrs(addrs: &[std::net::SocketAddr], block_private: bool) -> std::io:
 /// that rebinds public->private between the pre-check and the connect is still refused here.
 /// The OAuth endpoints come from an attacker-influenceable metadata document, so this is the
 /// load-bearing SSRF guard.
-fn screened_resolve(netloc: &str, block_private: bool) -> std::io::Result<Vec<std::net::SocketAddr>> {
+pub(crate) fn screened_resolve(netloc: &str, block_private: bool) -> std::io::Result<Vec<std::net::SocketAddr>> {
     use std::net::ToSocketAddrs;
     let addrs: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
     screen_addrs(&addrs, block_private)?;

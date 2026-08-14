@@ -3,7 +3,7 @@ import { Check, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { TransportPill } from "@/components/TransportPill";
-import type { ImportItem } from "@/lib/types";
+import type { ImportItem, ServerEntry } from "@/lib/types";
 
 interface Props {
   open: boolean;
@@ -212,6 +212,17 @@ export function isPrivateHostUrl(url: string | null | undefined): boolean {
     return false;
   }
   return isPrivateIpv4(host);
+}
+
+/** Team-synced local commands and LAN URLs stay off until the member confirms.
+ * Mirrors `ServerEntry::needs_team_enable_review` so the Servers Switch and
+ * Enable all cannot skip the Teams review dialog. */
+export function needsTeamEnableReview(
+  server: Pick<ServerEntry, "source" | "transport" | "command" | "url">,
+): boolean {
+  if (!server.source?.startsWith("team:")) return false;
+  if (server.transport === "stdio" || !!server.command) return true;
+  return isPrivateHostUrl(server.url);
 }
 
 /** Mirror src-tauri/src/oauth.rs ip_is_private for IPv4. */

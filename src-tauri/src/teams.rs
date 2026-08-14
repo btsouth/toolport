@@ -64,20 +64,48 @@ fn require_secure_team_url(server_url: &str) -> Result<(), String> {
     }
 }
 
+/// Public team hosts must not rebind onto the LAN; loopback/LAN team URLs (local
+/// `conduit-teams`) still connect. Link-local / cloud-metadata is always refused
+/// inside [`crate::oauth::screened_resolve`].
+fn block_private_for_team_url(server_url: &str) -> bool {
+    let host = crate::oauth::host_of_url(server_url).unwrap_or_default();
+    !crate::oauth::host_is_private(&host)
+}
+
 /// A ureq agent with a connect + read timeout. The team commands run on the Tauri
 /// command thread, so a slow or black-holed team server must not hang the UI: bare
 /// `ureq::get/post/put` have no timeout, this does.
-fn agent() -> ureq::Agent {
-    agent_with_timeout(30)
+///
+/// Redirects are refused: a 302 would replay `Authorization: Bearer` to a host of
+/// the redirector's choosing (the same control OAuth token POSTs and MCP HTTP use).
+fn agent(server_url: &str) -> ureq::Agent {
+    agent_with_timeout(server_url, 30)
 }
 
 /// A ureq agent with an explicit total timeout. A long-poll config pull needs a client
 /// timeout comfortably above the server's `wait` window, so the server (not the client)
 /// decides when to return.
-fn agent_with_timeout(secs: u64) -> ureq::Agent {
+fn agent_with_timeout(server_url: &str, secs: u64) -> ureq::Agent {
+    let block_private = block_private_for_team_url(server_url);
     ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(secs))
+        .redirects(0)
+        .resolver(move |netloc: &str| crate::oauth::screened_resolve(netloc, block_private))
         .build()
+}
+
+fn is_redirect_status(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// ureq with `redirects(0)` returns 3xx as a successful response. Treat those as
+/// errors so a team API never follows (or silently accepts) a bearer-bearing hop.
+fn require_no_redirect(resp: ureq::Response) -> Result<ureq::Response, String> {
+    if is_redirect_status(resp.status()) {
+        Err("team server redirected; Toolport does not follow redirects on team API calls".into())
+    } else {
+        Ok(resp)
+    }
 }
 
 // --- HTTP client (ureq) ---
@@ -118,7 +146,7 @@ pub fn join(server_url: &str, invite_code: &str, member_name: Option<&str>) -> R
     require_secure_team_url(server_url)?;
     let url = format!("{}/join", base(server_url));
     let body = serde_json::json!({ "invite_code": invite_code, "member_name": member_name });
-    let resp = agent().post(&url).send_json(body).map_err(stringify)?;
+    let resp = require_no_redirect(agent(server_url).post(&url).send_json(body).map_err(stringify)?)?;
     let v: Value = resp.into_json().map_err(|e| e.to_string())?;
     // An approval-gated link hands back a request token instead of a member token.
     if v["pending"].as_bool().unwrap_or(false) {
@@ -153,7 +181,7 @@ pub fn poll_join(
     require_secure_team_url(server_url)?;
     let url = format!("{}/join/status", base(server_url));
     let body = serde_json::json!({ "request_token": request_token });
-    let resp = agent().post(&url).send_json(body).map_err(stringify)?;
+    let resp = require_no_redirect(agent(server_url).post(&url).send_json(body).map_err(stringify)?)?;
     let v: Value = resp.into_json().map_err(|e| e.to_string())?;
     match v["status"].as_str().unwrap_or("") {
         "approved" => complete_join(server_url, member_name, joined_from(&v)?).map(JoinPoll::Connected),
@@ -181,9 +209,9 @@ pub fn pull_config(
     // when to return; a 304/200 the moment something changes.
     let ag = if wait_secs > 0 {
         url.push_str(&format!("?wait={wait_secs}"));
-        agent_with_timeout(wait_secs + 10)
+        agent_with_timeout(server_url, wait_secs + 10)
     } else {
-        agent()
+        agent(server_url)
     };
     // Echo the exact ETag the server last gave us. A restricted member's ETag carries a
     // per-member access suffix ("v{n}-m{hash}"), so a reconstructed "v{n}" would never
@@ -200,6 +228,7 @@ pub fn pull_config(
             if resp.status() == 304 {
                 return Ok(None);
             }
+            let resp = require_no_redirect(resp)?;
             // Capture the fresh ETag before the body consumes `resp`.
             let new_etag = resp.header("etag").map(str::to_string);
             let v: Value = resp.into_json().map_err(|e| e.to_string())?;
@@ -249,12 +278,13 @@ pub enum MembershipCheck {
 pub fn fetch_me(server_url: &str, team_id: &str, token: &str) -> Result<MembershipCheck, String> {
     require_secure_team_url(server_url)?;
     let url = format!("{}/teams/{}/me", base(server_url), team_id);
-    match agent()
+    match agent(server_url)
         .get(&url)
         .set("authorization", &format!("Bearer {token}"))
         .call()
     {
         Ok(resp) => {
+            let resp = require_no_redirect(resp)?;
             let v: Value = resp.into_json().map_err(|e| e.to_string())?;
             // Fail noisily on a malformed 200 rather than defaulting to "member": a
             // silent default would demote an admin's persisted role on a buggy response.
@@ -285,12 +315,13 @@ fn fetch_config_for_update(
 ) -> Result<(i64, Value), String> {
     require_secure_team_url(server_url)?;
     let url = format!("{}/teams/{}/config", base(server_url), team_id);
-    match agent()
+    match agent(server_url)
         .get(&url)
         .set("authorization", &format!("Bearer {token}"))
         .call()
     {
         Ok(resp) => {
+            let resp = require_no_redirect(resp)?;
             let v: Value = resp.into_json().map_err(|e| e.to_string())?;
             let version = v["version"]
                 .as_i64()
@@ -423,12 +454,12 @@ pub fn push_config(
     require_secure_team_url(server_url)?;
     let url = format!("{}/teams/{}/config", base(server_url), team_id);
     let body = push_body(config, base_version);
-    let resp = match agent()
+    let resp = match agent(server_url)
         .put(&url)
         .set("authorization", &format!("Bearer {token}"))
         .send_json(body)
     {
-        Ok(resp) => resp,
+        Ok(resp) => require_no_redirect(resp)?,
         Err(e @ ureq::Error::Status(status, _)) => {
             if let Some(message) = push_status_message(status) {
                 return Err(message.into());
@@ -469,12 +500,15 @@ fn post_usage_day(
     if let Some(status) = policy_status {
         body["policyStatus"] = status.clone();
     }
-    match agent()
+    match agent(server_url)
         .post(&url)
         .set("authorization", &format!("Bearer {token}"))
         .send_json(body)
     {
-        Ok(_) => Ok(true),
+        Ok(resp) => {
+            require_no_redirect(resp)?;
+            Ok(true)
+        }
         Err(ureq::Error::Status(404 | 405, _)) => Ok(false),
         Err(e) => Err(stringify(e)),
     }
@@ -1172,12 +1206,15 @@ fn post_call_events(
     require_secure_team_url(server_url)?;
     let url = format!("{}/teams/{}/call-events", base(server_url), team_id);
     let body = json!({ "events": events });
-    match agent()
+    match agent(server_url)
         .post(&url)
         .set("authorization", &format!("Bearer {token}"))
         .send_json(body)
     {
-        Ok(_) => Ok(true),
+        Ok(resp) => {
+            require_no_redirect(resp)?;
+            Ok(true)
+        }
         Err(ureq::Error::Status(404 | 405, _)) => Ok(false),
         Err(e) => Err(stringify(e)),
     }
@@ -2691,6 +2728,27 @@ mod tests {
         assert!(require_secure_team_url("http://192.168.1.10:8787").is_err());
         assert!(require_secure_team_url("http://teams.example.com").is_err());
         assert!(require_secure_team_url("teams.example.com").is_err());
+    }
+
+    #[test]
+    fn public_team_url_blocks_private_redirect_targets() {
+        // Literal public IPs so this does not depend on DNS (host_is_private
+        // fails closed on NXDOMAIN, which would invert the flag).
+        assert!(block_private_for_team_url("https://1.2.3.4"));
+        assert!(block_private_for_team_url("https://8.8.8.8"));
+        assert!(!block_private_for_team_url("http://127.0.0.1:8787"));
+        assert!(!block_private_for_team_url("http://localhost:8787"));
+        assert!(!block_private_for_team_url("http://[::1]:8787"));
+    }
+
+    #[test]
+    fn redirect_statuses_are_refused() {
+        for status in [301u16, 302, 303, 307, 308] {
+            assert!(is_redirect_status(status), "{status} must be a redirect");
+        }
+        for status in [200u16, 204, 304, 400, 401, 404] {
+            assert!(!is_redirect_status(status), "{status} must not be treated as a redirect");
+        }
     }
 
     #[test]
