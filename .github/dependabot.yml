@@ -36,5 +36,12 @@ updates:
       # this advisory, and it also carries the tao 0.36 fix that the Wayland
       # input-region workaround in `src-tauri/src/desktop.rs` is waiting on -
       # both go away in the same upgrade.
+      #
+      # `versions` matches the release Dependabot would update TO, not the
+      # vulnerable range we are on. The security job targets the fix, 0.20.0,
+      # so that is what has to be ignored - `"< 0.20.0"` would leave 0.20.0 a
+      # valid candidate and the run would still fail. Listing the versions is
+      # also required rather than optional here: under security-updates-only,
+      # Dependabot consults these strings, so a name-only entry is ignored.
       - dependency-name: "glib"
-        versions: ["< 0.20.0"]
+        versions: [">= 0.20.0"]
