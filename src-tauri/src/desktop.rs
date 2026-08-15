@@ -47,6 +47,13 @@ const OAUTH_LOCK_POLL_MS: u64 = 250;
 struct OAuthFlowLock {
     path: std::path::PathBuf,
     attempt_id: String,
+    succeeded: bool,
+}
+
+impl OAuthFlowLock {
+    fn mark_succeeded(&mut self) {
+        self.succeeded = true;
+    }
 }
 
 struct AuthMutationLock {
@@ -61,11 +68,19 @@ impl Drop for AuthMutationLock {
 
 impl Drop for OAuthFlowLock {
     fn drop(&mut self) {
+        // SBS-842: waiters treat a completion file as "the other process
+        // authenticated". Only claim success after tokens are vaulted;
+        // otherwise write an explicit failure so a concurrent waiter
+        // returns Err, not Ok(()).
         let completion = oauth_completion_path(&self.path, &self.attempt_id);
+        let status = if self.succeeded { "ok" } else { "failed" };
         let _ = std::fs::write(
             completion,
-            format!("done={} pid={}
-", now_unix_secs(), std::process::id()),
+            format!(
+                "status={status}\ndone={}\npid={}\n",
+                now_unix_secs(),
+                std::process::id()
+            ),
         );
         let _ = std::fs::remove_file(&self.path);
     }
@@ -161,6 +176,35 @@ fn lock_snapshot_is_expired(snapshot: &OAuthLockSnapshot) -> bool {
 
 fn completion_exists(path: &std::path::Path, attempt_id: &str) -> bool {
     oauth_completion_path(path, attempt_id).exists()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OAuthCompletion {
+    Succeeded,
+    Failed,
+}
+
+fn read_oauth_completion(path: &std::path::Path, attempt_id: &str) -> Option<OAuthCompletion> {
+    let content = std::fs::read_to_string(oauth_completion_path(path, attempt_id)).ok()?;
+    if content.lines().any(|line| line.trim() == "status=failed") {
+        Some(OAuthCompletion::Failed)
+    } else if content.lines().any(|line| line.trim() == "status=ok") {
+        Some(OAuthCompletion::Succeeded)
+    } else if content.contains("done=") {
+        // Pre-SBS-842 files had no status= and were written on every drop.
+        Some(OAuthCompletion::Succeeded)
+    } else {
+        Some(OAuthCompletion::Failed)
+    }
+}
+
+fn oauth_waiter_outcome(path: &std::path::Path, attempt_id: &str) -> Option<Result<(), String>> {
+    match read_oauth_completion(path, attempt_id)? {
+        OAuthCompletion::Succeeded => Some(Ok(())),
+        OAuthCompletion::Failed => Some(Err(
+            "another Toolport process failed to complete OAuth for this server".into(),
+        )),
+    }
 }
 
 fn try_replace_stale_lock(
@@ -289,6 +333,7 @@ fn try_acquire_oauth_lock(path: &std::path::Path) -> Result<Option<OAuthFlowLock
             Ok(Some(OAuthFlowLock {
                 path: path.to_path_buf(),
                 attempt_id,
+                succeeded: false,
             }))
         }
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
@@ -301,6 +346,7 @@ fn try_acquire_oauth_lock(path: &std::path::Path) -> Result<Option<OAuthFlowLock
                 return Ok(Some(OAuthFlowLock {
                     path: path.to_path_buf(),
                     attempt_id,
+                    succeeded: false,
                 }));
             }
             Ok(None)
@@ -314,26 +360,30 @@ fn acquire_or_wait_oauth_lock(
     url: &str,
 ) -> Result<Option<OAuthFlowLock>, String> {
     let path = oauth_lock_path(_server_id, url)?;
+    acquire_or_wait_oauth_lock_at(&path)
+}
+
+fn acquire_or_wait_oauth_lock_at(path: &std::path::Path) -> Result<Option<OAuthFlowLock>, String> {
     let mut observed_attempt_id: Option<String> = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(OAUTH_LOCK_WAIT_SECS);
     loop {
-        if let Some(lock) = try_acquire_oauth_lock(&path)? {
+        if let Some(lock) = try_acquire_oauth_lock(path)? {
             if let Some(attempt_id) = &observed_attempt_id {
-                if completion_exists(&path, attempt_id) {
+                if let Some(outcome) = oauth_waiter_outcome(path, attempt_id) {
                     drop(lock);
-                    return Ok(None);
+                    return outcome.map(|()| None);
                 }
             }
             return Ok(Some(lock));
         }
-        if let Some(snapshot) = read_oauth_lock_snapshot(&path)? {
+        if let Some(snapshot) = read_oauth_lock_snapshot(path)? {
             if let Some(attempt_id) = snapshot.attempt_id {
                 observed_attempt_id = Some(attempt_id);
             }
         }
         if let Some(attempt_id) = &observed_attempt_id {
-            if completion_exists(&path, attempt_id) {
-                return Ok(None);
+            if let Some(outcome) = oauth_waiter_outcome(path, attempt_id) {
+                return outcome.map(|()| None);
             }
         }
         if std::time::Instant::now() >= deadline {
@@ -3062,7 +3112,7 @@ async fn authenticate_oauth(
     server_id: String,
     url: String,
 ) -> Result<(), String> {
-    let Some(_lock) = acquire_or_wait_oauth_lock(&server_id, &url)? else {
+    let Some(mut lock) = acquire_or_wait_oauth_lock(&server_id, &url)? else {
         // Another process completed the OAuth flow for this same server while we waited.
         return Ok(());
     };
@@ -3087,6 +3137,7 @@ async fn authenticate_oauth(
     )?;
     secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &res.access_token)?;
     bump_secrets_generation(state.inner());
+    lock.mark_succeeded();
     Ok(())
 }
 
@@ -5567,6 +5618,113 @@ mod tests {
         let _ = std::fs::remove_file(stale_done);
         let _ = std::fs::remove_file(oauth_completion_path(&path, &attempt_id));
         let _ = std::fs::remove_file(path);
+    }
+
+    fn unique_oauth_lock_path(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("conduit-oauth-lock-{label}-{unique}.lock"))
+    }
+
+    fn cleanup_oauth_lock(path: &std::path::Path, attempt_ids: &[&str]) {
+        for attempt_id in attempt_ids {
+            let _ = std::fs::remove_file(oauth_completion_path(path, attempt_id));
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn oauth_lock_drop_without_success_is_a_failed_completion() {
+        let path = unique_oauth_lock_path("fail-drop");
+        let lock = try_acquire_oauth_lock(&path)
+            .expect("lock acquisition should not fail")
+            .expect("lock should be acquired");
+        let attempt_id = lock.attempt_id.clone();
+        drop(lock);
+        assert_eq!(
+            read_oauth_completion(&path, &attempt_id),
+            Some(OAuthCompletion::Failed),
+            "Drop without mark_succeeded must not look like a finished sign-in"
+        );
+        assert_eq!(
+            oauth_waiter_outcome(&path, &attempt_id)
+                .expect("failure completion should produce an outcome")
+                .expect_err("waiter must not treat a failed flow as success"),
+            "another Toolport process failed to complete OAuth for this server"
+        );
+        cleanup_oauth_lock(&path, &[&attempt_id]);
+    }
+
+    #[test]
+    fn oauth_lock_drop_after_success_is_an_ok_completion() {
+        let path = unique_oauth_lock_path("ok-drop");
+        let mut lock = try_acquire_oauth_lock(&path)
+            .expect("lock acquisition should not fail")
+            .expect("lock should be acquired");
+        let attempt_id = lock.attempt_id.clone();
+        lock.mark_succeeded();
+        drop(lock);
+        assert_eq!(
+            read_oauth_completion(&path, &attempt_id),
+            Some(OAuthCompletion::Succeeded)
+        );
+        assert!(
+            oauth_waiter_outcome(&path, &attempt_id)
+                .expect("success completion should produce an outcome")
+                .is_ok(),
+            "a vaulted first flow must still let a waiter treat the attempt as done"
+        );
+        cleanup_oauth_lock(&path, &[&attempt_id]);
+    }
+
+    #[test]
+    fn oauth_waiter_returns_err_when_first_flow_fails() {
+        let path = unique_oauth_lock_path("fail-wait");
+        let lock = try_acquire_oauth_lock(&path)
+            .expect("lock acquisition should not fail")
+            .expect("lock should be acquired");
+        let first_attempt = lock.attempt_id.clone();
+        let wait_path = path.clone();
+        let waiter = std::thread::spawn(move || acquire_or_wait_oauth_lock_at(&wait_path));
+        // Let the waiter observe the live lock before we fail it (SBS-842).
+        std::thread::sleep(Duration::from_millis(OAUTH_LOCK_POLL_MS * 2));
+        drop(lock);
+        let outcome = waiter.join().expect("waiter thread should finish");
+        let err = match outcome {
+            Err(e) => e,
+            Ok(None) => panic!("failed first flow must not report waiter success"),
+            Ok(Some(_)) => panic!("failed first flow must not start a second browser"),
+        };
+        assert!(
+            err.contains("failed to complete OAuth"),
+            "unexpected waiter error: {err}"
+        );
+        cleanup_oauth_lock(&path, &[&first_attempt]);
+    }
+
+    #[test]
+    fn oauth_waiter_returns_ok_none_when_first_flow_succeeds() {
+        let path = unique_oauth_lock_path("ok-wait");
+        let mut lock = try_acquire_oauth_lock(&path)
+            .expect("lock acquisition should not fail")
+            .expect("lock should be acquired");
+        let first_attempt = lock.attempt_id.clone();
+        let wait_path = path.clone();
+        let waiter = std::thread::spawn(move || acquire_or_wait_oauth_lock_at(&wait_path));
+        std::thread::sleep(Duration::from_millis(OAUTH_LOCK_POLL_MS * 2));
+        lock.mark_succeeded();
+        drop(lock);
+        let outcome = waiter.join().expect("waiter thread should finish");
+        match outcome {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!(
+                "successful first flow should let the waiter finish without a second browser"
+            ),
+            Err(e) => panic!("successful first flow should not error the waiter: {e}"),
+        }
+        cleanup_oauth_lock(&path, &[&first_attempt]);
     }
 
     #[test]
