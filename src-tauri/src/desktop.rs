@@ -2957,12 +2957,15 @@ fn nudge_gateway(state: &RegistryState) {
 
 /// Bump [`Registry::secrets_generation`] and save under the lock so gateways reload even
 /// when only the keychain changed. Increments the FRESH on-disk value (not a stale `+1`) so
-/// a concurrent bump from another writer isn't lost.
-fn bump_secrets_generation(state: &RegistryState) {
-    let _ = write_registry(state, |reg| {
+/// a concurrent bump from another writer isn't lost. Propagates registry write failures:
+/// callers must not report success when the running gateway was never told to reload (#737).
+fn bump_secrets_generation(state: &RegistryState) -> Result<(), String> {
+    write_registry(state, |reg| {
         reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
         Ok(())
-    });
+    })
+    .map(|_| ())
+    .map_err(|e| format!("could not reload the running gateway after the secret change: {e}"))
 }
 
 #[tauri::command]
@@ -2979,7 +2982,11 @@ async fn set_auth_token(app: AppHandle, server_id: String, token: String) -> Res
         // refresh metadata could otherwise overwrite the user's token later.
         remote::clear_oauth_state(&server_id)?;
         secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &token)?;
-        bump_secrets_generation(app.state::<RegistryState>().inner());
+        bump_secrets_generation(app.state::<RegistryState>().inner()).map_err(|e| {
+            // The vault half already succeeded; the user needs to know that and that the
+            // gateway wasn't told (#737).
+            format!("The token was stored in the keychain, but {e}")
+        })?;
         Ok(())
     })
     .await
@@ -2994,7 +3001,13 @@ async fn clear_auth_token(app: AppHandle, server_id: String) -> Result<(), Strin
         // that silently recreates the bearer token the user asked to delete.
         remote::clear_oauth_state(&server_id)?;
         secrets::delete_secret(&server_id, secrets::HTTP_AUTH_KEY)?;
-        bump_secrets_generation(app.state::<RegistryState>().inner());
+        bump_secrets_generation(app.state::<RegistryState>().inner()).map_err(|e| {
+            // The keychain half already succeeded; a token the user believes they just
+            // revoked must not read as cleanly removed when the gateway still serves it.
+            format!(
+                "The token was removed from the keychain, but {e}; the running gateway may still serve it"
+            )
+        })?;
         Ok(())
     })
     .await
@@ -3054,7 +3067,11 @@ async fn authenticate_oauth(
         res.expires_at,
     )?;
     secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &res.access_token)?;
-    bump_secrets_generation(state.inner());
+    bump_secrets_generation(state.inner()).map_err(|e| {
+        // The vault half already succeeded; a fresh sign-in that never reaches the
+        // gateway leaves the user staring at 401s from a server they just authenticated.
+        format!("Sign-in completed and the token was stored, but {e}")
+    })?;
     Ok(())
 }
 
@@ -6260,6 +6277,80 @@ mod tests {
             "fresh-B",
             "refresh_from_disk must not be able to restore stale cached state"
         );
+    }
+
+    /// A failed registry write must not be swallowed: `bump_secrets_generation` returns
+    /// the error so `clear_auth_token` (and friends) can tell the user the keychain half
+    /// succeeded but the running gateway was never told to reload (#737). The registry
+    /// "file" is an existing directory, so the atomic temp+rename save fails fast.
+    #[test]
+    fn bump_secrets_generation_propagates_registry_write_failure() {
+        let _serial = GEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = registry::REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = unique_update_test_dir("bump-failure");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("registry.json")).unwrap();
+
+        let previous = std::env::var_os("TOOLPORT_REGISTRY");
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("TOOLPORT_REGISTRY", value),
+                    None => std::env::remove_var("TOOLPORT_REGISTRY"),
+                }
+            }
+        }
+        let _restore = RestoreEnv(previous);
+        std::env::set_var("TOOLPORT_REGISTRY", dir.join("registry.json"));
+
+        let state: RegistryState = Mutex::new(Registry::default());
+        let err = bump_secrets_generation(&state).expect_err("a failed bump must propagate");
+        assert!(
+            err.contains("could not reload the running gateway"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The happy path: the bump persists the incremented generation so a running gateway
+    /// (which watches the file) reloads with the freshly vaulted credentials.
+    #[test]
+    fn bump_secrets_generation_increments_generation_on_disk() {
+        let _serial = GEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = registry::REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = unique_update_test_dir("bump-success");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+
+        let previous = std::env::var_os("TOOLPORT_REGISTRY");
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("TOOLPORT_REGISTRY", value),
+                    None => std::env::remove_var("TOOLPORT_REGISTRY"),
+                }
+            }
+        }
+        let _restore = RestoreEnv(previous);
+        std::env::set_var("TOOLPORT_REGISTRY", &path);
+
+        let state: RegistryState = Mutex::new(Registry::default());
+        bump_secrets_generation(&state).expect("bump should succeed");
+        let persisted = registry::load_from(&path).expect("registry should exist");
+        assert_eq!(persisted.secrets_generation, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The uncontended reload: nothing touches the cache during the load, so the disk

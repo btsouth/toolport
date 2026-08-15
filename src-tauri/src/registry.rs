@@ -17,6 +17,12 @@ use crate::router::sanitize_segment;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
+/// Serializes tests that read/write the `TOOLPORT_REGISTRY` env var (the env is
+/// process-global, so parallel tests in different modules would otherwise race).
+/// Declared outside the test module so desktop.rs tests can share it too.
+#[cfg(test)]
+pub(crate) static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const REGISTRY_VERSION: u32 = 1;
 
 /// Per-process counter for unique atomic-write temp names.
@@ -2636,8 +2642,6 @@ pub(crate) fn redact_url_userinfo(url: &str) -> String {
 mod tests {
     use super::*;
     use crate::approval::fingerprint_allow_key;
-
-    static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn sample_server(name: &str) -> ServerEntry {
         ServerEntry {
