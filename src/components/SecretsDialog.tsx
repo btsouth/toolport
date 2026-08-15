@@ -258,6 +258,10 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       onChanged?.();
     } catch (e) {
       toastError(secretErrorMessage(e));
+      // A partial failure (keychain removed, gateway reload failed) must not leave
+      // the green "vaulted" badge up: re-probe the authoritative keychain state so
+      // the badge reflects what the backend actually holds (#743).
+      void refreshStatus();
     } finally {
       setBusyKey(null);
     }
@@ -343,7 +347,10 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
     } catch (e) {
       const msg = `${e}`;
       const blankHint = /state mismatch|timed out|closed/i.test(msg);
-      toastError(`OAuth failed: ${msg}`, {
+      // Backend messages are complete sentences and already name the failure
+      // (e.g. "The token was stored in the keychain, but could not reload..."), so
+      // prefixing "OAuth failed:" produced a toast that argued with itself (#743).
+      toastError(msg, {
         description: blankHint
           ? "If the sign-in page was blank, your default browser (e.g. Safari) may block the local redirect. Set Chrome or Brave as default and try once more, or paste an access token above instead."
           : undefined,

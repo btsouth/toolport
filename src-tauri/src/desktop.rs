@@ -2968,6 +2968,36 @@ fn bump_secrets_generation(state: &RegistryState) -> Result<(), String> {
     .map_err(|e| format!("could not reload the running gateway after the secret change: {e}"))
 }
 
+/// Copy for a secret change whose keychain half succeeded but whose gateway reload
+/// failed. Named helpers so the exact wording is reachable from tests; the frontend
+/// shows these messages as-is, so they must stand alone without a "failed" prefix
+/// (they would otherwise read as a sentence arguing with itself) (#743).
+fn stored_token_but_reload_failed(e: &str) -> String {
+    format!("The token was stored in the keychain, but {e}")
+}
+
+fn removed_token_but_reload_failed(e: &str) -> String {
+    format!(
+        "The token was removed from the keychain, but {e}; the running gateway may still serve it"
+    )
+}
+
+fn stored_sign_in_token_but_reload_failed(e: &str) -> String {
+    format!("The sign-in token was stored in the keychain, but {e}")
+}
+
+/// The keychain half of `clear_auth_token`, extracted from the Tauri command so the
+/// whole clear-token path (not just the bump) is reachable from tests (#743).
+fn clear_auth_token_inner(server_id: &str, state: &RegistryState) -> Result<(), String> {
+    let _mutation = acquire_auth_mutation_lock(server_id)?;
+    // Remove refresh metadata first so a second-write failure cannot leave state
+    // that silently recreates the bearer token the user asked to delete.
+    remote::clear_oauth_state(server_id)?;
+    secrets::delete_secret(server_id, secrets::HTTP_AUTH_KEY)?;
+    bump_secrets_generation(state).map_err(|e| removed_token_but_reload_failed(&e))?;
+    Ok(())
+}
+
 #[tauri::command]
 fn take_registry_recovery_notice() -> Option<registry::RegistryRecoveryNotice> {
     registry::take_recovery_notice()
@@ -2985,7 +3015,7 @@ async fn set_auth_token(app: AppHandle, server_id: String, token: String) -> Res
         bump_secrets_generation(app.state::<RegistryState>().inner()).map_err(|e| {
             // The vault half already succeeded; the user needs to know that and that the
             // gateway wasn't told (#737).
-            format!("The token was stored in the keychain, but {e}")
+            stored_token_but_reload_failed(&e)
         })?;
         Ok(())
     })
@@ -2996,19 +3026,7 @@ async fn set_auth_token(app: AppHandle, server_id: String, token: String) -> Res
 #[tauri::command]
 async fn clear_auth_token(app: AppHandle, server_id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let _mutation = acquire_auth_mutation_lock(&server_id)?;
-        // Remove refresh metadata first so a second-write failure cannot leave state
-        // that silently recreates the bearer token the user asked to delete.
-        remote::clear_oauth_state(&server_id)?;
-        secrets::delete_secret(&server_id, secrets::HTTP_AUTH_KEY)?;
-        bump_secrets_generation(app.state::<RegistryState>().inner()).map_err(|e| {
-            // The keychain half already succeeded; a token the user believes they just
-            // revoked must not read as cleanly removed when the gateway still serves it.
-            format!(
-                "The token was removed from the keychain, but {e}; the running gateway may still serve it"
-            )
-        })?;
-        Ok(())
+        clear_auth_token_inner(&server_id, app.state::<RegistryState>().inner())
     })
     .await
     .map_err(|e| format!("keychain task join failed: {e}"))?
@@ -3070,7 +3088,7 @@ async fn authenticate_oauth(
     bump_secrets_generation(state.inner()).map_err(|e| {
         // The vault half already succeeded; a fresh sign-in that never reaches the
         // gateway leaves the user staring at 401s from a server they just authenticated.
-        format!("Sign-in completed and the token was stored, but {e}")
+        stored_sign_in_token_but_reload_failed(&e)
     })?;
     Ok(())
 }
@@ -6349,6 +6367,90 @@ mod tests {
         bump_secrets_generation(&state).expect("bump should succeed");
         let persisted = registry::load_from(&path).expect("registry should exist");
         assert_eq!(persisted.secrets_generation, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The three partial-failure messages are the exact copy users see (the frontend
+    /// shows them as-is, without an "OAuth failed:" prefix), so pin them here to keep
+    /// the wording deliberate and non-contradictory (#743).
+    #[test]
+    fn partial_secret_change_messages_state_the_outcome() {
+        assert_eq!(
+            stored_token_but_reload_failed("could not reload the running gateway"),
+            "The token was stored in the keychain, but could not reload the running gateway"
+        );
+        assert_eq!(
+            removed_token_but_reload_failed("could not reload the running gateway"),
+            "The token was removed from the keychain, but could not reload the running gateway; \
+             the running gateway may still serve it"
+        );
+        assert_eq!(
+            stored_sign_in_token_but_reload_failed("could not reload the running gateway"),
+            "The sign-in token was stored in the keychain, but could not reload the running gateway"
+        );
+    }
+
+    /// The clear-token path (not just the bump): with a file-backed keychain, a registry
+    /// write failure must surface the partial state — the token is gone from the keychain
+    /// but the running gateway was never told to reload (#737, #743).
+    #[test]
+    fn clear_auth_token_propagates_reload_failure_after_keychain_removal() {
+        let _serial = GEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = registry::REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _data = registry::data_dir_test_lock();
+        let dir = unique_update_test_dir("clear-auth-reload-fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The registry "file" is an existing directory, so the atomic temp+rename
+        // save fails fast and `bump_secrets_generation` must propagate the failure.
+        std::fs::create_dir_all(dir.join("registry.json")).unwrap();
+        let _override = registry::DataDirOverride::set(&dir);
+
+        let previous_key = std::env::var_os("TOOLPORT_SECRET_KEY");
+        struct RestoreKey(Option<std::ffi::OsString>);
+        impl Drop for RestoreKey {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("TOOLPORT_SECRET_KEY", value),
+                    None => std::env::remove_var("TOOLPORT_SECRET_KEY"),
+                }
+            }
+        }
+        let _restore_key = RestoreKey(previous_key);
+        std::env::set_var("TOOLPORT_SECRET_KEY", "test-secret-key-for-clear-auth");
+
+        let previous = std::env::var_os("TOOLPORT_REGISTRY");
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("TOOLPORT_REGISTRY", value),
+                    None => std::env::remove_var("TOOLPORT_REGISTRY"),
+                }
+            }
+        }
+        let _restore = RestoreEnv(previous);
+        std::env::set_var("TOOLPORT_REGISTRY", dir.join("registry.json"));
+
+        // A real vaulted token so the delete half has something to remove.
+        secrets::set_secret("srv-clear-auth", secrets::HTTP_AUTH_KEY, "tok-123").unwrap();
+        assert_eq!(
+            secrets::get_secret_result("srv-clear-auth", secrets::HTTP_AUTH_KEY).unwrap(),
+            Some("tok-123".to_string())
+        );
+
+        let state: RegistryState = Mutex::new(Registry::default());
+        let err = clear_auth_token_inner("srv-clear-auth", &state)
+            .expect_err("a failed bump must propagate on the clear path");
+        assert!(
+            err.contains("removed from the keychain"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("may still serve it"), "unexpected error: {err}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
