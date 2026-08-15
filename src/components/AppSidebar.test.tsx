@@ -343,3 +343,87 @@ describe("AppSidebar accessibility", () => {
     expect(checkForUpdate).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("AppSidebar quarantine badge", () => {
+  function renderSidebar() {
+    return render(
+      <TooltipProvider>
+        <AppSidebar
+          clients={[client()]}
+          registry={null}
+          onRegistryChange={vi.fn()}
+          selectedClientId={null}
+          onSelectClient={vi.fn()}
+          view="servers"
+          onSelectView={vi.fn()}
+          onReplayOnboarding={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+  }
+
+  function quarantinedTool(over: Partial<import("@/lib/api").QuarantinedTool> = {}) {
+    return {
+      server: "linear",
+      tool: "linear__save_issue",
+      reason: "a destructive tool's definition changed",
+      ts: Date.now(),
+      profile: "",
+      ...over,
+    };
+  }
+
+  it("shows the blocked-tool count once the poll confirms a count", async () => {
+    listQuarantined.mockResolvedValue([
+      quarantinedTool({ tool: "a" }),
+      quarantinedTool({ tool: "b" }),
+    ]);
+
+    renderSidebar();
+
+    expect(await screen.findByLabelText("2 tools blocked")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Quarantine status unknown")).not.toBeInTheDocument();
+  });
+
+  it("shows no badge on a confirmed clean state", async () => {
+    listQuarantined.mockResolvedValue([]);
+
+    renderSidebar();
+
+    await waitFor(() => expect(listQuarantined).toHaveBeenCalled());
+    expect(screen.queryByLabelText("Quarantine status unknown")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/tool\s?blocked/)).not.toBeInTheDocument();
+  });
+
+  it("does not present a failed poll as an all-clear (#741)", async () => {
+    listQuarantined.mockRejectedValue(new Error("gateway not reachable"));
+
+    renderSidebar();
+
+    expect(await screen.findByLabelText("Quarantine status unknown")).toBeInTheDocument();
+    expect(screen.queryByLabelText(/tool\s?blocked/)).not.toBeInTheDocument();
+  });
+
+  it("keeps surfacing the unknown state across repeated failures (#741)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      listQuarantined.mockRejectedValue(new Error("gateway not reachable"));
+
+      renderSidebar();
+
+      expect(
+        await screen.findByLabelText("Quarantine status unknown"),
+      ).toBeInTheDocument();
+
+      const callsBeforeNextTick = listQuarantined.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+
+      expect(listQuarantined.mock.calls.length).toBeGreaterThan(callsBeforeNextTick);
+      expect(screen.getByLabelText("Quarantine status unknown")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

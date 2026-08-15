@@ -497,7 +497,10 @@ export function AppSidebar({
 }: Props) {
   const [showMissing, setShowMissing] = useState(false);
   const [savings, setSavings] = useState<SavingsSummary | null>(null);
-  const [quarantinedCount, setQuarantinedCount] = useState(0);
+  // `null` means "no confirmed count": the first poll hasn't answered yet or
+  // the last poll failed. It must render distinctly from a confirmed zero so
+  // a gateway that never answered never reads as "all clear" (#741).
+  const [quarantinedCount, setQuarantinedCount] = useState<number | null>(null);
   const sorted = sortClients(clients);
   const detectedClients = sorted.filter((c) => statusOf(c) !== "missing");
   const missingClients = sorted.filter((c) => statusOf(c) === "missing");
@@ -533,7 +536,11 @@ export function AppSidebar({
         .then((q) => {
           if (alive && id === latest) setQuarantinedCount(q.length);
         })
-        .catch(() => {});
+        .catch(() => {
+          // A failed poll must not read as a confirmed zero: surface the
+          // unknown state so the badge never claims "all clear" (#741).
+          if (alive && id === latest) setQuarantinedCount(null);
+        });
     };
     load();
     const id = setInterval(load, 10_000);
@@ -550,7 +557,7 @@ export function AppSidebar({
     label: string,
     active: boolean,
     onClick: () => void,
-    badge?: number,
+    badge?: number | null,
   ) => (
     <button
       onClick={onClick}
@@ -561,12 +568,21 @@ export function AppSidebar({
         className={`size-4 shrink-0 ${active ? "text-primary" : "text-muted-foreground"}`}
       />
       <span>{label}</span>
-      {badge !== undefined && badge > 0 && (
+      {badge !== undefined && badge !== null && badge > 0 && (
         <span
           className="ml-auto inline-flex shrink-0 items-center rounded-full bg-warning/15 px-1.5 text-[10px] font-medium text-warning"
           aria-label={`${badge} tool${badge === 1 ? "" : "s"} blocked`}
         >
           {badge}
+        </span>
+      )}
+      {badge === null && (
+        <span
+          className="ml-auto inline-flex shrink-0 items-center rounded-full bg-warning/15 px-1.5 text-[10px] font-medium text-warning"
+          aria-label="Quarantine status unknown"
+          title="Could not reach the gateway — quarantine status unknown"
+        >
+          ?
         </span>
       )}
     </button>
