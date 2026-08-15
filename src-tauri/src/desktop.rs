@@ -3113,6 +3113,9 @@ async fn search_catalog(query: String) -> Result<Vec<catalog::CatalogEntry>, Str
 }
 
 /// Which of a server's env keys currently have a value stored in the keychain.
+///
+/// Errs on a failed vault read instead of reporting `(key, false)` (SBS-841): a
+/// locked keychain must not make a vaulted env secret look like "not stored".
 #[tauri::command]
 async fn secret_status(server_id: String, keys: Vec<String>) -> Result<Vec<(String, bool)>, String> {
     // Async, like every keychain command here: a Secret Service read is a
@@ -3120,21 +3123,25 @@ async fn secret_status(server_id: String, keys: Vec<String>) -> Result<Vec<(Stri
     // slow keyring, and as sync commands they ran on the GTK main loop,
     // freezing window controls while a dialog probed the vault (SBS-813).
     //
-    // Errs rather than returning an empty list on a worker failure, for the same
-    // reason `has_auth_token` errs (SBS-789): the dialog treats a resolved list
-    // as authoritative and would mark every key unvaulted, while its `catch`
-    // leaves the badges alone. The polled readers below can absorb a panic as an
-    // empty result because they run again in seconds; this is a one-shot probe.
+    // Errs rather than returning an empty list on a worker failure, and rather
+    // than mapping a failed per-key read to `false`, for the same reason
+    // `has_auth_token` / `has_client_secret` err (SBS-789 / SBS-722 / SBS-841):
+    // the dialog treats a resolved list as authoritative and would mark every
+    // key unvaulted, while its `catch` leaves the badges alone. `get_secret`
+    // swallows a locked or failed keyring into `None`; the presence probe must
+    // use `get_secret_result` so that becomes `Err`. The polled readers below
+    // can absorb a panic as an empty result because they run again in seconds;
+    // this is a one-shot probe.
     tauri::async_runtime::spawn_blocking(move || {
         keys.into_iter()
             .map(|k| {
-                let present = secrets::get_secret(&server_id, &k).is_some();
-                (k, present)
+                let present = secrets::get_secret_result(&server_id, &k)?.is_some();
+                Ok((k, present))
             })
-            .collect()
+            .collect::<Result<Vec<_>, String>>()
     })
     .await
-    .map_err(|e| format!("keychain task join failed: {e}"))
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 /// Open Toolport's data directory (registry, logs, audit) in the OS file manager,
@@ -5212,6 +5219,23 @@ mod tests {
         assert!(
             result.is_err(),
             "a failed secret read must propagate, not resolve to a boolean: {result:?}"
+        );
+    }
+
+    /// Same fail-closed contract as `has_client_secret` (SBS-841): a locked or
+    /// otherwise failed vault read must not resolve to `(key, false)`, which the
+    /// Secrets dialog treats as "not vaulted" and would overwrite. The reserved
+    /// internal namespace is the deterministic way to make `get_secret_result`
+    /// fail on every platform; `get_secret` swallows that into `None`.
+    #[test]
+    fn secret_status_reports_a_failed_read_as_an_error_not_missing() {
+        let result = tauri::async_runtime::block_on(secret_status(
+            "__toolport_internal__".to_string(),
+            vec!["SOME_KEY".to_string()],
+        ));
+        assert!(
+            result.is_err(),
+            "a failed secret read must propagate, not resolve to unvaulted: {result:?}"
         );
     }
 
