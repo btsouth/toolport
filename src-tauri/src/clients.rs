@@ -2820,8 +2820,21 @@ fn backup_file_named(
 ) -> Result<Option<PathBuf>, String> {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() && meta.len() <= MAX_CONFIG_BYTES => {}
-        // Missing, special file, or oversized: nothing safe to back up.
-        _ => return Ok(None),
+        // Genuinely missing: nothing to back up yet, and the caller may create
+        // the file from scratch. Special file or oversized: deliberately nothing
+        // safe to back up (kept from the original behaviour).
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // A stat that failed for any other reason (permission, network share,
+        // transient I/O) must NOT read as "no file here": the caller would then
+        // treat the config as absent, start from an empty document, and overwrite
+        // the user's real file with no backup to recover it.
+        Err(e) => {
+            return Err(format!(
+                "could not stat {} before backing it up: {e}",
+                path.display()
+            ))
+        }
     }
     let dir = backup_dir(client_id).ok_or("Could not resolve backup dir")?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -5629,6 +5642,57 @@ mod tests {
             left.contains("10000000000000-config.yaml"),
             "a lexical sort would have deleted this newer backup instead: {left:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SBS-735: a stat that fails for a reason other than "missing" must abort
+    /// the write, not read as "no file to back up". A metadata error on a config
+    /// whose path sits on an unreadable network share was folded into the same
+    /// `Ok(None)` as a genuinely absent file, so the caller started from an
+    /// empty document and overwrote the user's config with no recovery copy.
+    #[test]
+    fn backup_propagates_stat_failures_instead_of_noop() {
+        // A directory path makes metadata() succeed but is_file() fail -> still
+        // the deliberate Ok(None) "nothing safe to back up" case. Use a path
+        // whose parent cannot be traversed so metadata() itself errors.
+        let dir = std::env::temp_dir().join(format!("toolport-bk-stat-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.json");
+        std::fs::write(&file, "{}").unwrap();
+        // metadata(file/child) fails: file is a regular file, so traversing into
+        // it is ENOTDIR on unix (NotADirectory) / ERROR_DIRECTORY on Windows.
+        let broken = file.join("child.json");
+
+        let err = backup_file_named("claude-desktop", &broken, "child.json").unwrap_err();
+        assert!(
+            err.contains("could not stat"),
+            "a stat failure must be reported, not treated as no backup: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SBS-735 acceptance: a write must not proceed when the app could not tell
+    /// whether an existing file was there. Drive the full caller (`write_servers`)
+    /// with CLAUDE_CONFIG_DIR pointed at a path whose parent is a regular file, so
+    /// the pre-write backup stat fails and the write must abort.
+    #[test]
+    fn write_servers_aborts_when_backup_stat_fails() {
+        let dir = std::env::temp_dir().join(format!("toolport-bk-write-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        // Parent-of-config is a regular file: metadata(config) fails ENOTDIR.
+        let not_a_dir = dir.join("claude-home");
+        std::fs::write(&not_a_dir, "not a directory").unwrap();
+        let _restore = EnvRestore::set("CLAUDE_CONFIG_DIR", &not_a_dir);
+
+        let err = write_servers("claude-code", &[stdio("filesystem")]).unwrap_err();
+        assert!(
+            err.contains("could not stat"),
+            "the caller must surface the stat failure instead of writing: {err}"
+        );
+        // No destructive write happened: the "config" file was never created.
+        assert!(!not_a_dir.join(".claude.json").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
