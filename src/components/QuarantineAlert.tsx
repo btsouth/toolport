@@ -124,11 +124,28 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
       // The card can span profiles (the same tool may be blocked in one and fine in
       // another), and the store is per-profile, so clear each one it covers.
       const profiles = [...new Set(items.map((q) => q.profile))];
-      const outcomes = await Promise.all(profiles.map((p) => releaseAllQuarantine(p)));
+      // allSettled, not all: one profile's store being locked must not throw away the
+      // outcome of the profiles that did succeed, nor skip the refresh that takes
+      // their tools off the card. With Promise.all the card kept listing tools that
+      // were already released, and the count never came down.
+      const settled = await Promise.allSettled(
+        profiles.map((p) => releaseAllQuarantine(p)),
+      );
+      const outcomes = settled.flatMap((r) =>
+        r.status === "fulfilled" ? [r.value] : [],
+      );
+      const failed = settled.flatMap((r) => (r.status === "rejected" ? [r.reason] : []));
       const released = outcomes.reduce((n, o) => n + o.released, 0);
       const skipped = outcomes.flatMap((o) => o.skipped);
       await refresh();
-      if (skipped.length > 0) {
+      if (failed.length > 0) {
+        // Say what did get through, so the number still on the card adds up.
+        toastError(
+          `Re-approved ${released}. ${failed.length} profile${
+            failed.length === 1 ? "" : "s"
+          } could not be re-approved: ${failed[0]}`,
+        );
+      } else if (skipped.length > 0) {
         // Not a success: these are still blocked, and saying otherwise would send the
         // user away believing the catalog is whole.
         toastError(

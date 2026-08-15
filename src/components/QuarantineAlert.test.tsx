@@ -148,6 +148,34 @@ describe("QuarantineAlert bulk re-approval", () => {
     expect(toastSuccess).not.toHaveBeenCalled();
     expect(screen.getByRole("region")).toBeInTheDocument();
   });
+
+  it("still counts and refreshes the profiles that succeeded when one fails", async () => {
+    // One locked store must not discard the other profile's result. With Promise.all
+    // the whole batch was thrown away: the tools that really were released stayed on
+    // the card, and the count never came down.
+    listQuarantined.mockResolvedValueOnce([
+      ...catalog(2, "default"),
+      ...catalog(2, "work"),
+    ]);
+    releaseAllQuarantine
+      .mockResolvedValueOnce({ released: 2, skipped: [] })
+      .mockRejectedValueOnce(new Error("store locked"));
+    listQuarantined.mockResolvedValue(catalog(2, "work"));
+
+    render(<QuarantineAlert />);
+    await screen.findByRole("region");
+    const pollsBefore = listQuarantined.mock.calls.length;
+    await confirmReapproveAll();
+
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    // The successful profile is reported, not silently dropped.
+    expect(toastError.mock.calls[0][0]).toMatch(/Re-approved 2\./);
+    expect(toastError.mock.calls[0][0]).toMatch(/1 profile could not be re-approved/);
+    expect(toastSuccess).not.toHaveBeenCalled();
+    // The refresh still ran, so the card drops the tools that did come free.
+    expect(listQuarantined.mock.calls.length).toBeGreaterThan(pollsBefore);
+    expect(screen.getByRole("region")).toBeInTheDocument();
+  });
 });
 
 describe("QuarantineAlert", () => {

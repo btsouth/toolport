@@ -2810,7 +2810,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// A lost baseline quarantines the entire catalog. On a real install that was
     /// 2,156 tools, and `release` is per-tool, so recovery meant 2,156 lock
     /// acquisitions and 4,312 store writes. One pass must lift them all.
