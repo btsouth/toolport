@@ -52,9 +52,21 @@ describe("install.sh apt path (SBS-846)", () => {
   });
 
   it("still installs the AppImage as bindir/toolport", () => {
-    expect(script).toContain('curl -fsSL "$url" -o "$bindir/toolport"');
     expect(script).toContain('chmod +x "$bindir/toolport"');
     expect(script).toContain("Installed the AppImage to $bindir/toolport");
+  });
+
+  // SBS-843/#744 moved the AppImage download out of the install path: it stages in
+  // $tmp and is only moved into place after verification, so a corrupt or tampered
+  // download can no longer delete a working install. Assert the STAGING, not just the
+  // final path — the previous assertion pinned the literal `curl -o "$bindir/toolport"`
+  // and so silently described the unsafe shape as the intended one.
+  it("stages the AppImage in tmp and only moves it in after verification", () => {
+    expect(script).toContain('download_and_verify "$url" "$tmp/toolport.AppImage"');
+    expect(script).toContain('mv "$tmp/toolport.AppImage" "$bindir/toolport"');
+    // The direct-to-destination download is what made a failed verification
+    // destructive. It must not come back.
+    expect(script).not.toContain('-o "$bindir/toolport"');
   });
 });
 
