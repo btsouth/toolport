@@ -87,6 +87,11 @@ function vendorFromKey(key: string): string {
 export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   const [open, setOpen] = useState(false);
   const [vaulted, setVaulted] = useState<Record<string, boolean>>({});
+  // Whether the `secretStatus` probe succeeded. Failure must stay unknown
+  // (SBS-841): an empty `vaulted` renders exactly like "nothing is saved" - no
+  // badge, a first-time paste prompt, no Remove button - which is the lie the
+  // backend now refuses to tell. Same rule as `ccSecretProbeError` (SBS-722).
+  const [secretProbeError, setSecretProbeError] = useState(false);
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [newKey, setNewKey] = useState("");
   const [newValue, setNewValue] = useState("");
@@ -148,14 +153,10 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
     const fresh = () => runId === runIdRef.current;
     const vaultFresh = () => vaultRunId === vaultRunIdRef.current;
     if (secretKeys.length > 0) {
-      try {
-        const pairs = await secretStatus(server.id, secretKeys);
-        if (vaultFresh()) setVaulted(Object.fromEntries(pairs));
-      } catch {
-        /* non-fatal */
-      }
+      await probeVaultedKeys(vaultRunId);
     } else {
       setVaulted({});
+      setSecretProbeError(false);
     }
     if (isRemote && server.url) {
       hasAuthToken(server.id)
@@ -202,6 +203,37 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
         .catch(() => {})
         .finally(() => fresh() && setProbing(false));
     }
+  }
+
+  /** Ask which env keys are vaulted, under an already-claimed vault generation.
+   * `secret_status` is all-or-nothing: it errs if any key read fails, so there
+   * is one answer for the whole list and one warning to show. */
+  async function probeVaultedKeys(vaultRunId: number) {
+    try {
+      const pairs = await secretStatus(server.id, secretKeys);
+      if (vaultRunId !== vaultRunIdRef.current) return;
+      setVaulted(Object.fromEntries(pairs));
+      setSecretProbeError(false);
+    } catch {
+      // Unknown ≠ absent (SBS-841). The backend errs on a failed vault read
+      // rather than reporting the key unvaulted; swallowing that here would put
+      // the same lie back on screen - no badge, a first-time paste prompt, no
+      // Remove button - so drop any stale badge and say the check failed.
+      if (vaultRunId !== vaultRunIdRef.current) return;
+      setVaulted({});
+      setSecretProbeError(true);
+    }
+  }
+
+  /** Re-run the env-key probe once the keychain is unlocked. Deliberately not
+   * cleared by a successful `save`: writing one key says nothing about the
+   * others, and only a clean read makes the list authoritative again. */
+  async function retryVaultedKeysProbe() {
+    // A vault probe, so it rides the vault generation: a mutation started while
+    // this retry is in flight must win.
+    const vaultRunId = ++vaultRunIdRef.current;
+    setSecretProbeError(false);
+    await probeVaultedKeys(vaultRunId);
   }
 
   async function retrySecretProbe() {
@@ -706,6 +738,25 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                       <ExternalLink className="size-3" />
                     </button>
                   )}
+                </div>
+              )}
+
+              {/* Without this the failed probe is invisible: every badge and
+                  Remove button is simply missing, which reads as "nothing is
+                  saved here" (SBS-841). */}
+              {secretProbeError && (
+                <div className="rounded-md border border-warning/40 bg-warning/5 p-2.5 text-xs text-warning">
+                  <p>
+                    Couldn't check the keychain, so saved keys aren't shown below. Unlock
+                    it and retry; saving now overwrites anything already stored.
+                  </p>
+                  <button
+                    type="button"
+                    className="mt-1 font-medium underline underline-offset-2"
+                    onClick={() => void retryVaultedKeysProbe()}
+                  >
+                    Retry the keychain check
+                  </button>
                 </div>
               )}
 

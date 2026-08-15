@@ -3132,6 +3132,14 @@ async fn secret_status(server_id: String, keys: Vec<String>) -> Result<Vec<(Stri
     // use `get_secret_result` so that becomes `Err`. The polled readers below
     // can absorb a panic as an empty result because they run again in seconds;
     // this is a one-shot probe.
+    //
+    // All-or-nothing on purpose, rather than a per-key `Option<bool>`. The
+    // realistic failures are process-wide (locked keyring, no Secret Service,
+    // denied keychain access), so a per-key answer would report "unknown" for
+    // every key anyway, while pushing a third state through the dialog's
+    // `vaulted` map at every use site - badge, placeholder, Remove button. One
+    // `Err` maps to the one "couldn't check the keychain" warning the dialog
+    // now shows, and keeps the shape of `has_auth_token` / `has_client_secret`.
     tauri::async_runtime::spawn_blocking(move || {
         keys.into_iter()
             .map(|k| {
