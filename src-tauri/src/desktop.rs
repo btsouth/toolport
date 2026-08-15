@@ -3481,47 +3481,157 @@ fn apply_import(reg: &mut Registry, json: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Mutable loop state for [`watch_registry_for_app`] / [`watch_registry_tick`].
+struct RegistryWatchLoop {
+    /// Last-seen registry-file mtime after a successful load. Advanced on
+    /// identical / applied / lost-race so we do not reload every tick. A
+    /// transient `load_from` failure does not consume it (issue #695).
+    last_mtime: Option<SystemTime>,
+    /// Serialized form of the last applied registry. Identical JSON (an mtime-only
+    /// bump) skips emit but still advances `last_mtime`.
+    last_json: String,
+    /// Last load-failure string, used with `consecutive_failures` to log the
+    /// first failure, changed errors, and periodic reminders without spamming.
+    last_error: Option<String>,
+    /// Consecutive failed loads for bounded exponential retry delay.
+    consecutive_failures: u32,
+}
+
+impl RegistryWatchLoop {
+    /// Seed comparison from the registry value already applied to the app. The
+    /// mtime deliberately starts empty so the first tick validates disk through
+    /// the same load/publish path as every later change.
+    fn from_state(state: &RegistryState) -> Self {
+        let guard = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self {
+            last_mtime: None,
+            last_json: serde_json::to_string(&*guard).unwrap_or_default(),
+            last_error: None,
+            consecutive_failures: 0,
+        }
+    }
+}
+
+/// What one watcher iteration did. Extracted so tests can drive a tick without
+/// the infinite sleep loop or a Tauri `AppHandle` (issue #695).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryWatchTick {
+    Unchanged,
+    LoadFailed,
+    Identical,
+    LostRace,
+    Applied,
+}
+
+fn clear_watch_failure(loop_state: &mut RegistryWatchLoop) {
+    loop_state.consecutive_failures = 0;
+    if loop_state.last_error.take().is_some() {
+        eprintln!("toolport: registry reload recovered");
+    }
+}
+
+/// One iteration of the desktop registry watcher (no sleep).
+///
+/// `mtime`, `load`, and `emit` are parameters so a test can present a changed
+/// mtime, fail the first load, keep that mtime, and succeed on the second tick
+/// — the path `watch_registry_for_app` used to skip forever (issue #695).
+fn watch_registry_tick(
+    state: &RegistryState,
+    loop_state: &mut RegistryWatchLoop,
+    mtime: impl FnOnce() -> Option<SystemTime>,
+    load: impl FnOnce() -> Result<Registry, String>,
+    emit: impl FnOnce(&Registry),
+) -> RegistryWatchTick {
+    let cur = mtime();
+    if cur == loop_state.last_mtime {
+        // A previously failing change may have been rolled back to the last
+        // applied cursor. There is nothing left to retry, so return to the
+        // normal poll interval without claiming a successful recovery.
+        loop_state.consecutive_failures = 0;
+        loop_state.last_error = None;
+        return RegistryWatchTick::Unchanged;
+    }
+    // Sampled BEFORE the load, so any in-memory write racing this read is
+    // visible as a mismatch when we go to apply it (SOU-329).
+    let sampled = registry_generation();
+    let fresh = match load() {
+        Ok(r) => r,
+        Err(e) => {
+            loop_state.consecutive_failures = loop_state.consecutive_failures.saturating_add(1);
+            let error_changed = loop_state.last_error.as_deref() != Some(e.as_str());
+            if watch_failure_should_log(loop_state.consecutive_failures, error_changed) {
+                eprintln!(
+                    "toolport: registry reload failed ({} consecutive failures; will retry): {e}",
+                    loop_state.consecutive_failures
+                );
+            }
+            loop_state.last_error = Some(e);
+            return RegistryWatchTick::LoadFailed;
+        }
+    };
+    let fresh_json = serde_json::to_string(&fresh).unwrap_or_default();
+    if fresh_json == loop_state.last_json {
+        // Identical content (e.g. an mtime bump to nudge the gateway): consume
+        // the cursor so we do not reload every tick, but do not emit.
+        loop_state.last_mtime = cur;
+        clear_watch_failure(loop_state);
+        return RegistryWatchTick::Identical;
+    }
+    if !publish_if_unchanged(state, sampled, &fresh) {
+        // A command wrote a newer registry while we were reading. Consume
+        // `last_mtime` so a retry cannot publish this stale load over the
+        // winner (SOU-329). Leave `last_json` alone so this content is not
+        // remembered as applied, and do not emit: the winning write persisted
+        // to disk, so its mtime change brings us back with the newer value.
+        loop_state.last_mtime = cur;
+        clear_watch_failure(loop_state);
+        return RegistryWatchTick::LostRace;
+    }
+    loop_state.last_mtime = cur;
+    loop_state.last_json = fresh_json;
+    clear_watch_failure(loop_state);
+    emit(&fresh);
+    RegistryWatchTick::Applied
+}
+
+fn watch_retry_delay(consecutive_failures: u32) -> Duration {
+    const BASE_MS: u64 = 1500;
+    const CAP_MS: u64 = 60_000;
+    let exponent = consecutive_failures.saturating_sub(1).min(6);
+    Duration::from_millis((BASE_MS << exponent).min(CAP_MS))
+}
+
+fn watch_failure_should_log(consecutive_failures: u32, error_changed: bool) -> bool {
+    consecutive_failures > 0
+        && (consecutive_failures == 1 || error_changed || consecutive_failures % 20 == 0)
+}
+
 /// Watch the registry file and mirror external changes (e.g. an agent enabling a
 /// server through the gateway) back into the app's in-memory state, then nudge the
 /// UI to refetch. Without this, a gateway-written change would be invisible to the
 /// app and clobbered by its next save. Polls mtime (the gateway uses the same
-/// approach) and skips identical touches so an mtime-only bump doesn't churn the UI.
+/// approach), skips identical touches so an mtime-only bump doesn't churn the UI,
+/// and backs off repeated load failures without consuming their mtime.
 fn watch_registry_for_app(handle: tauri::AppHandle) {
     let Some(path) = registry::resolved_path() else {
         return;
     };
     let mtime = |p: &std::path::Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
-    let mut last = mtime(&path);
-    let mut last_json = registry::load_from(&path)
-        .ok()
-        .and_then(|r| serde_json::to_string(&r).ok())
-        .unwrap_or_default();
+    let mut loop_state = RegistryWatchLoop::from_state(&handle.state::<RegistryState>());
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        let cur = mtime(&path);
-        if cur == last {
-            continue;
-        }
-        last = cur;
-        // Sampled BEFORE the load, so any in-memory write racing this read is
-        // visible as a mismatch when we go to apply it (SOU-329).
-        let sampled = registry_generation();
-        let Ok(fresh) = registry::load_from(&path) else {
-            continue; // half-written file; retry next tick
-        };
-        let fresh_json = serde_json::to_string(&fresh).unwrap_or_default();
-        if fresh_json == last_json {
-            continue; // identical content (e.g. an mtime bump to nudge the gateway)
-        }
-        if !publish_if_unchanged(&handle.state::<RegistryState>(), sampled, &fresh) {
-            // A command wrote a newer registry while we were reading. Leave
-            // `last_json` alone so this content is not remembered as applied, and
-            // do not emit: the winning write persisted to disk, so its mtime change
-            // brings us back here with the newer value.
-            continue;
-        }
-        last_json = fresh_json;
-        let _ = handle.emit("registry-changed", &fresh);
+        let registry_state = handle.state::<RegistryState>();
+        let _ = watch_registry_tick(
+            &registry_state,
+            &mut loop_state,
+            || mtime(&path),
+            || registry::load_from(&path),
+            |fresh| {
+                let _ = handle.emit("registry-changed", fresh);
+            },
+        );
+        std::thread::sleep(watch_retry_delay(loop_state.consecutive_failures));
     }
 }
 
@@ -6171,6 +6281,356 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(only_server(&guard), "first");
+    }
+
+    // ----- issue #695: a failed load must not consume the mtime cursor --------
+
+    fn watch_mtime(offset_secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_700_000_000 + offset_secs)
+    }
+
+    fn json_of(reg: &Registry) -> String {
+        serde_json::to_string(reg).unwrap()
+    }
+
+    fn seeded_watch(tag: &str, mtime: SystemTime) -> RegistryWatchLoop {
+        RegistryWatchLoop {
+            last_mtime: Some(mtime),
+            last_json: json_of(&registry_named(tag)),
+            last_error: None,
+            consecutive_failures: 0,
+        }
+    }
+
+    fn tick_watch(
+        state: &RegistryState,
+        loop_state: &mut RegistryWatchLoop,
+        mtime: Option<SystemTime>,
+        load: impl FnOnce() -> Result<Registry, String>,
+        emitted: &std::cell::RefCell<Vec<String>>,
+    ) -> RegistryWatchTick {
+        watch_registry_tick(
+            state,
+            loop_state,
+            || mtime,
+            load,
+            |r| {
+                emitted.borrow_mut().push(only_server(r).to_string());
+            },
+        )
+    }
+
+    fn cache_tag(state: &RegistryState) -> String {
+        only_server(
+            &state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .to_string()
+    }
+
+    /// The defect in #695: the watcher recorded a new mtime before `load_from`
+    /// succeeded. A lock timeout (or corrupt file with no backup) then left the
+    /// next tick seeing the same mtime and skipping forever, so a later successful
+    /// read of that same file never published.
+    #[test]
+    fn registry_watch_retries_same_mtime_after_transient_load_failure() {
+        let _serial = GEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state: RegistryState = Mutex::new(registry_named("old"));
+        let mut loop_state = seeded_watch("old", watch_mtime(0));
+        let emitted = std::cell::RefCell::new(Vec::new());
+
+        let first = tick_watch(
+            &state,
+            &mut loop_state,
+            Some(watch_mtime(1)),
+            || {
+                Err(
+                    "The registry is locked by another Toolport process (os error); try again."
+                        .into(),
+                )
+            },
+            &emitted,
+        );
+        assert_eq!(first, RegistryWatchTick::LoadFailed);
+        assert_eq!(loop_state.consecutive_failures, 1);
+        assert_eq!(
+            loop_state.last_mtime,
+            Some(watch_mtime(0)),
+            "a failed load must not consume the change"
+        );
+        assert_eq!(loop_state.last_json, json_of(&registry_named("old")));
+        assert!(emitted.borrow().is_empty(), "a failed load must not emit");
+        assert_eq!(cache_tag(&state), "old");
+
+        let second = tick_watch(
+            &state,
+            &mut loop_state,
+            Some(watch_mtime(1)),
+            || Ok(registry_named("new")),
+            &emitted,
+        );
+        assert_eq!(
+            second,
+            RegistryWatchTick::Applied,
+            "the same mtime must be retried once the lock is free"
+        );
+        assert_eq!(loop_state.last_mtime, Some(watch_mtime(1)));
+        assert_eq!(loop_state.last_json, json_of(&registry_named("new")));
+        assert_eq!(loop_state.consecutive_failures, 0);
+        assert_eq!(emitted.borrow().as_slice(), ["new"]);
+        assert_eq!(cache_tag(&state), "new");
+        assert!(
+            loop_state.last_error.is_none(),
+            "a successful apply clears the logged error so a later failure can print again"
+        );
+    }
+
+    /// An mtime-only bump (the gateway nudge) must consume the cursor so we do
+    /// not reload every tick, and must not churn the UI.
+    #[test]
+    fn registry_watch_identical_content_advances_mtime_without_emitting() {
+        let _serial = GEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old = registry_named("old");
+        let state: RegistryState = Mutex::new(old.clone());
+        let mut loop_state = seeded_watch("old", watch_mtime(0));
+        let emitted = std::cell::RefCell::new(Vec::new());
+
+        let outcome = tick_watch(
+            &state,
+            &mut loop_state,
+            Some(watch_mtime(1)),
+            || Ok(old.clone()),
+            &emitted,
+        );
+        assert_eq!(outcome, RegistryWatchTick::Identical);
+        assert_eq!(loop_state.last_mtime, Some(watch_mtime(1)));
+        assert_eq!(loop_state.last_json, json_of(&old));
+        assert!(emitted.borrow().is_empty());
+
+        let mut loaded = false;
+        let quiet = watch_registry_tick(
+            &state,
+            &mut loop_state,
+            || Some(watch_mtime(1)),
+            || {
+                loaded = true;
+                Ok(old.clone())
+            },
+            |_| panic!("identical content must not emit"),
+        );
+        assert_eq!(quiet, RegistryWatchTick::Unchanged);
+        assert!(
+            !loaded,
+            "a consumed identical mtime must not load again until the file moves"
+        );
+    }
+
+    /// A SOU-329 lost race must consume the mtime. Retrying the same cursor
+    /// would publish stale disk over the newer cache the generation guard just
+    /// protected. The winner persisted, so a later mtime still reaches load.
+    #[test]
+    fn registry_watch_lost_race_consumes_mtime_and_keeps_newer_cache() {
+        let _serial = GEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state: RegistryState = Mutex::new(registry_named("old"));
+        let mut loop_state = seeded_watch("old", watch_mtime(0));
+        let emitted = std::cell::RefCell::new(Vec::new());
+
+        let failed = tick_watch(
+            &state,
+            &mut loop_state,
+            Some(watch_mtime(1)),
+            || Err("registry locked".into()),
+            &emitted,
+        );
+        assert_eq!(failed, RegistryWatchTick::LoadFailed);
+
+        let lost = tick_watch(
+            &state,
+            &mut loop_state,
+            Some(watch_mtime(1)),
+            || {
+                let mut guard = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *guard = registry_named("fresh-B");
+                bump_registry_generation();
+                Ok(registry_named("stale-A"))
+            },
+            &emitted,
+        );
+        assert_eq!(lost, RegistryWatchTick::LostRace);
+        assert_eq!(
+            loop_state.last_mtime,
+            Some(watch_mtime(1)),
+            "a dropped publish must consume the mtime so stale disk cannot retry"
+        );
+        assert_eq!(loop_state.last_json, json_of(&registry_named("old")));
+        assert_eq!(loop_state.consecutive_failures, 0);
+        assert!(loop_state.last_error.is_none());
+        assert!(emitted.borrow().is_empty());
+        assert_eq!(cache_tag(&state), "fresh-B");
+
+        let mut loaded = false;
+        let quiet = watch_registry_tick(
+            &state,
+            &mut loop_state,
+            || Some(watch_mtime(1)),
+            || {
+                loaded = true;
+                Ok(registry_named("from-disk"))
+            },
+            |_| panic!("a lost race must not emit on the same mtime"),
+        );
+        assert_eq!(quiet, RegistryWatchTick::Unchanged);
+        assert!(
+            !loaded,
+            "a consumed lost-race mtime must not load again until the file moves"
+        );
+        assert_eq!(cache_tag(&state), "fresh-B");
+
+        let persisted = tick_watch(
+            &state,
+            &mut loop_state,
+            Some(watch_mtime(2)),
+            || Ok(registry_named("fresh-B")),
+            &emitted,
+        );
+        assert_eq!(
+            persisted,
+            RegistryWatchTick::Applied,
+            "the winner's later mtime must still be loadable"
+        );
+        assert_eq!(loop_state.last_mtime, Some(watch_mtime(2)));
+        assert_eq!(emitted.borrow().as_slice(), ["fresh-B"]);
+        assert_eq!(cache_tag(&state), "fresh-B");
+    }
+
+    /// The app loads the registry before the watcher thread starts. If another
+    /// process persists B in that startup window, the watcher's first tick must
+    /// compare disk against the already-applied in-memory A and publish B. A
+    /// separate priming load used to remember B without applying it, leaving the
+    /// UI stale indefinitely.
+    #[test]
+    fn registry_watch_startup_disk_change_is_applied_on_first_tick() {
+        let _serial = GEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state: RegistryState = Mutex::new(registry_named("startup-A"));
+        let mut loop_state = RegistryWatchLoop::from_state(&state);
+        let emitted = std::cell::RefCell::new(Vec::new());
+
+        let outcome = tick_watch(
+            &state,
+            &mut loop_state,
+            Some(watch_mtime(1)),
+            || Ok(registry_named("disk-B")),
+            &emitted,
+        );
+
+        assert_eq!(outcome, RegistryWatchTick::Applied);
+        assert_eq!(loop_state.last_mtime, Some(watch_mtime(1)));
+        assert_eq!(loop_state.last_json, json_of(&registry_named("disk-B")));
+        assert_eq!(emitted.borrow().as_slice(), ["disk-B"]);
+        assert_eq!(cache_tag(&state), "disk-B");
+    }
+
+    #[test]
+    fn registry_watch_retry_delay_is_bounded() {
+        assert_eq!(watch_retry_delay(0), Duration::from_millis(1500));
+        assert_eq!(watch_retry_delay(1), Duration::from_millis(1500));
+        assert_eq!(watch_retry_delay(2), Duration::from_millis(3000));
+        assert_eq!(watch_retry_delay(3), Duration::from_millis(6000));
+        assert_eq!(watch_retry_delay(6), Duration::from_millis(48000));
+        assert_eq!(watch_retry_delay(7), Duration::from_millis(60000));
+        assert_eq!(watch_retry_delay(u32::MAX), Duration::from_millis(60000));
+    }
+
+    #[test]
+    fn registry_watch_failure_diagnostics_are_throttled() {
+        assert!(!watch_failure_should_log(0, false));
+        assert!(watch_failure_should_log(1, false));
+        assert!(!watch_failure_should_log(2, false));
+        assert!(!watch_failure_should_log(19, false));
+        assert!(watch_failure_should_log(20, false));
+        assert!(watch_failure_should_log(2, true));
+    }
+
+    #[test]
+    fn registry_watch_reverted_mtime_clears_pending_failure_backoff() {
+        let state: RegistryState = Mutex::new(registry_named("old"));
+        let mut loop_state = seeded_watch("old", watch_mtime(0));
+        let emitted = std::cell::RefCell::new(Vec::new());
+
+        let failed = tick_watch(
+            &state,
+            &mut loop_state,
+            Some(watch_mtime(1)),
+            || Err("registry locked".into()),
+            &emitted,
+        );
+        assert_eq!(failed, RegistryWatchTick::LoadFailed);
+
+        let mut loaded = false;
+        let reverted = tick_watch(
+            &state,
+            &mut loop_state,
+            Some(watch_mtime(0)),
+            || {
+                loaded = true;
+                Ok(registry_named("should-not-load"))
+            },
+            &emitted,
+        );
+        assert_eq!(reverted, RegistryWatchTick::Unchanged);
+        assert!(!loaded);
+        assert_eq!(loop_state.consecutive_failures, 0);
+        assert!(loop_state.last_error.is_none());
+    }
+
+    /// A failed first tick must leave the startup cursor empty and retry the same
+    /// observed mtime once the registry becomes readable.
+    #[test]
+    fn registry_watch_startup_failure_retries_same_mtime() {
+        let _serial = GEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state: RegistryState = Mutex::new(registry_named("startup"));
+        let mut loop_state = RegistryWatchLoop::from_state(&state);
+        let emitted = std::cell::RefCell::new(Vec::new());
+
+        let first = tick_watch(
+            &state,
+            &mut loop_state,
+            Some(watch_mtime(1)),
+            || Err("The registry is locked by another Toolport process; try again.".into()),
+            &emitted,
+        );
+        assert_eq!(first, RegistryWatchTick::LoadFailed);
+        assert_eq!(loop_state.last_mtime, None);
+        assert_eq!(loop_state.last_json, json_of(&registry_named("startup")));
+        assert_eq!(loop_state.consecutive_failures, 1);
+        assert!(emitted.borrow().is_empty());
+
+        let second = tick_watch(
+            &state,
+            &mut loop_state,
+            Some(watch_mtime(1)),
+            || Ok(registry_named("from-disk")),
+            &emitted,
+        );
+        assert_eq!(second, RegistryWatchTick::Applied);
+        assert_eq!(loop_state.last_mtime, Some(watch_mtime(1)));
+        assert_eq!(loop_state.consecutive_failures, 0);
+        assert_eq!(emitted.borrow().as_slice(), ["from-disk"]);
+        assert_eq!(cache_tag(&state), "from-disk");
+        assert!(loop_state.last_error.is_none());
     }
 
     /// SBS-524: whitespace decides only whether the field was blank; the value
