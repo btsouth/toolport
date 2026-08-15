@@ -979,8 +979,39 @@ fn zed_path() -> Option<PathBuf> {
 /// Hermes keeps MCP servers in ~/.hermes/config.yaml under the `mcp_servers:` key.
 /// The file is YAML and also holds the user's model and platform toolsets config,
 /// so it's read leniently and never wiped on a parse failure.
+///
+/// The Windows desktop build does NOT use the home-anchored path: it writes
+/// `%LOCALAPPDATA%\hermes\config.yaml` (lowercase dir), so resolving only
+/// `~/.hermes` made an installed Hermes undetectable there and there was no way
+/// to connect it. Same shape as [`crush_path`]: keep the canonical path as the
+/// answer, and prefer the platform location only when it actually holds a file,
+/// so a fresh install still writes where the docs say.
 fn hermes_path() -> Option<PathBuf> {
-    client_config_path("hermes")
+    let canonical = client_config_path("hermes")?;
+    // Only the Windows build uses the platform data dir. Passing None elsewhere
+    // keeps macOS and Linux on the home-anchored path with no probing at all.
+    let local = if cfg!(windows) {
+        dirs::data_local_dir()
+    } else {
+        None
+    };
+    Some(resolve_hermes_path(canonical, local))
+}
+
+/// Body of [`hermes_path`], taking the two roots directly so the fallback can be
+/// tested on any platform. An existing canonical file always wins, so a user who
+/// already has `~/.hermes/config.yaml` is never silently repointed.
+fn resolve_hermes_path(canonical: PathBuf, local_data: Option<PathBuf>) -> PathBuf {
+    if canonical.exists() {
+        return canonical;
+    }
+    if let Some(local) = local_data {
+        let platform = local.join("hermes").join("config.yaml");
+        if platform.exists() {
+            return platform;
+        }
+    }
+    canonical
 }
 
 fn continue_path() -> Option<PathBuf> {
@@ -5539,6 +5570,54 @@ mod tests {
 
     fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("conduit-w-{}-{}.cfg", std::process::id(), label))
+    }
+
+    /// The Windows Hermes desktop build writes `%LOCALAPPDATA%\hermes\config.yaml`,
+    /// not `~/.hermes/config.yaml`, so resolving only the home path left an
+    /// installed Hermes undetectable with no way to connect it. The canonical path
+    /// still wins when it exists, so nobody with an existing config is repointed.
+    #[test]
+    fn hermes_path_falls_back_to_the_platform_dir_only_when_home_has_no_config() {
+        let root = std::env::temp_dir().join(format!("toolport-hermes-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home_cfg = root.join("home").join(".hermes").join("config.yaml");
+        let local = root.join("local");
+        let local_cfg = local.join("hermes").join("config.yaml");
+
+        // Neither exists: keep the canonical path so a fresh install writes there.
+        assert_eq!(
+            resolve_hermes_path(home_cfg.clone(), Some(local.clone())),
+            home_cfg,
+            "with no config anywhere the home path stays authoritative"
+        );
+
+        // Only the platform dir has a config: that is the file Hermes actually reads.
+        std::fs::create_dir_all(local_cfg.parent().unwrap()).unwrap();
+        std::fs::write(&local_cfg, "mcp_servers: {}\n").unwrap();
+        assert_eq!(
+            resolve_hermes_path(home_cfg.clone(), Some(local.clone())),
+            local_cfg,
+            "an installed Hermes must be found in the platform data dir"
+        );
+
+        // Both exist: the canonical path wins, so an existing setup is untouched.
+        std::fs::create_dir_all(home_cfg.parent().unwrap()).unwrap();
+        std::fs::write(&home_cfg, "mcp_servers: {}\n").unwrap();
+        assert_eq!(
+            resolve_hermes_path(home_cfg.clone(), Some(local.clone())),
+            home_cfg,
+            "an existing home config must never be silently repointed"
+        );
+
+        // No platform dir at all (macOS / Linux pass None): canonical, no probing.
+        std::fs::remove_file(&home_cfg).unwrap();
+        assert_eq!(
+            resolve_hermes_path(home_cfg.clone(), None),
+            home_cfg,
+            "platforms without the fallback resolve the home path unchanged"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// SOU-433: config backups carry a live Shared HTTP bearer, so the directory
