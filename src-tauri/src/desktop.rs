@@ -4547,6 +4547,50 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+
+/// Launch-at-login enable. On Linux this writes the XDG autostart entry with
+/// `$APPIMAGE` when set, so AppImage sessions do not register the FUSE mount
+/// (`/tmp/.mount_*`) that `current_exe` returns. Other platforms keep the
+/// autostart plugin (`current_exe`).
+#[tauri::command]
+fn enable_launch_at_login(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        return crate::autostart::enable_linux(&app.package_info().name);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        app.autolaunch().enable().map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+fn disable_launch_at_login(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        return crate::autostart::disable_linux(&app.package_info().name);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        app.autolaunch().disable().map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+fn is_launch_at_login_enabled(app: AppHandle) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    {
+        return crate::autostart::is_enabled_linux(&app.package_info().name);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        app.autolaunch().is_enabled().map_err(|e| e.to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // `generate_context!()` must expand exactly once in this crate: on macOS dev
@@ -4626,6 +4670,8 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         // Launch at login (opt-in via Settings). `--hidden` is passed on auto-launch so
         // the app starts to the tray without flashing a window (see setup()).
+        // Linux AppImage sessions do not use this plugin's path: Settings goes
+        // through enable_launch_at_login, which writes $APPIMAGE (SBS-844).
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--hidden"]),
@@ -4759,6 +4805,9 @@ pub fn run() {
             recover_update_gateways,
             stop_stale_gateways,
             clients_needing_restart,
+            enable_launch_at_login,
+            disable_launch_at_login,
+            is_launch_at_login_enabled,
         ])
         // Close-to-tray: the window's X hides it instead of quitting, so the gateway and
         // approval broker keep running (HITL only works while the app is alive). Quit is
@@ -4780,6 +4829,11 @@ pub fn run() {
         })
         .setup(|app| {
             let handle = app.handle();
+
+            // AppImage launch-at-login: if a previous session registered the
+            // ephemeral FUSE mount, rewrite Exec to $APPIMAGE (SBS-844).
+            #[cfg(target_os = "linux")]
+            crate::autostart::repair_linux(&app.package_info().name);
 
             // Build the tray icon, then show the window - unless launched with `--hidden`
             // (auto-start at login), in which case we start straight to the tray. The

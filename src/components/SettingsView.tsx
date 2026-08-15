@@ -25,17 +25,15 @@ import {
   UserCheck,
   X,
 } from "lucide-react";
-import {
-  disable as disableAutostart,
-  enable as enableAutostart,
-  isEnabled as isAutostartEnabled,
-} from "@tauri-apps/plugin-autostart";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { toastError } from "@/lib/toast";
 import { Button } from "@/components/ui/button";
 import {
   addHttpClient,
+  disableAutostart,
+  enableAutostart,
+  isAutostartEnabled,
   approveRoutineSuggestion,
   dismissRoutineSuggestion,
   listRoutineSuggestions,

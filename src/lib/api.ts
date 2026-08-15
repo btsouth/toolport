@@ -862,3 +862,16 @@ export function setProfileServerTools(
 export function setFolderProfiles(mappings: FolderProfile[]): Promise<Registry> {
   return invoke<Registry>("set_folder_profiles", { mappings });
 }
+
+/** OS launch-at-login. Linux AppImage sessions write `$APPIMAGE`, not the FUSE mount. */
+export function isAutostartEnabled(): Promise<boolean> {
+  return invoke<boolean>("is_launch_at_login_enabled");
+}
+
+export function enableAutostart(): Promise<void> {
+  return invoke<void>("enable_launch_at_login");
+}
+
+export function disableAutostart(): Promise<void> {
+  return invoke<void>("disable_launch_at_login");
+}

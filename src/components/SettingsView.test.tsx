@@ -8,6 +8,7 @@ import {
   approveRoutineSuggestion,
   dismissRoutineSuggestion,
   listRoutineSuggestions,
+  isAutostartEnabled,
   listServerTools,
   setAllowRoutineWrites,
   setCodeMode,
@@ -20,6 +21,9 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return {
     ...actual,
     listServerTools: vi.fn(),
+    isAutostartEnabled: vi.fn(),
+    enableAutostart: vi.fn().mockResolvedValue(undefined),
+    disableAutostart: vi.fn().mockResolvedValue(undefined),
     setAllowRoutineWrites: vi.fn(),
     setCodeMode: vi.fn(),
     listRoutineSuggestions: vi.fn().mockResolvedValue([]),
@@ -30,13 +34,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
-vi.mock("@tauri-apps/plugin-autostart", () => ({
-  isEnabled: vi.fn(),
-  enable: vi.fn().mockResolvedValue(undefined),
-  disable: vi.fn().mockResolvedValue(undefined),
-}));
 
-import { isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 
 const mockedListServerTools = vi.mocked(listServerTools);
 const mockedIsAutostartEnabled = vi.mocked(isAutostartEnabled);
