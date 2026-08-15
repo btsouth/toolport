@@ -1097,7 +1097,11 @@ impl Router {
     /// never re-derive the original name by splitting the exposed name on `__`
     /// (overrides and `_2` collision suffixes make that split wrong, see
     /// [`Self::route_of`]). Only exposed names this router does not already
-    /// route are adopted, so a healthy server is never touched.
+    /// route are adopted, so a healthy server is never touched. Policy is
+    /// re-evaluated per restored tool before adoption: the rebuilt router only
+    /// indexed the degraded connect, so tools quarantined or disabled since the
+    /// previous build are absent from its `blocked` map and must not slip back
+    /// in through the guarded catalog (which still carries them from the cache).
     pub fn adopt_restored_routes(&mut self, previous: &Router, catalog: &[Value]) {
         for tool in catalog {
             let Some(exposed) = tool.get("name").and_then(Value::as_str) else {
@@ -1111,6 +1115,19 @@ impl Router {
             let Some((server_id, original)) = previous.route_of(exposed) else {
                 continue;
             };
+            // Re-evaluate policy before adopting. The rebuilt router only indexed
+            // the degraded connect, so a tool quarantined / disabled / scoped out
+            // since the previous build has no entry in `self.blocked` yet and the
+            // guarded catalog (from the disk cache) still carries it. Adopting it
+            // now would silently bypass the quarantine and scope guards while the
+            // cache keeps advertising it (review on #717).
+            if let Some(reason) = self
+                .policy
+                .blocked_reason(exposed, server_id, original, tool)
+            {
+                self.blocked.insert(exposed.to_string(), reason.to_string());
+                continue;
+            }
             self.routes
                 .insert(exposed.to_string(), (server_id.to_string(), original.to_string()));
             // Re-adopt the exposed tool entry so aggregated_tools() and the
@@ -2956,6 +2973,37 @@ mod tests {
             .collect();
         assert!(names.contains("atlassian__t39"));
         assert_eq!(names.len(), 45, "40 restored + 5 healthy");
+    }
+
+    #[test]
+    fn adopt_restored_routes_never_adopts_a_newly_quarantined_tool() {
+        // A tool quarantined since the previous build is absent from the degraded
+        // connect, so the rebuilt router's `blocked` map has no entry for it --
+        // but the guarded catalog (kept from the previous/cached catalog) still
+        // carries it. Adoption must re-check policy instead of blindly restoring
+        // the route, or quarantine would be silently bypassed (review on #717).
+        let previous = router_with_catalogs(&[("atlassian", 40)]);
+        let mut rebuilt = router_with_catalogs(&[("atlassian", 3)]);
+        // Quarantine a tool the degraded connect never returned, mirroring the
+        // live flow: requarantine re-indexes from the current (degraded) connect.
+        rebuilt.requarantine(BTreeSet::from(["atlassian__t30".to_string()]));
+        assert!(rebuilt.block_reason("atlassian__t30").is_none());
+
+        let guarded = previous.aggregated_tools();
+        rebuilt.adopt_restored_routes(&previous, &guarded);
+
+        // The quarantined tool must not be routed or advertised again.
+        assert!(rebuilt.block_reason("atlassian__t30").is_some());
+        assert!(rebuilt.route_of("atlassian__t30").is_none());
+        let names: std::collections::HashSet<String> = rebuilt
+            .aggregated_tools()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
+            .collect();
+        assert!(!names.contains("atlassian__t30"));
+        // The other 39 restored tools are still adopted (3 degraded + 36 more).
+        assert!(names.contains("atlassian__t39"));
+        assert_eq!(names.len(), 39, "3 degraded + 36 restored, t30 quarantined");
     }
 
     #[test]
