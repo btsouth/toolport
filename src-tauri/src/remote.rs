@@ -359,6 +359,12 @@ pub fn reset_client_credentials(server_id: &str) -> Result<(), String> {
 /// An unreadable state counts as unchanged: the caller only uses this to decide
 /// whether to discard state, and discarding on a parse failure would loop a broken
 /// vault into re-acquiring on every connect.
+///
+/// Deliberately still `get_secret`, not `get_secret_result`. The sole caller,
+/// [`client_credentials_state_is_stale`], already reads the same key through
+/// `get_secret_result` and returns the error before it can reach here, so a read
+/// failure never lands on this line. Converting it would add an error path that
+/// cannot be taken (SBS-840 sweep).
 fn client_credentials_resource_changed(server_id: &str, url: &str) -> bool {
     let Some(state) = secrets::get_secret(server_id, CC_STATE_KEY)
         .and_then(|s| serde_json::from_str::<ClientCredentialsState>(&s).ok())
@@ -862,6 +868,12 @@ fn authed_transport(
     // the extension requires. Keyed off vaulted state rather than registry config
     // so it is true of the credential actually being sent: a server configured for
     // the flow but not yet provisioned has nothing to declare.
+    //
+    // Deliberately still `get_secret`, not `get_secret_result`. A read failure here
+    // only omits an informational extension declaration: no credential is minted,
+    // sent, or overwritten, and the request itself is unaffected. Failing the whole
+    // transport build over a missing declaration would be worse than the omission
+    // (SBS-840 sweep).
     if secrets::get_secret(server_id, CC_STATE_KEY).is_some() {
         transport.declare_extension(
             crate::downstream::OAUTH_CLIENT_CREDENTIALS_EXTENSION,
