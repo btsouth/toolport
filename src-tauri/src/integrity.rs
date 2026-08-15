@@ -275,6 +275,62 @@ enum PinsLoad {
     Corrupt,
 }
 
+/// Reads and retries before giving up on a pin store.
+///
+/// Every connected client spawns its own gateway and they all share this file, so a
+/// read can land between another gateway's temp-write and its atomic rename. That
+/// transient bad read clears on a retry and must NOT raise the "baseline lost"
+/// alarm, because that alarm quarantines the entire catalog.
+///
+/// The original budget was 3 attempts 15ms apart, about 45ms total. That is not
+/// enough on a restart, when several gateways rebuild at once and contend for the
+/// same file; a real install lost its baseline that way. `None` means the file was
+/// present and still unusable after the full budget.
+const PINS_READ_ATTEMPTS: u32 = 5;
+const PINS_READ_BACKOFF_MS: u64 = 40;
+
+fn read_pins_at(path: &Path) -> Option<Pins> {
+    for attempt in 0..PINS_READ_ATTEMPTS {
+        let last = attempt + 1 == PINS_READ_ATTEMPTS;
+        let retry = || std::thread::sleep(std::time::Duration::from_millis(PINS_READ_BACKOFF_MS));
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            // The file existed a moment ago, so a read error here is most likely another
+            // process replacing it (on Windows that surfaces as a sharing violation).
+            Err(_) if !last => {
+                retry();
+                continue;
+            }
+            Err(_) => return None,
+        };
+        // An empty baseline is a LOST baseline, not a fresh start: atomic_write
+        // (temp + fsync + rename) never leaves an empty file, so emptiness means it was
+        // truncated by a crash mid write, or wiped to silently reset drift detection.
+        // Treating it as Fresh would re-baseline whatever is present now, re-trusting a
+        // poisoned definition with no signal at all.
+        if raw.trim().is_empty() {
+            if !last {
+                retry();
+                continue;
+            }
+            return None;
+        }
+        match serde_json::from_str::<BTreeMap<String, PinRepr>>(&raw) {
+            Ok(pins) => return Some(pins.into_iter().map(|(k, v)| (k, v.into())).collect()),
+            Err(_) if !last => retry(),
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Sidecar holding the last baseline that parsed, written by [`save_pins_with`].
+fn pins_backup_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".bak");
+    PathBuf::from(name)
+}
+
 fn load_pins(profile: Option<&str>) -> PinsLoad {
     let Some(path) = pins_path(profile) else {
         return PinsLoad::Fresh;
@@ -285,45 +341,18 @@ fn load_pins(profile: Option<&str>) -> PinsLoad {
         }
         return PinsLoad::Fresh;
     }
-    // Every connected client spawns its own gateway, and they all share this one pins file.
-    // A read that lands in the moment between another gateway's temp-write and its atomic
-    // rename can occasionally see the file mid-swap on some filesystems. That transient bad
-    // read clears on a quick retry, so it should NOT raise the loud "integrity baseline lost"
-    // alarm. But a file that is genuinely present and still won't parse after the retries -
-    // including an EMPTY one - is a lost baseline and stays Corrupt (loud), because that is
-    // what baseline tampering actually looks like.
-    for attempt in 0..3 {
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            // The file existed a moment ago; a read error here is transient (another process
-            // replacing it). Retry, then fall through to Corrupt only if it persists.
-            Err(_) if attempt < 2 => {
-                std::thread::sleep(std::time::Duration::from_millis(15));
-                continue;
-            }
-            Err(_) => return PinsLoad::Corrupt,
-        };
-        if raw.trim().is_empty() {
-            // An empty baseline file is a LOST baseline, not a fresh start: atomic_write
-            // (temp + fsync + rename) never leaves an empty file, so emptiness means it was
-            // truncated - a crash mid foreign write, or an attacker wiping it to silently
-            // reset drift detection. Returning Fresh here would silently re-baseline whatever
-            // tools are present now (re-trusting a poisoned definition with zero signal), so
-            // retry a transient empty read, then treat a persistently-empty file as Corrupt.
-            if attempt < 2 {
-                std::thread::sleep(std::time::Duration::from_millis(15));
-                continue;
-            }
-            return PinsLoad::Corrupt;
-        }
-        match serde_json::from_str::<BTreeMap<String, PinRepr>>(&raw) {
-            Ok(pins) => {
-                return PinsLoad::Loaded(pins.into_iter().map(|(k, v)| (k, v.into())).collect());
-            }
-            Err(_) if attempt < 2 => {
-                std::thread::sleep(std::time::Duration::from_millis(15));
-            }
-            Err(_) => return PinsLoad::Corrupt,
+    if let Some(pins) = read_pins_at(&path) {
+        return PinsLoad::Loaded(pins);
+    }
+    // The live baseline is unusable. Before declaring the trust root lost - which blocks
+    // every tool in the catalog and, at real catalog sizes, is indistinguishable from the
+    // app breaking - fall back to the last copy that parsed. The backup is only ever
+    // written from a file that already parsed, so it cannot itself be the corrupt one.
+    // Deliberately read-only: the next successful save rewrites the primary.
+    let backup = pins_backup_path(&path);
+    if backup.exists() {
+        if let Some(pins) = read_pins_at(&backup) {
+            return PinsLoad::Loaded(pins);
         }
     }
     PinsLoad::Corrupt
@@ -339,6 +368,17 @@ fn save_pins_with(
     })?;
     let serialized = serde_json::to_string(pins)
         .map_err(|e| format!("Could not serialize the integrity pin store at {path:?}: {e}"))?;
+    // Keep the outgoing baseline as `<store>.bak` so a later unreadable primary can be
+    // recovered instead of reported as a lost trust root, which quarantines the whole
+    // catalog. Only a file that still parses is copied, so the backup can never become
+    // the corrupt one; a save whose backup fails still proceeds, since refusing to
+    // persist a fresh baseline would be the worse outcome. Callers hold the pin-store
+    // lock, so this cannot race a peer gateway.
+    if let Some(previous) = read_pins_at(&path) {
+        if let Ok(encoded) = serde_json::to_string(&previous) {
+            let _ = crate::registry::atomic_write(&pins_backup_path(&path), &encoded);
+        }
+    }
     write(&path, &serialized)
         .map_err(|e| format!("Could not persist the integrity pin store at {path:?}: {e}"))
 }
@@ -1139,6 +1179,118 @@ fn release_inner(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// How a bulk re-approval went: how many blocks were lifted, and the tools that
+/// could not be repaired and stay blocked.
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseAllOutcome {
+    pub released: usize,
+    pub skipped: Vec<String>,
+}
+
+/// Re-approve every quarantined tool for a profile in one pass.
+///
+/// A lost baseline quarantines the WHOLE catalog (see `apply_quarantine_inner_with`),
+/// which on a real install is thousands of tools. [`release`] is per-tool, so
+/// recovering that way means one lock acquisition, one store load and two store
+/// writes per tool - unusable at that size, and the UI offered nothing else. This
+/// does the same work with one lock, one load and one write of each store.
+///
+/// A record whose captured pin is missing or unreadable cannot be repaired, so it
+/// is left blocked and named in `skipped` rather than failing the whole batch or,
+/// worse, being unblocked without re-establishing its baseline.
+pub fn release_all(profile: Option<&str>) -> Result<ReleaseAllOutcome, String> {
+    let path = quarantine_path(profile).ok_or_else(|| {
+        "Could not resolve the quarantine-store path; nothing was released".to_string()
+    })?;
+    with_store_lock(&path, || {
+        release_all_inner(profile, save_pins, save_quarantine)
+    })
+}
+
+fn release_all_inner(
+    profile: Option<&str>,
+    save_pin: impl FnOnce(Option<&str>, &Pins) -> Result<(), String>,
+    save_quarantine: impl FnOnce(Option<&str>, &Quarantine) -> Result<(), String>,
+) -> Result<ReleaseAllOutcome, String> {
+    // Fail closed on a corrupt store, exactly as `release_inner` does: never treat it
+    // as empty and save `{}`, which would drop every block without repairing anything.
+    let q = load_quarantine(profile)
+        .map_err(|e| format!("{e}; refusing to release until the store is fixed"))?;
+    if q.is_empty() {
+        return Ok(ReleaseAllOutcome::default());
+    }
+
+    let mut accepted: Vec<(String, Pin)> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut tamper_seen = false;
+    for (tool, record) in q.iter() {
+        let tamper = record.get("change").and_then(Value::as_str) == Some("tamper");
+        match record.get("pending_pin").cloned() {
+            Some(value) => match serde_json::from_value::<Pin>(value) {
+                Ok(pin) => {
+                    tamper_seen |= tamper;
+                    accepted.push((tool.clone(), pin));
+                }
+                // No usable captured definition: releasing would expose the tool with
+                // no baseline to compare against later.
+                Err(_) => skipped.push(tool.clone()),
+            },
+            // A tamper record without a captured pin has no trust root to repair.
+            None if tamper => skipped.push(tool.clone()),
+            // Ordinary drift with nothing staged: the block can simply be lifted.
+            None => {}
+        }
+    }
+
+    if !accepted.is_empty() {
+        let pin_path = pins_path(profile)
+            .ok_or_else(|| "the integrity pin-store path is unavailable".to_string())?;
+        with_store_lock(&pin_path, || {
+            let pins = match load_pins(profile) {
+                PinsLoad::Loaded(p) => p,
+                PinsLoad::Fresh => Pins::new(),
+                // Re-approving after baseline tamper is precisely how the lost trust
+                // root is rebuilt, so a corrupt store is expected on this path.
+                PinsLoad::Corrupt if tamper_seen => Pins::new(),
+                PinsLoad::Corrupt => {
+                    return Err(
+                        "the integrity pin store is corrupt; refusing to overwrite the lost trust root"
+                            .to_string(),
+                    );
+                }
+            };
+            let mut updated = pins.clone();
+            let stamp = epoch_millis();
+            for (tool, pin) in &accepted {
+                updated.insert(
+                    tool.clone(),
+                    merge_pending_pin(pins.get(tool), pin.clone(), stamp),
+                );
+            }
+            if updated != pins {
+                save_pin(profile, &updated)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| format!("Refusing to release; the accepted pins could not be saved: {e}"))?;
+    }
+
+    // Everything repaired (or needing no repair) is unblocked in one write. Anything
+    // skipped stays in the store so it is still blocked and still visible in the UI.
+    let mut remaining = Quarantine::new();
+    for tool in &skipped {
+        if let Some(record) = q.get(tool) {
+            remaining.insert(tool.clone(), record.clone());
+        }
+    }
+    let released = q.len() - remaining.len();
+    if released > 0 {
+        save_quarantine(profile, &remaining)?;
+    }
+    Ok(ReleaseAllOutcome { released, skipped })
 }
 
 /// From `check`'s drift `events` and the `current` tool list, quarantine the HIGH-RISK
@@ -2655,6 +2807,142 @@ mod tests {
         assert!(
             check_staged(profile, &changed).unwrap().is_empty(),
             "one release must leave the recovered definition exposed without re-quarantining"
+        );
+    }
+
+    #[test]
+    /// A lost baseline quarantines the entire catalog. On a real install that was
+    /// 2,156 tools, and `release` is per-tool, so recovery meant 2,156 lock
+    /// acquisitions and 4,312 store writes. One pass must lift them all.
+    #[test]
+    fn release_all_lifts_the_whole_catalog_and_repairs_every_baseline() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("release-all-bulk");
+        let profile = Some("release-all-bulk");
+
+        let catalog: Vec<Value> = (0..25)
+            .map(|i| destructive_tool(&format!("srv__wipe{i}"), "Wipe records."))
+            .collect();
+        check(profile, &catalog).unwrap();
+        // Lose the trust root, which is what triggers the mandatory whole-catalog block.
+        let path = pins_path(profile).expect("profile path");
+        std::fs::write(&path, "{ not json").unwrap();
+        let events = check(profile, &catalog).unwrap();
+        assert!(baseline_tamper_detected(&events), "the baseline must read as lost");
+        assert!(apply_quarantine(profile, &catalog, &events).unwrap());
+        assert_eq!(quarantined(profile).unwrap().len(), 25, "whole catalog blocked");
+
+        let outcome = release_all(profile).unwrap();
+
+        assert_eq!(outcome.released, 25);
+        assert!(outcome.skipped.is_empty(), "every record carried a pin: {outcome:?}");
+        assert!(quarantined(profile).unwrap().is_empty(), "nothing stays blocked");
+        // The trust root is rebuilt, so the very next check is quiet rather than
+        // re-detecting drift against a baseline that is still missing.
+        let pins = baselines(profile);
+        assert_eq!(pins.len(), 25, "every tool was re-pinned");
+        assert_eq!(pins["srv__wipe0"].fingerprint, pin_of(&catalog[0]).fp);
+        assert!(
+            check_staged(profile, &catalog).unwrap().is_empty(),
+            "a repaired baseline must not immediately re-flag the same catalog"
+        );
+    }
+
+    /// One unrepairable record must not fail the whole batch, and must not be
+    /// unblocked without a baseline either.
+    #[test]
+    fn release_all_keeps_records_it_cannot_repair_blocked() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("release-all-skips");
+        let profile = Some("release-all-skips");
+        let catalog = vec![
+            destructive_tool("srv__keeps", "Wipe records."),
+            destructive_tool("srv__broken", "Wipe records."),
+        ];
+        check(profile, &catalog).unwrap();
+        let path = pins_path(profile).expect("profile path");
+        std::fs::write(&path, "{ not json").unwrap();
+        let events = check(profile, &catalog).unwrap();
+        assert!(apply_quarantine(profile, &catalog, &events).unwrap());
+
+        // Corrupt one record's captured pin, the way a partial write would.
+        let qpath = quarantine_path(profile).expect("quarantine path");
+        let mut store: Quarantine =
+            serde_json::from_str(&std::fs::read_to_string(&qpath).unwrap()).unwrap();
+        store.get_mut("srv__broken").unwrap()["pending_pin"] = json!("not-a-pin");
+        std::fs::write(&qpath, serde_json::to_string(&store).unwrap()).unwrap();
+
+        let outcome = release_all(profile).unwrap();
+
+        assert_eq!(outcome.released, 1, "the healthy record is still released");
+        assert_eq!(outcome.skipped, vec!["srv__broken".to_string()]);
+        assert_eq!(
+            quarantined(profile).unwrap().into_iter().collect::<Vec<_>>(),
+            vec!["srv__broken".to_string()],
+            "an unrepairable tool stays blocked instead of being exposed unpinned"
+        );
+    }
+
+    /// The baseline had no backup at all, so a single unreadable read blocked every
+    /// tool with nothing to recover from. The last file that parsed is now kept
+    /// beside it and used before declaring the trust root lost.
+    #[test]
+    fn a_corrupt_baseline_recovers_from_its_backup_instead_of_blocking_everything() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("pins-backup");
+        let profile = Some("pins-backup");
+        let catalog = vec![destructive_tool("srv__wipe", "Wipe records.")];
+
+        // First save establishes the baseline; a second one leaves the first as the backup.
+        check(profile, &catalog).unwrap();
+        let changed = vec![destructive_tool("srv__wipe", "Wipe every record.")];
+        check(profile, &changed).unwrap();
+
+        let path = pins_path(profile).expect("profile path");
+        let backup = pins_backup_path(&path);
+        assert!(backup.exists(), "a parseable baseline must be kept as a backup");
+
+        // Truncate the live baseline, the exact shape that blocked a real catalog.
+        std::fs::write(&path, "").unwrap();
+        match load_pins(profile) {
+            PinsLoad::Loaded(pins) => {
+                assert!(pins.contains_key("srv__wipe"), "recovered the real baseline");
+            }
+            PinsLoad::Fresh => panic!("expected recovery from the backup, got Fresh"),
+            PinsLoad::Corrupt => panic!("expected recovery from the backup, got Corrupt"),
+        }
+        // And therefore no tamper event and no whole-catalog block.
+        let events = check(profile, &changed).unwrap();
+        assert!(
+            !baseline_tamper_detected(&events),
+            "a recoverable baseline must not report the trust root as lost"
+        );
+    }
+
+    /// The backup is only ever written from a file that parsed, so a corrupt primary
+    /// can never overwrite the last good copy.
+    #[test]
+    fn a_corrupt_baseline_never_overwrites_the_good_backup() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("pins-backup-guard");
+        let profile = Some("pins-backup-guard");
+        let catalog = vec![destructive_tool("srv__wipe", "Wipe records.")];
+        check(profile, &catalog).unwrap();
+        let changed = vec![destructive_tool("srv__wipe", "Wipe every record.")];
+        check(profile, &changed).unwrap();
+
+        let path = pins_path(profile).expect("profile path");
+        let backup = pins_backup_path(&path);
+        let good = std::fs::read_to_string(&backup).unwrap();
+
+        // Corrupt the primary, then force a save. The backup must not absorb the garbage.
+        std::fs::write(&path, "{ not json").unwrap();
+        save_pins(profile, &Pins::new()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            good,
+            "a corrupt primary must never become the recovery copy"
         );
     }
 
