@@ -18,6 +18,16 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **Connect and launch-time repoint no longer strip comments from Codex/Grok
+  `config.toml` or comments and YAML anchors from Goose/Hermes/Continue
+  `config.yaml`.** Those writers used to parse with `toml` / `serde_yaml` and
+  pretty-print the whole file, so a Connect click or `repoint_stale_gateways`
+  dropped every `#` comment and expanded every `&anchor`. Unrelated keys
+  survived as data; the annotations did not. TOML now goes through `toml_edit`
+  DocumentMut and YAML rewrites only the `mcp_servers` / `extensions` /
+  `mcpServers` node, matching the JSONC CST contract. A user who Connects or
+  disconnects now keeps the comments and anchors they had outside that node.
+  (SBS-884)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
