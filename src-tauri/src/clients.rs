@@ -4201,19 +4201,78 @@ fn stable_gateway_copy(src: &std::path::Path) -> Option<PathBuf> {
     // Keep the source's filename so the stable copy matches whichever binary name
     // (toolport-gateway, or the legacy conduit-gateway) was found next to the app.
     let dest = dest_dir.join(src.file_name()?);
-    if gateway_copy_is_stale(src, &dest) {
-        std::fs::copy(src, &dest).ok()?;
+    stable_gateway_copy_with(src, dest, replace_gateway_copy)
+}
+
+/// Refresh logic for [`stable_gateway_copy`], with the write step injected so
+/// tests can exercise the failure path without needing a genuinely busy binary.
+fn stable_gateway_copy_with(
+    src: &std::path::Path,
+    dest: PathBuf,
+    replace: impl Fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Option<PathBuf> {
+    if !gateway_copy_is_stale(src, &dest) {
+        return Some(dest);
+    }
+    if replace(src, &dest).is_ok() {
+        return Some(dest);
+    }
+    // The refresh failed, but an earlier stable copy is still sitting there.
+    // Hand that back: a slightly stale gateway on a path that survives is far
+    // better than the caller falling through to the AppImage-internal
+    // /tmp/.mount_XXXX path, which is written into a client config and then
+    // dies with the mount when Toolport exits. Only give up when there is no
+    // stable copy at all.
+    match std::fs::metadata(&dest) {
+        Ok(meta) if meta.is_file() && meta.len() > 0 => Some(dest),
+        _ => None,
+    }
+}
+
+/// Replace `dest` with the bytes of `src`.
+///
+/// Deliberately not a plain `std::fs::copy`: that opens the destination
+/// `O_WRONLY|O_TRUNC`, which on Linux fails with `ETXTBSY` whenever the
+/// destination is a binary that is currently executing. Any connected client
+/// keeps a gateway alive out of `~/.toolport/bin`, so that is the normal case,
+/// not a rare one. Writing a sibling temp file and `rename(2)`-ing it over the
+/// destination succeeds against a busy target (the running process keeps the
+/// old inode) and swaps atomically, so a reader never sees a half-written
+/// binary. The exec bit is set on the temp file *before* the rename for the
+/// same reason: the path is never briefly non-executable.
+fn replace_gateway_copy(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    let dir = dest.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "gateway copy destination has no parent directory",
+        )
+    })?;
+    let stem = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "toolport-gateway".to_string());
+    let tmp = dir.join(format!(
+        ".{stem}.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let written = (|| -> std::io::Result<()> {
+        std::fs::copy(src, &tmp)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&dest) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o755);
-                let _ = std::fs::set_permissions(&dest, perms);
-            }
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
         }
+        std::fs::rename(&tmp, dest)
+    })();
+    if written.is_err() {
+        // Never leave the half-written temp file behind in ~/.toolport/bin.
+        let _ = std::fs::remove_file(&tmp);
     }
-    Some(dest)
+    written
 }
 
 /// True when dest is missing, unreadable, a different length, or the same length
@@ -4221,11 +4280,41 @@ fn stable_gateway_copy(src: &std::path::Path) -> Option<PathBuf> {
 /// keep the previous length.
 fn gateway_copy_is_stale(src: &std::path::Path, dest: &std::path::Path) -> bool {
     match (std::fs::metadata(dest), std::fs::metadata(src)) {
-        (Ok(d), Ok(s)) if d.len() == s.len() => match (std::fs::read(dest), std::fs::read(src)) {
-            (Ok(dest_bytes), Ok(src_bytes)) => dest_bytes != src_bytes,
-            _ => true,
-        },
+        (Ok(d), Ok(s)) if d.is_file() && d.len() == s.len() => !files_have_same_bytes(src, dest),
         _ => true,
+    }
+}
+
+/// Byte-compare two files without slurping either into memory. The gateway is a
+/// multi-MB binary and this runs on every Connect plus twice at startup, so a
+/// streaming compare that short-circuits on the first differing chunk beats two
+/// full `std::fs::read`s. Returns false if either file cannot be read, which
+/// makes the caller treat the copy as stale.
+fn files_have_same_bytes(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::io::BufRead;
+    let (Ok(fa), Ok(fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    const CHUNK: usize = 64 * 1024;
+    let mut ra = std::io::BufReader::with_capacity(CHUNK, fa);
+    let mut rb = std::io::BufReader::with_capacity(CHUNK, fb);
+    loop {
+        let consumed = {
+            let (Ok(buf_a), Ok(buf_b)) = (ra.fill_buf(), rb.fill_buf()) else {
+                return false;
+            };
+            if buf_a.is_empty() || buf_b.is_empty() {
+                // Equal only if both hit EOF at the same offset.
+                return buf_a.is_empty() && buf_b.is_empty();
+            }
+            let n = buf_a.len().min(buf_b.len());
+            if buf_a[..n] != buf_b[..n] {
+                return false;
+            }
+            n
+        };
+        ra.consume(consumed);
+        rb.consume(consumed);
     }
 }
 
@@ -9753,6 +9842,205 @@ extensions:
         let again = stable_gateway_copy(&src).expect("identical src must still succeed");
         assert_eq!(again, dest);
         assert_eq!(std::fs::read(&dest).unwrap(), fixture_b);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Scratch dir + src/dest fixture pair for the stable-copy tests.
+    fn stable_gw_fixture(
+        tag: &str,
+        dest_bytes: &[u8],
+        src_bytes: &[u8],
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let scratch = std::env::temp_dir().join(format!(
+            "toolport-stable-gw-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let dest_dir = scratch.join("bin");
+        let src_dir = scratch.join("src");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let dest = dest_dir.join("toolport-gateway");
+        let src = src_dir.join("toolport-gateway");
+        std::fs::write(&dest, dest_bytes).unwrap();
+        std::fs::write(&src, src_bytes).unwrap();
+        (scratch, src, dest)
+    }
+
+    #[test]
+    fn stable_gateway_copy_keeps_existing_copy_when_refresh_fails() {
+        // The refresh can legitimately fail: on Linux, overwriting the stable
+        // gateway while a client keeps one running returns ETXTBSY. Giving up
+        // here would make resolve_gateway_path fall through to the
+        // AppImage-internal /tmp/.mount_XXXX path, and that path is written into
+        // the client's config and dies with the mount. A stale-but-reachable
+        // stable copy is the right answer instead.
+        let (scratch, src, dest) =
+            stable_gw_fixture("busy", b"gateway-binary-AAAA", b"gateway-binary-BBBB");
+
+        let attempted = std::cell::Cell::new(false);
+        let out = stable_gateway_copy_with(&src, dest.clone(), |_, _| {
+            attempted.set(true);
+            Err(std::io::Error::other("ETXTBSY"))
+        });
+
+        assert!(attempted.get(), "a stale copy must attempt a refresh");
+        assert_eq!(
+            out,
+            Some(dest.clone()),
+            "a failed refresh must still return the existing stable path, \
+             never fall through to the ephemeral mount"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"gateway-binary-AAAA",
+            "the previous copy must be left intact"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn stable_gateway_copy_gives_up_when_no_stable_copy_exists() {
+        // With nothing usable at dest there is no stable path to hand back, so
+        // the caller should be told to look elsewhere.
+        let (scratch, src, dest) = stable_gw_fixture("nodest", b"", b"gateway-binary-BBBB");
+        std::fs::remove_file(&dest).unwrap();
+
+        let out = stable_gateway_copy_with(&src, dest.clone(), |_, _| {
+            Err(std::io::Error::other("ETXTBSY"))
+        });
+        assert_eq!(out, None, "no stable copy at all must return None");
+
+        // A zero-length leftover is not a usable gateway either.
+        std::fs::write(&dest, b"").unwrap();
+        let out = stable_gateway_copy_with(&src, dest.clone(), |_, _| {
+            Err(std::io::Error::other("ETXTBSY"))
+        });
+        assert_eq!(out, None, "an empty leftover must not be handed to a client");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn stable_gateway_copy_skips_the_write_when_content_matches() {
+        let (scratch, src, dest) =
+            stable_gw_fixture("fresh", b"gateway-binary-AAAA", b"gateway-binary-AAAA");
+        let attempted = std::cell::Cell::new(false);
+        let out = stable_gateway_copy_with(&src, dest.clone(), |_, _| {
+            attempted.set(true);
+            Ok(())
+        });
+        assert_eq!(out, Some(dest));
+        assert!(
+            !attempted.get(),
+            "an up-to-date copy must not be rewritten on every Connect"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_gateway_copy_swaps_the_inode_and_sets_the_exec_bit() {
+        // rename(2) over the destination is what makes the refresh survive a
+        // running gateway (ETXTBSY). Prove we replaced the directory entry
+        // rather than truncating the existing inode: a hard link taken before
+        // the refresh must still read the OLD bytes afterwards, exactly as a
+        // process executing the old binary would.
+        use std::os::unix::fs::PermissionsExt;
+        let (scratch, src, dest) =
+            stable_gw_fixture("inode", b"gateway-binary-AAAA", b"gateway-binary-BBBB");
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let witness = scratch.join("bin").join("old-inode");
+        std::fs::hard_link(&dest, &witness).unwrap();
+
+        replace_gateway_copy(&src, &dest).expect("refresh must succeed");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"gateway-binary-BBBB");
+        assert_eq!(
+            std::fs::read(&witness).unwrap(),
+            b"gateway-binary-AAAA",
+            "the old inode must be left alone, not truncated in place"
+        );
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the swapped-in binary must already be executable"
+        );
+
+        // No temp files left behind in ~/.toolport/bin.
+        let leftovers: Vec<_> = std::fs::read_dir(scratch.join("bin"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_gateway_copy_cleans_up_after_a_failed_write() {
+        let (scratch, src, dest) =
+            stable_gw_fixture("cleanup", b"gateway-binary-AAAA", b"gateway-binary-BBBB");
+        std::fs::remove_file(&src).unwrap();
+
+        assert!(
+            replace_gateway_copy(&src, &dest).is_err(),
+            "a missing source must fail loudly"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"gateway-binary-AAAA",
+            "a failed refresh must not damage the existing copy"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(scratch.join("bin"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn gateway_copy_is_stale_streams_large_files() {
+        // The compare must stay correct on files bigger than one read chunk,
+        // and must short-circuit on the first differing chunk.
+        let big = vec![7u8; 300 * 1024];
+        let mut differs_late = big.clone();
+        *differs_late.last_mut().unwrap() = 9;
+        let mut differs_early = big.clone();
+        differs_early[0] = 9;
+
+        let (scratch, src, dest) = stable_gw_fixture("big", &big, &big);
+        assert!(!gateway_copy_is_stale(&src, &dest), "identical big files");
+
+        std::fs::write(&src, &differs_late).unwrap();
+        assert!(
+            gateway_copy_is_stale(&src, &dest),
+            "a difference in the final chunk must be caught"
+        );
+
+        std::fs::write(&src, &differs_early).unwrap();
+        assert!(gateway_copy_is_stale(&src, &dest), "first-chunk difference");
+
+        // Different lengths never reach the byte compare.
+        std::fs::write(&src, b"short").unwrap();
+        assert!(gateway_copy_is_stale(&src, &dest));
+
+        // A missing source is treated as stale rather than "up to date".
+        std::fs::remove_file(&src).unwrap();
+        assert!(gateway_copy_is_stale(&src, &dest));
 
         let _ = std::fs::remove_dir_all(&scratch);
     }
