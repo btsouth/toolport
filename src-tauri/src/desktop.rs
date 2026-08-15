@@ -3486,6 +3486,12 @@ fn apply_import(reg: &mut Registry, json: &str) -> Result<(), String> {
 /// UI to refetch. Without this, a gateway-written change would be invisible to the
 /// app and clobbered by its next save. Polls mtime (the gateway uses the same
 /// approach) and skips identical touches so an mtime-only bump doesn't churn the UI.
+///
+/// The last-applied mtime only advances after a successful load: a transient
+/// read/lock failure keeps `last` unchanged so the same mtime is retried instead
+/// of being permanently consumed (the desktop UI would otherwise stay stale until
+/// some later write changes the mtime again). Retries back off and diagnostics
+/// are throttled so a locked file does not spam stderr every tick.
 fn watch_registry_for_app(handle: tauri::AppHandle) {
     let Some(path) = registry::resolved_path() else {
         return;
@@ -3496,19 +3502,45 @@ fn watch_registry_for_app(handle: tauri::AppHandle) {
         .ok()
         .and_then(|r| serde_json::to_string(&r).ok())
         .unwrap_or_default();
+    // Consecutive load failures since the last successful load. Drives the retry
+    // backoff and the diagnostic throttle below (SOU-695).
+    let mut consecutive_failures: u32 = 0;
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        std::thread::sleep(if consecutive_failures == 0 {
+            std::time::Duration::from_millis(1500)
+        } else {
+            watch_retry_delay(consecutive_failures)
+        });
         let cur = mtime(&path);
+        // Cheap early exit: an unchanged mtime has nothing to apply. The load
+        // only runs after this gate, so the common no-op tick never touches disk.
         if cur == last {
             continue;
         }
-        last = cur;
         // Sampled BEFORE the load, so any in-memory write racing this read is
         // visible as a mismatch when we go to apply it (SOU-329).
         let sampled = registry_generation();
         let Ok(fresh) = registry::load_from(&path) else {
-            continue; // half-written file; retry next tick
+            // Half-written file (or a lock held past its timeout). Keep `last`
+            // unchanged so the next tick retries the same mtime, and surface a
+            // throttled diagnostic instead of silently dropping the change.
+            consecutive_failures += 1;
+            if consecutive_failures == 1 || consecutive_failures % 20 == 0 {
+                eprintln!(
+                    "toolport: registry watch: could not load {} ({} consecutive failures); will retry",
+                    path.display(),
+                    consecutive_failures
+                );
+            }
+            continue;
         };
+        consecutive_failures = 0;
+        // Only a successful load advances the last-applied mtime, so a transient
+        // failure is retried on the next tick instead of being consumed forever.
+        if !watch_advance_last_mtime(last, cur, true) {
+            continue;
+        }
+        last = cur;
         let fresh_json = serde_json::to_string(&fresh).unwrap_or_default();
         if fresh_json == last_json {
             continue; // identical content (e.g. an mtime bump to nudge the gateway)
@@ -3523,6 +3555,28 @@ fn watch_registry_for_app(handle: tauri::AppHandle) {
         last_json = fresh_json;
         let _ = handle.emit("registry-changed", &fresh);
     }
+}
+
+/// Backoff for registry-watch retries. The first failure retries on the next
+/// 1.5s tick; each further consecutive failure doubles the wait, capped so a
+/// registry held by another process cannot make the watcher hammer the disk.
+fn watch_retry_delay(consecutive_failures: u32) -> std::time::Duration {
+    const BASE_MS: u64 = 1500;
+    const CAP_MS: u64 = 60_000;
+    let exponent = consecutive_failures.saturating_sub(1).min(6);
+    std::time::Duration::from_millis((BASE_MS << exponent).min(CAP_MS))
+}
+
+/// Decide whether the registry watcher may consume the observed `cur` mtime.
+/// Returns `true` only when the mtime is new AND the registry loaded
+/// successfully: a transient load failure keeps the previous mtime so the same
+/// change is retried on a later tick instead of being skipped forever.
+fn watch_advance_last_mtime(
+    last: Option<std::time::SystemTime>,
+    cur: Option<std::time::SystemTime>,
+    load_succeeded: bool,
+) -> bool {
+    cur != last && load_succeeded
 }
 
 /// Reap the child if it has already exited; returns true if it is still alive.
@@ -5021,6 +5075,39 @@ mod tests {
         // Once ready, deliver live without leaving a queued duplicate.
         assert!(should_emit_tray_approvals(&pending));
         assert!(!claim_pending_tray_approvals(&pending));
+    }
+
+    /// A transient registry load failure must not permanently consume the
+    /// change (SOU-695): the last-applied mtime only advances after a
+    /// successful load, so the same mtime is retried on a later tick.
+    #[test]
+    fn registry_watch_advances_last_mtime_only_after_a_successful_load() {
+        let old = std::time::SystemTime::now();
+        let changed = old + std::time::Duration::from_secs(1);
+
+        // Step 1-2: a changed mtime whose first load fails is not consumed.
+        assert!(!watch_advance_last_mtime(Some(old), Some(changed), false));
+        // Step 3-4: the same mtime is consumed once the load succeeds.
+        assert!(watch_advance_last_mtime(Some(old), Some(changed), true));
+        // An unchanged mtime is never consumed, even when a load would succeed.
+        assert!(!watch_advance_last_mtime(Some(changed), Some(changed), true));
+        // A missing file (mtime None) is not consumed on a failed load either.
+        assert!(!watch_advance_last_mtime(Some(old), None, false));
+    }
+
+    /// The retry backoff is bounded: it starts at the base tick and doubles per
+    /// consecutive failure, never exceeding the cap.
+    #[test]
+    fn registry_watch_retry_delay_is_bounded_and_never_exceeds_the_cap() {
+        assert_eq!(watch_retry_delay(0), std::time::Duration::from_millis(1500));
+        assert_eq!(watch_retry_delay(1), std::time::Duration::from_millis(1500));
+        assert_eq!(watch_retry_delay(2), std::time::Duration::from_millis(3000));
+        assert_eq!(watch_retry_delay(3), std::time::Duration::from_millis(6000));
+        assert_eq!(watch_retry_delay(4), std::time::Duration::from_millis(12000));
+        assert_eq!(watch_retry_delay(5), std::time::Duration::from_millis(24000));
+        assert_eq!(watch_retry_delay(6), std::time::Duration::from_millis(48000));
+        assert_eq!(watch_retry_delay(7), std::time::Duration::from_millis(60000));
+        assert_eq!(watch_retry_delay(100), std::time::Duration::from_millis(60000));
     }
 
     #[test]
