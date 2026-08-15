@@ -535,10 +535,9 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "kimi-code" => home.join(".kimi-code").join("mcp.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
         "jan" => data.join("Jan").join("data").join("mcp_config.json"),
-        "zed" => home.join(".config").join("zed").join("settings.json"),
-        "goose" => home.join(".config").join("goose").join("config.yaml"),
-        "anythingllm" => home
-            .join(".config")
+        "zed" => config.join("zed").join("settings.json"),
+        "goose" => config.join("goose").join("config.yaml"),
+        "anythingllm" => config
             .join("anythingllm-desktop")
             .join("storage")
             .join("plugins")
@@ -8935,6 +8934,9 @@ command = "npx"
         let vscode = client_config_path("vscode").unwrap();
         let jan = client_config_path("jan").unwrap();
         let crush = client_config_path("crush").unwrap();
+        let zed = client_config_path("zed").unwrap();
+        let goose = client_config_path("goose").unwrap();
+        let anythingllm = client_config_path("anythingllm").unwrap();
         let opencode = client_config_path("opencode").unwrap();
         let kilo_code = client_config_path("kilo-code").unwrap();
 
@@ -8953,6 +8955,22 @@ command = "npx"
         assert_eq!(
             crush,
             xdg_config.join("crush").join("crush.json")
+        );
+        assert_eq!(
+            zed,
+            xdg_config.join("zed").join("settings.json")
+        );
+        assert_eq!(
+            goose,
+            xdg_config.join("goose").join("config.yaml")
+        );
+        assert_eq!(
+            anythingllm,
+            xdg_config
+                .join("anythingllm-desktop")
+                .join("storage")
+                .join("plugins")
+                .join("anythingllm_mcp_servers.json")
         );
         assert_eq!(
             opencode,
