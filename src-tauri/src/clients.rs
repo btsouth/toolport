@@ -8871,13 +8871,19 @@ command = "npx"
         let home = home().expect("home dir should be available in tests");
         let platform = Platform::current();
         for client in defs() {
-            if matches!(client.id, "antigravity" | "claude-desktop" | "hermes") {
-                // These probe alternate on-disk locations (Antigravity subdirs,
-                // Claude Desktop MSIX virtualized config, and the Windows Hermes
-                // build's %LOCALAPPDATA% dir), so the resolved path legitimately
-                // depends on what is installed on the host rather than on the
-                // static table. Hermes' fallback is covered by
-                // `hermes_path_falls_back_to_the_platform_dir_only_when_home_has_no_config`.
+            // These probe alternate on-disk locations (Antigravity subdirs, Claude
+            // Desktop MSIX virtualized config), so the resolved path legitimately
+            // depends on what is installed on the host rather than on the static
+            // table.
+            if matches!(client.id, "antigravity" | "claude-desktop") {
+                continue;
+            }
+            // Hermes only probes on Windows, where `%LOCALAPPDATA%\hermes` makes the
+            // answer host-dependent. Everywhere else `hermes_path` passes no platform
+            // root at all and is a pure function of home, so it stays covered here.
+            // The Windows behaviour is covered by
+            // `hermes_path_falls_back_to_the_platform_dir_only_when_home_has_no_config`.
+            if cfg!(windows) && client.id == "hermes" {
                 continue;
             }
             #[cfg(not(all(unix, not(target_os = "macos"))))]
