@@ -18,6 +18,7 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **A diagnostics bundle or second gateway can no longer see an empty `gateway.log` or lose a connect-failure line.** Trim used to rewrite the shared log in place, so a concurrent diagnostics read could land in the empty window and a concurrent append could be overwritten by the pre-truncate snapshot. Trim now replaces the file atomically under the same lock as append.
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
