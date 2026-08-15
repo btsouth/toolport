@@ -148,6 +148,23 @@ run_check "installs the AppImage" "Installed the AppImage" 0 "$(fake_release "sh
 echo "digest mismatch (refuses before install)"
 run_check "reports the mismatch" "mismatch for Toolport_1.13.0_amd64.AppImage" 1 "$(fake_release "sha256:$(printf '0%.0s' $(seq 1 64))" 64)"
 
+echo "digest mismatch (working install preserved)"
+workdir="$(mktemp -d)"
+shim="$workdir/shim"; home="$workdir/home"; bindir="$workdir/bin"
+mkdir -p "$home" "$bindir"
+printf 'existing working install' > "$bindir/toolport"
+make_shim "$shim" "$(fake_release "sha256:$(printf '0%.0s' $(seq 1 64))" 64)"
+set +e
+mismatch_output="$(cd "$workdir" && PATH="$shim:$PATH" HOME="$home" XDG_BIN_HOME="$bindir" bash "$INSTALL_SH" 2>&1)"
+mismatch_rc=$?
+set -e
+if [ "$mismatch_rc" = "1" ] && [ "$(cat "$bindir/toolport")" = "existing working install" ]; then
+  echo "  ok: digest mismatch leaves the working install untouched"; pass=$((pass + 1))
+else
+  echo "  FAIL: digest mismatch clobbered the working install (rc=$mismatch_rc, content: $(cat "$bindir/toolport"))"; fail=$((fail + 1))
+fi
+rm -rf "$workdir"
+
 echo "no digest (refuses by default)"
 run_check "refuses with the opt-out hint" "TOOLPORT_ALLOW_UNVERIFIED=1" 1 "$(fake_release "" 64)"
 

@@ -186,10 +186,10 @@ install_linux() {
   # Prefer the .deb on Debian/Ubuntu: it links the system WebKitGTK and is the most
   # reliable package (see README). Fall back to the no-root AppImage everywhere else.
   if command -v dpkg >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-    url="$(asset_url '_amd64\.deb')"
+    url="$(asset_url '_amd64[.]deb')"
     [ -n "$url" ] || err "No .deb found in $tag_name."
-    digest="$(asset_field '_amd64\.deb' digest)"
-    size="$(asset_field '_amd64\.deb' size)"
+    digest="$(asset_field '_amd64[.]deb' digest)"
+    size="$(asset_field '_amd64[.]deb' size)"
     download_and_verify "$url" "$tmp/toolport.deb" "$digest" "$size"
     # Use sudo only when we aren't already root (root shells / containers have no sudo).
     sudo=""
@@ -205,13 +205,16 @@ install_linux() {
     return
   fi
 
-  url="$(asset_url '_amd64\.AppImage')"
+  url="$(asset_url '_amd64[.]AppImage')"
   [ -n "$url" ] || err "No AppImage found in $tag_name."
   bindir="${XDG_BIN_HOME:-$HOME/.local/bin}"
   mkdir -p "$bindir"
-  digest="$(asset_field '_amd64\.AppImage' digest)"
-  size="$(asset_field '_amd64\.AppImage' size)"
-  download_and_verify "$url" "$bindir/toolport" "$digest" "$size"
+  digest="$(asset_field '_amd64[.]AppImage' digest)"
+  size="$(asset_field '_amd64[.]AppImage' size)"
+  # Stage in $tmp and only move into the install path after verification, so a
+  # corrupt or tampered download can never delete a working install.
+  download_and_verify "$url" "$tmp/toolport.AppImage" "$digest" "$size"
+  mv "$tmp/toolport.AppImage" "$bindir/toolport"
   chmod +x "$bindir/toolport"
 
   apps="$HOME/.local/share/applications"
@@ -237,8 +240,8 @@ install_macos() {
   say "Tip: on macOS the cleanest install is Homebrew:"
   say "     brew install --cask tsouth89/toolport/toolport"
   case "$arch" in
-    arm64 | aarch64) suffix='aarch64-apple-darwin\.dmg' ;;
-    x86_64) suffix='x86_64-apple-darwin\.dmg' ;;
+    arm64 | aarch64) suffix='aarch64-apple-darwin[.]dmg' ;;
+    x86_64) suffix='x86_64-apple-darwin[.]dmg' ;;
     *) err "Unsupported macOS arch: $arch" ;;
   esac
   url="$(asset_url "$suffix")"
