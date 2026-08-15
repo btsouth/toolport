@@ -65,20 +65,25 @@ asset_field() {
         sub(/^.*"name": *"/, "", name)
         sub(/".*$/, "", name)
       }
+      # Emit from each field block once the asset whose name matches the
+      # suffix is the current one. GitHub does not guarantee object key order,
+      # so the value must be printed when it is parsed, not when the
+      # browser_download_url happens to appear.
       /"size":/ {
-        size = $0
-        sub(/^.*"size": */, "", size)
-        sub(/,.*$/, "", size)
+        if (name ~ suffix "$" && field == "size") {
+          size = $0
+          sub(/^.*"size": */, "", size)
+          sub(/,.*$/, "", size)
+          print size
+          exit
+        }
       }
       /"digest":/ {
-        digest = $0
-        sub(/^.*"digest": *"/, "", digest)
-        sub(/".*$/, "", digest)
-      }
-      /"browser_download_url":/ {
-        if (name ~ suffix "$") {
-          if (field == "digest") print digest
-          else if (field == "size") print size
+        if (name ~ suffix "$" && field == "digest") {
+          digest = $0
+          sub(/^.*"digest": *"/, "", digest)
+          sub(/".*$/, "", digest)
+          print digest
           exit
         }
       }
@@ -134,8 +139,12 @@ download_and_verify() {
   say "Downloading $(basename "$url")"
   # --proto '=https' also applies to redirects, so a swapped-out asset URL can't
   # bounce the download to a plaintext endpoint.
-  curl --proto '=https' -fsSL "$url" -o "$dest" || err "Download failed ($url)."
+  if ! curl --proto '=https' -fsSL "$url" -o "$dest"; then
+    rm -f "$dest"
+    err "Download failed ($url)."
+  fi
   if [ ! -s "$dest" ]; then
+    rm -f "$dest"
     err "Download produced an empty file ($url)."
   fi
   if [ -n "$published_size" ] && [ "$published_size" != "0" ]; then

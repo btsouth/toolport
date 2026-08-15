@@ -41,10 +41,10 @@ fake_release() {
       "id": 1,
       "name": "Toolport_1.13.0_amd64.AppImage",
       "state": "uploaded",
-      "size": $size,
-      "digest": "$digest",
       "download_count": 0,
-      "browser_download_url": "$url"
+      "browser_download_url": "$url",
+      "size": $size,
+      "digest": "$digest"
     }
   ]
 }
@@ -69,6 +69,14 @@ for arg in "$@"; do
   if [ "$arg" = "-o" ]; then has_out=1; fi
 done
 if [ -n "$dest" ]; then
+  if [ "${TOOLPORT_TEST_EMPTY_DOWNLOAD:-0}" = "1" ]; then
+    : > "$dest"
+    exit 0
+  fi
+  if [ "${TOOLPORT_TEST_CURL_FAIL:-0}" = "1" ]; then
+    printf "partial" > "$dest"
+    exit 1
+  fi
   printf "%b" "\\x01\\x02\\x03\\x04\\x05\\x06\\x07\\x08\\x09\\x0a\\x0b\\x0c\\x0d\\x0e\\x0f\\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17\\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f\\x20\\x21\\x22\\x23\\x24\\x25\\x26\\x27\\x28\\x29\\x2a\\x2b\\x2c\\x2d\\x2e\\x2f\\x30\\x31\\x32\\x33\\x34\\x35\\x36\\x37\\x38\\x39\\x3a\\x3b\\x3c\\x3d\\x3e\\x3f\\x40" > "$dest"
   exit 0
 fi
@@ -151,6 +159,32 @@ run_check "reports truncation" "Treating it as truncated" 1 "$(fake_release "sha
 
 echo "non-https URL (refused before download)"
 run_check "refuses a non-https URL" "non-https URL" 1 "$(fake_release "sha256:$fake_sha256" 64 "http://example.invalid/Toolport_1.13.0_amd64.AppImage")"
+
+echo "empty download (rejected, destination removed)"
+run_check "rejects the empty download" "empty file" 1 "$(fake_release "sha256:$fake_sha256" 64)" TOOLPORT_TEST_EMPTY_DOWNLOAD=1
+
+echo "curl failure (partial download removed, AppImage path)"
+workdir="$(mktemp -d)"
+shim="$workdir/shim"; home="$workdir/home"; bindir="$workdir/bin"
+mkdir -p "$home" "$bindir"
+make_shim "$shim" "$(fake_release "sha256:$fake_sha256" 64)"
+set +e
+curl_fail_output="$(cd "$workdir" && PATH="$shim:$PATH" HOME="$home" XDG_BIN_HOME="$bindir" TOOLPORT_TEST_CURL_FAIL=1 bash "$INSTALL_SH" 2>&1)"
+curl_fail_rc=$?
+set -e
+check "reports the download failure" "Download failed" "$curl_fail_output"
+if [ "$curl_fail_rc" = "1" ]; then
+  echo "  ok: exit code 1"; pass=$((pass + 1))
+else
+  echo "  FAIL: exit code $curl_fail_rc (wanted 1)"; fail=$((fail + 1))
+fi
+if [ ! -e "$bindir/toolport" ]; then
+  echo "  ok: partial AppImage removed"; pass=$((pass + 1))
+else
+  echo "  FAIL: partial AppImage left behind"; fail=$((fail + 1))
+fi
+echo "    output: $(printf '%s' "$curl_fail_output" | tr '\n' ' ' | cut -c1-150)"
+rm -rf "$workdir"
 
 echo
 echo "$pass passed, $fail failed"
