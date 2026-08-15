@@ -918,59 +918,71 @@ fn refuse_if_customized(state: &RegistryState, client_id: &str, force: bool) -> 
 /// `transport` is `"stdio"` (default) or `"sharedHttp"` (SOU-407).
 /// When the live entry is user-customized, pass `force: true` after the UI confirms
 /// overwrite (SOU-406); otherwise the install is refused.
+///
+/// Runs on the blocking pool, not the GTK main loop (SBS-818): the shared-HTTP
+/// path reaches the vault through `ensure_client_http_token`, and a Secret
+/// Service call is a synchronous D-Bus round trip that stalls window controls
+/// and the tray menu on a slow or locked keyring (SBS-813, SBS-812). Reading the
+/// client's config in `refuse_if_customized` and writing it in `clients::*` are
+/// blocking file IO for the same reason.
 #[tauri::command]
-fn install_gateway(
-    state: State<RegistryState>,
-    bridge: State<HttpBridgeState>,
+async fn install_gateway(
+    app: AppHandle,
     client_id: String,
     profile: Option<String>,
     force: Option<bool>,
     transport: Option<String>,
 ) -> Result<clients::WriteOutcome, String> {
-    refuse_if_customized(state.inner(), &client_id, force.unwrap_or(false))?;
-    let transport = transport
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .unwrap_or("stdio");
-    let outcome = if transport.eq_ignore_ascii_case("sharedHttp")
-        || transport.eq_ignore_ascii_case("shared_http")
-    {
-        // Ensure the supervised bridge is up, mint/reuse a per-client bearer, write
-        // native remote or mcp-remote into the client config (SOU-407).
-        let status = start_http_bridge_at(bridge.inner(), None)?;
-        let port = status.port.unwrap_or(8765);
-        let url = format!("http://127.0.0.1:{port}/mcp");
-        let token = ensure_client_http_token(state.inner(), &client_id, profile.as_deref())?;
-        let spec = clients::SharedHttpSpec { url, token };
-        clients::install_gateway_shared_http(&client_id, profile.as_deref(), &spec)?
-    } else {
-        clients::install_gateway(&client_id, profile.as_deref())?
-    };
-    // Record the scope we just wrote into the client's config, so the UI can show
-    // and re-apply this client's effective scope without re-reading the config.
-    // A concrete profile is stored by name; "no profile" is recorded as an
-    // explicit-unscoped marker (not a removal) so a running gateway drops its old
-    // scope live instead of falling back to its boot-time CONDUIT_PROFILE. The client
-    // config was already written above (outside the lock); only the registry record
-    // goes through the locked load-modify-save.
-    let scope: Option<String> = profile
-        .as_deref()
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_string);
-    let managed = outcome.managed.clone();
-    write_registry(state.inner(), |reg| {
-        match scope.as_deref() {
-            Some(p) => reg.set_client_scope(&client_id, Some(p)),
-            None => reg.set_client_unscoped(&client_id),
-        }
-        if let Some(m) = managed {
-            reg.set_client_managed_entry(&client_id, m);
-        }
-        Ok(())
-    })?;
-    Ok(outcome)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        let bridge = app.state::<HttpBridgeState>();
+        refuse_if_customized(state.inner(), &client_id, force.unwrap_or(false))?;
+        let transport = transport
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or("stdio");
+        let outcome = if transport.eq_ignore_ascii_case("sharedHttp")
+            || transport.eq_ignore_ascii_case("shared_http")
+        {
+            // Ensure the supervised bridge is up, mint/reuse a per-client bearer, write
+            // native remote or mcp-remote into the client config (SOU-407).
+            let status = start_http_bridge_at(bridge.inner(), None)?;
+            let port = status.port.unwrap_or(8765);
+            let url = format!("http://127.0.0.1:{port}/mcp");
+            let token = ensure_client_http_token(state.inner(), &client_id, profile.as_deref())?;
+            let spec = clients::SharedHttpSpec { url, token };
+            clients::install_gateway_shared_http(&client_id, profile.as_deref(), &spec)?
+        } else {
+            clients::install_gateway(&client_id, profile.as_deref())?
+        };
+        // Record the scope we just wrote into the client's config, so the UI can show
+        // and re-apply this client's effective scope without re-reading the config.
+        // A concrete profile is stored by name; "no profile" is recorded as an
+        // explicit-unscoped marker (not a removal) so a running gateway drops its old
+        // scope live instead of falling back to its boot-time CONDUIT_PROFILE. The client
+        // config was already written above (outside the lock); only the registry record
+        // goes through the locked load-modify-save.
+        let scope: Option<String> = profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        let managed = outcome.managed.clone();
+        write_registry(state.inner(), |reg| {
+            match scope.as_deref() {
+                Some(p) => reg.set_client_scope(&client_id, Some(p)),
+                None => reg.set_client_unscoped(&client_id),
+            }
+            if let Some(m) = managed {
+                reg.set_client_managed_entry(&client_id, m);
+            }
+            Ok(())
+        })?;
+        Ok(outcome)
+    })
+    .await
+    .map_err(|e| format!("install task join failed: {e}"))?
 }
 
 /// Mint or reuse a bearer token for a managed shared-HTTP client install.
@@ -1049,21 +1061,30 @@ fn revoke_client_http_token(state: &RegistryState, client_id: &str) {
 }
 
 /// Remove the Toolport gateway from a client.
+///
+/// Runs on the blocking pool for the same reason as [`install_gateway`]
+/// (SBS-818): `revoke_client_http_token` deletes the vaulted bearer, which is a
+/// synchronous Secret Service round trip on Linux.
 #[tauri::command]
-fn uninstall_gateway(
-    state: State<RegistryState>,
+async fn uninstall_gateway(
+    app: AppHandle,
     client_id: String,
 ) -> Result<clients::WriteOutcome, String> {
-    let outcome = clients::uninstall_gateway(&client_id)?;
-    // Config entry is gone; also revoke the bridge bearer so a leftover backup or
-    // stale token cannot keep authenticating (WS3-4).
-    revoke_client_http_token(state.inner(), &client_id);
-    write_registry(state.inner(), |reg| {
-        reg.set_client_scope(&client_id, None);
-        reg.clear_client_managed_entry(&client_id);
-        Ok(())
-    })?;
-    Ok(outcome)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        let outcome = clients::uninstall_gateway(&client_id)?;
+        // Config entry is gone; also revoke the bridge bearer so a leftover backup or
+        // stale token cannot keep authenticating (WS3-4).
+        revoke_client_http_token(state.inner(), &client_id);
+        write_registry(state.inner(), |reg| {
+            reg.set_client_scope(&client_id, None);
+            reg.clear_client_managed_entry(&client_id);
+            Ok(())
+        })?;
+        Ok(outcome)
+    })
+    .await
+    .map_err(|e| format!("uninstall task join failed: {e}"))?
 }
 
 /// 24 random bytes (192 bits) as hex, for a bearer token or a unique id.
