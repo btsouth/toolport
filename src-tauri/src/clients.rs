@@ -372,14 +372,19 @@ fn claude_config_dir_override() -> Option<PathBuf> {
     claude_config_dir_from(std::env::var_os("CLAUDE_CONFIG_DIR"))
 }
 
+/// An env-supplied directory is only used when it is an absolute path.
+/// Empty or relative values are a misconfiguration, not an instruction to
+/// write relative to Toolport's cwd. Shared by `CLAUDE_CONFIG_DIR`,
+/// `CODEX_HOME`, `GEMINI_CLI_HOME`, `GROK_HOME`, and `QWEN_HOME` (SBS-885).
+fn absolute_env_dir(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let dir = PathBuf::from(raw?);
+    dir.is_absolute().then_some(dir)
+}
+
 /// The env-free half of [`claude_config_dir_override`], so the validation rules
 /// are testable without mutating process environment from a parallel test.
 fn claude_config_dir_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    let dir = PathBuf::from(raw?);
-    // An empty or relative value is a misconfiguration, not an instruction to
-    // write somewhere surprising: fall back to the documented default rather
-    // than resolving against whatever cwd Toolport happens to have.
-    dir.is_absolute().then_some(dir)
+    absolute_env_dir(raw)
 }
 
 /// The `.claude.json` a Claude Code process reads, given its config dir.
@@ -606,16 +611,14 @@ fn resolve_rules_target(
                 .join("toolport-team-rules.md"),
         ),
         // Strategy B — Toolport owns only the sentinel span in a shared global file.
-        "codex" => Target {
-            path: home.join(".codex").join("AGENTS.md"),
-            strategy: Strategy::SentinelBlock,
-            char_cap: None,
-            // AGENTS.override.md, if present, makes Codex ignore AGENTS.md entirely.
-            blocked_if_present: Some(home.join(".codex").join("AGENTS.override.md")),
-        },
-        // Gemini CLI and Antigravity share `~/.gemini/GEMINI.md`; both resolve to it so a
-        // standalone install of EITHER is covered, and `apply_instructions`' path-dedup writes
-        // it once when both are present.
+        // Default home only. `client_rules_target` relocates Codex / Gemini CLI
+        // when `CODEX_HOME` / `GEMINI_CLI_HOME` is an absolute path (SBS-885).
+        "codex" => codex_rules_target(&home.join(".codex")),
+        // Gemini CLI and Antigravity share `~/.gemini/GEMINI.md` at the default
+        // home so a standalone install of EITHER is covered, and
+        // `apply_instructions`' path-dedup writes it once when both are present.
+        // A relocated Gemini CLI home is handled in `client_rules_target` and
+        // does not move Antigravity (`GEMINI_CLI_HOME` is CLI-only).
         "gemini-cli" | "antigravity" => block(home.join(".gemini").join("GEMINI.md")),
         "windsurf" => Target {
             path: home
@@ -641,9 +644,44 @@ fn resolve_rules_target(
     Some(target)
 }
 
+/// Codex team-instructions live next to `config.toml` under `CODEX_HOME`
+/// (default `~/.codex`). `AGENTS.override.md` in that same directory, if
+/// present, makes Codex ignore `AGENTS.md` entirely.
+fn codex_rules_target(codex_home: &Path) -> crate::instructions::Target {
+    crate::instructions::Target {
+        path: codex_home.join("AGENTS.md"),
+        strategy: crate::instructions::Strategy::SentinelBlock,
+        char_cap: None,
+        blocked_if_present: Some(codex_home.join("AGENTS.override.md")),
+    }
+}
+
+/// Gemini CLI team-instructions follow `GEMINI_CLI_HOME` the same way settings
+/// do: the env replaces the process home, then `.gemini/` is still appended.
+fn gemini_cli_rules_target(cli_home: &Path) -> crate::instructions::Target {
+    crate::instructions::Target {
+        path: cli_home.join(".gemini").join("GEMINI.md"),
+        strategy: crate::instructions::Strategy::SentinelBlock,
+        char_cap: None,
+        blocked_if_present: None,
+    }
+}
+
 /// The rules-file target for a client on the current machine, or `None` if unsupported /
 /// transitively covered. Mirrors [`client_config_path`].
 pub fn client_rules_target(client_id: &str) -> Option<crate::instructions::Target> {
+    // Honor relocate envs even when `$HOME` is unset: the live file is under
+    // the override, not the default home table (SBS-885).
+    if client_id == "codex" {
+        if let Some(dir) = codex_home_from(std::env::var_os("CODEX_HOME")) {
+            return Some(codex_rules_target(&dir));
+        }
+    }
+    if client_id == "gemini-cli" {
+        if let Some(dir) = gemini_cli_home_from(std::env::var_os("GEMINI_CLI_HOME")) {
+            return Some(gemini_cli_rules_target(&dir));
+        }
+    }
     let home = home()?;
     resolve_rules_target(client_id, &home, Platform::current())
 }
@@ -770,7 +808,22 @@ fn windsurf_path() -> Option<PathBuf> {
     client_config_path("windsurf")
 }
 
+/// Codex reads `$CODEX_HOME/config.toml` when `CODEX_HOME` is set, otherwise
+/// `~/.codex/config.toml`. The env *is* the Codex home directory, not its
+/// parent. Empty or relative values fall back: resolving them would depend
+/// on Toolport's cwd, which is not where Codex looks (SBS-885).
+fn codex_home_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    absolute_env_dir(raw)
+}
+
+fn codex_config_path(codex_home: &Path) -> PathBuf {
+    codex_home.join("config.toml")
+}
+
 fn codex_path() -> Option<PathBuf> {
+    if let Some(dir) = codex_home_from(std::env::var_os("CODEX_HOME")) {
+        return Some(codex_config_path(&dir));
+    }
     client_config_path("codex")
 }
 
@@ -784,13 +837,24 @@ fn github_copilot_cli_path() -> Option<PathBuf> {
         .or_else(|| client_config_path("github-copilot-cli"))
 }
 
-/// Grok Build (xAI's terminal coding agent) stores MCP servers in
-/// `~/.grok/config.toml` under `[mcp_servers.<name>]` - the same TOML shape as
-/// Codex, so it shares the `TomlMcpServers` format. It also reads Claude Code's
-/// config as a fallback, but writing our own explicit entry is what makes the
-/// gateway reliably visible (`grok mcp list` doesn't surface the Claude-config
-/// pickup).
+/// Grok Build stores MCP servers in `$GROK_HOME/config.toml` (default
+/// `~/.grok/config.toml`) under `[mcp_servers.<name>]` - the same TOML
+/// shape as Codex. `GROK_HOME` is the same relocate class as `CODEX_HOME`
+/// (SBS-885). It also reads Claude Code's config as a fallback, but writing
+/// our own explicit entry is what makes the gateway reliably visible
+/// (`grok mcp list` doesn't surface the Claude-config pickup).
+fn grok_home_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    absolute_env_dir(raw)
+}
+
+fn grok_config_path(grok_home: &Path) -> PathBuf {
+    grok_home.join("config.toml")
+}
+
 fn grok_path() -> Option<PathBuf> {
+    if let Some(dir) = grok_home_from(std::env::var_os("GROK_HOME")) {
+        return Some(grok_config_path(&dir));
+    }
     client_config_path("grok")
 }
 
@@ -860,13 +924,42 @@ fn claude_code_path() -> Option<PathBuf> {
     client_config_path("claude-code")
 }
 
+/// Gemini CLI treats `GEMINI_CLI_HOME` as a replacement *home directory*,
+/// then still appends `.gemini/`. Settings live at
+/// `$GEMINI_CLI_HOME/.gemini/settings.json`. Empty or relative values fall
+/// back the same way `CLAUDE_CONFIG_DIR` does (SBS-885).
+fn gemini_cli_home_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    absolute_env_dir(raw)
+}
+
+fn gemini_cli_settings_path(cli_home: &Path) -> PathBuf {
+    cli_home.join(".gemini").join("settings.json")
+}
+
 fn gemini_cli_path() -> Option<PathBuf> {
+    if let Some(dir) = gemini_cli_home_from(std::env::var_os("GEMINI_CLI_HOME")) {
+        return Some(gemini_cli_settings_path(&dir));
+    }
     client_config_path("gemini-cli")
 }
 
-/// Qwen Code stores user-scoped settings at `~/.qwen/settings.json` on every
-/// supported platform.
+/// Qwen Code stores user-scoped settings at `~/.qwen/settings.json`.
+/// `QWEN_HOME` relocates that directory (`$QWEN_HOME/settings.json`), the
+/// same class as `CODEX_HOME` (SBS-885). Qwen itself also accepts a
+/// relative `QWEN_HOME` resolved against cwd; we do not, because Toolport's
+/// cwd is not Qwen's.
+fn qwen_home_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    absolute_env_dir(raw)
+}
+
+fn qwen_settings_path(qwen_home: &Path) -> PathBuf {
+    qwen_home.join("settings.json")
+}
+
 fn qwen_code_path() -> Option<PathBuf> {
+    if let Some(dir) = qwen_home_from(std::env::var_os("QWEN_HOME")) {
+        return Some(qwen_settings_path(&dir));
+    }
     client_config_path("qwen-code")
 }
 
@@ -1230,7 +1323,8 @@ fn defs() -> Vec<ClientDef> {
             plugin_scan: None,
         },
         ClientDef {
-            // The Codex CLI and the Codex desktop app share ~/.codex/config.toml.
+            // The Codex CLI and the Codex desktop app share config.toml under
+            // `CODEX_HOME` (default ~/.codex).
             id: "codex",
             name: "Codex",
             format: Format::TomlMcpServers,
@@ -5535,6 +5629,103 @@ mod tests {
         assert_eq!(claude_config_dir_from(Some("relative/dir".into())), None);
     }
 
+    fn relocated_abs(unix: &str, windows: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(windows)
+        } else {
+            PathBuf::from(unix)
+        }
+    }
+
+    /// Pins the failure mode in SBS-885: an absolute `CODEX_HOME` is the
+    /// directory Codex reads, so Connect must write `$CODEX_HOME/config.toml`
+    /// rather than a leftover `~/.codex/config.toml`.
+    #[test]
+    fn an_absolute_codex_home_is_the_config_and_rules_root() {
+        let relocated = relocated_abs("/work/codex", r"D:\work\codex");
+        assert_eq!(
+            codex_home_from(Some(relocated.clone().into_os_string())),
+            Some(relocated.clone())
+        );
+        assert_eq!(codex_config_path(&relocated), relocated.join("config.toml"));
+        let rules = codex_rules_target(&relocated);
+        assert_eq!(rules.path, relocated.join("AGENTS.md"));
+        assert_eq!(
+            rules.blocked_if_present,
+            Some(relocated.join("AGENTS.override.md"))
+        );
+    }
+
+    #[test]
+    fn an_unset_or_unusable_codex_home_falls_back_to_the_default() {
+        assert_eq!(codex_home_from(None), None);
+        assert_eq!(codex_home_from(Some("".into())), None);
+        assert_eq!(codex_home_from(Some("relative/dir".into())), None);
+    }
+
+    /// Gemini CLI replaces the process home, then still appends `.gemini/`.
+    /// Writing `$GEMINI_CLI_HOME/settings.json` would miss the live file.
+    #[test]
+    fn an_absolute_gemini_cli_home_nests_settings_and_rules_under_dot_gemini() {
+        let relocated = relocated_abs("/work/gemini", r"D:\work\gemini");
+        assert_eq!(
+            gemini_cli_home_from(Some(relocated.clone().into_os_string())),
+            Some(relocated.clone())
+        );
+        assert_eq!(
+            gemini_cli_settings_path(&relocated),
+            relocated.join(".gemini").join("settings.json")
+        );
+        assert_eq!(
+            gemini_cli_rules_target(&relocated).path,
+            relocated.join(".gemini").join("GEMINI.md")
+        );
+    }
+
+    #[test]
+    fn an_unset_or_unusable_gemini_cli_home_falls_back_to_the_default() {
+        assert_eq!(gemini_cli_home_from(None), None);
+        assert_eq!(gemini_cli_home_from(Some("".into())), None);
+        assert_eq!(gemini_cli_home_from(Some("relative/dir".into())), None);
+    }
+
+    #[test]
+    fn an_absolute_grok_home_is_the_config_root() {
+        let relocated = relocated_abs("/work/grok", r"D:\work\grok");
+        assert_eq!(
+            grok_home_from(Some(relocated.clone().into_os_string())),
+            Some(relocated.clone())
+        );
+        assert_eq!(grok_config_path(&relocated), relocated.join("config.toml"));
+    }
+
+    #[test]
+    fn an_unset_or_unusable_grok_home_falls_back_to_the_default() {
+        assert_eq!(grok_home_from(None), None);
+        assert_eq!(grok_home_from(Some("".into())), None);
+        assert_eq!(grok_home_from(Some("relative/dir".into())), None);
+    }
+
+    #[test]
+    fn an_absolute_qwen_home_is_the_settings_root() {
+        let relocated = relocated_abs("/work/qwen", r"D:\work\qwen");
+        assert_eq!(
+            qwen_home_from(Some(relocated.clone().into_os_string())),
+            Some(relocated.clone())
+        );
+        assert_eq!(
+            qwen_settings_path(&relocated),
+            relocated.join("settings.json")
+        );
+    }
+
+    #[test]
+    fn an_unset_or_unusable_qwen_home_falls_back_to_the_default() {
+        assert_eq!(qwen_home_from(None), None);
+        assert_eq!(qwen_home_from(Some("".into())), None);
+        assert_eq!(qwen_home_from(Some("relative/dir".into())), None);
+    }
+
     fn sample_gateway(profile: Option<&str>, client_id: &str) -> ServerEntry {
         let mut env = vec![EnvVar {
             key: crate::brand::CLIENT_ID.to_string(),
@@ -8377,6 +8568,55 @@ command = "npx"
     }
 
     #[test]
+    fn codex_path_and_rules_honor_an_absolute_codex_home() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("toolport-codex-home-{}", std::process::id()));
+        let _restore = EnvRestore::set("CODEX_HOME", &root);
+        assert_eq!(codex_path(), Some(root.join("config.toml")));
+        let rules = client_rules_target("codex").expect("codex rules");
+        assert_eq!(rules.path, root.join("AGENTS.md"));
+        assert_eq!(
+            rules.blocked_if_present,
+            Some(root.join("AGENTS.override.md"))
+        );
+    }
+
+    #[test]
+    fn gemini_cli_path_and_rules_honor_an_absolute_gemini_cli_home() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("toolport-gemini-cli-home-{}", std::process::id()));
+        let _restore = EnvRestore::set("GEMINI_CLI_HOME", &root);
+        assert_eq!(
+            gemini_cli_path(),
+            Some(root.join(".gemini").join("settings.json"))
+        );
+        let rules = client_rules_target("gemini-cli").expect("gemini rules");
+        assert_eq!(rules.path, root.join(".gemini").join("GEMINI.md"));
+        // Antigravity is a different product; GEMINI_CLI_HOME must not move it.
+        let home = home().expect("home");
+        let antigravity = resolve_rules_target("antigravity", &home, Platform::current())
+            .expect("antigravity rules");
+        assert_eq!(antigravity.path, home.join(".gemini").join("GEMINI.md"));
+    }
+
+    #[test]
+    fn grok_path_honors_an_absolute_grok_home() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("toolport-grok-home-{}", std::process::id()));
+        let _restore = EnvRestore::set("GROK_HOME", &root);
+        assert_eq!(grok_path(), Some(root.join("config.toml")));
+    }
+
+    #[test]
+    fn qwen_code_path_honors_an_absolute_qwen_home() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("toolport-qwen-home-{}", std::process::id()));
+        let _restore = EnvRestore::set("QWEN_HOME", &root);
+        assert_eq!(qwen_code_path(), Some(root.join("settings.json")));
+    }
+
+    #[test]
     fn kimi_json_parses_sse_transport_hint_and_bearer_env_var() {
         let content = r#"{
             "mcpServers": {
@@ -9061,6 +9301,12 @@ command = "npx"
         // `.claude.json`). The override itself is covered by
         // `claude_code_config_follows_a_relocated_config_dir`.
         let _claude_config_dir = EnvRestore::set("CLAUDE_CONFIG_DIR", Path::new(""));
+        // Same class as CLAUDE_CONFIG_DIR: neutralize relocate envs the host
+        // (or a parallel test) may have exported so this asserts the default table.
+        let _codex_home = EnvRestore::set("CODEX_HOME", Path::new(""));
+        let _gemini_cli_home = EnvRestore::set("GEMINI_CLI_HOME", Path::new(""));
+        let _grok_home = EnvRestore::set("GROK_HOME", Path::new(""));
+        let _qwen_home = EnvRestore::set("QWEN_HOME", Path::new(""));
         let home = home().expect("home dir should be available in tests");
         let platform = Platform::current();
         for client in defs() {

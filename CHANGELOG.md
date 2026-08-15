@@ -18,6 +18,17 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **Codex Connect honors `CODEX_HOME`.** Connect, migrate, and launch-time
+  re-point wrote `~/.codex/config.toml` even when Codex was reading
+  `$CODEX_HOME/config.toml`, so a relocated live config never got a gateway
+  entry and Toolport still reported success. Team-instructions `AGENTS.md`
+  follows the same home. Empty or relative `CODEX_HOME` still falls back to
+  `~/.codex` (Toolport's cwd is not Codex's home). The same class is now
+  honored for Gemini CLI (`GEMINI_CLI_HOME` →
+  `$GEMINI_CLI_HOME/.gemini/settings.json` and `GEMINI.md`), Grok Build
+  (`GROK_HOME`), and Qwen Code (`QWEN_HOME`). A GUI-only Toolport process
+  still cannot see a shell-only export; that limitation already applied to
+  `CLAUDE_CONFIG_DIR`. (SBS-885)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
