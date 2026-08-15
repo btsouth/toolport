@@ -89,29 +89,37 @@ describe("Linux .deb toolport packaging hook (SBS-846)", () => {
     expect(firstBin).toMatch(/^path = "src\/main\.rs"$/m);
   });
 
-  it("installs a toolport command that execs the conduit binary", () => {
-    const prefix = mkdtempSync(join(tmpdir(), "sbs-846-deb-"));
-    try {
-      writeFileSync(
-        join(prefix, "conduit"),
-        '#!/bin/sh\nprintf "conduit-ran"\n[ $# -gt 0 ] && printf " %s" "$@"\nprintf "\\n"\n',
-      );
-      chmodSync(join(prefix, "conduit"), 0o755);
-      copyFileSync(wrapperPath, join(prefix, "toolport"));
-      chmodSync(join(prefix, "toolport"), 0o755);
+  // Actually runs the wrapper, so it needs a POSIX shell and a real exec bit.
+  // On Windows `chmodSync` is a no-op and execFileSync on an extensionless
+  // `#!/bin/sh` file is ENOENT, so this one case is Linux/macOS only. CI runs
+  // the suite on ubuntu, so the coverage that matters is unaffected; this only
+  // stops `npm test` failing on a Windows dev box.
+  it.skipIf(process.platform === "win32")(
+    "installs a toolport command that execs the conduit binary",
+    () => {
+      const prefix = mkdtempSync(join(tmpdir(), "sbs-846-deb-"));
+      try {
+        writeFileSync(
+          join(prefix, "conduit"),
+          '#!/bin/sh\nprintf "conduit-ran"\n[ $# -gt 0 ] && printf " %s" "$@"\nprintf "\\n"\n',
+        );
+        chmodSync(join(prefix, "conduit"), 0o755);
+        copyFileSync(wrapperPath, join(prefix, "toolport"));
+        chmodSync(join(prefix, "toolport"), 0o755);
 
-      const viaAbs = execFileSync(join(prefix, "toolport"), ["--version"], {
-        encoding: "utf8",
-      });
-      expect(viaAbs).toBe("conduit-ran --version\n");
+        const viaAbs = execFileSync(join(prefix, "toolport"), ["--version"], {
+          encoding: "utf8",
+        });
+        expect(viaAbs).toBe("conduit-ran --version\n");
 
-      const viaPath = execFileSync("toolport", ["launch"], {
-        encoding: "utf8",
-        env: { ...process.env, PATH: prefix },
-      });
-      expect(viaPath).toBe("conduit-ran launch\n");
-    } finally {
-      rmSync(prefix, { recursive: true, force: true });
-    }
-  });
+        const viaPath = execFileSync("toolport", ["launch"], {
+          encoding: "utf8",
+          env: { ...process.env, PATH: prefix },
+        });
+        expect(viaPath).toBe("conduit-ran launch\n");
+      } finally {
+        rmSync(prefix, { recursive: true, force: true });
+      }
+    },
+  );
 });
