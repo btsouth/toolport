@@ -18,6 +18,10 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **SECURITY.md now matches the HTTP bind admission policy.** A hand-launched
+  loopback gateway without a token does not bind; it exits 1 unless
+  `--insecure-loopback` is passed. Non-loopback still requires a token or
+  registered HTTP client. (SBS-878)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
