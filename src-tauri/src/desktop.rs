@@ -2986,14 +2986,37 @@ fn stored_sign_in_token_but_reload_failed(e: &str) -> String {
     format!("The sign-in token was stored in the keychain, but {e}")
 }
 
+/// Sentence wrappers for the pre-bump failures on the auth paths. Keychain and
+/// sign-in-state errors are bare fragments (e.g. an OS keychain error), so they
+/// are wrapped into complete sentences before the frontend shows them as-is;
+/// the frontend renders these messages verbatim, so a bare fragment would leave
+/// users staring at an untethered error (#743).
+fn could_not_finish_sign_in(e: &str) -> String {
+    format!("Could not finish sign-in: {e}")
+}
+
+fn could_not_store_token(e: &str) -> String {
+    format!("Could not store the token: {e}")
+}
+
+fn could_not_clear_sign_in_state(e: &str) -> String {
+    format!("Could not clear the previous sign-in state: {e}")
+}
+
+fn could_not_remove_token(e: &str) -> String {
+    format!("Could not remove the token: {e}")
+}
+
 /// The keychain half of `clear_auth_token`, extracted from the Tauri command so the
 /// whole clear-token path (not just the bump) is reachable from tests (#743).
 fn clear_auth_token_inner(server_id: &str, state: &RegistryState) -> Result<(), String> {
     let _mutation = acquire_auth_mutation_lock(server_id)?;
     // Remove refresh metadata first so a second-write failure cannot leave state
     // that silently recreates the bearer token the user asked to delete.
-    remote::clear_oauth_state(server_id)?;
-    secrets::delete_secret(server_id, secrets::HTTP_AUTH_KEY)?;
+    remote::clear_oauth_state(server_id)
+        .map_err(|e| could_not_clear_sign_in_state(&e))?;
+    secrets::delete_secret(server_id, secrets::HTTP_AUTH_KEY)
+        .map_err(|e| could_not_remove_token(&e))?;
     bump_secrets_generation(state).map_err(|e| removed_token_but_reload_failed(&e))?;
     Ok(())
 }
@@ -3010,8 +3033,10 @@ async fn set_auth_token(app: AppHandle, server_id: String, token: String) -> Res
         let _mutation = acquire_auth_mutation_lock(&server_id)?;
         // A manually pasted bearer replaces any prior OAuth session. Keeping stale
         // refresh metadata could otherwise overwrite the user's token later.
-        remote::clear_oauth_state(&server_id)?;
-        secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &token)?;
+        remote::clear_oauth_state(&server_id)
+            .map_err(|e| could_not_clear_sign_in_state(&e))?;
+        secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &token)
+            .map_err(|e| could_not_store_token(&e))?;
         bump_secrets_generation(app.state::<RegistryState>().inner()).map_err(|e| {
             // The vault half already succeeded; the user needs to know that and that the
             // gateway wasn't told (#737).
@@ -3083,8 +3108,10 @@ async fn authenticate_oauth(
         res.scope,
         res.issued_at,
         res.expires_at,
-    )?;
-    secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &res.access_token)?;
+    )
+    .map_err(|e| could_not_finish_sign_in(&e))?;
+    secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &res.access_token)
+        .map_err(|e| could_not_store_token(&e))?;
     bump_secrets_generation(state.inner()).map_err(|e| {
         // The vault half already succeeded; a fresh sign-in that never reaches the
         // gateway leaves the user staring at 401s from a server they just authenticated.
@@ -6388,6 +6415,24 @@ mod tests {
         assert_eq!(
             stored_sign_in_token_but_reload_failed("could not reload the running gateway"),
             "The sign-in token was stored in the keychain, but could not reload the running gateway"
+        );
+        // The pre-bump vault failures are wrapped into complete sentences so a bare
+        // keychain fragment never reaches the frontend verbatim (#743).
+        assert_eq!(
+            could_not_finish_sign_in("state mismatch (possible CSRF); try connecting again"),
+            "Could not finish sign-in: state mismatch (possible CSRF); try connecting again"
+        );
+        assert_eq!(
+            could_not_store_token("keychain is locked"),
+            "Could not store the token: keychain is locked"
+        );
+        assert_eq!(
+            could_not_clear_sign_in_state("keychain is locked"),
+            "Could not clear the previous sign-in state: keychain is locked"
+        );
+        assert_eq!(
+            could_not_remove_token("keychain is locked"),
+            "Could not remove the token: keychain is locked"
         );
     }
 
