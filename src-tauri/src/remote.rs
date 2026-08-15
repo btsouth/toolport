@@ -360,11 +360,14 @@ pub fn reset_client_credentials(server_id: &str) -> Result<(), String> {
 /// whether to discard state, and discarding on a parse failure would loop a broken
 /// vault into re-acquiring on every connect.
 ///
-/// Deliberately still `get_secret`, not `get_secret_result`. The sole caller,
-/// [`client_credentials_state_is_stale`], already reads the same key through
-/// `get_secret_result` and returns the error before it can reach here, so a read
-/// failure never lands on this line. Converting it would add an error path that
-/// cannot be taken (SBS-840 sweep).
+/// Deliberately still `get_secret`, not `get_secret_result` (SBS-840 sweep). The sole
+/// caller, [`client_credentials_state_is_stale`], reads the same key through
+/// `get_secret_result` first, so the common failure is caught one frame up. Note this
+/// narrows the window rather than closing it: that is a SECOND round trip to the vault,
+/// so a backend that dies between the two calls still collapses to `None` here and skips
+/// the reset. Left as-is because the window is one round trip wide and also needs the
+/// user to have changed this server's URL; converting it means threading a `Result`
+/// through a `bool` helper for that. Re-evaluate if the vault gets flakier.
 fn client_credentials_resource_changed(server_id: &str, url: &str) -> bool {
     let Some(state) = secrets::get_secret(server_id, CC_STATE_KEY)
         .and_then(|s| serde_json::from_str::<ClientCredentialsState>(&s).ok())

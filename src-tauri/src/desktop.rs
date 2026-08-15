@@ -1086,7 +1086,10 @@ fn ensure_client_http_token_with(
     // request it makes 401s until the user reconnects that client by hand. Only a
     // confirmed "nothing vaulted" may mint (SBS-840 class).
     if let Some(existing) = read_vaulted_token(VAULT_SERVER, client_id)
-        .map_err(|e| format!("could not read the vaulted bearer for {client_id}: {e}"))?
+        // Complete sentence, capitalized: `install_gateway`'s caller renders this
+        // verbatim in a toast (`ClientDetail.tsx` `toastError(`${e}`)`), so a bare
+        // lowercase fragment would reach the user untethered.
+        .map_err(|e| format!("Could not read the saved token for {client_id}: {e}"))?
     {
         let hash = registry::sha256_hex(&existing);
         let mut matched = false;
@@ -7173,18 +7176,34 @@ mod tests {
         .expect_err("a failed vault read must not mint a replacement bearer");
 
         assert!(
-            err.contains("could not read the vaulted bearer"),
-            "the vault read failure must reach the caller, got: {err}"
+            err.starts_with("Could not read the saved token"),
+            "the vault read failure must reach the caller as a complete sentence \
+             (the frontend renders it verbatim), got: {err}"
         );
         assert!(
             err.contains("the keychain is locked"),
             "the underlying cause must survive, got: {err}"
         );
-        // The row is what `http_client_for_token` authenticates against, so it
-        // surviving is the whole point: the client's existing bearer still works.
-        assert!(
-            fixture.http_row_present(),
-            "a failed vault read must not drop the client's http_clients row"
+        // The `expect_err` above is what pins the reported bug; today's mint path
+        // returns `Ok`, so execution never reaches here under it.
+        //
+        // This guards the ORDERING invariant instead: nothing may error out after
+        // already replacing the row. Assert the HASH rather than the id, because the
+        // mint path `retain`s the old row away and pushes a new one under the SAME
+        // id, so an id-only check cannot tell a surviving bearer from a replaced one.
+        // `http_client_for_token` matches on `token_sha256`, so that is what decides
+        // whether the client's configured token still authenticates.
+        let on_disk = registry::load().expect("scratch registry loads");
+        let row = on_disk
+            .http_clients
+            .iter()
+            .find(|c| c.id == fixture.http_id)
+            .expect("a failed vault read must not drop the client's http_clients row");
+        assert_eq!(
+            row.token_sha256,
+            registry::sha256_hex("leftover-bearer"),
+            "the row must still carry the ORIGINAL bearer's hash; a new hash means a \
+             replacement was minted and the client's configured token is now dead"
         );
     }
 
