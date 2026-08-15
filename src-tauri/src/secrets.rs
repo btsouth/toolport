@@ -1925,6 +1925,10 @@ mod tests {
     fn file_backend_concurrent_sets_preserve_all_keys() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _data_dir = crate::registry::data_dir_test_lock();
+        // This asserts no key is LOST, not that every writer wins the lock inside the
+        // production budget. On a loaded runner the 5s default expires, a writer
+        // correctly gives up, and this fails for the machine's timing (SBS-895).
+        let _lock_budget = crate::registry::LockTimeoutOverride::generous();
         let dir = std::env::temp_dir().join(format!(
             "toolport-sou332-secrets-{}-{}",
             std::process::id(),

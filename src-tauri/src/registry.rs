@@ -2371,7 +2371,7 @@ fn load_from_inner(path: &Path) -> Result<Registry, String> {
 /// read/recovery path. Recovery can rewrite the primary from a backup, so even a caller
 /// that only intends to read must serialize with writers (SOU-330).
 pub fn load_from(path: &Path) -> Result<Registry, String> {
-    let lock = lock_for(path, REGISTRY_LOCK_TIMEOUT)?;
+    let lock = lock_for(path, registry_lock_timeout())?;
     load_from_locked(path, &lock)
 }
 
@@ -2472,7 +2472,58 @@ fn lock_path(path: &Path) -> PathBuf {
 /// Acquire the exclusive registry lock, retrying briefly under contention. Registry writes
 /// are sub-millisecond, so a real conflict clears at once; a holder stuck past the deadline
 /// surfaces as an error rather than hanging the caller indefinitely.
-const REGISTRY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DEFAULT_REGISTRY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The contention deadline, overridable via `TOOLPORT_LOCK_TIMEOUT_MS`.
+///
+/// The default is a PRODUCTION budget: giving up is the right answer when a holder is
+/// stuck, because hanging the app is worse. But the multi-process concurrency tests
+/// deliberately run eight or more writers at once and assert an INVARIANT ("no update is
+/// lost"), not a latency budget. On a loaded CI runner the 5s default expires, one writer
+/// correctly gives up, and the test fails for the machine's timing rather than for the
+/// thing it exists to catch. That flake hit three separate tests and made a clean PR look
+/// broken (SBS-895).
+///
+/// An env override rather than `cfg!(test)` because the rate-limit repro spawns real child
+/// processes, which are not test builds and inherit only the environment.
+fn registry_lock_timeout() -> std::time::Duration {
+    crate::brand::env_var("TOOLPORT_LOCK_TIMEOUT_MS", "CONDUIT_LOCK_TIMEOUT_MS")
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DEFAULT_REGISTRY_LOCK_TIMEOUT)
+}
+
+/// Raise the store-lock deadline for a test that deliberately runs many concurrent
+/// writers, restoring the previous value on drop.
+///
+/// Those tests assert that no update is LOST, not that every writer wins the lock inside
+/// the production budget. Raising the deadline is monotonically safe: it can only make a
+/// concurrently-running test more tolerant, never less. Child processes inherit it, which
+/// is why this is an env var and not a `cfg!(test)` branch (SBS-895).
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
+#[doc(hidden)]
+#[must_use = "the override is reverted when the guard drops, so it must be bound"]
+pub struct LockTimeoutOverride(Option<std::ffi::OsString>);
+
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
+impl LockTimeoutOverride {
+    pub fn generous() -> Self {
+        let previous = std::env::var_os("TOOLPORT_LOCK_TIMEOUT_MS");
+        std::env::set_var("TOOLPORT_LOCK_TIMEOUT_MS", "60000");
+        Self(previous)
+    }
+}
+
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
+impl Drop for LockTimeoutOverride {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(value) => std::env::set_var("TOOLPORT_LOCK_TIMEOUT_MS", value),
+            None => std::env::remove_var("TOOLPORT_LOCK_TIMEOUT_MS"),
+        }
+    }
+}
 
 fn lock_for(path: &Path, timeout: std::time::Duration) -> Result<FileLock, String> {
     if let Some(parent) = path.parent() {
@@ -2512,7 +2563,7 @@ pub fn update<T>(
     f: impl FnOnce(&mut Registry) -> Result<T, String>,
 ) -> Result<(Registry, T), String> {
     let path = resolved_path().ok_or("Could not resolve registry path")?;
-    let lock = lock_for(&path, REGISTRY_LOCK_TIMEOUT)?;
+    let lock = lock_for(&path, registry_lock_timeout())?;
     let mut reg = load_from_locked(&path, &lock)?;
     let out = f(&mut reg)?;
     // Save to the exact path we locked and loaded. Re-resolving after `f` would let a
@@ -2526,7 +2577,7 @@ pub fn update<T>(
 /// agent toggle (which interleaves audit + early returns), and the integrity pins/quarantine
 /// stores (SOU-165). Hold the returned guard across the entire read-decide-write.
 pub fn lock_at(path: &Path) -> Result<FileLock, String> {
-    lock_for(path, REGISTRY_LOCK_TIMEOUT)
+    lock_for(path, registry_lock_timeout())
 }
 
 /// Acquire an explicit-path lock with a caller-appropriate contention deadline.
@@ -2542,7 +2593,7 @@ pub fn update_at<T>(
     path: &Path,
     f: impl FnOnce(&mut Registry) -> Result<T, String>,
 ) -> Result<(Registry, T), String> {
-    let lock = lock_for(path, REGISTRY_LOCK_TIMEOUT)?;
+    let lock = lock_for(path, registry_lock_timeout())?;
     let mut reg = load_from_locked(path, &lock)?;
     let out = f(&mut reg)?;
     save_to(path, &reg)?;
@@ -2638,6 +2689,47 @@ mod tests {
     use crate::approval::fingerprint_allow_key;
 
     static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Pins the plumbing the concurrency tests rely on (SBS-895). Without this, a typo in
+    /// the env-var name would silently leave those tests on the 5s production budget and
+    /// they would go on flaking under load with nothing to point at.
+    #[test]
+    fn lock_timeout_honors_the_env_override_and_ignores_junk() {
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os("TOOLPORT_LOCK_TIMEOUT_MS");
+        std::env::remove_var("TOOLPORT_LOCK_TIMEOUT_MS");
+
+        assert_eq!(registry_lock_timeout(), DEFAULT_REGISTRY_LOCK_TIMEOUT);
+
+        {
+            let _guard = LockTimeoutOverride::generous();
+            assert_eq!(
+                registry_lock_timeout(),
+                std::time::Duration::from_millis(60_000),
+                "the override must actually reach the lock, or the concurrency tests \
+                 silently keep the production budget"
+            );
+        }
+        // Dropping the guard restores, so one test cannot leak a long budget into another.
+        assert_eq!(registry_lock_timeout(), DEFAULT_REGISTRY_LOCK_TIMEOUT);
+
+        // Junk and zero fall back rather than producing a 0ms (instantly-expiring) budget.
+        for bad in ["", "   ", "abc", "0", "-5", "9999999999999999999999"] {
+            std::env::set_var("TOOLPORT_LOCK_TIMEOUT_MS", bad);
+            assert_eq!(
+                registry_lock_timeout(),
+                DEFAULT_REGISTRY_LOCK_TIMEOUT,
+                "{bad:?} must fall back to the default, not disable locking"
+            );
+        }
+
+        match previous {
+            Some(value) => std::env::set_var("TOOLPORT_LOCK_TIMEOUT_MS", value),
+            None => std::env::remove_var("TOOLPORT_LOCK_TIMEOUT_MS"),
+        }
+    }
 
     fn sample_server(name: &str) -> ServerEntry {
         ServerEntry {

@@ -67,6 +67,13 @@ fn concurrent_gateway_processes_must_not_lose_rate_limit_increments() {
                 .env("TOOLPORT_RL_CHILD", "1")
                 .env("TOOLPORT_RL_CHILD_ID", id)
                 .env("TOOLPORT_RL_DIR", &dir)
+                // Four processes racing one counter file is the point of this test, and
+                // what it asserts is that no increment is LOST — not that every child
+                // wins the lock inside the production budget. On a loaded runner the 5s
+                // default expires, a child correctly gives up, `check_and_count` returns
+                // Err, and the child panics on its `expect`. That is the machine's
+                // timing, not the invariant (SBS-895).
+                .env("TOOLPORT_LOCK_TIMEOUT_MS", "60000")
                 .args([
                     "--exact",
                     "concurrent_gateway_processes_must_not_lose_rate_limit_increments",
