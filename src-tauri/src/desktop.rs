@@ -1055,13 +1055,25 @@ fn ensure_client_http_token(
 /// `http_clients` persist failure is returned so uninstall cannot report Ok
 /// while the token is still live (SBS-845).
 fn revoke_client_http_token(state: &RegistryState, client_id: &str) -> Result<(), String> {
+    revoke_client_http_token_with(state, client_id, crate::secrets::delete_secret)
+}
+
+/// [`revoke_client_http_token`] with the vault delete injected.
+///
+/// Split out because the real vault is not reachable on every platform the
+/// tests run on: headless Linux CI has no Secret Service, and the macOS
+/// data-protection keychain needs a signed build (the same reason
+/// `secrets::tests::set_get_delete_round_trip` is `ignore`d there). A test that
+/// called it would assert on the machine rather than on this function, so tests
+/// pass a stub while production passes [`crate::secrets::delete_secret`].
+fn revoke_client_http_token_with(
+    state: &RegistryState,
+    client_id: &str,
+    delete_vaulted_token: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<(), String> {
     const VAULT_SERVER: &str = "__toolport_http_clients__";
     let http_id = format!("client:{client_id}");
-    #[cfg(test)]
-    if FAIL_NEXT_VAULT_DELETE.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        return Err("injected vault delete failure".into());
-    }
-    crate::secrets::delete_secret(VAULT_SERVER, client_id)?;
+    delete_vaulted_token(VAULT_SERVER, client_id)?;
     write_registry(state, |reg| {
         reg.http_clients.retain(|c| c.id != http_id);
         Ok(())
@@ -2653,11 +2665,10 @@ fn write_registry<T>(
     Ok((reg, out))
 }
 
-/// Process-global test hooks for SBS-845. Tests that set these must hold
+/// Process-global test hook for SBS-845. Tests that set it must hold
 /// [`REVOKE_HOOK_LOCK`] so a leftover flag cannot leak into another case.
-#[cfg(test)]
-static FAIL_NEXT_VAULT_DELETE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// The vault half of the revoke needs no hook: it is injected instead, via
+/// [`revoke_client_http_token_with`].
 #[cfg(test)]
 static FAIL_NEXT_REGISTRY_WRITE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -6731,18 +6742,25 @@ mod tests {
     }
 
     // ----- SBS-845: Disconnect must not succeed while the bearer is still live --
-
-    fn fail_next_vault_delete() {
-        FAIL_NEXT_VAULT_DELETE.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
+    //
+    // These drive `revoke_client_http_token_with` rather than the real vault:
+    // headless Linux CI has no Secret Service, so a real `delete_secret` fails
+    // there and every case would assert on the runner instead of on the revoke
+    // logic. What is under test is which failures propagate and what each one
+    // leaves behind, so the vault result is injected.
 
     fn fail_next_registry_write() {
         FAIL_NEXT_REGISTRY_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn clear_revoke_hooks() {
-        FAIL_NEXT_VAULT_DELETE.store(false, std::sync::atomic::Ordering::SeqCst);
         FAIL_NEXT_REGISTRY_WRITE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A vault delete that succeeds, which is also what `secrets::delete_secret`
+    /// reports for a bearer that was never stored (WS3-4).
+    fn vault_delete_ok(_server: &str, _client_id: &str) -> Result<(), String> {
+        Ok(())
     }
 
     /// Scratch data dir + seeded `http_clients` row. Holds the process-global
@@ -6802,12 +6820,14 @@ mod tests {
     #[test]
     fn revoke_client_http_token_fails_when_vault_delete_fails() {
         let fixture = RevokeFixture::new("sbs-845-vault-delete");
-        fail_next_vault_delete();
-        let err = revoke_client_http_token(&fixture.state, &fixture.client_id)
+        let err =
+            revoke_client_http_token_with(&fixture.state, &fixture.client_id, |_server, _client| {
+                Err("the keychain is locked".into())
+            })
             .expect_err("a failed vault delete must not look like a successful disconnect");
         assert!(
-            err.contains("injected vault delete"),
-            "expected the injected vault failure, got: {err}"
+            err.contains("the keychain is locked"),
+            "the vault failure must reach the caller verbatim, got: {err}"
         );
         assert!(
             fixture.http_row_present(),
@@ -6819,7 +6839,7 @@ mod tests {
     fn revoke_client_http_token_fails_when_registry_write_fails() {
         let fixture = RevokeFixture::new("sbs-845-registry-write");
         fail_next_registry_write();
-        let err = revoke_client_http_token(&fixture.state, &fixture.client_id)
+        let err = revoke_client_http_token_with(&fixture.state, &fixture.client_id, vault_delete_ok)
             .expect_err("a failed http_clients persist must not look like a successful disconnect");
         assert!(
             err.contains("injected registry write"),
@@ -6834,8 +6854,20 @@ mod tests {
     #[test]
     fn revoke_client_http_token_drops_the_http_clients_row() {
         let fixture = RevokeFixture::new("sbs-845-success");
-        revoke_client_http_token(&fixture.state, &fixture.client_id)
-            .expect("a missing vault entry must not block Disconnect");
+        let deleted = std::cell::RefCell::new(Vec::new());
+        revoke_client_http_token_with(&fixture.state, &fixture.client_id, |server, client| {
+            deleted.borrow_mut().push((server.to_string(), client.to_string()));
+            Ok(())
+        })
+        .expect("a successful vault delete must not block Disconnect");
+        assert_eq!(
+            deleted.into_inner(),
+            vec![(
+                "__toolport_http_clients__".to_string(),
+                fixture.client_id.clone()
+            )],
+            "the vaulted bearer must be deleted under the shared-HTTP namespace"
+        );
         assert!(
             !fixture.http_row_present(),
             "success means the bearer is gone from the registry"
