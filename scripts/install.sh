@@ -16,6 +16,11 @@
 #   - macOS: copies Toolport.app from the signed .dmg into /Applications (Homebrew is
 #     the cleaner path, and this script points you there).
 # Windows: use scripts/install.ps1 instead.
+#
+# Every download is verified against the SHA-256 GitHub publishes for that asset
+# before it is used, and an https-only URL is required. A release that publishes
+# no checksum is refused unless TOOLPORT_ALLOW_UNVERIFIED=1 (mirroring
+# scripts/install.ps1's -AllowUnverified).
 set -euo pipefail
 
 REPO="tsouth89/toolport"
@@ -46,6 +51,123 @@ asset_url() {
     grep -E "$1\$" | head -n1
 }
 
+# The releases API publishes per-asset `size` and `digest` ("sha256:...")
+# fields on each asset object, next to its download URL. Pull the field that
+# belongs to the asset whose filename matches the given (regex) suffix, so we
+# can verify what we download instead of trusting the wire.
+asset_field() {
+  suffix="$1"
+  field="$2"
+  printf '%s' "$release_json" |
+    awk -v suffix="$suffix" -v field="$field" '
+      /"name":/ {
+        name = $0
+        sub(/^.*"name": *"/, "", name)
+        sub(/".*$/, "", name)
+      }
+      /"size":/ {
+        size = $0
+        sub(/^.*"size": */, "", size)
+        sub(/,.*$/, "", size)
+      }
+      /"digest":/ {
+        digest = $0
+        sub(/^.*"digest": *"/, "", digest)
+        sub(/".*$/, "", digest)
+      }
+      /"browser_download_url":/ {
+        if (name ~ suffix "$") {
+          if (field == "digest") print digest
+          else if (field == "size") print size
+          exit
+        }
+      }
+    '
+}
+
+# Mirrors install.ps1's EnvFlag: values "0", "false", "no", "off" mean the
+# flag is not set; anything else (including "1") means it is.
+env_flag() {
+  case "${!1:-}" in
+    "" | 0 | false | no | off) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Download an asset and verify it before the caller uses it. Mirrors
+# scripts/install.ps1: https-only URLs, the published per-asset digest checked
+# before install, and empty or truncated downloads rejected. Refuses a release
+# that publishes no checksum unless TOOLPORT_ALLOW_UNVERIFIED=1.
+download_and_verify() {
+  url="$1"
+  dest="$2"
+  digest="$3"
+  published_size="$4"
+
+  case "$url" in
+    https://*) ;;
+    *) err "Refusing to download a non-https URL: $url" ;;
+  esac
+
+  algo=""
+  expected=""
+  if [ -n "$digest" ]; then
+    algo="$(printf '%s' "$digest" | sed 's/:.*//')"
+    expected="$(printf '%s' "$digest" | sed 's/^[^:]*://')"
+    case "$algo" in
+      sha256 | sha384 | sha512) : ;;
+      *) algo="" ; expected="" ;;  # a digest we don't know how to verify
+    esac
+  fi
+
+  if [ -z "$algo" ] || [ -z "$expected" ]; then
+    if env_flag TOOLPORT_ALLOW_UNVERIFIED; then
+      say "GitHub publishes no usable checksum for $(basename "$url");"
+      say "installing unverified because TOOLPORT_ALLOW_UNVERIFIED is set."
+    else
+      err "GitHub publishes no checksum for $(basename "$url"), so this download can't be verified." \
+        "Refusing to install it. Either download it yourself from the Releases page," \
+        "or re-run with TOOLPORT_ALLOW_UNVERIFIED=1 to install anyway."
+    fi
+  fi
+
+  say "Downloading $(basename "$url")"
+  # --proto '=https' also applies to redirects, so a swapped-out asset URL can't
+  # bounce the download to a plaintext endpoint.
+  curl --proto '=https' -fsSL "$url" -o "$dest" || err "Download failed ($url)."
+  if [ ! -s "$dest" ]; then
+    err "Download produced an empty file ($url)."
+  fi
+  if [ -n "$published_size" ] && [ "$published_size" != "0" ]; then
+    actual_size="$(wc -c < "$dest" | tr -d ' ')"
+    if [ "$actual_size" != "$published_size" ]; then
+      rm -f "$dest"
+      err "Download is $actual_size bytes but the release says $published_size. Treating it as truncated."
+    fi
+  fi
+
+  if [ -n "$algo" ]; then
+    case "$algo" in
+      sha256) sumtool="sha256sum" ;;
+      sha384) sumtool="sha384sum" ;;
+      sha512) sumtool="sha512sum" ;;
+    esac
+    if command -v "$sumtool" >/dev/null 2>&1; then
+      actual="$("$sumtool" "$dest" | awk '{print $1}')"
+    else
+      need shasum
+      actual="$(shasum -a "${algo#sha}" "$dest" | awk '{print $1}')"
+    fi
+    if [ "$actual" != "$expected" ]; then
+      rm -f "$dest"
+      err "$algo mismatch for $(basename "$url"). Deleting the download and stopping." \
+        "  expected $expected" \
+        "  got      $actual"
+    fi
+    say "$algo verified: $actual"
+  fi
+}
+
 install_linux() {
   [ "$arch" = "x86_64" ] ||
     err "Linux builds are x86_64 only right now (you're on $arch). Use Development mode or grab a build from the Releases page."
@@ -57,8 +179,9 @@ install_linux() {
   if command -v dpkg >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
     url="$(asset_url '_amd64\.deb')"
     [ -n "$url" ] || err "No .deb found in $tag_name."
-    say "Downloading $(basename "$url")"
-    curl -fsSL "$url" -o "$tmp/toolport.deb"
+    digest="$(asset_field '_amd64\.deb' digest)"
+    size="$(asset_field '_amd64\.deb' size)"
+    download_and_verify "$url" "$tmp/toolport.deb" "$digest" "$size"
     # Use sudo only when we aren't already root (root shells / containers have no sudo).
     sudo=""
     if [ "$(id -u)" -ne 0 ]; then
@@ -77,8 +200,9 @@ install_linux() {
   [ -n "$url" ] || err "No AppImage found in $tag_name."
   bindir="${XDG_BIN_HOME:-$HOME/.local/bin}"
   mkdir -p "$bindir"
-  say "Downloading $(basename "$url")"
-  curl -fsSL "$url" -o "$bindir/toolport"
+  digest="$(asset_field '_amd64\.AppImage' digest)"
+  size="$(asset_field '_amd64\.AppImage' size)"
+  download_and_verify "$url" "$bindir/toolport" "$digest" "$size"
   chmod +x "$bindir/toolport"
 
   apps="$HOME/.local/share/applications"
@@ -112,8 +236,9 @@ install_macos() {
   [ -n "$url" ] || err "No macOS .dmg found in $tag_name."
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
-  say "Downloading $(basename "$url")"
-  curl -fsSL "$url" -o "$tmp/toolport.dmg"
+  digest="$(asset_field "$suffix" digest)"
+  size="$(asset_field "$suffix" size)"
+  download_and_verify "$url" "$tmp/toolport.dmg" "$digest" "$size"
   say "Mounting and copying Toolport.app to /Applications"
   hdiutil attach -nobrowse -readonly -mountpoint "$tmp/mnt" "$tmp/toolport.dmg" >/dev/null ||
     err "Couldn't mount the disk image."
