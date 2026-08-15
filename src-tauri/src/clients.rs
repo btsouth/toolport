@@ -5654,15 +5654,16 @@ mod tests {
     fn backup_propagates_stat_failures_instead_of_noop() {
         // A directory path makes metadata() succeed but is_file() fail -> still
         // the deliberate Ok(None) "nothing safe to back up" case. Use a path
-        // whose parent cannot be traversed so metadata() itself errors.
+        // that fails to stat for a reason other than "missing".
         let dir = std::env::temp_dir().join(format!("toolport-bk-stat-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("config.json");
-        std::fs::write(&file, "{}").unwrap();
-        // metadata(file/child) fails: file is a regular file, so traversing into
-        // it is ENOTDIR on unix (NotADirectory) / ERROR_DIRECTORY on Windows.
-        let broken = file.join("child.json");
+        // A NUL byte makes the path invalid on BOTH platforms: the stat fails
+        // with InvalidInput (unix) / InvalidFilename (Windows), never NotFound.
+        // (The file/child ENOTDIR trick only errors non-NotFound on unix — on
+        // Windows a path under a regular file reports ERROR_PATH_NOT_FOUND,
+        // which maps to NotFound and would be swallowed by the missing-file arm.)
+        let broken = dir.join("child\u{0}.json");
 
         let err = backup_file_named("claude-desktop", &broken, "child.json").unwrap_err();
         assert!(
@@ -5674,25 +5675,49 @@ mod tests {
 
     /// SBS-735 acceptance: a write must not proceed when the app could not tell
     /// whether an existing file was there. Drive the full caller (`write_servers`)
-    /// with CLAUDE_CONFIG_DIR pointed at a path whose parent is a regular file, so
-    /// the pre-write backup stat fails and the write must abort.
+    /// with CLAUDE_CONFIG_DIR pointed at a path that fails to stat for a reason
+    /// other than "missing", so the pre-write backup stat fails and the write
+    /// must abort. Each platform gets its own non-NotFound stat failure: a NUL
+    /// byte cannot go into an env var, and a path under a regular file is
+    /// ENOTDIR on unix but ERROR_PATH_NOT_FOUND (NotFound) on Windows.
     #[test]
     fn write_servers_aborts_when_backup_stat_fails() {
         let dir = std::env::temp_dir().join(format!("toolport-bk-write-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        // Parent-of-config is a regular file: metadata(config) fails ENOTDIR.
-        let not_a_dir = dir.join("claude-home");
-        std::fs::write(&not_a_dir, "not a directory").unwrap();
-        let _restore = EnvRestore::set("CLAUDE_CONFIG_DIR", &not_a_dir);
 
-        let err = write_servers("claude-code", &[stdio("filesystem")]).unwrap_err();
-        assert!(
-            err.contains("could not stat"),
-            "the caller must surface the stat failure instead of writing: {err}"
-        );
-        // No destructive write happened: the "config" file was never created.
-        assert!(!not_a_dir.join(".claude.json").exists());
+        #[cfg(unix)]
+        {
+            // Parent-of-config is a regular file: metadata(config) fails ENOTDIR.
+            let not_a_dir = dir.join("claude-home");
+            std::fs::write(&not_a_dir, "not a directory").unwrap();
+            let _restore = EnvRestore::set("CLAUDE_CONFIG_DIR", &not_a_dir);
+
+            let err = write_servers("claude-code", &[stdio("filesystem")]).unwrap_err();
+            assert!(
+                err.contains("could not stat"),
+                "the caller must surface the stat failure instead of writing: {err}"
+            );
+            // No destructive write happened: the "config" file was never created.
+            assert!(!not_a_dir.join(".claude.json").exists());
+        }
+
+        #[cfg(windows)]
+        {
+            // A '<' is an invalid filename character on Windows: metadata fails
+            // with ERROR_INVALID_NAME (InvalidFilename), not ERROR_PATH_NOT_FOUND.
+            let not_a_dir = dir.join("claude-home<>");
+            let _restore = EnvRestore::set("CLAUDE_CONFIG_DIR", &not_a_dir);
+
+            let err = write_servers("claude-code", &[stdio("filesystem")]).unwrap_err();
+            assert!(
+                err.contains("could not stat"),
+                "the caller must surface the stat failure instead of writing: {err}"
+            );
+            // No destructive write happened: the "config" file was never created.
+            assert!(!not_a_dir.join(".claude.json").exists());
+        }
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
