@@ -5,7 +5,38 @@ import { afterEach } from "vitest";
 import { cleanup } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  // Reset the in-memory storage so localStorage state never leaks across tests.
+  storageData.clear();
+});
+
+// Node 25+ ships `localStorage` on globalThis as a method-less placeholder for
+// the experimental Web Storage API (it only works with `--localstorage-file`).
+// Vitest's jsdom environment deliberately skips copying jsdom's own localStorage
+// because the key already exists on the Node global, so tests would otherwise
+// call into a dead stub (`localStorage.clear is not a function`). Install a
+// working in-memory Storage that matches jsdom's semantics.
+const storageData = new Map<string, string>();
+const memoryStorage: Storage = {
+  get length() {
+    return storageData.size;
+  },
+  clear: () => storageData.clear(),
+  getItem: (key: string) => storageData.get(key) ?? null,
+  key: (index: number) => [...storageData.keys()][index] ?? null,
+  removeItem: (key: string) => {
+    storageData.delete(key);
+  },
+  setItem: (key: string, value: string) => {
+    storageData.set(key, String(value));
+  },
+};
+Object.defineProperty(globalThis, "localStorage", {
+  value: memoryStorage,
+  configurable: true,
+  writable: true,
+});
 
 // jsdom is missing a few DOM APIs that Radix UI (Dialog/Select) calls at runtime.
 // Stub them so component tests can render those primitives without throwing.

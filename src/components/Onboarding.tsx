@@ -44,7 +44,7 @@ import {
 } from "@/lib/types";
 import { openExternal } from "@/lib/openUrl";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
 
 interface Props {
@@ -192,6 +192,14 @@ function StepHeader({
 }) {
   return (
     <div className="flex flex-col gap-2">
+      {/* Name the dialog from the visible step heading. Radix wires
+       * aria-labelledby from DialogTitle, so the dialog is announced with the
+       * current step's title (and Done's live state) instead of as an unnamed
+       * dialog. asChild + span keeps the visible h2 the only heading; the
+       * sr-only copy is purely the dialog's accessible name. */}
+      <DialogTitle asChild className="sr-only">
+        <span>{title}</span>
+      </DialogTitle>
       <div className="flex size-10 items-center justify-center rounded-xl bg-success/10 text-success">
         {icon}
       </div>
@@ -596,6 +604,8 @@ function AddServers({
               {stacks.map((s) => (
                 <button
                   key={s.id}
+                  type="button"
+                  aria-pressed={s.id === selected}
                   onClick={() => setSelected(s.id === selected ? null : s.id)}
                   className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${
                     s.id === selected
