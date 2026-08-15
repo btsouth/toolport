@@ -18,6 +18,10 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **Linux `.deb` installs a `toolport` command.** The package still ships the
+  crate binary as `conduit` (compat alias) and now also puts `toolport` on
+  `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
+  users to run `toolport`.
 - **A second Claude Code profile no longer gets stuck on an old gateway.**
   `CLAUDE_CONFIG_DIR` is usually set per shell or per launcher rather than exported, so a
   machine often has several Claude configs (a personal `~/.claude` beside a work

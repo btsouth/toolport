@@ -67,9 +67,10 @@ install_linux() {
     fi
     say "Installing with apt${sudo:+ (you may be prompted for your password)}"
     $sudo apt-get install -y "$tmp/toolport.deb"
-    # The .deb installs the app binary as `conduit` (the crate name) plus a Toolport
-    # desktop entry; the AppImage path below installs a `toolport` command instead.
-    say "Installed. Launch Toolport from your app menu, or run: conduit"
+    # The .deb still ships the crate binary as `conduit` and adds a `toolport`
+    # wrapper on PATH (see packaging/linux/deb/toolport). AppImage below is
+    # installed as `$bindir/toolport` as well.
+    say "Installed. Launch Toolport from your app menu, or run: toolport"
     return
   fi
 
