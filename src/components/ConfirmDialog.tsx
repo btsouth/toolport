@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 import {
   Dialog,
   DialogContent,
@@ -43,6 +43,12 @@ export function ConfirmDialog({
 }: Props) {
   const [openState, setOpenState] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Rich (element) descriptions contain block elements (div/p/ul), which are
+  // invalid inside Radix DialogDescription's <p> root. Render those in a plain
+  // block container and wire aria-describedby by hand; string descriptions keep
+  // using DialogDescription exactly as before (#692).
+  const descriptionId = useId();
+  const richDescription = description !== undefined && typeof description !== "string";
   // Controlled when an `open` prop is supplied (e.g. opened from a menu item),
   // otherwise self-managed by the trigger.
   const isControlled = openProp !== undefined;
@@ -69,10 +75,24 @@ export function ConfirmDialog({
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       {trigger && <DialogTrigger asChild>{trigger}</DialogTrigger>}
-      <DialogContent className="sm:max-w-sm" onClick={(e) => e.stopPropagation()}>
+      <DialogContent
+        className="sm:max-w-sm"
+        onClick={(e) => e.stopPropagation()}
+        aria-describedby={richDescription ? descriptionId : undefined}
+      >
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
-          {description && <DialogDescription>{description}</DialogDescription>}
+          {description &&
+            (richDescription ? (
+              <div
+                id={descriptionId}
+                className="text-sm text-muted-foreground *:[a]:underline *:[a]:underline-offset-3 *:[a]:hover:text-foreground"
+              >
+                {description}
+              </div>
+            ) : (
+              <DialogDescription>{description}</DialogDescription>
+            ))}
         </DialogHeader>
         <DialogFooter>
           <Button variant="ghost" onClick={() => setOpen(false)} disabled={busy}>

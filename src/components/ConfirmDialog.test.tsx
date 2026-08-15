@@ -87,4 +87,37 @@ describe("ConfirmDialog", () => {
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(screen.getByText("Delete item?")).toBeInTheDocument();
   });
+
+  it("renders rich descriptions in a block container without invalid-DOM errors", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      renderControlledDialog({
+        description: (
+          <div>
+            <p>Only the server list changes.</p>
+            <ul>
+              <li>Alpha</li>
+            </ul>
+          </div>
+        ),
+      });
+
+      expect(screen.getByText("Only the server list changes.")).toBeInTheDocument();
+      expect(screen.getByText("Alpha")).toBeInTheDocument();
+
+      // aria-describedby still points at the complete explanation container.
+      const dialog = screen.getByRole("dialog");
+      const describedBy = dialog.getAttribute("aria-describedby");
+      expect(describedBy).toBeTruthy();
+      const described = document.getElementById(describedBy!);
+      expect(described).not.toBeNull();
+      expect(described!.tagName).toBe("DIV");
+      expect(described!.querySelector("ul")).not.toBeNull();
+      expect(described!.querySelector("ul li")).toHaveTextContent("Alpha");
+    } finally {
+      errorSpy.mockRestore();
+    }
+
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
 });
