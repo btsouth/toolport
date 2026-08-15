@@ -15,6 +15,26 @@ permissions:
   contents: read
 
 jobs:
+  clippy:
+    name: Rust Clippy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: clippy
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev pkg-config libdbus-1-dev
+
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --lib --bins
+
   build-test:
     name: Build + test
     runs-on: ubuntu-22.04

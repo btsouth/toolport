@@ -114,6 +114,17 @@ warning, it's usually the standard Tauri pattern of loading data from the Rust
 backend in a `useEffect` — review it for unnecessary re-renders, but it won't
 block the build.
 
+### Rust linting
+
+Clippy checks the Rust backend and gateway binary. CI runs it on every PR.
+
+```bash
+cargo clippy --manifest-path src-tauri/Cargo.toml --lib --bins
+```
+
+Clippy warnings are currently non-blocking. The CI gate will be made blocking
+after the existing warnings have been cleared.
+
 ### Git hooks (pre-commit)
 
 When you run `npm install`, Husky installs a pre-commit hook that automatically
