@@ -40,7 +40,7 @@ not json
     )
     .expect("write fixture audit log");
 
-    let recent = read_recent(3);
+    let recent = read_recent(3).unwrap();
     assert_eq!(
         recent.len(),
         3,
@@ -73,13 +73,13 @@ fn a_fully_valid_log_is_unchanged() {
     )
     .expect("write fixture audit log");
 
-    let recent = read_recent(2);
+    let recent = read_recent(2).unwrap();
     assert_eq!(recent.len(), 2);
     assert_eq!(recent[0].get("i").and_then(|v| v.as_u64()), Some(3));
     assert_eq!(recent[1].get("i").and_then(|v| v.as_u64()), Some(2));
 
     // A limit past the end returns everything, newest first.
-    let all = read_recent(99);
+    let all = read_recent(99).unwrap();
     assert_eq!(all.len(), 3);
     assert_eq!(all[0].get("i").and_then(|v| v.as_u64()), Some(3));
 

@@ -145,19 +145,26 @@ fn rotate_if_large(path: &Path) {
 }
 
 /// The most recent `limit` traces, newest first.
-pub fn read_recent(limit: usize) -> Vec<Value> {
+///
+/// A missing file is an empty trace log: nothing has searched yet. Any other
+/// IO error is returned so a caller cannot treat an unreadable existing file as
+/// "no traces" (SBS-873). Unparseable lines are skipped — a mid-write or
+/// corrupt line is not an IO failure.
+pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
     let Some(path) = trace_path() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
-    content
+    Ok(content
         .lines()
         .rev()
         .filter_map(|line| serde_json::from_str(line).ok())
         .take(limit)
-        .collect()
+        .collect())
 }
 
 /// Delete the trace log. Returns `Err` only on a real removal failure; a missing file
@@ -217,7 +224,7 @@ mod tests {
             &[],
             "lexical",
         );
-        let recent = read_recent(10);
+        let recent = read_recent(10).unwrap();
         assert_eq!(recent.len(), 2);
         // Newest first.
         assert_eq!(recent[0]["query"], "send email");
@@ -254,7 +261,8 @@ mod tests {
             &ranking,
             "semantic",
         );
-        let e = &read_recent(1)[0];
+        let recent = read_recent(1).unwrap();
+        let e = &recent[0];
         assert_eq!(e["mode"], "semantic");
         assert_eq!(e["fallbacks"], 30);
         let r = e["ranking"].as_array().unwrap();
@@ -279,7 +287,8 @@ mod tests {
             &[],
             "lexical",
         );
-        let e = &read_recent(1)[0];
+        let recent = read_recent(1).unwrap();
+        let e = &recent[0];
         assert_eq!(e["mode"], "lexical");
         assert!(e.get("ranking").is_none());
         clear();
@@ -306,10 +315,15 @@ mod tests {
             &[],
             "lexical",
         );
-        let e = &read_recent(1)[0];
+        let recent = read_recent(1).unwrap();
+        let e = &recent[0];
         let stored_q = e["query"].as_str().unwrap();
         // Capped to MAX_QUERY_CHARS (+ the ellipsis), never the full 500.
-        assert!(stored_q.chars().count() <= MAX_QUERY_CHARS + 1, "query not capped: {}", stored_q.chars().count());
+        assert!(
+            stored_q.chars().count() <= MAX_QUERY_CHARS + 1,
+            "query not capped: {}",
+            stored_q.chars().count()
+        );
         assert_eq!(e["names"].as_array().unwrap().len(), MAX_NAMES);
         clear();
     }
@@ -333,11 +347,65 @@ mod tests {
             &[],
             "lexical",
         );
-        let e = &read_recent(1)[0];
+        let recent = read_recent(1).unwrap();
+        let e = &recent[0];
         assert_eq!(e["returned"], 0);
         assert_eq!(e["top"], "");
         // A miss still shows what a full catalog would have cost.
         assert_eq!(e["flatTokens"], 5000);
         clear();
+    }
+
+    fn isolated_data_dir(label: &str) -> (crate::registry::DataDirOverride, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "toolport-searchtrace-read-{label}-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("scratch data dir");
+        (crate::registry::DataDirOverride::set(&path), path)
+    }
+
+    /// A missing search-trace.jsonl is an empty trace log, not a load failure.
+    #[test]
+    fn read_recent_missing_file_is_ok_empty() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("missing");
+        let path = trace_path().expect("trace path under override");
+        assert!(!path.exists(), "fixture must not create the log");
+        let entries = read_recent(10).expect("missing file is Ok empty");
+        assert!(entries.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A readable JSONL returns newest-first parsed rows.
+    #[test]
+    fn read_recent_readable_jsonl_is_newest_first() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("readable");
+        let path = trace_path().expect("trace path under override");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, "{\"i\":1}\n{\"i\":2}\n").unwrap();
+        let entries = read_recent(10).expect("readable fixture");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["i"], 2);
+        assert_eq!(entries[1]["i"], 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An existing but unreadable search-trace.jsonl must not look like "no
+    /// traces" (SBS-873).
+    #[test]
+    fn read_recent_unreadable_existing_path_is_err() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("unreadable");
+        let path = trace_path().expect("trace path under override");
+        std::fs::create_dir_all(&path).unwrap();
+        let err = read_recent(10).expect_err("unreadable existing path must be Err");
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

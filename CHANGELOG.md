@@ -18,6 +18,11 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **Unreadable activity/security log no longer renders as empty healthy.** A failed
+  read of `audit.jsonl`, `security.jsonl`, `inspect.jsonl`, or `search-trace.jsonl`
+  used to come back as an empty list, so Activity showed **No tool calls yet** /
+  **Protection active**. A missing file is still empty (honest). Any other IO error
+  now rejects the invoke, and the existing error/retry UI surfaces it. (SBS-873)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt

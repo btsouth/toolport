@@ -15,7 +15,10 @@ pub fn metrics_enabled() -> bool {
 
 /// Prometheus text exposition of current local stats.
 pub fn render() -> String {
-    let entries = crate::audit::read_all();
+    let entries = match crate::audit::read_all() {
+        Ok(entries) => entries,
+        Err(error) => return format!("# Toolport metrics unavailable: {error}\n"),
+    };
     let tokens_saved = crate::savings::summary()
         .get("tokensSaved")
         .and_then(Value::as_u64)

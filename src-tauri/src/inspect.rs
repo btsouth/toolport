@@ -123,22 +123,26 @@ fn ring_trim(path: &std::path::Path) {
 }
 
 /// The most recent `limit` captured calls, newest first.
-pub fn read_recent(limit: usize) -> Vec<Value> {
-    let path = match inspect_path() {
-        Some(p) => p,
-        None => return Vec::new(),
+///
+/// A missing file is an empty inspector: capture has never written. Any other
+/// IO error is returned so a caller cannot treat an unreadable existing file as
+/// "no captures" (SBS-873). Unparseable lines are skipped — a mid-write or
+/// corrupt line is not an IO failure.
+pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
+    let Some(path) = inspect_path() else {
+        return Ok(Vec::new());
     };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
-    let entries: Vec<Value> = content
+    Ok(content
         .lines()
         .rev()
         .filter_map(|line| serde_json::from_str(line).ok())
         .take(limit)
-        .collect();
-    entries
+        .collect())
 }
 
 /// Delete the inspect ring. Returns `Err` only on a real removal failure; a missing
@@ -182,7 +186,7 @@ mod tests {
             true,
             42,
         );
-        let recent = read_recent(10);
+        let recent = read_recent(10).unwrap();
         assert_eq!(recent.len(), 1);
         let e = &recent[0];
         assert_eq!(e["server"], "github");
@@ -210,7 +214,7 @@ mod tests {
                 1,
             );
         }
-        let recent = read_recent(1000);
+        let recent = read_recent(1000).unwrap();
         // Ring-trimmed to the last 50, so only 50 remain...
         assert_eq!(recent.len(), 50);
         // ...and they are the most recent (i = 59 newest, i = 10 oldest kept).
@@ -234,11 +238,14 @@ mod tests {
             true,
             1,
         );
-        let recent = read_recent(10);
+        let recent = read_recent(10).unwrap();
         assert_eq!(recent.len(), 1);
         let req = &recent[0]["request"];
         // The full body is NOT stored: request collapses to the marker string.
-        assert!(req.is_string(), "oversized request should be a marker string");
+        assert!(
+            req.is_string(),
+            "oversized request should be a marker string"
+        );
         let marker = req.as_str().unwrap();
         assert!(marker.starts_with("<truncated "), "got: {marker}");
         assert!(marker.contains("bytes>"));
@@ -277,11 +284,64 @@ mod tests {
         {"i":4}"#,
         )
         .unwrap();
-        let recent = read_recent(3);
+        let recent = read_recent(3).unwrap();
         assert_eq!(recent.len(), 3);
         assert_eq!(recent[0]["i"], 4);
         assert_eq!(recent[1]["i"], 3);
         assert_eq!(recent[2]["i"], 2);
         reset();
+    }
+
+    fn isolated_data_dir(label: &str) -> (crate::registry::DataDirOverride, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "toolport-inspect-read-{label}-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("scratch data dir");
+        (crate::registry::DataDirOverride::set(&path), path)
+    }
+
+    /// A missing inspect.jsonl is an empty inspector, not a load failure.
+    #[test]
+    fn read_recent_missing_file_is_ok_empty() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("missing");
+        let path = inspect_path().expect("inspect path under override");
+        assert!(!path.exists(), "fixture must not create the log");
+        let entries = read_recent(10).expect("missing file is Ok empty");
+        assert!(entries.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A readable JSONL returns newest-first parsed rows.
+    #[test]
+    fn read_recent_readable_jsonl_is_newest_first() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("readable");
+        let path = inspect_path().expect("inspect path under override");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, "{\"i\":1}\n{\"i\":2}\n").unwrap();
+        let entries = read_recent(10).expect("readable fixture");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["i"], 2);
+        assert_eq!(entries[1]["i"], 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An existing but unreadable inspect.jsonl must not look like "no captures"
+    /// (SBS-873).
+    #[test]
+    fn read_recent_unreadable_existing_path_is_err() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("unreadable");
+        let path = inspect_path().expect("inspect path under override");
+        std::fs::create_dir_all(&path).unwrap();
+        let err = read_recent(10).expect_err("unreadable existing path must be Err");
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
