@@ -1981,7 +1981,7 @@ fn set_server_enabled_via_agent(
     // A scoped client sees (and can toggle) only servers in its allowed set; an
     // out-of-scope server is indistinguishable from a non-existent one.
     let in_scope =
-        |s: &ServerEntry| allowed.map_or(true, |set| set.contains(&sanitize_segment(&s.id)));
+        |s: &ServerEntry| allowed.map_or(true, |set| set.contains(&s.id));
     let server = match reg.servers.iter().find(|s| {
         in_scope(s) && (s.id.eq_ignore_ascii_case(target) || s.name.eq_ignore_ascii_case(target))
     }) {
@@ -2932,15 +2932,13 @@ fn enabled_summary(
             .servers
             .iter()
             .filter(|s| reg.is_enabled(&active, &s.id) && !clients::is_gateway_server(s))
-            .map(|s| sanitize_segment(&s.id))
+            .map(|s| s.id.clone())
             .collect(),
     };
     let servers: Vec<_> = reg
         .servers
         .iter()
-        .filter(|s| {
-            !clients::is_gateway_server(s) && visible.contains(sanitize_segment(&s.id).as_str())
-        })
+        .filter(|s| !clients::is_gateway_server(s) && visible.contains(&s.id))
         .collect();
     let header = match allowed {
         Some(_) => "Servers available to this client".to_string(),
@@ -3360,9 +3358,10 @@ fn recovery_hint(catalog: &[Value], server: &str) -> String {
     }
 }
 
-/// The server prefix of a namespaced tool name (`server__tool`). Matches the
-/// router's `sanitize_segment(server_id)` prefix, so it tests against the
-/// allowed-server set the same way the router names tools.
+/// The server prefix of a namespaced tool name (`server__tool`). This is the
+/// router's `sanitize_segment(server_id)` prefix, not the raw registry id.
+/// Authorization compares raw ids; this prefix is only a cold-cache fallback
+/// via [`sanitized_prefix_in_scope`] (SBS-866).
 fn server_of_tool(name: &str) -> &str {
     name.split_once("__").map(|(s, _)| s).unwrap_or(name)
 }
@@ -3609,9 +3608,9 @@ fn tool_in_scope(
     route_of: &impl Fn(&str) -> Option<String>,
 ) -> bool {
     match route_of(name) {
-        // Authoritative: gate on the real server, sanitized to the same prefix form
-        // `allowed` stores. Catches override-renamed names and ids containing `__`.
-        Some(server_id) => allowed.contains(sanitize_segment(&server_id).as_str()),
+        // Authoritative: gate on the raw registry id `allowed` stores (SBS-866).
+        // Catches override-renamed names and ids containing `__`.
+        Some(server_id) => allowed.contains(server_id.as_str()),
         // The router can't resolve the name (a cold/stale cache before downstream servers
         // are indexed). Recognize gateway-generated tools by name rather than assuming any
         // bare name is a meta-tool - that assumption would leak a downstream tool renamed
@@ -3622,14 +3621,14 @@ fn tool_in_scope(
                 true
             } else if let Some(server) = grouped_help_target(name) {
                 // A grouped `help_<server>` browse tool: gate on its target server.
-                allowed.contains(server)
+                sanitized_prefix_in_scope(server, allowed)
             } else {
                 // A namespaced tool the router hasn't indexed yet: gate on its `server__`
                 // prefix (fail-closed). A bare name that is neither a known meta-tool nor a
                 // help tool is unattributable (most likely an override-renamed downstream
                 // tool) - drop it rather than leak it.
                 let prefix = server_of_tool(name);
-                prefix != name && allowed.contains(prefix)
+                prefix != name && sanitized_prefix_in_scope(prefix, allowed)
             }
         }
     }
@@ -3661,7 +3660,7 @@ fn is_fixed_meta_tool(name: &str) -> bool {
 struct McpSessionOwner {
     identity: String,
     /// `None` is the full connected set; `Some` is a sorted, deduplicated set of
-    /// sanitized server ids, matching [`resolve_http_scope`].
+    /// raw registry server ids, matching [`resolve_http_caller`].
     scope: Option<Vec<String>>,
 }
 
@@ -3717,7 +3716,7 @@ fn resolve_http_caller(
             Some(
                 reg.enabled_servers_for(&client.profile)
                     .iter()
-                    .map(|server| sanitize_segment(&server.id))
+                    .map(|server| server.id.clone())
                     .collect(),
             )
         };
@@ -4201,9 +4200,10 @@ fn execute_call(
     // Scope guard: a registered HTTP client may only call tools on the
     // servers its token is allowed to see (a no-op when unscoped). Search
     // and list are already filtered, but a client could name any tool, so
-    // enforce it on the call path too.
+    // enforce it on the call path too. Compare the raw registry id (SBS-866),
+    // not sanitize_segment(server_id) — that collapses team-slack / team_slack.
     if let Some(set) = allowed {
-        if !set.contains(srv) {
+        if !server_in_allowed_scope(server_id, set) {
             return json!({
                 "content": [{ "type": "text", "text": format!("Toolport: '{srv}' is not available to this client.") }],
                 "isError": true
@@ -5371,13 +5371,15 @@ struct Defended {
 /// Exposed tool names for code-mode `servers.*` stubs: full catalog minus gateway
 /// meta-tools, optionally filtered to the client's allowed server prefixes.
 ///
-/// Scope matching uses [`server_in_allowed_scope`] (SOU-327) so hyphenated server ids
-/// sanitize the same way as `execute_call` / tools-list filtering. Bare names (no
+/// Scope matching uses [`server_in_allowed_scope`] on the real server id when
+/// `route_of` can resolve the exposed name (SBS-866). Hyphenated ids still match
+/// (SOU-327) because the allow-set stores the raw id. Bare names (no
 /// `server__tool` separator) are dropped: they cannot become `servers.*` stubs and must
 /// not appear in `listTools` as if they were catalog entries.
 fn script_catalog_tools(
     cached: &[Value],
     allowed: Option<&std::collections::HashSet<String>>,
+    route_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
     let mut names: Vec<String> = cached
         .iter()
@@ -5391,7 +5393,10 @@ fn script_catalog_tools(
                 return false;
             }
             match allowed {
-                Some(set) => server_in_allowed_scope(server, set),
+                Some(set) => match route_of(n) {
+                    Some(sid) => server_in_allowed_scope(&sid, set),
+                    None => sanitized_prefix_in_scope(server, set),
+                },
                 None => true,
             }
         })
@@ -5467,7 +5472,7 @@ fn validate_script(
     cached: &[Value],
     allowed: Option<&std::collections::HashSet<String>>,
 ) -> ScriptValidation {
-    let catalog = script_catalog_tools(cached, allowed);
+    let catalog = script_catalog_tools(cached, allowed, |_| None);
     // Resolution set for the recorder. The typed `servers.*` stubs are built from
     // this same list, so they reject an unknown name on their own — but the
     // string form (`toolport.call("s__tool")`) reaches the binding directly and
@@ -6278,7 +6283,9 @@ fn execute_script_dispatch_with_candidate(
     });
 
     // Typed `servers.*` stubs from the client-scoped catalog (meta-tools excluded).
-    let catalog = script_catalog_tools(cached, allowed);
+    let catalog = script_catalog_tools(cached, allowed, |name| {
+        router_arc.route_of(name).map(|(server, _)| server.to_string())
+    });
 
     let outcome =
         codemode::run_script_with_input(script, input, call, Some(fetch), limits, &catalog);
@@ -8195,8 +8202,8 @@ fn handle_request_with_cancel(
             let mut resources = router.aggregated_resources();
             // Scope to the client's allowed servers (a no-op when unscoped), so a
             // registered HTTP client can't list another server's resources.
-            // Compare sanitized server ids: `allowed` stores sanitize_segment form
-            // (SOU-327), same as the tools path.
+            // Compare raw registry ids: `allowed` stores the unsanitized server id
+            // (SBS-866). SOU-327 hyphenated ids match because they are stored raw.
             if let Some(set) = allowed {
                 resources.retain(|r| {
                     r.get("uri")
@@ -8510,10 +8517,24 @@ fn handle_request_with_cancel(
 }
 
 /// Whether a downstream server id is in a registered HTTP client's allowed set.
-/// `allowed` always stores [`sanitize_segment`] form (see tools scoping); raw
-/// server ids with hyphens must be sanitized before comparison (SOU-327).
+///
+/// `allowed` stores raw registry ids (SBS-866). `sanitize_segment` is a tool-name
+/// charset rewrite and is not injective (`team-slack` and `team_slack` both become
+/// `team_slack`), so it must not be the tenant-scope key. Hyphenated ids still
+/// match (SOU-327) because the allow-set now stores the raw id.
 fn server_in_allowed_scope(server_id: &str, allowed: &std::collections::HashSet<String>) -> bool {
-    allowed.contains(sanitize_segment(server_id).as_str())
+    allowed.contains(server_id)
+}
+
+/// A sanitized tool-name prefix is in scope iff exactly one allowed raw id
+/// sanitizes to it. Used only when `route_of` is cold (SBS-866 / SOU-327).
+/// Zero matches: deny. Two or more: deny (ambiguous collision).
+fn sanitized_prefix_in_scope(prefix: &str, allowed: &std::collections::HashSet<String>) -> bool {
+    allowed
+        .iter()
+        .filter(|id| sanitize_segment(id) == prefix)
+        .count()
+        == 1
 }
 
 /// Fail-closed merge of every profile's `tool_scope` for the shared HTTP-bridge router.
@@ -17579,26 +17600,53 @@ mod tests {
         assert_eq!(v["hasOther"], json!("object"));
     }
 
-    /// SOU-327 / CodeRabbit #481: catalog scope must sanitize like tools-list filtering.
-    /// Allowed stores sanitize_segment form; raw or already-sanitized server segments match.
+    /// SOU-327 / CodeRabbit #481 / SBS-866: catalog scope uses the raw registry
+    /// id when `route_of` can resolve the exposed name. The old assertion stored
+    /// sanitize_segment form and treated `file-system` and `file_system` as the
+    /// same tenant — that collapse is the SBS-866 hole.
     #[test]
     fn script_catalog_tools_uses_server_in_allowed_scope() {
         let mut allowed = std::collections::HashSet::new();
-        allowed.insert("file_system".to_string());
+        allowed.insert("file-system".to_string());
         let cached = vec![
             json!({ "name": "file_system__read" }),
             json!({ "name": "other__tool" }),
             json!({ "name": "toolport_call_tool" }),
             json!({ "name": "no_separator" }),
         ];
-        let names = script_catalog_tools(&cached, Some(&allowed));
+        let route = |name: &str| match name {
+            "file_system__read" => Some("file-system".to_string()),
+            "other__tool" => Some("other".to_string()),
+            _ => None,
+        };
+        let names = script_catalog_tools(&cached, Some(&allowed), route);
         assert_eq!(names, vec!["file_system__read".to_string()]);
         // Unscoped sees every namespaced non-meta tool, still drops bare + meta.
-        let all = script_catalog_tools(&cached, None);
+        let all = script_catalog_tools(&cached, None, |_| None);
         assert_eq!(
             all,
             vec!["file_system__read".to_string(), "other__tool".to_string(),]
         );
+    }
+
+    /// SBS-866: a Personal allow-set of `team-slack` must not list a tool that
+    /// `route_of` attributes to the colliding team id `team_slack`.
+    #[test]
+    fn script_catalog_tools_does_not_leak_sanitized_id_twin() {
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("team-slack".to_string());
+        let cached = vec![
+            json!({ "name": "team_slack__send" }),
+            json!({ "name": "team_slack__send_2" }),
+        ];
+        let route = |name: &str| match name {
+            "team_slack__send" => Some("team-slack".to_string()),
+            "team_slack__send_2" => Some("team_slack".to_string()),
+            _ => None,
+        };
+        let names = script_catalog_tools(&cached, Some(&allowed), route);
+        assert_eq!(names, vec!["team_slack__send".to_string()]);
+        assert!(!names.iter().any(|n| n.ends_with("_2")));
     }
 
     /// End-to-end: a typed stub routes through execute_call like toolport.call.
@@ -22045,14 +22093,164 @@ mod tests {
         }
     }
 
+    /// The previous assertion stored sanitize_segment form and required
+    /// `file-system` and `file_system` to both match. That encoded the SBS-866
+    /// collision. SOU-327 still holds: hyphenated ids match because the allow-set
+    /// now stores the raw registry id.
     #[test]
-    fn server_in_allowed_scope_sanitizes_server_ids() {
-        // SOU-327: allowed set stores sanitize_segment form; raw hyphenated ids must match.
+    fn server_in_allowed_scope_uses_raw_registry_ids() {
         let mut allowed = std::collections::HashSet::new();
-        allowed.insert("file_system".to_string());
+        allowed.insert("file-system".to_string());
         assert!(server_in_allowed_scope("file-system", &allowed));
-        assert!(server_in_allowed_scope("file_system", &allowed));
+        assert!(
+            !server_in_allowed_scope("file_system", &allowed),
+            "underscore twin must not inherit hyphenated scope (SBS-866)"
+        );
         assert!(!server_in_allowed_scope("other-server", &allowed));
+    }
+
+    fn sbs866_server(id: &str, name: &str) -> ServerEntry {
+        ServerEntry {
+            id: id.into(),
+            name: name.into(),
+            transport: "stdio".into(),
+            command: Some(format!("{id}-cmd")),
+            args: vec![],
+            env: vec![],
+            url: None,
+            source: None,
+            disabled_tools: vec![],
+            cwd: None,
+            client_credentials: None,
+            unknown_fields: serde_json::Map::new(),
+        }
+    }
+
+    /// SBS-866: Personal `Team Slack` (id team-slack) must not share an allow-set
+    /// key with team `slack` (id team_slack).
+    #[test]
+    fn resolve_http_caller_scopes_personal_team_slack_without_team_twin() {
+        let mut reg = Registry::default();
+        reg.servers.push(sbs866_server("team-slack", "Team Slack"));
+        reg.servers.push(sbs866_server("team_slack", "slack"));
+        let personal = reg.add_profile("Personal");
+        reg.set_server_enabled(&personal, "team-slack", true).unwrap();
+        reg.set_server_enabled("default", "team_slack", true).unwrap();
+        reg.http_clients.push(registry::HttpClient {
+            id: "c-personal".into(),
+            label: "Open WebUI".into(),
+            token_sha256: registry::sha256_hex("tok-personal"),
+            profile: personal,
+        });
+        let (allowed, caller) =
+            resolve_http_caller(&reg, None, Some("tok-personal"), false).unwrap();
+        let set = allowed.expect("Personal client is scoped");
+        assert!(set.contains("team-slack"));
+        assert!(
+            !set.contains("team_slack"),
+            "sanitized collision must not put the team server in Personal scope"
+        );
+        assert_eq!(caller.session_owner.scope, Some(vec!["team-slack".to_string()]));
+        assert!(server_in_allowed_scope("team-slack", &set));
+        assert!(!server_in_allowed_scope("team_slack", &set));
+    }
+
+    /// SBS-866: route_of is authoritative; an override-renamed team tool must not
+    /// pass a Personal allow-set just because the exposed name has no server prefix.
+    #[test]
+    fn tool_in_scope_uses_raw_route_id_not_sanitized_twin() {
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("team-slack".to_string());
+        let route = |name: &str| match name {
+            "send_message" => Some("team_slack".to_string()),
+            "personal_send" => Some("team-slack".to_string()),
+            _ => None,
+        };
+        assert!(!tool_in_scope("send_message", &allowed, &route));
+        assert!(tool_in_scope("personal_send", &allowed, &route));
+    }
+
+    /// SBS-866: execute_call must refuse the team twin even when both servers are routed.
+    #[test]
+    fn execute_call_refuses_team_twin_for_personal_scope() {
+        let reg = Registry::default();
+        let mut router = Router::new();
+        for id in ["team-slack", "team_slack"] {
+            let ds = DownstreamServer::connect(
+                id.to_string(),
+                Box::new(MockRoute {
+                    tools: vec![json!({ "name": "send", "description": "" })],
+                }),
+            )
+            .unwrap();
+            router.add(ds);
+        }
+        let cached = router.aggregated_tools();
+        let personal: std::collections::HashSet<String> =
+            ["team-slack".to_string()].into_iter().collect();
+        let team_name = cached
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .find(|n| router.route_of(n).is_some_and(|(sid, _)| sid == "team_slack"))
+            .expect("team twin exposes a routed tool")
+            .to_string();
+        let personal_name = cached
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .find(|n| router.route_of(n).is_some_and(|(sid, _)| sid == "team-slack"))
+            .expect("personal server exposes a routed tool")
+            .to_string();
+        let denied = execute_call(
+            &reg,
+            &router,
+            &cached,
+            Some("open-webui"),
+            None,
+            Some(&personal),
+            None,
+            Some(&ConfirmGuard::new()),
+            &team_name,
+            json!({}),
+            None,
+            None,
+            CallOpts {
+                confirmed: true,
+                shape: false,
+                allow_app_only: true,
+            },
+            None,
+        );
+        let text = denied["content"][0]["text"].as_str().unwrap_or("");
+        assert_eq!(denied["isError"], true);
+        assert!(
+            text.contains("not available to this client"),
+            "team twin must be a scope denial, got {denied}"
+        );
+        let allowed_call = execute_call(
+            &reg,
+            &router,
+            &cached,
+            Some("open-webui"),
+            None,
+            Some(&personal),
+            None,
+            Some(&ConfirmGuard::new()),
+            &personal_name,
+            json!({}),
+            None,
+            None,
+            CallOpts {
+                confirmed: true,
+                shape: false,
+                allow_app_only: true,
+            },
+            None,
+        );
+        let allowed_text = allowed_call["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            !allowed_text.contains("not available to this client"),
+            "personal server must not be a scope denial, got {allowed_call}"
+        );
     }
 
     #[test]

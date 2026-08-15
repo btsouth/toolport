@@ -18,6 +18,12 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **A Personal-scoped HTTP bearer can no longer call a team server whose id
+  collides after sanitizing.** A personal server named Team Slack becomes
+  `team-slack`; a team server named slack becomes `team_slack`. The HTTP bridge
+  used `sanitize_segment` as the profile allow-set key, and both ids map to
+  `team_slack`, so the Personal token could list and call the team Slack server.
+  Scope now keys on the raw registry id (SBS-866). Tool names are still sanitized.
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
