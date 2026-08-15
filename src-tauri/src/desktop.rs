@@ -1048,7 +1048,7 @@ fn ensure_client_http_token(
     Ok(token)
 }
 
-/// Drop the managed shared-HTTP bearer for this client (registry row + vault).
+/// Drop the managed shared-HTTP bearer for this client (registry row, then vault).
 ///
 /// `delete_secret` already treats a missing vault entry as success (WS3-4), so
 /// Disconnect is not blocked when the bearer was never stored. A real vault or
@@ -1073,11 +1073,24 @@ fn revoke_client_http_token_with(
 ) -> Result<(), String> {
     const VAULT_SERVER: &str = "__toolport_http_clients__";
     let http_id = format!("client:{client_id}");
-    delete_vaulted_token(VAULT_SERVER, client_id)?;
+    // Drop the registry row FIRST. `resolve_http_caller` authenticates a bearer
+    // through `http_client_for_token`, which matches the row's `token_sha256`;
+    // the vault copy is never consulted on the auth path. So the row is the
+    // thing that grants access, and removing it revokes the bearer even if the
+    // vault step below then fails. The reverse order fails open: a vault error
+    // would return early with the row still registered and the bearer still
+    // authenticating. An orphaned vault entry is a hygiene problem; a live
+    // bearer after a failed revoke is a security one.
     write_registry(state, |reg| {
         reg.http_clients.retain(|c| c.id != http_id);
         Ok(())
     })?;
+    // A failed persist above means nothing was revoked, so the vault copy is
+    // deliberately left alone: the bearer it belongs to is still registered.
+    // Past this point the bearer is already dead, but a vault failure is still
+    // returned, because uninstall must not report a clean Disconnect while a
+    // copy of the token is left on the machine.
+    delete_vaulted_token(VAULT_SERVER, client_id)?;
     Ok(())
 }
 
@@ -6757,12 +6770,6 @@ mod tests {
         FAIL_NEXT_REGISTRY_WRITE.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// A vault delete that succeeds, which is also what `secrets::delete_secret`
-    /// reports for a bearer that was never stored (WS3-4).
-    fn vault_delete_ok(_server: &str, _client_id: &str) -> Result<(), String> {
-        Ok(())
-    }
-
     /// Scratch data dir + seeded `http_clients` row. Holds the process-global
     /// hook lock and `data_dir_test_lock` so persist and injected failures cannot
     /// interleave with another test.
@@ -6829,17 +6836,26 @@ mod tests {
             err.contains("the keychain is locked"),
             "the vault failure must reach the caller verbatim, got: {err}"
         );
+        // The point of the ordering: the row is dropped before the vault is
+        // touched, so a keychain failure still revokes the bearer. The caller
+        // is told the disconnect was not clean (an orphaned vault entry is
+        // left), but the token can no longer authenticate.
         assert!(
-            fixture.http_row_present(),
-            "a failed vault delete must leave the http_clients row registered"
+            !fixture.http_row_present(),
+            "the bearer must be revoked even when the vault delete fails"
         );
     }
 
     #[test]
     fn revoke_client_http_token_fails_when_registry_write_fails() {
         let fixture = RevokeFixture::new("sbs-845-registry-write");
+        let vault_called = std::cell::Cell::new(false);
         fail_next_registry_write();
-        let err = revoke_client_http_token_with(&fixture.state, &fixture.client_id, vault_delete_ok)
+        let err =
+            revoke_client_http_token_with(&fixture.state, &fixture.client_id, |_server, _client| {
+                vault_called.set(true);
+                Ok(())
+            })
             .expect_err("a failed http_clients persist must not look like a successful disconnect");
         assert!(
             err.contains("injected registry write"),
@@ -6848,6 +6864,13 @@ mod tests {
         assert!(
             fixture.http_row_present(),
             "a failed persist must leave the http_clients row registered"
+        );
+        // Nothing was revoked, so the vault copy must survive: it still belongs
+        // to a bearer that is registered and can authenticate. Deleting it here
+        // would strip Toolport's own record of a token that still works.
+        assert!(
+            !vault_called.get(),
+            "a failed persist must not delete the vaulted bearer"
         );
     }
 
