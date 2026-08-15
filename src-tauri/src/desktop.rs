@@ -1049,15 +1049,24 @@ fn ensure_client_http_token(
 }
 
 /// Drop the managed shared-HTTP bearer for this client (registry row + vault).
-/// Best-effort on vault delete so a missing secret never blocks Disconnect (WS3-4).
-fn revoke_client_http_token(state: &RegistryState, client_id: &str) {
+///
+/// `delete_secret` already treats a missing vault entry as success (WS3-4), so
+/// Disconnect is not blocked when the bearer was never stored. A real vault or
+/// `http_clients` persist failure is returned so uninstall cannot report Ok
+/// while the token is still live (SBS-845).
+fn revoke_client_http_token(state: &RegistryState, client_id: &str) -> Result<(), String> {
     const VAULT_SERVER: &str = "__toolport_http_clients__";
     let http_id = format!("client:{client_id}");
-    let _ = crate::secrets::delete_secret(VAULT_SERVER, client_id);
-    let _ = write_registry(state, |reg| {
+    #[cfg(test)]
+    if FAIL_NEXT_VAULT_DELETE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err("injected vault delete failure".into());
+    }
+    crate::secrets::delete_secret(VAULT_SERVER, client_id)?;
+    write_registry(state, |reg| {
         reg.http_clients.retain(|c| c.id != http_id);
         Ok(())
-    });
+    })?;
+    Ok(())
 }
 
 /// Remove the Toolport gateway from a client.
@@ -1074,8 +1083,9 @@ async fn uninstall_gateway(
         let state = app.state::<RegistryState>();
         let outcome = clients::uninstall_gateway(&client_id)?;
         // Config entry is gone; also revoke the bridge bearer so a leftover backup or
-        // stale token cannot keep authenticating (WS3-4).
-        revoke_client_http_token(state.inner(), &client_id);
+        // stale token cannot keep authenticating (WS3-4). A vault or registry
+        // failure must fail Disconnect — the bearer is still live (SBS-845).
+        revoke_client_http_token(state.inner(), &client_id)?;
         write_registry(state.inner(), |reg| {
             reg.set_client_scope(&client_id, None);
             reg.clear_client_managed_entry(&client_id);
@@ -2632,12 +2642,27 @@ fn write_registry<T>(
     state: &RegistryState,
     f: impl FnOnce(&mut Registry) -> Result<T, String>,
 ) -> Result<(Registry, T), String> {
+    #[cfg(test)]
+    if FAIL_NEXT_REGISTRY_WRITE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err("injected registry write failure".into());
+    }
     let mut guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (reg, out) = registry::update(f)?;
     *guard = reg.clone();
     bump_registry_generation();
     Ok((reg, out))
 }
+
+/// Process-global test hooks for SBS-845. Tests that set these must hold
+/// [`REVOKE_HOOK_LOCK`] so a leftover flag cannot leak into another case.
+#[cfg(test)]
+static FAIL_NEXT_VAULT_DELETE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static FAIL_NEXT_REGISTRY_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static REVOKE_HOOK_LOCK: Mutex<()> = Mutex::new(());
 
 /// Bumped every time the in-memory registry cache is replaced, while the
 /// `RegistryState` mutex is held.
@@ -6703,5 +6728,117 @@ mod tests {
         assert_eq!(supplied_secret(Some("   ".into())), None);
         assert_eq!(supplied_secret(Some("\t\n".into())), None);
         assert_eq!(supplied_secret(None), None);
+    }
+
+    // ----- SBS-845: Disconnect must not succeed while the bearer is still live --
+
+    fn fail_next_vault_delete() {
+        FAIL_NEXT_VAULT_DELETE.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn fail_next_registry_write() {
+        FAIL_NEXT_REGISTRY_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn clear_revoke_hooks() {
+        FAIL_NEXT_VAULT_DELETE.store(false, std::sync::atomic::Ordering::SeqCst);
+        FAIL_NEXT_REGISTRY_WRITE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Scratch data dir + seeded `http_clients` row. Holds the process-global
+    /// hook lock and `data_dir_test_lock` so persist and injected failures cannot
+    /// interleave with another test.
+    struct RevokeFixture {
+        _hooks: std::sync::MutexGuard<'static, ()>,
+        _data_dir: std::sync::MutexGuard<'static, ()>,
+        _override: crate::registry::DataDirOverride,
+        state: RegistryState,
+        client_id: String,
+        http_id: String,
+    }
+
+    impl Drop for RevokeFixture {
+        fn drop(&mut self) {
+            clear_revoke_hooks();
+        }
+    }
+
+    impl RevokeFixture {
+        fn new(label: &str) -> Self {
+            let hooks = REVOKE_HOOK_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            clear_revoke_hooks();
+            let data_dir = crate::registry::data_dir_test_lock();
+            let dir = unique_update_test_dir(label);
+            std::fs::create_dir_all(&dir).unwrap();
+            let over = crate::registry::DataDirOverride::set(&dir);
+            let client_id = "cursor".to_string();
+            let http_id = format!("client:{client_id}");
+            let mut reg = Registry::default();
+            reg.http_clients.push(registry::HttpClient {
+                id: http_id.clone(),
+                label: format!("Client: {client_id}"),
+                token_sha256: registry::sha256_hex("leftover-bearer"),
+                profile: String::new(),
+            });
+            registry::save(&reg).unwrap();
+            Self {
+                _hooks: hooks,
+                _data_dir: data_dir,
+                _override: over,
+                state: Mutex::new(reg),
+                client_id,
+                http_id,
+            }
+        }
+
+        fn http_row_present(&self) -> bool {
+            let on_disk = registry::load().expect("scratch registry loads");
+            on_disk.http_clients.iter().any(|c| c.id == self.http_id)
+        }
+    }
+
+    #[test]
+    fn revoke_client_http_token_fails_when_vault_delete_fails() {
+        let fixture = RevokeFixture::new("sbs-845-vault-delete");
+        fail_next_vault_delete();
+        let err = revoke_client_http_token(&fixture.state, &fixture.client_id)
+            .expect_err("a failed vault delete must not look like a successful disconnect");
+        assert!(
+            err.contains("injected vault delete"),
+            "expected the injected vault failure, got: {err}"
+        );
+        assert!(
+            fixture.http_row_present(),
+            "a failed vault delete must leave the http_clients row registered"
+        );
+    }
+
+    #[test]
+    fn revoke_client_http_token_fails_when_registry_write_fails() {
+        let fixture = RevokeFixture::new("sbs-845-registry-write");
+        fail_next_registry_write();
+        let err = revoke_client_http_token(&fixture.state, &fixture.client_id)
+            .expect_err("a failed http_clients persist must not look like a successful disconnect");
+        assert!(
+            err.contains("injected registry write"),
+            "expected the injected registry failure, got: {err}"
+        );
+        assert!(
+            fixture.http_row_present(),
+            "a failed persist must leave the http_clients row registered"
+        );
+    }
+
+    #[test]
+    fn revoke_client_http_token_drops_the_http_clients_row() {
+        let fixture = RevokeFixture::new("sbs-845-success");
+        revoke_client_http_token(&fixture.state, &fixture.client_id)
+            .expect("a missing vault entry must not block Disconnect");
+        assert!(
+            !fixture.http_row_present(),
+            "success means the bearer is gone from the registry"
+        );
     }
 }
