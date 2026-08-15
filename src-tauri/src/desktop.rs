@@ -74,9 +74,14 @@ impl Drop for OAuthFlowLock {
         // returns Err, not Ok(()).
         let completion = oauth_completion_path(&self.path, &self.attempt_id);
         let status = if self.succeeded { "ok" } else { "failed" };
-        let _ = std::fs::write(
-            completion,
-            format!(
+        // Written atomically (temp file + rename): `fs::write` truncates first, so a
+        // waiter polling every OAUTH_LOCK_POLL_MS could open the file between the
+        // truncate and the bytes landing and read zero bytes. A rename makes the
+        // completion file appear only once it is whole, so no waiter ever sees a
+        // half-written verdict, not even if this process dies mid-write.
+        let _ = registry::atomic_write(
+            &completion,
+            &format!(
                 "status={status}\ndone={}\npid={}\n",
                 now_unix_secs(),
                 std::process::id()
@@ -184,6 +189,11 @@ enum OAuthCompletion {
     Failed,
 }
 
+/// `None` means "no verdict yet", never "failed": an empty or unrecognised file is a
+/// file we caught mid-write (or one written by a build we do not know), and a waiter
+/// that turned that into `Failed` would tell the user sign-in failed while the other
+/// window was busy vaulting a token. Waiters keep polling on `None` and fall back to
+/// the wait timeout, so an unreadable file costs a slow error, not a wrong one.
 fn read_oauth_completion(path: &std::path::Path, attempt_id: &str) -> Option<OAuthCompletion> {
     let content = std::fs::read_to_string(oauth_completion_path(path, attempt_id)).ok()?;
     if content.lines().any(|line| line.trim() == "status=failed") {
@@ -194,7 +204,7 @@ fn read_oauth_completion(path: &std::path::Path, attempt_id: &str) -> Option<OAu
         // Pre-SBS-842 files had no status= and were written on every drop.
         Some(OAuthCompletion::Succeeded)
     } else {
-        Some(OAuthCompletion::Failed)
+        None
     }
 }
 
@@ -5723,6 +5733,55 @@ mod tests {
                 "successful first flow should let the waiter finish without a second browser"
             ),
             Err(e) => panic!("successful first flow should not error the waiter: {e}"),
+        }
+        cleanup_oauth_lock(&path, &[&first_attempt]);
+    }
+
+    #[test]
+    fn truncated_completion_file_is_not_a_failure_verdict() {
+        let path = unique_oauth_lock_path("torn-read");
+        let attempt_id = "attempt-torn-read";
+        let completion = oauth_completion_path(&path, attempt_id);
+        // Every shape a reader can catch while a writer is mid-write: the file
+        // exists but the verdict is not in it yet.
+        for partial in ["", "\n", "status=", "status=o"] {
+            std::fs::write(&completion, partial).expect("partial completion should be writable");
+            assert_eq!(
+                read_oauth_completion(&path, attempt_id),
+                None,
+                "a partially written completion ({partial:?}) must read as no verdict yet, not as failure"
+            );
+            assert!(
+                oauth_waiter_outcome(&path, attempt_id).is_none(),
+                "a partially written completion ({partial:?}) must not resolve the waiter"
+            );
+        }
+        cleanup_oauth_lock(&path, &[attempt_id]);
+    }
+
+    #[test]
+    fn oauth_waiter_keeps_polling_through_a_torn_completion_file() {
+        let path = unique_oauth_lock_path("torn-wait");
+        let mut lock = try_acquire_oauth_lock(&path)
+            .expect("lock acquisition should not fail")
+            .expect("lock should be acquired");
+        let first_attempt = lock.attempt_id.clone();
+        let wait_path = path.clone();
+        let waiter = std::thread::spawn(move || acquire_or_wait_oauth_lock_at(&wait_path));
+        // Let the waiter latch the live attempt id off the lock file.
+        std::thread::sleep(Duration::from_millis(OAUTH_LOCK_POLL_MS * 2));
+        // Stand in for the truncate half of a non-atomic completion write: the file
+        // is there, the bytes are not.
+        std::fs::write(oauth_completion_path(&path, &first_attempt), "")
+            .expect("torn completion should be writable");
+        std::thread::sleep(Duration::from_millis(OAUTH_LOCK_POLL_MS * 3));
+        // ...and only now does the first window finish vaulting its tokens.
+        lock.mark_succeeded();
+        drop(lock);
+        match waiter.join().expect("waiter thread should finish") {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("successful first flow should not start a second browser"),
+            Err(e) => panic!("a torn completion read must not be reported as a failed sign-in: {e}"),
         }
         cleanup_oauth_lock(&path, &[&first_attempt]);
     }
