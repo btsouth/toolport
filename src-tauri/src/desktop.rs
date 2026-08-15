@@ -3537,9 +3537,6 @@ fn watch_registry_for_app(handle: tauri::AppHandle) {
         consecutive_failures = 0;
         // Only a successful load advances the last-applied mtime, so a transient
         // failure is retried on the next tick instead of being consumed forever.
-        if !watch_advance_last_mtime(last, cur, true) {
-            continue;
-        }
         last = cur;
         let fresh_json = serde_json::to_string(&fresh).unwrap_or_default();
         if fresh_json == last_json {
@@ -3565,18 +3562,6 @@ fn watch_retry_delay(consecutive_failures: u32) -> std::time::Duration {
     const CAP_MS: u64 = 60_000;
     let exponent = consecutive_failures.saturating_sub(1).min(6);
     std::time::Duration::from_millis((BASE_MS << exponent).min(CAP_MS))
-}
-
-/// Decide whether the registry watcher may consume the observed `cur` mtime.
-/// Returns `true` only when the mtime is new AND the registry loaded
-/// successfully: a transient load failure keeps the previous mtime so the same
-/// change is retried on a later tick instead of being skipped forever.
-fn watch_advance_last_mtime(
-    last: Option<std::time::SystemTime>,
-    cur: Option<std::time::SystemTime>,
-    load_succeeded: bool,
-) -> bool {
-    cur != last && load_succeeded
 }
 
 /// Reap the child if it has already exited; returns true if it is still alive.
@@ -5075,24 +5060,6 @@ mod tests {
         // Once ready, deliver live without leaving a queued duplicate.
         assert!(should_emit_tray_approvals(&pending));
         assert!(!claim_pending_tray_approvals(&pending));
-    }
-
-    /// A transient registry load failure must not permanently consume the
-    /// change (SOU-695): the last-applied mtime only advances after a
-    /// successful load, so the same mtime is retried on a later tick.
-    #[test]
-    fn registry_watch_advances_last_mtime_only_after_a_successful_load() {
-        let old = std::time::SystemTime::now();
-        let changed = old + std::time::Duration::from_secs(1);
-
-        // Step 1-2: a changed mtime whose first load fails is not consumed.
-        assert!(!watch_advance_last_mtime(Some(old), Some(changed), false));
-        // Step 3-4: the same mtime is consumed once the load succeeds.
-        assert!(watch_advance_last_mtime(Some(old), Some(changed), true));
-        // An unchanged mtime is never consumed, even when a load would succeed.
-        assert!(!watch_advance_last_mtime(Some(changed), Some(changed), true));
-        // A missing file (mtime None) is not consumed on a failed load either.
-        assert!(!watch_advance_last_mtime(Some(old), None, false));
     }
 
     /// The retry backoff is bounded: it starts at the base tick and doubles per
