@@ -2962,14 +2962,35 @@ mod tests {
     fn adopt_restored_routes_never_touches_an_already_routed_tool() {
         // A tool the rebuilt router already routes (one of the 3 the degraded
         // connect returned) must keep its live mapping, not be overwritten.
-        let previous = router_with_catalogs(&[("atlassian", 40)]);
+        // The previous router carries an override renaming one of those same
+        // tools (t1 -> renamed-t1), so its catalog disagrees with the rebuilt
+        // router's live routes; adoption must leave every live name alone and
+        // adopt the renamed slot under its renamed exposure.
+        let mut previous = Router::new();
+        previous.set_overrides(HashMap::from([(
+            "atlassian".to_string(),
+            HashMap::from([(
+                "t1".to_string(),
+                ToolOverride {
+                    name: Some("renamed-t1".into()),
+                    description: None,
+                },
+            )]),
+        )]));
+        previous.add(catalog_server("atlassian", 40));
         let mut rebuilt = router_with_catalogs(&[("atlassian", 3)]);
         let guarded = previous.aggregated_tools();
         rebuilt.adopt_restored_routes(&previous, &guarded);
 
+        // Live routes for tools the degraded connect still advertises are kept,
+        // even though the previous catalog disagrees about one of them.
         assert_eq!(rebuilt.route_of("atlassian__t0"), Some(("atlassian", "t0")));
         assert_eq!(rebuilt.route_of("atlassian__t1"), Some(("atlassian", "t1")));
         assert_eq!(rebuilt.route_of("atlassian__t2"), Some(("atlassian", "t2")));
+        // The renamed slot from the previous catalog is adopted under its
+        // renamed (sanitized) exposure — never re-derived by splitting on `__`
+        // — pointing at the same downstream tool.
+        assert_eq!(rebuilt.route_of("renamed_t1"), Some(("atlassian", "t1")));
     }
 
     #[test]
