@@ -4193,18 +4193,15 @@ pub(crate) fn resolve_gateway_path() -> Option<PathBuf> {
 
 /// Copy the gateway binary to a stable per-user location, so a client config can
 /// point at a path that outlives an ephemeral AppImage mount. Re-copies when the
-/// source size differs (e.g. after an app update). Returns the stable path.
+/// source size or content differs (e.g. after an app update that rebuilt the
+/// gateway at the same byte length). Returns the stable path.
 fn stable_gateway_copy(src: &std::path::Path) -> Option<PathBuf> {
     let dest_dir = crate::registry::conduit_dir()?.join("bin");
     std::fs::create_dir_all(&dest_dir).ok()?;
     // Keep the source's filename so the stable copy matches whichever binary name
     // (toolport-gateway, or the legacy conduit-gateway) was found next to the app.
     let dest = dest_dir.join(src.file_name()?);
-    let stale = match (std::fs::metadata(&dest), std::fs::metadata(src)) {
-        (Ok(d), Ok(s)) => d.len() != s.len(),
-        _ => true,
-    };
-    if stale {
+    if gateway_copy_is_stale(src, &dest) {
         std::fs::copy(src, &dest).ok()?;
         #[cfg(unix)]
         {
@@ -4217,6 +4214,19 @@ fn stable_gateway_copy(src: &std::path::Path) -> Option<PathBuf> {
         }
     }
     Some(dest)
+}
+
+/// True when dest is missing, unreadable, a different length, or the same length
+/// with different bytes. Size alone is not enough: AppImage rebuilds commonly
+/// keep the previous length.
+fn gateway_copy_is_stale(src: &std::path::Path, dest: &std::path::Path) -> bool {
+    match (std::fs::metadata(dest), std::fs::metadata(src)) {
+        (Ok(d), Ok(s)) if d.len() == s.len() => match (std::fs::read(dest), std::fs::read(src)) {
+            (Ok(dest_bytes), Ok(src_bytes)) => dest_bytes != src_bytes,
+            _ => true,
+        },
+        _ => true,
+    }
 }
 
 fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, String> {
@@ -9694,5 +9704,56 @@ extensions:
             .collect();
         assert_eq!(vals.get("PORT"), Some(&"3000"));
         assert_eq!(vals.get("DEBUG"), Some(&"true"));
+    }
+
+    #[test]
+    fn stable_gateway_copy_replaces_same_size_different_bytes() {
+        // AppImage updates often rebuild the gateway at the same length. Size-only
+        // stale detection would leave clients on the previous copy.
+        let _lock = crate::registry::data_dir_test_lock();
+        let scratch = std::env::temp_dir().join(format!(
+            "toolport-stable-gw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data_dir = crate::registry::DataDirOverride::set(&scratch);
+
+        let fixture_a = b"gateway-binary-AAAA";
+        let fixture_b = b"gateway-binary-BBBB";
+        assert_eq!(
+            fixture_a.len(),
+            fixture_b.len(),
+            "fixtures must be equal length so size-only detection would skip the copy"
+        );
+
+        let dest_dir = scratch.join("bin");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let dest = dest_dir.join("toolport-gateway");
+        std::fs::write(&dest, fixture_a).unwrap();
+
+        let src_dir = scratch.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("toolport-gateway");
+        std::fs::write(&src, fixture_b).unwrap();
+
+        let copied = stable_gateway_copy(&src).expect("same-size newer src must recopy");
+        assert_eq!(copied, dest);
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            fixture_b,
+            "dest must match the newer src, not the equal-length previous copy"
+        );
+
+        // Same-content same-size is not a failure; dest still matches src.
+        let again = stable_gateway_copy(&src).expect("identical src must still succeed");
+        assert_eq!(again, dest);
+        assert_eq!(std::fs::read(&dest).unwrap(), fixture_b);
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }
