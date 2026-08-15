@@ -779,7 +779,12 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       .then(setNeedsRestart)
       .catch(() => {});
   }, []);
-  const [autostartOn, setAutostartOn] = useState(false);
+  // Launch-at-login is OS-level state owned by the autostart plugin. Model
+  // loading/ready/error explicitly so the switch is never presented as a
+  // verified Off while the real OS value is unknown or unreadable (#694).
+  const [autostart, setAutostart] = useState<
+    { status: "loading" } | { status: "error" } | { status: "ready"; enabled: boolean }
+  >({ status: "loading" });
 
   const httpClients = registry?.httpClients ?? [];
   const profiles = registry?.profiles ?? [];
@@ -791,18 +796,27 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   }, [registry?.servers]);
 
   // Launch-at-login is OS-level (managed by the autostart plugin), not registry state.
-  useEffect(() => {
-    isAutostartEnabled()
-      .then(setAutostartOn)
-      .catch(() => {});
+  // A failed read must not be rendered as "Off": keep the switch disabled and offer
+  // a retry until the OS value is actually known.
+  const loadAutostart = useCallback(async () => {
+    setAutostart({ status: "loading" });
+    try {
+      setAutostart({ status: "ready", enabled: await isAutostartEnabled() });
+    } catch {
+      setAutostart({ status: "error" });
+    }
   }, []);
+
+  useEffect(() => {
+    void loadAutostart();
+  }, [loadAutostart]);
 
   const toggleAutostart = async (on: boolean) => {
     setBusySettings((current) => new Set(current).add("autostart"));
     try {
       if (on) await enableAutostart();
       else await disableAutostart();
-      setAutostartOn(on);
+      setAutostart({ status: "ready", enabled: on });
     } catch (e) {
       toastError(`Couldn't ${on ? "enable" : "disable"} launch at login: ${e}`);
     } finally {
@@ -976,18 +990,41 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     desc: string,
     onChange: (v: boolean) => void,
     settingKey: SettingKey,
+    extra?: {
+      switchDisabled?: boolean;
+      hint?: string;
+      hintTone?: "muted" | "destructive";
+      onRetry?: () => void;
+    },
   ) => (
     <label className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm">
       <Icon className={`size-4 shrink-0 ${on ? accent : "text-muted-foreground"}`} />
       <span className="flex min-w-0 flex-1 flex-col leading-tight">
         <span className="font-medium">{title}</span>
         <span className="text-xs text-muted-foreground">{desc}</span>
+        {extra?.hint && (
+          <span
+            className={
+              extra.hintTone === "destructive"
+                ? "text-xs text-destructive"
+                : "text-xs text-muted-foreground"
+            }
+          >
+            {extra.hint}
+          </span>
+        )}
       </span>
       <Switch
         checked={on}
         onCheckedChange={onChange}
-        disabled={busySettings.has(settingKey)}
+        disabled={busySettings.has(settingKey) || extra?.switchDisabled}
       />
+      {extra?.onRetry && (
+        <Button size="sm" variant="ghost" className="gap-1.5" onClick={extra.onRetry}>
+          <RefreshCw className="size-3.5" />
+          Retry
+        </Button>
+      )}
     </label>
   );
 
@@ -999,12 +1036,24 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         </h2>
         {toggle(
           Power,
-          autostartOn,
+          autostart.status === "ready" && autostart.enabled,
           "text-info",
           "Launch at login",
           "Start Toolport in the tray when you sign in, so it can hold tool calls for approval even before you open it",
           toggleAutostart,
           "autostart",
+          {
+            switchDisabled: autostart.status !== "ready",
+            hint:
+              autostart.status === "loading"
+                ? "Checking the current OS setting…"
+                : autostart.status === "error"
+                  ? "Couldn't read the OS setting — launch-at-login state is unknown."
+                  : undefined,
+            hintTone: autostart.status === "error" ? "destructive" : "muted",
+            onRetry:
+              autostart.status === "error" ? () => void loadAutostart() : undefined,
+          },
         )}
         <div className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm">
           <Sun className="size-4 shrink-0 text-info" />

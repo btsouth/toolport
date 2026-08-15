@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { ThemeProvider } from "@/lib/theme";
@@ -30,8 +30,16 @@ vi.mock("@/lib/api", async (importOriginal) => {
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
+vi.mock("@tauri-apps/plugin-autostart", () => ({
+  isEnabled: vi.fn(),
+  enable: vi.fn().mockResolvedValue(undefined),
+  disable: vi.fn().mockResolvedValue(undefined),
+}));
+
+import { isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 
 const mockedListServerTools = vi.mocked(listServerTools);
+const mockedIsAutostartEnabled = vi.mocked(isAutostartEnabled);
 const mockedSetAllowRoutineWrites = vi.mocked(setAllowRoutineWrites);
 const mockedSetCodeMode = vi.mocked(setCodeMode);
 const mockedListRoutineSuggestions = vi.mocked(listRoutineSuggestions);
@@ -328,5 +336,60 @@ describe("SettingsView routine suggestions", () => {
     await waitFor(() =>
       expect(screen.queryByText("Suggested routines")).not.toBeInTheDocument(),
     );
+  });
+});
+
+describe("SettingsView launch at login", () => {
+  it("keeps the switch disabled until the OS autostart state is known", async () => {
+    const request = deferred<boolean>();
+    mockedIsAutostartEnabled.mockReturnValueOnce(request.promise);
+
+    renderSettings();
+
+    const control = screen.getByRole("switch", { name: /launch at login/i });
+    expect(control).toBeDisabled();
+    expect(screen.getByText(/checking the current os setting/i)).toBeInTheDocument();
+
+    request.resolve(true);
+    await waitFor(() => expect(control).toBeEnabled());
+    expect(control).toHaveAttribute("aria-checked", "true");
+    expect(
+      screen.queryByText(/checking the current os setting/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders a verified disabled state once the OS read succeeds with false", async () => {
+    mockedIsAutostartEnabled.mockResolvedValueOnce(false);
+
+    renderSettings();
+
+    const control = screen.getByRole("switch", { name: /launch at login/i });
+    await waitFor(() => expect(control).toBeEnabled());
+    expect(control).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("shows unavailable/retry feedback on a failed read and restores the real state on retry", async () => {
+    const user = userEvent.setup();
+    mockedIsAutostartEnabled.mockRejectedValueOnce(new Error("boom"));
+
+    renderSettings();
+
+    const control = screen.getByRole("switch", { name: /launch at login/i });
+    await waitFor(() =>
+      expect(screen.getByText(/couldn't read the os setting/i)).toBeInTheDocument(),
+    );
+    // A failed read must never be presented as a verified Off state.
+    expect(control).toBeDisabled();
+    const row = screen.getByText("Launch at login").closest("label");
+    expect(row).not.toBeNull();
+    expect(within(row!).getByRole("button", { name: /retry/i })).toBeInTheDocument();
+
+    // A successful retry restores the real enabled/disabled state.
+    mockedIsAutostartEnabled.mockResolvedValueOnce(true);
+    await user.click(within(row!).getByRole("button", { name: /retry/i }));
+
+    await waitFor(() => expect(control).toBeEnabled());
+    expect(control).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByText(/couldn't read the os setting/i)).not.toBeInTheDocument();
   });
 });
