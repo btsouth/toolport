@@ -2523,6 +2523,38 @@ fn release_quarantine(
     Ok(())
 }
 
+/// Re-approve every quarantined tool for a profile in one action.
+///
+/// A lost integrity baseline blocks the whole catalog at once, which on a real
+/// install is thousands of tools. Recovering through `release_quarantine` means one
+/// IPC round trip, one cross-process lock and two store writes per tool, so the
+/// only recovery the UI offered did not finish in practice. `integrity::release_all`
+/// does the same repair with a single pass. Tools whose captured definition could
+/// not be read stay blocked and come back in `skipped`, so this can never expose a
+/// tool without re-establishing its baseline.
+#[tauri::command]
+async fn release_all_quarantine(
+    app: AppHandle,
+    profile: String,
+) -> Result<integrity::ReleaseAllOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        let prof = if profile.is_empty() {
+            None
+        } else {
+            Some(profile.as_str())
+        };
+        let outcome = integrity::release_all(prof)
+            .map_err(|e| format!("Could not re-approve the blocked tools: {e}"))?;
+        // Same reasoning as `release_quarantine`: refresh the cache rather than
+        // blind-writing a possibly stale snapshot over a concurrent gateway write.
+        reload_into_state(state.inner())?;
+        Ok(outcome)
+    })
+    .await
+    .map_err(|e| format!("re-approval task join failed: {e}"))?
+}
+
 /// Set lazy discovery globally. The gateway reads this from the registry, so it
 /// takes effect for every client (including ones that don't forward env vars).
 /// Clients pick it up the next time they (re)spawn the gateway.
@@ -4718,6 +4750,7 @@ pub fn run() {
             set_pii_redaction,
             list_quarantined,
             release_quarantine,
+            release_all_quarantine,
             set_lazy_discovery,
             set_code_mode,
             set_allow_routine_writes,

@@ -350,6 +350,22 @@ export function releaseQuarantine(profile: string, tool: string): Promise<void> 
   return invoke<void>("release_quarantine", { profile, tool });
 }
 
+/** Outcome of a bulk re-approval. `skipped` names tools that stay blocked. */
+export type ReleaseAllOutcome = {
+  released: number;
+  skipped: string[];
+};
+
+/**
+ * Re-approve every blocked tool for a profile in one pass. A lost integrity
+ * baseline blocks the whole catalog at once, which is far too many to clear one
+ * at a time. Tools whose captured definition could not be read stay blocked and
+ * are returned in `skipped`.
+ */
+export function releaseAllQuarantine(profile: string): Promise<ReleaseAllOutcome> {
+  return invoke<ReleaseAllOutcome>("release_all_quarantine", { profile });
+}
+
 /** Toggle global lazy discovery (meta-tools vs full catalog) for all clients. */
 export function setLazyDiscovery(lazy: boolean): Promise<Registry> {
   return invoke<Registry>("set_lazy_discovery", { lazy });
