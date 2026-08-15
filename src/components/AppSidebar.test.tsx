@@ -426,4 +426,44 @@ describe("AppSidebar quarantine badge", () => {
       vi.useRealTimers();
     }
   });
+
+  it("keeps a confirmed count on a failed poll and marks it stale (#742)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      listQuarantined
+        .mockResolvedValueOnce([
+          quarantinedTool({ tool: "a" }),
+          quarantinedTool({ tool: "b" }),
+          quarantinedTool({ tool: "c" }),
+        ])
+        .mockRejectedValueOnce(new Error("gateway not reachable"));
+
+      renderSidebar();
+
+      const badge = await screen.findByLabelText("3 tools blocked");
+      expect(badge).toBeInTheDocument();
+      expect(
+        screen.queryByLabelText("Quarantine status unknown"),
+      ).not.toBeInTheDocument();
+
+      const callsBeforeNextTick = listQuarantined.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+
+      expect(listQuarantined.mock.calls.length).toBeGreaterThan(callsBeforeNextTick);
+      // The confirmed count survives the failed poll instead of degrading to "?".
+      expect(screen.getByLabelText("3 tools blocked")).toBeInTheDocument();
+      expect(
+        screen.queryByLabelText("Quarantine status unknown"),
+      ).not.toBeInTheDocument();
+      // ...but the badge says the number may be stale.
+      expect(screen.getByLabelText("3 tools blocked")).toHaveAttribute(
+        "title",
+        expect.stringContaining("stale"),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

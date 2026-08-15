@@ -497,10 +497,14 @@ export function AppSidebar({
 }: Props) {
   const [showMissing, setShowMissing] = useState(false);
   const [savings, setSavings] = useState<SavingsSummary | null>(null);
-  // `null` means "no confirmed count": the first poll hasn't answered yet or
-  // the last poll failed. It must render distinctly from a confirmed zero so
-  // a gateway that never answered never reads as "all clear" (#741).
+  // `null` means "no confirmed count": the first poll hasn't answered yet. It
+  // must render distinctly from a confirmed zero so a gateway that never
+  // answered never reads as "all clear" (#741).
   const [quarantinedCount, setQuarantinedCount] = useState<number | null>(null);
+  // A failed poll keeps the last confirmed count and flags it stale instead of
+  // dropping back to `null`, so one transient blip never erases a real number.
+  // Mirrors SettingsView's list+error shape (keep the value, add a flag) (#742).
+  const [quarantineStale, setQuarantineStale] = useState(false);
   const sorted = sortClients(clients);
   const detectedClients = sorted.filter((c) => statusOf(c) !== "missing");
   const missingClients = sorted.filter((c) => statusOf(c) === "missing");
@@ -534,12 +538,17 @@ export function AppSidebar({
       const id = ++latest;
       return listQuarantined()
         .then((q) => {
-          if (alive && id === latest) setQuarantinedCount(q.length);
+          if (alive && id === latest) {
+            setQuarantinedCount(q.length);
+            setQuarantineStale(false);
+          }
         })
         .catch(() => {
-          // A failed poll must not read as a confirmed zero: surface the
-          // unknown state so the badge never claims "all clear" (#741).
-          if (alive && id === latest) setQuarantinedCount(null);
+          // A failed poll must not read as a confirmed zero, but it must not
+          // erase a confirmed count either: keep the last answer and mark it
+          // stale so the badge never claims "all clear" and never loses a
+          // real number over one blip (#741, #742).
+          if (alive && id === latest) setQuarantineStale(true);
         });
     };
     load();
@@ -558,6 +567,7 @@ export function AppSidebar({
     active: boolean,
     onClick: () => void,
     badge?: number | null,
+    stale?: boolean,
   ) => (
     <button
       onClick={onClick}
@@ -572,6 +582,11 @@ export function AppSidebar({
         <span
           className="ml-auto inline-flex shrink-0 items-center rounded-full bg-warning/15 px-1.5 text-[10px] font-medium text-warning"
           aria-label={`${badge} tool${badge === 1 ? "" : "s"} blocked`}
+          title={
+            stale
+              ? "Could not reach the gateway — quarantine count may be stale"
+              : undefined
+          }
         >
           {badge}
         </span>
@@ -654,6 +669,7 @@ export function AppSidebar({
             view === "settings",
             () => onSelectView("settings"),
             quarantinedCount,
+            quarantineStale,
           )}
         </nav>
 
