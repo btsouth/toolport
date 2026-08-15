@@ -18,6 +18,11 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **Failed routine-suggestion load no longer hides the save queue.** Settings treated
+  an unreachable `list_routine_suggestions` as "nothing pending" and hid the section,
+  including wiping cards already on screen when a later refresh failed. A failed load
+  is now its own state: empty after a successful read still hides; error shows retry
+  and keeps the last loaded queue. (SBS-879)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt

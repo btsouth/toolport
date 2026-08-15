@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
@@ -35,6 +35,8 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
+import { listen } from "@tauri-apps/api/event";
+
 const mockedListServerTools = vi.mocked(listServerTools);
 const mockedIsAutostartEnabled = vi.mocked(isAutostartEnabled);
 const mockedSetAllowRoutineWrites = vi.mocked(setAllowRoutineWrites);
@@ -42,6 +44,7 @@ const mockedSetCodeMode = vi.mocked(setCodeMode);
 const mockedListRoutineSuggestions = vi.mocked(listRoutineSuggestions);
 const mockedApproveRoutineSuggestion = vi.mocked(approveRoutineSuggestion);
 const mockedDismissRoutineSuggestion = vi.mocked(dismissRoutineSuggestion);
+const mockedListen = vi.mocked(listen);
 
 const registry: Registry = {
   version: 1,
@@ -269,6 +272,13 @@ describe("SettingsView routine writes", () => {
 });
 
 describe("SettingsView routine suggestions", () => {
+  beforeEach(() => {
+    mockedListen.mockReset();
+    mockedListen.mockResolvedValue(() => {});
+    mockedListRoutineSuggestions.mockReset();
+    mockedListRoutineSuggestions.mockResolvedValue([]);
+  });
+
   const suggestion: RoutineSuggestion = {
     suggestedName: "batch-deepwiki-ask-question",
     source:
@@ -333,6 +343,70 @@ describe("SettingsView routine suggestions", () => {
     await waitFor(() =>
       expect(screen.queryByText("Suggested routines")).not.toBeInTheDocument(),
     );
+  });
+
+  it("shows retry instead of hiding when the first load fails (SBS-879)", async () => {
+    const user = userEvent.setup();
+    mockedListRoutineSuggestions.mockRejectedValueOnce(new Error("backend down"));
+
+    renderSettings();
+
+    const error = await screen.findByText(/couldn't load suggested routines/i);
+    const row = error.closest("div");
+    expect(row).not.toBeNull();
+    expect(within(row!).getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    expect(screen.queryByText("Suggested routines")).not.toBeInTheDocument();
+
+    mockedListRoutineSuggestions.mockResolvedValueOnce([suggestion]);
+    await user.click(within(row!).getByRole("button", { name: /retry/i }));
+
+    expect(await screen.findByText("Suggested routines")).toBeInTheDocument();
+    expect(screen.getByText("Calls: 3")).toBeInTheDocument();
+    expect(
+      screen.queryByText(/couldn't load suggested routines/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps on-screen cards when a later refresh fails (SBS-879)", async () => {
+    const handlers: Array<() => void> = [];
+    mockedListen.mockImplementation(async (event, handler) => {
+      if (event === "routine-suggestion") {
+        handlers.push(() => {
+          (handler as (event: unknown) => void)({});
+        });
+      }
+      return () => {};
+    });
+    mockedListRoutineSuggestions
+      .mockResolvedValueOnce([suggestion])
+      .mockRejectedValueOnce(new Error("backend down"));
+
+    renderSettings();
+
+    expect(await screen.findByText("Suggested routines")).toBeInTheDocument();
+    expect(screen.getByText("Calls: 3")).toBeInTheDocument();
+    await waitFor(() => expect(handlers.length).toBeGreaterThan(0));
+
+    handlers[0]();
+
+    expect(
+      await screen.findByText(/couldn't refresh suggested routines/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Suggested routines")).toBeInTheDocument();
+    expect(screen.getByText("Calls: 3")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /save routine/i })).toBeInTheDocument();
+  });
+
+  it("still hides the section after a successful empty read", async () => {
+    mockedListRoutineSuggestions.mockResolvedValueOnce([]);
+
+    renderSettings();
+
+    await waitFor(() => expect(mockedListRoutineSuggestions).toHaveBeenCalled());
+    expect(screen.queryByText("Suggested routines")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/couldn't load suggested routines/i),
+    ).not.toBeInTheDocument();
   });
 });
 

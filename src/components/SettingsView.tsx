@@ -94,13 +94,16 @@ function RoutineSuggestions() {
   const [suggestions, setSuggestions] = useState<RoutineSuggestion[]>([]);
   const [names, setNames] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
+  // SBS-879: a failed invoke is not an empty queue. Keep last-known cards and
+  // surface retry; only a successful read of [] hides the section.
+  const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
 
   const refresh = useCallback(async () => {
     try {
       setSuggestions(await listRoutineSuggestions());
+      setStatus("ready");
     } catch {
-      // An unreachable backend renders as an empty queue; the section hides itself.
-      setSuggestions([]);
+      setStatus("error");
     }
   }, []);
 
@@ -144,7 +147,25 @@ function RoutineSuggestions() {
     }
   }
 
-  if (suggestions.length === 0) return null;
+  if (status === "loading") return null;
+  if (status === "ready" && suggestions.length === 0) return null;
+  if (status === "error" && suggestions.length === 0) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-muted/20 p-3 text-xs text-muted-foreground">
+        <Braces className="size-3.5 shrink-0 text-warning" />
+        <span>Couldn&apos;t load suggested routines.</span>
+        <Button
+          size="sm"
+          variant="ghost"
+          className="ml-auto gap-1.5"
+          onClick={() => void refresh()}
+        >
+          <RefreshCw className="size-3.5" />
+          Retry
+        </Button>
+      </div>
+    );
+  }
   return (
     <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
       <div className="flex items-center gap-2 text-xs">
@@ -157,6 +178,22 @@ function RoutineSuggestions() {
           repeated patterns Toolport verified; saving advertises them to every client
         </span>
       </div>
+      {status === "error" && (
+        <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
+          <span>
+            Couldn&apos;t refresh suggested routines; showing the last loaded queue.
+          </span>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="ml-auto gap-1.5"
+            onClick={() => void refresh()}
+          >
+            <RefreshCw className="size-3.5" />
+            Retry
+          </Button>
+        </div>
+      )}
       <ul className="mt-2 space-y-2">
         {suggestions.map((suggestion) => {
           const fingerprint = suggestion.definitionFingerprint;
@@ -1209,8 +1246,9 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             )
           : null}
         {/* Rendered independently of the writes toggle: a suggestion queued while
-            writes were on stays actionable (the user is the authority here), and the
-            section hides itself entirely when the queue is empty. */}
+            writes were on stays actionable (the user is the authority here). A
+            successful empty read hides the section; a failed load is a visible
+            error, not an empty queue (SBS-879). */}
         <RoutineSuggestions />
       </section>
       <section className="flex flex-col gap-2">
