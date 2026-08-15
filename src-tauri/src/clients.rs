@@ -5682,6 +5682,12 @@ mod tests {
     /// ENOTDIR on unix but ERROR_PATH_NOT_FOUND (NotFound) on Windows.
     #[test]
     fn write_servers_aborts_when_backup_stat_fails() {
+        // Serialize against other tests that mutate the process-global
+        // CLAUDE_CONFIG_DIR (e.g. client_config_paths_match_current_platform):
+        // without the lock, that test could resolve the default home config
+        // path mid-flight and make this one flaky.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let dir = std::env::temp_dir().join(format!("toolport-bk-write-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
