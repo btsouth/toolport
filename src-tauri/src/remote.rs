@@ -382,9 +382,22 @@ fn resource_binding_changed(vaulted_resource: &str, url: &str) -> bool {
 /// without a live connect. Two ways state goes stale, both reached by editing the
 /// server outside `set_client_credentials`: the config was removed, or the URL
 /// changed out from under an RFC 8707 resource binding.
-fn client_credentials_state_is_stale(server: &ServerEntry, server_id: &str, url: &str) -> bool {
-    secrets::get_secret(server_id, CC_STATE_KEY).is_some()
-        && (!uses_client_credentials(server) || client_credentials_resource_changed(server_id, url))
+///
+/// Errs on a failed vault read (SBS-840). Collapsing that to "no state here" skips
+/// the reset, and the connect then sends a token RFC 8707 bound to the OLD resource
+/// to the new one, which is the exact thing the reset exists to prevent.
+fn client_credentials_state_is_stale(
+    server: &ServerEntry,
+    server_id: &str,
+    url: &str,
+) -> Result<bool, String> {
+    if secrets::get_secret_result(server_id, CC_STATE_KEY)
+        .map_err(|e| format!("could not read the vaulted client-credentials state: {e}"))?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    Ok(!uses_client_credentials(server) || client_credentials_resource_changed(server_id, url))
 }
 
 /// Expiry of the vaulted client-credentials token, if this server uses that flow.
@@ -923,6 +936,26 @@ fn first_vaulted_secret(server: &ServerEntry) -> Result<Option<String>, String> 
     Ok(None)
 }
 
+/// Did the transport spend its own forced refresh during this connect?
+///
+/// The transport force-refreshes internally on a 401/403 and vaults the result, so a
+/// vaulted token that differs from the one we handed it means an exchange already
+/// happened (SOU-474). `sent_auth` is what went out; `None` back means there is
+/// nothing vaulted to compare, which is not evidence of a refresh.
+///
+/// Errs on a failed vault read (SBS-840) rather than answering "no refresh happened".
+/// That answer sends the caller into a second exchange on a refresh token the
+/// transport may have already spent, which is what a provider with reuse detection
+/// revokes the whole family over.
+fn transport_refreshed_during_connect(
+    server_id: &str,
+    sent_auth: Option<&str>,
+) -> Result<bool, String> {
+    let vaulted = secrets::get_secret_result(server_id, secrets::HTTP_AUTH_KEY)
+        .map_err(|e| format!("could not read the vaulted access token: {e}"))?;
+    Ok(vaulted.is_some_and(|vaulted| Some(vaulted.as_str()) != sent_auth))
+}
+
 /// Connect to a remote server, injecting any vaulted token. On an auth error,
 /// refresh the token once and retry.
 ///
@@ -971,7 +1004,7 @@ pub fn connect_remote_with_handler(
     //
     // Handled here because this is the only place that sees both the current entry
     // and the vault; the reacquire seam takes just a server id by design.
-    if client_credentials_state_is_stale(server, server_id, url) {
+    if client_credentials_state_is_stale(server, server_id, url)? {
         // Not ignored: leaving stale state would silently keep using the wrong
         // flow, or the wrong resource binding, for the rest of the session.
         reset_client_credentials(server_id)?;
@@ -1011,32 +1044,56 @@ pub fn connect_remote_with_handler(
     transport.set_change_sink(change_dirty.clone());
     match DownstreamServer::connect(server_id.to_string(), Box::new(transport)) {
         Ok(ds) => Ok(ds),
-        // The transport already gets one forced refresh per token on a 401/403.
-        // If it spent one during this connect, the vault now holds a token that
-        // has ALREADY been rejected, so minting yet another cannot help - and
-        // against a provider that rotates the refresh token on use, each needless
-        // exchange consumes a further link of the chain. Retry only when the
-        // transport had no refresh of its own to spend (SOU-474).
-        Err(e)
-            if is_auth_error(&e)
-                && secrets::get_secret(server_id, secrets::HTTP_AUTH_KEY)
-                    .is_some_and(|vaulted| Some(&vaulted) != sent_auth.as_ref()) =>
-        {
-            Err(e)
-        }
-        Err(e) if is_auth_error(&e) => match refresh_token(server_id) {
-            Ok(fresh) => {
-                let mut transport = authed_transport(url, Some(fresh), server_id, block_private)?;
-                if let Some(handler) = server_handler.clone() {
-                    transport.set_server_request_handler(handler);
-                }
-                transport.set_resource_updated_sink(resource_updated);
-                transport.set_progress_sink(progress);
-                transport.set_change_sink(change_dirty);
-                DownstreamServer::connect(server_id.to_string(), Box::new(transport))
+        Err(e) if is_auth_error(&e) => {
+            // The transport already gets one forced refresh per token on a 401/403.
+            // If it spent one during this connect, the vault now holds a token that
+            // has ALREADY been rejected, so minting yet another cannot help - and
+            // against a provider that rotates the refresh token on use, each needless
+            // exchange consumes a further link of the chain. Retry only when the
+            // transport had no refresh of its own to spend (SOU-474).
+            //
+            // The two auth-error arms are one arm so that check can use `?`: a match
+            // guard cannot, so it could only answer "no refresh happened" on a failed
+            // vault read and go on to refresh anyway (SBS-840). The rejection is then
+            // described in words rather than quoted, because its text would make
+            // `is_auth_error` classify a keychain fault as needs-sign-in and push the
+            // user into a sign-in the same vault could not store.
+            let already_refreshed =
+                match transport_refreshed_during_connect(server_id, sent_auth.as_deref()) {
+                    Ok(refreshed) => refreshed,
+                    Err(vault_error) => {
+                        // Keep the downstream rejection out of the returned string but
+                        // not out of the record of what happened.
+                        eprintln!(
+                            "toolport: could not tell whether the transport refreshed during the \
+                             failed connect to {server_id:?}; the server rejected the credential \
+                             with: {e}"
+                        );
+                        return Err(format!(
+                            "{vault_error} (the server rejected the credential Toolport sent, and \
+                             without the vault there is no way to tell whether it had already been \
+                             renewed, so no further token exchange was attempted)"
+                        ));
+                    }
+                };
+            if already_refreshed {
+                return Err(e);
             }
-            Err(_) => Err(e),
-        },
+            match refresh_token(server_id) {
+                Ok(fresh) => {
+                    let mut transport =
+                        authed_transport(url, Some(fresh), server_id, block_private)?;
+                    if let Some(handler) = server_handler.clone() {
+                        transport.set_server_request_handler(handler);
+                    }
+                    transport.set_resource_updated_sink(resource_updated);
+                    transport.set_progress_sink(progress);
+                    transport.set_change_sink(change_dirty);
+                    DownstreamServer::connect(server_id.to_string(), Box::new(transport))
+                }
+                Err(_) => Err(e),
+            }
+        }
         Err(e) => Err(e),
     }
 }
@@ -1639,22 +1696,29 @@ mod tests {
             &server,
             &server_id,
             "https://mcp.example.com/MCP"
-        ));
+        )
+        .expect("readable vault"));
 
         // The edit: same host, same everything but the path case.
         let edited = "https://mcp.example.com/mcp";
         server.url = Some(edited.into());
         assert!(client_credentials_resource_changed(&server_id, edited));
         assert!(
-            client_credentials_state_is_stale(&server, &server_id, edited),
+            client_credentials_state_is_stale(&server, &server_id, edited).expect("readable vault"),
             "the connect path must treat the vaulted state as stale"
         );
 
         // What the connect path then does. After it, nothing is left to reuse, so
         // the next acquisition binds to the URL actually being contacted.
         reset_client_credentials(&server_id).expect("reset");
-        assert!(secrets::get_secret(&server_id, CC_STATE_KEY).is_none());
-        assert!(secrets::get_secret(&server_id, secrets::HTTP_AUTH_KEY).is_none());
+        for key in [CC_STATE_KEY, secrets::HTTP_AUTH_KEY] {
+            assert!(
+                secrets::get_secret_result(&server_id, key)
+                    .expect("readable vault")
+                    .is_none(),
+                "{key} must be gone after the reset"
+            );
+        }
     }
 
     /// Removing the config is the other way state goes stale, and it must not
@@ -1669,7 +1733,7 @@ mod tests {
 
         assert!(!client_credentials_resource_changed(&server_id, url));
         assert!(
-            client_credentials_state_is_stale(&server, &server_id, url),
+            client_credentials_state_is_stale(&server, &server_id, url).expect("readable vault"),
             "state for a server no longer configured for the flow must be discarded"
         );
     }
@@ -1690,7 +1754,8 @@ mod tests {
             &server,
             &server_id,
             "https://mcp.example.com/mcp"
-        ));
+        )
+        .expect("readable vault"));
     }
 
     // ----- SBS-840: a vault read failure is not missing OAuth/CC state ---------
@@ -1848,5 +1913,81 @@ mod tests {
             !err.contains("the vaulted client secret is gone"),
             "must fail on the state read, not claim the secret is gone: {err}"
         );
+    }
+
+    /// A failed CC-state read used to read as "there is no state here", which skips
+    /// [`reset_client_credentials`] and lets the connect present a token RFC 8707
+    /// bound to the OLD resource to the new one.
+    #[test]
+    fn client_credentials_staleness_reports_a_vault_read_failure_not_absent_state() {
+        let server = http_server("sbs840-stale", Some(cc("client-abc")));
+        let Err(err) = client_credentials_state_is_stale(
+            &server,
+            RESERVED_VAULT_NS,
+            "https://mcp.example.com/mcp",
+        ) else {
+            panic!("reserved namespace must fail the CC-state read, not answer 'not stale'");
+        };
+        assert!(
+            err.contains("could not read the vaulted client-credentials state"),
+            "must describe a read failure: {err}"
+        );
+        assert!(
+            !err.contains("no client-credentials state"),
+            "a vault failure must not look like missing CC state: {err}"
+        );
+    }
+
+    /// The SOU-474 guard. A failed read must not answer "the transport did not
+    /// refresh", because the caller acts on that by spending another exchange on a
+    /// refresh token the transport may already have consumed.
+    #[test]
+    fn a_failed_post_connect_token_read_is_not_a_missed_refresh() {
+        let Err(err) = transport_refreshed_during_connect(RESERVED_VAULT_NS, Some("sent-token"))
+        else {
+            panic!("reserved namespace must fail the access-token read");
+        };
+        assert!(
+            err.contains("could not read the vaulted access token"),
+            "must describe a read failure: {err}"
+        );
+        assert!(
+            !is_auth_error(&err),
+            "a locked vault must not be classified as needs-authentication: {err}"
+        );
+    }
+
+    /// The guard's answers over the real vault, so the fix above cannot regress into
+    /// always reporting a refresh (which would stop the legitimate retry).
+    #[test]
+    fn a_rotated_vaulted_token_is_the_only_evidence_of_a_transport_refresh() {
+        let _vault = VaultFixture::new("sou474");
+        let server_id = "sbs840-guard";
+
+        // Nothing vaulted is not evidence of anything: the retry must still be free
+        // to run for a server whose token was cleared mid-connect.
+        assert!(
+            !transport_refreshed_during_connect(server_id, Some("sent-token"))
+                .expect("readable vault"),
+            "an empty vault is not a refresh"
+        );
+
+        secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, "sent-token")
+            .expect("scratch vault write");
+        assert!(
+            !transport_refreshed_during_connect(server_id, Some("sent-token"))
+                .expect("readable vault"),
+            "the token we sent is still there, so the transport spent no refresh"
+        );
+
+        secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, "rotated-token")
+            .expect("scratch vault write");
+        assert!(
+            transport_refreshed_during_connect(server_id, Some("sent-token"))
+                .expect("readable vault"),
+            "a different vaulted token means the transport already refreshed"
+        );
+
+        let _ = secrets::delete_secret(server_id, secrets::HTTP_AUTH_KEY);
     }
 }
