@@ -4547,7 +4547,6 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-
 /// Launch-at-login enable. On Linux this writes the XDG autostart entry with
 /// `$APPIMAGE` when set, so AppImage sessions do not register the FUSE mount
 /// (`/tmp/.mount_*`) that `current_exe` returns. Other platforms keep the

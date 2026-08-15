@@ -35,7 +35,6 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
-
 const mockedListServerTools = vi.mocked(listServerTools);
 const mockedIsAutostartEnabled = vi.mocked(isAutostartEnabled);
 const mockedSetAllowRoutineWrites = vi.mocked(setAllowRoutineWrites);
