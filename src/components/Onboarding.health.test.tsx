@@ -49,10 +49,16 @@ describe("Onboarding health verification", () => {
     expect(
       screen.getByRole("button", { name: "Continue without verification" }),
     ).toBeEnabled();
-    expect(screen.queryByText("You're set up")).not.toBeInTheDocument();
+    // The visible step heading (the dialog is also named from it via the
+    // sr-only DialogTitle, so target the heading to avoid the duplicate copy).
+    expect(
+      screen.queryByRole("heading", { name: "You're set up" }),
+    ).not.toBeInTheDocument();
 
     probe.resolve([]);
-    expect(await screen.findByText("You're set up")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "You're set up" }),
+    ).toBeInTheDocument();
   });
 
   it("does not dress an unconfigured setup in verification language", async () => {
@@ -65,7 +71,9 @@ describe("Onboarding health verification", () => {
     // Servers exist but no client is connected: the step explains what's missing,
     // so neither the probe's pending state nor its failure may relabel the finish
     // button or show verification status blocks.
-    expect(await screen.findByText("Setup started")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Setup started" }),
+    ).toBeInTheDocument();
     expect(screen.queryByText("Checking server health…")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Got it" })).toBeEnabled();
 
@@ -90,7 +98,9 @@ describe("Onboarding health verification", () => {
     expect(
       await screen.findByText(/couldn't verify your servers started/i),
     ).toBeInTheDocument();
-    expect(screen.getByText("Setup couldn't be verified")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Setup couldn't be verified" }),
+    ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Continue without verification" }),
     ).toBeEnabled();
