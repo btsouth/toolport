@@ -62,6 +62,9 @@ powershell -ExecutionPolicy Bypass -File scripts/smoke-headless.ps1
 # Frontend unit tests (Vitest)
 npm run test
 
+# Windows installer script (Pester 5, Windows only)
+npm run test:install-script
+
 # Frontend type-check + build
 npx tsc --noEmit && npm run build
 ```
@@ -72,6 +75,21 @@ in `src-tauri/tests/`. Use the npm script above so your local target selection
 matches CI. Frontend tests use [Vitest](https://vitest.dev) and live alongside
 the code as `*.test.ts` or `*.test.tsx` files inside `src/`, depending on whether
 the test contains JSX.
+
+`scripts/install.ps1` is the `irm ... | iex` one-liner, so a regression in asset
+selection, checksum enforcement, or the silent-install flag reaches users with no
+build step in between. `scripts/install.Tests.ps1` drives the real script end to
+end with the GitHub API, the download, and the installer mocked. It needs
+[Pester](https://pester.dev) 5.5 or newer, which is not the version bundled with
+Windows PowerShell 5.1:
+
+```powershell
+Install-Module Pester -MinimumVersion 5.5.0 -Force -Scope CurrentUser -SkipPublisherCheck
+```
+
+`Get-FileHash` is deliberately left unmocked there: the download mock writes known
+bytes and the fake release advertises their real digest, so a checksum test fails
+if verification is ever skipped or inverted. Keep it that way when adding cases.
 
 ### Formatting
 

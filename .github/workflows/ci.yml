@@ -144,3 +144,35 @@ jobs:
       - name: Headless gateway security smoke (Windows)
         if: matrix.os == 'windows-latest'
         run: powershell -ExecutionPolicy Bypass -File scripts/smoke-headless.ps1
+
+  # scripts/install.ps1 is piped into `iex` from a pinned commit, so a
+  # regression in asset selection, checksum enforcement, or the silent-install
+  # flag reaches users with no build step in between. Nothing else in CI runs
+  # it. Its own job because it needs neither Rust nor Node (SBS-713).
+  installer-script:
+    name: Installer script tests
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      # windows-latest ships Pester 5, but pin the major here so a runner-image
+      # change cannot silently move the test framework under these tests.
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          if (-not (Get-Module -ListAvailable Pester |
+                Where-Object { $_.Version -ge [version]'5.5.0' -and $_.Version -lt [version]'6.0.0' })) {
+            Set-PSRepository PSGallery -InstallationPolicy Trusted
+            Install-Module Pester -MinimumVersion 5.5.0 -MaximumVersion 5.99.99 `
+              -Force -Scope CurrentUser -SkipPublisherCheck
+          }
+
+      - name: Pester tests for scripts/install.ps1
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0 -MaximumVersion 5.99.99
+          $result = Invoke-Pester -Path scripts/install.Tests.ps1 -Output Detailed -PassThru
+          if ($result.FailedCount -gt 0) { exit 1 }

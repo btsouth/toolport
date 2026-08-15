@@ -19,6 +19,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib --bins --tests",
+    "test:install-script": "pwsh -NoProfile -Command \"Import-Module Pester -MinimumVersion 5.5.0; $r = Invoke-Pester -Path scripts/install.Tests.ps1 -Output Detailed -PassThru; if ($r.FailedCount -gt 0) { exit 1 }\"",
     "test:rust:windows": "powershell -ExecutionPolicy Bypass -File scripts/test-rust-windows.ps1",
     "smoke:headless": "node scripts/smoke-headless.mjs",
     "bench:latency": "node benchmark/latency.mjs",
