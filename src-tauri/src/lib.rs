@@ -33,6 +33,7 @@ pub mod semantic;
 pub mod shaping;
 pub mod stacks;
 pub mod teams;
+pub mod topology;
 pub mod usage_report;
 pub mod vendors;
 
