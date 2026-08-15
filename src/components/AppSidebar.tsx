@@ -503,7 +503,9 @@ export function AppSidebar({
   const [quarantinedCount, setQuarantinedCount] = useState<number | null>(null);
   // A failed poll keeps the last confirmed count and flags it stale instead of
   // dropping back to `null`, so one transient blip never erases a real number.
-  // Mirrors SettingsView's list+error shape (keep the value, add a flag) (#742).
+  // Before the first poll answers (`null`, not stale) no badge renders at all —
+  // the "?" glyph and its "Could not reach the gateway" tooltip must only appear
+  // once a poll has actually failed, not on every app start (#742).
   const [quarantineStale, setQuarantineStale] = useState(false);
   const sorted = sortClients(clients);
   const detectedClients = sorted.filter((c) => statusOf(c) !== "missing");
@@ -591,7 +593,7 @@ export function AppSidebar({
           {badge}
         </span>
       )}
-      {badge === null && (
+      {badge === null && stale && (
         <span
           className="ml-auto inline-flex shrink-0 items-center rounded-full bg-warning/15 px-1.5 text-[10px] font-medium text-warning"
           aria-label="Quarantine status unknown"

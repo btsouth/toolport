@@ -395,6 +395,27 @@ describe("AppSidebar quarantine badge", () => {
     expect(screen.queryByLabelText(/tool\s?blocked/)).not.toBeInTheDocument();
   });
 
+  it("shows no badge before the first poll answers (#742)", async () => {
+    let resolvePoll!: (q: import("@/lib/api").QuarantinedTool[]) => void;
+    listQuarantined.mockReturnValue(
+      new Promise((resolve) => {
+        resolvePoll = resolve;
+      }),
+    );
+
+    renderSidebar();
+
+    await waitFor(() => expect(listQuarantined).toHaveBeenCalled());
+    expect(screen.queryByLabelText("Quarantine status unknown")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/tool\s?blocked/)).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolvePoll([quarantinedTool({ tool: "a" })]);
+    });
+
+    expect(await screen.findByLabelText("1 tool blocked")).toBeInTheDocument();
+  });
+
   it("does not present a failed poll as an all-clear (#741)", async () => {
     listQuarantined.mockRejectedValue(new Error("gateway not reachable"));
 
