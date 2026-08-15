@@ -179,6 +179,9 @@ fn lock_snapshot_is_expired(snapshot: &OAuthLockSnapshot) -> bool {
     elapsed.as_secs() >= OAUTH_LOCK_LEASE_SECS
 }
 
+/// Test-only: production reads the file's CONTENT (see [`read_oauth_completion`]),
+/// because existence alone is what wrongly reported a failed drop as success.
+#[cfg(test)]
 fn completion_exists(path: &std::path::Path, attempt_id: &str) -> bool {
     oauth_completion_path(path, attempt_id).exists()
 }
