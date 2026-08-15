@@ -5,7 +5,11 @@ import { afterEach } from "vitest";
 import { cleanup } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  // Reset the in-memory storage so localStorage state never leaks across tests.
+  storageData.clear();
+});
 
 // Node 25+ ships `localStorage` on globalThis as a method-less placeholder for
 // the experimental Web Storage API (it only works with `--localstorage-file`).
