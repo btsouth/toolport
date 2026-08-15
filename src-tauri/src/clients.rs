@@ -983,9 +983,11 @@ fn zed_path() -> Option<PathBuf> {
 /// The Windows desktop build does NOT use the home-anchored path: it writes
 /// `%LOCALAPPDATA%\hermes\config.yaml` (lowercase dir), so resolving only
 /// `~/.hermes` made an installed Hermes undetectable there and there was no way
-/// to connect it. Same shape as [`crush_path`]: keep the canonical path as the
-/// answer, and prefer the platform location only when it actually holds a file,
-/// so a fresh install still writes where the docs say.
+/// to connect it. Related to [`crush_path`], but the preference is the other way
+/// round: Crush's platform path is the LEGACY one, so it only wins when it holds a
+/// file, whereas Hermes' platform path is the CURRENT one on Windows and so also
+/// wins when neither exists. Writing a fresh config into `~/.hermes` on Windows
+/// would put it somewhere Hermes never reads.
 fn hermes_path() -> Option<PathBuf> {
     let canonical = client_config_path("hermes")?;
     // Only the Windows build uses the platform data dir. Passing None elsewhere
@@ -1005,13 +1007,15 @@ fn resolve_hermes_path(canonical: PathBuf, local_data: Option<PathBuf>) -> PathB
     if canonical.exists() {
         return canonical;
     }
-    if let Some(local) = local_data {
-        let platform = local.join("hermes").join("config.yaml");
-        if platform.exists() {
-            return platform;
-        }
+    // Nothing at the canonical path. Where a platform dir applies at all (Windows
+    // only), that is the file the installed build reads, whether it exists yet or
+    // not, so a first write has to land there. Returning the canonical path here
+    // would write a config into `~/.hermes` that Hermes never looks at, which reads
+    // to the user as "Toolport said it connected and nothing happened".
+    match local_data {
+        Some(local) => local.join("hermes").join("config.yaml"),
+        None => canonical,
     }
-    canonical
 }
 
 fn continue_path() -> Option<PathBuf> {
@@ -5584,11 +5588,13 @@ mod tests {
         let local = root.join("local");
         let local_cfg = local.join("hermes").join("config.yaml");
 
-        // Neither exists: keep the canonical path so a fresh install writes there.
+        // Neither exists: a first write must still land where the installed build
+        // reads. Returning the home path here would write a config into `~/.hermes`
+        // that Hermes never opens, so connecting would silently do nothing.
         assert_eq!(
             resolve_hermes_path(home_cfg.clone(), Some(local.clone())),
-            home_cfg,
-            "with no config anywhere the home path stays authoritative"
+            local_cfg,
+            "a fresh Windows config must be written where Hermes reads it"
         );
 
         // Only the platform dir has a config: that is the file Hermes actually reads.
