@@ -14,17 +14,21 @@ pub fn metrics_enabled() -> bool {
 }
 
 /// Prometheus text exposition of current local stats.
-pub fn render() -> String {
-    let entries = crate::audit::read_all();
+///
+/// `Err` when a local stat file exists but cannot be read. The caller answers
+/// non-200 so the scrape fails loudly (`up` goes 0) instead of serving a body
+/// that is indistinguishable from an idle instance with every series missing
+/// (SBS-873). Same contract as the desktop readers: a missing file is empty,
+/// an unreadable one is an error.
+pub fn render() -> Result<String, String> {
+    let entries =
+        crate::audit::read_all().map_err(|e| format!("couldn't read the activity log: {e}"))?;
     let tokens_saved = crate::savings::summary()
         .get("tokensSaved")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let quarantined = match crate::integrity::all_quarantined() {
-        Ok(entries) => entries.len() as u64,
-        Err(error) => return format!("# Toolport metrics unavailable: {error}\n"),
-    };
-    render_from_parts(&entries, tokens_saved, quarantined)
+    let quarantined = crate::integrity::all_quarantined()?.len() as u64;
+    Ok(render_from_parts(&entries, tokens_saved, quarantined))
 }
 
 /// Pure renderer for tests (no disk).
@@ -183,5 +187,50 @@ mod tests {
         assert!(text.contains("toolport_tokens_saved_total 0"));
         assert!(text.contains("toolport_quarantined_tools 0"));
         assert!(!text.contains("toolport_tool_calls_total{"));
+    }
+
+    /// Scratch data dir for the disk-backed `render()` cases.
+    fn scratch_data_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "toolport-metrics-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("scratch data dir");
+        path
+    }
+
+    /// A missing audit.jsonl is a real idle instance: render the gauges and
+    /// answer 200, exactly like an empty log.
+    #[test]
+    fn missing_audit_log_renders_an_idle_instance() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = scratch_data_dir("missing");
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let text = render().expect("a missing log is an idle instance, not a scrape failure");
+        assert!(text.contains("toolport_tokens_saved_total"));
+        assert!(text.contains("toolport_quarantined_tools"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An existing but unreadable audit.jsonl must be a FAILED scrape, not a
+    /// 200 whose body is indistinguishable from `render_from_parts(&[], 0, 0)`
+    /// (SBS-873). Otherwise a persistent permission error reads as an idle
+    /// instance while Prometheus `up` stays 1.
+    #[test]
+    fn unreadable_audit_log_fails_the_scrape() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = scratch_data_dir("unreadable");
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let path = crate::audit::audit_path().expect("audit path under override");
+        // IsADirectory: the log path exists but cannot be read as a file.
+        std::fs::create_dir_all(&path).expect("unreadable log fixture");
+        let error = render().expect_err("an unreadable log must fail the scrape");
+        assert!(
+            error.contains("activity log"),
+            "the scrape error must name what failed: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

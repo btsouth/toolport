@@ -2437,21 +2437,30 @@ fn rotate_if_large(path: &Path) {
 
 /// The most recent `limit` security events, newest first. Powers the app's
 /// security panel.
-pub fn read_recent(limit: usize) -> Vec<Value> {
-    let path = match security_path() {
-        Some(p) => p,
-        None => return Vec::new(),
+///
+/// A missing file is an empty event log: nothing has been recorded yet. Any
+/// other IO error is returned so a caller cannot treat an unreadable existing
+/// file as "Protection active" (SBS-873). Unparseable lines are skipped — a
+/// mid-write or corrupt line is not an IO failure.
+pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
+    let Some(path) = security_path() else {
+        return Ok(Vec::new());
     };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
-    content
+    // Filter BEFORE take, matching `audit::read_recent` and the other readers.
+    // Taking first let an unparseable line consume a slot, so one corrupt or
+    // mid-write row among the newest events returned a short page and dropped
+    // an older valid security event that should have filled it.
+    Ok(content
         .lines()
         .rev()
-        .take(limit)
         .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+        .take(limit)
+        .collect())
 }
 
 #[cfg(test)]
@@ -4294,5 +4303,72 @@ mod tests {
             }
         }
         drifts
+    }
+
+    /// A missing security.jsonl is an empty event log, not a load failure.
+    #[test]
+    fn read_recent_missing_file_is_ok_empty() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let _dir = TestDataDir::new("read-recent-missing");
+        let path = security_path().expect("security path under override");
+        assert!(!path.exists(), "fixture must not create the log");
+        let entries = read_recent(10).expect("missing file is Ok empty");
+        assert!(entries.is_empty());
+    }
+
+    /// A readable JSONL returns newest-first parsed rows.
+    #[test]
+    fn read_recent_readable_jsonl_is_newest_first() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let _dir = TestDataDir::new("read-recent-readable");
+        let path = security_path().expect("security path under override");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, "{\"i\":1}\n{\"i\":2}\n").unwrap();
+        let entries = read_recent(10).expect("readable fixture");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["i"], 2);
+        assert_eq!(entries[1]["i"], 1);
+    }
+
+    /// An existing but unreadable security.jsonl must not look like "Protection
+    /// active" (SBS-873).
+    #[test]
+    fn read_recent_unreadable_existing_path_is_err() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let _dir = TestDataDir::new("read-recent-unreadable");
+        let path = security_path().expect("security path under override");
+        std::fs::create_dir_all(&path).unwrap();
+        let err = read_recent(10).expect_err("unreadable existing path must be Err");
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// A corrupt or mid-write line among the NEWEST events must not consume a
+    /// slot of `limit`. Taking before filtering returned a short page and lost
+    /// an older valid security event that should have filled it.
+    #[test]
+    fn read_recent_corrupt_newest_line_does_not_shorten_the_page() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let _dir = TestDataDir::new("read-recent-corrupt");
+        let path = security_path().expect("security path under override");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        // Oldest to newest; the half-written row is the second-newest line.
+        std::fs::write(
+            &path,
+            "{\"i\":1}\n{\"i\":2}\n{\"i\":3}\n{\"i\":4,\"partial\":\n{\"i\":5}\n",
+        )
+        .unwrap();
+        let entries = read_recent(3).expect("readable fixture");
+        assert_eq!(
+            entries.len(),
+            3,
+            "a corrupt newest-window line must not shorten the page"
+        );
+        assert_eq!(entries[0]["i"], 5);
+        assert_eq!(entries[1]["i"], 3);
+        assert_eq!(entries[2]["i"], 2);
     }
 }
