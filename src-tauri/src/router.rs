@@ -435,6 +435,10 @@ pub struct ToolPolicy {
     /// Exposed (namespaced) tool names quarantined after a high-risk drift; hidden
     /// until the user re-approves them. Empty unless quarantine-on-drift is enabled.
     pub quarantined: BTreeSet<String>,
+    /// Hide every tool. Used when a cold-start quarantine-store read fails
+    /// (SBS-871): there is no prior live set to keep, so the catalog stays
+    /// blocked until a later successful read `requarantine`s a real set.
+    pub fail_closed_catalog: bool,
 }
 
 impl ToolPolicy {
@@ -465,6 +469,11 @@ impl ToolPolicy {
         }
         if self.deny_destructive && is_destructive(tool) {
             return Some("blocked by the destructive-tool policy");
+        }
+        if self.fail_closed_catalog {
+            return Some(
+                "quarantine store unreadable; catalog blocked until the store reads",
+            );
         }
         if self.quarantined.contains(exposed) {
             return Some("quarantined after a high-risk change; re-approve to restore");
@@ -1069,7 +1078,16 @@ impl Router {
     /// downstream. Cheap: it only re-applies the policy to the cached tool lists.
     pub fn requarantine(&mut self, quarantined: BTreeSet<String>) {
         self.policy.quarantined = quarantined;
+        // A successful reconcile/rebuild installs a known set, so lift the
+        // cold-start fail-closed hide (SBS-871).
+        self.policy.fail_closed_catalog = false;
         self.rebuild_aggregation();
+    }
+
+    /// True when this router is hiding the whole catalog because the quarantine
+    /// store could not be read on a cold start (SBS-871).
+    pub fn catalog_fail_closed(&self) -> bool {
+        self.policy.fail_closed_catalog
     }
 
     /// The quarantine set this router is currently enforcing. Lets a caller diff the
@@ -3198,6 +3216,33 @@ mod tests {
 
         router.requarantine(BTreeSet::new());
         assert!(router.quarantined().is_empty());
+    }
+
+    #[test]
+    fn sbs871_fail_closed_catalog_hides_every_tool_until_requarantine() {
+        // SBS-871: a cold-start store Err has no prior live set, so the whole
+        // catalog stays hidden until a later successful read installs a set.
+        let mut policy = ToolPolicy::default();
+        policy.fail_closed_catalog = true;
+        let mut router = Router::with_policy(policy);
+        router.add(mock_server("github"));
+        assert!(
+            router.aggregated_tools().is_empty(),
+            "fail-closed catalog must hide every tool"
+        );
+        assert!(router.catalog_fail_closed());
+        let err = router.route_call("github__echo", json!({})).unwrap_err();
+        assert!(
+            err.contains("quarantine store unreadable"),
+            "unexpected: {err}"
+        );
+
+        router.requarantine(BTreeSet::new());
+        assert!(!router.catalog_fail_closed());
+        assert!(
+            !router.aggregated_tools().is_empty(),
+            "a later known set must re-expose the catalog"
+        );
     }
 
     #[test]

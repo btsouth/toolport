@@ -8536,9 +8536,63 @@ fn merge_tool_scopes_for_http(reg: &Registry) -> HashMap<String, HashSet<String>
     by_server
 }
 
+/// Live quarantine enforcement a rebuild can keep when the store read fails
+/// (SBS-871). `None` is a genuine cold start (no prior decision).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PriorQuarantine {
+    set: BTreeSet<String>,
+    fail_closed: bool,
+}
+
+/// How [`build_router`] should start the quarantine set after a store read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QuarantineBootstrap {
+    UseSet(BTreeSet<String>),
+    KeepSet(BTreeSet<String>),
+    KeepFailClosed,
+    FailClosedCatalog,
+}
+
+/// Decide the quarantine set a rebuilt router starts with (SBS-871).
+///
+/// A store `Err` must never become an empty set: keep the pre-rebuild live set
+/// when we have one, and hide the whole catalog on a genuine cold start.
+fn quarantine_bootstrap(
+    stored: Result<BTreeSet<String>, String>,
+    previous: Option<&PriorQuarantine>,
+) -> QuarantineBootstrap {
+    match stored {
+        Ok(set) => QuarantineBootstrap::UseSet(set),
+        Err(_) => match previous {
+            Some(prior) if prior.fail_closed => QuarantineBootstrap::KeepFailClosed,
+            Some(prior) => QuarantineBootstrap::KeepSet(prior.set.clone()),
+            None => QuarantineBootstrap::FailClosedCatalog,
+        },
+    }
+}
+
+/// Snapshot the live router's quarantine decision BEFORE a rebuild (SBS-871).
+/// A never-built placeholder (`Router::new()`) is not a prior live set.
+fn prior_quarantine_from_router(router: &Router) -> Option<PriorQuarantine> {
+    if router.catalog_fail_closed() {
+        return Some(PriorQuarantine {
+            set: router.quarantined().clone(),
+            fail_closed: true,
+        });
+    }
+    if router.server_count() == 0 && router.quarantined().is_empty() {
+        return None;
+    }
+    Some(PriorQuarantine {
+        set: router.quarantined().clone(),
+        fail_closed: false,
+    })
+}
+
 /// Spawn and connect every enabled server into a router. With `profile` set, only
 /// that profile's servers are connected (per-client scoping); otherwise the
 /// active profile is used.
+#[allow(clippy::too_many_arguments)] // SBS-871 adds the pre-rebuild quarantine set.
 fn build_router(
     reg: &Registry,
     profile: Option<&str>,
@@ -8554,6 +8608,8 @@ fn build_router(
     resource_updated: Option<ResourceUpdatedDispatch>,
     // Live subscription table so reconnect factories re-issue resources/subscribe.
     resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
+    // Pre-rebuild live quarantine set. `None` is a genuine cold start (SBS-871).
+    previous_quarantine: Option<PriorQuarantine>,
 ) -> Router {
     // In HTTP mode one process serves every registered client, so connect the
     // union of all their profiles (per-request filtering scopes each one down).
@@ -8601,35 +8657,57 @@ fn build_router(
         }
         allow
     };
+    // Historical installs have pins without quarantine.json. Materialize `{}`
+    // under the store lock so a later missing-while-pins-exist read is a real
+    // rename-window error, not every boot (SBS-871).
+    integrity::ensure_quarantine_store_for_existing_pins(profile);
+    let stored = if reg.quarantine_on_drift_effective() {
+        integrity::quarantined(profile)
+    } else {
+        // Baseline tamper invalidates the catalog's trust root, so those entries
+        // remain blocked even when optional high-risk drift quarantine is off.
+        integrity::mandatory_quarantined(profile)
+    };
+    let stored_error = stored.as_ref().err().cloned();
+    let bootstrap = quarantine_bootstrap(stored, previous_quarantine.as_ref());
+    if let Some(e) = stored_error {
+        match &bootstrap {
+            QuarantineBootstrap::KeepSet(_) => {
+                glog(&format!(
+                    "SECURITY: {e}; keeping the pre-rebuild quarantine set rather than \
+                     installing an empty one. Fix or replace the quarantine store."
+                ));
+                eprintln!("toolport: {e}; keeping the pre-rebuild quarantine set");
+            }
+            QuarantineBootstrap::KeepFailClosed | QuarantineBootstrap::FailClosedCatalog => {
+                glog(&format!(
+                    "SECURITY: {e}; blocking the catalog until the quarantine store reads. \
+                     Fix or replace the quarantine store."
+                ));
+                eprintln!(
+                    "toolport: {e}; blocking the catalog until the quarantine store reads"
+                );
+            }
+            QuarantineBootstrap::UseSet(_) => {}
+        }
+    }
+    let (quarantined, fail_closed_catalog) = match bootstrap {
+        QuarantineBootstrap::UseSet(set) | QuarantineBootstrap::KeepSet(set) => (set, false),
+        QuarantineBootstrap::KeepFailClosed | QuarantineBootstrap::FailClosedCatalog => {
+            (BTreeSet::new(), true)
+        }
+    };
     let policy = ToolPolicy {
         disabled,
         allow,
         deny_destructive: reg.deny_destructive_effective(),
         // Hide already-quarantined tools from the first build (the set persists across
         // restarts); newly detected drift is added during the integrity check below.
-        // On store failure, start with empty blocked and log loudly (SOU-320): there is
-        // no prior live set yet. We deliberately do NOT rename/clear a corrupt file —
-        // that would make the next reconcile install a permanent empty set.
-        quarantined: {
-            let stored = if reg.quarantine_on_drift_effective() {
-                integrity::quarantined(profile)
-            } else {
-                // Baseline tamper invalidates the catalog's trust root, so those entries
-                // remain blocked even when optional high-risk drift quarantine is off.
-                integrity::mandatory_quarantined(profile)
-            };
-            match stored {
-                Ok(set) => set,
-                Err(e) => {
-                    glog(&format!(
-                        "SECURITY: {e}; starting with no quarantine set (cold start has \
-                         no prior set to keep). Fix or replace the quarantine store."
-                    ));
-                    eprintln!("toolport: {e}; starting with no quarantine set");
-                    Default::default()
-                }
-            }
-        },
+        // On store Err, keep the pre-rebuild live set or hide the catalog (SBS-871).
+        // We deliberately do NOT rename/clear a corrupt file — that would make the
+        // next reconcile install a permanent empty set (SOU-320).
+        quarantined,
+        fail_closed_catalog,
     };
 
     // Connect concurrently so total time is the slowest server, not the sum. Each
@@ -10176,6 +10254,16 @@ fn watch_tick(
         let _rebuild = rebuild_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Snapshot the pre-rebuild router BEFORE build_router so a store Err
+        // can keep the live quarantine set (SBS-871). The routes map is also
+        // the authoritative (server, original) source for tools a guarded
+        // rebuild keeps from the previous catalog (issue #700).
+        let previous_router = {
+            let guard = router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (**guard).clone()
+        };
         // Build the new router (spawns processes) before taking the router lock.
         let new_router = build_router(
             &new_reg,
@@ -10186,6 +10274,7 @@ fn watch_tick(
             root.as_deref(),
             resource_updated.cloned(),
             resource_subs.cloned(),
+            prior_quarantine_from_router(&previous_router),
         );
         // Re-issue tracked resource subscriptions against the fresh connections.
         if let Some(subs) = resource_subs {
@@ -10193,15 +10282,6 @@ fn watch_tick(
         }
         let server_count = new_router.server_count();
         let tools = new_router.aggregated_tools();
-        // Snapshot the pre-rebuild router BEFORE publishing the new one: its
-        // routes map is the authoritative (server, original) source for tools a
-        // guarded rebuild keeps from the previous catalog (issue #700).
-        let previous_router = {
-            let guard = router
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (**guard).clone()
-        };
         *registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = new_reg;
@@ -11778,6 +11858,14 @@ fn rebuild_router_for_root(state: &GatewayState) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let root = current_client_root(state);
+    // Snapshot before build_router so a store Err keeps the live set (SBS-871).
+    let previous_router = {
+        let guard = state
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (**guard).clone()
+    };
     let new_router = build_router(
         &reg,
         profile.as_deref(),
@@ -11787,18 +11875,10 @@ fn rebuild_router_for_root(state: &GatewayState) {
         root.as_deref(),
         state.resource_updated_sink.clone(),
         Some(Arc::clone(&state.resource_subs)),
+        prior_quarantine_from_router(&previous_router),
     );
     reestablish_all_resource_subscriptions(&new_router, &state.resource_subs);
     let tools = new_router.aggregated_tools();
-    // Snapshot the pre-rebuild router before publishing: authoritative routes
-    // for tools a guarded rebuild keeps from the previous catalog (issue #700).
-    let previous_router = {
-        let guard = state
-            .router
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (**guard).clone()
-    };
     *state
         .router
         .lock()
@@ -12054,6 +12134,14 @@ fn process_request(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             let root = current_client_root(state);
+            // Snapshot before build_router so a store Err keeps the live set (SBS-871).
+            let previous_router = {
+                let guard = state
+                    .router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (**guard).clone()
+            };
             let built = build_router(
                 &reg,
                 profile_snapshot.as_deref(),
@@ -12063,19 +12151,11 @@ fn process_request(
                 root.as_deref(),
                 state.resource_updated_sink.clone(),
                 Some(Arc::clone(&state.resource_subs)),
+                prior_quarantine_from_router(&previous_router),
             );
             if built.server_count() > 0 {
                 reestablish_all_resource_subscriptions(&built, &state.resource_subs);
                 let tools = built.aggregated_tools();
-                // Snapshot the pre-rebuild router before publishing: authoritative
-                // routes for tools the guard keeps from the previous catalog.
-                let previous_router = {
-                    let guard = state
-                        .router
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    (**guard).clone()
-                };
                 *state
                     .router
                     .lock()
@@ -14760,6 +14840,8 @@ fn main() {
                 // Cold start: no upstream clients yet; reconnect factories still
                 // capture the shared table for later re-subscribes.
                 Some(resource_subs_for_build),
+                // Genuine cold start: no prior live set to keep (SBS-871).
+                None,
             );
             let tools = built.aggregated_tools();
             glog(&format!(
@@ -24826,6 +24908,53 @@ mod tests {
         assert!(reconcile_to(&router, &stdout, None, set_of(&["a__x"])));
         assert_eq!(router.lock().unwrap().quarantined(), &set_of(&["a__x"]));
         assert!(!reconcile_to(&router, &stdout, None, set_of(&["a__x"])));
+    }
+
+    /// SBS-871: build_router must not Default::default() an empty set on store Err.
+    /// Extracted so the decision can be tested without spawning downstream servers.
+    #[test]
+    fn sbs871_quarantine_bootstrap_keeps_prior_set_on_store_err() {
+        let prior = PriorQuarantine {
+            set: set_of(&["srv__wipe"]),
+            fail_closed: false,
+        };
+        assert_eq!(
+            quarantine_bootstrap(Err("store unreadable".into()), Some(&prior)),
+            QuarantineBootstrap::KeepSet(set_of(&["srv__wipe"]))
+        );
+    }
+
+    #[test]
+    fn sbs871_quarantine_bootstrap_fail_closes_catalog_on_cold_start_err() {
+        assert_eq!(
+            quarantine_bootstrap(Err("store unreadable".into()), None),
+            QuarantineBootstrap::FailClosedCatalog
+        );
+    }
+
+    #[test]
+    fn sbs871_quarantine_bootstrap_keeps_fail_closed_across_rebuild() {
+        let prior = PriorQuarantine {
+            set: BTreeSet::new(),
+            fail_closed: true,
+        };
+        assert_eq!(
+            quarantine_bootstrap(Err("still unreadable".into()), Some(&prior)),
+            QuarantineBootstrap::KeepFailClosed
+        );
+    }
+
+    #[test]
+    fn sbs871_quarantine_bootstrap_uses_the_store_on_ok() {
+        assert_eq!(
+            quarantine_bootstrap(Ok(set_of(&["srv__wipe"])), None),
+            QuarantineBootstrap::UseSet(set_of(&["srv__wipe"]))
+        );
+    }
+
+    #[test]
+    fn sbs871_prior_quarantine_from_placeholder_router_is_none() {
+        assert_eq!(prior_quarantine_from_router(&Router::new()), None);
     }
 
     #[test]

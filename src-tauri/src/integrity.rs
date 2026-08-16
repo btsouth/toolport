@@ -43,6 +43,18 @@ static QUARANTINE_READ_CACHE: Mutex<Option<QuarantineReadCache>> = Mutex::new(No
 static QUARANTINE_READ_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Remaining injected `NotFound` answers for [`read_quarantine_to_string`]. Tests use
+/// this to pin the metadata-then-vanished arm of SBS-871 without a multi-process race.
+#[cfg(test)]
+static QUARANTINE_INJECT_READ_NOTFOUND: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// How many quarantine-file read attempts the current test has observed, including
+/// injected `NotFound`s. Reset by each SBS-871 test.
+#[cfg(test)]
+static QUARANTINE_READ_IO_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Pins map: namespaced tool name (`server__tool`) -> pinned baseline.
 type Pins = BTreeMap<String, Pin>;
 
@@ -842,7 +854,9 @@ type Quarantine = BTreeMap<String, Value>;
 
 /// Load the quarantine map for `profile`.
 ///
-/// - Missing file → empty set (nothing quarantined yet).
+/// - Missing file after retries, pin store `Fresh` → empty set (honest first run).
+/// - Missing file after retries while pins are `Loaded`/`Corrupt` → `Err` (SBS-871).
+///   A rename-window `NotFound` is not "nothing blocked".
 /// - Unreadable or corrupt → `Err` (fail closed). Never renames the file aside: moving a
 ///   corrupt store to `.corrupt` made the next read look like a legitimate empty set and
 ///   silently unblocked every tool (SOU-320). Leave the broken file for inspection.
@@ -850,23 +864,114 @@ fn load_quarantine(profile: Option<&str>) -> Result<Quarantine, String> {
     let Some(path) = quarantine_path(profile) else {
         return Ok(Quarantine::new());
     };
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if profile
-                .is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, false))
-            {
-                return Err(format!(
-                    "quarantine store at {path:?} was not migrated from a legacy file; refusing to treat that as empty"
-                ));
+    match read_quarantine_file(&path) {
+        QuarantineFileRead::Raw(raw) => parse_quarantine_raw(&raw, &path),
+        QuarantineFileRead::Missing => missing_quarantine_store(profile, &path),
+        QuarantineFileRead::Unreadable(e) => {
+            Err(format!("quarantine store at {path:?} is unreadable: {e}"))
+        }
+    }
+}
+
+/// Outcome of a retried quarantine-file read. Parse failures are not an IO outcome:
+/// empty/corrupt content is fail-closed by [`parse_quarantine_raw`] (SBS-654 / SBS-320).
+enum QuarantineFileRead {
+    Raw(String),
+    Missing,
+    Unreadable(std::io::Error),
+}
+
+/// Read the quarantine file, retrying the same transient rename window [`read_pins_at`]
+/// already covers (SBS-871): a brief `NotFound`, empty-handle, or sharing-violation
+/// moment during another gateway's `atomic_write`.
+fn read_quarantine_file(path: &Path) -> QuarantineFileRead {
+    for attempt in 0..PINS_READ_ATTEMPTS {
+        #[cfg(test)]
+        QUARANTINE_READ_IO_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let last = attempt + 1 == PINS_READ_ATTEMPTS;
+        match read_quarantine_to_string(path) {
+            Ok(raw) => return QuarantineFileRead::Raw(raw),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if last {
+                    return QuarantineFileRead::Missing;
+                }
             }
-            return Ok(Quarantine::new());
+            Err(e) => {
+                if last {
+                    return QuarantineFileRead::Unreadable(e);
+                }
+            }
         }
-        Err(e) => {
-            return Err(format!("quarantine store at {path:?} is unreadable: {e}"))
+        std::thread::sleep(std::time::Duration::from_millis(PINS_READ_BACKOFF_MS));
+    }
+    QuarantineFileRead::Missing
+}
+
+fn read_quarantine_to_string(path: &Path) -> std::io::Result<String> {
+    #[cfg(test)]
+    {
+        let left = QUARANTINE_INJECT_READ_NOTFOUND.load(std::sync::atomic::Ordering::SeqCst);
+        if left > 0 {
+            QUARANTINE_INJECT_READ_NOTFOUND.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "injected NotFound after metadata (SBS-871)",
+            ));
         }
+    }
+    std::fs::read_to_string(path)
+}
+
+/// Phrase that marks "file lastingly gone, but this is not a first run" (SBS-871).
+/// The write path matches this so a first persist can still create the store; enforcement
+/// reads must not treat it as empty.
+fn quarantine_absent_not_fresh_message(path: &Path) -> String {
+    format!(
+        "quarantine store at {path:?} is missing while the pin store is not a first-run Fresh baseline; \
+         refusing to treat a rename-window NotFound as an empty quarantine set"
+    )
+}
+
+fn is_absent_quarantine_not_fresh(err: &str) -> bool {
+    err.contains("missing while the pin store is not a first-run Fresh baseline")
+}
+
+/// A missing quarantine file is an honest empty set only on a real first run
+/// (pin store `Fresh`). Same shape as the SBS-715 unmigrated-legacy guard: the pin
+/// store is the first-run marker. SBS-871.
+fn missing_quarantine_store(profile: Option<&str>, path: &Path) -> Result<Quarantine, String> {
+    if profile.is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, false)) {
+        return Err(format!(
+            "quarantine store at {path:?} was not migrated from a legacy file; refusing to treat that as empty"
+        ));
+    }
+    match load_pins(profile) {
+        PinsLoad::Fresh => Ok(Quarantine::new()),
+        PinsLoad::Loaded(_) | PinsLoad::Corrupt => Err(quarantine_absent_not_fresh_message(path)),
+    }
+}
+
+/// Historical installs write pins on the first catalog check but never create
+/// `quarantine.json` until the first high-risk drift. That shape is honest-empty,
+/// not a lost store. Materialize `{}` under the quarantine lock so later
+/// enforcement reads can treat "missing while pins exist" as a rename-window
+/// error (SBS-871) without hiding the catalog on every boot.
+pub fn ensure_quarantine_store_for_existing_pins(profile: Option<&str>) {
+    let Some(path) = quarantine_path(profile) else {
+        return;
     };
-    parse_quarantine_raw(&raw, &path)
+    if path.exists() {
+        return;
+    }
+    if matches!(load_pins(profile), PinsLoad::Fresh) {
+        return;
+    }
+    let _ = with_store_lock(&path, || {
+        if path.exists() {
+            return Ok(());
+        }
+        crate::registry::atomic_write(&path, "{}")
+    });
 }
 
 /// Parse quarantine JSON. Shared by disk load and the mtime-cached read path.
@@ -937,7 +1042,7 @@ pub fn quarantined_checked(profile: Option<&str>) -> Result<BTreeSet<String>, St
             "quarantine store at {path:?} was not migrated from a legacy file; refusing to treat that as empty"
         ));
     }
-    quarantined_checked_at(&path)
+    quarantined_checked_at(&path, profile)
 }
 
 /// Tools quarantined because the integrity baseline itself was lost. Unlike ordinary
@@ -968,7 +1073,7 @@ pub fn mandatory_quarantined_checked(profile: Option<&str>) -> Result<BTreeSet<S
             "quarantine store at {path:?} was not migrated from a legacy file; refusing to treat that as empty"
         ));
     }
-    Ok(quarantined_sets_checked_at(&path)?.1)
+    Ok(quarantined_sets_checked_at(&path, profile)?.1)
 }
 
 fn mandatory_quarantine_set(q: &Quarantine) -> BTreeSet<String> {
@@ -980,71 +1085,116 @@ fn mandatory_quarantine_set(q: &Quarantine) -> BTreeSet<String> {
 
 /// Path-level read used by [`quarantined_checked`]. Separated so the mtime/len
 /// pre-filter (SOU-303) and fail-closed parse sit in one place.
-fn quarantined_checked_at(path: &Path) -> Result<BTreeSet<String>, String> {
-    Ok(quarantined_sets_checked_at(path)?.0)
+fn quarantined_checked_at(
+    path: &Path,
+    profile: Option<&str>,
+) -> Result<BTreeSet<String>, String> {
+    Ok(quarantined_sets_checked_at(path, profile)?.0)
 }
 
 fn quarantined_sets_checked_at(
     path: &Path,
+    profile: Option<&str>,
 ) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        // Missing is the normal first-run state: nothing quarantined yet.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Drop a stale hit for this path so a later recreate is re-parsed.
-            clear_quarantine_read_cache_for(path);
-            return Ok((BTreeSet::new(), BTreeSet::new()));
-        }
-        Err(e) => return Err(format!("quarantine store at {path:?} is unreadable: {e}")),
-    };
-    let mtime = match meta.modified() {
-        Ok(t) => t,
-        Err(e) => {
-            return Err(format!(
-                "quarantine store at {path:?} has unreadable mtime: {e}"
-            ))
-        }
-    };
-    let len = meta.len();
+    // SBS-871: retry the same transient rename window `read_pins_at` already covers
+    // instead of treating a vanished file as a legitimate empty set.
+    for attempt in 0..PINS_READ_ATTEMPTS {
+        #[cfg(test)]
+        QUARANTINE_READ_IO_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let last = attempt + 1 == PINS_READ_ATTEMPTS;
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if last {
+                    return missing_quarantine_as_sets(profile, path);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(PINS_READ_BACKOFF_MS));
+                continue;
+            }
+            Err(_) if !last => {
+                std::thread::sleep(std::time::Duration::from_millis(PINS_READ_BACKOFF_MS));
+                continue;
+            }
+            Err(e) => return Err(format!("quarantine store at {path:?} is unreadable: {e}")),
+        };
+        let mtime = match meta.modified() {
+            Ok(t) => t,
+            Err(_) if !last => {
+                std::thread::sleep(std::time::Duration::from_millis(PINS_READ_BACKOFF_MS));
+                continue;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "quarantine store at {path:?} has unreadable mtime: {e}"
+                ))
+            }
+        };
+        let len = meta.len();
 
-    {
-        let cache = QUARANTINE_READ_CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(c) = cache.as_ref() {
-            if c.path == path && c.mtime == mtime && c.len == len {
-                return Ok((c.set.clone(), c.mandatory.clone()));
+        {
+            let cache = QUARANTINE_READ_CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(c) = cache.as_ref() {
+                if c.path == path && c.mtime == mtime && c.len == len {
+                    return Ok((c.set.clone(), c.mandatory.clone()));
+                }
             }
         }
+
+        #[cfg(test)]
+        QUARANTINE_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let raw = match read_quarantine_to_string(path) {
+            Ok(s) => s,
+            // Race: file vanished between metadata and open. Retry; after the budget,
+            // a miss while pins are not Fresh is Err, not empty (SBS-871).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if last {
+                    return missing_quarantine_as_sets(profile, path);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(PINS_READ_BACKOFF_MS));
+                continue;
+            }
+            Err(_) if !last => {
+                std::thread::sleep(std::time::Duration::from_millis(PINS_READ_BACKOFF_MS));
+                continue;
+            }
+            Err(e) => return Err(format!("quarantine store at {path:?} is unreadable: {e}")),
+        };
+        // Fail closed: do not cache a corrupt parse, do not return empty, do not rename.
+        let records = parse_quarantine_raw(&raw, path)?;
+        let mandatory = mandatory_quarantine_set(&records);
+        let set: BTreeSet<String> = records.into_keys().collect();
+
+        *QUARANTINE_READ_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(QuarantineReadCache {
+            path: path.to_path_buf(),
+            mtime,
+            len,
+            set: set.clone(),
+            mandatory: mandatory.clone(),
+        });
+        return Ok((set, mandatory));
     }
+    missing_quarantine_as_sets(profile, path)
+}
 
-    #[cfg(test)]
-    QUARANTINE_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-    let raw = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        // Race: file vanished between metadata and open — treat as empty.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+fn missing_quarantine_as_sets(
+    profile: Option<&str>,
+    path: &Path,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
+    match missing_quarantine_store(profile, path) {
+        Ok(_) => {
             clear_quarantine_read_cache_for(path);
-            return Ok((BTreeSet::new(), BTreeSet::new()));
+            Ok((BTreeSet::new(), BTreeSet::new()))
         }
-        Err(e) => return Err(format!("quarantine store at {path:?} is unreadable: {e}")),
-    };
-    // Fail closed: do not cache a corrupt parse, do not return empty, do not rename.
-    let records = parse_quarantine_raw(&raw, path)?;
-    let mandatory = mandatory_quarantine_set(&records);
-    let set: BTreeSet<String> = records.into_keys().collect();
-
-    *QUARANTINE_READ_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(QuarantineReadCache {
-        path: path.to_path_buf(),
-        mtime,
-        len,
-        set: set.clone(),
-        mandatory: mandatory.clone(),
-    });
-    Ok((set, mandatory))
+        Err(e) => {
+            clear_quarantine_read_cache_for(path);
+            Err(e)
+        }
+    }
 }
 
 fn clear_quarantine_read_cache_for(path: &Path) {
@@ -1354,8 +1504,19 @@ fn apply_quarantine_inner_with(
 ) -> Result<bool, String> {
     // Fail closed: do not load a corrupt store as empty and rewrite it with only the
     // new entries (that would drop every previously quarantined tool).
-    let mut q = load_quarantine(profile)
-        .map_err(|e| format!("{e}; refusing to apply quarantine until the store is fixed"))?;
+    // SBS-871: enforcement treats "missing while pins exist" as Err. This write path
+    // holds the store lock and has already retried, so a still-missing file is
+    // lastingly gone (first persist after pins exist, or a deleted store). Start
+    // empty so the new blocks can be written. Do not use this arm for reads.
+    let mut q = match load_quarantine(profile) {
+        Ok(q) => q,
+        Err(e) if is_absent_quarantine_not_fresh(&e) => Quarantine::new(),
+        Err(e) => {
+            return Err(format!(
+                "{e}; refusing to apply quarantine until the store is fixed"
+            ))
+        }
+    };
     let mut added = false;
 
     // A corrupt baseline invalidates every trust decision in the current catalog. This
@@ -3320,6 +3481,157 @@ mod tests {
         std::fs::write(&v2, record).unwrap();
         assert_eq!(quarantined_checked(Some("billing")).unwrap().len(), 1);
         assert_eq!(mandatory_quarantined_checked(Some("billing")).unwrap().len(), 1);
+    }
+
+    fn write_loaded_pin_store(profile: Option<&str>) {
+        let path = pins_path(profile).expect("pin path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Legacy bare-fingerprint form is enough for load_pins to return Loaded.
+        std::fs::write(&path, r#"{"srv__a":"deadbeef"}"#).unwrap();
+        assert!(
+            matches!(load_pins(profile), PinsLoad::Loaded(_)),
+            "fixture must be a real Loaded pin store"
+        );
+    }
+
+    fn reset_sbs871_read_hooks() {
+        QUARANTINE_INJECT_READ_NOTFOUND.store(0, std::sync::atomic::Ordering::SeqCst);
+        QUARANTINE_READ_IO_ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        *QUARANTINE_READ_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// SBS-871: a missing quarantine file is an honest first-run empty set only
+    /// when the pin store is Fresh. Without this, every clean profile would refuse
+    /// to serve tools.
+    #[test]
+    fn sbs871_missing_quarantine_with_fresh_pins_is_empty_first_run() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("sbs871-missing-fresh");
+        let profile = Some("sbs871-fresh");
+        reset_sbs871_read_hooks();
+        assert!(
+            matches!(load_pins(profile), PinsLoad::Fresh),
+            "fixture is a real first run"
+        );
+        assert!(
+            !quarantine_path(profile).expect("path").exists(),
+            "quarantine file must be absent"
+        );
+
+        let set = quarantined(profile).expect("first run is Ok empty, not Err");
+        assert!(set.is_empty(), "honest first run has nothing blocked");
+        assert!(
+            quarantined_checked(profile)
+                .expect("cached first-run path is also Ok empty")
+                .is_empty()
+        );
+        assert!(load_quarantine(profile).expect("load first run").is_empty());
+    }
+
+    /// SBS-871: a missing quarantine file while pins are Loaded is not "nothing
+    /// blocked". The previous assertion (missing = Ok empty whenever the file is
+    /// gone) pinned the rename-window fail-open.
+    #[test]
+    fn sbs871_missing_quarantine_with_loaded_pins_is_err_not_empty() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("sbs871-missing-loaded");
+        let profile = Some("sbs871-loaded");
+        reset_sbs871_read_hooks();
+        write_loaded_pin_store(profile);
+        assert!(
+            !quarantine_path(profile).expect("path").exists(),
+            "quarantine file must be absent"
+        );
+
+        let err = quarantined(profile).expect_err("missing + Loaded must not be Ok empty");
+        assert!(
+            is_absent_quarantine_not_fresh(&err),
+            "error must name the SBS-871 missing-not-fresh case, got {err}"
+        );
+        assert!(
+            quarantined_checked(profile).is_err(),
+            "the watcher's cached read must also refuse"
+        );
+        assert!(load_quarantine(profile).is_err());
+    }
+
+    /// SBS-871: NotFound after metadata (file vanished between stat and open) is
+    /// retried like `read_pins_at`. After the budget, pins Loaded means Err, not
+    /// Ok empty. The old comment on that arm was "Race: file vanished between
+    /// metadata and open — treat as empty."
+    #[test]
+    fn sbs871_quarantine_notfound_after_metadata_is_retried_then_err_when_pins_loaded() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("sbs871-meta-then-notfound");
+        let profile = Some("sbs871-meta-race");
+        reset_sbs871_read_hooks();
+        write_loaded_pin_store(profile);
+
+        let mut q = Quarantine::new();
+        q.insert(
+            "srv__wipe".to_string(),
+            json!({"tool":"srv__wipe","change":"changed"}),
+        );
+        save_quarantine(profile, &q).unwrap();
+        assert!(
+            quarantine_path(profile).expect("path").exists(),
+            "metadata must succeed so the injected NotFound is the post-stat arm"
+        );
+
+        QUARANTINE_INJECT_READ_NOTFOUND.store(
+            PINS_READ_ATTEMPTS,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let err = quarantined_checked(profile)
+            .expect_err("exhausted post-metadata NotFound with Loaded pins must be Err");
+        assert!(
+            is_absent_quarantine_not_fresh(&err),
+            "must not collapse the race to Ok empty, got {err}"
+        );
+        assert!(
+            QUARANTINE_READ_IO_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst)
+                >= PINS_READ_ATTEMPTS as usize,
+            "NotFound after metadata must be retried, attempts={}",
+            QUARANTINE_READ_IO_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(
+            QUARANTINE_INJECT_READ_NOTFOUND.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the retry budget must consume every injected NotFound"
+        );
+        reset_sbs871_read_hooks();
+    }
+
+    /// SBS-871: a transient post-metadata NotFound that clears before the budget
+    /// is exhausted must return the real set, not empty and not Err.
+    #[test]
+    fn sbs871_quarantine_notfound_after_metadata_recovers_on_retry() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("sbs871-meta-recover");
+        let profile = Some("sbs871-meta-recover");
+        reset_sbs871_read_hooks();
+        write_loaded_pin_store(profile);
+
+        let mut q = Quarantine::new();
+        q.insert(
+            "srv__wipe".to_string(),
+            json!({"tool":"srv__wipe","change":"changed"}),
+        );
+        save_quarantine(profile, &q).unwrap();
+
+        QUARANTINE_INJECT_READ_NOTFOUND.store(2, std::sync::atomic::Ordering::SeqCst);
+        let set = quarantined_checked(profile).expect("retry must see the file");
+        assert!(
+            set.contains("srv__wipe"),
+            "a transient post-metadata miss must not drop the live block"
+        );
+        assert!(
+            QUARANTINE_READ_IO_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "two injected misses plus the successful read"
+        );
+        reset_sbs871_read_hooks();
     }
 
     #[test]
