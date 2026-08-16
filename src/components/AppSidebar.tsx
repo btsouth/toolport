@@ -271,7 +271,9 @@ function VersionFooter({
           <Compass className="size-3.5" />
         </button>
         <button
-          onClick={() => openDataDir().catch(() => {})}
+          onClick={() =>
+            openDataDir().catch(() => toastError("Couldn't open data folder"))
+          }
           title="Open data folder (config, logs)"
           aria-label="Open data folder"
           className={ICON_BTN}
