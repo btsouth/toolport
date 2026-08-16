@@ -13,6 +13,7 @@ const checkForUpdate = vi.fn();
 const installUpdate = vi.fn();
 const toastInfo = vi.fn();
 const toastError = vi.fn();
+const openDataDir = vi.fn();
 const eventListeners = new Map<string, (event: { payload: unknown }) => void>();
 
 vi.mock("sonner", () => ({
@@ -30,7 +31,7 @@ vi.mock("@/lib/api", () => ({
   gatherDiagnostics: vi.fn(),
   getSavingsSummary: (...args: unknown[]) => getSavingsSummary(...args),
   listQuarantined: (...args: unknown[]) => listQuarantined(...args),
-  openDataDir: vi.fn(),
+  openDataDir: (...args: unknown[]) => openDataDir(...args),
 }));
 
 vi.mock("@tauri-apps/api/app", () => ({
@@ -77,6 +78,7 @@ beforeEach(() => {
   installUpdate.mockReset();
   toastInfo.mockReset();
   toastError.mockReset();
+  openDataDir.mockReset();
   eventListeners.clear();
   checkForUpdate.mockResolvedValue({ kind: "current" });
   getSavingsSummary.mockResolvedValue({
@@ -486,5 +488,33 @@ describe("AppSidebar quarantine badge", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("AppSidebar open data folder", () => {
+  it("shows an error toast when opening the data folder fails", async () => {
+    openDataDir.mockRejectedValue(new Error("no such directory"));
+    const user = userEvent.setup();
+
+    render(
+      <TooltipProvider>
+        <AppSidebar
+          clients={[client()]}
+          registry={null}
+          onRegistryChange={vi.fn()}
+          selectedClientId={null}
+          onSelectClient={vi.fn()}
+          view="servers"
+          onSelectView={vi.fn()}
+          onReplayOnboarding={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+
+    await user.click(await screen.findByLabelText("Open data folder"));
+
+    await waitFor(() => {
+      expect(toastError).toHaveBeenCalledWith("Couldn't open data folder");
+    });
   });
 });

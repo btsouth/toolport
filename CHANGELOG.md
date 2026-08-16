@@ -25,6 +25,13 @@ Entries before the rename below shipped under the project's former name, Conduit
   opens an unauthenticated listener only while no token is set and no HTTP clients
   are registered. SECURITY.md also now explains what a registered HTTP client is
   and how the desktop app creates one. (SBS-878)
+- **Connect keeps stow/chezmoi config symlinks.** Writing a client config
+  (Connect, Disconnect, migrate, launch-time re-point) used to replace a
+  symlink at the config path with a regular file, leaving the file in the
+  dotfiles repo unchanged. The next `chezmoi apply` / `stow` restored the
+  old content and the gateway entry disappeared. Writes now follow the
+  link and update the target, so the path under home stays a symlink.
+  (SBS-886)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
