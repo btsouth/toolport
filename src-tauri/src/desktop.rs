@@ -6811,6 +6811,13 @@ mod tests {
         let _env = registry::REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // TOOLPORT_REGISTRY is process-global and OUTRANKS the data-dir override,
+        // so while this test points it at a deliberately broken path, any
+        // concurrent test using DataDirOverride reads and writes the wrong
+        // registry and fails on state it just saved. Take the same lock those
+        // tests hold (as clear_auth_token_propagates_reload_failure... already
+        // does) so the two can never overlap.
+        let _data = registry::data_dir_test_lock();
         let dir = unique_update_test_dir("bump-failure");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(dir.join("registry.json")).unwrap();
@@ -6848,6 +6855,9 @@ mod tests {
         let _env = registry::REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Same reason as above: this sets the process-global TOOLPORT_REGISTRY,
+        // which outranks any concurrent test's data-dir override.
+        let _data = registry::data_dir_test_lock();
         let dir = unique_update_test_dir("bump-success");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("registry.json");
