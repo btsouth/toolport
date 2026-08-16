@@ -271,7 +271,9 @@ function VersionFooter({
           <Compass className="size-3.5" />
         </button>
         <button
-          onClick={() => openDataDir().catch(() => {})}
+          onClick={() =>
+            openDataDir().catch(() => toastError("Couldn't open data folder"))
+          }
           title="Open data folder (config, logs)"
           aria-label="Open data folder"
           className={ICON_BTN}
@@ -497,7 +499,16 @@ export function AppSidebar({
 }: Props) {
   const [showMissing, setShowMissing] = useState(false);
   const [savings, setSavings] = useState<SavingsSummary | null>(null);
-  const [quarantinedCount, setQuarantinedCount] = useState(0);
+  // `null` means "no confirmed count": the first poll hasn't answered yet. It
+  // must render distinctly from a confirmed zero so a gateway that never
+  // answered never reads as "all clear" (#741).
+  const [quarantinedCount, setQuarantinedCount] = useState<number | null>(null);
+  // A failed poll keeps the last confirmed count and flags it stale instead of
+  // dropping back to `null`, so one transient blip never erases a real number.
+  // Before the first poll answers (`null`, not stale) no badge renders at all —
+  // the "?" glyph and its "Could not reach the gateway" tooltip must only appear
+  // once a poll has actually failed, not on every app start (#742).
+  const [quarantineStale, setQuarantineStale] = useState(false);
   const sorted = sortClients(clients);
   const detectedClients = sorted.filter((c) => statusOf(c) !== "missing");
   const missingClients = sorted.filter((c) => statusOf(c) === "missing");
@@ -531,9 +542,18 @@ export function AppSidebar({
       const id = ++latest;
       return listQuarantined()
         .then((q) => {
-          if (alive && id === latest) setQuarantinedCount(q.length);
+          if (alive && id === latest) {
+            setQuarantinedCount(q.length);
+            setQuarantineStale(false);
+          }
         })
-        .catch(() => {});
+        .catch(() => {
+          // A failed poll must not read as a confirmed zero, but it must not
+          // erase a confirmed count either: keep the last answer and mark it
+          // stale so the badge never claims "all clear" and never loses a
+          // real number over one blip (#741, #742).
+          if (alive && id === latest) setQuarantineStale(true);
+        });
     };
     load();
     const id = setInterval(load, 10_000);
@@ -550,7 +570,8 @@ export function AppSidebar({
     label: string,
     active: boolean,
     onClick: () => void,
-    badge?: number,
+    badge?: number | null,
+    stale?: boolean,
   ) => (
     <button
       onClick={onClick}
@@ -561,12 +582,26 @@ export function AppSidebar({
         className={`size-4 shrink-0 ${active ? "text-primary" : "text-muted-foreground"}`}
       />
       <span>{label}</span>
-      {badge !== undefined && badge > 0 && (
+      {badge !== undefined && badge !== null && badge > 0 && (
         <span
           className="ml-auto inline-flex shrink-0 items-center rounded-full bg-warning/15 px-1.5 text-[10px] font-medium text-warning"
           aria-label={`${badge} tool${badge === 1 ? "" : "s"} blocked`}
+          title={
+            stale
+              ? "Could not reach the gateway — quarantine count may be stale"
+              : undefined
+          }
         >
           {badge}
+        </span>
+      )}
+      {badge === null && stale && (
+        <span
+          className="ml-auto inline-flex shrink-0 items-center rounded-full bg-warning/15 px-1.5 text-[10px] font-medium text-warning"
+          aria-label="Quarantine status unknown"
+          title="Could not reach the gateway — quarantine status unknown"
+        >
+          ?
         </span>
       )}
     </button>
@@ -638,6 +673,7 @@ export function AppSidebar({
             view === "settings",
             () => onSelectView("settings"),
             quarantinedCount,
+            quarantineStale,
           )}
         </nav>
 

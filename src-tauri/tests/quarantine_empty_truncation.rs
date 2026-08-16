@@ -94,8 +94,9 @@ fn empty_quarantine_file_must_not_silently_unblock() {
 
 #[test]
 fn a_missing_quarantine_file_is_still_an_empty_set() {
-    // First run has no file at all. That must stay a legitimate empty set, or every
-    // clean install would refuse to serve tools.
+    // First run has no file at all and the pin store is Fresh. That must stay a
+    // legitimate empty set, or every clean install would refuse to serve tools.
+    // SBS-871: missing + Loaded pins is a different case (Err, not Ok empty).
     let dir = scratch_dir("absent");
     let _lock = data_dir_guard();
     let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);

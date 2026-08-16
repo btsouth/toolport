@@ -13,6 +13,7 @@ const checkForUpdate = vi.fn();
 const installUpdate = vi.fn();
 const toastInfo = vi.fn();
 const toastError = vi.fn();
+const openDataDir = vi.fn();
 const eventListeners = new Map<string, (event: { payload: unknown }) => void>();
 
 vi.mock("sonner", () => ({
@@ -30,7 +31,7 @@ vi.mock("@/lib/api", () => ({
   gatherDiagnostics: vi.fn(),
   getSavingsSummary: (...args: unknown[]) => getSavingsSummary(...args),
   listQuarantined: (...args: unknown[]) => listQuarantined(...args),
-  openDataDir: vi.fn(),
+  openDataDir: (...args: unknown[]) => openDataDir(...args),
 }));
 
 vi.mock("@tauri-apps/api/app", () => ({
@@ -77,6 +78,7 @@ beforeEach(() => {
   installUpdate.mockReset();
   toastInfo.mockReset();
   toastError.mockReset();
+  openDataDir.mockReset();
   eventListeners.clear();
   checkForUpdate.mockResolvedValue({ kind: "current" });
   getSavingsSummary.mockResolvedValue({
@@ -341,5 +343,178 @@ describe("AppSidebar accessibility", () => {
 
     expect(toastInfo).toHaveBeenCalledWith("An update is already in progress");
     expect(checkForUpdate).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("AppSidebar quarantine badge", () => {
+  function renderSidebar() {
+    return render(
+      <TooltipProvider>
+        <AppSidebar
+          clients={[client()]}
+          registry={null}
+          onRegistryChange={vi.fn()}
+          selectedClientId={null}
+          onSelectClient={vi.fn()}
+          view="servers"
+          onSelectView={vi.fn()}
+          onReplayOnboarding={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+  }
+
+  function quarantinedTool(over: Partial<import("@/lib/api").QuarantinedTool> = {}) {
+    return {
+      server: "linear",
+      tool: "linear__save_issue",
+      reason: "a destructive tool's definition changed",
+      ts: Date.now(),
+      profile: "",
+      ...over,
+    };
+  }
+
+  it("shows the blocked-tool count once the poll confirms a count", async () => {
+    listQuarantined.mockResolvedValue([
+      quarantinedTool({ tool: "a" }),
+      quarantinedTool({ tool: "b" }),
+    ]);
+
+    renderSidebar();
+
+    expect(await screen.findByLabelText("2 tools blocked")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Quarantine status unknown")).not.toBeInTheDocument();
+  });
+
+  it("shows no badge on a confirmed clean state", async () => {
+    listQuarantined.mockResolvedValue([]);
+
+    renderSidebar();
+
+    await waitFor(() => expect(listQuarantined).toHaveBeenCalled());
+    expect(screen.queryByLabelText("Quarantine status unknown")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/tool\s?blocked/)).not.toBeInTheDocument();
+  });
+
+  it("shows no badge before the first poll answers (#742)", async () => {
+    let resolvePoll!: (q: import("@/lib/api").QuarantinedTool[]) => void;
+    listQuarantined.mockReturnValue(
+      new Promise((resolve) => {
+        resolvePoll = resolve;
+      }),
+    );
+
+    renderSidebar();
+
+    await waitFor(() => expect(listQuarantined).toHaveBeenCalled());
+    expect(screen.queryByLabelText("Quarantine status unknown")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/tool\s?blocked/)).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolvePoll([quarantinedTool({ tool: "a" })]);
+    });
+
+    expect(await screen.findByLabelText("1 tool blocked")).toBeInTheDocument();
+  });
+
+  it("does not present a failed poll as an all-clear (#741)", async () => {
+    listQuarantined.mockRejectedValue(new Error("gateway not reachable"));
+
+    renderSidebar();
+
+    expect(await screen.findByLabelText("Quarantine status unknown")).toBeInTheDocument();
+    expect(screen.queryByLabelText(/tool\s?blocked/)).not.toBeInTheDocument();
+  });
+
+  it("keeps surfacing the unknown state across repeated failures (#741)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      listQuarantined.mockRejectedValue(new Error("gateway not reachable"));
+
+      renderSidebar();
+
+      expect(
+        await screen.findByLabelText("Quarantine status unknown"),
+      ).toBeInTheDocument();
+
+      const callsBeforeNextTick = listQuarantined.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+
+      expect(listQuarantined.mock.calls.length).toBeGreaterThan(callsBeforeNextTick);
+      expect(screen.getByLabelText("Quarantine status unknown")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a confirmed count on a failed poll and marks it stale (#742)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      listQuarantined
+        .mockResolvedValueOnce([
+          quarantinedTool({ tool: "a" }),
+          quarantinedTool({ tool: "b" }),
+          quarantinedTool({ tool: "c" }),
+        ])
+        .mockRejectedValueOnce(new Error("gateway not reachable"));
+
+      renderSidebar();
+
+      const badge = await screen.findByLabelText("3 tools blocked");
+      expect(badge).toBeInTheDocument();
+      expect(
+        screen.queryByLabelText("Quarantine status unknown"),
+      ).not.toBeInTheDocument();
+
+      const callsBeforeNextTick = listQuarantined.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+
+      expect(listQuarantined.mock.calls.length).toBeGreaterThan(callsBeforeNextTick);
+      // The confirmed count survives the failed poll instead of degrading to "?".
+      expect(screen.getByLabelText("3 tools blocked")).toBeInTheDocument();
+      expect(
+        screen.queryByLabelText("Quarantine status unknown"),
+      ).not.toBeInTheDocument();
+      // ...but the badge says the number may be stale.
+      expect(screen.getByLabelText("3 tools blocked")).toHaveAttribute(
+        "title",
+        expect.stringContaining("stale"),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("AppSidebar open data folder", () => {
+  it("shows an error toast when opening the data folder fails", async () => {
+    openDataDir.mockRejectedValue(new Error("no such directory"));
+    const user = userEvent.setup();
+
+    render(
+      <TooltipProvider>
+        <AppSidebar
+          clients={[client()]}
+          registry={null}
+          onRegistryChange={vi.fn()}
+          selectedClientId={null}
+          onSelectClient={vi.fn()}
+          view="servers"
+          onSelectView={vi.fn()}
+          onReplayOnboarding={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+
+    await user.click(await screen.findByLabelText("Open data folder"));
+
+    await waitFor(() => {
+      expect(toastError).toHaveBeenCalledWith("Couldn't open data folder");
+    });
   });
 });

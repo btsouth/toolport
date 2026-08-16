@@ -366,7 +366,11 @@ pub fn is_destructive(tool: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn name_looks_destructive(name: &str) -> bool {
+/// True when `name` contains an obvious write/delete verb. Used by
+/// [`is_destructive`] as a fallback when no hint is present, and by integrity
+/// drift tiering even when the server set `destructiveHint: false` (SBS-875:
+/// the hint is attacker-controlled and must not disarm quarantine).
+pub fn name_looks_destructive(name: &str) -> bool {
     let mut tokens = name
         .split(|c: char| !c.is_ascii_alphanumeric())
         .flat_map(split_camel_lower);
@@ -435,6 +439,12 @@ pub struct ToolPolicy {
     /// Exposed (namespaced) tool names quarantined after a high-risk drift; hidden
     /// until the user re-approves them. Empty unless quarantine-on-drift is enabled.
     pub quarantined: BTreeSet<String>,
+    /// Hide every tool. Used when a cold-start quarantine-store read fails
+    /// (SBS-871): there is no prior live set to keep, so the catalog stays
+    /// blocked until a SUCCESSFUL store read installs a real set through
+    /// [`Router::requarantine_from_store`]. Error paths must use
+    /// [`Router::requarantine`], which leaves this set.
+    pub fail_closed_catalog: bool,
 }
 
 impl ToolPolicy {
@@ -465,6 +475,11 @@ impl ToolPolicy {
         }
         if self.deny_destructive && is_destructive(tool) {
             return Some("blocked by the destructive-tool policy");
+        }
+        if self.fail_closed_catalog {
+            return Some(
+                "quarantine store unreadable; catalog blocked until the store reads",
+            );
         }
         if self.quarantined.contains(exposed) {
             return Some("quarantined after a high-risk change; re-approve to restore");
@@ -582,6 +597,11 @@ pub struct Router {
     prompts: Vec<Value>,
     /// Exposed prompt name -> (server id, original prompt name).
     prompt_routes: HashMap<String, (String, String)>,
+    /// False only for the never-built placeholder the gateway installs before its
+    /// first build. `with_policy` (the constructor every real build uses) sets it,
+    /// so a live router whose connects all failed is still a real prior decision
+    /// and not a cold start (SBS-871).
+    built: bool,
 }
 
 impl Router {
@@ -593,8 +613,16 @@ impl Router {
     pub fn with_policy(policy: ToolPolicy) -> Self {
         Router {
             policy,
+            built: true,
             ..Router::default()
         }
+    }
+
+    /// Whether this router came from a real build rather than the startup
+    /// placeholder. A built router carries a quarantine decision even when it
+    /// connected zero servers (SBS-871).
+    pub fn is_built(&self) -> bool {
+        self.built
     }
 
     /// Set the per-tool exposure overrides. Must be called BEFORE `add`/`refresh`, since
@@ -814,9 +842,10 @@ impl Router {
     /// working and silently went somewhere new. Sorting on the raw name makes the
     /// assignment a property of the tools themselves, so list order can't move it.
     ///
-    /// Cross-server collisions can't arise here: server ids are slugified to
-    /// `[a-z0-9-]` and `sanitize_segment` only maps `-` to `_`, which is injective
-    /// over that alphabet. So the contested namespace is always within one server.
+    /// Cross-server collisions *can* arise: personal `team-slack` and team
+    /// `team_slack` both sanitize to `team_slack` (SBS-866). The `_2` suffix still
+    /// keeps exposed names unique; authorization must use the raw registry id,
+    /// not this prefix.
     fn allocate_exposed_names(&mut self, server_id: &str, items: &[Value]) -> Vec<Option<String>> {
         fn raw_name(item: &Value) -> Option<&str> {
             item.get("name").and_then(|n| n.as_str())
@@ -1067,14 +1096,38 @@ impl Router {
     /// Replace the quarantine set and re-derive the exposed aggregation so newly
     /// quarantined tools are hidden (or re-approved ones restored) without re-querying
     /// downstream. Cheap: it only re-applies the policy to the cached tool lists.
+    ///
+    /// Deliberately does NOT lift a fail-closed catalog (SBS-871): every caller that
+    /// reaches here on a store error would otherwise re-expose the whole catalog while
+    /// the store is still unreadable. Use [`Self::requarantine_from_store`] when the
+    /// set came from a successful read.
     pub fn requarantine(&mut self, quarantined: BTreeSet<String>) {
         self.policy.quarantined = quarantined;
         self.rebuild_aggregation();
     }
 
+    /// Install a quarantine set that came from a SUCCESSFUL store read, lifting the
+    /// fail-closed hide (SBS-871). This is the only way the catalog comes back: the
+    /// store answered, so the set is known and enforcement can resume normally.
+    pub fn requarantine_from_store(&mut self, quarantined: BTreeSet<String>) {
+        self.policy.fail_closed_catalog = false;
+        self.requarantine(quarantined);
+    }
+
+    /// True when this router is hiding the whole catalog because the quarantine
+    /// store could not be read and there was no prior live set to keep (SBS-871).
+    pub fn catalog_fail_closed(&self) -> bool {
+        self.policy.fail_closed_catalog
+    }
+
     /// The quarantine set this router is currently enforcing. Lets a caller diff the
     /// live set against the persisted one and skip `requarantine` (and the client
     /// `list_changed` that follows it) when nothing actually changed.
+    ///
+    /// NOT the whole enforcement picture: while [`Self::catalog_fail_closed`] is true
+    /// every tool is hidden even though this set can be empty, so a caller diffing
+    /// live against persisted MUST check `catalog_fail_closed()` too or it will read
+    /// "blocked everything" as "nothing blocked" (SBS-871).
     pub fn quarantined(&self) -> &BTreeSet<String> {
         &self.policy.quarantined
     }
@@ -3118,6 +3171,19 @@ mod tests {
     }
 
     #[test]
+    fn name_looks_destructive_is_hint_independent() {
+        // Drift tiering (SBS-875) uses this even when the hint is an explicit false.
+        assert!(name_looks_destructive("delete_file"));
+        assert!(name_looks_destructive("srv__run_admin_script"));
+        assert!(name_looks_destructive("sendEmail"));
+        assert!(!name_looks_destructive("list_files"));
+        assert!(
+            !name_looks_destructive("rc__edit_paywall_ai"),
+            "edit/modify stay omitted so benign description churn stays quiet"
+        );
+    }
+
+    #[test]
     fn disabled_tool_is_hidden_and_blocked() {
         let mut policy = ToolPolicy::default();
         policy
@@ -3198,6 +3264,73 @@ mod tests {
 
         router.requarantine(BTreeSet::new());
         assert!(router.quarantined().is_empty());
+    }
+
+    #[test]
+    fn sbs871_fail_closed_catalog_hides_every_tool_until_requarantine() {
+        // SBS-871: a cold-start store Err has no prior live set, so the whole
+        // catalog stays hidden until a later successful read installs a set.
+        let mut policy = ToolPolicy::default();
+        policy.fail_closed_catalog = true;
+        let mut router = Router::with_policy(policy);
+        router.add(mock_server("github"));
+        assert!(
+            router.aggregated_tools().is_empty(),
+            "fail-closed catalog must hide every tool"
+        );
+        assert!(router.catalog_fail_closed());
+        let err = router.route_call("github__echo", json!({})).unwrap_err();
+        assert!(
+            err.contains("quarantine store unreadable"),
+            "unexpected: {err}"
+        );
+
+        router.requarantine_from_store(BTreeSet::new());
+        assert!(!router.catalog_fail_closed());
+        assert!(
+            !router.aggregated_tools().is_empty(),
+            "a later known set must re-expose the catalog"
+        );
+    }
+
+    /// SBS-871: the whole point of the hide is that it survives every path that is
+    /// NOT a successful store read. `requarantine` runs on store-error paths
+    /// (integrity write failure, unreadable persisted set), so it must leave the
+    /// catalog hidden; only `requarantine_from_store` lifts it.
+    #[test]
+    fn sbs871_requarantine_on_an_error_path_does_not_lift_fail_closed() {
+        let mut policy = ToolPolicy::default();
+        policy.fail_closed_catalog = true;
+        let mut router = Router::with_policy(policy);
+        router.add(mock_server("github"));
+
+        // The error paths union the live set with the names that triggered the write.
+        router.requarantine(["github__echo".to_string()].into_iter().collect());
+        assert!(
+            router.catalog_fail_closed(),
+            "a store-error requarantine must not re-expose the catalog"
+        );
+        assert!(
+            router.aggregated_tools().is_empty(),
+            "the catalog must stay hidden while the store is still unreadable"
+        );
+        // The reported set is not the whole picture, so callers have to consult
+        // catalog_fail_closed() as well.
+        assert_eq!(router.quarantined().len(), 1);
+
+        router.requarantine_from_store(BTreeSet::new());
+        assert!(!router.catalog_fail_closed());
+        assert!(!router.aggregated_tools().is_empty());
+    }
+
+    /// SBS-871: `Router::new()` is the startup placeholder, but a router that was
+    /// really built and connected nothing is still a prior quarantine decision.
+    #[test]
+    fn sbs871_built_flag_separates_a_placeholder_from_a_live_empty_router() {
+        assert!(!Router::new().is_built(), "placeholder is not a build");
+        let built = Router::with_policy(ToolPolicy::default());
+        assert!(built.is_built(), "a policy build is a real build");
+        assert_eq!(built.server_count(), 0, "even with zero connected servers");
     }
 
     #[test]

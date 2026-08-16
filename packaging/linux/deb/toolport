@@ -1,0 +1,14 @@
+#!/bin/sh
+# The .deb still ships the Cargo bin as `conduit`. This wrapper puts `toolport`
+# on PATH so apt users get the same command as the AppImage installer.
+#
+# Prefer the crate binary next to this file (`/usr/bin/conduit` in the package).
+# Fall back to PATH so a test prefix and a bare `toolport` argv0 still work.
+case "$0" in
+  */*) here=${0%/*} ;;
+  *) here=. ;;
+esac
+if [ -x "$here/conduit" ]; then
+  exec "$here/conduit" "$@"
+fi
+exec conduit "$@"

@@ -47,6 +47,13 @@ const OAUTH_LOCK_POLL_MS: u64 = 250;
 struct OAuthFlowLock {
     path: std::path::PathBuf,
     attempt_id: String,
+    succeeded: bool,
+}
+
+impl OAuthFlowLock {
+    fn mark_succeeded(&mut self) {
+        self.succeeded = true;
+    }
 }
 
 struct AuthMutationLock {
@@ -61,11 +68,24 @@ impl Drop for AuthMutationLock {
 
 impl Drop for OAuthFlowLock {
     fn drop(&mut self) {
+        // SBS-842: waiters treat a completion file as "the other process
+        // authenticated". Only claim success after tokens are vaulted;
+        // otherwise write an explicit failure so a concurrent waiter
+        // returns Err, not Ok(()).
         let completion = oauth_completion_path(&self.path, &self.attempt_id);
-        let _ = std::fs::write(
-            completion,
-            format!("done={} pid={}
-", now_unix_secs(), std::process::id()),
+        let status = if self.succeeded { "ok" } else { "failed" };
+        // Written atomically (temp file + rename): `fs::write` truncates first, so a
+        // waiter polling every OAUTH_LOCK_POLL_MS could open the file between the
+        // truncate and the bytes landing and read zero bytes. A rename makes the
+        // completion file appear only once it is whole, so no waiter ever sees a
+        // half-written verdict, not even if this process dies mid-write.
+        let _ = registry::atomic_write(
+            &completion,
+            &format!(
+                "status={status}\ndone={}\npid={}\n",
+                now_unix_secs(),
+                std::process::id()
+            ),
         );
         let _ = std::fs::remove_file(&self.path);
     }
@@ -159,8 +179,45 @@ fn lock_snapshot_is_expired(snapshot: &OAuthLockSnapshot) -> bool {
     elapsed.as_secs() >= OAUTH_LOCK_LEASE_SECS
 }
 
+/// Test-only: production reads the file's CONTENT (see [`read_oauth_completion`]),
+/// because existence alone is what wrongly reported a failed drop as success.
+#[cfg(test)]
 fn completion_exists(path: &std::path::Path, attempt_id: &str) -> bool {
     oauth_completion_path(path, attempt_id).exists()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OAuthCompletion {
+    Succeeded,
+    Failed,
+}
+
+/// `None` means "no verdict yet", never "failed": an empty or unrecognised file is a
+/// file we caught mid-write (or one written by a build we do not know), and a waiter
+/// that turned that into `Failed` would tell the user sign-in failed while the other
+/// window was busy vaulting a token. Waiters keep polling on `None` and fall back to
+/// the wait timeout, so an unreadable file costs a slow error, not a wrong one.
+fn read_oauth_completion(path: &std::path::Path, attempt_id: &str) -> Option<OAuthCompletion> {
+    let content = std::fs::read_to_string(oauth_completion_path(path, attempt_id)).ok()?;
+    if content.lines().any(|line| line.trim() == "status=failed") {
+        Some(OAuthCompletion::Failed)
+    } else if content.lines().any(|line| line.trim() == "status=ok") {
+        Some(OAuthCompletion::Succeeded)
+    } else if content.contains("done=") {
+        // Pre-SBS-842 files had no status= and were written on every drop.
+        Some(OAuthCompletion::Succeeded)
+    } else {
+        None
+    }
+}
+
+fn oauth_waiter_outcome(path: &std::path::Path, attempt_id: &str) -> Option<Result<(), String>> {
+    match read_oauth_completion(path, attempt_id)? {
+        OAuthCompletion::Succeeded => Some(Ok(())),
+        OAuthCompletion::Failed => Some(Err(
+            "another Toolport process failed to complete OAuth for this server".into(),
+        )),
+    }
 }
 
 fn try_replace_stale_lock(
@@ -289,6 +346,7 @@ fn try_acquire_oauth_lock(path: &std::path::Path) -> Result<Option<OAuthFlowLock
             Ok(Some(OAuthFlowLock {
                 path: path.to_path_buf(),
                 attempt_id,
+                succeeded: false,
             }))
         }
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
@@ -301,6 +359,7 @@ fn try_acquire_oauth_lock(path: &std::path::Path) -> Result<Option<OAuthFlowLock
                 return Ok(Some(OAuthFlowLock {
                     path: path.to_path_buf(),
                     attempt_id,
+                    succeeded: false,
                 }));
             }
             Ok(None)
@@ -314,26 +373,30 @@ fn acquire_or_wait_oauth_lock(
     url: &str,
 ) -> Result<Option<OAuthFlowLock>, String> {
     let path = oauth_lock_path(_server_id, url)?;
+    acquire_or_wait_oauth_lock_at(&path)
+}
+
+fn acquire_or_wait_oauth_lock_at(path: &std::path::Path) -> Result<Option<OAuthFlowLock>, String> {
     let mut observed_attempt_id: Option<String> = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(OAUTH_LOCK_WAIT_SECS);
     loop {
-        if let Some(lock) = try_acquire_oauth_lock(&path)? {
+        if let Some(lock) = try_acquire_oauth_lock(path)? {
             if let Some(attempt_id) = &observed_attempt_id {
-                if completion_exists(&path, attempt_id) {
+                if let Some(outcome) = oauth_waiter_outcome(path, attempt_id) {
                     drop(lock);
-                    return Ok(None);
+                    return outcome.map(|()| None);
                 }
             }
             return Ok(Some(lock));
         }
-        if let Some(snapshot) = read_oauth_lock_snapshot(&path)? {
+        if let Some(snapshot) = read_oauth_lock_snapshot(path)? {
             if let Some(attempt_id) = snapshot.attempt_id {
                 observed_attempt_id = Some(attempt_id);
             }
         }
         if let Some(attempt_id) = &observed_attempt_id {
-            if completion_exists(&path, attempt_id) {
-                return Ok(None);
+            if let Some(outcome) = oauth_waiter_outcome(path, attempt_id) {
+                return outcome.map(|()| None);
             }
         }
         if std::time::Instant::now() >= deadline {
@@ -996,11 +1059,38 @@ fn ensure_client_http_token(
     client_id: &str,
     profile: Option<&str>,
 ) -> Result<String, String> {
+    ensure_client_http_token_with(state, client_id, profile, crate::secrets::get_secret_result)
+}
+
+/// [`ensure_client_http_token`] with the vault read injected.
+///
+/// The vault server id is fixed here, so the reserved-namespace trick the other
+/// fail-closed tests use cannot reach it. Injecting the read is how
+/// [`revoke_client_http_token_with`] solves the same problem in this file.
+fn ensure_client_http_token_with(
+    state: &RegistryState,
+    client_id: &str,
+    profile: Option<&str>,
+    read_vaulted_token: impl FnOnce(&str, &str) -> Result<Option<String>, String>,
+) -> Result<String, String> {
     const VAULT_SERVER: &str = "__toolport_http_clients__";
     let http_id = format!("client:{client_id}");
     let desired_profile = profile.unwrap_or("").trim().to_string();
     // Reuse vaulted token when we still have a matching http_clients row.
-    if let Some(existing) = crate::secrets::get_secret(VAULT_SERVER, client_id) {
+    //
+    // A failed vault READ must not fall through to minting a replacement. `get_secret`
+    // collapses a read error into `None`, so a locked or flaky keychain looked exactly
+    // like "this client has no bearer yet": the mint path below then overwrites the
+    // vaulted copy AND `retain`s the client's `http_clients` row away for a new one.
+    // The bearer the client is already configured with now hashes to no row, so every
+    // request it makes 401s until the user reconnects that client by hand. Only a
+    // confirmed "nothing vaulted" may mint (SBS-840 class).
+    if let Some(existing) = read_vaulted_token(VAULT_SERVER, client_id)
+        // Complete sentence, capitalized: `install_gateway`'s caller renders this
+        // verbatim in a toast (`ClientDetail.tsx` `toastError(`${e}`)`), so a bare
+        // lowercase fragment would reach the user untethered.
+        .map_err(|e| format!("Could not read the saved token for {client_id}: {e}"))?
+    {
         let hash = registry::sha256_hex(&existing);
         let mut matched = false;
         let mut profile_stale = false;
@@ -1048,16 +1138,50 @@ fn ensure_client_http_token(
     Ok(token)
 }
 
-/// Drop the managed shared-HTTP bearer for this client (registry row + vault).
-/// Best-effort on vault delete so a missing secret never blocks Disconnect (WS3-4).
-fn revoke_client_http_token(state: &RegistryState, client_id: &str) {
+/// Drop the managed shared-HTTP bearer for this client (registry row, then vault).
+///
+/// `delete_secret` already treats a missing vault entry as success (WS3-4), so
+/// Disconnect is not blocked when the bearer was never stored. A real vault or
+/// `http_clients` persist failure is returned so uninstall cannot report Ok
+/// while the token is still live (SBS-845).
+fn revoke_client_http_token(state: &RegistryState, client_id: &str) -> Result<(), String> {
+    revoke_client_http_token_with(state, client_id, crate::secrets::delete_secret)
+}
+
+/// [`revoke_client_http_token`] with the vault delete injected.
+///
+/// Split out because the real vault is not reachable on every platform the
+/// tests run on: headless Linux CI has no Secret Service, and the macOS
+/// data-protection keychain needs a signed build (the same reason
+/// `secrets::tests::set_get_delete_round_trip` is `ignore`d there). A test that
+/// called it would assert on the machine rather than on this function, so tests
+/// pass a stub while production passes [`crate::secrets::delete_secret`].
+fn revoke_client_http_token_with(
+    state: &RegistryState,
+    client_id: &str,
+    delete_vaulted_token: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<(), String> {
     const VAULT_SERVER: &str = "__toolport_http_clients__";
     let http_id = format!("client:{client_id}");
-    let _ = crate::secrets::delete_secret(VAULT_SERVER, client_id);
-    let _ = write_registry(state, |reg| {
+    // Drop the registry row FIRST. `resolve_http_caller` authenticates a bearer
+    // through `http_client_for_token`, which matches the row's `token_sha256`;
+    // the vault copy is never consulted on the auth path. So the row is the
+    // thing that grants access, and removing it revokes the bearer even if the
+    // vault step below then fails. The reverse order fails open: a vault error
+    // would return early with the row still registered and the bearer still
+    // authenticating. An orphaned vault entry is a hygiene problem; a live
+    // bearer after a failed revoke is a security one.
+    write_registry(state, |reg| {
         reg.http_clients.retain(|c| c.id != http_id);
         Ok(())
-    });
+    })?;
+    // A failed persist above means nothing was revoked, so the vault copy is
+    // deliberately left alone: the bearer it belongs to is still registered.
+    // Past this point the bearer is already dead, but a vault failure is still
+    // returned, because uninstall must not report a clean Disconnect while a
+    // copy of the token is left on the machine.
+    delete_vaulted_token(VAULT_SERVER, client_id)?;
+    Ok(())
 }
 
 /// Remove the Toolport gateway from a client.
@@ -1074,8 +1198,9 @@ async fn uninstall_gateway(
         let state = app.state::<RegistryState>();
         let outcome = clients::uninstall_gateway(&client_id)?;
         // Config entry is gone; also revoke the bridge bearer so a leftover backup or
-        // stale token cannot keep authenticating (WS3-4).
-        revoke_client_http_token(state.inner(), &client_id);
+        // stale token cannot keep authenticating (WS3-4). A vault or registry
+        // failure must fail Disconnect — the bearer is still live (SBS-845).
+        revoke_client_http_token(state.inner(), &client_id)?;
         write_registry(state.inner(), |reg| {
             reg.set_client_scope(&client_id, None);
             reg.clear_client_managed_entry(&client_id);
@@ -1513,34 +1638,43 @@ async fn has_client_secret(server_id: String) -> Result<bool, String> {
 
 /// The most recent tool-call audit entries (newest first).
 #[tauri::command]
-async fn get_audit_log(limit: usize) -> Vec<serde_json::Value> {
+async fn get_audit_log(limit: usize) -> Result<Vec<serde_json::Value>, String> {
     // Async, like every polled reader here: Activity invokes these every few
     // seconds, and as sync commands the file reads ran on the GTK main loop,
     // where a large log made window controls intermittently dead on Linux
-    // (SBS-813). A join failure only means the worker panicked; return the
-    // benign empty shape rather than poisoning the poll loop.
-    tauri::async_runtime::spawn_blocking(move || audit::read_recent(limit))
-        .await
-        .unwrap_or_default()
+    // (SBS-813). An unreadable log or a join failure must reject so Activity
+    // can show error/retry instead of "No tool calls yet" (SBS-873).
+    tauri::async_runtime::spawn_blocking(move || {
+        audit::read_recent(limit).map_err(|e| format!("Couldn't read the activity log: {e}"))
+    })
+    .await
+    .map_err(|e| format!("activity log task join failed: {e}"))?
 }
 
 /// Aggregate the full retained audit log into per-server call/error/latency stats for
 /// the observability dashboard. Bounded by the log's byte cap, so totals are real.
 #[tauri::command]
-async fn audit_stats() -> serde_json::Value {
-    tauri::async_runtime::spawn_blocking(audit::stats)
-        .await
-        .unwrap_or(serde_json::Value::Null)
+async fn audit_stats() -> Result<serde_json::Value, String> {
+    // Rejects on the same unreadable log that makes `get_audit_log` reject. A
+    // `null` here only hides the dashboard, which reads as "no data" rather
+    // than "the read failed" (SBS-873).
+    tauri::async_runtime::spawn_blocking(|| {
+        audit::stats().map_err(|e| format!("Couldn't read the activity log: {e}"))
+    })
+    .await
+    .map_err(|e| format!("activity stats task join failed: {e}"))?
 }
 
 /// Recent tool-definition integrity events (newest first): a previously-approved
 /// tool whose definition changed (rug-pull signal) or a known server that added a
 /// tool. Powers the in-app security notices.
 #[tauri::command]
-async fn get_security_events(limit: usize) -> Vec<serde_json::Value> {
-    tauri::async_runtime::spawn_blocking(move || integrity::read_recent(limit))
-        .await
-        .unwrap_or_default()
+async fn get_security_events(limit: usize) -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        integrity::read_recent(limit).map_err(|e| format!("Couldn't read security events: {e}"))
+    })
+    .await
+    .map_err(|e| format!("security events task join failed: {e}"))?
 }
 
 /// Cumulative tool-definition tokens that lazy discovery has kept out of clients'
@@ -2202,10 +2336,12 @@ fn set_live_inspect(state: State<RegistryState>, enabled: bool) -> Result<Regist
 /// The most recent live-inspection captures (newest first): each tool call's args and
 /// result, only present while live inspection has been on. Empty when off/unused.
 #[tauri::command]
-async fn get_inspect_log(limit: usize) -> Vec<serde_json::Value> {
-    tauri::async_runtime::spawn_blocking(move || inspect::read_recent(limit))
-        .await
-        .unwrap_or_default()
+async fn get_inspect_log(limit: usize) -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        inspect::read_recent(limit).map_err(|e| format!("Couldn't read the inspector log: {e}"))
+    })
+    .await
+    .map_err(|e| format!("inspector log task join failed: {e}"))?
 }
 
 /// Clear the live-inspection ring (delete `inspect.jsonl`), so no captured args/results
@@ -2221,10 +2357,12 @@ fn clear_inspect_log() -> Result<(), String> {
 /// the whole catalog. The in-path proof that lazy discovery is working. Empty when
 /// nothing has searched yet.
 #[tauri::command]
-async fn get_search_traces(limit: usize) -> Vec<serde_json::Value> {
-    tauri::async_runtime::spawn_blocking(move || searchtrace::read_recent(limit))
-        .await
-        .unwrap_or_default()
+async fn get_search_traces(limit: usize) -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        searchtrace::read_recent(limit).map_err(|e| format!("Couldn't read search traces: {e}"))
+    })
+    .await
+    .map_err(|e| format!("search traces task join failed: {e}"))?
 }
 
 /// Clear the search-trace log (delete `search-trace.jsonl`).
@@ -2523,6 +2661,38 @@ fn release_quarantine(
     Ok(())
 }
 
+/// Re-approve every quarantined tool for a profile in one action.
+///
+/// A lost integrity baseline blocks the whole catalog at once, which on a real
+/// install is thousands of tools. Recovering through `release_quarantine` means one
+/// IPC round trip, one cross-process lock and two store writes per tool, so the
+/// only recovery the UI offered did not finish in practice. `integrity::release_all`
+/// does the same repair with a single pass. Tools whose captured definition could
+/// not be read stay blocked and come back in `skipped`, so this can never expose a
+/// tool without re-establishing its baseline.
+#[tauri::command]
+async fn release_all_quarantine(
+    app: AppHandle,
+    profile: String,
+) -> Result<integrity::ReleaseAllOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        let prof = if profile.is_empty() {
+            None
+        } else {
+            Some(profile.as_str())
+        };
+        let outcome = integrity::release_all(prof)
+            .map_err(|e| format!("Could not re-approve the blocked tools: {e}"))?;
+        // Same reasoning as `release_quarantine`: refresh the cache rather than
+        // blind-writing a possibly stale snapshot over a concurrent gateway write.
+        reload_into_state(state.inner())?;
+        Ok(outcome)
+    })
+    .await
+    .map_err(|e| format!("re-approval task join failed: {e}"))?
+}
+
 /// Set lazy discovery globally. The gateway reads this from the registry, so it
 /// takes effect for every client (including ones that don't forward env vars).
 /// Clients pick it up the next time they (re)spawn the gateway.
@@ -2600,12 +2770,26 @@ fn write_registry<T>(
     state: &RegistryState,
     f: impl FnOnce(&mut Registry) -> Result<T, String>,
 ) -> Result<(Registry, T), String> {
+    #[cfg(test)]
+    if FAIL_NEXT_REGISTRY_WRITE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err("injected registry write failure".into());
+    }
     let mut guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (reg, out) = registry::update(f)?;
     *guard = reg.clone();
     bump_registry_generation();
     Ok((reg, out))
 }
+
+/// Process-global test hook for SBS-845. Tests that set it must hold
+/// [`REVOKE_HOOK_LOCK`] so a leftover flag cannot leak into another case.
+/// The vault half of the revoke needs no hook: it is injected instead, via
+/// [`revoke_client_http_token_with`].
+#[cfg(test)]
+static FAIL_NEXT_REGISTRY_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static REVOKE_HOOK_LOCK: Mutex<()> = Mutex::new(());
 
 /// Bumped every time the in-memory registry cache is replaced, while the
 /// `RegistryState` mutex is held.
@@ -3086,7 +3270,7 @@ async fn authenticate_oauth(
     server_id: String,
     url: String,
 ) -> Result<(), String> {
-    let Some(_lock) = acquire_or_wait_oauth_lock(&server_id, &url)? else {
+    let Some(mut lock) = acquire_or_wait_oauth_lock(&server_id, &url)? else {
         // Another process completed the OAuth flow for this same server while we waited.
         return Ok(());
     };
@@ -3112,6 +3296,13 @@ async fn authenticate_oauth(
     .map_err(|e| could_not_finish_sign_in(&e))?;
     secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &res.access_token)
         .map_err(|e| could_not_store_token(&e))?;
+    // SBS-842: a waiter treats the completion file as "the other process
+    // authenticated", and the criterion for that is tokens vaulted, which just
+    // happened. The reload signal below is this process's own follow-up: it can
+    // fail and be reported to THIS user without telling a concurrent waiter that
+    // the sign-in failed, which would send it round the whole flow again for
+    // tokens that are already in the vault.
+    lock.mark_succeeded();
     bump_secrets_generation(state.inner()).map_err(|e| {
         // The vault half already succeeded; a fresh sign-in that never reaches the
         // gateway leaves the user staring at 401s from a server they just authenticated.
@@ -3143,6 +3334,9 @@ async fn search_catalog(query: String) -> Result<Vec<catalog::CatalogEntry>, Str
 }
 
 /// Which of a server's env keys currently have a value stored in the keychain.
+///
+/// Errs on a failed vault read instead of reporting `(key, false)` (SBS-841): a
+/// locked keychain must not make a vaulted env secret look like "not stored".
 #[tauri::command]
 async fn secret_status(server_id: String, keys: Vec<String>) -> Result<Vec<(String, bool)>, String> {
     // Async, like every keychain command here: a Secret Service read is a
@@ -3150,21 +3344,33 @@ async fn secret_status(server_id: String, keys: Vec<String>) -> Result<Vec<(Stri
     // slow keyring, and as sync commands they ran on the GTK main loop,
     // freezing window controls while a dialog probed the vault (SBS-813).
     //
-    // Errs rather than returning an empty list on a worker failure, for the same
-    // reason `has_auth_token` errs (SBS-789): the dialog treats a resolved list
-    // as authoritative and would mark every key unvaulted, while its `catch`
-    // leaves the badges alone. The polled readers below can absorb a panic as an
-    // empty result because they run again in seconds; this is a one-shot probe.
+    // Errs rather than returning an empty list on a worker failure, and rather
+    // than mapping a failed per-key read to `false`, for the same reason
+    // `has_auth_token` / `has_client_secret` err (SBS-789 / SBS-722 / SBS-841):
+    // the dialog treats a resolved list as authoritative and would mark every
+    // key unvaulted, while its `catch` leaves the badges alone. `get_secret`
+    // swallows a locked or failed keyring into `None`; the presence probe must
+    // use `get_secret_result` so that becomes `Err`. The polled readers below
+    // can absorb a panic as an empty result because they run again in seconds;
+    // this is a one-shot probe.
+    //
+    // All-or-nothing on purpose, rather than a per-key `Option<bool>`. The
+    // realistic failures are process-wide (locked keyring, no Secret Service,
+    // denied keychain access), so a per-key answer would report "unknown" for
+    // every key anyway, while pushing a third state through the dialog's
+    // `vaulted` map at every use site - badge, placeholder, Remove button. One
+    // `Err` maps to the one "couldn't check the keychain" warning the dialog
+    // now shows, and keeps the shape of `has_auth_token` / `has_client_secret`.
     tauri::async_runtime::spawn_blocking(move || {
         keys.into_iter()
             .map(|k| {
-                let present = secrets::get_secret(&server_id, &k).is_some();
-                (k, present)
+                let present = secrets::get_secret_result(&server_id, &k)?.is_some();
+                Ok((k, present))
             })
-            .collect()
+            .collect::<Result<Vec<_>, String>>()
     })
     .await
-    .map_err(|e| format!("keychain task join failed: {e}"))
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 /// Open Toolport's data directory (registry, logs, audit) in the OS file manager,
@@ -3236,7 +3442,8 @@ fn export_config_to_path(
 /// log, which the audit module already caps.
 #[tauri::command]
 fn export_audit_to_path(path: String, format: String) -> Result<(), String> {
-    let entries = audit::read_recent(usize::MAX);
+    let entries = audit::read_recent(usize::MAX)
+        .map_err(|e| format!("Couldn't read the activity log: {e}"))?;
     let body = if format == "csv" {
         audit::to_csv(&entries)
     } else {
@@ -4609,6 +4816,49 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Launch-at-login enable. On Linux this writes the XDG autostart entry with
+/// `$APPIMAGE` when set, so AppImage sessions do not register the FUSE mount
+/// (`/tmp/.mount_*`) that `current_exe` returns. Other platforms keep the
+/// autostart plugin (`current_exe`).
+#[tauri::command]
+fn enable_launch_at_login(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        return crate::autostart::enable_linux(&app.package_info().name);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        app.autolaunch().enable().map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+fn disable_launch_at_login(app: AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        return crate::autostart::disable_linux(&app.package_info().name);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        app.autolaunch().disable().map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+fn is_launch_at_login_enabled(app: AppHandle) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    {
+        return crate::autostart::is_enabled_linux(&app.package_info().name);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        app.autolaunch().is_enabled().map_err(|e| e.to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // `generate_context!()` must expand exactly once in this crate: on macOS dev
@@ -4688,6 +4938,8 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         // Launch at login (opt-in via Settings). `--hidden` is passed on auto-launch so
         // the app starts to the tray without flashing a window (see setup()).
+        // Linux AppImage sessions do not use this plugin's path: Settings goes
+        // through enable_launch_at_login, which writes $APPIMAGE (SBS-844).
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--hidden"]),
@@ -4780,6 +5032,7 @@ pub fn run() {
             set_pii_redaction,
             list_quarantined,
             release_quarantine,
+            release_all_quarantine,
             set_lazy_discovery,
             set_code_mode,
             set_allow_routine_writes,
@@ -4821,6 +5074,9 @@ pub fn run() {
             recover_update_gateways,
             stop_stale_gateways,
             clients_needing_restart,
+            enable_launch_at_login,
+            disable_launch_at_login,
+            is_launch_at_login_enabled,
         ])
         // Close-to-tray: the window's X hides it instead of quitting, so the gateway and
         // approval broker keep running (HITL only works while the app is alive). Quit is
@@ -4842,6 +5098,11 @@ pub fn run() {
         })
         .setup(|app| {
             let handle = app.handle();
+
+            // AppImage launch-at-login: if a previous session registered the
+            // ephemeral FUSE mount, rewrite Exec to $APPIMAGE (SBS-844).
+            #[cfg(target_os = "linux")]
+            crate::autostart::repair_linux(&app.package_info().name);
 
             // Build the tray icon, then show the window - unless launched with `--hidden`
             // (auto-start at login), in which case we start straight to the tray. The
@@ -5244,6 +5505,64 @@ mod tests {
         );
     }
 
+    /// Same fail-closed contract as `has_client_secret` (SBS-841): a locked or
+    /// otherwise failed vault read must not resolve to `(key, false)`, which the
+    /// Secrets dialog treats as "not vaulted" and would overwrite. The reserved
+    /// internal namespace is the deterministic way to make `get_secret_result`
+    /// fail on every platform; `get_secret` swallows that into `None`.
+    #[test]
+    fn secret_status_reports_a_failed_read_as_an_error_not_missing() {
+        let result = tauri::async_runtime::block_on(secret_status(
+            "__toolport_internal__".to_string(),
+            vec!["SOME_KEY".to_string()],
+        ));
+        assert!(
+            result.is_err(),
+            "a failed secret read must propagate, not resolve to unvaulted: {result:?}"
+        );
+    }
+
+    /// An unreadable activity log must reject `audit_stats`, not resolve to
+    /// `null` (SBS-873). Activity hides the dashboard on `null`, so a failed
+    /// read looked like "no data" while `get_audit_log` on the same file
+    /// rejected.
+    #[test]
+    fn audit_stats_rejects_an_unreadable_activity_log() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = unique_update_test_dir("audit-stats-unreadable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let path = audit::audit_path().expect("audit path under override");
+        // IsADirectory: the log path exists but cannot be read as a file.
+        std::fs::create_dir_all(&path).unwrap();
+
+        let result = tauri::async_runtime::block_on(audit_stats());
+        assert!(
+            result.is_err(),
+            "a failed activity-log read must reject, not resolve to null: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the contract: a missing log is an honest empty
+    /// dashboard, so a first run still resolves.
+    #[test]
+    fn audit_stats_resolves_when_the_activity_log_is_missing() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = unique_update_test_dir("audit-stats-missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let path = audit::audit_path().expect("audit path under override");
+        assert!(!path.exists(), "fixture must not create the log");
+
+        let stats = tauri::async_runtime::block_on(audit_stats())
+            .expect("a missing log is an empty dashboard, not a failure");
+        assert!(stats.is_object(), "expected aggregated stats: {stats}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn github_with_secret() -> ServerEntry {
         ServerEntry {
             id: "gh".into(),
@@ -5596,6 +5915,162 @@ mod tests {
         let _ = std::fs::remove_file(stale_done);
         let _ = std::fs::remove_file(oauth_completion_path(&path, &attempt_id));
         let _ = std::fs::remove_file(path);
+    }
+
+    fn unique_oauth_lock_path(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("conduit-oauth-lock-{label}-{unique}.lock"))
+    }
+
+    fn cleanup_oauth_lock(path: &std::path::Path, attempt_ids: &[&str]) {
+        for attempt_id in attempt_ids {
+            let _ = std::fs::remove_file(oauth_completion_path(path, attempt_id));
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn oauth_lock_drop_without_success_is_a_failed_completion() {
+        let path = unique_oauth_lock_path("fail-drop");
+        let lock = try_acquire_oauth_lock(&path)
+            .expect("lock acquisition should not fail")
+            .expect("lock should be acquired");
+        let attempt_id = lock.attempt_id.clone();
+        drop(lock);
+        assert_eq!(
+            read_oauth_completion(&path, &attempt_id),
+            Some(OAuthCompletion::Failed),
+            "Drop without mark_succeeded must not look like a finished sign-in"
+        );
+        assert_eq!(
+            oauth_waiter_outcome(&path, &attempt_id)
+                .expect("failure completion should produce an outcome")
+                .expect_err("waiter must not treat a failed flow as success"),
+            "another Toolport process failed to complete OAuth for this server"
+        );
+        cleanup_oauth_lock(&path, &[&attempt_id]);
+    }
+
+    #[test]
+    fn oauth_lock_drop_after_success_is_an_ok_completion() {
+        let path = unique_oauth_lock_path("ok-drop");
+        let mut lock = try_acquire_oauth_lock(&path)
+            .expect("lock acquisition should not fail")
+            .expect("lock should be acquired");
+        let attempt_id = lock.attempt_id.clone();
+        lock.mark_succeeded();
+        drop(lock);
+        assert_eq!(
+            read_oauth_completion(&path, &attempt_id),
+            Some(OAuthCompletion::Succeeded)
+        );
+        assert!(
+            oauth_waiter_outcome(&path, &attempt_id)
+                .expect("success completion should produce an outcome")
+                .is_ok(),
+            "a vaulted first flow must still let a waiter treat the attempt as done"
+        );
+        cleanup_oauth_lock(&path, &[&attempt_id]);
+    }
+
+    #[test]
+    fn oauth_waiter_returns_err_when_first_flow_fails() {
+        let path = unique_oauth_lock_path("fail-wait");
+        let lock = try_acquire_oauth_lock(&path)
+            .expect("lock acquisition should not fail")
+            .expect("lock should be acquired");
+        let first_attempt = lock.attempt_id.clone();
+        let wait_path = path.clone();
+        let waiter = std::thread::spawn(move || acquire_or_wait_oauth_lock_at(&wait_path));
+        // Let the waiter observe the live lock before we fail it (SBS-842).
+        std::thread::sleep(Duration::from_millis(OAUTH_LOCK_POLL_MS * 2));
+        drop(lock);
+        let outcome = waiter.join().expect("waiter thread should finish");
+        let err = match outcome {
+            Err(e) => e,
+            Ok(None) => panic!("failed first flow must not report waiter success"),
+            Ok(Some(_)) => panic!("failed first flow must not start a second browser"),
+        };
+        assert!(
+            err.contains("failed to complete OAuth"),
+            "unexpected waiter error: {err}"
+        );
+        cleanup_oauth_lock(&path, &[&first_attempt]);
+    }
+
+    #[test]
+    fn oauth_waiter_returns_ok_none_when_first_flow_succeeds() {
+        let path = unique_oauth_lock_path("ok-wait");
+        let mut lock = try_acquire_oauth_lock(&path)
+            .expect("lock acquisition should not fail")
+            .expect("lock should be acquired");
+        let first_attempt = lock.attempt_id.clone();
+        let wait_path = path.clone();
+        let waiter = std::thread::spawn(move || acquire_or_wait_oauth_lock_at(&wait_path));
+        std::thread::sleep(Duration::from_millis(OAUTH_LOCK_POLL_MS * 2));
+        lock.mark_succeeded();
+        drop(lock);
+        let outcome = waiter.join().expect("waiter thread should finish");
+        match outcome {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!(
+                "successful first flow should let the waiter finish without a second browser"
+            ),
+            Err(e) => panic!("successful first flow should not error the waiter: {e}"),
+        }
+        cleanup_oauth_lock(&path, &[&first_attempt]);
+    }
+
+    #[test]
+    fn truncated_completion_file_is_not_a_failure_verdict() {
+        let path = unique_oauth_lock_path("torn-read");
+        let attempt_id = "attempt-torn-read";
+        let completion = oauth_completion_path(&path, attempt_id);
+        // Every shape a reader can catch while a writer is mid-write: the file
+        // exists but the verdict is not in it yet.
+        for partial in ["", "\n", "status=", "status=o"] {
+            std::fs::write(&completion, partial).expect("partial completion should be writable");
+            assert_eq!(
+                read_oauth_completion(&path, attempt_id),
+                None,
+                "a partially written completion ({partial:?}) must read as no verdict yet, not as failure"
+            );
+            assert!(
+                oauth_waiter_outcome(&path, attempt_id).is_none(),
+                "a partially written completion ({partial:?}) must not resolve the waiter"
+            );
+        }
+        cleanup_oauth_lock(&path, &[attempt_id]);
+    }
+
+    #[test]
+    fn oauth_waiter_keeps_polling_through_a_torn_completion_file() {
+        let path = unique_oauth_lock_path("torn-wait");
+        let mut lock = try_acquire_oauth_lock(&path)
+            .expect("lock acquisition should not fail")
+            .expect("lock should be acquired");
+        let first_attempt = lock.attempt_id.clone();
+        let wait_path = path.clone();
+        let waiter = std::thread::spawn(move || acquire_or_wait_oauth_lock_at(&wait_path));
+        // Let the waiter latch the live attempt id off the lock file.
+        std::thread::sleep(Duration::from_millis(OAUTH_LOCK_POLL_MS * 2));
+        // Stand in for the truncate half of a non-atomic completion write: the file
+        // is there, the bytes are not.
+        std::fs::write(oauth_completion_path(&path, &first_attempt), "")
+            .expect("torn completion should be writable");
+        std::thread::sleep(Duration::from_millis(OAUTH_LOCK_POLL_MS * 3));
+        // ...and only now does the first window finish vaulting its tokens.
+        lock.mark_succeeded();
+        drop(lock);
+        match waiter.join().expect("waiter thread should finish") {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("successful first flow should not start a second browser"),
+            Err(e) => panic!("a torn completion read must not be reported as a failed sign-in: {e}"),
+        }
+        cleanup_oauth_lock(&path, &[&first_attempt]);
     }
 
     #[test]
@@ -6908,5 +7383,227 @@ mod tests {
         assert_eq!(supplied_secret(Some("   ".into())), None);
         assert_eq!(supplied_secret(Some("\t\n".into())), None);
         assert_eq!(supplied_secret(None), None);
+    }
+
+    // ----- SBS-845: Disconnect must not succeed while the bearer is still live --
+    //
+    // These drive `revoke_client_http_token_with` rather than the real vault:
+    // headless Linux CI has no Secret Service, so a real `delete_secret` fails
+    // there and every case would assert on the runner instead of on the revoke
+    // logic. What is under test is which failures propagate and what each one
+    // leaves behind, so the vault result is injected.
+
+    fn fail_next_registry_write() {
+        FAIL_NEXT_REGISTRY_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn clear_revoke_hooks() {
+        FAIL_NEXT_REGISTRY_WRITE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Scratch data dir + seeded `http_clients` row. Holds the process-global
+    /// hook lock and `data_dir_test_lock` so persist and injected failures cannot
+    /// interleave with another test.
+    ///
+    /// Field order IS drop order (unlike locals, struct fields drop in declaration
+    /// order), so the override is declared before the guards that protect it. The
+    /// other way round, teardown released `data_dir_test_lock` while this fixture's
+    /// `DataDirOverride` was still installed; the next test could take the lock and
+    /// install its own override, only for this drop to land and clear it. That
+    /// test's `registry::load()` then read the REAL data dir, where its seeded
+    /// `http_clients` row does not exist.
+    struct RevokeFixture {
+        _override: crate::registry::DataDirOverride,
+        _data_dir: std::sync::MutexGuard<'static, ()>,
+        _hooks: std::sync::MutexGuard<'static, ()>,
+        state: RegistryState,
+        client_id: String,
+        http_id: String,
+    }
+
+    impl Drop for RevokeFixture {
+        fn drop(&mut self) {
+            clear_revoke_hooks();
+        }
+    }
+
+    impl RevokeFixture {
+        fn new(label: &str) -> Self {
+            let hooks = REVOKE_HOOK_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            clear_revoke_hooks();
+            let data_dir = crate::registry::data_dir_test_lock();
+            let dir = unique_update_test_dir(label);
+            std::fs::create_dir_all(&dir).unwrap();
+            let over = crate::registry::DataDirOverride::set(&dir);
+            let client_id = "cursor".to_string();
+            let http_id = format!("client:{client_id}");
+            let mut reg = Registry::default();
+            reg.http_clients.push(registry::HttpClient {
+                id: http_id.clone(),
+                label: format!("Client: {client_id}"),
+                token_sha256: registry::sha256_hex("leftover-bearer"),
+                profile: String::new(),
+            });
+            registry::save(&reg).unwrap();
+            Self {
+                _override: over,
+                _data_dir: data_dir,
+                _hooks: hooks,
+                state: Mutex::new(reg),
+                client_id,
+                http_id,
+            }
+        }
+
+        fn http_row_present(&self) -> bool {
+            let on_disk = registry::load().expect("scratch registry loads");
+            on_disk.http_clients.iter().any(|c| c.id == self.http_id)
+        }
+    }
+
+    /// SBS-840 class, the instance left behind by that sweep. A failed vault READ
+    /// must not fall through to minting a replacement bearer. `get_secret` collapsed
+    /// a read error into `None`, which looks exactly like "this client has no bearer
+    /// yet", so the mint path overwrote the vaulted copy and `retain`ed the client's
+    /// `http_clients` row away for a new one. The bearer the client was already
+    /// configured with then hashed to no row, so every request it made 401'd until
+    /// the user reconnected that client by hand.
+    #[test]
+    fn ensure_client_http_token_propagates_a_failed_vault_read_instead_of_minting() {
+        let fixture = RevokeFixture::new("sbs-840-ensure-read");
+
+        let err = ensure_client_http_token_with(
+            &fixture.state,
+            &fixture.client_id,
+            None,
+            |_server, _client| Err("the keychain is locked".into()),
+        )
+        .expect_err("a failed vault read must not mint a replacement bearer");
+
+        assert!(
+            err.starts_with("Could not read the saved token"),
+            "the vault read failure must reach the caller as a complete sentence \
+             (the frontend renders it verbatim), got: {err}"
+        );
+        assert!(
+            err.contains("the keychain is locked"),
+            "the underlying cause must survive, got: {err}"
+        );
+        // The `expect_err` above is what pins the reported bug; today's mint path
+        // returns `Ok`, so execution never reaches here under it.
+        //
+        // This guards the ORDERING invariant instead: nothing may error out after
+        // already replacing the row. Assert the HASH rather than the id, because the
+        // mint path `retain`s the old row away and pushes a new one under the SAME
+        // id, so an id-only check cannot tell a surviving bearer from a replaced one.
+        // `http_client_for_token` matches on `token_sha256`, so that is what decides
+        // whether the client's configured token still authenticates.
+        let on_disk = registry::load().expect("scratch registry loads");
+        let row = on_disk
+            .http_clients
+            .iter()
+            .find(|c| c.id == fixture.http_id)
+            .expect("a failed vault read must not drop the client's http_clients row");
+        assert_eq!(
+            row.token_sha256,
+            registry::sha256_hex("leftover-bearer"),
+            "the row must still carry the ORIGINAL bearer's hash; a new hash means a \
+             replacement was minted and the client's configured token is now dead"
+        );
+    }
+
+    /// The reuse path is unchanged by the fix: a confirmed vaulted token that still
+    /// matches a registered row is handed back as-is, with nothing minted. Guards
+    /// against over-correcting the above into "never reuse".
+    #[test]
+    fn ensure_client_http_token_reuses_a_vaulted_token_that_matches_its_row() {
+        let fixture = RevokeFixture::new("sbs-840-ensure-reuse");
+
+        let token = ensure_client_http_token_with(
+            &fixture.state,
+            &fixture.client_id,
+            None,
+            // The fixture's row is registered against this exact token.
+            |_server, _client| Ok(Some("leftover-bearer".to_string())),
+        )
+        .expect("a matching vaulted token must be reused");
+
+        assert_eq!(token, "leftover-bearer");
+        assert!(fixture.http_row_present());
+    }
+
+    #[test]
+    fn revoke_client_http_token_fails_when_vault_delete_fails() {
+        let fixture = RevokeFixture::new("sbs-845-vault-delete");
+        let err =
+            revoke_client_http_token_with(&fixture.state, &fixture.client_id, |_server, _client| {
+                Err("the keychain is locked".into())
+            })
+            .expect_err("a failed vault delete must not look like a successful disconnect");
+        assert!(
+            err.contains("the keychain is locked"),
+            "the vault failure must reach the caller verbatim, got: {err}"
+        );
+        // The point of the ordering: the row is dropped before the vault is
+        // touched, so a keychain failure still revokes the bearer. The caller
+        // is told the disconnect was not clean (an orphaned vault entry is
+        // left), but the token can no longer authenticate.
+        assert!(
+            !fixture.http_row_present(),
+            "the bearer must be revoked even when the vault delete fails"
+        );
+    }
+
+    #[test]
+    fn revoke_client_http_token_fails_when_registry_write_fails() {
+        let fixture = RevokeFixture::new("sbs-845-registry-write");
+        let vault_called = std::cell::Cell::new(false);
+        fail_next_registry_write();
+        let err =
+            revoke_client_http_token_with(&fixture.state, &fixture.client_id, |_server, _client| {
+                vault_called.set(true);
+                Ok(())
+            })
+            .expect_err("a failed http_clients persist must not look like a successful disconnect");
+        assert!(
+            err.contains("injected registry write"),
+            "expected the injected registry failure, got: {err}"
+        );
+        assert!(
+            fixture.http_row_present(),
+            "a failed persist must leave the http_clients row registered"
+        );
+        // Nothing was revoked, so the vault copy must survive: it still belongs
+        // to a bearer that is registered and can authenticate. Deleting it here
+        // would strip Toolport's own record of a token that still works.
+        assert!(
+            !vault_called.get(),
+            "a failed persist must not delete the vaulted bearer"
+        );
+    }
+
+    #[test]
+    fn revoke_client_http_token_drops_the_http_clients_row() {
+        let fixture = RevokeFixture::new("sbs-845-success");
+        let deleted = std::cell::RefCell::new(Vec::new());
+        revoke_client_http_token_with(&fixture.state, &fixture.client_id, |server, client| {
+            deleted.borrow_mut().push((server.to_string(), client.to_string()));
+            Ok(())
+        })
+        .expect("a successful vault delete must not block Disconnect");
+        assert_eq!(
+            deleted.into_inner(),
+            vec![(
+                "__toolport_http_clients__".to_string(),
+                fixture.client_id.clone()
+            )],
+            "the vaulted bearer must be deleted under the shared-HTTP namespace"
+        );
+        assert!(
+            !fixture.http_row_present(),
+            "success means the bearer is gone from the registry"
+        );
     }
 }

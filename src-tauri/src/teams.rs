@@ -732,9 +732,15 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         Some(applied) => applied,
     };
     // Write/refresh the org instructions to each installed client's rules file (skips unless the
-    // content actually changed). Outside the lock, best-effort, never fails the sync.
-    if let Some((version, desired)) = desired_instr {
-        apply_instructions(&conn.team_id, version, desired.as_deref());
+    // content actually changed, or a target moved). Outside the lock, best-effort, never fails
+    // the sync.
+    match desired_instr {
+        Some((version, desired)) => apply_instructions(&conn.team_id, version, desired.as_deref()),
+        // A 304 means the org text is unchanged, but a release can still move where a client
+        // reads its rules from (Goose/Zed under XDG, SBS-899). Re-run against the content we
+        // already applied so the block relocates on the next quiet cycle rather than waiting for
+        // an admin edit; `apply_instructions` returns immediately unless a target really moved.
+        None => relocate_stored_instructions(&conn.team_id),
     }
     // Best-effort showback after the config work: report today's/yesterday's per-server
     // usage rollup to the team server. Any failure here must never affect the sync
@@ -804,7 +810,11 @@ fn report_usage(conn: &TeamConnection, token: &str) {
     if team_servers.is_empty() {
         return;
     }
-    let audit_lines = crate::audit::read_recent(usize::MAX);
+    // An unreadable audit log is not "zero usage". Skip this cycle rather than
+    // POST a false empty report (SBS-873).
+    let Ok(audit_lines) = crate::audit::read_recent(usize::MAX) else {
+        return;
+    };
     let savings_lines = crate::savings::entries();
     let mut new_state: HashMap<String, HashMap<String, [u64; 2]>> = HashMap::new();
     let mut changed = false;
@@ -876,12 +886,81 @@ fn desired_instructions(cfg: &serde_json::Value) -> Option<String> {
     (enabled && !content.trim().is_empty()).then(|| content.to_string())
 }
 
+/// Every installed client's rules target, de-duped by path so a file two clients share (e.g.
+/// Gemini/Antigravity) is only written once. Split out of [`apply_instructions`] so a test can
+/// drive an apply over a known target set instead of over the developer's real machine.
+fn installed_rules_targets() -> Vec<crate::instructions::Target> {
+    let mut seen_paths = std::collections::HashSet::new();
+    crate::clients::detect_clients()
+        .into_iter()
+        // Only write into clients that are actually installed, so we never scatter rules files
+        // into an absent client's home.
+        .filter(|client| client.app_present)
+        // `None` = unsupported or covered transitively (Antigravity/Copilot).
+        .filter_map(|client| crate::clients::client_rules_target(&client.id))
+        .filter(|target| seen_paths.insert(target.path.clone()))
+        .collect()
+}
+
+/// True when a current target is a path we have never written AND does not already hold the
+/// current block. That is the signature of a RELOCATED rules file: the org text is unchanged, so
+/// the hash skip in [`apply_instructions_to`] would fire, but a release moved where the client
+/// reads its rules from (Goose/Zed following `XDG_CONFIG_HOME` or `GOOSE_PATH_ROOT`, SBS-899).
+/// Without this a member who upgrades in place keeps the block at the OLD path forever and
+/// coverage reports Stale until an admin happens to edit the text.
+///
+/// Reusing `current_state` keeps the check from spinning the sync loop: a target that can never
+/// be written (a Codex shadow file, an over-cap Windsurf file) never lands in the recorded set,
+/// but it reports `BlockedOverride` / `TooLong` rather than `Stale`, so it is not read as a
+/// relocation and does not make every cycle rewrite every rules file.
+fn targets_relocated(
+    team_id: &str,
+    version: i64,
+    content: &str,
+    targets: &[crate::instructions::Target],
+    recorded: &[String],
+) -> bool {
+    use crate::instructions::{self, ApplyState};
+    targets.iter().any(|target| {
+        let key = target.path.to_string_lossy().to_string();
+        !recorded.iter().any(|old| *old == key)
+            && instructions::current_state(target, team_id, version, content) == ApplyState::Stale
+    })
+}
+
 /// Write (or remove) the org Team Instructions across every installed client's rules file after
 /// a config change (spec "W2"). Best-effort and run OUTSIDE the registry lock — a failure here
 /// must never affect the already-applied, already-saved server config. Skips entirely when the
-/// org content is unchanged since the last write (hash match), so the ~25s sync loop only ever
-/// touches rules files when an admin actually edits the instructions.
+/// org content is unchanged since the last write (hash match) and every client's rules file is
+/// still at the path we wrote it to, so the ~25s sync loop only ever touches rules files when an
+/// admin actually edits the instructions or a target moves ([`targets_relocated`]).
 fn apply_instructions(team_id: &str, version: i64, desired: Option<&str>) {
+    apply_instructions_to(team_id, version, desired, &installed_rules_targets());
+}
+
+/// Re-run [`apply_instructions`] with the content already on record, so a moved rules path is
+/// still picked up on a cycle that pulled nothing (HTTP 304). A no-op when the team has no
+/// instructions, and [`apply_instructions`] itself is a no-op unless a target moved.
+fn relocate_stored_instructions(team_id: &str) {
+    let Ok(reg) = crate::registry::load() else {
+        return;
+    };
+    let Some(team) = reg.team.as_ref().filter(|t| t.team_id == team_id) else {
+        return;
+    };
+    let Some(content) = team.team_instructions_content.clone() else {
+        return;
+    };
+    apply_instructions(team_id, team.team_instructions_version, Some(&content));
+}
+
+/// [`apply_instructions`] over an explicit target set.
+fn apply_instructions_to(
+    team_id: &str,
+    version: i64,
+    desired: Option<&str>,
+    targets: &[crate::instructions::Target],
+) {
     use crate::instructions::{self, ApplyState};
     // Prior state: only act if still connected to THIS team.
     let (prev_content, prev_targets) = match crate::registry::load() {
@@ -894,28 +973,24 @@ fn apply_instructions(team_id: &str, version: i64, desired: Option<&str>) {
         },
         Err(_) => return,
     };
-    if desired == prev_content.as_deref() {
-        return; // content unchanged — nothing to write or clean up (coverage is re-checked and
-                // reported every cycle by `report_instructions_status`, independent of this)
+    // Skip only when the content AND the target paths are both unchanged. A release that moves
+    // where a client reads its rules from (Goose/Zed under XDG, SBS-899) leaves the org text
+    // identical, so the content check on its own would return here and strand an existing
+    // member's block at the old path until an admin happened to edit the instructions.
+    let relocated = desired.is_some_and(|content| {
+        targets_relocated(team_id, version, content, targets, &prev_targets)
+    });
+    if desired == prev_content.as_deref() && !relocated {
+        return; // content unchanged and every target is still where we left it, so there is
+                // nothing to write or clean up (coverage is re-checked and reported every cycle
+                // by `report_instructions_status`, independent of this)
     }
 
     let mut written: Vec<String> = Vec::new();
     if let Some(content) = desired {
-        let mut seen_paths = std::collections::HashSet::new();
-        for client in crate::clients::detect_clients() {
-            // Only write into clients that are actually installed, so we never scatter rules
-            // files into an absent client's home.
-            if !client.app_present {
-                continue;
-            }
-            let Some(target) = crate::clients::client_rules_target(&client.id) else {
-                continue; // unsupported or covered transitively (Antigravity/Copilot)
-            };
+        for target in targets {
             let key = target.path.to_string_lossy().to_string();
-            if !seen_paths.insert(key.clone()) {
-                continue; // a shared file (e.g. Gemini/Antigravity) already handled this round
-            }
-            if instructions::write_target(&target, team_id, version, content) == ApplyState::Applied
+            if instructions::write_target(target, team_id, version, content) == ApplyState::Applied
             {
                 written.push(key);
             }
@@ -1158,7 +1233,11 @@ fn report_call_events(conn: &TeamConnection, token: &str) {
     if !enabled {
         return;
     }
-    let lines = crate::audit::read_recent(usize::MAX);
+    // An unreadable audit log is not "no new calls". Skip this cycle rather
+    // than POST an empty batch that would advance nothing honestly (SBS-873).
+    let Ok(lines) = crate::audit::read_recent(usize::MAX) else {
+        return;
+    };
     let mut batch: Vec<Value> = Vec::new();
     let mut max_ts = cursor;
     for line in &lines {
@@ -1846,6 +1925,96 @@ mod tests {
         ] {
             assert_eq!(desired_instructions(&cfg), None, "should mean removal: {cfg}");
         }
+    }
+
+    /// SBS-899: a release that MOVES where a client reads its rules from must relocate an
+    /// already-applied block. The org text is unchanged, so the content-hash skip used to return
+    /// before writing anything: the new path stayed empty and coverage reported Stale until an
+    /// admin happened to edit the instructions.
+    #[test]
+    fn apply_instructions_relocates_a_block_whose_target_path_moved() {
+        const TEAM: &str = "team_relocate";
+        const CONTENT: &str = "Use the approved issue workflow.";
+        const VERSION: i64 = 4;
+        use crate::instructions::{ApplyState, Strategy, Target};
+
+        // Both guards: the test sets GOOSE_PATH_ROOT and redirects the data dir, and both are
+        // process-global.
+        let _env = crate::clients::env_test_lock();
+        let _dirs = crate::registry::data_dir_test_lock();
+        let base = std::env::temp_dir().join(format!("toolport-relocate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let _data_dir = crate::registry::DataDirOverride::set(base.join("data"));
+        // Stands in for the pre-fix `~/.config/goose/.goosehints` (a test must not write into the
+        // developer's real home). An absolute GOOSE_PATH_ROOT then puts the live target at
+        // `<root>/config/.goosehints`, exactly the move this PR introduces.
+        let old_path = base
+            .join("old-home")
+            .join(".config")
+            .join("goose")
+            .join(".goosehints");
+        let root = base.join("goose-root");
+        let _root = crate::clients::EnvRestore::set("GOOSE_PATH_ROOT", &root);
+
+        let old_target = Target {
+            path: old_path.clone(),
+            strategy: Strategy::SentinelBlock,
+            char_cap: None,
+            blocked_if_present: None,
+        };
+        assert_eq!(
+            crate::instructions::write_target(&old_target, TEAM, VERSION, CONTENT),
+            ApplyState::Applied,
+            "fixture: the previous release's block at the old path"
+        );
+        let conn: TeamConnection = serde_json::from_value(json!({
+            "serverUrl": "https://teams.example.com",
+            "teamId": TEAM,
+            "role": "member",
+            "teamInstructionsContent": CONTENT,
+            "teamInstructionsVersion": VERSION,
+            "teamInstructionsTargets": [old_path.to_string_lossy()],
+        }))
+        .expect("team connection fixture");
+        crate::registry::update(|reg| {
+            reg.team = Some(conn.clone());
+            Ok(())
+        })
+        .expect("seed the registry");
+
+        let target = crate::clients::client_rules_target("goose").expect("goose rules target");
+        assert_eq!(
+            target.path,
+            root.join("config").join(".goosehints"),
+            "fixture: GOOSE_PATH_ROOT must move the live target"
+        );
+
+        // Same content, same version. Only the PATH moved.
+        apply_instructions_to(TEAM, VERSION, Some(CONTENT), std::slice::from_ref(&target));
+
+        let moved = std::fs::read_to_string(&target.path).unwrap_or_default();
+        let recorded = crate::registry::load()
+            .ok()
+            .and_then(|reg| reg.team)
+            .map(|t| t.team_instructions_targets)
+            .unwrap_or_default();
+        let old_left_behind = old_path.exists();
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(
+            moved.contains(crate::instructions::SENTINEL_START_PREFIX) && moved.contains(CONTENT),
+            "the block must be rewritten at the new path, not skipped as unchanged content"
+        );
+        assert!(
+            !old_left_behind,
+            "the old file held only our block, so cleanup must remove it rather than leave a \
+             stale duplicate"
+        );
+        assert_eq!(
+            recorded,
+            vec![target.path.to_string_lossy().to_string()],
+            "the recorded target must follow the move, so leave/disconnect cleans up the right file"
+        );
     }
 
     #[test]

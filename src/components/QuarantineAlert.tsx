@@ -1,8 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ShieldAlert } from "lucide-react";
-import { listQuarantined, releaseQuarantine, type QuarantinedTool } from "@/lib/api";
+import { toast } from "sonner";
+import {
+  listQuarantined,
+  releaseAllQuarantine,
+  releaseQuarantine,
+  type QuarantinedTool,
+} from "@/lib/api";
 import { toastError } from "@/lib/toast";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { fmtTs } from "@/lib/utils";
 
 /** Matches the PendingApprovals cadence so the two attention surfaces feel equally live. */
@@ -56,6 +63,7 @@ function whenLabel(ts: number): string {
 export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
   const [items, setItems] = useState<QuarantinedTool[]>([]);
   const [releasing, setReleasing] = useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
   const [dismissedFor, setDismissedFor] = useState<string | null>(null);
   // Monotonic request id: `release` refreshes while the interval may already have a poll
   // in flight, so an older response can land last and momentarily resurrect a tool the
@@ -98,6 +106,60 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
         next.delete(k);
         return next;
       });
+    }
+  }
+
+  /**
+   * Re-approve everything on the card in one action.
+   *
+   * A lost integrity baseline blocks the entire catalog, which is thousands of tools
+   * on a real install. Clearing that one row at a time is not something anyone will
+   * do, so without this the card is an unusable wall and the app is effectively
+   * stuck. The backend repairs each baseline in a single pass and refuses to expose
+   * any tool whose captured definition it could not read, so those stay listed.
+   */
+  async function releaseEverything() {
+    setBulkBusy(true);
+    try {
+      // The card can span profiles (the same tool may be blocked in one and fine in
+      // another), and the store is per-profile, so clear each one it covers.
+      const profiles = [...new Set(items.map((q) => q.profile))];
+      // allSettled, not all: one profile's store being locked must not throw away the
+      // outcome of the profiles that did succeed, nor skip the refresh that takes
+      // their tools off the card. With Promise.all the card kept listing tools that
+      // were already released, and the count never came down.
+      const settled = await Promise.allSettled(
+        profiles.map((p) => releaseAllQuarantine(p)),
+      );
+      const outcomes = settled.flatMap((r) =>
+        r.status === "fulfilled" ? [r.value] : [],
+      );
+      const failed = settled.flatMap((r) => (r.status === "rejected" ? [r.reason] : []));
+      const released = outcomes.reduce((n, o) => n + o.released, 0);
+      const skipped = outcomes.flatMap((o) => o.skipped);
+      await refresh();
+      if (failed.length > 0) {
+        // Say what did get through, so the number still on the card adds up.
+        toastError(
+          `Re-approved ${released}. ${failed.length} profile${
+            failed.length === 1 ? "" : "s"
+          } could not be re-approved: ${failed[0]}`,
+        );
+      } else if (skipped.length > 0) {
+        // Not a success: these are still blocked, and saying otherwise would send the
+        // user away believing the catalog is whole.
+        toastError(
+          `Re-approved ${released}. ${skipped.length} could not be repaired and ${
+            skipped.length === 1 ? "is" : "are"
+          } still blocked.`,
+        );
+      } else {
+        toast.success(`Re-approved ${released} tool${released === 1 ? "" : "s"}`);
+      }
+    } catch (e) {
+      toastError(`Couldn't re-approve the blocked tools: ${e}`);
+    } finally {
+      setBulkBusy(false);
     }
   }
 
@@ -171,6 +233,35 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
         </ul>
 
         <div className="flex items-center justify-end gap-2 border-t border-border/60 px-4 py-2.5">
+          {/* Bulk re-approval is confirmed, like every other decision that changes what
+              clients can call. It is the recovery path for a lost baseline, which blocks
+              the whole catalog at once, so it is the difference between the app being
+              usable and not. */}
+          <ConfirmDialog
+            title={`Re-approve ${items.length} blocked tool${many ? "s" : ""}?`}
+            description={
+              <div className="space-y-2">
+                <p>
+                  This trusts{" "}
+                  {many
+                    ? "these tools' current definitions"
+                    : "this tool's current definition"}{" "}
+                  and makes {many ? "them" : "it"} callable by every client again.
+                </p>
+                <p>
+                  Only do this if you expected the change. If a definition was altered by
+                  something you did not do, re-approving accepts it.
+                </p>
+              </div>
+            }
+            confirmLabel="Re-approve all"
+            onConfirm={releaseEverything}
+            trigger={
+              <Button size="sm" variant="outline" disabled={bulkBusy} className="mr-auto">
+                {bulkBusy ? "Re-approving…" : `Re-approve all (${items.length})`}
+              </Button>
+            }
+          />
           {onReview && (
             <Button size="sm" variant="ghost" onClick={onReview}>
               Review in Settings

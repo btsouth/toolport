@@ -76,6 +76,13 @@ matches CI. Frontend tests use [Vitest](https://vitest.dev) and live alongside
 the code as `*.test.ts` or `*.test.tsx` files inside `src/`, depending on whether
 the test contains JSX.
 
+The GitHub required check is still named **Build + test**. That name is a
+merge gate over the Linux suite, the headless Rust matrix (the Windows
+keyring tests live on `windows-latest`), and the `install.ps1` Pester job
+(SBS-874). Clippy stays non-blocking until existing warnings are cleared.
+Adding the individual job names as separate required contexts is a GitHub
+settings click; it is not something a workflow file can do.
+
 `scripts/install.ps1` is the `irm ... | iex` one-liner, so a regression in asset
 selection, checksum enforcement, or the silent-install flag reaches users with no
 build step in between. `scripts/install.Tests.ps1` drives the real script end to
@@ -131,6 +138,17 @@ Warnings are non-blocking. If you see a `react-hooks/set-state-in-effect`
 warning, it's usually the standard Tauri pattern of loading data from the Rust
 backend in a `useEffect` — review it for unnecessary re-renders, but it won't
 block the build.
+
+### Rust linting
+
+Clippy checks the Rust backend and gateway binary. CI runs it on every PR.
+
+```bash
+cargo clippy --manifest-path src-tauri/Cargo.toml --lib --bins
+```
+
+Clippy warnings are currently non-blocking. The CI gate will be made blocking
+after the existing warnings have been cleared.
 
 ### Git hooks (pre-commit)
 

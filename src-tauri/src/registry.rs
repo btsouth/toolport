@@ -8,7 +8,7 @@
 //! Secrets are never stored here. Env vars marked `secret` keep their value in
 //! the OS keychain; this file only records that a secret exists.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -87,12 +87,86 @@ impl Drop for TempFileCleanup {
     }
 }
 
+/// Linux `MAXSYMLINKS`. A hop cap is the backstop when a cycle is spelled
+/// differently on each visit (`link` vs `dir/../link`) and the seen-set misses it.
+const ATOMIC_WRITE_MAX_SYMLINK_HOPS: usize = 40;
+
+/// Where `atomic_write` should create its sibling temp file and `rename`.
+///
+/// POSIX `rename` does not follow a destination symlink: it replaces the link
+/// inode with a regular file and leaves the target unchanged. Stow/chezmoi
+/// users then lose the gateway entry on the next apply (SBS-886).
+///
+/// Walk with `read_link` + parent-join. Do **not** `canonicalize`: that fails
+/// on a dangling link (the usual first-Connect case) and would refuse to create
+/// the target. A `symlink_metadata` error other than `NotFound` is not "not a
+/// symlink" — failing open would clobber a link we could not inspect.
+///
+/// This is the shared primitive, so following also applies to a Toolport-owned
+/// file (`registry.json`, pins, audit, secrets.enc) that is already a symlink.
+fn resolve_atomic_write_dest(path: &Path) -> Result<PathBuf, String> {
+    let mut current = path.to_path_buf();
+    let mut seen = HashSet::new();
+
+    for _ in 0..ATOMIC_WRITE_MAX_SYMLINK_HOPS {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if !meta.file_type().is_symlink() {
+                    // Followed a config symlink onto a directory (or a further
+                    // link that resolved to one). Cannot write file bytes there.
+                    if meta.is_dir() && current != path {
+                        return Err(format!(
+                            "{} is a symlink to the directory {}, which cannot be overwritten as a file",
+                            path.display(),
+                            current.display()
+                        ));
+                    }
+                    return Ok(current);
+                }
+                if !seen.insert(current.clone()) {
+                    return Err(format!(
+                        "symlink loop at {} while resolving atomic write destination",
+                        current.display()
+                    ));
+                }
+                let target = std::fs::read_link(&current).map_err(|e| {
+                    format!("could not read symlink {}: {e}", current.display())
+                })?;
+                // Relative targets are relative to the link's parent, not cwd.
+                current = match current.parent() {
+                    Some(parent) => parent.join(target),
+                    None => target,
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Missing original path, or a dangling link's target: write a
+                // regular file there. create_dir_all of the dest parent happens
+                // at the call site so a first write can create the target.
+                return Ok(current);
+            }
+            Err(e) => {
+                return Err(format!(
+                    "could not inspect {} before writing: {e}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "too many symlink hops ({ATOMIC_WRITE_MAX_SYMLINK_HOPS}) resolving {}",
+        path.display()
+    ))
+}
+
 /// Write `contents` to `path` atomically: a uniquely-named sibling temp file,
 /// then rename over the target. The unique name (pid + per-process sequence)
 /// means two writers to the same path can't overwrite each other's half-written
 /// temp. The temp sits in the same directory so the rename stays on one
 /// filesystem (and is therefore atomic). Once created, the temp is guarded so
 /// any permissions, write, sync, or rename failure removes it.
+///
+/// If `path` is a symlink, the temp and rename target the resolved file so the
+/// link inode is left in place (SBS-886).
 pub fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     atomic_write_with_ops(path, contents, &FsAtomicWriteOps)
 }
@@ -102,13 +176,16 @@ fn atomic_write_with_ops(
     contents: &str,
     ops: &impl AtomicWriteOps,
 ) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
+    // SBS-886: rename(2) replaces a destination symlink. Resolve first so the
+    // temp file and rename land next to the real target.
+    let dest = resolve_atomic_write_dest(path)?;
+    if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = PathBuf::from(format!(
         "{}.{}.{}.conduit-tmp",
-        path.display(),
+        dest.display(),
         std::process::id(),
         seq
     ));
@@ -129,12 +206,13 @@ fn atomic_write_with_ops(
     // leave a truncated registry.json. `fs::write` + `rename` alone did not.
     ops.sync_all(&f).map_err(|e| e.to_string())?;
     drop(f);
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
     cleanup.disarm();
     // Best-effort: fsync the containing directory so the rename entry itself is durable
     // (Unix). Opening a directory as a File fails on Windows, where NTFS journals the
-    // rename anyway, so the error is ignored.
-    if let Some(dir) = path.parent() {
+    // rename anyway, so the error is ignored. Fsync the *resolved* parent so a
+    // write-through-symlink still durables the directory that holds the new file.
+    if let Some(dir) = dest.parent() {
         if let Ok(d) = std::fs::File::open(dir) {
             let _ = d.sync_all();
         }
@@ -2269,6 +2347,11 @@ enum ReadOutcome {
     Content(String),
     /// Still missing or empty after retries: genuinely absent, not a race.
     Absent,
+    /// The file is there but every read failed with something other than
+    /// not-found (sharing violation, permissions, I/O error). Recovery treats
+    /// this exactly like `Absent`, but a caller reading a security decision out
+    /// of the result has to know the real contents were never seen (SBS-900).
+    Unreadable,
 }
 
 /// Read the registry tolerating the transient states a concurrent `atomic_write`
@@ -2283,18 +2366,29 @@ enum ReadOutcome {
 fn read_registry_file(path: &Path) -> ReadOutcome {
     const ATTEMPTS: u32 = 4;
     const BACKOFF_MS: u64 = 75;
+    // Why the last attempt failed, so a file we were never allowed to read is not
+    // reported as a file that is not there (SBS-900). Recovery behaves the same
+    // for both; only the reported outcome differs.
+    let mut last_error: Option<std::io::ErrorKind> = None;
     for attempt in 0..ATTEMPTS {
         match std::fs::read_to_string(path) {
             Ok(content) if !content.trim().is_empty() => return ReadOutcome::Content(content),
+            // An empty read is the rename window itself, not an error.
+            Ok(_) => last_error = None,
             // Empty, missing, locked (sharing violation), or any other error:
             // all indistinguishable from a rename in flight. Wait and re-look.
-            _ => {}
+            Err(e) => last_error = Some(e.kind()),
         }
         if attempt + 1 < ATTEMPTS {
             std::thread::sleep(std::time::Duration::from_millis(BACKOFF_MS));
         }
     }
-    ReadOutcome::Absent
+    match last_error {
+        // Nothing there (or an empty file): a first run, or a deletion.
+        None | Some(std::io::ErrorKind::NotFound) => ReadOutcome::Absent,
+        // Present, but its contents were never seen by this process.
+        Some(_) => ReadOutcome::Unreadable,
+    }
 }
 
 /// Preserve an unreadable registry file next to the original before anything
@@ -2339,21 +2433,69 @@ fn quarantine_unreadable(path: &Path, content: &str) -> Option<PathBuf> {
     Some(dest)
 }
 
-fn load_from_inner(path: &Path) -> Result<Registry, String> {
-    let mut registry = match read_registry_file(path) {
+/// Where a loaded [`Registry`] actually came from.
+///
+/// `load_from` returns `Ok` for several quite different situations, and only some
+/// of them mean "this is everything the user configured". A caller that reads a
+/// security decision out of an EMPTY field has to tell them apart: the gateway
+/// treats an empty `http_clients` as "no HTTP auth is configured, so
+/// `--insecure-loopback` may serve an open listener", and a registry that was
+/// defaulted over contents nobody could read, or rebuilt from a backup taken
+/// before the first client was registered, is empty for a completely different
+/// reason (SBS-900).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadSource {
+    /// The primary registry file was read and parsed. Memory matches disk.
+    File,
+    /// No registry file and no backup worth recovering: a genuine first run.
+    /// Empty here is the truth.
+    FirstRun,
+    /// The primary was absent, unreadable, or unparseable, and the registry came
+    /// from a backup. `save_to` snapshots the PRE-write content, so the newest
+    /// backup is state N-1: the save that registered the first HTTP client is
+    /// exactly the one whose backup still has none.
+    Backup,
+    /// The primary exists but could not be read (locked, permissions, I/O) and
+    /// no backup was usable, so this is a `Registry::default()` standing in for
+    /// contents nobody has seen.
+    Unreadable,
+}
+
+impl LoadSource {
+    /// True only when an absent value in the loaded registry means the user never
+    /// configured it, rather than "this build could not tell". Everything
+    /// reconstructed or defaulted over unread contents is `false`, so a caller
+    /// that must fail closed can just ask.
+    pub fn is_authoritative(self) -> bool {
+        matches!(self, LoadSource::File | LoadSource::FirstRun)
+    }
+}
+
+fn load_from_inner(path: &Path) -> Result<(Registry, LoadSource), String> {
+    let (mut registry, source) = match read_registry_file(path) {
         // Genuinely missing or empty (not a rename race - read_registry_file
         // already waited that out): recover the last-known-good from the .bak
         // sibling if one survived, else this is a first run.
         ReadOutcome::Absent => {
             if let Some(reg) = restore_from_backup(path) {
                 record_registry_recovery("missing", None);
-                Ok(reg)
+                Ok((reg, LoadSource::Backup))
             } else {
-                Ok(Registry::default())
+                Ok((Registry::default(), LoadSource::FirstRun))
+            }
+        }
+        // Same recovery, different truth: the file is there and we never saw it,
+        // so a default here is a placeholder, not a first run (SBS-900).
+        ReadOutcome::Unreadable => {
+            if let Some(reg) = restore_from_backup(path) {
+                record_registry_recovery("missing", None);
+                Ok((reg, LoadSource::Backup))
+            } else {
+                Ok((Registry::default(), LoadSource::Unreadable))
             }
         }
         ReadOutcome::Content(content) => match serde_json::from_str(&content) {
-            Ok(reg) => Ok(reg),
+            Ok(reg) => Ok((reg, LoadSource::File)),
             // Present but unparseable by THIS build: corrupt, or a newer schema.
             // Quarantine the evidence BEFORE restore_from_backup self-heals the
             // primary from .bak, so nothing is ever silently destroyed.
@@ -2362,7 +2504,7 @@ fn load_from_inner(path: &Path) -> Result<Registry, String> {
                 match restore_from_backup(path) {
                     Some(reg) => {
                         record_registry_recovery("corrupt", quarantine);
-                        Ok(reg)
+                        Ok((reg, LoadSource::Backup))
                     }
                     None => Err(format!("Corrupt registry: {e}")),
                 }
@@ -2370,21 +2512,35 @@ fn load_from_inner(path: &Path) -> Result<Registry, String> {
         },
     }?;
     registry.normalize_profile_references();
-    Ok(registry)
+    Ok((registry, source))
 }
 
 /// Load an explicit registry while holding its cross-process lock across the full
 /// read/recovery path. Recovery can rewrite the primary from a backup, so even a caller
 /// that only intends to read must serialize with writers (SOU-330).
 pub fn load_from(path: &Path) -> Result<Registry, String> {
-    let lock = lock_for(path, REGISTRY_LOCK_TIMEOUT)?;
-    load_from_locked(path, &lock)
+    load_from_with_source(path).map(|(registry, _)| registry)
+}
+
+/// [`load_from`] plus where the result actually came from, for the callers that
+/// must not read "empty" as "nothing configured" (SBS-900).
+pub fn load_from_with_source(path: &Path) -> Result<(Registry, LoadSource), String> {
+    let lock = lock_for(path, registry_lock_timeout())?;
+    load_from_locked_with_source(path, &lock)
 }
 
 /// Load while the caller already holds a registry lock. Requiring the guard by reference
 /// prevents nested acquisition in read-modify-write paths while making the lock requirement
 /// explicit at call sites that need to keep it through a later save.
-pub fn load_from_locked(path: &Path, _lock: &FileLock) -> Result<Registry, String> {
+pub fn load_from_locked(path: &Path, lock: &FileLock) -> Result<Registry, String> {
+    load_from_locked_with_source(path, lock).map(|(registry, _)| registry)
+}
+
+/// [`load_from_locked`] plus the [`LoadSource`] of the result.
+pub fn load_from_locked_with_source(
+    path: &Path,
+    _lock: &FileLock,
+) -> Result<(Registry, LoadSource), String> {
     load_from_inner(path)
 }
 
@@ -2478,7 +2634,58 @@ fn lock_path(path: &Path) -> PathBuf {
 /// Acquire the exclusive registry lock, retrying briefly under contention. Registry writes
 /// are sub-millisecond, so a real conflict clears at once; a holder stuck past the deadline
 /// surfaces as an error rather than hanging the caller indefinitely.
-const REGISTRY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DEFAULT_REGISTRY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The contention deadline, overridable via `TOOLPORT_LOCK_TIMEOUT_MS`.
+///
+/// The default is a PRODUCTION budget: giving up is the right answer when a holder is
+/// stuck, because hanging the app is worse. But the multi-process concurrency tests
+/// deliberately run eight or more writers at once and assert an INVARIANT ("no update is
+/// lost"), not a latency budget. On a loaded CI runner the 5s default expires, one writer
+/// correctly gives up, and the test fails for the machine's timing rather than for the
+/// thing it exists to catch. That flake hit three separate tests and made a clean PR look
+/// broken (SBS-895).
+///
+/// An env override rather than `cfg!(test)` because the rate-limit repro spawns real child
+/// processes, which are not test builds and inherit only the environment.
+fn registry_lock_timeout() -> std::time::Duration {
+    crate::brand::env_var("TOOLPORT_LOCK_TIMEOUT_MS", "CONDUIT_LOCK_TIMEOUT_MS")
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DEFAULT_REGISTRY_LOCK_TIMEOUT)
+}
+
+/// Raise the store-lock deadline for a test that deliberately runs many concurrent
+/// writers, restoring the previous value on drop.
+///
+/// Those tests assert that no update is LOST, not that every writer wins the lock inside
+/// the production budget. Raising the deadline is monotonically safe: it can only make a
+/// concurrently-running test more tolerant, never less. Child processes inherit it, which
+/// is why this is an env var and not a `cfg!(test)` branch (SBS-895).
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
+#[doc(hidden)]
+#[must_use = "the override is reverted when the guard drops, so it must be bound"]
+pub struct LockTimeoutOverride(Option<std::ffi::OsString>);
+
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
+impl LockTimeoutOverride {
+    pub fn generous() -> Self {
+        let previous = std::env::var_os("TOOLPORT_LOCK_TIMEOUT_MS");
+        std::env::set_var("TOOLPORT_LOCK_TIMEOUT_MS", "60000");
+        Self(previous)
+    }
+}
+
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
+impl Drop for LockTimeoutOverride {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(value) => std::env::set_var("TOOLPORT_LOCK_TIMEOUT_MS", value),
+            None => std::env::remove_var("TOOLPORT_LOCK_TIMEOUT_MS"),
+        }
+    }
+}
 
 fn lock_for(path: &Path, timeout: std::time::Duration) -> Result<FileLock, String> {
     if let Some(parent) = path.parent() {
@@ -2518,7 +2725,7 @@ pub fn update<T>(
     f: impl FnOnce(&mut Registry) -> Result<T, String>,
 ) -> Result<(Registry, T), String> {
     let path = resolved_path().ok_or("Could not resolve registry path")?;
-    let lock = lock_for(&path, REGISTRY_LOCK_TIMEOUT)?;
+    let lock = lock_for(&path, registry_lock_timeout())?;
     let mut reg = load_from_locked(&path, &lock)?;
     let out = f(&mut reg)?;
     // Save to the exact path we locked and loaded. Re-resolving after `f` would let a
@@ -2532,7 +2739,7 @@ pub fn update<T>(
 /// agent toggle (which interleaves audit + early returns), and the integrity pins/quarantine
 /// stores (SOU-165). Hold the returned guard across the entire read-decide-write.
 pub fn lock_at(path: &Path) -> Result<FileLock, String> {
-    lock_for(path, REGISTRY_LOCK_TIMEOUT)
+    lock_for(path, registry_lock_timeout())
 }
 
 /// Acquire an explicit-path lock with a caller-appropriate contention deadline.
@@ -2548,7 +2755,7 @@ pub fn update_at<T>(
     path: &Path,
     f: impl FnOnce(&mut Registry) -> Result<T, String>,
 ) -> Result<(Registry, T), String> {
-    let lock = lock_for(path, REGISTRY_LOCK_TIMEOUT)?;
+    let lock = lock_for(path, registry_lock_timeout())?;
     let mut reg = load_from_locked(path, &lock)?;
     let out = f(&mut reg)?;
     save_to(path, &reg)?;
@@ -2567,12 +2774,22 @@ pub fn resolved_path() -> Option<PathBuf> {
 /// Load honoring the `TOOLPORT_REGISTRY` / `CONDUIT_REGISTRY` env override (used
 /// by the gateway and tests), falling back to the default path.
 pub fn load_resolved() -> Result<Registry, String> {
-    let registry = match resolved_path() {
-        Some(path) => load_from(&path),
-        None => Ok(Registry::default()),
+    load_resolved_with_source().map(|(registry, _)| registry)
+}
+
+/// [`load_resolved`] plus where the result came from. `Ok` alone does not mean the
+/// registry on disk was read: it also covers a recovery from a backup and a
+/// default standing in for a file that could not be read, both of which are empty
+/// for reasons that are not "the user configured nothing" (SBS-900).
+pub fn load_resolved_with_source() -> Result<(Registry, LoadSource), String> {
+    let (registry, source) = match resolved_path() {
+        Some(path) => load_from_with_source(&path),
+        // No resolvable path means there is no registry to configure anything in,
+        // so an empty one is the whole truth rather than a stand-in.
+        None => Ok((Registry::default(), LoadSource::FirstRun)),
     }?;
     migrate_profile_stores(&registry)?;
-    Ok(registry)
+    Ok((registry, source))
 }
 
 /// True when a command argument looks like it carries a secret: an inline
@@ -2642,6 +2859,49 @@ pub(crate) fn redact_url_userinfo(url: &str) -> String {
 mod tests {
     use super::*;
     use crate::approval::fingerprint_allow_key;
+
+    static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Pins the plumbing the concurrency tests rely on (SBS-895). Without this, a typo in
+    /// the env-var name would silently leave those tests on the 5s production budget and
+    /// they would go on flaking under load with nothing to point at.
+    #[test]
+    fn lock_timeout_honors_the_env_override_and_ignores_junk() {
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os("TOOLPORT_LOCK_TIMEOUT_MS");
+        std::env::remove_var("TOOLPORT_LOCK_TIMEOUT_MS");
+
+        assert_eq!(registry_lock_timeout(), DEFAULT_REGISTRY_LOCK_TIMEOUT);
+
+        {
+            let _guard = LockTimeoutOverride::generous();
+            assert_eq!(
+                registry_lock_timeout(),
+                std::time::Duration::from_millis(60_000),
+                "the override must actually reach the lock, or the concurrency tests \
+                 silently keep the production budget"
+            );
+        }
+        // Dropping the guard restores, so one test cannot leak a long budget into another.
+        assert_eq!(registry_lock_timeout(), DEFAULT_REGISTRY_LOCK_TIMEOUT);
+
+        // Junk and zero fall back rather than producing a 0ms (instantly-expiring) budget.
+        for bad in ["", "   ", "abc", "0", "-5", "9999999999999999999999"] {
+            std::env::set_var("TOOLPORT_LOCK_TIMEOUT_MS", bad);
+            assert_eq!(
+                registry_lock_timeout(),
+                DEFAULT_REGISTRY_LOCK_TIMEOUT,
+                "{bad:?} must fall back to the default, not disable locking"
+            );
+        }
+
+        match previous {
+            Some(value) => std::env::set_var("TOOLPORT_LOCK_TIMEOUT_MS", value),
+            None => std::env::remove_var("TOOLPORT_LOCK_TIMEOUT_MS"),
+        }
+    }
 
     fn sample_server(name: &str) -> ServerEntry {
         ServerEntry {
@@ -3688,6 +3948,271 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[cfg(unix)]
+    fn atomic_write_symlink_scratch(label: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-aw-symlink-{}-{}-{stamp}",
+            std::process::id(),
+            label
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn assert_is_symlink_to(link: &Path, target: &Path) {
+        let meta = std::fs::symlink_metadata(link).expect("link must still exist");
+        assert!(
+            meta.file_type().is_symlink(),
+            "expected {} to remain a symlink, became {:?}",
+            link.display(),
+            meta.file_type()
+        );
+        assert_eq!(
+            std::fs::read_link(link).unwrap(),
+            target,
+            "symlink target must be left unchanged"
+        );
+    }
+
+    /// SBS-886: rename(2) over a symlink dest replaces the link inode and leaves
+    /// the target bytes unchanged. Connect then "succeeds" while the file in the
+    /// dotfiles repo still has the old content.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_follows_existing_symlink() {
+        let dir = atomic_write_symlink_scratch("existing");
+        let target = dir.join("dotfiles").join("config.toml");
+        let link = dir.join("home").join("config.toml");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::write(&target, "old").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        atomic_write(&link, "new").unwrap();
+
+        assert_is_symlink_to(&link, &target);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert!(
+            atomic_temp_files(&target).is_empty(),
+            "temp must land next to the resolved dest and be cleaned up"
+        );
+        assert!(
+            atomic_temp_files(&link).is_empty(),
+            "must not leave a temp next to the symlink"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// SBS-886: a dangling stow/chezmoi link (repo file not created yet) must
+    /// still stay a link; the write creates the target instead of replacing the
+    /// inode under home.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_dangling_symlink_creates_target_and_keeps_link() {
+        let dir = atomic_write_symlink_scratch("dangling");
+        let target = dir
+            .join("dotfiles")
+            .join("codex")
+            .join("config.toml");
+        let link = dir.join("home").join(".codex").join("config.toml");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        // Target parent is missing on purpose: first Connect should create it.
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::symlink_metadata(&target).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        atomic_write(&link, "created").unwrap();
+
+        assert_is_symlink_to(&link, &target);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "created");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// SBS-886: relative link targets are relative to the link's parent, not cwd.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_relative_symlink_target() {
+        let dir = atomic_write_symlink_scratch("relative");
+        let target = dir.join("dotfiles").join("config.toml");
+        let link = dir.join("home").join("config.toml");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::write(&target, "old").unwrap();
+        std::os::unix::fs::symlink("../dotfiles/config.toml", &link).unwrap();
+
+        atomic_write(&link, "via-relative").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("../dotfiles/config.toml")
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "via-relative");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// SBS-886: a chain A -> B -> file must walk to the file, leaving every
+    /// link inode in place.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_walks_nested_symlinks() {
+        let dir = atomic_write_symlink_scratch("nested");
+        let file = dir.join("real.toml");
+        let mid = dir.join("mid.toml");
+        let link = dir.join("home.toml");
+        std::fs::write(&file, "old").unwrap();
+        std::os::unix::fs::symlink(&file, &mid).unwrap();
+        std::os::unix::fs::symlink(&mid, &link).unwrap();
+
+        atomic_write(&link, "nested").unwrap();
+
+        assert_is_symlink_to(&link, &mid);
+        assert_is_symlink_to(&mid, &file);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "nested");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// SBS-886: a loop is its own state. Do not treat it as "not a symlink"
+    /// and replace one of the link inodes.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_symlink_loop_errors() {
+        let dir = atomic_write_symlink_scratch("loop");
+        let a = dir.join("a.toml");
+        let b = dir.join("b.toml");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        let err = atomic_write(&a, "loop").expect_err("a symlink loop must fail");
+        assert!(
+            err.contains("symlink loop") || err.contains("too many symlink hops"),
+            "unexpected loop error: {err}"
+        );
+        assert_is_symlink_to(&a, &b);
+        assert_is_symlink_to(&b, &a);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// SBS-886: writing file bytes over a symlink-to-directory must error
+    /// rather than rename a regular file onto a directory inode.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_symlink_to_dir_errors() {
+        let dir = atomic_write_symlink_scratch("to-dir");
+        let target_dir = dir.join("dotfiles");
+        let link = dir.join("config.toml");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("keep"), "safe").unwrap();
+        std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+
+        let err = atomic_write(&link, "nope").expect_err("symlink-to-dir must fail");
+        assert!(
+            err.contains("directory"),
+            "unexpected symlink-to-dir error: {err}"
+        );
+        assert_is_symlink_to(&link, &target_dir);
+        assert_eq!(
+            std::fs::read_to_string(target_dir.join("keep")).unwrap(),
+            "safe"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A missing path is not a symlink: create a regular file, same as before.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_missing_path_creates_regular_file() {
+        let dir = atomic_write_symlink_scratch("missing");
+        let path = dir.join("new").join("config.toml");
+        atomic_write(&path, "fresh").unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(
+            meta.file_type().is_file() && !meta.file_type().is_symlink(),
+            "a first write to a missing path must create a regular file"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Regular-file dest is unchanged: still overwrite in place, never invent
+    /// a symlink, never write beside a different path.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_regular_file_destination_unchanged() {
+        let dir = atomic_write_symlink_scratch("regular");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "old").unwrap();
+        atomic_write(&path, "new").unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(
+            meta.file_type().is_file() && !meta.file_type().is_symlink(),
+            "a regular file dest must stay a regular file"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// SBS-886: `symlink_metadata` failing for a reason other than NotFound is
+    /// unknown, not "not a symlink". Collapsing those would let the write
+    /// proceed against a path we could not inspect.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_inspect_error_is_not_treated_as_missing() {
+        let dir = atomic_write_symlink_scratch("inspect");
+        let not_a_dir = dir.join("file");
+        std::fs::write(&not_a_dir, "regular").unwrap();
+        // Parent is a regular file: lstat of child is ENOTDIR, never NotFound.
+        let child = not_a_dir.join("config.toml");
+
+        let err = resolve_atomic_write_dest(&child)
+            .expect_err("an inspect failure must not collapse to missing");
+        assert!(
+            err.contains("could not inspect"),
+            "inspect failure must be reported as inspect, not as a write: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&not_a_dir).unwrap(), "regular");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A failed write through a symlink must not replace the link and must
+    /// leave the target bytes and no sibling temp.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_failed_write_through_symlink_keeps_link_and_target() {
+        let dir = atomic_write_symlink_scratch("fail-keep");
+        let target = dir.join("target.toml");
+        let link = dir.join("link.toml");
+        std::fs::write(&target, "original").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = atomic_write_with_ops(
+            &link,
+            "replacement",
+            &FailingAtomicWriteOps(FailingAtomicWriteStep::Write),
+        )
+        .expect_err("injected write must fail");
+        assert!(err.contains("write"), "unexpected error: {err}");
+        assert_is_symlink_to(&link, &target);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+        assert!(atomic_temp_files(&target).is_empty());
+        assert!(atomic_temp_files(&link).is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     fn quarantine_files(path: &Path) -> Vec<PathBuf> {
         let dir = path.parent().unwrap();
         let prefix = format!("{}.unreadable-", path.file_name().unwrap().to_str().unwrap());
@@ -3742,6 +4267,113 @@ mod tests {
         cleanup_quarantine(&path);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&bak).ok();
+    }
+
+    fn sample_http_client() -> HttpClient {
+        HttpClient {
+            id: "c1".into(),
+            label: "Open WebUI".into(),
+            token_sha256: sha256_hex("tok"),
+            profile: String::new(),
+        }
+    }
+
+    fn clear_registry_files(path: &Path) {
+        cleanup_quarantine(path);
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(backup_path(path)).ok();
+        std::fs::remove_file(backup_sequence_path(path)).ok();
+        for generation in backup_generations(path) {
+            std::fs::remove_file(generation).ok();
+        }
+    }
+
+    /// SBS-900: `load_from` answers `Ok` to three different questions, and the
+    /// gateway reads a security decision out of an EMPTY field (an empty
+    /// `http_clients` is what lets `--insecure-loopback` serve an open listener).
+    /// The source has to say which `Ok` this was.
+    #[test]
+    fn load_source_separates_a_real_read_from_a_recovery() {
+        let path =
+            std::env::temp_dir().join(format!("conduit-reg-source-{}.json", std::process::id()));
+        clear_registry_files(&path);
+
+        // A genuine first run: no file, no backup. Empty here IS the truth, so
+        // this must stay authoritative or `--insecure-loopback` breaks on day one.
+        let (fresh, source) = load_from_with_source(&path).unwrap();
+        assert_eq!(source, LoadSource::FirstRun);
+        assert!(source.is_authoritative());
+        assert!(fresh.http_clients.is_empty());
+
+        // State N-1: a server configured, no HTTP client registered yet.
+        let mut reg = Registry::default();
+        reg.add_server(sample_server("alpha"));
+        save_to(&path, &reg).unwrap();
+        // State N: the save that registers the FIRST http client. `save_to`
+        // snapshots the PRE-write content, so every backup on disk is now a
+        // registry with no clients at all.
+        reg.http_clients.push(sample_http_client());
+        save_to(&path, &reg).unwrap();
+
+        let (read, source) = load_from_with_source(&path).unwrap();
+        assert_eq!(source, LoadSource::File);
+        assert!(source.is_authoritative());
+        assert_eq!(read.http_clients.len(), 1);
+
+        // Corrupt the primary. Recovery succeeds from that N-1 backup and hands
+        // back every server with ZERO http_clients: byte for byte the same thing
+        // as "no client is registered" unless the source says otherwise.
+        std::fs::write(&path, "{ not json").unwrap();
+        let (recovered, source) = load_from_with_source(&path).unwrap();
+        assert_eq!(source, LoadSource::Backup);
+        assert!(
+            !source.is_authoritative(),
+            "a backup is state N-1; its empty client list is not a fact about now"
+        );
+        assert_eq!(recovered.servers.len(), 1, "self-healed from .bak");
+        assert!(
+            recovered.http_clients.is_empty(),
+            "the recovery really did lose the registered client"
+        );
+
+        clear_registry_files(&path);
+    }
+
+    /// SBS-900: `read_registry_file` used to fold every read failure into
+    /// "absent", so a registry this process was not allowed to read came back as
+    /// a first run. Unix-only: it needs a mode the current user is denied.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_registry_is_not_reported_as_a_first_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "conduit-reg-unreadable-{}.json",
+            std::process::id()
+        ));
+        clear_registry_files(&path);
+
+        let mut reg = Registry::default();
+        reg.http_clients.push(sample_http_client());
+        // A first save leaves no backup, so recovery cannot mask the read failure.
+        save_to(&path, &reg).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root ignores the mode; there is nothing to assert on such a machine.
+        if std::fs::read_to_string(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
+            clear_registry_files(&path);
+            return;
+        }
+
+        let (loaded, source) = load_from_with_source(&path).unwrap();
+        assert_eq!(source, LoadSource::Unreadable);
+        assert!(
+            !source.is_authoritative(),
+            "a default standing in for contents nobody read is not a first run"
+        );
+        assert!(loaded.http_clients.is_empty(), "it really is a default");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
+        clear_registry_files(&path);
     }
 
     #[test]

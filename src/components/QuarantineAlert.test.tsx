@@ -1,18 +1,33 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QuarantineAlert } from "./QuarantineAlert";
 import type { QuarantinedTool } from "@/lib/api";
 
 const listQuarantined = vi.fn();
 const releaseQuarantine = vi.fn();
+const releaseAllQuarantine = vi.fn();
 const toastError = vi.fn();
+const toastSuccess = vi.fn();
 
 vi.mock("@/lib/api", () => ({
   listQuarantined: (...a: unknown[]) => listQuarantined(...a),
   releaseQuarantine: (...a: unknown[]) => releaseQuarantine(...a),
+  releaseAllQuarantine: (...a: unknown[]) => releaseAllQuarantine(...a),
 }));
 vi.mock("@/lib/toast", () => ({ toastError: (...a: unknown[]) => toastError(...a) }));
+vi.mock("sonner", () => ({
+  toast: { success: (...a: unknown[]) => toastSuccess(...a) },
+}));
+
+/** Open the bulk confirm and press its confirm button. */
+async function confirmReapproveAll() {
+  await userEvent.click(screen.getByRole("button", { name: /re-approve all \(/i }));
+  const dialog = await screen.findByRole("dialog");
+  await userEvent.click(
+    within(dialog).getByRole("button", { name: /^re-approve all$/i }),
+  );
+}
 
 function tool(over: Partial<QuarantinedTool> = {}): QuarantinedTool {
   return {
@@ -28,7 +43,139 @@ function tool(over: Partial<QuarantinedTool> = {}): QuarantinedTool {
 beforeEach(() => {
   listQuarantined.mockReset();
   releaseQuarantine.mockReset();
+  releaseAllQuarantine.mockReset();
   toastError.mockReset();
+  toastSuccess.mockReset();
+});
+
+describe("QuarantineAlert bulk re-approval", () => {
+  /** A lost integrity baseline blocks the whole catalog at once. A real install saw
+   * 2,156 tools blocked in one shot, and the only recovery on offer was a per-tool
+   * button, so the card was an unusable wall. */
+  function catalog(n: number, profile = "default"): QuarantinedTool[] {
+    return Array.from({ length: n }, (_, i) =>
+      tool({
+        tool: `clerk__call_api_key_${i}`,
+        reason: "the integrity baseline was corrupt or tampered with",
+        profile,
+      }),
+    );
+  }
+
+  it("clears a whole blocked catalog in one call per profile", async () => {
+    listQuarantined.mockResolvedValueOnce(catalog(40));
+    releaseAllQuarantine.mockResolvedValue({ released: 40, skipped: [] });
+    listQuarantined.mockResolvedValue([]);
+
+    render(<QuarantineAlert />);
+    expect(
+      await screen.findByRole("button", { name: /re-approve all \(40\)/i }),
+    ).toBeInTheDocument();
+    await confirmReapproveAll();
+
+    // One call for the one profile, not one per tool.
+    await waitFor(() => expect(releaseAllQuarantine).toHaveBeenCalledTimes(1));
+    expect(releaseAllQuarantine).toHaveBeenCalledWith("default");
+    expect(releaseQuarantine).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole("region")).not.toBeInTheDocument());
+    expect(toastSuccess).toHaveBeenCalledWith("Re-approved 40 tools");
+  });
+
+  it("clears every profile the card covers", async () => {
+    // The same tool can be blocked in one profile and fine in another, and the store is
+    // per-profile, so a single call would silently leave the other profile blocked.
+    listQuarantined.mockResolvedValueOnce([
+      ...catalog(2, "default"),
+      ...catalog(2, "work"),
+    ]);
+    releaseAllQuarantine.mockResolvedValue({ released: 2, skipped: [] });
+    listQuarantined.mockResolvedValue([]);
+
+    render(<QuarantineAlert />);
+    await screen.findByRole("region");
+    await confirmReapproveAll();
+
+    await waitFor(() => expect(releaseAllQuarantine).toHaveBeenCalledTimes(2));
+    expect(releaseAllQuarantine).toHaveBeenCalledWith("default");
+    expect(releaseAllQuarantine).toHaveBeenCalledWith("work");
+  });
+
+  it("does not release anything until the confirm is accepted", async () => {
+    // Bulk-trusting definitions is a security decision, so it gets the same gate as
+    // every other action that changes what clients may call.
+    listQuarantined.mockResolvedValue(catalog(3));
+
+    render(<QuarantineAlert />);
+    await userEvent.click(
+      await screen.findByRole("button", { name: /re-approve all \(3\)/i }),
+    );
+
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(releaseAllQuarantine).not.toHaveBeenCalled();
+  });
+
+  it("reports tools it could not repair as still blocked, not as success", async () => {
+    // Saying "re-approved" when some tools are still hidden would send the user away
+    // believing the catalog is whole.
+    listQuarantined.mockResolvedValue(catalog(3));
+    releaseAllQuarantine.mockResolvedValue({
+      released: 1,
+      skipped: ["clerk__call_api_key_1", "clerk__call_api_key_2"],
+    });
+
+    render(<QuarantineAlert />);
+    await screen.findByRole("region");
+    await confirmReapproveAll();
+
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(toastError.mock.calls[0][0]).toMatch(
+      /Re-approved 1\. 2 could not be repaired/,
+    );
+    expect(toastSuccess).not.toHaveBeenCalled();
+    // Still blocked, so the card must stay up.
+    expect(screen.getByRole("region")).toBeInTheDocument();
+  });
+
+  it("keeps the card up and reports a failed bulk re-approval", async () => {
+    listQuarantined.mockResolvedValue(catalog(3));
+    releaseAllQuarantine.mockRejectedValue(new Error("store locked"));
+
+    render(<QuarantineAlert />);
+    await screen.findByRole("region");
+    await confirmReapproveAll();
+
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(toastSuccess).not.toHaveBeenCalled();
+    expect(screen.getByRole("region")).toBeInTheDocument();
+  });
+
+  it("still counts and refreshes the profiles that succeeded when one fails", async () => {
+    // One locked store must not discard the other profile's result. With Promise.all
+    // the whole batch was thrown away: the tools that really were released stayed on
+    // the card, and the count never came down.
+    listQuarantined.mockResolvedValueOnce([
+      ...catalog(2, "default"),
+      ...catalog(2, "work"),
+    ]);
+    releaseAllQuarantine
+      .mockResolvedValueOnce({ released: 2, skipped: [] })
+      .mockRejectedValueOnce(new Error("store locked"));
+    listQuarantined.mockResolvedValue(catalog(2, "work"));
+
+    render(<QuarantineAlert />);
+    await screen.findByRole("region");
+    const pollsBefore = listQuarantined.mock.calls.length;
+    await confirmReapproveAll();
+
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    // The successful profile is reported, not silently dropped.
+    expect(toastError.mock.calls[0][0]).toMatch(/Re-approved 2\./);
+    expect(toastError.mock.calls[0][0]).toMatch(/1 profile could not be re-approved/);
+    expect(toastSuccess).not.toHaveBeenCalled();
+    // The refresh still ran, so the card drops the tools that did come free.
+    expect(listQuarantined.mock.calls.length).toBeGreaterThan(pollsBefore);
+    expect(screen.getByRole("region")).toBeInTheDocument();
+  });
 });
 
 describe("QuarantineAlert", () => {
@@ -75,7 +222,8 @@ describe("QuarantineAlert", () => {
     listQuarantined.mockResolvedValue([]);
 
     render(<QuarantineAlert />);
-    await userEvent.click(await screen.findByRole("button", { name: /re-approve/i }));
+    // Exact match: the footer also offers a bulk "Re-approve all" button.
+    await userEvent.click(await screen.findByRole("button", { name: /^re-approve$/i }));
 
     expect(releaseQuarantine).toHaveBeenCalledWith("work", "linear__save_issue");
     await waitFor(() => expect(screen.queryByRole("region")).not.toBeInTheDocument());
@@ -88,7 +236,8 @@ describe("QuarantineAlert", () => {
     releaseQuarantine.mockRejectedValue(new Error("locked"));
 
     render(<QuarantineAlert />);
-    await userEvent.click(await screen.findByRole("button", { name: /re-approve/i }));
+    // Exact match: the footer also offers a bulk "Re-approve all" button.
+    await userEvent.click(await screen.findByRole("button", { name: /^re-approve$/i }));
 
     await waitFor(() => expect(toastError).toHaveBeenCalled());
     expect(screen.getByRole("region")).toBeInTheDocument();

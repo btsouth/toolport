@@ -2,6 +2,7 @@ pub mod approval;
 #[cfg(feature = "desktop")]
 mod approval_broker;
 pub mod audit;
+pub mod autostart;
 pub mod brand;
 pub mod catalog;
 pub mod clients;
@@ -33,6 +34,7 @@ pub mod semantic;
 pub mod shaping;
 pub mod stacks;
 pub mod teams;
+pub mod topology;
 pub mod usage_report;
 pub mod vendors;
 

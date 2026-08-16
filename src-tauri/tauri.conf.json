@@ -38,6 +38,13 @@
       "nsis": {
         "installerHooks": "nsis-hooks.nsh"
       }
+    },
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/bin/toolport": "../packaging/linux/deb/toolport"
+        }
+      }
     }
   },
   "plugins": {

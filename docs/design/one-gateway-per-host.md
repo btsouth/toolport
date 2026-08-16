@@ -1,7 +1,13 @@
 # Design: One heavy gateway per host
 
-Status: PROPOSED for SBS-551. This document is the design pass requested before an
-implementation estimate. It does not change the current gateway topology.
+Status: Phase 0 landed (SBS-838). Phases 1-4 remain PROPOSED, and **the current gateway
+topology is unchanged** — every stdio client session still runs its own gateway and its
+own copy of every enabled downstream server.
+
+SBS-551 delivered this design plus a slice of Phase 1 (`ActiveRequestContext` and the
+per-request guards). It was closed at that point, which read as "one gateway per host is
+done" when only the enabling refactor had shipped. The measured cost of the unchanged
+topology is in the Phase 0 baseline below.
 
 ## Goal
 
@@ -210,16 +216,55 @@ This sequencing keeps fixed-port behavior, registered client tokens, LAN exposur
 and user expectations out of the first migration. It also avoids accidentally exposing the
 internal host bearer as a copyable integration credential.
 
+## Phase 0 baseline (measured 2026-08-15)
+
+Taken from a real multi-session machine, which the sequence below names as the acceptance
+scenario. Three client sessions: two Grok windows and one Claude.
+
+| measure                        | value                                        |
+| ------------------------------ | -------------------------------------------- |
+| gateway processes              | 3 (one per client _process_, not per client) |
+| processes in the gateway trees | 74                                           |
+| resident memory                | 2,034 MB                                     |
+| per client session             | ~25 processes, ~678 MB                       |
+| duplication factor             | 3.0                                          |
+
+Each gateway spawned ~9 direct children, and the same downstream servers appeared once per
+gateway (`cli.js` x12 across three gateways, `index.js` x3 and x3). The gateways take no
+arguments; identity arrives via `TOOLPORT_CLIENT_ID` in the environment.
+
+Two findings worth carrying into Phase 2:
+
+- Gateways outlive the desktop app. After the app was closed all three kept running and a
+  client spawned a fourth. That is arguably correct, since the MCP client owns the
+  subprocess, and it is why the fix has to be rendezvous-at-startup rather than a reaper.
+- The pileup is a reliability multiplier, not only a resource cost. Every gateway shares
+  one pin store and one quarantine store per profile, and an unreadable pin store is
+  treated as a lost trust root that quarantines the entire catalog. That fired on this
+  machine the same morning, blocking 2,156 tools.
+
+`src-tauri/src/topology.rs` encodes this as executable assertions:
+`today_every_session_duplicates_every_downstream_server` pins the current shape, and
+`the_target_topology_runs_each_downstream_server_once` pins where Phases 2-3 have to land
+(`router_owners == 1`, `duplication_factor == 1.0`).
+
 ## Implementation sequence
 
 ### Phase 0: measurement and invariants
 
-- Add a diagnostic snapshot for gateway role, daemon compatibility key, session count,
-  downstream launch count, and launch keys without secret material.
-- Add an integration fixture that starts multiple logical clients and measures peak daemon,
-  adapter, and downstream child counts.
-- Record current cold-start, first-list, first-call, steady memory, and process counts as a
-  baseline. The ticket's real multi-session machine is the acceptance scenario.
+- [x] Diagnostic snapshot for gateway role, compatibility key, session count, and launch
+      keys without secret material (`topology.rs`: `GatewayRole`, `CompatKey`, `LaunchKey`,
+      `TopologySnapshot`, `HostTopology`).
+- [x] Baseline recorded above, and as a test that fails if the topology changes shape.
+- [ ] Integration fixture that starts multiple _real_ clients and measures peak process
+      counts. The logical fixture exists in `topology.rs`; the process-level one is
+      deferred until Phase 2 gives it two topologies to compare.
+
+`LaunchKey` and `CompatKey` are built now on purpose. `LaunchKey` is the identity Phase 3
+pools on, so defining it early makes pooling "reuse an existing launch for this key"
+instead of also having to invent what makes two launches interchangeable. `CompatKey` is
+what a rendezvous elects on, and getting it wrong silently mixes data directories or
+builds.
 
 ### Phase 1: make session ownership explicit without changing topology
 

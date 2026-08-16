@@ -73,6 +73,8 @@ export interface AuditEntry {
   /** The registered HTTP client that made the call, when known. Absent for the
    * local desktop client and legacy/open tokens. */
   client?: string;
+  /** Human-readable name of the registered HTTP client, when known. */
+  clientName?: string;
   /** How many values this call's result had pseudonymized. Absent when PII redaction was
    * off for the call — which is deliberately distinct from `0` ("it ran, found nothing").
    * A count only; the values themselves never enter the audit log. */
@@ -89,6 +91,7 @@ export interface AuditEntry {
 export interface InspectEntry {
   ts: number;
   client?: string;
+  clientName?: string;
   server: string;
   tool: string;
   request: unknown;

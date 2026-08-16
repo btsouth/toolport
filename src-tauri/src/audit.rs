@@ -97,6 +97,7 @@ pub fn record_timed_with_hash(
         duration_ms,
         error,
         client,
+        None,
         args_hash,
         None,
     )
@@ -116,6 +117,7 @@ pub fn record_timed_with_pii(
     duration_ms: Option<u64>,
     error: Option<&str>,
     client: Option<&str>,
+    client_name: Option<&str>,
     args_hash: Option<&str>,
     pii: Option<PiiPass>,
 ) {
@@ -126,6 +128,7 @@ pub fn record_timed_with_pii(
         duration_ms,
         error,
         client,
+        client_name,
         args_hash,
         pii,
     ));
@@ -141,6 +144,7 @@ fn timed_entry(
     duration_ms: Option<u64>,
     error: Option<&str>,
     client: Option<&str>,
+    client_name: Option<&str>,
     args_hash: Option<&str>,
     pii: Option<PiiPass>,
 ) -> Value {
@@ -165,6 +169,9 @@ fn timed_entry(
     // log answers "who invoked this?". Absent for the local stdio client / open tokens.
     if let Some(c) = client.filter(|c| !c.is_empty()) {
         entry["client"] = json!(c);
+    }
+    if let Some(name) = client_name.filter(|name| !name.is_empty()) {
+        entry["clientName"] = json!(name);
     }
     if let Some(h) = args_hash.filter(|h| !h.is_empty()) {
         entry["argsHash"] = json!(h);
@@ -647,27 +654,30 @@ fn trimmed_tail(content: &str, keep: usize) -> String {
 }
 
 /// The most recent `limit` entries, newest first.
-pub fn read_recent(limit: usize) -> Vec<Value> {
-    let path = match audit_path() {
-        Some(p) => p,
-        None => return Vec::new(),
+///
+/// A missing file is an empty log: nothing has been written yet. Any other IO
+/// error is returned so a caller cannot treat an unreadable existing file as
+/// "no tool calls" / Protection active (SBS-873). Unparseable lines are skipped
+/// — a mid-write or corrupt line is not an IO failure.
+pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
+    let Some(path) = audit_path() else {
+        return Ok(Vec::new());
     };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
     // Filter BEFORE take, matching `inspect::read_recent` and `searchtrace`. Taking
     // first let an unparseable line consume a slot, so one corrupt row among the
     // newest entries returned a short page and dropped older valid history that
     // should have filled it.
-    let entries: Vec<Value> = content
+    Ok(content
         .lines()
         .rev()
         .filter_map(|line| serde_json::from_str(line).ok())
         .take(limit)
-        .collect();
-    // `rev()` gives newest-first already.
-    entries
+        .collect())
 }
 
 /// Average and 95th-percentile of a duration sample, in ms. `None` when the
@@ -688,28 +698,30 @@ fn latency(durs: &mut [u64]) -> (Option<u64>, Option<u64>) {
 
 /// Every retained entry, newest first. The log is size-capped (see `MAX_AUDIT_BYTES`), so
 /// this stays bounded no matter how long Toolport has been running.
-pub fn read_all() -> Vec<Value> {
-    let path = match audit_path() {
-        Some(p) => p,
-        None => return Vec::new(),
+///
+/// Same empty-vs-unreadable contract as [`read_recent`] (SBS-873).
+pub fn read_all() -> std::io::Result<Vec<Value>> {
+    let Some(path) = audit_path() else {
+        return Ok(Vec::new());
     };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
-    content
+    Ok(content
         .lines()
         .rev()
         .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+        .collect())
 }
 
 /// Aggregate the FULL retained log into per-server stats plus global totals: call volume,
 /// error rate, and latency per server, computed locally. Totals are the real count of what's
 /// retained (the byte cap bounds it), not a fixed window, so the error rate stays consistent
 /// with the call count instead of being taken over an arbitrary slice.
-pub fn stats() -> Value {
-    aggregate(&read_all())
+pub fn stats() -> std::io::Result<Value> {
+    Ok(aggregate(&read_all()?))
 }
 
 /// Pure aggregation of audit entries into per-server + global stats. Split from
@@ -844,6 +856,7 @@ const CSV_COLUMNS: &[&str] = &[
     // the clear. Counts only -- the values never enter this log.
     "piiReplaced",
     "piiIncomplete",
+    "clientName",
 ];
 
 /// Render audit `entries` as CSV (RFC-4180-ish: CRLF rows, quoted cells, doubled
@@ -855,7 +868,10 @@ pub fn to_csv(entries: &[Value]) -> String {
     out.push_str(&CSV_COLUMNS.join(","));
     out.push_str("\r\n");
     for e in entries {
-        let row: Vec<String> = CSV_COLUMNS.iter().map(|col| csv_cell(e.get(*col))).collect();
+        let row: Vec<String> = CSV_COLUMNS
+            .iter()
+            .map(|col| csv_cell(e.get(*col)))
+            .collect();
         out.push_str(&row.join(","));
         out.push_str("\r\n");
     }
@@ -872,9 +888,7 @@ fn csv_cell(value: Option<&Value>) -> String {
     };
     // Formula-injection guard (OWASP): a cell starting with one of these could be
     // executed as a formula by a spreadsheet, so shift it behind a quote.
-    let guarded = if raw
-        .starts_with(['=', '+', '-', '@', '\t', '\r'])
-    {
+    let guarded = if raw.starts_with(['=', '+', '-', '@', '\t', '\r']) {
         format!("'{raw}")
     } else {
         raw
@@ -956,7 +970,7 @@ mod tests {
         })];
         let csv = to_csv(&entries);
         assert!(csv.starts_with(
-            "ts,server,tool,client,ok,held,kind,reason,decision,argsHash,durationMs,heldMs,action,error,piiReplaced,piiIncomplete\r\n"
+            "ts,server,tool,client,ok,held,kind,reason,decision,argsHash,durationMs,heldMs,action,error,piiReplaced,piiIncomplete,clientName\r\n"
         ));
         assert!(csv.contains("\"gh\""));
         assert!(csv.contains("\"search\""));
@@ -1040,7 +1054,10 @@ mod tests {
             true,
         );
         assert_eq!(e["event"], "agent_control.server_toggle");
-        assert!(e["resolvedServerId"].is_null(), "a scoped miss must not resolve a server");
+        assert!(
+            e["resolvedServerId"].is_null(),
+            "a scoped miss must not resolve a server"
+        );
         assert_eq!(e["decision"], "unresolved");
         assert_eq!(e["knownListScope"], "client_allowed_only");
         assert_eq!(e["ok"], false);
@@ -1385,6 +1402,56 @@ mod tests {
     }
 
     #[test]
+    fn timed_entry_records_client_name_when_present() {
+        let entry = timed_entry(
+            "crm",
+            "crm__lookup",
+            true,
+            Some(12),
+            None,
+            Some("http-client"),
+            Some("claude"),
+            Some("deadbeef"),
+            None,
+        );
+
+        assert_eq!(entry["client"], "http-client");
+        assert_eq!(entry["clientName"], "claude");
+        assert_eq!(entry["argsHash"], "deadbeef");
+    }
+
+    #[test]
+    fn timed_entry_omits_empty_or_missing_client_name() {
+        let missing = timed_entry(
+            "crm",
+            "crm__lookup",
+            true,
+            Some(12),
+            None,
+            Some("http-client"),
+            None,
+            None,
+            None,
+        );
+
+        assert!(missing.get("clientName").is_none());
+
+        let empty = timed_entry(
+            "crm",
+            "crm__lookup",
+            true,
+            Some(12),
+            None,
+            Some("http-client"),
+            Some(""),
+            None,
+            None,
+        );
+
+        assert!(empty.get("clientName").is_none());
+    }
+
+    #[test]
     fn timed_entry_records_the_pii_pass_as_a_count_and_flags_an_incomplete_one() {
         let pass = |replaced, complete| {
             timed_entry(
@@ -1394,6 +1461,7 @@ mod tests {
                 Some(12),
                 None,
                 Some("claude"),
+                None,
                 Some("deadbeef"),
                 Some(PiiPass { replaced, complete }),
             )
@@ -1425,6 +1493,7 @@ mod tests {
             Some(12),
             None,
             Some("claude"),
+            None,
             Some("deadbeef"),
             None,
         );
@@ -1445,6 +1514,7 @@ mod tests {
             "crm__lookup",
             true,
             Some(12),
+            None,
             None,
             None,
             None,
@@ -1499,5 +1569,59 @@ mod tests {
             args_hash(&value),
             "943d56ce0b02b80a8afcd12d849426226b68f2d8cd2840af8f6f93067f14c360"
         );
+    }
+
+    fn isolated_data_dir(label: &str) -> (crate::registry::DataDirOverride, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "toolport-audit-read-{label}-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("scratch data dir");
+        (crate::registry::DataDirOverride::set(&path), path)
+    }
+
+    /// A missing audit.jsonl is an empty log, not a load failure.
+    #[test]
+    fn read_recent_missing_file_is_ok_empty() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("missing");
+        let path = audit_path().expect("audit path under override");
+        assert!(!path.exists(), "fixture must not create the log");
+        let entries = read_recent(10).expect("missing file is Ok empty");
+        assert!(entries.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A readable JSONL returns newest-first parsed rows.
+    #[test]
+    fn read_recent_readable_jsonl_is_newest_first() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("readable");
+        let path = audit_path().expect("audit path under override");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, "{\"i\":1}\n{\"i\":2}\n").unwrap();
+        let entries = read_recent(10).expect("readable fixture");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["i"], 2);
+        assert_eq!(entries[1]["i"], 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An existing but unreadable audit.jsonl must not look like "no tool calls"
+    /// / Protection active (SBS-873).
+    #[test]
+    fn read_recent_unreadable_existing_path_is_err() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("unreadable");
+        let path = audit_path().expect("audit path under override");
+        // IsADirectory: the log path exists but cannot be read as a file.
+        std::fs::create_dir_all(&path).unwrap();
+        let err = read_recent(10).expect_err("unreadable existing path must be Err");
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

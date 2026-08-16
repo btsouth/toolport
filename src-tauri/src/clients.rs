@@ -372,19 +372,91 @@ fn claude_config_dir_override() -> Option<PathBuf> {
     claude_config_dir_from(std::env::var_os("CLAUDE_CONFIG_DIR"))
 }
 
+/// An env-supplied directory is only used when it is an absolute path.
+/// Empty or relative values are a misconfiguration, not an instruction to
+/// write relative to Toolport's cwd. Shared by `CLAUDE_CONFIG_DIR`,
+/// `CODEX_HOME`, `GEMINI_CLI_HOME`, `GROK_HOME`, and `QWEN_HOME` (SBS-885).
+///
+/// A literal `~` is NOT a home reference here. Every one of those clients except
+/// Qwen Code uses its env value verbatim (Codex `find_codex_home_from_env`, Grok
+/// `resolve_grok_home_from`, Gemini CLI `homedir()`), so a value the shell left
+/// unexpanded is already broken for the client itself and the default path is the
+/// closer guess. Qwen Code expands it, so `qwen_home_from` runs the value through
+/// [`expand_leading_tilde`] first.
+fn absolute_env_dir(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let dir = PathBuf::from(raw?);
+    dir.is_absolute().then_some(dir)
+}
+
+/// Expand a leading `~`, `~/`, or `~\` against the home directory.
+///
+/// Only for env vars whose owning client performs the same expansion; see
+/// [`absolute_env_dir`] for why the rest keep the value verbatim. A bare `~work`
+/// has no separator and is not a home reference, which matches the client. A
+/// non-UTF-8 value, or one read with no home directory available, passes through
+/// untouched so the caller's absolute check still sees the original.
+fn expand_leading_tilde(raw: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    let raw = raw?;
+    let Some(text) = raw.to_str() else {
+        return Some(raw);
+    };
+    let rest = if text == "~" {
+        ""
+    } else if let Some(rest) = text.strip_prefix("~/").or_else(|| text.strip_prefix(r"~\")) {
+        // Every further separator has to go too. `~//work/qwen` leaves `/work/qwen`,
+        // which `PathBuf::join` reads as rooted and substitutes for the home dir
+        // instead of appending to it, so the value escapes home entirely.
+        rest.trim_start_matches(['/', '\\'])
+    } else {
+        return Some(raw);
+    };
+    let Some(home) = home() else {
+        return Some(raw);
+    };
+    let expanded = if rest.is_empty() {
+        home
+    } else {
+        home.join(rest)
+    };
+    Some(expanded.into_os_string())
+}
+
 /// The env-free half of [`claude_config_dir_override`], so the validation rules
 /// are testable without mutating process environment from a parallel test.
 fn claude_config_dir_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    let dir = PathBuf::from(raw?);
-    // An empty or relative value is a misconfiguration, not an instruction to
-    // write somewhere surprising: fall back to the documented default rather
-    // than resolving against whatever cwd Toolport happens to have.
-    dir.is_absolute().then_some(dir)
+    absolute_env_dir(raw)
 }
 
 /// The `.claude.json` a Claude Code process reads, given its config dir.
 fn claude_code_config_path(config_dir: &std::path::Path) -> PathBuf {
     config_dir.join(".claude.json")
+}
+
+/// Goose relocates its whole tree — `config/config.yaml` and
+/// `config/.goosehints` included — when `GOOSE_PATH_ROOT` is an absolute path
+/// (SBS-899). Relative or empty values are a misconfiguration, not an
+/// instruction to write relative to Toolport's cwd. Matches Goose's own
+/// `Paths::validated_path_root`.
+fn goose_path_root_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let dir = PathBuf::from(raw.filter(|p| !p.is_empty())?);
+    dir.is_absolute().then_some(dir)
+}
+
+fn goose_config_under_root(root: &Path) -> PathBuf {
+    root.join("config").join("config.yaml")
+}
+
+fn goose_hints_under_root(root: &Path) -> PathBuf {
+    root.join("config").join(".goosehints")
+}
+
+fn rules_sentinel_block(path: PathBuf) -> crate::instructions::Target {
+    crate::instructions::Target {
+        path,
+        strategy: crate::instructions::Strategy::SentinelBlock,
+        char_cap: None,
+        blocked_if_present: None,
+    }
 }
 
 /// Every `.claude.json` on this machine that some Claude Code process may read.
@@ -470,7 +542,24 @@ fn claude_code_config_paths_from(
 }
 
 fn client_config_path(client_id: &str) -> Option<PathBuf> {
-    let home = home()?;
+    client_config_path_with_home(client_id, home())
+}
+
+/// [`client_config_path`] with the home directory passed in, so a test can drive the
+/// `$HOME`-unavailable case on any platform (`dirs::home_dir` reads a known folder on
+/// Windows, so it cannot be unset from a test).
+fn client_config_path_with_home(client_id: &str, home: Option<PathBuf>) -> Option<PathBuf> {
+    // An absolute `GOOSE_PATH_ROOT` names the live config outright, so it resolves even
+    // when there is no home directory to fall back to. This mirrors `codex_path`, which
+    // checks `CODEX_HOME` before it ever calls this (SBS-885), and it keeps the config
+    // path in step with `client_rules_target`: without it Connect could write Goose Team
+    // Instructions under the root but fail to find the config beside them (SBS-899).
+    if client_id == "goose" {
+        if let Some(root) = goose_path_root_from(std::env::var_os("GOOSE_PATH_ROOT")) {
+            return Some(goose_config_under_root(&root));
+        }
+    }
+    let home = home?;
     if client_id == "claude-code" {
         if let Some(dir) = claude_config_dir_override() {
             return Some(claude_code_config_path(&dir));
@@ -535,10 +624,9 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "kimi-code" => home.join(".kimi-code").join("mcp.json"),
         "lm-studio" => home.join(".lmstudio").join("mcp.json"),
         "jan" => data.join("Jan").join("data").join("mcp_config.json"),
-        "zed" => home.join(".config").join("zed").join("settings.json"),
-        "goose" => home.join(".config").join("goose").join("config.yaml"),
-        "anythingllm" => home
-            .join(".config")
+        "zed" => config.join("zed").join("settings.json"),
+        "goose" => config.join("goose").join("config.yaml"),
+        "anythingllm" => config
             .join("anythingllm-desktop")
             .join("storage")
             .join("plugins")
@@ -557,10 +645,12 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
 /// `~/.claude.json` but its rules live under `~/.claude/rules/`. `None` means the client has
 /// no global-rules location we write: either its globals are UI/cloud-stored (Cursor, Warp),
 /// or it's covered transitively by another client's file (Antigravity reads Gemini's
-/// `GEMINI.md`; VS Code Copilot reads Claude Code's `~/.claude` rules). Unlike the config
-/// resolver these paths are all home-anchored (or literal `~/.config`), so one cross-platform
-/// resolver covers Linux too — no XDG/data-dir or MSIX handling needed. See the spec's adapter
-/// table for citations.
+/// `GEMINI.md`; VS Code Copilot reads Claude Code's `~/.claude` rules). Most of these
+/// paths are home-anchored. Goose and Zed on Linux follow `XDG_CONFIG_HOME` via
+/// [`client_rules_target`] / `dirs::config_dir()`, matching [`client_config_path`]
+/// (SBS-899 / #757). Goose also honours absolute `GOOSE_PATH_ROOT`, which relocates
+/// both `config/config.yaml` and `config/.goosehints`. See the spec's adapter table
+/// for citations.
 fn resolve_rules_target(
     client_id: &str,
     home: &std::path::Path,
@@ -607,16 +697,14 @@ fn resolve_rules_target(
                 .join("toolport-team-rules.md"),
         ),
         // Strategy B — Toolport owns only the sentinel span in a shared global file.
-        "codex" => Target {
-            path: home.join(".codex").join("AGENTS.md"),
-            strategy: Strategy::SentinelBlock,
-            char_cap: None,
-            // AGENTS.override.md, if present, makes Codex ignore AGENTS.md entirely.
-            blocked_if_present: Some(home.join(".codex").join("AGENTS.override.md")),
-        },
-        // Gemini CLI and Antigravity share `~/.gemini/GEMINI.md`; both resolve to it so a
-        // standalone install of EITHER is covered, and `apply_instructions`' path-dedup writes
-        // it once when both are present.
+        // Default home only. `client_rules_target` relocates Codex / Gemini CLI
+        // when `CODEX_HOME` / `GEMINI_CLI_HOME` is an absolute path (SBS-885).
+        "codex" => codex_rules_target(&home.join(".codex")),
+        // Gemini CLI and Antigravity share `~/.gemini/GEMINI.md` at the default
+        // home so a standalone install of EITHER is covered, and
+        // `apply_instructions`' path-dedup writes it once when both are present.
+        // A relocated Gemini CLI home is handled in `client_rules_target` and
+        // does not move Antigravity (`GEMINI_CLI_HOME` is CLI-only).
         "gemini-cli" | "antigravity" => block(home.join(".gemini").join("GEMINI.md")),
         "windsurf" => Target {
             path: home
@@ -628,7 +716,22 @@ fn resolve_rules_target(
             char_cap: Some(6000), // Windsurf hard-caps the global rules file.
             blocked_if_present: None,
         },
-        "goose" => block(home.join(".config").join("goose").join(".goosehints")),
+        // Sibling of config.yaml. Windows uses the etcetera config dir
+        // (%APPDATA%\\Block\\goose\\config); macOS/Linux default to ~/.config/goose
+        // (Goose's documented XDG location). Production Linux overlays XDG via
+        // client_rules_target; GOOSE_PATH_ROOT is handled there too.
+        "goose" => match platform {
+            Platform::Windows => block(
+                config
+                    .join("Block")
+                    .join("goose")
+                    .join("config")
+                    .join(".goosehints"),
+            ),
+            Platform::MacOs | Platform::Linux => {
+                block(home.join(".config").join("goose").join(".goosehints"))
+            }
+        },
         "pi" => block(home.join(".pi").join("agent").join("AGENTS.md")),
         "omp" => block(home.join(".omp").join("agent").join("AGENTS.md")),
         "zed" => match platform {
@@ -642,10 +745,61 @@ fn resolve_rules_target(
     Some(target)
 }
 
+/// Codex team-instructions live next to `config.toml` under `CODEX_HOME`
+/// (default `~/.codex`). `AGENTS.override.md` in that same directory, if
+/// present, makes Codex ignore `AGENTS.md` entirely.
+fn codex_rules_target(codex_home: &Path) -> crate::instructions::Target {
+    crate::instructions::Target {
+        path: codex_home.join("AGENTS.md"),
+        strategy: crate::instructions::Strategy::SentinelBlock,
+        char_cap: None,
+        blocked_if_present: Some(codex_home.join("AGENTS.override.md")),
+    }
+}
+
+/// Gemini CLI team-instructions follow `GEMINI_CLI_HOME` the same way settings
+/// do: the env replaces the process home, then `.gemini/` is still appended.
+fn gemini_cli_rules_target(cli_home: &Path) -> crate::instructions::Target {
+    crate::instructions::Target {
+        path: cli_home.join(".gemini").join("GEMINI.md"),
+        strategy: crate::instructions::Strategy::SentinelBlock,
+        char_cap: None,
+        blocked_if_present: None,
+    }
+}
+
 /// The rules-file target for a client on the current machine, or `None` if unsupported /
-/// transitively covered. Mirrors [`client_config_path`].
+/// transitively covered. Mirrors [`client_config_path`]: Goose/Zed on Linux honor
+/// `XDG_CONFIG_HOME`, and Goose honors absolute `GOOSE_PATH_ROOT` (SBS-899).
 pub fn client_rules_target(client_id: &str) -> Option<crate::instructions::Target> {
+    // Honor relocate envs even when `$HOME` is unset: the live file is under
+    // the override, not the default home table (SBS-885, SBS-899).
+    if client_id == "goose" {
+        if let Some(root) = goose_path_root_from(std::env::var_os("GOOSE_PATH_ROOT")) {
+            return Some(rules_sentinel_block(goose_hints_under_root(&root)));
+        }
+    }
+    if client_id == "codex" {
+        if let Some(dir) = codex_home_from(std::env::var_os("CODEX_HOME")) {
+            return Some(codex_rules_target(&dir));
+        }
+    }
+    if client_id == "gemini-cli" {
+        if let Some(dir) = gemini_cli_home_from(std::env::var_os("GEMINI_CLI_HOME")) {
+            return Some(gemini_cli_rules_target(&dir));
+        }
+    }
     let home = home()?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if matches!(client_id, "goose" | "zed") {
+        let config = dirs::config_dir().unwrap_or_else(|| home.join(".config"));
+        let path = match client_id {
+            "goose" => config.join("goose").join(".goosehints"),
+            "zed" => config.join("zed").join("AGENTS.md"),
+            _ => unreachable!("guarded by matches! above"),
+        };
+        return Some(rules_sentinel_block(path));
+    }
     resolve_rules_target(client_id, &home, Platform::current())
 }
 
@@ -771,7 +925,22 @@ fn windsurf_path() -> Option<PathBuf> {
     client_config_path("windsurf")
 }
 
+/// Codex reads `$CODEX_HOME/config.toml` when `CODEX_HOME` is set, otherwise
+/// `~/.codex/config.toml`. The env *is* the Codex home directory, not its
+/// parent. Empty or relative values fall back: resolving them would depend
+/// on Toolport's cwd, which is not where Codex looks (SBS-885).
+fn codex_home_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    absolute_env_dir(raw)
+}
+
+fn codex_config_path(codex_home: &Path) -> PathBuf {
+    codex_home.join("config.toml")
+}
+
 fn codex_path() -> Option<PathBuf> {
+    if let Some(dir) = codex_home_from(std::env::var_os("CODEX_HOME")) {
+        return Some(codex_config_path(&dir));
+    }
     client_config_path("codex")
 }
 
@@ -785,13 +954,24 @@ fn github_copilot_cli_path() -> Option<PathBuf> {
         .or_else(|| client_config_path("github-copilot-cli"))
 }
 
-/// Grok Build (xAI's terminal coding agent) stores MCP servers in
-/// `~/.grok/config.toml` under `[mcp_servers.<name>]` - the same TOML shape as
-/// Codex, so it shares the `TomlMcpServers` format. It also reads Claude Code's
-/// config as a fallback, but writing our own explicit entry is what makes the
-/// gateway reliably visible (`grok mcp list` doesn't surface the Claude-config
-/// pickup).
+/// Grok Build stores MCP servers in `$GROK_HOME/config.toml` (default
+/// `~/.grok/config.toml`) under `[mcp_servers.<name>]` - the same TOML
+/// shape as Codex. `GROK_HOME` is the same relocate class as `CODEX_HOME`
+/// (SBS-885). It also reads Claude Code's config as a fallback, but writing
+/// our own explicit entry is what makes the gateway reliably visible
+/// (`grok mcp list` doesn't surface the Claude-config pickup).
+fn grok_home_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    absolute_env_dir(raw)
+}
+
+fn grok_config_path(grok_home: &Path) -> PathBuf {
+    grok_home.join("config.toml")
+}
+
 fn grok_path() -> Option<PathBuf> {
+    if let Some(dir) = grok_home_from(std::env::var_os("GROK_HOME")) {
+        return Some(grok_config_path(&dir));
+    }
     client_config_path("grok")
 }
 
@@ -861,13 +1041,51 @@ fn claude_code_path() -> Option<PathBuf> {
     client_config_path("claude-code")
 }
 
+/// Gemini CLI treats `GEMINI_CLI_HOME` as a replacement *home directory*,
+/// then still appends `.gemini/`. Settings live at
+/// `$GEMINI_CLI_HOME/.gemini/settings.json`. Empty or relative values fall
+/// back the same way `CLAUDE_CONFIG_DIR` does (SBS-885).
+fn gemini_cli_home_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    absolute_env_dir(raw)
+}
+
+fn gemini_cli_settings_path(cli_home: &Path) -> PathBuf {
+    cli_home.join(".gemini").join("settings.json")
+}
+
 fn gemini_cli_path() -> Option<PathBuf> {
+    if let Some(dir) = gemini_cli_home_from(std::env::var_os("GEMINI_CLI_HOME")) {
+        return Some(gemini_cli_settings_path(&dir));
+    }
     client_config_path("gemini-cli")
 }
 
-/// Qwen Code stores user-scoped settings at `~/.qwen/settings.json` on every
-/// supported platform.
+/// Qwen Code stores user-scoped settings at `~/.qwen/settings.json`.
+/// `QWEN_HOME` relocates that directory (`$QWEN_HOME/settings.json`), the
+/// same class as `CODEX_HOME` (SBS-885). Qwen itself also accepts a
+/// relative `QWEN_HOME` resolved against cwd; we do not, because Toolport's
+/// cwd is not Qwen's.
+///
+/// A leading `~` IS honored, unlike the sibling relocate envs: Qwen's
+/// `Storage.resolvePath` expands `~`, `~/`, and `~\` against `os.homedir()`
+/// before any cwd resolve, so `$expanded/settings.json` is the live file. An
+/// unquoted `export QWEN_HOME=~/work` is expanded by the shell before Toolport
+/// sees it, but a quoted export, a PowerShell `$env:QWEN_HOME`, and a Windows
+/// user-env value all stay literal. Dropping those left Connect, migrate, and
+/// the launch re-point writing `~/.qwen/settings.json` while Qwen read the
+/// expanded home.
+fn qwen_home_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    absolute_env_dir(expand_leading_tilde(raw))
+}
+
+fn qwen_settings_path(qwen_home: &Path) -> PathBuf {
+    qwen_home.join("settings.json")
+}
+
 fn qwen_code_path() -> Option<PathBuf> {
+    if let Some(dir) = qwen_home_from(std::env::var_os("QWEN_HOME")) {
+        return Some(qwen_settings_path(&dir));
+    }
     client_config_path("qwen-code")
 }
 
@@ -979,8 +1197,43 @@ fn zed_path() -> Option<PathBuf> {
 /// Hermes keeps MCP servers in ~/.hermes/config.yaml under the `mcp_servers:` key.
 /// The file is YAML and also holds the user's model and platform toolsets config,
 /// so it's read leniently and never wiped on a parse failure.
+///
+/// The Windows desktop build does NOT use the home-anchored path: it writes
+/// `%LOCALAPPDATA%\hermes\config.yaml` (lowercase dir), so resolving only
+/// `~/.hermes` made an installed Hermes undetectable there and there was no way
+/// to connect it. Related to [`crush_path`], but the preference is the other way
+/// round: Crush's platform path is the LEGACY one, so it only wins when it holds a
+/// file, whereas Hermes' platform path is the CURRENT one on Windows and so also
+/// wins when neither exists. Writing a fresh config into `~/.hermes` on Windows
+/// would put it somewhere Hermes never reads.
 fn hermes_path() -> Option<PathBuf> {
-    client_config_path("hermes")
+    let canonical = client_config_path("hermes")?;
+    // Only the Windows build uses the platform data dir. Passing None elsewhere
+    // keeps macOS and Linux on the home-anchored path with no probing at all.
+    let local = if cfg!(windows) {
+        dirs::data_local_dir()
+    } else {
+        None
+    };
+    Some(resolve_hermes_path(canonical, local))
+}
+
+/// Body of [`hermes_path`], taking the two roots directly so the fallback can be
+/// tested on any platform. An existing canonical file always wins, so a user who
+/// already has `~/.hermes/config.yaml` is never silently repointed.
+fn resolve_hermes_path(canonical: PathBuf, local_data: Option<PathBuf>) -> PathBuf {
+    if canonical.exists() {
+        return canonical;
+    }
+    // Nothing at the canonical path. Where a platform dir applies at all (Windows
+    // only), that is the file the installed build reads, whether it exists yet or
+    // not, so a first write has to land there. Returning the canonical path here
+    // would write a config into `~/.hermes` that Hermes never looks at, which reads
+    // to the user as "Toolport said it connected and nothing happened".
+    match local_data {
+        Some(local) => local.join("hermes").join("config.yaml"),
+        None => canonical,
+    }
 }
 
 fn continue_path() -> Option<PathBuf> {
@@ -1196,7 +1449,8 @@ fn defs() -> Vec<ClientDef> {
             plugin_scan: None,
         },
         ClientDef {
-            // The Codex CLI and the Codex desktop app share ~/.codex/config.toml.
+            // The Codex CLI and the Codex desktop app share config.toml under
+            // `CODEX_HOME` (default ~/.codex).
             id: "codex",
             name: "Codex",
             format: Format::TomlMcpServers,
@@ -2820,8 +3074,21 @@ fn backup_file_named(
 ) -> Result<Option<PathBuf>, String> {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() && meta.len() <= MAX_CONFIG_BYTES => {}
-        // Missing, special file, or oversized: nothing safe to back up.
-        _ => return Ok(None),
+        // Genuinely missing: nothing to back up yet, and the caller may create
+        // the file from scratch. Special file or oversized: deliberately nothing
+        // safe to back up (kept from the original behaviour).
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // A stat that failed for any other reason (permission, network share,
+        // transient I/O) must NOT read as "no file here": the caller would then
+        // treat the config as absent, start from an empty document, and overwrite
+        // the user's real file with no backup to recover it.
+        Err(e) => {
+            return Err(format!(
+                "could not stat {} before backing it up: {e}",
+                path.display()
+            ))
+        }
     }
     let dir = backup_dir(client_id).ok_or("Could not resolve backup dir")?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -3004,10 +3271,7 @@ fn entry_to_kimi_json(entry: &ServerEntry) -> serde_json::Value {
         let object = value.as_object_mut().unwrap();
         object.remove("type");
         if entry.transport.eq_ignore_ascii_case("sse") {
-            object.insert(
-                "transport".into(),
-                serde_json::Value::String("sse".into()),
-            );
+            object.insert("transport".into(), serde_json::Value::String("sse".into()));
         }
     }
     value
@@ -3139,8 +3403,7 @@ fn reject_duplicate_top_level_key(original: &str, key: &str) -> Result<(), Strin
     use jsonc_parser::cst::CstRootNode;
     use jsonc_parser::ParseOptions;
 
-    let root = CstRootNode::parse(original, &ParseOptions::default())
-        .map_err(|e| e.to_string())?;
+    let root = CstRootNode::parse(original, &ParseOptions::default()).map_err(|e| e.to_string())?;
     let Some(obj) = root.object_value() else {
         return Ok(());
     };
@@ -3166,8 +3429,7 @@ fn rewrite_json_key_preserving(
     use jsonc_parser::cst::CstRootNode;
     use jsonc_parser::ParseOptions;
 
-    let root = CstRootNode::parse(original, &ParseOptions::default())
-        .map_err(|e| e.to_string())?;
+    let root = CstRootNode::parse(original, &ParseOptions::default()).map_err(|e| e.to_string())?;
     // Client configs we edit are always root objects. Non-objects fall through
     // to the pretty-print path via the caller.
     let Some(obj) = root.object_value() else {
@@ -3201,9 +3463,7 @@ fn atomic_write_json_config(
     root: &serde_json::Value,
     changed_key: &str,
 ) -> Result<(), String> {
-    let pretty = || {
-        serde_json::to_string_pretty(root).map_err(|e| e.to_string())
-    };
+    let pretty = || serde_json::to_string_pretty(root).map_err(|e| e.to_string());
 
     let out = match (original, root.get(changed_key)) {
         (Some(src), Some(val)) if !src.trim().is_empty() => {
@@ -3223,6 +3483,659 @@ fn atomic_write_json_config(
     atomic_write(path, &out)
 }
 
+/// Convert a `toml::Value` into a `toml_edit::Item` so we can splice a rewritten
+/// `mcp_servers` table into an existing DocumentMut without losing comments on
+/// every other key (SBS-884).
+fn toml_value_to_item(value: &toml::Value) -> toml_edit::Item {
+    use toml_edit::{Item, Table};
+    match value {
+        toml::Value::Table(map) => {
+            let mut table = Table::new();
+            for (k, v) in map {
+                table.insert(k, toml_value_to_item(v));
+            }
+            Item::Table(table)
+        }
+        other => Item::Value(toml_value_to_edit_value(other)),
+    }
+}
+
+/// Value-level counterpart of [`toml_value_to_item`]. A nested table inside an
+/// array has to become an inline table: a standard `Item::Table` is not an
+/// `Item::Value`, so an array-of-tables would otherwise be dropped silently.
+fn toml_value_to_edit_value(value: &toml::Value) -> toml_edit::Value {
+    use toml_edit::{Array, InlineTable, Value};
+    match value {
+        toml::Value::String(s) => Value::from(s.as_str()),
+        toml::Value::Integer(i) => Value::from(*i),
+        toml::Value::Float(f) => Value::from(*f),
+        toml::Value::Boolean(b) => Value::from(*b),
+        toml::Value::Datetime(dt) => match dt.to_string().parse::<toml_edit::Datetime>() {
+            Ok(parsed) => Value::from(parsed),
+            Err(_) => Value::from(dt.to_string()),
+        },
+        toml::Value::Array(items) => {
+            let mut array = Array::new();
+            for item in items {
+                array.push(toml_value_to_edit_value(item));
+            }
+            Value::Array(array)
+        }
+        toml::Value::Table(map) => {
+            let mut inline = InlineTable::new();
+            for (k, v) in map {
+                inline.insert(k, toml_value_to_edit_value(v));
+            }
+            Value::InlineTable(inline)
+        }
+    }
+}
+
+/// Load a TOML config as a comment-preserving DocumentMut. An unparseable
+/// non-empty file is an error (same fail-closed contract as `read_existing_toml`)
+/// so we never replace Codex/Grok `config.toml` with a pretty-printed stub.
+fn load_toml_document(path: &Path) -> Result<toml_edit::DocumentMut, String> {
+    if !path.exists() {
+        return Ok(toml_edit::DocumentMut::new());
+    }
+    let content = read_config_file(path)?;
+    // Keep the toml 0.8 parse as the public error gate so existing tests and
+    // callers still see "Could not parse the existing config".
+    read_existing_toml(&content)?;
+    if content.trim().is_empty() {
+        return Ok(toml_edit::DocumentMut::new());
+    }
+    content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("Could not parse the existing config ({e}); leaving it untouched."))
+}
+
+/// Guarantee `item` is a standard table. Inline tables and non-table values
+/// (a corrupt-but-parseable `mcp_servers = "..."`) become an empty table, matching
+/// the previous `toml::Value` path that replaced a non-table with `Table::new()`.
+fn ensure_toml_table(item: &mut toml_edit::Item) -> &mut toml_edit::Table {
+    use toml_edit::{Item, Table};
+    if item.as_table().is_some() {
+        return item.as_table_mut().unwrap();
+    }
+    let converted = item.as_inline_table().map(|inline| {
+        let mut table = Table::new();
+        for (k, val) in inline.iter() {
+            table.insert(k, Item::Value(val.clone()));
+        }
+        table
+    });
+    *item = Item::Table(converted.unwrap_or_default());
+    item.as_table_mut().unwrap()
+}
+
+fn toml_mcp_servers_mut(doc: &mut toml_edit::DocumentMut) -> &mut toml_edit::Table {
+    ensure_toml_table(&mut doc["mcp_servers"])
+}
+
+/// Does the document already carry an explicit `[mcp_servers]` header with a
+/// `#` comment on it? An implicit table emits no header line, so making the
+/// table implicit would throw that comment away, the exact loss this path exists
+/// to prevent (SBS-884). Files with a bare header keep the old collapsed
+/// `[mcp_servers.name]` shape.
+fn toml_keeps_servers_header(doc: &toml_edit::DocumentMut) -> bool {
+    let Some(table) = doc.get("mcp_servers").and_then(|item| item.as_table()) else {
+        return false;
+    };
+    if table.is_implicit() {
+        return false;
+    }
+    let decor = table.decor();
+    [decor.prefix(), decor.suffix()]
+        .into_iter()
+        .flatten()
+        .filter_map(|raw| raw.as_str())
+        .any(|text| text.contains('#'))
+}
+
+/// Line-scan state for locating top-level YAML mapping keys without expanding
+/// anchors or dropping comments outside the rewritten node (SBS-884).
+#[derive(Default)]
+struct YamlLineState {
+    in_double: bool,
+    in_single: bool,
+    escape: bool,
+    flow_depth: i32,
+    /// Indent of the key that opened a `|` / `>` block scalar. Lines indented
+    /// further belong to the scalar, so a nested `extensions:` must not look
+    /// like a top-level key.
+    block_scalar_indent: Option<usize>,
+}
+
+/// Byte length of a line's YAML indentation.
+///
+/// Bytes, not characters, because callers use the result as a slice index.
+/// `char::is_whitespace` also matches multi-byte whitespace such as U+00A0 and
+/// U+3000, so a character count is smaller than the byte offset of the first
+/// content byte and the slice lands mid-character (panic). Only space and tab
+/// count: YAML indents with spaces, and everything else is content.
+fn yaml_leading_indent(line: &str) -> usize {
+    line.bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count()
+}
+
+fn yaml_is_doc_marker(line: &str) -> bool {
+    let t = line.trim_end();
+    t == "---"
+        || t == "..."
+        || t.starts_with("--- ")
+        || t.starts_with("---\t")
+        || t.starts_with("---#")
+        || t.starts_with("... ")
+        || t.starts_with("...\t")
+        || t.starts_with("...#")
+}
+
+fn yaml_is_seq_item(line: &str) -> bool {
+    let t = line.trim_start();
+    t == "-"
+        || t.starts_with("- ")
+        || t.starts_with("-\t")
+        || t.starts_with("-[")
+        || t.starts_with("-{")
+}
+
+fn yaml_is_block_scalar_header(s: &str) -> bool {
+    let b = s.as_bytes();
+    if !matches!(b.first(), Some(b'|' | b'>')) {
+        return false;
+    }
+    let mut i = 1;
+    while i < b.len() && matches!(b[i], b'+' | b'-' | b'0'..=b'9') {
+        i += 1;
+    }
+    i == b.len() || b[i].is_ascii_whitespace() || b[i] == b'#'
+}
+
+/// Skip YAML `&anchor`, `*alias`, and `!tag` prefixes that can sit between `:`
+/// and the real value (`key: &foo |`, `key: !!str bar`).
+fn yaml_skip_value_prefixes(s: &str) -> &str {
+    let mut rest = s.trim_start();
+    loop {
+        if rest.starts_with('&') || rest.starts_with('*') || rest.starts_with('!') {
+            let token_end = rest
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || c == '#'
+                        || c == ','
+                        || c == '{'
+                        || c == '['
+                        || c == '}'
+                        || c == ']'
+                })
+                .unwrap_or(rest.len());
+            if token_end == 0 {
+                return rest;
+            }
+            rest = rest[token_end..].trim_start();
+            continue;
+        }
+        return rest;
+    }
+}
+
+/// The `&anchor` token defined on a value, if any (`key: &exts`, `key: !!map &exts`).
+/// Returned with its `&` so a rewrite can re-emit it verbatim.
+fn yaml_value_anchor(s: &str) -> Option<&str> {
+    let mut rest = s.trim_start();
+    loop {
+        if !rest.starts_with('&') && !rest.starts_with('!') {
+            return None;
+        }
+        let token_end = rest
+            .find(|c: char| {
+                c.is_whitespace()
+                    || c == '#'
+                    || c == ','
+                    || c == '{'
+                    || c == '['
+                    || c == '}'
+                    || c == ']'
+            })
+            .unwrap_or(rest.len());
+        if token_end <= 1 {
+            return None;
+        }
+        let token = &rest[..token_end];
+        if token.starts_with('&') {
+            return Some(token);
+        }
+        rest = rest[token_end..].trim_start();
+    }
+}
+
+fn yaml_scan_chars(state: &mut YamlLineState, text: &str) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if state.in_double {
+            if state.escape {
+                state.escape = false;
+            } else if c == '\\' {
+                state.escape = true;
+            } else if c == '"' {
+                state.in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        if state.in_single {
+            if c == '\'' {
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    i += 2;
+                    continue;
+                }
+                state.in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '#' {
+            break;
+        }
+        if c == '"' {
+            state.in_double = true;
+            i += 1;
+            continue;
+        }
+        if c == '\'' {
+            state.in_single = true;
+            i += 1;
+            continue;
+        }
+        if c == '{' || c == '[' {
+            state.flow_depth += 1;
+            i += 1;
+            continue;
+        }
+        if (c == '}' || c == ']') && state.flow_depth > 0 {
+            state.flow_depth -= 1;
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn yaml_scan_after_colon(state: &mut YamlLineState, rest: &str, key_indent: usize) {
+    let rest = yaml_skip_value_prefixes(rest);
+    if yaml_is_block_scalar_header(rest) {
+        state.block_scalar_indent = Some(key_indent);
+        return;
+    }
+    yaml_scan_chars(state, rest);
+}
+
+fn yaml_unquote_double(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Split a YAML mapping line into (unquoted key, text after `:`). Returns
+/// `None` for comments, document markers, and sequence items.
+fn split_yaml_mapping_key(line: &str) -> Option<(String, &str)> {
+    let line = line.trim_end_matches(['\n', '\r']);
+    if line.is_empty()
+        || line.starts_with('#')
+        || yaml_is_doc_marker(line)
+        || yaml_is_seq_item(line)
+    {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    if bytes.first() == Some(&b'"') {
+        let mut i = 1;
+        let mut escape = false;
+        while i < bytes.len() {
+            if escape {
+                escape = false;
+                i += 1;
+                continue;
+            }
+            if bytes[i] == b'\\' {
+                escape = true;
+                i += 1;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                let key = yaml_unquote_double(&line[1..i]);
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b':' {
+                    return Some((key, &line[j + 1..]));
+                }
+                return None;
+            }
+            i += 1;
+        }
+        return None;
+    }
+    if bytes.first() == Some(&b'\'') {
+        let mut i = 1;
+        while i < bytes.len() {
+            if bytes[i] == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                let key = line[1..i].replace("''", "'");
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b':' {
+                    return Some((key, &line[j + 1..]));
+                }
+                return None;
+            }
+            i += 1;
+        }
+        return None;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            let after = i + 1;
+            if after == bytes.len() || bytes[after].is_ascii_whitespace() || bytes[after] == b'#' {
+                let key = line[..i].trim();
+                if key.is_empty() {
+                    return None;
+                }
+                return Some((key.to_string(), &line[after..]));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Locate each top-level block-mapping key and the byte span of its value.
+/// Column-0 comments, `---` markers, and keys inside `|`/`>` scalars are not keys.
+fn top_level_yaml_key_spans(src: &str) -> Vec<(String, usize, usize)> {
+    let (bom_len, src) = match src.strip_prefix('\u{feff}') {
+        Some(rest) => ('\u{feff}'.len_utf8(), rest),
+        None => (0, src),
+    };
+    let mut spans = Vec::new();
+    let mut state = YamlLineState::default();
+    let mut current: Option<(String, usize)> = None;
+    let mut last_value_end = 0usize;
+    let mut offset = 0usize;
+    for line in src.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        let line_end = offset;
+        let stripped = line.trim_end_matches(['\n', '\r']);
+        let indent = yaml_leading_indent(stripped);
+        let content = &stripped[indent.min(stripped.len())..];
+        let at_col0 = indent == 0 && !content.is_empty();
+
+        if let Some(parent_indent) = state.block_scalar_indent {
+            if !content.is_empty() && indent <= parent_indent {
+                state.block_scalar_indent = None;
+            } else {
+                last_value_end = line_end;
+                continue;
+            }
+        }
+
+        if state.in_double || state.in_single || state.flow_depth > 0 {
+            yaml_scan_chars(&mut state, stripped);
+            last_value_end = line_end;
+            continue;
+        }
+
+        if content.is_empty() {
+            continue;
+        }
+
+        if at_col0 && content.starts_with('#') {
+            if let Some((k, start)) = current.take() {
+                spans.push((k, start, last_value_end.max(start)));
+            }
+            continue;
+        }
+        if at_col0 && yaml_is_doc_marker(content) {
+            if let Some((k, start)) = current.take() {
+                spans.push((k, start, last_value_end.max(start)));
+            }
+            continue;
+        }
+        if at_col0 {
+            if let Some((key, rest)) = split_yaml_mapping_key(content) {
+                if let Some((k, start)) = current.take() {
+                    spans.push((k, start, last_value_end.max(start)));
+                }
+                current = Some((key, line_start));
+                last_value_end = line_end;
+                yaml_scan_after_colon(&mut state, rest, 0);
+                continue;
+            }
+            if yaml_is_seq_item(content) {
+                last_value_end = line_end;
+                yaml_scan_chars(&mut state, stripped);
+                continue;
+            }
+        }
+
+        last_value_end = line_end;
+        if let Some((_, rest)) = split_yaml_mapping_key(content) {
+            yaml_scan_after_colon(&mut state, rest, indent);
+        } else {
+            yaml_scan_chars(&mut state, stripped);
+        }
+    }
+    if let Some((k, start)) = current {
+        spans.push((k, start, last_value_end.max(start)));
+    }
+    spans
+        .into_iter()
+        .map(|(k, start, end)| (k, start + bom_len, end + bom_len))
+        .collect()
+}
+
+fn count_top_level_yaml_key(src: &str, key: &str) -> usize {
+    top_level_yaml_key_spans(src)
+        .into_iter()
+        .filter(|(k, _, _)| k == key)
+        .count()
+}
+
+/// Reject duplicate top-level occurrences of `key` in YAML text.
+///
+/// Duplicate keys are ambiguous: a span rewrite only replaces the first, so a
+/// later effective entry can stay stale. Callers must not fall back to
+/// `serde_yaml::to_string` when this fails — the file must remain unchanged
+/// (SBS-884, matching #555).
+fn reject_duplicate_top_level_yaml_key(original: &str, key: &str) -> Result<(), String> {
+    let n = count_top_level_yaml_key(original, key);
+    if n > 1 {
+        return Err(format!(
+            "malformed config: top-level key '{key}' appears {n} times; refusing to write"
+        ));
+    }
+    Ok(())
+}
+
+/// Indentation the replacement block should give the key's children, taken from
+/// the node already in the file so a 4-space config does not get one node
+/// reformatted to serde_yaml's 2 spaces (SBS-884 review). `span` is the existing
+/// text of the key, first line included. Levels below the first keep
+/// serde_yaml's own step: re-indenting emitted text per level would break
+/// sequence-item alignment and block-scalar content.
+fn yaml_child_indent(span: &str) -> String {
+    const DEFAULT: &str = "  ";
+    for line in span.split_inclusive('\n').skip(1) {
+        let stripped = line.trim_end_matches(['\n', '\r']);
+        let indent = yaml_leading_indent(stripped);
+        let content = &stripped[indent..];
+        if content.is_empty() || content.starts_with('#') {
+            continue;
+        }
+        let ws = &stripped[..indent];
+        // A tab never indents valid YAML, and a 0-indent child is a sequence
+        // written at the parent's column, which a mapping cannot reuse.
+        if (1..=8).contains(&ws.len()) && ws.bytes().all(|b| b == b' ') {
+            return ws.to_string();
+        }
+        break;
+    }
+    DEFAULT.to_string()
+}
+
+/// Render `key: <value>` as a YAML block (mapping/sequence nested under the key).
+/// `anchor` is re-emitted on the key line when the key being replaced defined one.
+fn format_yaml_key_block(
+    key: &str,
+    value: &serde_yaml::Value,
+    anchor: Option<&str>,
+    indent: &str,
+) -> Result<String, String> {
+    let head = match anchor {
+        Some(anchor) => format!("{key}: {anchor}"),
+        None => format!("{key}:"),
+    };
+    match value {
+        serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_) => {
+            let body = serde_yaml::to_string(value).map_err(|e| e.to_string())?;
+            let body = body.trim_end_matches('\n');
+            if body.is_empty() || body == "{}" || body == "[]" {
+                return Ok(format!("{head} {body}\n"));
+            }
+            let mut out = format!("{head}\n");
+            for line in body.lines() {
+                if line.is_empty() {
+                    out.push('\n');
+                } else {
+                    out.push_str(indent);
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            Ok(out)
+        }
+        serde_yaml::Value::Null => Ok(format!("{head} null\n")),
+        other => {
+            let body = serde_yaml::to_string(other).map_err(|e| e.to_string())?;
+            Ok(format!("{head} {}\n", body.trim()))
+        }
+    }
+}
+
+/// Rewrite a single top-level mapping key in `original` YAML text, preserving
+/// comments, anchors, aliases, and formatting of everything else. Used so
+/// Goose/Hermes/Continue Connect no longer strips user annotations (SBS-884).
+///
+/// Fails if `key` appears more than once at the top level (ambiguous rewrite).
+fn rewrite_yaml_key_preserving(
+    original: &str,
+    key: &str,
+    new_value: &serde_yaml::Value,
+) -> Result<String, String> {
+    let spans = top_level_yaml_key_spans(original);
+    let hits: Vec<&(String, usize, usize)> = spans.iter().filter(|(k, _, _)| k == key).collect();
+    if hits.len() > 1 {
+        return Err(format!(
+            "malformed config: top-level key '{key}' appears {} times; refusing to write",
+            hits.len()
+        ));
+    }
+    if let Some((_, start, end)) = hits.first() {
+        let span = &original[*start..*end];
+        // An anchor defined on this key is referenced by `*alias` elsewhere in the
+        // file. Replacing the key line without it leaves every alias undefined and
+        // the config no longer parses, so carry it onto the replacement (SBS-884).
+        // A tag on the key line is dropped on purpose: it described the value we
+        // are replacing, not the new one.
+        let anchor = split_yaml_mapping_key(span.lines().next().unwrap_or_default())
+            .and_then(|(_, rest)| yaml_value_anchor(rest));
+        let block = format_yaml_key_block(key, new_value, anchor, &yaml_child_indent(span))?;
+        let mut out = String::with_capacity(original.len() + block.len());
+        out.push_str(&original[..*start]);
+        out.push_str(&block);
+        out.push_str(&original[*end..]);
+        Ok(out)
+    } else {
+        let block = format_yaml_key_block(key, new_value, None, "  ")?;
+        let mut out = original.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&block);
+        Ok(out)
+    }
+}
+
+/// Serialize `root` for disk. When `original` is present, surgically rewrite
+/// only `changed_key` so comments and YAML anchors outside that key survive.
+/// Pretty-print is used only for new/empty files — an existing parseable file
+/// is never replaced with a full `serde_yaml::to_string` dump (that is SBS-884).
+///
+/// Duplicate top-level keys for `changed_key` are a hard error (no pretty fallback)
+/// so the existing file is left untouched.
+fn atomic_write_yaml_config(
+    path: &Path,
+    original: Option<&str>,
+    root: &serde_yaml::Value,
+    changed_key: &str,
+) -> Result<(), String> {
+    let pretty = || serde_yaml::to_string(root).map_err(|e| e.to_string());
+
+    let out = match (original, root.get(changed_key)) {
+        (Some(src), Some(val)) if !src.trim().is_empty() => {
+            reject_duplicate_top_level_yaml_key(src, changed_key)?;
+            rewrite_yaml_key_preserving(src, changed_key, val)?
+        }
+        _ => pretty()?,
+    };
+    atomic_write(path, &out)
+}
+
+fn parse_existing_yaml_content(content: &str) -> Result<serde_yaml::Value, String> {
+    if content.trim().is_empty() {
+        return Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    }
+    serde_yaml::from_str(content).map_err(|e| {
+        format!("Could not parse the existing config.yaml ({e}); leaving it untouched.")
+    })
+}
+
+/// Read an existing YAML config and keep the original text so the write can
+/// surgically replace one key instead of pretty-printing the whole file.
+fn read_existing_yaml_with_source(
+    path: &Path,
+) -> Result<(Option<String>, serde_yaml::Value), String> {
+    if !path.exists() {
+        return Ok((None, serde_yaml::Value::Mapping(serde_yaml::Mapping::new())));
+    }
+    let content = read_config_file(path)?;
+    let value = parse_existing_yaml_content(&content)?;
+    Ok((Some(content), value))
+}
+
 fn validate_amp_settings_shape(root: &serde_json::Value) -> Result<(), String> {
     let object = root
         .as_object()
@@ -3240,7 +4153,10 @@ fn validate_crush_settings_shape(root: &serde_json::Value) -> Result<(), String>
     let object = root
         .as_object()
         .ok_or("Crush config root must be an object; leaving it untouched.")?;
-    if object.get("mcp").is_some_and(|servers| !servers.is_object()) {
+    if object
+        .get("mcp")
+        .is_some_and(|servers| !servers.is_object())
+    {
         return Err("'mcp' must be an object; leaving the Crush config untouched.".into());
     }
     Ok(())
@@ -3260,18 +4176,42 @@ fn write_crush_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> 
 }
 
 fn write_copilot_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    write_json_with(path, "mcpServers", servers, false, entry_to_json, false, true)
+    write_json_with(
+        path,
+        "mcpServers",
+        servers,
+        false,
+        entry_to_json,
+        false,
+        true,
+    )
 }
 
 fn write_droid_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    write_json_with(path, "mcpServers", servers, false, entry_to_droid_json, false, false)
+    write_json_with(
+        path,
+        "mcpServers",
+        servers,
+        false,
+        entry_to_droid_json,
+        false,
+        false,
+    )
 }
 
 /// Kimi Code's `mcp.json` is MCP-only (app settings live in config.toml).
 /// `read_existing_json` ignores the lenient flag and always errors on a parse
 /// failure; pass `true` anyway to match Qwen, the closest analogue.
 fn write_kimi_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    write_json_with(path, "mcpServers", servers, true, entry_to_kimi_json, false, false)
+    write_json_with(
+        path,
+        "mcpServers",
+        servers,
+        true,
+        entry_to_kimi_json,
+        false,
+        false,
+    )
 }
 
 fn write_json_with(
@@ -3333,10 +4273,10 @@ fn write_json_with_body(
         .map(|server| {
             let mut value = entry_to_value(server);
             if include_tools {
-                value.as_object_mut().unwrap().insert(
-                    "tools".into(),
-                    serde_json::json!(["*"]),
-                );
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("tools".into(), serde_json::json!(["*"]));
             }
             (server.name.clone(), value)
         })
@@ -3426,24 +4366,27 @@ fn write_opencode_json(path: &Path, servers: &[ServerEntry]) -> Result<(), Strin
 }
 
 fn write_toml(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    let mut root = if path.exists() {
-        let content = read_config_file(path)?;
-        read_existing_toml(&content)?
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-    if !root.is_table() {
-        root = toml::Value::Table(toml::map::Map::new());
+    let mut doc = load_toml_document(path)?;
+    let keep_header = toml_keeps_servers_header(&doc);
+    // Carry the old header's comments and blank lines onto the rebuilt table.
+    let decor = doc
+        .get("mcp_servers")
+        .and_then(|item| item.as_table())
+        .map(|table| table.decor().clone());
+    let mut servers_table = toml_edit::Table::new();
+    if let Some(decor) = decor {
+        *servers_table.decor_mut() = decor;
     }
-    let table = root.as_table_mut().unwrap();
-    let servers_table: toml::map::Map<String, toml::Value> = servers
-        .iter()
-        .map(|s| (s.name.clone(), entry_to_toml(s)))
-        .collect();
-    table.insert("mcp_servers".into(), toml::Value::Table(servers_table));
-
-    let out = toml::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    atomic_write(path, &out)
+    if !servers.is_empty() && !keep_header {
+        // Implicit so we emit `[mcp_servers.name]` rather than a `[mcp_servers]`
+        // wrapper, the same shape Codex already ships.
+        servers_table.set_implicit(true);
+    }
+    for s in servers {
+        servers_table.insert(&s.name, toml_value_to_item(&entry_to_toml(s)));
+    }
+    doc["mcp_servers"] = toml_edit::Item::Table(servers_table);
+    atomic_write(path, &doc.to_string())
 }
 
 // --- Goose: YAML config.yaml with a top-level `extensions` map ---
@@ -3537,22 +4480,6 @@ fn entry_to_goose_yaml(entry: &ServerEntry) -> serde_yaml::Value {
     serde_yaml::to_value(&v).unwrap_or(serde_yaml::Value::Null)
 }
 
-/// Read an existing config.yaml we're about to modify. Like the JSON lenient path,
-/// an unparseable non-empty file is an ERROR, never replaced - config.yaml also
-/// holds the user's model settings and other extensions, so we must not wipe it.
-fn read_existing_yaml(path: &Path) -> Result<serde_yaml::Value, String> {
-    if !path.exists() {
-        return Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-    }
-    let content = read_config_file(path)?;
-    if content.trim().is_empty() {
-        return Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-    }
-    serde_yaml::from_str(&content).map_err(|e| {
-        format!("Could not parse the existing config.yaml ({e}); leaving it untouched.")
-    })
-}
-
 fn yaml_extensions_mut(root: &mut serde_yaml::Value) -> &mut serde_yaml::Mapping {
     if !root.is_mapping() {
         *root = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
@@ -3569,7 +4496,7 @@ fn yaml_extensions_mut(root: &mut serde_yaml::Value) -> &mut serde_yaml::Mapping
 }
 
 fn write_yaml_extensions(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    let mut root = read_existing_yaml(path)?;
+    let (original, mut root) = read_existing_yaml_with_source(path)?;
     let exts = yaml_extensions_mut(&mut root);
     // Replace only definitions Toolport can actually import as MCP servers.
     // Goose builtins/platform extensions and unknown shapes share this map but
@@ -3599,12 +4526,11 @@ fn write_yaml_extensions(path: &Path, servers: &[ServerEntry]) -> Result<(), Str
             entry_to_goose_yaml(s),
         );
     }
-    let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
-    atomic_write(path, &out)
+    atomic_write_yaml_config(path, original.as_deref(), &root, "extensions")
 }
 
 fn edit_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    let mut root = read_existing_yaml(path)?;
+    let (original, mut root) = read_existing_yaml_with_source(path)?;
     let exts = yaml_extensions_mut(&mut root);
     let key = serde_yaml::Value::String(GATEWAY_ENTRY_NAME.into());
     exts.retain(|name, definition| {
@@ -3618,8 +4544,7 @@ fn edit_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), Str
     if let Some(entry) = entry {
         exts.insert(key, entry_to_goose_yaml(entry));
     }
-    let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
-    atomic_write(path, &out)
+    atomic_write_yaml_config(path, original.as_deref(), &root, "extensions")
 }
 
 /// Parse Continue's `mcpServers` list into servers. Entries may be local stdio
@@ -3793,7 +4718,7 @@ fn continue_servers_mut(root: &mut serde_yaml::Value) -> &mut Vec<serde_yaml::Va
 }
 
 fn write_continue_yaml_servers(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    let mut root = read_existing_yaml(path)?;
+    let (original, mut root) = read_existing_yaml_with_source(path)?;
 
     let list = continue_servers_mut(&mut root);
 
@@ -3803,13 +4728,11 @@ fn write_continue_yaml_servers(path: &Path, servers: &[ServerEntry]) -> Result<(
         list.push(entry_to_continue_yaml(server));
     }
 
-    let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
-
-    atomic_write(path, &out)
+    atomic_write_yaml_config(path, original.as_deref(), &root, "mcpServers")
 }
 
 fn edit_continue_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    let mut root = read_existing_yaml(path)?;
+    let (original, mut root) = read_existing_yaml_with_source(path)?;
 
     let servers = continue_servers_mut(&mut root);
 
@@ -3829,9 +4752,7 @@ fn edit_continue_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Resul
         servers.push(entry_to_continue_yaml(entry));
     }
 
-    let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
-
-    atomic_write(path, &out)
+    atomic_write_yaml_config(path, original.as_deref(), &root, "mcpServers")
 }
 
 // ---------------------------------------------------------------------------
@@ -3965,13 +4886,6 @@ fn entry_to_hermes_yaml(entry: &ServerEntry) -> serde_yaml::Value {
     serde_yaml::Value::Mapping(cfg)
 }
 
-/// Read a Hermes config.yaml we're about to modify. Same contract as
-/// `read_existing_yaml`: an unparseable non-empty file is an ERROR, never
-/// replaced — config.yaml also holds the user's model and toolsets.
-fn read_existing_hermes_yaml(path: &Path) -> Result<serde_yaml::Value, String> {
-    read_existing_yaml(path)
-}
-
 fn hermes_mcp_servers_mut(root: &mut serde_yaml::Value) -> &mut serde_yaml::Mapping {
     if !root.is_mapping() {
         *root = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
@@ -3988,19 +4902,18 @@ fn hermes_mcp_servers_mut(root: &mut serde_yaml::Value) -> &mut serde_yaml::Mapp
 }
 
 fn write_hermes_yaml_servers(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    let mut root = read_existing_hermes_yaml(path)?;
+    let (original, mut root) = read_existing_yaml_with_source(path)?;
     let mcp_servers = hermes_mcp_servers_mut(&mut root);
     mcp_servers.clear();
     for entry in servers {
         let name_val = serde_yaml::Value::String(entry.name.clone());
         mcp_servers.insert(name_val, entry_to_hermes_yaml(entry));
     }
-    let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
-    atomic_write(path, &out)
+    atomic_write_yaml_config(path, original.as_deref(), &root, "mcp_servers")
 }
 
 fn edit_hermes_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    let mut root = read_existing_hermes_yaml(path)?;
+    let (original, mut root) = read_existing_yaml_with_source(path)?;
     let mcp_servers = hermes_mcp_servers_mut(&mut root);
     let key = serde_yaml::Value::String(GATEWAY_ENTRY_NAME.into());
     mcp_servers.retain(|name, definition| {
@@ -4014,8 +4927,7 @@ fn edit_hermes_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<
     if let Some(entry) = entry {
         mcp_servers.insert(key, entry_to_hermes_yaml(entry));
     }
-    let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
-    atomic_write(path, &out)
+    atomic_write_yaml_config(path, original.as_deref(), &root, "mcp_servers")
 }
 
 /// Write a server set into a client's config, backing up the existing file first
@@ -4146,30 +5058,129 @@ pub(crate) fn resolve_gateway_path() -> Option<PathBuf> {
 
 /// Copy the gateway binary to a stable per-user location, so a client config can
 /// point at a path that outlives an ephemeral AppImage mount. Re-copies when the
-/// source size differs (e.g. after an app update). Returns the stable path.
+/// source size or content differs (e.g. after an app update that rebuilt the
+/// gateway at the same byte length). Returns the stable path.
 fn stable_gateway_copy(src: &std::path::Path) -> Option<PathBuf> {
     let dest_dir = crate::registry::conduit_dir()?.join("bin");
     std::fs::create_dir_all(&dest_dir).ok()?;
     // Keep the source's filename so the stable copy matches whichever binary name
     // (toolport-gateway, or the legacy conduit-gateway) was found next to the app.
     let dest = dest_dir.join(src.file_name()?);
-    let stale = match (std::fs::metadata(&dest), std::fs::metadata(src)) {
-        (Ok(d), Ok(s)) => d.len() != s.len(),
-        _ => true,
-    };
-    if stale {
-        std::fs::copy(src, &dest).ok()?;
+    stable_gateway_copy_with(src, dest, replace_gateway_copy)
+}
+
+/// Refresh logic for [`stable_gateway_copy`], with the write step injected so
+/// tests can exercise the failure path without needing a genuinely busy binary.
+fn stable_gateway_copy_with(
+    src: &std::path::Path,
+    dest: PathBuf,
+    replace: impl Fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Option<PathBuf> {
+    if !gateway_copy_is_stale(src, &dest) {
+        return Some(dest);
+    }
+    if replace(src, &dest).is_ok() {
+        return Some(dest);
+    }
+    // The refresh failed, but an earlier stable copy is still sitting there.
+    // Hand that back: a slightly stale gateway on a path that survives is far
+    // better than the caller falling through to the AppImage-internal
+    // /tmp/.mount_XXXX path, which is written into a client config and then
+    // dies with the mount when Toolport exits. Only give up when there is no
+    // stable copy at all.
+    match std::fs::metadata(&dest) {
+        Ok(meta) if meta.is_file() && meta.len() > 0 => Some(dest),
+        _ => None,
+    }
+}
+
+/// Replace `dest` with the bytes of `src`.
+///
+/// Deliberately not a plain `std::fs::copy`: that opens the destination
+/// `O_WRONLY|O_TRUNC`, which on Linux fails with `ETXTBSY` whenever the
+/// destination is a binary that is currently executing. Any connected client
+/// keeps a gateway alive out of `~/.toolport/bin`, so that is the normal case,
+/// not a rare one. Writing a sibling temp file and `rename(2)`-ing it over the
+/// destination succeeds against a busy target (the running process keeps the
+/// old inode) and swaps atomically, so a reader never sees a half-written
+/// binary. The exec bit is set on the temp file *before* the rename for the
+/// same reason: the path is never briefly non-executable.
+fn replace_gateway_copy(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    let dir = dest.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "gateway copy destination has no parent directory",
+        )
+    })?;
+    let stem = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "toolport-gateway".to_string());
+    let tmp = dir.join(format!(
+        ".{stem}.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let written = (|| -> std::io::Result<()> {
+        std::fs::copy(src, &tmp)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&dest) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o755);
-                let _ = std::fs::set_permissions(&dest, perms);
-            }
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
         }
+        std::fs::rename(&tmp, dest)
+    })();
+    if written.is_err() {
+        // Never leave the half-written temp file behind in ~/.toolport/bin.
+        let _ = std::fs::remove_file(&tmp);
     }
-    Some(dest)
+    written
+}
+
+/// True when dest is missing, unreadable, a different length, or the same length
+/// with different bytes. Size alone is not enough: AppImage rebuilds commonly
+/// keep the previous length.
+fn gateway_copy_is_stale(src: &std::path::Path, dest: &std::path::Path) -> bool {
+    match (std::fs::metadata(dest), std::fs::metadata(src)) {
+        (Ok(d), Ok(s)) if d.is_file() && d.len() == s.len() => !files_have_same_bytes(src, dest),
+        _ => true,
+    }
+}
+
+/// Byte-compare two files without slurping either into memory. The gateway is a
+/// multi-MB binary and this runs on every Connect plus twice at startup, so a
+/// streaming compare that short-circuits on the first differing chunk beats two
+/// full `std::fs::read`s. Returns false if either file cannot be read, which
+/// makes the caller treat the copy as stale.
+fn files_have_same_bytes(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::io::BufRead;
+    let (Ok(fa), Ok(fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    const CHUNK: usize = 64 * 1024;
+    let mut ra = std::io::BufReader::with_capacity(CHUNK, fa);
+    let mut rb = std::io::BufReader::with_capacity(CHUNK, fb);
+    loop {
+        let consumed = {
+            let (Ok(buf_a), Ok(buf_b)) = (ra.fill_buf(), rb.fill_buf()) else {
+                return false;
+            };
+            if buf_a.is_empty() || buf_b.is_empty() {
+                // Equal only if both hit EOF at the same offset.
+                return buf_a.is_empty() && buf_b.is_empty();
+            }
+            let n = buf_a.len().min(buf_b.len());
+            if buf_a[..n] != buf_b[..n] {
+                return false;
+            }
+            n
+        };
+        ra.consume(consumed);
+        rb.consume(consumed);
+    }
 }
 
 fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, String> {
@@ -4352,7 +5363,15 @@ fn edit_copilot_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result
 }
 
 fn edit_droid_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    edit_json_gateway_with(path, "mcpServers", entry, false, Some(entry_to_droid_json), false, false)
+    edit_json_gateway_with(
+        path,
+        "mcpServers",
+        entry,
+        false,
+        Some(entry_to_droid_json),
+        false,
+        false,
+    )
 }
 
 fn edit_json_gateway_with(
@@ -4437,10 +5456,10 @@ fn edit_json_gateway_body(
             entry_to_json(entry)
         };
         if include_tools {
-            value.as_object_mut().unwrap().insert(
-                "tools".into(),
-                serde_json::json!(["*"]),
-            );
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert("tools".into(), serde_json::json!(["*"]));
         }
         servers.insert(GATEWAY_ENTRY_NAME.to_string(), value);
     }
@@ -4474,41 +5493,37 @@ fn edit_opencode_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(),
 }
 
 fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    let mut root = if path.exists() {
-        let content = read_config_file(path)?;
-        read_existing_toml(&content)?
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-    if !root.is_table() {
-        root = toml::Value::Table(toml::map::Map::new());
+    let mut doc = load_toml_document(path)?;
+    let keep_header = toml_keeps_servers_header(&doc);
+    let servers = toml_mcp_servers_mut(&mut doc);
+    let doomed: Vec<String> = servers
+        .iter()
+        .filter(|(name, definition)| {
+            let command = definition.get("command").and_then(|value| value.as_str());
+            gateway_identity_matches(name, name, command)
+        })
+        .map(|(name, _)| name.to_string())
+        .collect();
+    for name in doomed {
+        servers.remove(&name);
     }
-    let table = root.as_table_mut().unwrap();
-    if !table
-        .get("mcp_servers")
-        .map(|v| v.is_table())
-        .unwrap_or(false)
-    {
-        table.insert(
-            "mcp_servers".to_string(),
-            toml::Value::Table(toml::map::Map::new()),
+    if let Some(entry) = entry {
+        servers.insert(
+            GATEWAY_ENTRY_NAME,
+            toml_value_to_item(&entry_to_toml(entry)),
         );
     }
-    let servers = table
-        .get_mut("mcp_servers")
-        .unwrap()
-        .as_table_mut()
-        .unwrap();
-    servers.retain(|name, definition| {
-        let command = definition.get("command").and_then(|value| value.as_str());
-        !gateway_identity_matches(name, name, command)
-    });
-    if let Some(entry) = entry {
-        servers.insert(GATEWAY_ENTRY_NAME.to_string(), entry_to_toml(entry));
+    if servers.is_empty() || keep_header {
+        // Keep an explicit empty table so uninstall still leaves `mcp_servers`
+        // present, matching the previous toml::Value insert-if-missing path.
+        // An existing commented header stays explicit too, otherwise the comment
+        // has no header line left to hang on.
+        servers.set_implicit(false);
+    } else {
+        servers.set_implicit(true);
     }
 
-    let out = toml::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    atomic_write(path, &out)
+    atomic_write(path, &doc.to_string())
 }
 
 /// Clients whose JSON config file holds their ENTIRE application state (project
@@ -4538,18 +5553,12 @@ fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<Wri
     // we put on disk (SOU-406). Strip secrets for the registry record.
     let managed = entry.map(ManagedEntry::from_gateway_entry);
     match def.format {
-        Format::JsonMcpServers => {
-            edit_json_gateway(&path, "mcpServers", entry, lenient)?
-        }
+        Format::JsonMcpServers => edit_json_gateway(&path, "mcpServers", entry, lenient)?,
         Format::JsonCopilotMcpServers => edit_copilot_json_gateway(&path, entry)?,
         Format::JsonDroidMcpServers => edit_droid_json_gateway(&path, entry)?,
-        Format::JsonAmpMcpServers => {
-            edit_json_gateway(&path, "amp.mcpServers", entry, true)?
-        }
+        Format::JsonAmpMcpServers => edit_json_gateway(&path, "amp.mcpServers", entry, true)?,
         Format::JsonQwenMcpServers => edit_json_gateway(&path, "mcpServers", entry, true)?,
-        Format::JsonKimiMcpServers => {
-            edit_json_gateway(&path, "mcpServers", entry, true)?
-        }
+        Format::JsonKimiMcpServers => edit_json_gateway(&path, "mcpServers", entry, true)?,
         Format::JsonServers => edit_json_gateway(&path, "servers", entry, lenient)?,
         Format::JsonMcp => edit_crush_gateway(&path, entry)?,
         Format::JsonOpenCodeMcp => edit_opencode_gateway(&path, entry)?,
@@ -5112,6 +6121,47 @@ fn log_repoint_outcome(current: &str, outcome: &RepointOutcome) {
     ));
 }
 
+/// Serializes tests that read or mutate the process-global env vars these resolvers depend on
+/// (`XDG_*`, `GOOSE_PATH_ROOT`, `CLAUDE_CONFIG_DIR`). The env is process-global and Rust runs
+/// tests in parallel, so a test in ANY module that sets one of those keys must hold this lock,
+/// not a lock of its own. Poison is recovered: a panic elsewhere shouldn't wedge these.
+#[cfg(test)]
+pub(crate) fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Sets a process env var and puts the old value back when the guard drops. Only valid while
+/// [`env_test_lock`] is held. Lives beside the lock so other modules' tests use both.
+#[cfg(test)]
+pub(crate) struct EnvRestore {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl EnvRestore {
+    pub(crate) fn set(key: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5324,7 +6374,10 @@ mod tests {
         let dir = temp_path("claude-secondary-repair");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let current = dir.join("toolport-gateway-1.13.0").to_string_lossy().into_owned();
+        let current = dir
+            .join("toolport-gateway-1.13.0")
+            .to_string_lossy()
+            .into_owned();
         std::fs::write(&current, b"binary").unwrap();
 
         let write = |name: &str, body: &str| {
@@ -5351,7 +6404,10 @@ mod tests {
             "custom.json",
             r#"{"mcpServers":{"toolport":{"command":"npx","args":["-y","something"]}}}"#,
         );
-        let no_gateway = write("none.json", r#"{"mcpServers":{"sentry":{"command":"npx"}}}"#);
+        let no_gateway = write(
+            "none.json",
+            r#"{"mcpServers":{"sentry":{"command":"npx"}}}"#,
+        );
         let unparseable = write("broken.json", "{ this is not json");
         let missing = dir.join("does-not-exist.json");
 
@@ -5387,6 +6443,173 @@ mod tests {
         // Relative: resolving it would depend on Toolport's cwd, which has nothing
         // to do with where the client reads its config.
         assert_eq!(claude_config_dir_from(Some("relative/dir".into())), None);
+    }
+
+    fn relocated_abs(unix: &str, windows: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(windows)
+        } else {
+            PathBuf::from(unix)
+        }
+    }
+
+    /// Pins the failure mode in SBS-885: an absolute `CODEX_HOME` is the
+    /// directory Codex reads, so Connect must write `$CODEX_HOME/config.toml`
+    /// rather than a leftover `~/.codex/config.toml`.
+    #[test]
+    fn an_absolute_codex_home_is_the_config_and_rules_root() {
+        let relocated = relocated_abs("/work/codex", r"D:\work\codex");
+        assert_eq!(
+            codex_home_from(Some(relocated.clone().into_os_string())),
+            Some(relocated.clone())
+        );
+        assert_eq!(codex_config_path(&relocated), relocated.join("config.toml"));
+        let rules = codex_rules_target(&relocated);
+        assert_eq!(rules.path, relocated.join("AGENTS.md"));
+        assert_eq!(
+            rules.blocked_if_present,
+            Some(relocated.join("AGENTS.override.md"))
+        );
+    }
+
+    #[test]
+    fn an_unset_or_unusable_codex_home_falls_back_to_the_default() {
+        assert_eq!(codex_home_from(None), None);
+        assert_eq!(codex_home_from(Some("".into())), None);
+        assert_eq!(codex_home_from(Some("relative/dir".into())), None);
+    }
+
+    /// Gemini CLI replaces the process home, then still appends `.gemini/`.
+    /// Writing `$GEMINI_CLI_HOME/settings.json` would miss the live file.
+    #[test]
+    fn an_absolute_gemini_cli_home_nests_settings_and_rules_under_dot_gemini() {
+        let relocated = relocated_abs("/work/gemini", r"D:\work\gemini");
+        assert_eq!(
+            gemini_cli_home_from(Some(relocated.clone().into_os_string())),
+            Some(relocated.clone())
+        );
+        assert_eq!(
+            gemini_cli_settings_path(&relocated),
+            relocated.join(".gemini").join("settings.json")
+        );
+        assert_eq!(
+            gemini_cli_rules_target(&relocated).path,
+            relocated.join(".gemini").join("GEMINI.md")
+        );
+    }
+
+    #[test]
+    fn an_unset_or_unusable_gemini_cli_home_falls_back_to_the_default() {
+        assert_eq!(gemini_cli_home_from(None), None);
+        assert_eq!(gemini_cli_home_from(Some("".into())), None);
+        assert_eq!(gemini_cli_home_from(Some("relative/dir".into())), None);
+    }
+
+    #[test]
+    fn an_absolute_grok_home_is_the_config_root() {
+        let relocated = relocated_abs("/work/grok", r"D:\work\grok");
+        assert_eq!(
+            grok_home_from(Some(relocated.clone().into_os_string())),
+            Some(relocated.clone())
+        );
+        assert_eq!(grok_config_path(&relocated), relocated.join("config.toml"));
+    }
+
+    #[test]
+    fn an_unset_or_unusable_grok_home_falls_back_to_the_default() {
+        assert_eq!(grok_home_from(None), None);
+        assert_eq!(grok_home_from(Some("".into())), None);
+        assert_eq!(grok_home_from(Some("relative/dir".into())), None);
+    }
+
+    #[test]
+    fn an_absolute_qwen_home_is_the_settings_root() {
+        let relocated = relocated_abs("/work/qwen", r"D:\work\qwen");
+        assert_eq!(
+            qwen_home_from(Some(relocated.clone().into_os_string())),
+            Some(relocated.clone())
+        );
+        assert_eq!(
+            qwen_settings_path(&relocated),
+            relocated.join("settings.json")
+        );
+    }
+
+    #[test]
+    fn an_unset_or_unusable_qwen_home_falls_back_to_the_default() {
+        assert_eq!(qwen_home_from(None), None);
+        assert_eq!(qwen_home_from(Some("".into())), None);
+        assert_eq!(qwen_home_from(Some("relative/dir".into())), None);
+    }
+
+    /// Qwen's own `Storage.resolvePath` expands a leading `~` before it reads
+    /// `$QWEN_HOME/settings.json`, and a quoted export or a PowerShell
+    /// `$env:QWEN_HOME` never gets shell expansion. Dropping the value as "not
+    /// absolute" left Connect writing `~/.qwen/settings.json` while Qwen read
+    /// the expanded home.
+    #[test]
+    fn a_tilde_qwen_home_expands_against_the_home_dir() {
+        let home = home().expect("home dir should be available in tests");
+
+        assert_eq!(qwen_home_from(Some("~".into())), Some(home.clone()));
+        assert_eq!(
+            qwen_home_from(Some("~/work/qwen".into())),
+            Some(home.join("work/qwen"))
+        );
+        assert_eq!(
+            qwen_home_from(Some(r"~\work\qwen".into())),
+            Some(home.join(r"work\qwen"))
+        );
+        assert_eq!(
+            qwen_settings_path(&qwen_home_from(Some("~/work/qwen".into())).expect("expanded")),
+            home.join("work/qwen").join("settings.json")
+        );
+        // No separator, so it is a literal directory name and not a home
+        // reference, the same call Qwen's `resolvePath` makes.
+        assert_eq!(qwen_home_from(Some("~work".into())), None);
+    }
+
+    /// A doubled separator after the `~` used to leave a rooted remainder, and
+    /// `PathBuf::join` substitutes a rooted path for the base rather than
+    /// appending to it. `~//work/qwen` resolved to `/work/qwen`, outside the home
+    /// dir the tilde asked for. Every leading separator is stripped now, so an
+    /// expanded value always stays under home.
+    #[test]
+    fn extra_separators_after_the_tilde_cannot_escape_the_home_dir() {
+        let home = home().expect("home dir should be available in tests");
+
+        for raw in ["~", "~/", r"~\", "~//work/qwen", r"~\\work\qwen", "~///"] {
+            let expanded = qwen_home_from(Some(raw.into()))
+                .unwrap_or_else(|| panic!("{raw} should expand to an absolute path"));
+            assert!(
+                expanded.starts_with(&home),
+                "{raw} expanded to {expanded:?}, which escapes {home:?}"
+            );
+        }
+
+        assert_eq!(
+            qwen_home_from(Some("~//work/qwen".into())),
+            Some(home.join("work/qwen"))
+        );
+        assert_eq!(
+            qwen_home_from(Some(r"~\\work\qwen".into())),
+            Some(home.join(r"work\qwen"))
+        );
+        assert_eq!(qwen_home_from(Some("~".into())), Some(home.clone()));
+        assert_eq!(qwen_home_from(Some("~///".into())), Some(home));
+    }
+
+    /// The tilde rule is Qwen-only on purpose. Codex (`find_codex_home_from_env`),
+    /// Grok (`resolve_grok_home_from`), Gemini CLI (`homedir()`), and Claude Code
+    /// all use the env value verbatim, so a literal `~` is already broken for the
+    /// client and the default path is the closer guess. Expanding it here would
+    /// have Toolport write a config the client never reads.
+    #[test]
+    fn a_tilde_is_not_expanded_for_the_verbatim_relocate_envs() {
+        assert_eq!(codex_home_from(Some("~/work/codex".into())), None);
+        assert_eq!(gemini_cli_home_from(Some("~/work/gemini".into())), None);
+        assert_eq!(grok_home_from(Some("~/work/grok".into())), None);
+        assert_eq!(claude_config_dir_from(Some("~/work/claude".into())), None);
     }
 
     fn sample_gateway(profile: Option<&str>, client_id: &str) -> ServerEntry {
@@ -5541,6 +6764,56 @@ mod tests {
         std::env::temp_dir().join(format!("conduit-w-{}-{}.cfg", std::process::id(), label))
     }
 
+    /// The Windows Hermes desktop build writes `%LOCALAPPDATA%\hermes\config.yaml`,
+    /// not `~/.hermes/config.yaml`, so resolving only the home path left an
+    /// installed Hermes undetectable with no way to connect it. The canonical path
+    /// still wins when it exists, so nobody with an existing config is repointed.
+    #[test]
+    fn hermes_path_falls_back_to_the_platform_dir_only_when_home_has_no_config() {
+        let root = std::env::temp_dir().join(format!("toolport-hermes-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home_cfg = root.join("home").join(".hermes").join("config.yaml");
+        let local = root.join("local");
+        let local_cfg = local.join("hermes").join("config.yaml");
+
+        // Neither exists: a first write must still land where the installed build
+        // reads. Returning the home path here would write a config into `~/.hermes`
+        // that Hermes never opens, so connecting would silently do nothing.
+        assert_eq!(
+            resolve_hermes_path(home_cfg.clone(), Some(local.clone())),
+            local_cfg,
+            "a fresh Windows config must be written where Hermes reads it"
+        );
+
+        // Only the platform dir has a config: that is the file Hermes actually reads.
+        std::fs::create_dir_all(local_cfg.parent().unwrap()).unwrap();
+        std::fs::write(&local_cfg, "mcp_servers: {}\n").unwrap();
+        assert_eq!(
+            resolve_hermes_path(home_cfg.clone(), Some(local.clone())),
+            local_cfg,
+            "an installed Hermes must be found in the platform data dir"
+        );
+
+        // Both exist: the canonical path wins, so an existing setup is untouched.
+        std::fs::create_dir_all(home_cfg.parent().unwrap()).unwrap();
+        std::fs::write(&home_cfg, "mcp_servers: {}\n").unwrap();
+        assert_eq!(
+            resolve_hermes_path(home_cfg.clone(), Some(local.clone())),
+            home_cfg,
+            "an existing home config must never be silently repointed"
+        );
+
+        // No platform dir at all (macOS / Linux pass None): canonical, no probing.
+        std::fs::remove_file(&home_cfg).unwrap();
+        assert_eq!(
+            resolve_hermes_path(home_cfg.clone(), None),
+            home_cfg,
+            "platforms without the fallback resolve the home path unchanged"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// SOU-433: config backups carry a live Shared HTTP bearer, so the directory
     /// must not grow forever. Prune keeps the newest generations of the file it was
     /// called for, and never touches a differently-named config's backups.
@@ -5629,6 +6902,88 @@ mod tests {
             left.contains("10000000000000-config.yaml"),
             "a lexical sort would have deleted this newer backup instead: {left:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SBS-735: a stat that fails for a reason other than "missing" must abort
+    /// the write, not read as "no file to back up". A metadata error on a config
+    /// whose path sits on an unreadable network share was folded into the same
+    /// `Ok(None)` as a genuinely absent file, so the caller started from an
+    /// empty document and overwrote the user's config with no recovery copy.
+    #[test]
+    fn backup_propagates_stat_failures_instead_of_noop() {
+        // A directory path makes metadata() succeed but is_file() fail -> still
+        // the deliberate Ok(None) "nothing safe to back up" case. Use a path
+        // that fails to stat for a reason other than "missing".
+        let dir = std::env::temp_dir().join(format!("toolport-bk-stat-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        // A NUL byte makes the path invalid on BOTH platforms: the stat fails
+        // with InvalidInput (unix) / InvalidFilename (Windows), never NotFound.
+        // (The file/child ENOTDIR trick only errors non-NotFound on unix — on
+        // Windows a path under a regular file reports ERROR_PATH_NOT_FOUND,
+        // which maps to NotFound and would be swallowed by the missing-file arm.)
+        let broken = dir.join("child\u{0}.json");
+
+        let err = backup_file_named("claude-desktop", &broken, "child.json").unwrap_err();
+        assert!(
+            err.contains("could not stat"),
+            "a stat failure must be reported, not treated as no backup: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// SBS-735 acceptance: a write must not proceed when the app could not tell
+    /// whether an existing file was there. Drive the full caller (`write_servers`)
+    /// with CLAUDE_CONFIG_DIR pointed at a path that fails to stat for a reason
+    /// other than "missing", so the pre-write backup stat fails and the write
+    /// must abort. Each platform gets its own non-NotFound stat failure: a NUL
+    /// byte cannot go into an env var, and a path under a regular file is
+    /// ENOTDIR on unix but ERROR_PATH_NOT_FOUND (NotFound) on Windows.
+    #[test]
+    fn write_servers_aborts_when_backup_stat_fails() {
+        // Serialize against other tests that mutate the process-global
+        // CLAUDE_CONFIG_DIR (e.g. client_config_paths_match_current_platform):
+        // without the lock, that test could resolve the default home config
+        // path mid-flight and make this one flaky.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir().join(format!("toolport-bk-write-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        #[cfg(unix)]
+        {
+            // Parent-of-config is a regular file: metadata(config) fails ENOTDIR.
+            let not_a_dir = dir.join("claude-home");
+            std::fs::write(&not_a_dir, "not a directory").unwrap();
+            let _restore = EnvRestore::set("CLAUDE_CONFIG_DIR", &not_a_dir);
+
+            let err = write_servers("claude-code", &[stdio("filesystem")]).unwrap_err();
+            assert!(
+                err.contains("could not stat"),
+                "the caller must surface the stat failure instead of writing: {err}"
+            );
+            // No destructive write happened: the "config" file was never created.
+            assert!(!not_a_dir.join(".claude.json").exists());
+        }
+
+        #[cfg(windows)]
+        {
+            // A '<' is an invalid filename character on Windows: metadata fails
+            // with ERROR_INVALID_NAME (InvalidFilename), not ERROR_PATH_NOT_FOUND.
+            let not_a_dir = dir.join("claude-home<>");
+            let _restore = EnvRestore::set("CLAUDE_CONFIG_DIR", &not_a_dir);
+
+            let err = write_servers("claude-code", &[stdio("filesystem")]).unwrap_err();
+            assert!(
+                err.contains("could not stat"),
+                "the caller must surface the stat failure instead of writing: {err}"
+            );
+            // No destructive write happened: the "config" file was never created.
+            assert!(!not_a_dir.join(".claude.json").exists());
+        }
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6204,6 +7559,60 @@ bad = "not-a-table"
         std::fs::remove_file(&path).ok();
     }
 
+    /// SBS-886: Connect (`edit_json_gateway` / `install_or_remove`) must write
+    /// through a stow/chezmoi symlink. Failure mode: POSIX rename replaced
+    /// `~/.claude.json -> ~/dotfiles/claude.json` with a regular file, the repo
+    /// copy never got the gateway entry, and the next chezmoi apply restored
+    /// the old link and the entry disappeared.
+    #[cfg(unix)]
+    #[test]
+    fn connect_write_through_symlinked_config_keeps_link_and_updates_target() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-sbs886-connect-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("dotfiles").join("claude.json");
+        let link = dir.join("home").join(".claude.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::write(
+            &target,
+            r#"{"theme":"dark","mcpServers":{"existing":{"command":"node","env":{"SECRET":"keepme"}}}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        {
+            let entry = sample_gateway(Some("Billing"), "claude-code");
+            edit_json_gateway(&link, "mcpServers", Some(&entry), true)
+        }
+        .unwrap();
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "Connect must leave the config path a symlink, became {:?}",
+            meta.file_type()
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        let servers = root["mcpServers"].as_object().unwrap();
+        assert!(
+            servers.contains_key(GATEWAY_ENTRY_NAME),
+            "gateway entry must land in the symlink target"
+        );
+        assert!(servers.contains_key("existing"));
+        assert_eq!(root["theme"], "dark");
+        assert_eq!(servers["existing"]["env"]["SECRET"], "keepme");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn droid_install_preserves_existing_factory_server() {
         let path = temp_path("droid-install-json");
@@ -6224,10 +7633,7 @@ bad = "not-a-table"
         let servers = root["mcpServers"].as_object().unwrap();
         assert!(servers.contains_key(GATEWAY_ENTRY_NAME));
         assert!(servers.contains_key("filesystem"));
-        assert_eq!(
-            servers["filesystem"]["env"]["HOME"],
-            "/home/user"
-        );
+        assert_eq!(servers["filesystem"]["env"]["HOME"], "/home/user");
         assert_eq!(
             servers[GATEWAY_ENTRY_NAME]["env"][crate::brand::PROFILE],
             "Work"
@@ -6671,9 +8077,8 @@ bad = "not-a-table"
         // disagree on the path while both still name OUR gateway. Reading that as
         // Customized makes repoint_stale_gateways skip the client forever, which
         // is how six clients on a real machine sat on a superseded gateway.
-        let record = managed_record(
-            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe",
-        );
+        let record =
+            managed_record(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe");
         let drifted = detected_server(
             r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0-140f0e8d8cfa.exe",
         );
@@ -6689,9 +8094,8 @@ bad = "not-a-table"
         // The other side of the same rule: #487 must keep working. A record exists,
         // but the command now names something that is not our binary, so the user
         // has taken the entry over and we stand down.
-        let record = managed_record(
-            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe",
-        );
+        let record =
+            managed_record(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe");
         for taken_over in ["npx", "docker", r"C:\Users\me\bin\my-wrapper.cmd"] {
             assert_eq!(
                 resolve_entry_state(&[detected_server(taken_over)], Some(&record)),
@@ -6705,9 +8109,8 @@ bad = "not-a-table"
     fn a_drifted_path_with_changed_args_is_still_customized() {
         // Only the command path is forgiven. Anything else the user touched still
         // counts as customization.
-        let record = managed_record(
-            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe",
-        );
+        let record =
+            managed_record(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe");
         let mut server = detected_server(
             r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0-140f0e8d8cfa.exe",
         );
@@ -7207,10 +8610,8 @@ command = "npx"
 
     #[test]
     fn junie_install_marker_controls_detection_without_config() {
-        let marker = std::env::temp_dir().join(format!(
-            "toolport-junie-marker-{}",
-            std::process::id()
-        ));
+        let marker =
+            std::env::temp_dir().join(format!("toolport-junie-marker-{}", std::process::id()));
         std::fs::remove_dir_all(&marker).ok();
         let config = marker.join("mcp").join("mcp.json");
 
@@ -7737,6 +9138,195 @@ command = "npx"
         assert!(root["context_servers"].get("Toolport").is_some());
     }
 
+    /// SBS-884: a `#` comment and an `&anchor` sitting outside `extensions`
+    /// must survive a surgical YAML rewrite. Pretty-printing the whole file
+    /// expands the alias and drops both.
+    #[test]
+    fn rewrite_yaml_key_preserving_keeps_unrelated_text() {
+        let original = r#"# Goose config
+GOOSE_MODEL: gpt-4o
+defaults: &anchor
+  timeout: 300
+  enabled: true
+extensions:
+  fetch:
+    cmd: uvx
+"#;
+        let new_exts = serde_yaml::from_str::<serde_yaml::Value>(
+            "fetch:\n  cmd: uvx\ntoolport:\n  cmd: toolport-gateway\n",
+        )
+        .unwrap();
+        let rewritten = rewrite_yaml_key_preserving(original, "extensions", &new_exts).unwrap();
+        assert!(
+            rewritten.contains("# Goose config"),
+            "file-level comment must survive: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("&anchor"),
+            "anchor outside extensions must survive: {rewritten}"
+        );
+        assert!(rewritten.contains("GOOSE_MODEL: gpt-4o"));
+        assert!(rewritten.contains("toolport"));
+        let root: serde_yaml::Value = serde_yaml::from_str(&rewritten).unwrap();
+        assert!(root["extensions"].get("toolport").is_some());
+        assert!(root.get("defaults").is_some());
+    }
+
+    /// SBS-884: a `|` block scalar can contain a line that looks like
+    /// `extensions:`; that line is not a top-level key and must not be rewritten.
+    #[test]
+    fn rewrite_yaml_key_preserving_ignores_keys_inside_block_scalars() {
+        let original = r#"prompt: |
+  extensions:
+    fake: true
+extensions:
+  real:
+    cmd: uvx
+"#;
+        let new_exts =
+            serde_yaml::from_str::<serde_yaml::Value>("real:\n  cmd: uvx\nextra: 1\n").unwrap();
+        let rewritten = rewrite_yaml_key_preserving(original, "extensions", &new_exts).unwrap();
+        assert!(
+            rewritten.contains("  extensions:\n    fake: true"),
+            "text inside a block scalar must stay: {rewritten}"
+        );
+        assert!(rewritten.contains("extra: 1") || rewritten.contains("extra:1"));
+        let root: serde_yaml::Value = serde_yaml::from_str(&rewritten).unwrap();
+        assert_eq!(
+            root["prompt"].as_str().map(str::trim),
+            Some("extensions:\n  fake: true")
+        );
+        assert!(root["extensions"].get("extra").is_some());
+    }
+
+    /// SBS-884 review: `yaml_leading_indent` counted characters while the caller
+    /// used the count as a byte index. A U+00A0 in a block scalar's indentation
+    /// made the slice land mid-character and panicked before this fix.
+    #[test]
+    fn rewrite_yaml_key_preserving_survives_multi_byte_whitespace() {
+        let original = concat!(
+            "# Goose config\n",
+            "instructions: |\n",
+            "  \u{a0}review the plan\n",
+            "  then run it\n",
+            "extensions:\n",
+            "  fetch:\n",
+            "    cmd: uvx\n",
+        );
+        // The fixture is valid YAML, so it really can reach the line scanner.
+        serde_yaml::from_str::<serde_yaml::Value>(original).unwrap();
+        let new_exts = serde_yaml::from_str::<serde_yaml::Value>(
+            "fetch:\n  cmd: uvx\ntoolport:\n  cmd: toolport-gateway\n",
+        )
+        .unwrap();
+        let rewritten = rewrite_yaml_key_preserving(original, "extensions", &new_exts).unwrap();
+        let root: serde_yaml::Value = serde_yaml::from_str(&rewritten).unwrap();
+        assert!(root["extensions"].get("toolport").is_some());
+        assert!(
+            root["instructions"]
+                .as_str()
+                .is_some_and(|s| s.contains('\u{a0}')),
+            "block scalar content must be untouched: {rewritten}"
+        );
+        assert!(rewritten.contains("# Goose config"));
+    }
+
+    /// SBS-884 review: an anchor on the rewritten key is referenced by aliases
+    /// elsewhere. Dropping it leaves `*exts` undefined and the config unloadable.
+    #[test]
+    fn rewrite_yaml_key_preserving_keeps_anchor_on_the_rewritten_key() {
+        let original = concat!(
+            "extensions: &exts\n",
+            "  fetch:\n",
+            "    cmd: uvx\n",
+            "shared:\n",
+            "  copy: *exts\n",
+        );
+        let new_exts = serde_yaml::from_str::<serde_yaml::Value>(
+            "fetch:\n  cmd: uvx\ntoolport:\n  cmd: toolport-gateway\n",
+        )
+        .unwrap();
+        let rewritten = rewrite_yaml_key_preserving(original, "extensions", &new_exts).unwrap();
+        assert!(
+            rewritten.contains("extensions: &exts"),
+            "anchor on the rewritten key must survive: {rewritten}"
+        );
+        // The real failure was an unparseable file, so parsing is the assertion
+        // that matters: an undefined alias is a hard error in serde_yaml.
+        let root: serde_yaml::Value = serde_yaml::from_str(&rewritten).unwrap();
+        assert!(root["extensions"].get("toolport").is_some());
+        assert!(root["shared"]["copy"].get("toolport").is_some());
+    }
+
+    /// SBS-884 review: a 4-space config must not get one node reformatted to
+    /// serde_yaml's 2 spaces.
+    #[test]
+    fn rewrite_yaml_key_preserving_matches_existing_indent_width() {
+        let original = concat!(
+            "extensions:\n",
+            "    fetch:\n",
+            "        cmd: uvx\n",
+            "other: 1\n",
+        );
+        let new_exts = serde_yaml::from_str::<serde_yaml::Value>(
+            "fetch:\n  cmd: uvx\ntoolport:\n  cmd: toolport-gateway\n",
+        )
+        .unwrap();
+        let rewritten = rewrite_yaml_key_preserving(original, "extensions", &new_exts).unwrap();
+        assert!(
+            rewritten.contains("\n    toolport:"),
+            "children must keep the file's 4-space indent: {rewritten}"
+        );
+        let root: serde_yaml::Value = serde_yaml::from_str(&rewritten).unwrap();
+        assert!(root["extensions"].get("toolport").is_some());
+        assert_eq!(root["other"].as_i64(), Some(1));
+    }
+
+    #[test]
+    fn rewrite_yaml_key_preserving_rejects_duplicate_top_level_keys() {
+        let original = r#"# keep me
+extensions:
+  a:
+    cmd: old-a
+other: 1
+extensions:
+  b:
+    cmd: old-b
+"#;
+        let err = rewrite_yaml_key_preserving(
+            original,
+            "extensions",
+            &serde_yaml::from_str::<serde_yaml::Value>("toolport:\n  cmd: x\n").unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("appears") && err.contains("2"), "got: {err}");
+    }
+
+    #[test]
+    fn atomic_write_yaml_config_rejects_duplicate_top_level_keys() {
+        let path = temp_path("dup-extensions.yaml");
+        let original = r#"# keep me
+extensions:
+  a:
+    cmd: old-a
+other: 1
+extensions:
+  b:
+    cmd: old-b
+"#;
+        std::fs::write(&path, original).unwrap();
+        let root: serde_yaml::Value =
+            serde_yaml::from_str("other: 1\nextensions:\n  toolport:\n    cmd: toolport-gateway\n")
+                .unwrap();
+        let err = atomic_write_yaml_config(&path, Some(original), &root, "extensions").unwrap_err();
+        assert!(
+            err.contains("malformed") && err.contains("extensions"),
+            "expected malformed duplicate-key error, got: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn atomic_write_json_config_rejects_duplicate_top_level_keys() {
         // Duplicate top-level mcpServers: rewriting only the first would leave a stale second.
@@ -7872,6 +9462,150 @@ command = "npx"
         std::fs::remove_file(&path).ok();
     }
 
+    /// SBS-884: `toml::to_string_pretty` dropped every `#` comment in Codex/Grok
+    /// `config.toml` on Connect and again on uninstall. Hash comments outside
+    /// `mcp_servers` must survive both writes.
+    #[test]
+    fn toml_connect_and_uninstall_preserve_hash_comments() {
+        let path = temp_path("toml-comments-connect");
+        std::fs::write(
+            &path,
+            r#"# Codex configuration
+model = "o3"  # default model
+approval_policy = "on-request"
+
+[profiles.work]
+model = "gpt-5"
+
+[mcp_servers.existing]
+command = "npx"
+"#,
+        )
+        .unwrap();
+
+        {
+            let entry = sample_gateway(None, "codex");
+            edit_toml_gateway(&path, Some(&entry))
+        }
+        .unwrap();
+        let connected = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            connected.contains("# Codex configuration"),
+            "file-level comment must survive Connect: {connected}"
+        );
+        assert!(
+            connected.contains("# default model"),
+            "inline comment on an unrelated key must survive Connect: {connected}"
+        );
+        let parsed: toml::Value = toml::from_str(&connected).unwrap();
+        assert_eq!(parsed.get("model").and_then(|v| v.as_str()), Some("o3"));
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get(GATEWAY_ENTRY_NAME))
+            .is_some());
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get("existing"))
+            .is_some());
+
+        edit_toml_gateway(&path, None).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("# Codex configuration"),
+            "file-level comment must survive uninstall: {after}"
+        );
+        assert!(
+            after.contains("# default model"),
+            "inline comment must survive uninstall: {after}"
+        );
+        let parsed: toml::Value = toml::from_str(&after).unwrap();
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get(GATEWAY_ENTRY_NAME))
+            .is_none());
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get("existing"))
+            .is_some());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SBS-884 review: a comment on the `[mcp_servers]` header itself only
+    /// survives while the table stays explicit. An implicit table emits no
+    /// header line, so both write paths dropped it.
+    #[test]
+    fn toml_preserves_mcp_servers_header_comment() {
+        let path = temp_path("toml-servers-header");
+        let original = r#"# Codex configuration
+model = "o3"
+
+# gateway servers live below
+[mcp_servers]
+
+[mcp_servers.existing]
+command = "npx"
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        {
+            let entry = sample_gateway(None, "codex");
+            edit_toml_gateway(&path, Some(&entry))
+        }
+        .unwrap();
+        let connected = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            connected.contains("# gateway servers live below"),
+            "comment on the [mcp_servers] header must survive Connect: {connected}"
+        );
+        let parsed: toml::Value = toml::from_str(&connected).unwrap();
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get(GATEWAY_ENTRY_NAME))
+            .is_some());
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get("existing"))
+            .is_some());
+
+        // The inventory write path rebuilds the table from scratch, so it has to
+        // carry the header decor over too.
+        std::fs::write(&path, original).unwrap();
+        write_toml(&path, &[stdio("linear")]).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("# gateway servers live below"),
+            "comment on the [mcp_servers] header must survive write_toml: {written}"
+        );
+        let parsed: toml::Value = toml::from_str(&written).unwrap();
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get("linear"))
+            .is_some());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SBS-884: inventory write (`write_toml`) used the same pretty-print path
+    /// and stripped comments even when it kept unrelated keys as data.
+    #[test]
+    fn toml_write_preserves_hash_comments() {
+        let path = temp_path("toml-comments-write");
+        std::fs::write(&path, "# keep this comment\nmodel = \"opus\"\n").unwrap();
+        write_toml(&path, &[stdio("linear")]).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("# keep this comment"),
+            "comment must survive write_toml: {content}"
+        );
+        let root: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(root.get("model").and_then(|v| v.as_str()), Some("opus"));
+        assert!(root
+            .get("mcp_servers")
+            .and_then(|v| v.as_table())
+            .map(|t| t.contains_key("linear"))
+            .unwrap_or(false));
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn zed_is_registered_as_context_servers() {
         let d = defs().into_iter().find(|d| d.id == "zed").unwrap();
@@ -7895,11 +9629,7 @@ command = "npx"
             home.join(".config").join("crush").join("crush.json")
         );
         assert_eq!(
-            resolve_crush_path(
-                home,
-                None,
-                Some(std::ffi::OsString::from("xdg-config")),
-            ),
+            resolve_crush_path(home, None, Some(std::ffi::OsString::from("xdg-config")),),
             PathBuf::from("xdg-config").join("crush").join("crush.json")
         );
         assert_eq!(
@@ -7946,10 +9676,7 @@ command = "npx"
             .find(|definition| definition.id == "github-copilot-cli")
             .unwrap();
         assert_eq!(definition.name, "GitHub Copilot CLI");
-        assert!(matches!(
-            definition.format,
-            Format::JsonCopilotMcpServers
-        ));
+        assert!(matches!(definition.format, Format::JsonCopilotMcpServers));
         assert!((definition.path)().is_some());
     }
 
@@ -7975,8 +9702,7 @@ command = "npx"
             edit_copilot_json_gateway(&path, Some(&gateway))
         }
         .unwrap();
-        let installed =
-            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        let installed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
         assert_eq!(installed.len(), 2);
         assert!(installed.iter().any(|server| server.name == "existing"));
         assert!(installed
@@ -7984,18 +9710,14 @@ command = "npx"
             .any(|server| server.name == GATEWAY_ENTRY_NAME));
         let installed_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            installed_json["mcpServers"]["existing"],
-            original_existing
-        );
+        assert_eq!(installed_json["mcpServers"]["existing"], original_existing);
         assert_eq!(
             installed_json["mcpServers"][GATEWAY_ENTRY_NAME]["tools"],
             serde_json::json!(["*"])
         );
 
         edit_copilot_json_gateway(&path, None).unwrap();
-        let removed =
-            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        let removed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].name, "existing");
         let removed_json: serde_json::Value =
@@ -8029,10 +9751,12 @@ command = "npx"
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].name, "existing");
 
-        { let _e = sample_gateway(None, "junie"); edit_json_gateway(&path, "mcpServers", Some(&_e), false) }
-            .unwrap();
-        let installed =
-            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        {
+            let _e = sample_gateway(None, "junie");
+            edit_json_gateway(&path, "mcpServers", Some(&_e), false)
+        }
+        .unwrap();
+        let installed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
         assert_eq!(installed.len(), 2);
         assert!(installed.iter().any(|server| server.name == "existing"));
         assert!(installed
@@ -8040,14 +9764,10 @@ command = "npx"
             .any(|server| server.name == GATEWAY_ENTRY_NAME));
         let installed_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            installed_json["mcpServers"]["existing"],
-            original_existing
-        );
+        assert_eq!(installed_json["mcpServers"]["existing"], original_existing);
 
         edit_json_gateway(&path, "mcpServers", None, false).unwrap();
-        let removed =
-            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        let removed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].name, "existing");
         let removed_json: serde_json::Value =
@@ -8073,8 +9793,8 @@ command = "npx"
     fn kimi_code_config_path_is_under_home_data_root() {
         for platform in Platform::ALL {
             let home = mock_home(platform);
-            let path = resolve_client_config_path("kimi-code", &home, platform)
-                .expect("kimi-code path");
+            let path =
+                resolve_client_config_path("kimi-code", &home, platform).expect("kimi-code path");
             assert_eq!(
                 path,
                 home.join(".kimi-code").join("mcp.json"),
@@ -8086,16 +9806,62 @@ command = "npx"
     #[test]
     fn kimi_code_path_honors_kimi_code_home_override() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let root = std::env::temp_dir().join(format!(
-            "toolport-kimi-home-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("toolport-kimi-home-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let _restore = EnvRestore::set("KIMI_CODE_HOME", &root);
         let resolved = kimi_code_path().expect("kimi-code path with override");
         assert_eq!(resolved, root.join("mcp.json"));
         drop(_restore);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn codex_path_and_rules_honor_an_absolute_codex_home() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("toolport-codex-home-{}", std::process::id()));
+        let _restore = EnvRestore::set("CODEX_HOME", &root);
+        assert_eq!(codex_path(), Some(root.join("config.toml")));
+        let rules = client_rules_target("codex").expect("codex rules");
+        assert_eq!(rules.path, root.join("AGENTS.md"));
+        assert_eq!(
+            rules.blocked_if_present,
+            Some(root.join("AGENTS.override.md"))
+        );
+    }
+
+    #[test]
+    fn gemini_cli_path_and_rules_honor_an_absolute_gemini_cli_home() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("toolport-gemini-cli-home-{}", std::process::id()));
+        let _restore = EnvRestore::set("GEMINI_CLI_HOME", &root);
+        assert_eq!(
+            gemini_cli_path(),
+            Some(root.join(".gemini").join("settings.json"))
+        );
+        let rules = client_rules_target("gemini-cli").expect("gemini rules");
+        assert_eq!(rules.path, root.join(".gemini").join("GEMINI.md"));
+        // Antigravity is a different product; GEMINI_CLI_HOME must not move it.
+        let home = home().expect("home");
+        let antigravity = resolve_rules_target("antigravity", &home, Platform::current())
+            .expect("antigravity rules");
+        assert_eq!(antigravity.path, home.join(".gemini").join("GEMINI.md"));
+    }
+
+    #[test]
+    fn grok_path_honors_an_absolute_grok_home() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("toolport-grok-home-{}", std::process::id()));
+        let _restore = EnvRestore::set("GROK_HOME", &root);
+        assert_eq!(grok_path(), Some(root.join("config.toml")));
+    }
+
+    #[test]
+    fn qwen_code_path_honors_an_absolute_qwen_home() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("toolport-qwen-home-{}", std::process::id()));
+        let _restore = EnvRestore::set("QWEN_HOME", &root);
+        assert_eq!(qwen_code_path(), Some(root.join("settings.json")));
     }
 
     #[test]
@@ -8192,25 +9958,35 @@ command = "npx"
         let parsed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
         assert_eq!(parsed.len(), 4);
         assert_eq!(
-            parsed.iter().find(|s| s.name == "filesystem").unwrap().transport,
+            parsed
+                .iter()
+                .find(|s| s.name == "filesystem")
+                .unwrap()
+                .transport,
             "stdio"
         );
         assert_eq!(
-            parsed.iter().find(|s| s.name == "remote-http").unwrap().transport,
+            parsed
+                .iter()
+                .find(|s| s.name == "remote-http")
+                .unwrap()
+                .transport,
             "http"
         );
         assert_eq!(
-            parsed.iter().find(|s| s.name == "remote-sse").unwrap().transport,
-            "sse"
-        );
-        assert!(
             parsed
                 .iter()
-                .find(|s| s.name == "bearer-remote")
+                .find(|s| s.name == "remote-sse")
                 .unwrap()
-                .env_keys
-                .is_empty()
+                .transport,
+            "sse"
         );
+        assert!(parsed
+            .iter()
+            .find(|s| s.name == "bearer-remote")
+            .unwrap()
+            .env_keys
+            .is_empty());
 
         // Gateway install preserves existing servers and uses the standard stdio shape.
         {
@@ -8218,12 +9994,9 @@ command = "npx"
             edit_json_gateway(&path, "mcpServers", Some(&_e), true)
         }
         .unwrap();
-        let installed =
-            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        let installed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
         assert!(installed.iter().any(|s| s.name == "filesystem"));
-        assert!(installed
-            .iter()
-            .any(|s| s.name == GATEWAY_ENTRY_NAME));
+        assert!(installed.iter().any(|s| s.name == GATEWAY_ENTRY_NAME));
 
         std::fs::remove_file(&path).ok();
     }
@@ -8599,6 +10372,209 @@ command = "npx"
         assert!((d.path)().is_some());
     }
 
+    /// SBS-884: Goose Connect/uninstall pretty-printed `config.yaml` and dropped
+    /// `#` comments plus `&anchor` definitions sitting outside `extensions`.
+    #[test]
+    fn goose_yaml_connect_and_uninstall_preserve_comments_and_anchors() {
+        let path = temp_path("goose-comments-anchors.yaml");
+        std::fs::write(
+            &path,
+            r#"# Goose config
+GOOSE_MODEL: gpt-4o
+defaults: &anchor
+  timeout: 300
+  enabled: true
+extensions:
+  developer:
+    type: builtin
+    enabled: true
+  fetch:
+    type: stdio
+    cmd: uvx
+    args: [mcp-server-fetch]
+"#,
+        )
+        .unwrap();
+
+        {
+            let entry = sample_gateway(None, "goose");
+            edit_yaml_gateway(&path, Some(&entry))
+        }
+        .unwrap();
+        let connected = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            connected.contains("# Goose config"),
+            "hash comment must survive Connect: {connected}"
+        );
+        assert!(
+            connected.contains("&anchor"),
+            "anchor outside extensions must survive Connect: {connected}"
+        );
+        let v: serde_yaml::Value = serde_yaml::from_str(&connected).unwrap();
+        assert_eq!(v["GOOSE_MODEL"].as_str(), Some("gpt-4o"));
+        assert!(v["extensions"].get(GATEWAY_ENTRY_NAME).is_some());
+        assert!(v["extensions"].get("fetch").is_some());
+        assert!(v["extensions"].get("developer").is_some());
+
+        edit_yaml_gateway(&path, None).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("# Goose config"),
+            "hash comment must survive uninstall: {after}"
+        );
+        assert!(
+            after.contains("&anchor"),
+            "anchor must survive uninstall: {after}"
+        );
+        let after_v: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        assert!(after_v["extensions"].get(GATEWAY_ENTRY_NAME).is_none());
+        assert!(after_v["extensions"].get("fetch").is_some());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SBS-884: inventory write must not pretty-print the whole Goose file.
+    #[test]
+    fn goose_yaml_write_preserves_comments_and_anchors() {
+        let path = temp_path("goose-write-comments.yaml");
+        std::fs::write(
+            &path,
+            "# keep this comment\ndefaults: &anchor\n  timeout: 300\nGOOSE_MODEL: gpt-4o\nextensions:\n  developer:\n    type: builtin\n    enabled: true\n",
+        )
+        .unwrap();
+        write_yaml_extensions(&path, &[sample_gateway(None, "goose")]).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("# keep this comment"),
+            "comment must survive write_yaml_extensions: {content}"
+        );
+        assert!(
+            content.contains("&anchor"),
+            "anchor must survive write_yaml_extensions: {content}"
+        );
+        let root: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        assert!(root["extensions"].get("developer").is_some());
+        assert!(root["extensions"].get(GATEWAY_ENTRY_NAME).is_some());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SBS-884: Hermes Connect/uninstall must keep `#` comments and `&anchor`
+    /// outside `mcp_servers`.
+    #[test]
+    fn hermes_yaml_connect_and_uninstall_preserve_comments_and_anchors() {
+        let path = temp_path("hermes-comments-anchors.yaml");
+        std::fs::write(
+            &path,
+            r#"# Hermes config
+model:
+  default: gpt-4o
+shared_headers: &anchor
+  Authorization: Bearer token
+mcp_servers:
+  zread:
+    url: https://mcp.example.com/mcp
+    timeout: 120
+"#,
+        )
+        .unwrap();
+
+        {
+            let entry = sample_gateway(None, "hermes");
+            edit_hermes_yaml_gateway(&path, Some(&entry))
+        }
+        .unwrap();
+        let connected = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            connected.contains("# Hermes config"),
+            "hash comment must survive Connect: {connected}"
+        );
+        assert!(
+            connected.contains("&anchor"),
+            "anchor outside mcp_servers must survive Connect: {connected}"
+        );
+        let v: serde_yaml::Value = serde_yaml::from_str(&connected).unwrap();
+        assert_eq!(v["model"]["default"].as_str(), Some("gpt-4o"));
+        assert!(v["mcp_servers"].get(GATEWAY_ENTRY_NAME).is_some());
+        assert!(v["mcp_servers"].get("zread").is_some());
+
+        edit_hermes_yaml_gateway(&path, None).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("# Hermes config"),
+            "hash comment must survive uninstall: {after}"
+        );
+        assert!(
+            after.contains("&anchor"),
+            "anchor must survive uninstall: {after}"
+        );
+        let after_v: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        assert!(after_v["mcp_servers"].get(GATEWAY_ENTRY_NAME).is_none());
+        assert!(after_v["mcp_servers"].get("zread").is_some());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SBS-884: Continue Connect/uninstall must keep `#` comments and `&anchor`
+    /// outside the `mcpServers` list (column-0 sequence items stay in that node).
+    #[test]
+    fn continue_yaml_connect_and_uninstall_preserve_comments_and_anchors() {
+        let path = temp_path("continue-comments-anchors.yaml");
+        std::fs::write(
+            &path,
+            r#"# Continue config
+models:
+  - title: GPT-4o
+shared: &anchor
+  env:
+    TOKEN: abc
+mcpServers:
+- name: fetch
+  command: uvx
+rules:
+  - Keep responses concise
+"#,
+        )
+        .unwrap();
+
+        {
+            let entry = sample_gateway(None, "continue");
+            edit_continue_yaml_gateway(&path, Some(&entry))
+        }
+        .unwrap();
+        let connected = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            connected.contains("# Continue config"),
+            "hash comment must survive Connect: {connected}"
+        );
+        assert!(
+            connected.contains("&anchor"),
+            "anchor outside mcpServers must survive Connect: {connected}"
+        );
+        let v: serde_yaml::Value = serde_yaml::from_str(&connected).unwrap();
+        let servers = v["mcpServers"].as_sequence().unwrap();
+        assert!(servers
+            .iter()
+            .any(|s| s.get("name").and_then(|n| n.as_str()) == Some(GATEWAY_ENTRY_NAME)));
+        assert!(servers
+            .iter()
+            .any(|s| s.get("name").and_then(|n| n.as_str()) == Some("fetch")));
+        assert_eq!(v["models"][0]["title"].as_str(), Some("GPT-4o"));
+
+        edit_continue_yaml_gateway(&path, None).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("# Continue config"),
+            "hash comment must survive uninstall: {after}"
+        );
+        assert!(
+            after.contains("&anchor"),
+            "anchor must survive uninstall: {after}"
+        );
+        let after_v: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        let servers = after_v["mcpServers"].as_sequence().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["name"].as_str(), Some("fetch"));
+        std::fs::remove_file(&path).ok();
+    }
+
     fn mock_home(platform: Platform) -> PathBuf {
         match platform {
             Platform::Windows => PathBuf::from(r"C:\Users\alice"),
@@ -8657,6 +10633,40 @@ command = "npx"
     }
 
     #[test]
+    fn rules_target_goose_matches_config_directory() {
+        // Rules sit beside config.yaml so the two path families cannot drift
+        // (SBS-899). Windows uses the etcetera config dir; macOS/Linux stay on
+        // Goose's documented ~/.config/goose (macOS config in Toolport is
+        // Application Support — a pre-existing split, listed in the PR).
+        for platform in Platform::ALL {
+            let home = mock_home(platform);
+            let rules = resolve_rules_target("goose", &home, platform).expect("supported");
+            let config =
+                resolve_client_config_path("goose", &home, platform).expect("goose config");
+            match platform {
+                Platform::Windows => {
+                    assert_eq!(
+                        rules.path,
+                        home.join("AppData")
+                            .join("Roaming")
+                            .join("Block")
+                            .join("goose")
+                            .join("config")
+                            .join(".goosehints")
+                    );
+                    assert_eq!(rules.path.parent(), config.parent());
+                }
+                Platform::MacOs | Platform::Linux => {
+                    assert_eq!(
+                        rules.path,
+                        home.join(".config").join("goose").join(".goosehints")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rules_target_unsupported_clients_return_none() {
         // Cursor/Warp store globals in UI/cloud; Continue is deferred; chat/identity apps have
         // no global rules file we manage.
@@ -8699,30 +10709,9 @@ command = "npx"
     /// runs tests in parallel, so without this the test that sets `XDG_CONFIG_HOME`
     /// could change `dirs::config_dir()` mid-flight under a test that reads it,
     /// which is exactly what made `client_config_paths_match_current_platform`
-    /// flake on CI. Poison is recovered: a panic elsewhere shouldn't wedge these.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct EnvRestore {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvRestore {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    /// flake on CI. Lives on the module (see [`super::env_test_lock`]) so tests in
+    /// other modules that set the same keys take the SAME lock.
+    use super::ENV_TEST_LOCK as ENV_LOCK;
 
     #[test]
     fn amp_is_registered() {
@@ -8783,12 +10772,31 @@ command = "npx"
         // `.claude.json`). The override itself is covered by
         // `claude_code_config_follows_a_relocated_config_dir`.
         let _claude_config_dir = EnvRestore::set("CLAUDE_CONFIG_DIR", Path::new(""));
+        // Same class as CLAUDE_CONFIG_DIR: neutralize relocate envs the host
+        // (or a parallel test) may have exported so this asserts the default table.
+        let _codex_home = EnvRestore::set("CODEX_HOME", Path::new(""));
+        let _gemini_cli_home = EnvRestore::set("GEMINI_CLI_HOME", Path::new(""));
+        let _grok_home = EnvRestore::set("GROK_HOME", Path::new(""));
+        let _qwen_home = EnvRestore::set("QWEN_HOME", Path::new(""));
+        // goose_path / client_config_path honor GOOSE_PATH_ROOT; clear it so this
+        // table assertion stays on the documented default (SBS-899).
+        let _goose_root = EnvRestore::set("GOOSE_PATH_ROOT", Path::new(""));
         let home = home().expect("home dir should be available in tests");
         let platform = Platform::current();
         for client in defs() {
+            // These probe alternate on-disk locations (Antigravity subdirs, Claude
+            // Desktop MSIX virtualized config), so the resolved path legitimately
+            // depends on what is installed on the host rather than on the static
+            // table.
             if matches!(client.id, "antigravity" | "claude-desktop") {
-                // These probe alternate on-disk locations (Antigravity subdirs,
-                // Claude Desktop MSIX virtualized config).
+                continue;
+            }
+            // Hermes only probes on Windows, where `%LOCALAPPDATA%\hermes` makes the
+            // answer host-dependent. Everywhere else `hermes_path` passes no platform
+            // root at all and is a pure function of home, so it stays covered here.
+            // The Windows behaviour is covered by
+            // `hermes_path_falls_back_to_the_platform_dir_only_when_home_has_no_config`.
+            if cfg!(windows) && client.id == "hermes" {
                 continue;
             }
             #[cfg(not(all(unix, not(target_os = "macos"))))]
@@ -8808,7 +10816,9 @@ command = "npx"
         let cases: &[(&str, fn(&Path, Platform) -> PathBuf)] = &[
             ("cursor", |home, _| home.join(".cursor").join("mcp.json")),
             ("droid", |home, _| home.join(".factory").join("mcp.json")),
-            ("crush", |home, _| home.join(".config").join("crush").join("crush.json")),
+            ("crush", |home, _| {
+                home.join(".config").join("crush").join("crush.json")
+            }),
             ("grok", |home, _| home.join(".grok").join("config.toml")),
             ("github-copilot-cli", |home, _| {
                 home.join(".copilot").join("mcp-config.json")
@@ -8930,11 +10940,17 @@ command = "npx"
 
         std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
         std::env::set_var("XDG_DATA_HOME", &xdg_data);
+        // Absolute GOOSE_PATH_ROOT wins over XDG; neutralize it so this test
+        // pins the XDG branch (SBS-899).
+        let _goose_root = EnvRestore::set("GOOSE_PATH_ROOT", Path::new(""));
 
         let home = home().expect("home dir");
         let vscode = client_config_path("vscode").unwrap();
         let jan = client_config_path("jan").unwrap();
         let crush = client_config_path("crush").unwrap();
+        let zed = client_config_path("zed").unwrap();
+        let goose = client_config_path("goose").unwrap();
+        let anythingllm = client_config_path("anythingllm").unwrap();
         let opencode = client_config_path("opencode").unwrap();
         let kilo_code = client_config_path("kilo-code").unwrap();
 
@@ -8950,9 +10966,16 @@ command = "npx"
             jan,
             xdg_data.join("Jan").join("data").join("mcp_config.json")
         );
+        assert_eq!(crush, xdg_config.join("crush").join("crush.json"));
+        assert_eq!(zed, xdg_config.join("zed").join("settings.json"));
+        assert_eq!(goose, xdg_config.join("goose").join("config.yaml"));
         assert_eq!(
-            crush,
-            xdg_config.join("crush").join("crush.json")
+            anythingllm,
+            xdg_config
+                .join("anythingllm-desktop")
+                .join("storage")
+                .join("plugins")
+                .join("anythingllm_mcp_servers.json")
         );
         assert_eq!(
             opencode,
@@ -8961,6 +10984,115 @@ command = "npx"
         assert_eq!(
             kilo_code,
             home.join(".config").join("kilo").join("kilo.jsonc")
+        );
+    }
+
+    /// SBS-899: Team Instructions for Goose/Zed must land in the same XDG
+    /// config dir as Connect already writes (`client_config_path`). Without
+    /// this, a user with `XDG_CONFIG_HOME=/data/cfg` gets a successful write
+    /// to `~/.config/...` that Goose/Zed never read.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn client_rules_paths_honor_xdg_dirs_on_linux() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("conduit-xdg-rules-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let xdg_config = base.join("xdg-config");
+        std::fs::create_dir_all(&xdg_config).unwrap();
+
+        let _xdg = EnvRestore::set("XDG_CONFIG_HOME", &xdg_config);
+        let _goose_root = EnvRestore::set("GOOSE_PATH_ROOT", Path::new(""));
+
+        let goose = client_rules_target("goose").expect("goose has a rules target");
+        let zed = client_rules_target("zed").expect("zed has a rules target");
+        let goose_config = client_config_path("goose").expect("goose config");
+        let zed_config = client_config_path("zed").expect("zed config");
+
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            goose.path,
+            xdg_config.join("goose").join(".goosehints"),
+            "Goose Team Instructions must follow XDG_CONFIG_HOME"
+        );
+        assert_eq!(
+            zed.path,
+            xdg_config.join("zed").join("AGENTS.md"),
+            "Zed Team Instructions must follow XDG_CONFIG_HOME"
+        );
+        assert_eq!(
+            goose.path.parent(),
+            goose_config.parent(),
+            "Goose rules and config must share a directory so the two families cannot drift"
+        );
+        assert_eq!(
+            zed.path.parent(),
+            zed_config.parent(),
+            "Zed rules and config must share a directory so the two families cannot drift"
+        );
+    }
+
+    /// SBS-899: absolute GOOSE_PATH_ROOT relocates both config.yaml and
+    /// .goosehints to `<root>/config/`, matching Goose `Paths::get_dir`.
+    #[test]
+    fn goose_path_root_relocates_config_and_rules() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("goose-root-{}", std::process::id()));
+        let _restore = EnvRestore::set("GOOSE_PATH_ROOT", &root);
+
+        assert_eq!(
+            client_config_path("goose"),
+            Some(root.join("config").join("config.yaml"))
+        );
+        assert_eq!(
+            client_rules_target("goose")
+                .expect("goose has a rules target")
+                .path,
+            root.join("config").join(".goosehints")
+        );
+    }
+
+    /// SBS-899: an absolute GOOSE_PATH_ROOT names the live config outright, so it must
+    /// resolve with no home directory at all. `client_rules_target` already did, so
+    /// without this the rules file relocates but the config beside it comes back `None`
+    /// and Connect cannot write the gateway entry. Same rule `codex_path` applies to
+    /// `CODEX_HOME` (SBS-885).
+    #[test]
+    fn goose_path_root_resolves_without_a_home_dir() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("goose-nohome-{}", std::process::id()));
+        let _restore = EnvRestore::set("GOOSE_PATH_ROOT", &root);
+
+        assert_eq!(
+            client_config_path_with_home("goose", None),
+            Some(root.join("config").join("config.yaml")),
+            "an absolute GOOSE_PATH_ROOT must not depend on a resolvable home dir"
+        );
+        // The override is Goose-only: every other client still needs a home.
+        assert_eq!(client_config_path_with_home("zed", None), None);
+    }
+
+    /// Relative / empty GOOSE_PATH_ROOT is ignored — same rule as
+    /// `CLAUDE_CONFIG_DIR` and Goose's own `validated_path_root`.
+    #[test]
+    fn goose_path_root_relative_or_empty_is_ignored() {
+        assert_eq!(goose_path_root_from(None), None);
+        assert_eq!(
+            goose_path_root_from(Some(std::ffi::OsString::from(""))),
+            None
+        );
+        assert_eq!(
+            goose_path_root_from(Some(std::ffi::OsString::from("relative/goose"))),
+            None
+        );
+        let absolute = if cfg!(windows) {
+            PathBuf::from(r"C:\\abs\\goose")
+        } else {
+            PathBuf::from("/abs/goose")
+        };
+        assert_eq!(
+            goose_path_root_from(Some(absolute.clone().into_os_string())),
+            Some(absolute)
         );
     }
 
@@ -9486,5 +11618,264 @@ extensions:
             .collect();
         assert_eq!(vals.get("PORT"), Some(&"3000"));
         assert_eq!(vals.get("DEBUG"), Some(&"true"));
+    }
+
+    #[test]
+    fn stable_gateway_copy_replaces_same_size_different_bytes() {
+        // AppImage updates often rebuild the gateway at the same length. Size-only
+        // stale detection would leave clients on the previous copy.
+        let _lock = crate::registry::data_dir_test_lock();
+        let scratch = std::env::temp_dir().join(format!(
+            "toolport-stable-gw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data_dir = crate::registry::DataDirOverride::set(&scratch);
+
+        let fixture_a = b"gateway-binary-AAAA";
+        let fixture_b = b"gateway-binary-BBBB";
+        assert_eq!(
+            fixture_a.len(),
+            fixture_b.len(),
+            "fixtures must be equal length so size-only detection would skip the copy"
+        );
+
+        let dest_dir = scratch.join("bin");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let dest = dest_dir.join("toolport-gateway");
+        std::fs::write(&dest, fixture_a).unwrap();
+
+        let src_dir = scratch.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("toolport-gateway");
+        std::fs::write(&src, fixture_b).unwrap();
+
+        let copied = stable_gateway_copy(&src).expect("same-size newer src must recopy");
+        assert_eq!(copied, dest);
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            fixture_b,
+            "dest must match the newer src, not the equal-length previous copy"
+        );
+
+        // Same-content same-size is not a failure; dest still matches src.
+        let again = stable_gateway_copy(&src).expect("identical src must still succeed");
+        assert_eq!(again, dest);
+        assert_eq!(std::fs::read(&dest).unwrap(), fixture_b);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Scratch dir + src/dest fixture pair for the stable-copy tests.
+    fn stable_gw_fixture(
+        tag: &str,
+        dest_bytes: &[u8],
+        src_bytes: &[u8],
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let scratch = std::env::temp_dir().join(format!(
+            "toolport-stable-gw-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let dest_dir = scratch.join("bin");
+        let src_dir = scratch.join("src");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let dest = dest_dir.join("toolport-gateway");
+        let src = src_dir.join("toolport-gateway");
+        std::fs::write(&dest, dest_bytes).unwrap();
+        std::fs::write(&src, src_bytes).unwrap();
+        (scratch, src, dest)
+    }
+
+    #[test]
+    fn stable_gateway_copy_keeps_existing_copy_when_refresh_fails() {
+        // The refresh can legitimately fail: on Linux, overwriting the stable
+        // gateway while a client keeps one running returns ETXTBSY. Giving up
+        // here would make resolve_gateway_path fall through to the
+        // AppImage-internal /tmp/.mount_XXXX path, and that path is written into
+        // the client's config and dies with the mount. A stale-but-reachable
+        // stable copy is the right answer instead.
+        let (scratch, src, dest) =
+            stable_gw_fixture("busy", b"gateway-binary-AAAA", b"gateway-binary-BBBB");
+
+        let attempted = std::cell::Cell::new(false);
+        let out = stable_gateway_copy_with(&src, dest.clone(), |_, _| {
+            attempted.set(true);
+            Err(std::io::Error::other("ETXTBSY"))
+        });
+
+        assert!(attempted.get(), "a stale copy must attempt a refresh");
+        assert_eq!(
+            out,
+            Some(dest.clone()),
+            "a failed refresh must still return the existing stable path, \
+             never fall through to the ephemeral mount"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"gateway-binary-AAAA",
+            "the previous copy must be left intact"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn stable_gateway_copy_gives_up_when_no_stable_copy_exists() {
+        // With nothing usable at dest there is no stable path to hand back, so
+        // the caller should be told to look elsewhere.
+        let (scratch, src, dest) = stable_gw_fixture("nodest", b"", b"gateway-binary-BBBB");
+        std::fs::remove_file(&dest).unwrap();
+
+        let out = stable_gateway_copy_with(&src, dest.clone(), |_, _| {
+            Err(std::io::Error::other("ETXTBSY"))
+        });
+        assert_eq!(out, None, "no stable copy at all must return None");
+
+        // A zero-length leftover is not a usable gateway either.
+        std::fs::write(&dest, b"").unwrap();
+        let out = stable_gateway_copy_with(&src, dest.clone(), |_, _| {
+            Err(std::io::Error::other("ETXTBSY"))
+        });
+        assert_eq!(
+            out, None,
+            "an empty leftover must not be handed to a client"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn stable_gateway_copy_skips_the_write_when_content_matches() {
+        let (scratch, src, dest) =
+            stable_gw_fixture("fresh", b"gateway-binary-AAAA", b"gateway-binary-AAAA");
+        let attempted = std::cell::Cell::new(false);
+        let out = stable_gateway_copy_with(&src, dest.clone(), |_, _| {
+            attempted.set(true);
+            Ok(())
+        });
+        assert_eq!(out, Some(dest));
+        assert!(
+            !attempted.get(),
+            "an up-to-date copy must not be rewritten on every Connect"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_gateway_copy_swaps_the_inode_and_sets_the_exec_bit() {
+        // rename(2) over the destination is what makes the refresh survive a
+        // running gateway (ETXTBSY). Prove we replaced the directory entry
+        // rather than truncating the existing inode: a hard link taken before
+        // the refresh must still read the OLD bytes afterwards, exactly as a
+        // process executing the old binary would.
+        use std::os::unix::fs::PermissionsExt;
+        let (scratch, src, dest) =
+            stable_gw_fixture("inode", b"gateway-binary-AAAA", b"gateway-binary-BBBB");
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let witness = scratch.join("bin").join("old-inode");
+        std::fs::hard_link(&dest, &witness).unwrap();
+
+        replace_gateway_copy(&src, &dest).expect("refresh must succeed");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"gateway-binary-BBBB");
+        assert_eq!(
+            std::fs::read(&witness).unwrap(),
+            b"gateway-binary-AAAA",
+            "the old inode must be left alone, not truncated in place"
+        );
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the swapped-in binary must already be executable"
+        );
+
+        // No temp files left behind in ~/.toolport/bin.
+        let leftovers: Vec<_> = std::fs::read_dir(scratch.join("bin"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_gateway_copy_cleans_up_after_a_failed_write() {
+        let (scratch, src, dest) =
+            stable_gw_fixture("cleanup", b"gateway-binary-AAAA", b"gateway-binary-BBBB");
+        std::fs::remove_file(&src).unwrap();
+
+        assert!(
+            replace_gateway_copy(&src, &dest).is_err(),
+            "a missing source must fail loudly"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"gateway-binary-AAAA",
+            "a failed refresh must not damage the existing copy"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(scratch.join("bin"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn gateway_copy_is_stale_streams_large_files() {
+        // The compare must stay correct on files bigger than one read chunk,
+        // and must short-circuit on the first differing chunk.
+        let big = vec![7u8; 300 * 1024];
+        let mut differs_late = big.clone();
+        *differs_late.last_mut().unwrap() = 9;
+        let mut differs_early = big.clone();
+        differs_early[0] = 9;
+
+        let (scratch, src, dest) = stable_gw_fixture("big", &big, &big);
+        assert!(!gateway_copy_is_stale(&src, &dest), "identical big files");
+
+        std::fs::write(&src, &differs_late).unwrap();
+        assert!(
+            gateway_copy_is_stale(&src, &dest),
+            "a difference in the final chunk must be caught"
+        );
+
+        std::fs::write(&src, &differs_early).unwrap();
+        assert!(gateway_copy_is_stale(&src, &dest), "first-chunk difference");
+
+        // Different lengths never reach the byte compare.
+        std::fs::write(&src, b"short").unwrap();
+        assert!(gateway_copy_is_stale(&src, &dest));
+
+        // A missing source is treated as stale rather than "up to date".
+        std::fs::remove_file(&src).unwrap();
+        assert!(gateway_copy_is_stale(&src, &dest));
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

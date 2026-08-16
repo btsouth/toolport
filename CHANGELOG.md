@@ -18,6 +18,145 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **A space no longer smuggles a forged Toolport marker past the voice rewrite.**
+  The gateway-voice matcher folded zero-width, bidi, fullwidth and homoglyph
+  evasions but compared whitespace literally, so `[ Toolport advisor: …]` with a
+  plain space (or a tab, a newline, a no-break space, or a doubled space inside
+  the brand) reached the model unchanged while the zero-width form was caught.
+  Whitespace is now folded like the other evasions: ignored before the brand and
+  collapsed to one space inside it. (SBS-896)
+- **Team Instructions now follow `XDG_CONFIG_HOME` for Goose and Zed.** Connect
+  already wrote those clients' MCP configs under XDG (#757 / SBS-847); the rules
+  writer still hardcoded `~/.config`, so an org push could succeed and never
+  apply. Absolute `GOOSE_PATH_ROOT` is honoured on both the config and rules
+  paths (`<root>/config/config.yaml` and `<root>/config/.goosehints`). A member
+  who upgrades in place also gets the block moved to the new path: an unchanged
+  org text used to skip the write entirely, so the new location stayed empty and
+  coverage reported Stale until someone edited the instructions. (SBS-899)
+- **Untrusted MCP output can no longer speak as Toolport.** The external-data
+  wrapper is Toolport-branded (it still said `conduit` after the rebrand) and
+  sanitizes the server label, so a quote in a resource URI cannot close the
+  marker. Downstream text that imitates `[Toolport advisor:]`, `[Toolport shaped]`,
+  `[Toolport:]`, or `[conduit:]` is rewritten before it reaches the model,
+  including tools/list, search (ranked and pinned results), tool and resource
+  and prompt output, and resource errors, even when content defense is off. The
+  rewrite covers a whole tool definition (title, annotations, parameter
+  descriptions, enum values, property names) and a whole result (structured
+  output, prompt messages in any shape), and it folds the same zero-width,
+  fullwidth, and homoglyph evasions the injection scanner already folds.
+  (SBS-896)
+- **A registry that was not really read no longer counts as "no HTTP clients".**
+  `--insecure-loopback` treats an empty `http_clients` list as permission to bind and
+  serve without a bearer, and that list came back empty for three unrelated reasons: a
+  load error falling back to `Registry::default()`, a load that could not read the file
+  at all (locked, permissions) and reported it as absent, and a load recovered from a
+  backup, which is the state before the last save and so is missing exactly the save
+  that registered the first client. Loading now reports where the registry came from,
+  and the open branch requires a load that actually saw the configured state. The check
+  is also live rather than decided at boot: the file watcher republishes that verdict
+  with every reload, so a registry corrupted while the gateway runs closes the listener
+  instead of quietly re-opening it. A missing registry file is a real first run and still
+  opens with `--insecure-loopback`, and a failed load with `TOOLPORT_HTTP_TOKEN` still
+  binds. (SBS-900)
+- **A transient missing quarantine store no longer installs an empty block set.**
+  Rewriting `quarantine.json` uses a temp file plus rename, so a reader can see
+  `NotFound` for a tick. That used to look like "nothing is blocked" and the
+  gateway would un-hide every quarantined tool. The read now retries the same
+  way the pin store already does, and a miss after those retries is an error
+  unless this profile has never written pins (a real first run). A rebuild
+  keeps the live set, or hides the catalog on a cold start until the store
+  reads. (SBS-871)
+- **Codex Connect honors `CODEX_HOME`.** Connect, migrate, and launch-time
+  re-point wrote `~/.codex/config.toml` even when Codex was reading
+  `$CODEX_HOME/config.toml`, so a relocated live config never got a gateway
+  entry and Toolport still reported success. Team-instructions `AGENTS.md`
+  follows the same home. Empty or relative `CODEX_HOME` still falls back to
+  `~/.codex` (Toolport's cwd is not Codex's home). The same class is now
+  honored for Gemini CLI (`GEMINI_CLI_HOME` →
+  `$GEMINI_CLI_HOME/.gemini/settings.json` and `GEMINI.md`), Grok Build
+  (`GROK_HOME`), and Qwen Code (`QWEN_HOME`). A leading `~` in `QWEN_HOME` is
+  expanded, because Qwen expands it too; the other three use their env value
+  verbatim, so a literal `~` there stays a fallback. A GUI-only Toolport
+  process still cannot see a shell-only export; that limitation already
+  applied to `CLAUDE_CONFIG_DIR`. (SBS-885)
+- **A flagged tool result can no longer self-close its provenance wrap.** A
+  payload that embedded `[/conduit: end external data]` (or `[/Toolport`) used
+  to terminate the wrap and leave a forged `[Toolport: …]` line reading as
+  gateway voice. The close tag is now per-call and includes a random nonce,
+  and an embedded close marker is stripped to a plain note that cannot read as
+  a terminator. The match runs on the folded form, so a close hidden with
+  zero-width characters, a Cyrillic homoglyph or fullwidth brackets is caught
+  too. (SBS-892)
+- **A Personal-scoped HTTP bearer can no longer call a team server whose id
+  collides after sanitizing.** A personal server named Team Slack becomes
+  `team-slack`; a team server named slack becomes `team_slack`. The HTTP bridge
+  used `sanitize_segment` as the profile allow-set key, and both ids map to
+  `team_slack`, so the Personal token could list and call the team Slack server.
+  Scope now keys on the raw registry id (SBS-866). Tool names are still sanitized.
+  The bridge answers its first `tools/list` and OpenAPI document from the on-disk
+  catalog before any downstream server has connected, so scoping in that window
+  resolves the owning server through the registry and withholds any tool whose
+  prefix two server ids share, instead of guessing from the prefix.
+- **Unreadable activity/security log no longer renders as empty healthy.** A failed
+  read of `audit.jsonl`, `security.jsonl`, `inspect.jsonl`, or `search-trace.jsonl`
+  used to come back as an empty list, so Activity showed **No tool calls yet** /
+  **Protection active**. A missing file is still empty (honest). Any other IO error
+  now rejects the invoke (including the dashboard's `audit_stats`), and the existing
+  error/retry UI surfaces it. `GET /metrics` answers 500 on the same unreadable log
+  instead of 200 with every series missing, so a Prometheus scrape fails rather than
+  reading as an idle instance. Security events also no longer lose an older row when
+  a corrupt or mid-write line lands in the newest page. (SBS-873)
+- **Windows keyring and install.ps1 tests can now block merge.** Branch
+  protection still requires only the check named `Build + test`. That name now
+  belongs to a merge-gate job that fails unless the Linux suite, the
+  cross-platform headless Rust matrix (including the Windows keyring tests),
+  and the `install.ps1` Pester job all succeeded. Adding those names as
+  separate required contexts still needs a GitHub settings click; this change
+  does not edit branch protection.
+
+- **A write-named tool cannot disarm drift quarantine with `destructiveHint: false`.**
+  MCP annotations are untrusted unless the server is. Drift severity now escalates
+  when the tool name itself claims write capability (`delete`, `run`, …), even if
+  the server set `destructiveHint: false` at first sight. Call-time confirm still
+  honours an explicit false hint. First sight of that contradiction is recorded
+  in Activity and is not quarantined. (SBS-875)
+- **Connect and launch-time repoint no longer strip comments from Codex/Grok
+  `config.toml` or comments and YAML anchors from Goose/Hermes/Continue
+  `config.yaml`.** Those writers used to parse with `toml` / `serde_yaml` and
+  pretty-print the whole file, so a Connect click or `repoint_stale_gateways`
+  dropped every `#` comment and expanded every `&anchor`. Unrelated keys
+  survived as data; the annotations did not. TOML now goes through `toml_edit`
+  DocumentMut and YAML rewrites only the `mcp_servers` / `extensions` /
+  `mcpServers` node, matching the JSONC CST contract. A user who Connects or
+  disconnects now keeps the comments and anchors they had outside that node.
+  (SBS-884)
+- **Failed routine-suggestion load no longer hides the save queue.** Settings treated
+  an unreachable `list_routine_suggestions` as "nothing pending" and hid the section,
+  including wiping cards already on screen when a later refresh failed. A failed load
+  is now its own state: empty after a successful read still hides; error shows retry
+  and keeps the last loaded queue. (SBS-879)
+- **A diagnostics bundle or second gateway can no longer see an empty `gateway.log` or lose a connect-failure line.** Trim used to rewrite the shared log in place, so a concurrent diagnostics read could land in the empty window and a concurrent append could be overwritten by the pre-truncate snapshot. Trim now replaces the file atomically under the same lock as append.
+- **SECURITY.md now matches the HTTP bind admission policy.** Every bind, loopback
+  or not, needs HTTP authentication: a bearer token, or at least one registered
+  HTTP client in `registry.json`. A hand-launched loopback gateway with neither
+  does not bind; it exits 1 unless `--insecure-loopback` is passed, and that flag
+  opens an unauthenticated listener only while no token is set and no HTTP clients
+  are registered. SECURITY.md also now explains what a registered HTTP client is
+  and how the desktop app creates one. (SBS-878)
+- **Connect keeps stow/chezmoi config symlinks.** Writing a client config
+  (Connect, Disconnect, migrate, launch-time re-point) used to replace a
+  symlink at the config path with a regular file, leaving the file in the
+  dotfiles repo unchanged. The next `chezmoi apply` / `stow` restored the
+  old content and the gateway entry disappeared. Writes now follow the
+  link and update the target, so the path under home stays a symlink.
+  (SBS-886)
+
+> > > > > > > origin/main
+
+- **Linux `.deb` installs a `toolport` command.** The package still ships the
+  crate binary as `conduit` (compat alias) and now also puts `toolport` on
+  `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
+  users to run `toolport`.
 - **A second Claude Code profile no longer gets stuck on an old gateway.**
   `CLAUDE_CONFIG_DIR` is usually set per shell or per launcher rather than exported, so a
   machine often has several Claude configs (a personal `~/.claude` beside a work

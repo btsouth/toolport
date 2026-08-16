@@ -5,6 +5,7 @@
 //! state (token endpoint, client id, refresh token) is vaulted alongside the
 //! access token.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, Mutex};
@@ -113,8 +114,40 @@ pub fn store_oauth_state(
     secrets::set_secret(server_id, STATE_KEY, &json)
 }
 
-fn load_state(server_id: &str) -> Option<OAuthState> {
-    secrets::get_secret(server_id, STATE_KEY).and_then(|s| serde_json::from_str(&s).ok())
+/// Decode a vaulted JSON blob, distinguishing confirmed-missing (`Ok(None)`)
+/// from a failed read or an unreadable stored value (`Err`).
+///
+/// A locked keychain must not look like "never saved" (SBS-840), and a stored
+/// blob that does not parse is not treated as missing — something is there,
+/// just unreadable. The blob is left in place.
+fn decode_vaulted_json<T: DeserializeOwned>(
+    blob: Result<Option<String>, String>,
+    what: &str,
+) -> Result<Option<T>, String> {
+    match blob {
+        Ok(None) => Ok(None),
+        Ok(Some(s)) => serde_json::from_str(&s)
+            .map(Some)
+            .map_err(|e| format!("could not parse the vaulted {what}: {e}")),
+        Err(e) => Err(format!("could not read the vaulted {what}: {e}")),
+    }
+}
+
+/// A failed vault read is NOT "missing" (SBS-840): a locked keychain must
+/// not look like the user never authenticated.
+fn load_state(server_id: &str) -> Result<Option<OAuthState>, String> {
+    decode_vaulted_json(
+        secrets::get_secret_result(server_id, STATE_KEY),
+        "OAuth state",
+    )
+}
+
+/// Same fail-closed mapping as [`load_state`] for the headless flow (SBS-840).
+fn load_cc_state(server_id: &str) -> Result<Option<ClientCredentialsState>, String> {
+    decode_vaulted_json(
+        secrets::get_secret_result(server_id, CC_STATE_KEY),
+        "client-credentials state",
+    )
 }
 
 fn issuer_bound_token_endpoint<'a>(
@@ -182,10 +215,19 @@ fn acquire_client_credentials(
     resource: &str,
     config: &crate::registry::ClientCredentials,
 ) -> Result<RefreshedToken, String> {
-    let secret = secrets::get_secret(server_id, secrets::CLIENT_SECRET_KEY).ok_or(
-        "no client secret is vaulted for this server; add one before connecting \
-         (client-credentials auth never falls back to a browser sign-in)",
-    )?;
+    // A vault read failure is not "no client secret" (SBS-840): a locked
+    // keychain must not look like the secret was never saved.
+    let secret = match secrets::get_secret_result(server_id, secrets::CLIENT_SECRET_KEY) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Err(
+                "no client secret is vaulted for this server; add one before connecting \
+                 (client-credentials auth never falls back to a browser sign-in)"
+                    .to_string(),
+            )
+        }
+        Err(e) => return Err(format!("could not read the vaulted client secret: {e}")),
+    };
     let configured = match config.token_endpoint_auth_method.as_deref() {
         Some(raw) => Some(oauth::ClientAuthMethod::parse(raw).ok_or_else(|| {
             format!("unknown token_endpoint_auth_method {raw:?} configured for this server")
@@ -244,11 +286,15 @@ fn acquire_client_credentials(
 /// that changed authorization server fails closed instead of sending the secret
 /// somewhere new.
 fn reacquire_client_credentials(server_id: &str) -> Result<RefreshedToken, String> {
-    let state: ClientCredentialsState = secrets::get_secret(server_id, CC_STATE_KEY)
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .ok_or("no client-credentials state to reacquire from")?;
-    let secret = secrets::get_secret(server_id, secrets::CLIENT_SECRET_KEY)
-        .ok_or("the vaulted client secret is gone; re-add it for this server")?;
+    // A failed read is not "no state" / "secret is gone" (SBS-840).
+    let state = load_cc_state(server_id)?.ok_or("no client-credentials state to reacquire from")?;
+    let secret = match secrets::get_secret_result(server_id, secrets::CLIENT_SECRET_KEY) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Err("the vaulted client secret is gone; re-add it for this server".to_string())
+        }
+        Err(e) => return Err(format!("could not read the vaulted client secret: {e}")),
+    };
     let method = oauth::ClientAuthMethod::parse(&state.method)
         .ok_or_else(|| format!("vaulted auth method {:?} is not recognized", state.method))?;
 
@@ -313,6 +359,15 @@ pub fn reset_client_credentials(server_id: &str) -> Result<(), String> {
 /// An unreadable state counts as unchanged: the caller only uses this to decide
 /// whether to discard state, and discarding on a parse failure would loop a broken
 /// vault into re-acquiring on every connect.
+///
+/// Deliberately still `get_secret`, not `get_secret_result` (SBS-840 sweep). The sole
+/// caller, [`client_credentials_state_is_stale`], reads the same key through
+/// `get_secret_result` first, so the common failure is caught one frame up. Note this
+/// narrows the window rather than closing it: that is a SECOND round trip to the vault,
+/// so a backend that dies between the two calls still collapses to `None` here and skips
+/// the reset. Left as-is because the window is one round trip wide and also needs the
+/// user to have changed this server's URL; converting it means threading a `Result`
+/// through a `bool` helper for that. Re-evaluate if the vault gets flakier.
 fn client_credentials_resource_changed(server_id: &str, url: &str) -> bool {
     let Some(state) = secrets::get_secret(server_id, CC_STATE_KEY)
         .and_then(|s| serde_json::from_str::<ClientCredentialsState>(&s).ok())
@@ -336,19 +391,33 @@ fn resource_binding_changed(vaulted_resource: &str, url: &str) -> bool {
 /// without a live connect. Two ways state goes stale, both reached by editing the
 /// server outside `set_client_credentials`: the config was removed, or the URL
 /// changed out from under an RFC 8707 resource binding.
-fn client_credentials_state_is_stale(server: &ServerEntry, server_id: &str, url: &str) -> bool {
-    secrets::get_secret(server_id, CC_STATE_KEY).is_some()
-        && (!uses_client_credentials(server) || client_credentials_resource_changed(server_id, url))
+///
+/// Errs on a failed vault read (SBS-840). Collapsing that to "no state here" skips
+/// the reset, and the connect then sends a token RFC 8707 bound to the OLD resource
+/// to the new one, which is the exact thing the reset exists to prevent.
+fn client_credentials_state_is_stale(
+    server: &ServerEntry,
+    server_id: &str,
+    url: &str,
+) -> Result<bool, String> {
+    if secrets::get_secret_result(server_id, CC_STATE_KEY)
+        .map_err(|e| format!("could not read the vaulted client-credentials state: {e}"))?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    Ok(!uses_client_credentials(server) || client_credentials_resource_changed(server_id, url))
 }
 
 /// Expiry of the vaulted client-credentials token, if this server uses that flow.
-fn client_credentials_expiry(server_id: &str) -> Option<u64> {
-    let state: ClientCredentialsState =
-        secrets::get_secret(server_id, CC_STATE_KEY).and_then(|s| serde_json::from_str(&s).ok())?;
+///
+/// Propagates a vault read failure (SBS-840) so a locked keychain cannot look
+/// like "this server has no client-credentials state".
+fn client_credentials_expiry(server_id: &str) -> Result<Option<u64>, String> {
     // A server that reports no lifetime keeps the reactive 401/403 behaviour,
     // matching the interactive flow. Returning 0 here would reacquire on every
     // single connect.
-    state.expires_at
+    Ok(load_cc_state(server_id)?.and_then(|state| state.expires_at))
 }
 
 /// Is this server configured for the headless flow?
@@ -411,17 +480,28 @@ fn lock_oauth_refresh(server_id: &str) -> Option<crate::registry::FileLock> {
 ///
 /// A rotated-but-already-expired token is not reusable, so that falls through and refreshes
 /// normally.
-fn refreshed_while_waiting(server_id: &str, before: Option<&str>) -> Option<RefreshedToken> {
-    let current = secrets::get_secret(server_id, secrets::HTTP_AUTH_KEY);
+fn refreshed_while_waiting(
+    server_id: &str,
+    before: Option<&str>,
+) -> Result<Option<RefreshedToken>, String> {
+    // A vault read failure is not "no token" / "no state" (SBS-840): pretending
+    // there is nothing stored would fall through into a refresh that also lies.
+    let current = match secrets::get_secret_result(server_id, secrets::HTTP_AUTH_KEY) {
+        Ok(v) => v,
+        Err(e) => return Err(format!("could not read the vaulted access token: {e}")),
+    };
     let now = now_epoch_seconds();
     // Client-credentials servers keep their expiry under their own key and have no
     // OAuthState, so they need their own read. Without this a CC waiter would win the
     // lock and mint a second grant it did not need — serialized, so not a race, but a
     // redundant round trip to the token endpoint on every contended connect.
-    if let Some(expires_at) = client_credentials_expiry(server_id) {
-        return reuse_racing_client_credentials(before, current, expires_at, now);
+    if let Some(expires_at) = client_credentials_expiry(server_id)? {
+        return Ok(reuse_racing_client_credentials(
+            before, current, expires_at, now,
+        ));
     }
-    reuse_racing_refresh(before, current, load_state(server_id).as_ref(), now)
+    let state = load_state(server_id)?;
+    Ok(reuse_racing_refresh(before, current, state.as_ref(), now))
 }
 
 /// [`reuse_racing_refresh`] for the client-credentials flow.
@@ -477,21 +557,30 @@ fn reuse_racing_refresh(
 fn refresh_token_with_expiry(server_id: &str) -> Result<RefreshedToken, String> {
     // Snapshot before locking: the comparison after we win is what tells us whether a
     // racing process rotated the credential while we waited.
-    let before_access = secrets::get_secret(server_id, secrets::HTTP_AUTH_KEY);
+    // A vault read failure is not "no token" (SBS-840).
+    let before_access = match secrets::get_secret_result(server_id, secrets::HTTP_AUTH_KEY) {
+        Ok(v) => v,
+        Err(e) => return Err(format!("could not read the vaulted access token: {e}")),
+    };
     // Held for the whole function, including the client-credentials branch, so two
     // processes cannot mint two tokens for the same server.
     let _refresh_lock = lock_oauth_refresh(server_id);
-    if let Some(winner) = refreshed_while_waiting(server_id, before_access.as_deref()) {
+    if let Some(winner) = refreshed_while_waiting(server_id, before_access.as_deref())? {
         return Ok(winner);
     }
     // Client-credentials servers have no refresh token by construction, so they
     // reacquire instead. Checked first because this is the seam BOTH the proactive
     // pre-expiry path and the reactive 401/403 retry go through; branching here
     // means neither has to know which flow a server uses.
-    if secrets::get_secret(server_id, CC_STATE_KEY).is_some() {
+    // A failed CC-state read must not fall through to interactive refresh (SBS-840).
+    if load_cc_state(server_id)?.is_some() {
         return reacquire_client_credentials(server_id);
     }
-    let state = load_state(server_id).ok_or("no stored OAuth state to refresh")?;
+    let state = match load_state(server_id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return Err("no stored OAuth state to refresh".to_string()),
+        Err(e) => return Err(e),
+    };
     let rt = state
         .refresh_token
         .as_deref()
@@ -562,8 +651,16 @@ fn reauthorize_for_scope(
     resource: &str,
     required_scope: &str,
 ) -> Result<RefreshedToken, String> {
-    let previous = load_state(server_id)
-        .ok_or("saved OAuth state is unavailable; authenticate again to grant additional scope")?;
+    let previous =
+        match load_state(server_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => return Err(
+                "saved OAuth state is unavailable; authenticate again to grant additional scope"
+                    .to_string(),
+            ),
+            // A locked keychain is not "authenticate again" (SBS-840).
+            Err(e) => return Err(e),
+        };
     let requested = oauth::scope_union(previous.scope.as_deref(), Some(required_scope));
     let result = oauth::authenticate_with_scope(resource, requested.as_deref())?;
     store_oauth_state(
@@ -596,7 +693,7 @@ fn refresh_token_if_needed(server_id: &str) -> Result<Option<String>, String> {
     // Same pre-expiry rule for the headless flow, minus the "no refresh token"
     // branch: reacquiring needs no user interaction, so a near-deadline token is
     // simply replaced rather than surfaced as "needs sign-in".
-    if let Some(expires_at) = client_credentials_expiry(server_id) {
+    if let Some(expires_at) = client_credentials_expiry(server_id)? {
         if now_epoch_seconds().saturating_add(PROACTIVE_REFRESH_SKEW_SECS) >= expires_at {
             // Through `refresh_token`, not `reacquire_client_credentials` directly: that
             // seam is where the cross-process lock lives, and calling the reacquire
@@ -607,7 +704,9 @@ fn refresh_token_if_needed(server_id: &str) -> Result<Option<String>, String> {
         }
         return Ok(None);
     }
-    let Some(state) = load_state(server_id) else {
+    // A vault read failure is not "no stored OAuth state" (SBS-840): skipping
+    // refresh would treat a locked keychain as never-authenticated.
+    let Some(state) = load_state(server_id)? else {
         return Ok(None);
     };
     match refresh_decision(&state, now_epoch_seconds()) {
@@ -679,7 +778,10 @@ fn authed_transport(
     }
     // Shared by ordinary refresh and scope step-up so a newly-authorized token's
     // expiry replaces the previous token's proactive deadline immediately.
-    let refresh_at = load_state(server_id)
+    // A failed state read must not silently disable proactive refresh (SBS-840).
+    let oauth_state = load_state(server_id)?;
+    let refresh_at = oauth_state
+        .as_ref()
         .and_then(|state| state.expires_at)
         .map(|expires_at| expires_at.saturating_sub(PROACTIVE_REFRESH_SKEW_SECS));
     let next_refresh_at = Arc::new(Mutex::new(refresh_at));
@@ -716,6 +818,12 @@ fn authed_transport(
                             .map_err(|_| "OAuth refresh deadline lock poisoned".to_string())? =
                             Some(now_epoch_seconds().saturating_add(PROACTIVE_REFRESH_RETRY_SECS));
                     }
+                    // A locked keychain is not "please sign in again" (SBS-840).
+                    if e.contains("could not read the vaulted")
+                        || e.contains("could not parse the vaulted")
+                    {
+                        return Err(e);
+                    }
                     return Err(format!(
                         "OAuth token refresh failed; needs authentication: {e}"
                     ));
@@ -732,28 +840,28 @@ fn authed_transport(
     } else {
         None
     };
-    let scope_reauthorize: Option<ScopeReauthorizeFn> =
-        if token.is_some() && load_state(server_id).is_some() {
-            let sid = server_id.to_string();
-            let resource = url.to_string();
-            let next_refresh_at = Arc::clone(&next_refresh_at);
-            let credential_update = Arc::clone(&credential_update);
-            Some(Box::new(move |scope| {
-                let _update = credential_update
-                    .lock()
-                    .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
-                let token = reauthorize_for_scope(&sid, &resource, scope)?;
-                let deadline = token
-                    .expires_at
-                    .map(|expires_at| expires_at.saturating_sub(PROACTIVE_REFRESH_SKEW_SECS));
-                *next_refresh_at
-                    .lock()
-                    .map_err(|_| "OAuth refresh deadline lock poisoned".to_string())? = deadline;
-                Ok(token.access_token)
-            }))
-        } else {
-            None
-        };
+    let scope_reauthorize: Option<ScopeReauthorizeFn> = if token.is_some() && oauth_state.is_some()
+    {
+        let sid = server_id.to_string();
+        let resource = url.to_string();
+        let next_refresh_at = Arc::clone(&next_refresh_at);
+        let credential_update = Arc::clone(&credential_update);
+        Some(Box::new(move |scope| {
+            let _update = credential_update
+                .lock()
+                .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
+            let token = reauthorize_for_scope(&sid, &resource, scope)?;
+            let deadline = token
+                .expires_at
+                .map(|expires_at| expires_at.saturating_sub(PROACTIVE_REFRESH_SKEW_SECS));
+            *next_refresh_at
+                .lock()
+                .map_err(|_| "OAuth refresh deadline lock poisoned".to_string())? = deadline;
+            Ok(token.access_token)
+        }))
+    } else {
+        None
+    };
     // The resolver enforces the SSRF policy at connect time (DNS-rebind safe); it
     // mirrors `guard_connect_target`: link-local/metadata blocked for all, private
     // blocked only for untrusted-provenance servers.
@@ -763,6 +871,12 @@ fn authed_transport(
     // the extension requires. Keyed off vaulted state rather than registry config
     // so it is true of the credential actually being sent: a server configured for
     // the flow but not yet provisioned has nothing to declare.
+    //
+    // Deliberately still `get_secret`, not `get_secret_result`. A read failure here
+    // only omits an informational extension declaration: no credential is minted,
+    // sent, or overwritten, and the request itself is unaffected. Failing the whole
+    // transport build over a missing declaration would be worse than the omission
+    // (SBS-840 sweep).
     if secrets::get_secret(server_id, CC_STATE_KEY).is_some() {
         transport.declare_extension(
             crate::downstream::OAUTH_CLIENT_CREDENTIALS_EXTENSION,
@@ -837,6 +951,26 @@ fn first_vaulted_secret(server: &ServerEntry) -> Result<Option<String>, String> 
     Ok(None)
 }
 
+/// Did the transport spend its own forced refresh during this connect?
+///
+/// The transport force-refreshes internally on a 401/403 and vaults the result, so a
+/// vaulted token that differs from the one we handed it means an exchange already
+/// happened (SOU-474). `sent_auth` is what went out; `None` back means there is
+/// nothing vaulted to compare, which is not evidence of a refresh.
+///
+/// Errs on a failed vault read (SBS-840) rather than answering "no refresh happened".
+/// That answer sends the caller into a second exchange on a refresh token the
+/// transport may have already spent, which is what a provider with reuse detection
+/// revokes the whole family over.
+fn transport_refreshed_during_connect(
+    server_id: &str,
+    sent_auth: Option<&str>,
+) -> Result<bool, String> {
+    let vaulted = secrets::get_secret_result(server_id, secrets::HTTP_AUTH_KEY)
+        .map_err(|e| format!("could not read the vaulted access token: {e}"))?;
+    Ok(vaulted.is_some_and(|vaulted| Some(vaulted.as_str()) != sent_auth))
+}
+
 /// Connect to a remote server, injecting any vaulted token. On an auth error,
 /// refresh the token once and retry.
 ///
@@ -885,12 +1019,13 @@ pub fn connect_remote_with_handler(
     //
     // Handled here because this is the only place that sees both the current entry
     // and the vault; the reacquire seam takes just a server id by design.
-    if client_credentials_state_is_stale(server, server_id, url) {
+    if client_credentials_state_is_stale(server, server_id, url)? {
         // Not ignored: leaving stale state would silently keep using the wrong
         // flow, or the wrong resource binding, for the rest of the session.
         reset_client_credentials(server_id)?;
     }
-    if uses_client_credentials(server) && secrets::get_secret(server_id, CC_STATE_KEY).is_none() {
+    // A failed CC-state read is not "no state" (SBS-840): do not mint a second grant.
+    if uses_client_credentials(server) && load_cc_state(server_id)?.is_none() {
         let config = server
             .client_credentials
             .as_ref()
@@ -924,32 +1059,56 @@ pub fn connect_remote_with_handler(
     transport.set_change_sink(change_dirty.clone());
     match DownstreamServer::connect(server_id.to_string(), Box::new(transport)) {
         Ok(ds) => Ok(ds),
-        // The transport already gets one forced refresh per token on a 401/403.
-        // If it spent one during this connect, the vault now holds a token that
-        // has ALREADY been rejected, so minting yet another cannot help - and
-        // against a provider that rotates the refresh token on use, each needless
-        // exchange consumes a further link of the chain. Retry only when the
-        // transport had no refresh of its own to spend (SOU-474).
-        Err(e)
-            if is_auth_error(&e)
-                && secrets::get_secret(server_id, secrets::HTTP_AUTH_KEY)
-                    .is_some_and(|vaulted| Some(&vaulted) != sent_auth.as_ref()) =>
-        {
-            Err(e)
-        }
-        Err(e) if is_auth_error(&e) => match refresh_token(server_id) {
-            Ok(fresh) => {
-                let mut transport = authed_transport(url, Some(fresh), server_id, block_private)?;
-                if let Some(handler) = server_handler.clone() {
-                    transport.set_server_request_handler(handler);
-                }
-                transport.set_resource_updated_sink(resource_updated);
-                transport.set_progress_sink(progress);
-                transport.set_change_sink(change_dirty);
-                DownstreamServer::connect(server_id.to_string(), Box::new(transport))
+        Err(e) if is_auth_error(&e) => {
+            // The transport already gets one forced refresh per token on a 401/403.
+            // If it spent one during this connect, the vault now holds a token that
+            // has ALREADY been rejected, so minting yet another cannot help - and
+            // against a provider that rotates the refresh token on use, each needless
+            // exchange consumes a further link of the chain. Retry only when the
+            // transport had no refresh of its own to spend (SOU-474).
+            //
+            // The two auth-error arms are one arm so that check can use `?`: a match
+            // guard cannot, so it could only answer "no refresh happened" on a failed
+            // vault read and go on to refresh anyway (SBS-840). The rejection is then
+            // described in words rather than quoted, because its text would make
+            // `is_auth_error` classify a keychain fault as needs-sign-in and push the
+            // user into a sign-in the same vault could not store.
+            let already_refreshed =
+                match transport_refreshed_during_connect(server_id, sent_auth.as_deref()) {
+                    Ok(refreshed) => refreshed,
+                    Err(vault_error) => {
+                        // Keep the downstream rejection out of the returned string but
+                        // not out of the record of what happened.
+                        eprintln!(
+                            "toolport: could not tell whether the transport refreshed during the \
+                             failed connect to {server_id:?}; the server rejected the credential \
+                             with: {e}"
+                        );
+                        return Err(format!(
+                            "{vault_error} (the server rejected the credential Toolport sent, and \
+                             without the vault there is no way to tell whether it had already been \
+                             renewed, so no further token exchange was attempted)"
+                        ));
+                    }
+                };
+            if already_refreshed {
+                return Err(e);
             }
-            Err(_) => Err(e),
-        },
+            match refresh_token(server_id) {
+                Ok(fresh) => {
+                    let mut transport =
+                        authed_transport(url, Some(fresh), server_id, block_private)?;
+                    if let Some(handler) = server_handler.clone() {
+                        transport.set_server_request_handler(handler);
+                    }
+                    transport.set_resource_updated_sink(resource_updated);
+                    transport.set_progress_sink(progress);
+                    transport.set_change_sink(change_dirty);
+                    DownstreamServer::connect(server_id.to_string(), Box::new(transport))
+                }
+                Err(_) => Err(e),
+            }
+        }
         Err(e) => Err(e),
     }
 }
@@ -1476,9 +1635,15 @@ mod tests {
     ///
     /// Holds `data_dir_test_lock` for the whole test: the data-dir override and the
     /// backend-selecting env var are both process-global.
+    ///
+    /// Field order IS drop order (unlike locals, struct fields drop in declaration
+    /// order), so the override is declared before the guard that protects it. The
+    /// other way round, teardown released the lock with the override still
+    /// installed, and this drop could then clear the override the NEXT test had
+    /// just installed, sending that test at the REAL data dir.
     struct VaultFixture {
-        _data_dir_lock: std::sync::MutexGuard<'static, ()>,
         _override: crate::registry::DataDirOverride,
+        _data_dir_lock: std::sync::MutexGuard<'static, ()>,
         dir: std::path::PathBuf,
         previous_key: Option<String>,
     }
@@ -1496,8 +1661,8 @@ mod tests {
             let previous_key = std::env::var("TOOLPORT_SECRET_KEY").ok();
             std::env::set_var("TOOLPORT_SECRET_KEY", "sbs-615-unit-test-passphrase");
             Self {
-                _data_dir_lock: lock,
                 _override: over,
+                _data_dir_lock: lock,
                 dir,
                 previous_key,
             }
@@ -1552,22 +1717,29 @@ mod tests {
             &server,
             &server_id,
             "https://mcp.example.com/MCP"
-        ));
+        )
+        .expect("readable vault"));
 
         // The edit: same host, same everything but the path case.
         let edited = "https://mcp.example.com/mcp";
         server.url = Some(edited.into());
         assert!(client_credentials_resource_changed(&server_id, edited));
         assert!(
-            client_credentials_state_is_stale(&server, &server_id, edited),
+            client_credentials_state_is_stale(&server, &server_id, edited).expect("readable vault"),
             "the connect path must treat the vaulted state as stale"
         );
 
         // What the connect path then does. After it, nothing is left to reuse, so
         // the next acquisition binds to the URL actually being contacted.
         reset_client_credentials(&server_id).expect("reset");
-        assert!(secrets::get_secret(&server_id, CC_STATE_KEY).is_none());
-        assert!(secrets::get_secret(&server_id, secrets::HTTP_AUTH_KEY).is_none());
+        for key in [CC_STATE_KEY, secrets::HTTP_AUTH_KEY] {
+            assert!(
+                secrets::get_secret_result(&server_id, key)
+                    .expect("readable vault")
+                    .is_none(),
+                "{key} must be gone after the reset"
+            );
+        }
     }
 
     /// Removing the config is the other way state goes stale, and it must not
@@ -1582,7 +1754,7 @@ mod tests {
 
         assert!(!client_credentials_resource_changed(&server_id, url));
         assert!(
-            client_credentials_state_is_stale(&server, &server_id, url),
+            client_credentials_state_is_stale(&server, &server_id, url).expect("readable vault"),
             "state for a server no longer configured for the flow must be discarded"
         );
     }
@@ -1603,6 +1775,240 @@ mod tests {
             &server,
             &server_id,
             "https://mcp.example.com/mcp"
-        ));
+        )
+        .expect("readable vault"));
+    }
+
+    // ----- SBS-840: a vault read failure is not missing OAuth/CC state ---------
+
+    /// The reserved namespace makes `get_secret_result` return `Err` without
+    /// touching a real keychain (same trick as SBS-841).
+    const RESERVED_VAULT_NS: &str = "__toolport_internal__";
+
+    #[test]
+    fn decode_vaulted_json_distinguishes_missing_from_a_failed_read() {
+        assert!(
+            matches!(
+                decode_vaulted_json::<OAuthState>(Ok(None), "OAuth state"),
+                Ok(None)
+            ),
+            "confirmed-missing must stay Ok(None)"
+        );
+
+        let Err(err) =
+            decode_vaulted_json::<OAuthState>(Err("keychain locked".into()), "OAuth state")
+        else {
+            panic!("a failed read must be Err, not missing");
+        };
+        assert!(
+            err.contains("could not read the vaulted OAuth state"),
+            "must describe a read failure: {err}"
+        );
+        assert!(
+            err.contains("keychain locked"),
+            "must keep the underlying vault error: {err}"
+        );
+        assert!(
+            !err.contains("no stored OAuth state"),
+            "a vault failure must not look like missing state: {err}"
+        );
+
+        let Err(parse_err) = decode_vaulted_json::<OAuthState>(Ok(Some("{".into())), "OAuth state")
+        else {
+            panic!("unreadable stored JSON is an error, not missing");
+        };
+        assert!(
+            parse_err.contains("could not parse the vaulted OAuth state"),
+            "must describe a parse failure: {parse_err}"
+        );
+        assert!(
+            !parse_err.contains("no stored OAuth state"),
+            "corrupt stored state is not missing: {parse_err}"
+        );
+
+        assert!(
+            matches!(
+                decode_vaulted_json::<ClientCredentialsState>(Ok(None), "client-credentials state"),
+                Ok(None)
+            ),
+            "confirmed-missing CC state must stay Ok(None)"
+        );
+        let Err(cc_err) = decode_vaulted_json::<ClientCredentialsState>(
+            Err("keychain locked".into()),
+            "client-credentials state",
+        ) else {
+            panic!("a failed CC-state read must be Err");
+        };
+        assert!(
+            cc_err.contains("could not read the vaulted client-credentials state"),
+            "{cc_err}"
+        );
+        assert!(
+            !cc_err.contains("no client-credentials state"),
+            "a vault failure must not look like missing CC state: {cc_err}"
+        );
+    }
+
+    #[test]
+    fn load_state_on_reserved_namespace_is_a_read_failure_not_missing() {
+        let Err(err) = load_state(RESERVED_VAULT_NS) else {
+            panic!("reserved namespace must fail the vault read");
+        };
+        assert!(
+            err.contains("could not read the vaulted OAuth state"),
+            "must describe a read failure: {err}"
+        );
+        assert!(
+            !err.contains("no stored OAuth state"),
+            "a vault failure must not look like missing state: {err}"
+        );
+    }
+
+    #[test]
+    fn refresh_token_reports_a_vault_read_failure_not_missing_state() {
+        let err = refresh_token(RESERVED_VAULT_NS)
+            .expect_err("reserved namespace must fail the vault read");
+        let lower = err.to_lowercase();
+        assert!(
+            lower.contains("could not read")
+                && (lower.contains("vault") || lower.contains("state")),
+            "must describe a vault/state read failure: {err}"
+        );
+        assert!(
+            !err.contains("no stored OAuth state"),
+            "a vault failure must not look like missing state: {err}"
+        );
+        assert!(
+            !is_auth_error(&err),
+            "a locked vault must not be classified as needs-authentication: {err}"
+        );
+    }
+
+    #[test]
+    fn refresh_token_if_needed_reports_a_vault_read_failure_not_ok_none() {
+        let result = refresh_token_if_needed(RESERVED_VAULT_NS);
+        assert!(
+            matches!(result, Err(_)),
+            "a failed state read must not skip refresh as if there is no state: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            !err.contains("no stored OAuth state"),
+            "a vault failure must not look like missing state: {err}"
+        );
+    }
+
+    #[test]
+    fn acquire_client_credentials_reports_a_vault_read_failure_not_missing_secret() {
+        let Err(err) = acquire_client_credentials(
+            RESERVED_VAULT_NS,
+            "https://mcp.example.com/mcp",
+            &cc("client-abc"),
+        ) else {
+            panic!("reserved namespace must fail the client-secret read");
+        };
+        assert!(
+            err.contains("could not read the vaulted client secret"),
+            "must describe a read failure: {err}"
+        );
+        assert!(
+            !err.contains("no client secret is vaulted"),
+            "a vault failure must not look like a missing client secret: {err}"
+        );
+    }
+
+    #[test]
+    fn reacquire_client_credentials_reports_a_vault_read_failure_not_missing_state() {
+        let Err(err) = reacquire_client_credentials(RESERVED_VAULT_NS) else {
+            panic!("reserved namespace must fail the CC-state read");
+        };
+        assert!(
+            err.contains("could not read the vaulted client-credentials state"),
+            "must describe a read failure: {err}"
+        );
+        assert!(
+            !err.contains("no client-credentials state"),
+            "a vault failure must not look like missing CC state: {err}"
+        );
+        assert!(
+            !err.contains("the vaulted client secret is gone"),
+            "must fail on the state read, not claim the secret is gone: {err}"
+        );
+    }
+
+    /// A failed CC-state read used to read as "there is no state here", which skips
+    /// [`reset_client_credentials`] and lets the connect present a token RFC 8707
+    /// bound to the OLD resource to the new one.
+    #[test]
+    fn client_credentials_staleness_reports_a_vault_read_failure_not_absent_state() {
+        let server = http_server("sbs840-stale", Some(cc("client-abc")));
+        let Err(err) = client_credentials_state_is_stale(
+            &server,
+            RESERVED_VAULT_NS,
+            "https://mcp.example.com/mcp",
+        ) else {
+            panic!("reserved namespace must fail the CC-state read, not answer 'not stale'");
+        };
+        assert!(
+            err.contains("could not read the vaulted client-credentials state"),
+            "must describe a read failure: {err}"
+        );
+        assert!(
+            !err.contains("no client-credentials state"),
+            "a vault failure must not look like missing CC state: {err}"
+        );
+    }
+
+    /// The SOU-474 guard. A failed read must not answer "the transport did not
+    /// refresh", because the caller acts on that by spending another exchange on a
+    /// refresh token the transport may already have consumed.
+    #[test]
+    fn a_failed_post_connect_token_read_is_not_a_missed_refresh() {
+        let Err(err) = transport_refreshed_during_connect(RESERVED_VAULT_NS, Some("sent-token"))
+        else {
+            panic!("reserved namespace must fail the access-token read");
+        };
+        assert!(
+            err.contains("could not read the vaulted access token"),
+            "must describe a read failure: {err}"
+        );
+        assert!(
+            !is_auth_error(&err),
+            "a locked vault must not be classified as needs-authentication: {err}"
+        );
+    }
+
+    /// The guard's answers over the real vault, so the fix above cannot regress into
+    /// always reporting a refresh (which would stop the legitimate retry).
+    #[test]
+    fn a_rotated_vaulted_token_is_the_only_evidence_of_a_transport_refresh() {
+        let _vault = VaultFixture::new("sou474");
+        let server_id = "sbs840-guard";
+
+        // Nothing vaulted is not evidence of anything: the retry must still be free
+        // to run for a server whose token was cleared mid-connect.
+        assert!(
+            !transport_refreshed_during_connect(server_id, Some("sent-token"))
+                .expect("readable vault"),
+            "an empty vault is not a refresh"
+        );
+
+        secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, "sent-token")
+            .expect("scratch vault write");
+        assert!(
+            !transport_refreshed_during_connect(server_id, Some("sent-token"))
+                .expect("readable vault"),
+            "the token we sent is still there, so the transport spent no refresh"
+        );
+
+        secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, "rotated-token")
+            .expect("scratch vault write");
+        assert!(
+            transport_refreshed_during_connect(server_id, Some("sent-token"))
+                .expect("readable vault"),
+            "a different vaulted token means the transport already refreshed"
+        );
+
+        let _ = secrets::delete_secret(server_id, secrets::HTTP_AUTH_KEY);
     }
 }
