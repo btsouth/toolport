@@ -415,12 +415,7 @@ pub fn start(app: AppHandle) -> ApprovalBroker {
 /// location sits right next to the gateway's `dir_resolution=` line. Best-effort: a logging
 /// failure never touches an approval decision.
 fn log_broker_event(msg: &str) {
-    if let Some(path) = crate::registry::gateway_log_path() {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "[broker] {msg}");
-        }
-    }
+    crate::gatewaylog::append(&format!("[broker] {msg}"));
 }
 
 /// Best-effort removal of the endpoint descriptor on app shutdown, so a gateway that dials
