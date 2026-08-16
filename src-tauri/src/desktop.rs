@@ -5449,7 +5449,7 @@ mod tests {
     fn stop_http_bridge_failed_kill_keeps_live_state_for_retry() {
         #[cfg(windows)]
         let child = std::process::Command::new("ping")
-            .args(["-n", "10", "127.0.0.1"])
+            .args(["-t", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -5457,7 +5457,7 @@ mod tests {
 
         #[cfg(not(windows))]
         let child = std::process::Command::new("sleep")
-            .arg("10")
+            .arg("300")
             .spawn()
             .unwrap();
 
