@@ -30,27 +30,35 @@ interface WorkflowStep {
   "continue-on-error"?: boolean;
 }
 
+interface RunDefaults {
+  run?: { shell?: string };
+}
+
 interface WorkflowJob {
   name?: string;
   if?: string;
   needs?: string | string[];
-  "runs-on"?: string;
+  "runs-on"?: string | string[];
   "continue-on-error"?: boolean;
+  defaults?: RunDefaults;
   strategy?: { "fail-fast"?: boolean; matrix?: Record<string, unknown> };
   steps?: WorkflowStep[];
 }
 
 interface Workflow {
+  defaults?: RunDefaults;
   jobs?: Record<string, WorkflowJob>;
 }
 
-function parseJobs(source: string): Record<string, WorkflowJob> {
+type ParsedWorkflow = Workflow & { jobs: Record<string, WorkflowJob> };
+
+function parseWorkflow(source: string): ParsedWorkflow {
   const workflow = parse(source) as Workflow | null;
   const jobs = workflow?.jobs;
-  if (!jobs || typeof jobs !== "object") {
+  if (!workflow || !jobs || typeof jobs !== "object") {
     throw new Error("workflow has no jobs: block");
   }
-  return jobs;
+  return { ...workflow, jobs };
 }
 
 /** GitHub falls back to the job id when a job has no display `name:`. */
@@ -79,32 +87,78 @@ function runScripts(job: WorkflowJob): string[] {
   return (job.steps ?? []).flatMap((step) => (step.run ? [step.run] : []));
 }
 
+/** `test` / `[` only mean the POSIX builtins under one of these. */
+const POSIX_SHELLS = new Set(["bash", "sh"]);
+
+function runsOnLabels(job: WorkflowJob): string[] {
+  const runsOn = job["runs-on"];
+  if (typeof runsOn === "string") return [runsOn];
+  if (Array.isArray(runsOn)) return runsOn.map(String);
+  return [];
+}
+
+/**
+ * Whether the step's script is run by a POSIX shell, so that a failing `test`
+ * aborts it (GitHub runs `bash -e {0}` / `sh -e {0}`).
+ *
+ * With no `shell:` the default follows the runner, and on Windows runners that
+ * default is `pwsh`, where `test` is not the comparison builtin and the exit
+ * code stops tracking the comparison. So an unset `shell:` only counts when
+ * the runner is plainly not Windows; anything unrecognised is rejected.
+ */
+function stepUsesPosixShell(
+  workflow: Workflow,
+  job: WorkflowJob,
+  step: WorkflowStep,
+): boolean {
+  const shell = step.shell ?? job.defaults?.run?.shell ?? workflow.defaults?.run?.shell;
+  if (shell !== undefined) return POSIX_SHELLS.has(shell.trim());
+  const labels = runsOnLabels(job);
+  return labels.length > 0 && labels.every((label) => /^(ubuntu|macos)-/.test(label));
+}
+
+// Matches `test "${{ needs.x.result }}" = "success"` and the `[ ... ]` /
+// `[[ ... ]]` spellings, with or without quotes, `=` or `==`. Anchoring the
+// left side keeps `if test ...` and commented-out lines out.
+const RESULT_COMPARISON =
+  /(?:^|\n|;|&&|\|\|)[ \t]*(?:test|\[\[?)[ \t]+"?\$\{\{[ \t]*needs\.([A-Za-z0-9_-]+)\.result[ \t]*\}\}"?[ \t]*={1,2}[ \t]*"?success"?/g;
+
+// `test ... || <anything>` is a compound command whose status is the right
+// side, so under `set -e` the comparison no longer aborts the step. Only a
+// right side that itself fails keeps the line fail-closed.
+const FAILING_FALLBACK =
+  /^[ \t]*\|\|[ \t]*(?:exit[ \t]+[1-9][0-9]*|false)[ \t]*;?[ \t]*$/;
+
 /**
  * Dependency ids that the job actually gates on: ids whose
  * `needs.<id>.result` is compared against `success` by a shell test that
  * aborts the step on mismatch.
  *
- * Only steps that always run and always count are considered, so neither
- * `continue-on-error: true` nor an `if:` guard that skips the step on failure
- * can be used to smuggle a check past this. A bare
- * `echo "${{ needs.x.result }}"` line does not count either: it never changes
- * the exit code.
+ * Only steps that always run, always count, and can actually fail are
+ * considered. `continue-on-error: true`, an `if:` guard that skips the step on
+ * failure, a non-POSIX shell, and a `|| true` style fallback all disqualify a
+ * comparison, because each one lets the comparison be false while the step
+ * still exits 0. A bare `echo "${{ needs.x.result }}"` does not count either:
+ * it never changes the exit code.
  */
-function failClosedResultChecks(job: WorkflowJob): string[] {
+function failClosedResultChecks(workflow: Workflow, job: WorkflowJob): string[] {
   if (job["continue-on-error"] === true) return [];
   const gatingSteps = (job.steps ?? []).filter((step) => {
     if (step["continue-on-error"] === true) return false;
+    if (!stepUsesPosixShell(workflow, job, step)) return false;
     const guard = step.if?.trim();
     return guard === undefined || guard === "always()" || guard === "${{ always() }}";
   });
-  // Matches `test "${{ needs.x.result }}" = "success"` and the `[ ... ]` /
-  // `[[ ... ]]` spellings, with or without quotes, `=` or `==`.
-  const comparison =
-    /(?:^|\n|;|&&|\|\|)[ \t]*(?:test|\[\[?)[ \t]+"?\$\{\{[ \t]*needs\.([A-Za-z0-9_-]+)\.result[ \t]*\}\}"?[ \t]*={1,2}[ \t]*"?success"?/g;
   const gated = new Set<string>();
   for (const script of gatingSteps.flatMap((step) => (step.run ? [step.run] : []))) {
-    for (const match of script.matchAll(comparison)) {
-      gated.add(match[1]);
+    for (const match of script.matchAll(RESULT_COMPARISON)) {
+      const lineEnd = script.indexOf("\n", match.index + match[0].length);
+      const rest = script.slice(
+        match.index + match[0].length,
+        lineEnd === -1 ? undefined : lineEnd,
+      );
+      const swallowed = rest.includes("||") && !FAILING_FALLBACK.test(rest);
+      if (!swallowed) gated.add(match[1]);
     }
   }
   return [...gated].sort();
@@ -114,7 +168,8 @@ const ciYaml = readFileSync(
   join(process.cwd(), ".github", "workflows", "ci.yml"),
   "utf8",
 );
-const jobs = parseJobs(ciYaml);
+const ci = parseWorkflow(ciYaml);
+const jobs = ci.jobs;
 
 describe("CI required merge gate (SBS-874)", () => {
   it("puts the required check name on a gate that needs Windows rust and install.ps1", () => {
@@ -134,8 +189,9 @@ describe("CI required merge gate (SBS-874)", () => {
     const [, gate] = jobsWithCheckName(jobs, REQUIRED_CHECK_NAME)[0];
     // The point of the gate: `if: always()` means the step runs on failed,
     // skipped, and cancelled dependencies, so it must compare each result
-    // against `success` itself.
-    expect(failClosedResultChecks(gate)).toEqual([...GATED_JOB_IDS].sort());
+    // against `success` itself, in a step where a false comparison is what
+    // makes the step exit non-zero.
+    expect(failClosedResultChecks(ci, gate)).toEqual([...GATED_JOB_IDS].sort());
   });
 
   it("keeps the Linux suite under a different check name", () => {
@@ -164,7 +220,7 @@ describe("CI required merge gate (SBS-874)", () => {
 // stop failing and this block goes red.
 describe("the gate assertions reject a workflow that reopens the hole", () => {
   it("rejects a gate step that only echoes the dependency results", () => {
-    const fixture = parseJobs(`
+    const fixture = parseWorkflow(`
 jobs:
   merge-gate:
     name: Build + test
@@ -178,14 +234,14 @@ jobs:
           echo "cross-platform-rust=\${{ needs.cross-platform-rust.result }}"
           echo "installer-script=\${{ needs.installer-script.result }}"
 `);
-    const gate = jobsWithCheckName(fixture, REQUIRED_CHECK_NAME)[0][1];
+    const gate = jobsWithCheckName(fixture.jobs, REQUIRED_CHECK_NAME)[0][1];
     // Passes the name / always() / needs assertions, but gates nothing.
     expect(needsOf(gate)).toEqual(expect.arrayContaining(GATED_JOB_IDS));
-    expect(failClosedResultChecks(gate)).toEqual([]);
+    expect(failClosedResultChecks(fixture, gate)).toEqual([]);
   });
 
   it("rejects result checks parked behind continue-on-error or a skip guard", () => {
-    const fixture = parseJobs(`
+    const fixture = parseWorkflow(`
 jobs:
   merge-gate:
     name: Build + test
@@ -202,12 +258,64 @@ jobs:
       - name: Real check
         run: test "\${{ needs.installer-script.result }}" = "success"
 `);
-    const gate = jobsWithCheckName(fixture, REQUIRED_CHECK_NAME)[0][1];
-    expect(failClosedResultChecks(gate)).toEqual(["installer-script"]);
+    const gate = jobsWithCheckName(fixture.jobs, REQUIRED_CHECK_NAME)[0][1];
+    expect(failClosedResultChecks(fixture, gate)).toEqual(["installer-script"]);
+  });
+
+  it("rejects a comparison whose failure is swallowed by a fallback", () => {
+    const fixture = parseWorkflow(`
+jobs:
+  merge-gate:
+    name: Build + test
+    if: always()
+    needs: [build-test, cross-platform-rust, installer-script]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Require everything
+        run: |
+          test "\${{ needs.build-test.result }}" = "success" || true
+          test "\${{ needs.cross-platform-rust.result }}" = "success" || exit 0
+          test "\${{ needs.installer-script.result }}" = "success" || exit 1
+`);
+    const gate = jobsWithCheckName(fixture.jobs, REQUIRED_CHECK_NAME)[0][1];
+    // All three compare against success, but only the last one can fail.
+    expect(failClosedResultChecks(fixture, gate)).toEqual(["installer-script"]);
+  });
+
+  it("rejects comparisons run by a shell where test is not the POSIX builtin", () => {
+    const script = `
+        run: |
+          test "\${{ needs.build-test.result }}" = "success"
+          test "\${{ needs.cross-platform-rust.result }}" = "success"
+          test "\${{ needs.installer-script.result }}" = "success"`;
+    const gateWith = (extra: string, runsOn = "ubuntu-22.04") =>
+      parseWorkflow(`
+jobs:
+  merge-gate:
+    name: Build + test
+    if: always()
+    needs: [build-test, cross-platform-rust, installer-script]
+    runs-on: ${runsOn}
+    steps:
+      - name: Require everything${extra}${script}
+`);
+
+    const posix = gateWith("");
+    expect(failClosedResultChecks(posix, posix.jobs["merge-gate"])).toEqual(
+      [...GATED_JOB_IDS].sort(),
+    );
+
+    // pwsh has no POSIX `test`, so the exit code stops tracking the comparison.
+    const pwsh = gateWith("\n        shell: pwsh");
+    expect(failClosedResultChecks(pwsh, pwsh.jobs["merge-gate"])).toEqual([]);
+
+    // Same hole with no `shell:` at all: GitHub defaults Windows runners to pwsh.
+    const windows = gateWith("", "windows-latest");
+    expect(failClosedResultChecks(windows, windows.jobs["merge-gate"])).toEqual([]);
   });
 
   it("rejects a matrix that mentions windows-latest only in step guards", () => {
-    const fixture = parseJobs(`
+    const fixture = parseWorkflow(`
 jobs:
   cross-platform-rust:
     name: Headless Rust tests (\${{ matrix.os }})
@@ -220,7 +328,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: powershell -ExecutionPolicy Bypass -File scripts/test-rust-windows.ps1
 `);
-    const job = fixture["cross-platform-rust"];
+    const job = fixture.jobs["cross-platform-rust"];
     // The old substring pins both still pass on this workflow.
     expect(JSON.stringify(job)).toContain("windows-latest");
     expect(runScripts(job).join("\n")).toContain("scripts/test-rust-windows.ps1");
