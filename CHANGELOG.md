@@ -26,6 +26,23 @@ Entries before the rename below shipped under the project's former name, Conduit
   unless this profile has never written pins (a real first run). A rebuild
   keeps the live set, or hides the catalog on a cold start until the store
   reads. (SBS-871)
+- **Unreadable activity/security log no longer renders as empty healthy.** A failed
+  read of `audit.jsonl`, `security.jsonl`, `inspect.jsonl`, or `search-trace.jsonl`
+  used to come back as an empty list, so Activity showed **No tool calls yet** /
+  **Protection active**. A missing file is still empty (honest). Any other IO error
+  now rejects the invoke (including the dashboard's `audit_stats`), and the existing
+  error/retry UI surfaces it. `GET /metrics` answers 500 on the same unreadable log
+  instead of 200 with every series missing, so a Prometheus scrape fails rather than
+  reading as an idle instance. Security events also no longer lose an older row when
+  a corrupt or mid-write line lands in the newest page. (SBS-873)
+- **Windows keyring and install.ps1 tests can now block merge.** Branch
+  protection still requires only the check named `Build + test`. That name now
+  belongs to a merge-gate job that fails unless the Linux suite, the
+  cross-platform headless Rust matrix (including the Windows keyring tests),
+  and the `install.ps1` Pester job all succeeded. Adding those names as
+  separate required contexts still needs a GitHub settings click; this change
+  does not edit branch protection.
+
 - **A write-named tool cannot disarm drift quarantine with `destructiveHint: false`.**
   MCP annotations are untrusted unless the server is. Drift severity now escalates
   when the tool name itself claims write capability (`delete`, `run`, …), even if

@@ -40,7 +40,7 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --lib --bins
 
   build-test:
-    name: Build + test
+    name: Linux build + test
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -200,3 +200,32 @@ jobs:
           Import-Module Pester -MinimumVersion 5.5.0 -MaximumVersion 5.99.99
           $result = Invoke-Pester -Path scripts/install.Tests.ps1 -Output Detailed -PassThru
           if ($result.FailedCount -gt 0) { exit 1 }
+
+  # SBS-874: branch protection required contexts are only the check named
+  # "Build + test". That name used to belong to the Linux-only job, so a red
+  # Windows keyring run (Headless Rust tests (windows-latest)) or a red
+  # install.ps1 Pester job could not block merge. This job keeps the required
+  # name and fails unless every job that must gate merge succeeded. A skipped
+  # or cancelled dependency must not count as success (`if: always()` plus
+  # explicit result checks). Clippy stays out of this gate (non-blocking
+  # until existing warnings are cleared). Adding the individual job names as
+  # separate required contexts still needs a GitHub settings click; this file
+  # cannot do that.
+  merge-gate:
+    name: Build + test
+    if: always()
+    needs:
+      - build-test
+      - cross-platform-rust
+      - installer-script
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Require Linux, Windows/macOS headless, and install.ps1
+        run: |
+          echo "build-test=${{ needs.build-test.result }}"
+          echo "cross-platform-rust=${{ needs.cross-platform-rust.result }}"
+          echo "installer-script=${{ needs.installer-script.result }}"
+          test "${{ needs.build-test.result }}" = "success"
+          test "${{ needs.cross-platform-rust.result }}" = "success"
+          test "${{ needs.installer-script.result }}" = "success"
