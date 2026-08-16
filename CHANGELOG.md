@@ -18,6 +18,11 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **A flagged tool result can no longer self-close its provenance wrap.** A
+  payload that embedded `[/conduit: end external data]` (or `[/Toolport`) used
+  to terminate the wrap and leave a forged `[Toolport: …]` line reading as
+  gateway voice. The close tag is now per-call and includes a random nonce,
+  and embedded close prefixes are rewritten to `[/untrusted`. (SBS-892)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
