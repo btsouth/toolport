@@ -1981,7 +1981,7 @@ fn set_server_enabled_via_agent(
     // A scoped client sees (and can toggle) only servers in its allowed set; an
     // out-of-scope server is indistinguishable from a non-existent one.
     let in_scope =
-        |s: &ServerEntry| allowed.map_or(true, |set| set.contains(&sanitize_segment(&s.id)));
+        |s: &ServerEntry| allowed.map_or(true, |set| set.contains(&s.id));
     let server = match reg.servers.iter().find(|s| {
         in_scope(s) && (s.id.eq_ignore_ascii_case(target) || s.name.eq_ignore_ascii_case(target))
     }) {
@@ -2932,15 +2932,13 @@ fn enabled_summary(
             .servers
             .iter()
             .filter(|s| reg.is_enabled(&active, &s.id) && !clients::is_gateway_server(s))
-            .map(|s| sanitize_segment(&s.id))
+            .map(|s| s.id.clone())
             .collect(),
     };
     let servers: Vec<_> = reg
         .servers
         .iter()
-        .filter(|s| {
-            !clients::is_gateway_server(s) && visible.contains(sanitize_segment(&s.id).as_str())
-        })
+        .filter(|s| !clients::is_gateway_server(s) && visible.contains(&s.id))
         .collect();
     let header = match allowed {
         Some(_) => "Servers available to this client".to_string(),
@@ -2970,9 +2968,22 @@ fn enabled_summary(
     if !cached.is_empty() {
         let mut counts: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
+        // `visible` holds RAW registry ids; a catalog prefix is the sanitized exposed
+        // form, so the two are not comparable directly (a `file-system` server owns
+        // `file_system__*` tools). Resolve the prefix back to the one server id it can
+        // belong to instead. An ambiguous prefix resolves to nothing and is counted for
+        // neither twin, which is the same fail-closed answer scoping gives (SBS-866).
+        let owners = unique_prefix_owners(reg);
         for t in cached {
             let prefix = tool_prefix(t);
-            if !prefix.is_empty() && visible.contains(prefix.as_str()) {
+            if prefix.is_empty() {
+                continue;
+            }
+            // `tool_prefix` already lower-cases, matching how `owners` is keyed.
+            let owned_by_visible = owners
+                .get(prefix.as_str())
+                .is_some_and(|id| visible.contains(id.as_str()));
+            if owned_by_visible {
                 *counts.entry(prefix).or_insert(0) += 1;
             }
         }
@@ -2992,7 +3003,8 @@ fn enabled_summary(
             // server is simply missing.
             let silent: Vec<&str> = servers
                 .iter()
-                .filter(|s| !counts.contains_key(&sanitize_segment(&s.id)))
+                // `counts` is keyed by `tool_prefix`, which lower-cases.
+                .filter(|s| !counts.contains_key(&sanitize_segment(&s.id).to_lowercase()))
                 .map(|s| s.name.as_str())
                 .collect();
             if !silent.is_empty() {
@@ -3360,9 +3372,11 @@ fn recovery_hint(catalog: &[Value], server: &str) -> String {
     }
 }
 
-/// The server prefix of a namespaced tool name (`server__tool`). Matches the
-/// router's `sanitize_segment(server_id)` prefix, so it tests against the
-/// allowed-server set the same way the router names tools.
+/// The server prefix of a namespaced tool name (`server__tool`). This is the
+/// router's `sanitize_segment(server_id)` prefix, not the raw registry id, and it
+/// is a display/grouping key only. Never authorize on it: two registry ids can
+/// sanitize to the same prefix (SBS-866). Use [`owner_of_exposed_tool`], which
+/// resolves a prefix back to a raw id only when it is unambiguous registry-wide.
 fn server_of_tool(name: &str) -> &str {
     name.split_once("__").map(|(s, _)| s).unwrap_or(name)
 }
@@ -3546,13 +3560,13 @@ fn tool_risk_class(name: &str, cached: &[Value], router: &Router) -> routines::R
 /// A meta-tool (no owning downstream server, e.g. `toolport_search_tools`) is always
 /// kept. A downstream tool is kept only if its REAL server is in `allowed`.
 ///
-/// `route_of` resolves an exposed name to its owning server id via the router's route
-/// map. Using it (not just the `server__` prefix) is what stops a tool renamed via a
-/// `ToolOverride` to a non-namespaced name (e.g. `deploy`) from being mistaken for a
-/// meta-tool and leaked to every scoped client. When the router can't resolve the name (a
-/// cold cache before downstream servers are indexed), only KNOWN gateway meta-tools and
-/// in-scope `help_<server>` tools are kept; an unknown bare name is dropped (fail-closed)
-/// rather than assumed to be a meta-tool.
+/// `route_of` resolves an exposed name to its owning RAW registry id. Callers build it
+/// with [`owner_of_exposed_tool`]: the router's route map first, then a registry-backed
+/// cold-cache fallback for the `server__` prefix. Resolving the real server (not just
+/// reading the prefix) is what stops a tool renamed via a `ToolOverride` to a
+/// non-namespaced name (e.g. `deploy`) from being mistaken for a meta-tool and leaked to
+/// every scoped client. A name `route_of` cannot attribute is dropped unless it is a
+/// known gateway meta-tool: fail closed rather than guess an owner.
 fn scope_tools(
     tools: &[Value],
     allowed: Option<&std::collections::HashSet<String>>,
@@ -3581,12 +3595,14 @@ fn mcp_app_tools_for_client(
     catalog: &[Value],
     allowed: Option<&std::collections::HashSet<String>>,
     router: &Router,
+    reg: &Registry,
 ) -> Vec<Value> {
     if !relays_mcp_app_html_to_active_client(router, allowed) {
         return Vec::new();
     }
+    let owners = unique_prefix_owners(reg);
     scope_tools(catalog, allowed, |name| {
-        router.route_of(name).map(|(server, _)| server.to_string())
+        owner_of_exposed_tool(Some(router), &owners, name)
     })
     .into_iter()
     .filter(|tool| {
@@ -3609,29 +3625,16 @@ fn tool_in_scope(
     route_of: &impl Fn(&str) -> Option<String>,
 ) -> bool {
     match route_of(name) {
-        // Authoritative: gate on the real server, sanitized to the same prefix form
-        // `allowed` stores. Catches override-renamed names and ids containing `__`.
-        Some(server_id) => allowed.contains(sanitize_segment(&server_id).as_str()),
-        // The router can't resolve the name (a cold/stale cache before downstream servers
-        // are indexed). Recognize gateway-generated tools by name rather than assuming any
-        // bare name is a meta-tool - that assumption would leak a downstream tool renamed
-        // (via an override) to a bare name during that window.
-        None => {
-            if is_fixed_meta_tool(name) {
-                // Gateway meta-tools are owned by no server; always visible.
-                true
-            } else if let Some(server) = grouped_help_target(name) {
-                // A grouped `help_<server>` browse tool: gate on its target server.
-                allowed.contains(server)
-            } else {
-                // A namespaced tool the router hasn't indexed yet: gate on its `server__`
-                // prefix (fail-closed). A bare name that is neither a known meta-tool nor a
-                // help tool is unattributable (most likely an override-renamed downstream
-                // tool) - drop it rather than leak it.
-                let prefix = server_of_tool(name);
-                prefix != name && allowed.contains(prefix)
-            }
-        }
+        // Authoritative: gate on the raw registry id `allowed` stores (SBS-866).
+        // Catches override-renamed names and ids containing `__`.
+        Some(server_id) => allowed.contains(server_id.as_str()),
+        // Unattributable. Gateway meta-tools are owned by no server and are always
+        // visible; everything else is dropped (fail-closed). Guessing an owner from
+        // the sanitized `server__` prefix is exactly what handed a scoped client the
+        // colliding twin (SBS-866) and what leaked an override-renamed bare name
+        // (SOU-21) - `owner_of_exposed_tool` is the only place a prefix may be
+        // resolved, and only when it maps to one server registry-wide.
+        None => is_fixed_meta_tool(name),
     }
 }
 
@@ -3661,7 +3664,7 @@ fn is_fixed_meta_tool(name: &str) -> bool {
 struct McpSessionOwner {
     identity: String,
     /// `None` is the full connected set; `Some` is a sorted, deduplicated set of
-    /// sanitized server ids, matching [`resolve_http_scope`].
+    /// raw registry server ids, matching [`resolve_http_caller`].
     scope: Option<Vec<String>>,
 }
 
@@ -3717,7 +3720,7 @@ fn resolve_http_caller(
             Some(
                 reg.enabled_servers_for(&client.profile)
                     .iter()
-                    .map(|server| sanitize_segment(&server.id))
+                    .map(|server| server.id.clone())
                     .collect(),
             )
         };
@@ -4201,9 +4204,10 @@ fn execute_call(
     // Scope guard: a registered HTTP client may only call tools on the
     // servers its token is allowed to see (a no-op when unscoped). Search
     // and list are already filtered, but a client could name any tool, so
-    // enforce it on the call path too.
+    // enforce it on the call path too. Compare the raw registry id (SBS-866),
+    // not sanitize_segment(server_id) — that collapses team-slack / team_slack.
     if let Some(set) = allowed {
-        if !set.contains(srv) {
+        if !server_in_allowed_scope(server_id, set) {
             return json!({
                 "content": [{ "type": "text", "text": format!("Toolport: '{srv}' is not available to this client.") }],
                 "isError": true
@@ -5371,13 +5375,17 @@ struct Defended {
 /// Exposed tool names for code-mode `servers.*` stubs: full catalog minus gateway
 /// meta-tools, optionally filtered to the client's allowed server prefixes.
 ///
-/// Scope matching uses [`server_in_allowed_scope`] (SOU-327) so hyphenated server ids
-/// sanitize the same way as `execute_call` / tools-list filtering. Bare names (no
-/// `server__tool` separator) are dropped: they cannot become `servers.*` stubs and must
-/// not appear in `listTools` as if they were catalog entries.
+/// Scope matching uses [`server_in_allowed_scope`] on the RAW server id `route_of`
+/// resolves the exposed name to (SBS-866). Hyphenated ids still match (SOU-327)
+/// because the allow-set stores the raw id. A name `route_of` cannot attribute is
+/// dropped for a scoped caller: the sanitized prefix alone cannot tell a personal
+/// `team-slack` from a team `team_slack`. Bare names (no `server__tool` separator)
+/// are dropped either way: they cannot become `servers.*` stubs and must not appear
+/// in `listTools` as if they were catalog entries.
 fn script_catalog_tools(
     cached: &[Value],
     allowed: Option<&std::collections::HashSet<String>>,
+    route_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
     let mut names: Vec<String> = cached
         .iter()
@@ -5391,7 +5399,7 @@ fn script_catalog_tools(
                 return false;
             }
             match allowed {
-                Some(set) => server_in_allowed_scope(server, set),
+                Some(set) => route_of(n).is_some_and(|sid| server_in_allowed_scope(&sid, set)),
                 None => true,
             }
         })
@@ -5460,14 +5468,20 @@ impl ScriptValidation {
     }
 }
 
+/// `route_of` must be the same owner lookup the executing path uses
+/// (`owner_of_exposed_tool` over the live router), or the dry run and
+/// `execute_script_dispatch` disagree about which names are in scope and the
+/// validator either passes a call `execute_call` will refuse or refuses one it
+/// would have allowed (SBS-866).
 fn validate_script(
     script: &str,
     input: codemode::ScriptInput,
     limits: codemode::Limits,
     cached: &[Value],
     allowed: Option<&std::collections::HashSet<String>>,
+    route_of: impl Fn(&str) -> Option<String>,
 ) -> ScriptValidation {
-    let catalog = script_catalog_tools(cached, allowed);
+    let catalog = script_catalog_tools(cached, allowed, route_of);
     // Resolution set for the recorder. The typed `servers.*` stubs are built from
     // this same list, so they reject an unknown name on their own — but the
     // string form (`toolport.call("s__tool")`) reaches the binding directly and
@@ -5598,9 +5612,17 @@ fn validate_script_dispatch(
     cached: &[Value],
     allowed: Option<&std::collections::HashSet<String>>,
     client: Option<&str>,
+    route_of: impl Fn(&str) -> Option<String>,
 ) -> Value {
     render_script_validation(
-        validate_script(script, input, codemode::Limits::default(), cached, allowed),
+        validate_script(
+            script,
+            input,
+            codemode::Limits::default(),
+            cached,
+            allowed,
+            route_of,
+        ),
         client,
     )
 }
@@ -5636,6 +5658,7 @@ fn candidate_caller(client: Option<&str>) -> String {
 /// promotion approval.
 #[allow(clippy::too_many_arguments)]
 fn advise_after_direct_call(
+    reg: &Registry,
     router: &Router,
     cached: &[Value],
     client: Option<&str>,
@@ -5675,12 +5698,14 @@ fn advise_after_direct_call(
 
     // A draft that fails its own dry run is a synthesis bug; advertising it would
     // teach the model to distrust every future hint. Stay silent instead.
+    let owners = unique_prefix_owners(reg);
     let validation = validate_script(
         &pattern.draft.source,
         codemode::ScriptInput::ImmutableInput(pattern.draft.input_example.clone()),
         codemode::Limits::default(),
         cached,
         allowed,
+        |name| owner_of_exposed_tool(Some(router), &owners, name),
     );
     let validated = validation.outcome.error.is_none() && validation.unresolved.is_empty();
     if !validated {
@@ -6109,12 +6134,17 @@ fn run_script_dispatch_with_candidates(
     // Dry run: same compile, same scoped `servers.*` surface, same limits, but a
     // call binding that records instead of executing. Branch before the real
     // binding is built so there is no path from here to `execute_call` (#647).
+    // Same owner lookup the executing branch uses, so validation and enforcement
+    // agree on which names this caller may resolve (SBS-866).
     if arguments
         .get("validate")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return validate_script_dispatch(&script, input, cached, allowed, client);
+        let owners = unique_prefix_owners(reg);
+        return validate_script_dispatch(&script, input, cached, allowed, client, |name| {
+            owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
+        });
     }
 
     let candidate = candidates.map(|registry| CandidateContext {
@@ -6278,7 +6308,10 @@ fn execute_script_dispatch_with_candidate(
     });
 
     // Typed `servers.*` stubs from the client-scoped catalog (meta-tools excluded).
-    let catalog = script_catalog_tools(cached, allowed);
+    let owners = unique_prefix_owners(reg);
+    let catalog = script_catalog_tools(cached, allowed, |name| {
+        owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
+    });
 
     let outcome =
         codemode::run_script_with_input(script, input, call, Some(fetch), limits, &catalog);
@@ -6964,12 +6997,17 @@ fn save_routine_dispatch(
         return routine_error(error);
     }
 
+    // No live router on this path, so owners resolve from the registry alone: an
+    // exposed prefix only attributes to a server id no other id sanitizes to
+    // (SBS-866). An ambiguous name stays unresolved rather than validating clean.
+    let owners = unique_prefix_owners(reg);
     let validation = validate_script(
         definition.source(),
         codemode::ScriptInput::ImmutableInput(validation_arguments),
         definition.limits().effective(),
         cached,
         allowed,
+        |name| owner_of_exposed_tool(None, &owners, name),
     );
     if validation.has_hard_error() {
         let detail = if validation.unresolved.is_empty() {
@@ -7225,12 +7263,16 @@ fn run_routine_dispatch(
             }
         });
     }
+    // Same owner lookup the run itself will use, so a routine can't validate on a
+    // name `execute_call` would refuse for this caller (SBS-866).
+    let owners = unique_prefix_owners(reg);
     let validation = validate_script(
         routine.source(),
         codemode::ScriptInput::ImmutableInput(input.clone()),
         routine.limits().effective(),
         cached,
         allowed,
+        |name| owner_of_exposed_tool(router_arc.map(Arc::as_ref), &owners, name),
     );
     if validation.has_hard_error() {
         let detail = if validation.unresolved.is_empty() {
@@ -7483,7 +7525,7 @@ fn handle_request_with_cancel(
                 // tools/list. Preserve those few tools when the requesting host
                 // explicitly negotiated the UI extension; the rest of the
                 // downstream catalog remains behind lazy discovery.
-                tools.extend(mcp_app_tools_for_client(catalog, allowed, router));
+                tools.extend(mcp_app_tools_for_client(catalog, allowed, router, reg));
                 let status = status_tool_def();
                 let full_tokens = savings::estimate_tokens(catalog)
                     + savings::estimate_tokens(std::slice::from_ref(&status));
@@ -7519,8 +7561,9 @@ fn handle_request_with_cancel(
                 } else {
                     cached
                 };
+                let owners = unique_prefix_owners(reg);
                 let scoped = scope_tools(catalog, allowed, |n| {
-                    router.route_of(n).map(|(s, _)| s.to_string())
+                    owner_of_exposed_tool(Some(router), &owners, n)
                 });
                 let mut tools = grouped_tool_defs(
                     reg.allow_agent_control,
@@ -7528,7 +7571,7 @@ fn handle_request_with_cancel(
                     reg.confirm_destructive,
                     &scoped,
                 );
-                tools.extend(mcp_app_tools_for_client(catalog, allowed, router));
+                tools.extend(mcp_app_tools_for_client(catalog, allowed, router, reg));
                 // Savings vs. advertising the whole (scoped) catalog + status.
                 let status = status_tool_def();
                 let full_tokens = savings::estimate_tokens(&scoped)
@@ -7575,8 +7618,9 @@ fn handle_request_with_cancel(
             } else {
                 cached.to_vec()
             };
+            let owners = unique_prefix_owners(reg);
             let mut scoped = scope_tools(&catalog, allowed, |n| {
-                router.route_of(n).map(|(s, _)| s.to_string())
+                owner_of_exposed_tool(Some(router), &owners, n)
             });
             if !relays_mcp_app_html_to_active_client(router, allowed) {
                 scoped.retain(mcp_app_tool_is_model_visible);
@@ -7761,8 +7805,9 @@ fn handle_request_with_cancel(
                             search_index.filter(|index| index.matches_catalog(base)),
                         )
                     } else {
+                        let owners = unique_prefix_owners(reg);
                         scoped = scope_tools(base, allowed, |n| {
-                            router.route_of(n).map(|(s, _)| s.to_string())
+                            owner_of_exposed_tool(Some(router), &owners, n)
                         });
                         (&scoped, None)
                     };
@@ -8185,7 +8230,8 @@ fn handle_request_with_cancel(
             }
             let result = match (advisor, advisor_arguments) {
                 (Some(advisor), Some(arguments)) => advise_after_direct_call(
-                    router, cached, client, allowed, candidates, advisor, &name, arguments, result,
+                    reg, router, cached, client, allowed, candidates, advisor, &name, arguments,
+                    result,
                 ),
                 _ => result,
             };
@@ -8195,8 +8241,8 @@ fn handle_request_with_cancel(
             let mut resources = router.aggregated_resources();
             // Scope to the client's allowed servers (a no-op when unscoped), so a
             // registered HTTP client can't list another server's resources.
-            // Compare sanitized server ids: `allowed` stores sanitize_segment form
-            // (SOU-327), same as the tools path.
+            // Compare raw registry ids: `allowed` stores the unsanitized server id
+            // (SBS-866). SOU-327 hyphenated ids match because they are stored raw.
             if let Some(set) = allowed {
                 resources.retain(|r| {
                     r.get("uri")
@@ -8510,10 +8556,65 @@ fn handle_request_with_cancel(
 }
 
 /// Whether a downstream server id is in a registered HTTP client's allowed set.
-/// `allowed` always stores [`sanitize_segment`] form (see tools scoping); raw
-/// server ids with hyphens must be sanitized before comparison (SOU-327).
+///
+/// `allowed` stores raw registry ids (SBS-866). `sanitize_segment` is a tool-name
+/// charset rewrite and is not injective (`team-slack` and `team_slack` both become
+/// `team_slack`), so it must not be the tenant-scope key. Hyphenated ids still
+/// match (SOU-327) because the allow-set now stores the raw id.
 fn server_in_allowed_scope(server_id: &str, allowed: &std::collections::HashSet<String>) -> bool {
-    allowed.contains(sanitize_segment(server_id).as_str())
+    allowed.contains(server_id)
+}
+
+/// Sanitized tool-name prefix -> the raw registry id that owns it, for every prefix
+/// exactly one server id sanitizes to.
+///
+/// `sanitize_segment` is not injective (`team-slack` and `team_slack` both become
+/// `team_slack`), so a prefix two server ids share is deliberately absent: nothing
+/// may guess which tenant owns a tool carrying it (SBS-866). Built from the whole
+/// registry, not from the caller's allow-set: the colliding twin is by definition
+/// the server the caller may NOT see, so an allow-set-only check can never spot it.
+///
+/// Keyed case-folded, matching [`tool_prefix`]. Folding can only merge two ids into
+/// an ambiguous (absent) entry, never attribute a prefix to the wrong server.
+fn unique_prefix_owners(reg: &Registry) -> HashMap<String, String> {
+    let mut owners: HashMap<String, Option<String>> = HashMap::new();
+    for server in &reg.servers {
+        owners
+            .entry(sanitize_segment(&server.id).to_lowercase())
+            // Second id with the same sanitized prefix: the prefix is ambiguous.
+            .and_modify(|slot| *slot = None)
+            .or_insert_with(|| Some(server.id.clone()));
+    }
+    owners
+        .into_iter()
+        .filter_map(|(prefix, id)| id.map(|id| (prefix, id)))
+        .collect()
+}
+
+/// The raw registry id that owns an exposed tool name, or `None` when the name is
+/// not attributable to exactly one server.
+///
+/// The router's route map is authoritative: it survives `ToolOverride` renames and
+/// server ids that themselves contain `__`. On a cold or stale cache (the HTTP
+/// bridge serves the on-disk union catalog against an empty router while downstream
+/// servers connect) the router misses, so fall back to the exposed `server__`
+/// prefix, but only through `owners`: an ambiguous prefix resolves to nothing and
+/// every scope check on it fails closed (SBS-866). A bare name resolves to nothing
+/// too; [`tool_in_scope`] keeps the known gateway meta-tools by name instead.
+fn owner_of_exposed_tool(
+    router: Option<&Router>,
+    owners: &HashMap<String, String>,
+    name: &str,
+) -> Option<String> {
+    if let Some((server, _)) = router.and_then(|r| r.route_of(name)) {
+        return Some(server.to_string());
+    }
+    let prefix = match grouped_help_target(name) {
+        // A grouped `help_<server>` browse tool: owned by the server it targets.
+        Some(target) => target,
+        None => name.split_once("__").map(|(prefix, _)| prefix)?,
+    };
+    owners.get(&prefix.to_lowercase()).cloned()
 }
 
 /// Fail-closed merge of every profile's `tool_scope` for the shared HTTP-bridge router.
@@ -12366,6 +12467,16 @@ fn http_port() -> (Option<u16>, Option<String>) {
     resolve_http_port(cli_port, http.as_deref(), http_port.as_deref(), stdio_peer)
 }
 
+/// [`unique_prefix_owners`] for the live registry. Takes and releases the registry
+/// lock on its own, so callers keep the registry-before-router lock order.
+fn state_prefix_owners(state: &GatewayState) -> HashMap<String, String> {
+    let reg = state
+        .registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    unique_prefix_owners(&reg)
+}
+
 /// The tools the HTTP surface exposes, mirroring `tools/list`: the meta-tools
 /// in lazy mode, or status + fetch + the full namespaced catalog in full mode.
 /// Agent-control tools appear only when the registry opts in.
@@ -12424,12 +12535,13 @@ fn http_tool_defs(
         // Resolve `catalog()` (which may itself lock the router) BEFORE locking the router
         // here, so the two locks never nest.
         let cat = catalog();
+        let owners = state_prefix_owners(state);
         let router = state
             .router
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let scoped = scope_tools(&cat, allowed, |n| {
-            router.route_of(n).map(|(s, _)| s.to_string())
+            owner_of_exposed_tool(Some(&router), &owners, n)
         });
         drop(router);
         grouped_tool_defs(
@@ -12459,12 +12571,16 @@ fn openapi_spec(
     // Scope the advertised tools to the client's allowed servers (no-op when
     // unscoped), so a registered client's spec never lists out-of-scope tools.
     let all_defs = http_tool_defs(state, allowed);
+    // The bridge answers this before the router has connected anything, so the
+    // registry-backed owner fallback (not the raw `server__` prefix) is what keeps
+    // a colliding twin out of the spec on a cold cache (SBS-866).
+    let owners = state_prefix_owners(state);
     let router = state
         .router
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let defs = scope_tools(&all_defs, allowed, |n| {
-        router.route_of(n).map(|(s, _)| s.to_string())
+        owner_of_exposed_tool(Some(&router), &owners, n)
     });
     drop(router);
     // The gateway's error envelope is always `{ "error": "<message>" }`; point
@@ -17544,7 +17660,9 @@ mod tests {
     /// servers are absent from `servers` / listServers even if present in the full cache.
     #[test]
     fn run_script_servers_stubs_are_scope_filtered() {
-        let reg = Registry::default();
+        let mut reg = Registry::default();
+        reg.servers.push(stub_server("s", "s"));
+        reg.servers.push(stub_server("other", "other"));
         let router = Arc::new(paging_router("hi".to_string()));
         let mut allowed = std::collections::HashSet::new();
         allowed.insert("other".to_string());
@@ -17581,25 +17699,85 @@ mod tests {
         assert_eq!(v["hasOther"], json!("object"));
     }
 
-    /// SOU-327 / CodeRabbit #481: catalog scope must sanitize like tools-list filtering.
-    /// Allowed stores sanitize_segment form; raw or already-sanitized server segments match.
+    /// SOU-327 / CodeRabbit #481 / SBS-866: catalog scope uses the raw registry
+    /// id when `route_of` can resolve the exposed name. The old assertion stored
+    /// sanitize_segment form and treated `file-system` and `file_system` as the
+    /// same tenant — that collapse is the SBS-866 hole.
     #[test]
     fn script_catalog_tools_uses_server_in_allowed_scope() {
         let mut allowed = std::collections::HashSet::new();
-        allowed.insert("file_system".to_string());
+        allowed.insert("file-system".to_string());
         let cached = vec![
             json!({ "name": "file_system__read" }),
             json!({ "name": "other__tool" }),
             json!({ "name": "toolport_call_tool" }),
             json!({ "name": "no_separator" }),
         ];
-        let names = script_catalog_tools(&cached, Some(&allowed));
+        let route = |name: &str| match name {
+            "file_system__read" => Some("file-system".to_string()),
+            "other__tool" => Some("other".to_string()),
+            _ => None,
+        };
+        let names = script_catalog_tools(&cached, Some(&allowed), route);
         assert_eq!(names, vec!["file_system__read".to_string()]);
         // Unscoped sees every namespaced non-meta tool, still drops bare + meta.
-        let all = script_catalog_tools(&cached, None);
+        let all = script_catalog_tools(&cached, None, |_| None);
         assert_eq!(
             all,
             vec!["file_system__read".to_string(), "other__tool".to_string(),]
+        );
+    }
+
+    /// SBS-866: a Personal allow-set of `team-slack` must not list a tool that
+    /// `route_of` attributes to the colliding team id `team_slack`.
+    #[test]
+    fn script_catalog_tools_does_not_leak_sanitized_id_twin() {
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("team-slack".to_string());
+        let cached = vec![
+            json!({ "name": "team_slack__send" }),
+            json!({ "name": "team_slack__send_2" }),
+        ];
+        let route = |name: &str| match name {
+            "team_slack__send" => Some("team-slack".to_string()),
+            "team_slack__send_2" => Some("team_slack".to_string()),
+            _ => None,
+        };
+        let names = script_catalog_tools(&cached, Some(&allowed), route);
+        assert_eq!(names, vec!["team_slack__send".to_string()]);
+        assert!(!names.iter().any(|n| n.ends_with("_2")));
+    }
+
+    /// SBS-866: the same collision reached the code-mode catalog through the cold
+    /// cache, where `route_of` misses and only the shared prefix is left.
+    #[test]
+    fn script_catalog_tools_denies_the_sanitized_twin_on_a_cold_cache() {
+        let cached = vec![
+            json!({ "name": "team_slack__send" }),
+            json!({ "name": "team_slack__send_2" }),
+        ];
+        let owners = unique_prefix_owners(&twin_registry());
+        let names = script_catalog_tools(&cached, Some(&personal_scope()), |n| {
+            owner_of_exposed_tool(None, &owners, n)
+        });
+        assert!(
+            names.is_empty(),
+            "an ambiguous prefix must expose no servers.* stub: {names:?}"
+        );
+        // Control: no colliding id in the registry, so the cold path still resolves
+        // and a scoped client keeps its own stubs.
+        let mut alone = Registry::default();
+        alone.servers.push(stub_server("team-slack", "Team Slack"));
+        let owners = unique_prefix_owners(&alone);
+        let names = script_catalog_tools(&cached, Some(&personal_scope()), |n| {
+            owner_of_exposed_tool(None, &owners, n)
+        });
+        assert_eq!(
+            names,
+            vec![
+                "team_slack__send".to_string(),
+                "team_slack__send_2".to_string()
+            ]
         );
     }
 
@@ -17892,6 +18070,55 @@ mod tests {
             text.contains("s__missing"),
             "name the offender; got: {text}"
         );
+    }
+
+    /// SBS-866: the dry run has to resolve names exactly the way the real run does.
+    /// It used to pass no route lookup at all, so a Personal caller validated clean
+    /// on the team twin and then hit a scope refusal at `execute_call`.
+    #[test]
+    fn validate_resolves_names_the_same_way_execution_does() {
+        let reg = twin_registry();
+        let router = Arc::new(twin_router());
+        let cached = router.aggregated_tools();
+        let (personal_name, team_name) = twin_tool_names(&router, &cached);
+        let personal = personal_scope();
+
+        let refused = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &cached,
+            None,
+            None,
+            Some(&personal),
+            None,
+            &json!({
+                "validate": true,
+                "script": format!("toolport.call('{team_name}', {{}}); return 'done';")
+            }),
+            None,
+        );
+        let validate = &refused["structuredContent"]["toolportValidate"];
+        assert_eq!(validate["ok"], false, "got {refused}");
+        assert_eq!(validate["unresolved"][0], json!(team_name));
+        assert_eq!(validate["plan"][0]["resolved"], false);
+
+        let accepted = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &cached,
+            None,
+            None,
+            Some(&personal),
+            None,
+            &json!({
+                "validate": true,
+                "script": format!("toolport.call('{personal_name}', {{}}); return 'done';")
+            }),
+            None,
+        );
+        let validate = &accepted["structuredContent"]["toolportValidate"];
+        assert_eq!(validate["ok"], true, "got {accepted}");
+        assert_eq!(validate["plan"][0]["resolved"], true);
     }
 
     /// One dry run should surface EVERY bad name, not stop at the first.
@@ -18760,6 +18987,7 @@ mod tests {
         let candidates = CandidateRegistry::default();
         let observe = |value: &str, is_error: bool| {
             advise_after_direct_call(
+                &reg,
                 &router,
                 &catalog,
                 None,
@@ -18913,6 +19141,7 @@ mod tests {
         // Code mode off: the ledger is consulted but never hints at a disabled door.
         for value in ["a", "b", "c", "d"] {
             let result = advise_after_direct_call(
+                &Registry::default(),
                 &router,
                 &catalog,
                 None,
@@ -20377,12 +20606,18 @@ mod tests {
             json!({ "name": "resend__send" }),
             json!({ "name": "toolport_search_tools" }),
         ];
-        // Unscoped: everything passes. (`|_| None` = the router knows nothing, so scoping
-        // falls back to the `server__` prefix heuristic.)
+        // Unscoped: everything passes, resolver or no resolver.
         assert_eq!(scope_tools(&tools, None, |_| None).len(), 3);
+        // Cold cache (empty router): the owner still resolves from the registry
+        // because neither prefix is shared by a second server id.
+        let mut reg = Registry::default();
+        reg.servers.push(stub_server("vercel", "Vercel"));
+        reg.servers.push(stub_server("resend", "Resend"));
+        let owners = unique_prefix_owners(&reg);
+        let cold = |n: &str| owner_of_exposed_tool(None, &owners, n);
         // Scoped to vercel: its tool plus the meta-tool, never resend.
         let set: std::collections::HashSet<String> = ["vercel".to_string()].into_iter().collect();
-        let names: Vec<String> = scope_tools(&tools, Some(&set), |_| None)
+        let names: Vec<String> = scope_tools(&tools, Some(&set), cold)
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
             .collect();
@@ -20436,11 +20671,16 @@ mod tests {
             json!({ "name": "toolport_status" }), // genuine gateway meta-tool
             json!({ "name": "vercel__ship" }), // namespaced, in scope
         ];
+        let mut reg = Registry::default();
+        reg.servers.push(stub_server("vercel", "Vercel"));
+        let owners = unique_prefix_owners(&reg);
         let set: std::collections::HashSet<String> = ["vercel".to_string()].into_iter().collect();
-        let names: Vec<String> = scope_tools(&tools, Some(&set), |_| None)
-            .iter()
-            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
-            .collect();
+        let names: Vec<String> = scope_tools(&tools, Some(&set), |n| {
+            owner_of_exposed_tool(None, &owners, n)
+        })
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
         assert!(
             names.contains(&"toolport_status".to_string()),
             "known meta-tool kept"
@@ -20787,6 +21027,42 @@ mod tests {
         let hint = out.split("Enabled but exposing 0 tools").nth(1).unwrap();
         assert!(hint.contains("atlassian"));
         assert!(!hint.contains("github"));
+    }
+
+    /// SBS-866 follow-on: the visible set holds RAW registry ids while a catalog
+    /// prefix is the sanitized exposed form, so the default hyphenated id
+    /// `file-system` (which owns `file_system__*`) matched nothing and status
+    /// dropped its counts, then reported it as exposing 0 tools.
+    #[test]
+    fn status_counts_tools_for_a_hyphenated_server_id() {
+        let mut reg = Registry::default();
+        reg.servers.push(stub_server("file-system", "File System"));
+        reg.set_server_enabled("default", "file-system", true)
+            .unwrap();
+        let cached = vec![
+            json!({ "name": "file_system__read" }),
+            json!({ "name": "file_system__write" }),
+        ];
+        let out = enabled_summary(&reg, &cached, None, None);
+        assert!(out.contains("file_system: 2 tool(s)"), "{out}");
+        assert!(!out.contains("Enabled but exposing 0 tools"), "{out}");
+        // Same answer for a scoped HTTP caller, whose allow-set is raw ids too.
+        let allowed: std::collections::HashSet<String> =
+            ["file-system".to_string()].into_iter().collect();
+        let scoped = enabled_summary(&reg, &cached, None, Some(&allowed));
+        assert!(scoped.contains("file_system: 2 tool(s)"), "{scoped}");
+
+        // A prefix two tenants share is counted for neither, rather than crediting
+        // one twin with the other's tools.
+        let mut twins = twin_registry();
+        twins
+            .set_server_enabled("default", "team-slack", true)
+            .unwrap();
+        twins
+            .set_server_enabled("default", "team_slack", true)
+            .unwrap();
+        let out = enabled_summary(&twins, &[json!({ "name": "team_slack__send" })], None, None);
+        assert!(!out.contains("team_slack: 1 tool(s)"), "{out}");
     }
 
     #[test]
@@ -21501,6 +21777,11 @@ mod tests {
     #[test]
     fn modern_http_scope_is_resolved_per_request_not_from_session_state() {
         let state = http_state(false);
+        {
+            let mut reg = state.registry.lock().unwrap();
+            reg.servers.push(stub_server("github", "github"));
+            reg.servers.push(stub_server("stripe", "stripe"));
+        }
         *state.cached_tools.lock().unwrap() = Arc::new(CatalogSnapshot::new(vec![
             json!({ "name": "github__list_repos", "description": "github" }),
             json!({ "name": "stripe__list_charges", "description": "stripe" }),
@@ -22047,14 +22328,295 @@ mod tests {
         }
     }
 
+    /// The previous assertion stored sanitize_segment form and required
+    /// `file-system` and `file_system` to both match. That encoded the SBS-866
+    /// collision. SOU-327 still holds: hyphenated ids match because the allow-set
+    /// now stores the raw registry id.
     #[test]
-    fn server_in_allowed_scope_sanitizes_server_ids() {
-        // SOU-327: allowed set stores sanitize_segment form; raw hyphenated ids must match.
+    fn server_in_allowed_scope_uses_raw_registry_ids() {
         let mut allowed = std::collections::HashSet::new();
-        allowed.insert("file_system".to_string());
+        allowed.insert("file-system".to_string());
         assert!(server_in_allowed_scope("file-system", &allowed));
-        assert!(server_in_allowed_scope("file_system", &allowed));
+        assert!(
+            !server_in_allowed_scope("file_system", &allowed),
+            "underscore twin must not inherit hyphenated scope (SBS-866)"
+        );
         assert!(!server_in_allowed_scope("other-server", &allowed));
+    }
+
+    fn stub_server(id: &str, name: &str) -> ServerEntry {
+        ServerEntry {
+            id: id.into(),
+            name: name.into(),
+            transport: "stdio".into(),
+            command: Some(format!("{id}-cmd")),
+            args: vec![],
+            env: vec![],
+            url: None,
+            source: None,
+            disabled_tools: vec![],
+            cwd: None,
+            client_credentials: None,
+            unknown_fields: serde_json::Map::new(),
+        }
+    }
+
+    /// SBS-866: Personal `Team Slack` (id team-slack) must not share an allow-set
+    /// key with team `slack` (id team_slack).
+    #[test]
+    fn resolve_http_caller_scopes_personal_team_slack_without_team_twin() {
+        let mut reg = Registry::default();
+        reg.servers.push(stub_server("team-slack", "Team Slack"));
+        reg.servers.push(stub_server("team_slack", "slack"));
+        let personal = reg.add_profile("Personal");
+        reg.set_server_enabled(&personal, "team-slack", true)
+            .unwrap();
+        reg.set_server_enabled("default", "team_slack", true)
+            .unwrap();
+        reg.http_clients.push(registry::HttpClient {
+            id: "c-personal".into(),
+            label: "Open WebUI".into(),
+            token_sha256: registry::sha256_hex("tok-personal"),
+            profile: personal,
+        });
+        let (allowed, caller) =
+            resolve_http_caller(&reg, None, Some("tok-personal"), false).unwrap();
+        let set = allowed.expect("Personal client is scoped");
+        assert!(set.contains("team-slack"));
+        assert!(
+            !set.contains("team_slack"),
+            "sanitized collision must not put the team server in Personal scope"
+        );
+        assert_eq!(caller.session_owner.scope, Some(vec!["team-slack".to_string()]));
+        assert!(server_in_allowed_scope("team-slack", &set));
+        assert!(!server_in_allowed_scope("team_slack", &set));
+    }
+
+    /// SBS-866: route_of is authoritative; an override-renamed team tool must not
+    /// pass a Personal allow-set just because the exposed name has no server prefix.
+    #[test]
+    fn tool_in_scope_uses_raw_route_id_not_sanitized_twin() {
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("team-slack".to_string());
+        let route = |name: &str| match name {
+            "send_message" => Some("team_slack".to_string()),
+            "personal_send" => Some("team-slack".to_string()),
+            _ => None,
+        };
+        assert!(!tool_in_scope("send_message", &allowed, &route));
+        assert!(tool_in_scope("personal_send", &allowed, &route));
+    }
+
+    /// SBS-866: execute_call must refuse the team twin even when both servers are routed.
+    /// The SBS-866 pair: a personal `Team Slack` (id `team-slack`) and a team
+    /// `slack` (id `team_slack`). Different tenants, one sanitized tool prefix
+    /// (`team_slack`), so the prefix alone can never say which one owns a tool.
+    fn twin_registry() -> Registry {
+        let mut reg = Registry::default();
+        reg.servers.push(stub_server("team-slack", "Team Slack"));
+        reg.servers.push(stub_server("team_slack", "slack"));
+        reg
+    }
+
+    fn twin_router() -> Router {
+        let mut router = Router::new();
+        for id in ["team-slack", "team_slack"] {
+            let ds = DownstreamServer::connect(
+                id.to_string(),
+                Box::new(MockRoute {
+                    tools: vec![json!({ "name": "send", "description": "" })],
+                }),
+            )
+            .unwrap();
+            router.add(ds);
+        }
+        router
+    }
+
+    /// The (personal, team) exposed tool names, resolved through the router rather
+    /// than assumed: the second twin carries whatever de-duplication suffix the
+    /// router picked.
+    fn twin_tool_names(router: &Router, cached: &[Value]) -> (String, String) {
+        let find = |server: &str| {
+            cached
+                .iter()
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                .find(|n| router.route_of(n).is_some_and(|(sid, _)| sid == server))
+                .unwrap_or_else(|| panic!("{server} exposes a routed tool"))
+                .to_string()
+        };
+        (find("team-slack"), find("team_slack"))
+    }
+
+    fn personal_scope() -> std::collections::HashSet<String> {
+        ["team-slack".to_string()].into_iter().collect()
+    }
+
+    /// SBS-866, cold cache: with the router empty `route_of` misses, and the only
+    /// clue left is the `team_slack__` prefix - which both tenants share. Guessing
+    /// from it handed a Personal token the team server's tool; an unattributable
+    /// name now drops out instead.
+    #[test]
+    fn tool_in_scope_denies_the_sanitized_twin_on_a_cold_cache() {
+        let owners = unique_prefix_owners(&twin_registry());
+        let cold = |n: &str| owner_of_exposed_tool(None, &owners, n);
+        let personal = personal_scope();
+        assert!(
+            !tool_in_scope("team_slack__send", &personal, &cold),
+            "an ambiguous prefix must not resolve to the allowed twin"
+        );
+        assert!(
+            !tool_in_scope("help_team_slack", &personal, &cold),
+            "the grouped browse tool carries the same ambiguous prefix"
+        );
+        // Meta-tools are owned by no server and stay visible.
+        assert!(tool_in_scope("toolport_search_tools", &personal, &cold));
+        // Control: with no colliding id in the registry the same cold path still
+        // resolves, so an ordinary scoped client keeps its tools while the router
+        // is still connecting.
+        let mut alone = Registry::default();
+        alone.servers.push(stub_server("team-slack", "Team Slack"));
+        let owners = unique_prefix_owners(&alone);
+        let cold = |n: &str| owner_of_exposed_tool(None, &owners, n);
+        assert!(tool_in_scope("team_slack__send", &personal, &cold));
+        assert!(tool_in_scope("help_team_slack", &personal, &cold));
+    }
+
+    /// SBS-866: the HTTP bridge answers the first tools/list and the OpenAPI doc
+    /// from the on-disk union cache against an empty router, so this is exactly the
+    /// window where the prefix guess leaked the other tenant's tool name,
+    /// description, and schema - before any call was ever made.
+    #[test]
+    fn http_cold_cache_withholds_the_sanitized_twin() {
+        let state = http_state(false);
+        *state.registry.lock().unwrap() = twin_registry();
+        let cached = vec![
+            json!({ "name": "team_slack__send", "description": "personal" }),
+            json!({ "name": "team_slack__send_2", "description": "team" }),
+        ];
+        *state.cached_tools.lock().unwrap() = Arc::new(CatalogSnapshot::new(cached));
+        let personal = personal_scope();
+
+        let spec = openapi_spec(&state, Some(&personal)).to_string();
+        assert!(
+            !spec.contains("send_2"),
+            "the team twin must not reach a Personal token's OpenAPI doc: {spec}"
+        );
+
+        let out = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &modern_http_body(1, "tools/list", json!({})),
+            modern_http_headers("tools/list", None, Some("untrusted-id"), None),
+            Some(&personal),
+            Some(&test_caller("client:personal", Some(&["team-slack"]))),
+        );
+        assert_eq!(out.status, 200, "body={}", out.body);
+        assert!(
+            !out.body.contains("send_2"),
+            "the team twin must not reach a Personal token's tools/list: {}",
+            out.body
+        );
+    }
+
+    /// The other half of the fail-closed trade: once the router has indexed both
+    /// servers the Personal token gets its own tool back, and only that one.
+    #[test]
+    fn http_warm_router_lists_only_the_personal_twin() {
+        let state = http_state(false);
+        *state.registry.lock().unwrap() = twin_registry();
+        let router = twin_router();
+        let cached = router.aggregated_tools();
+        let (personal_name, team_name) = twin_tool_names(&router, &cached);
+        *state.cached_tools.lock().unwrap() = Arc::new(CatalogSnapshot::new(cached));
+        *state.router.lock().unwrap() = Arc::new(router);
+        let personal = personal_scope();
+
+        let out = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &modern_http_body(1, "tools/list", json!({})),
+            modern_http_headers("tools/list", None, Some("untrusted-id"), None),
+            Some(&personal),
+            Some(&test_caller("client:personal", Some(&["team-slack"]))),
+        );
+        assert_eq!(out.status, 200, "body={}", out.body);
+        let body: Value = serde_json::from_str(&out.body).unwrap();
+        let names: Vec<String> = body["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .map(str::to_string)
+            .collect();
+        assert!(names.contains(&personal_name), "got {names:?}");
+        assert!(!names.contains(&team_name), "got {names:?}");
+    }
+
+    #[test]
+    fn execute_call_refuses_team_twin_for_personal_scope() {
+        let reg = Registry::default();
+        let router = twin_router();
+        let cached = router.aggregated_tools();
+        let personal = personal_scope();
+        let (personal_name, team_name) = twin_tool_names(&router, &cached);
+        let denied = execute_call(
+            &reg,
+            &router,
+            &cached,
+            Some("open-webui"),
+            None,
+            Some(&personal),
+            None,
+            Some(&ConfirmGuard::new()),
+            &team_name,
+            json!({}),
+            None,
+            None,
+            CallOpts {
+                confirmed: true,
+                shape: false,
+                allow_app_only: true,
+            },
+            None,
+        );
+        let text = denied["content"][0]["text"].as_str().unwrap_or("");
+        assert_eq!(denied["isError"], true);
+        assert!(
+            text.contains("not available to this client"),
+            "team twin must be a scope denial, got {denied}"
+        );
+        let allowed_call = execute_call(
+            &reg,
+            &router,
+            &cached,
+            Some("open-webui"),
+            None,
+            Some(&personal),
+            None,
+            Some(&ConfirmGuard::new()),
+            &personal_name,
+            json!({}),
+            None,
+            None,
+            CallOpts {
+                confirmed: true,
+                shape: false,
+                allow_app_only: true,
+            },
+            None,
+        );
+        let allowed_text = allowed_call["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            !allowed_text.contains("not available to this client"),
+            "personal server must not be a scope denial, got {allowed_call}"
+        );
     }
 
     #[test]

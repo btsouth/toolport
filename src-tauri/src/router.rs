@@ -818,9 +818,10 @@ impl Router {
     /// working and silently went somewhere new. Sorting on the raw name makes the
     /// assignment a property of the tools themselves, so list order can't move it.
     ///
-    /// Cross-server collisions can't arise here: server ids are slugified to
-    /// `[a-z0-9-]` and `sanitize_segment` only maps `-` to `_`, which is injective
-    /// over that alphabet. So the contested namespace is always within one server.
+    /// Cross-server collisions *can* arise: personal `team-slack` and team
+    /// `team_slack` both sanitize to `team_slack` (SBS-866). The `_2` suffix still
+    /// keeps exposed names unique; authorization must use the raw registry id,
+    /// not this prefix.
     fn allocate_exposed_names(&mut self, server_id: &str, items: &[Value]) -> Vec<Option<String>> {
         fn raw_name(item: &Value) -> Option<&str> {
             item.get("name").and_then(|n| n.as_str())
