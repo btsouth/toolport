@@ -1912,20 +1912,11 @@ fn downstream_trace(msg: &str) {
     if crate::brand::env_var_os("TOOLPORT_DEBUG", "CONDUIT_DEBUG").is_none() {
         return;
     }
-    let Some(path) = crate::registry::gateway_log_path() else {
+    if crate::registry::gateway_log_path().is_none() {
         eprintln!("toolport: {msg}");
         return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{msg}");
-    }
+    crate::gatewaylog::append(msg);
 }
 
 /// Bitmask of which downstream list a `notifications/.../list_changed` announces.
