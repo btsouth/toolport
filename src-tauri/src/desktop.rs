@@ -1654,10 +1654,15 @@ async fn get_audit_log(limit: usize) -> Result<Vec<serde_json::Value>, String> {
 /// Aggregate the full retained audit log into per-server call/error/latency stats for
 /// the observability dashboard. Bounded by the log's byte cap, so totals are real.
 #[tauri::command]
-async fn audit_stats() -> serde_json::Value {
-    tauri::async_runtime::spawn_blocking(|| audit::stats().unwrap_or(serde_json::Value::Null))
-        .await
-        .unwrap_or(serde_json::Value::Null)
+async fn audit_stats() -> Result<serde_json::Value, String> {
+    // Rejects on the same unreadable log that makes `get_audit_log` reject. A
+    // `null` here only hides the dashboard, which reads as "no data" rather
+    // than "the read failed" (SBS-873).
+    tauri::async_runtime::spawn_blocking(|| {
+        audit::stats().map_err(|e| format!("Couldn't read the activity log: {e}"))
+    })
+    .await
+    .map_err(|e| format!("activity stats task join failed: {e}"))?
 }
 
 /// Recent tool-definition integrity events (newest first): a previously-approved
@@ -5447,6 +5452,47 @@ mod tests {
             result.is_err(),
             "a failed secret read must propagate, not resolve to unvaulted: {result:?}"
         );
+    }
+
+    /// An unreadable activity log must reject `audit_stats`, not resolve to
+    /// `null` (SBS-873). Activity hides the dashboard on `null`, so a failed
+    /// read looked like "no data" while `get_audit_log` on the same file
+    /// rejected.
+    #[test]
+    fn audit_stats_rejects_an_unreadable_activity_log() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = unique_update_test_dir("audit-stats-unreadable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let path = audit::audit_path().expect("audit path under override");
+        // IsADirectory: the log path exists but cannot be read as a file.
+        std::fs::create_dir_all(&path).unwrap();
+
+        let result = tauri::async_runtime::block_on(audit_stats());
+        assert!(
+            result.is_err(),
+            "a failed activity-log read must reject, not resolve to null: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the contract: a missing log is an honest empty
+    /// dashboard, so a first run still resolves.
+    #[test]
+    fn audit_stats_resolves_when_the_activity_log_is_missing() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = unique_update_test_dir("audit-stats-missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let path = audit::audit_path().expect("audit path under override");
+        assert!(!path.exists(), "fixture must not create the log");
+
+        let stats = tauri::async_runtime::block_on(audit_stats())
+            .expect("a missing log is an empty dashboard, not a failure");
+        assert!(stats.is_object(), "expected aggregated stats: {stats}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn github_with_secret() -> ServerEntry {

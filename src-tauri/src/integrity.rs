@@ -2431,11 +2431,15 @@ pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
+    // Filter BEFORE take, matching `audit::read_recent` and the other readers.
+    // Taking first let an unparseable line consume a slot, so one corrupt or
+    // mid-write row among the newest events returned a short page and dropped
+    // an older valid security event that should have filled it.
     Ok(content
         .lines()
         .rev()
-        .take(limit)
         .filter_map(|line| serde_json::from_str(line).ok())
+        .take(limit)
         .collect())
 }
 
@@ -4198,5 +4202,33 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
         let err = read_recent(10).expect_err("unreadable existing path must be Err");
         assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// A corrupt or mid-write line among the NEWEST events must not consume a
+    /// slot of `limit`. Taking before filtering returned a short page and lost
+    /// an older valid security event that should have filled it.
+    #[test]
+    fn read_recent_corrupt_newest_line_does_not_shorten_the_page() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let _dir = TestDataDir::new("read-recent-corrupt");
+        let path = security_path().expect("security path under override");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        // Oldest to newest; the half-written row is the second-newest line.
+        std::fs::write(
+            &path,
+            "{\"i\":1}\n{\"i\":2}\n{\"i\":3}\n{\"i\":4,\"partial\":\n{\"i\":5}\n",
+        )
+        .unwrap();
+        let entries = read_recent(3).expect("readable fixture");
+        assert_eq!(
+            entries.len(),
+            3,
+            "a corrupt newest-window line must not shorten the page"
+        );
+        assert_eq!(entries[0]["i"], 5);
+        assert_eq!(entries[1]["i"], 3);
+        assert_eq!(entries[2]["i"], 2);
     }
 }

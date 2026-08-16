@@ -64,6 +64,11 @@ Emits counters for tool calls (`server`, `tool`, `client`, `ok`), held
 destructive calls, duration sum/count, lazy-discovery tokens saved, and a
 quarantine gauge. Labels are ids only (never arguments). Same auth as OpenAPI.
 
+An instance that has not run a tool yet scrapes 200 with the gauges at zero. If a
+local stat file exists but cannot be read (permissions, a sharing lock), the
+endpoint answers `500` instead of a 200 with no series, so the scrape fails and
+Prometheus `up` goes to 0 rather than the instance looking idle.
+
 ### Modern MCP request (curl)
 
 ```bash
