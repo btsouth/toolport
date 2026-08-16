@@ -4495,6 +4495,34 @@ fn start_http_bridge_with_token_at(
     Ok(HttpBridgeStatus::new(Some(port), Some(token)))
 }
 
+fn stop_http_bridge_with(
+    bridge: &mut HttpBridge,
+    kill_child: impl FnOnce(&mut std::process::Child) -> std::io::Result<()>,
+) -> Result<HttpBridgeStatus, String> {
+    if let Some(mut child) = bridge.child.take() {
+        let stopped = match kill_child(&mut child) {
+            Ok(()) => child.wait().map(|_| ()),
+            Err(kill_error) => match child.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(kill_error),
+                Err(wait_error) => Err(wait_error),
+            },
+        };
+
+        if let Err(error) = stopped {
+            bridge.child = Some(child);
+            return Err(match bridge.port {
+                Some(port) => format!("Toolport HTTP endpoint on port {port}: {error}"),
+                None => format!("Toolport HTTP endpoint: {error}"),
+            });
+        }
+    }
+
+    bridge.port = None;
+    bridge.token = None;
+    Ok(HttpBridgeStatus::new(None, None))
+}
+
 /// Stop the supervised HTTP bridge child, if any.
 #[tauri::command]
 fn stop_http_bridge(state: State<HttpBridgeState>) -> Result<HttpBridgeStatus, String> {
@@ -4503,13 +4531,7 @@ fn stop_http_bridge(state: State<HttpBridgeState>) -> Result<HttpBridgeStatus, S
     // denied, leave the endpoint running and report the error; otherwise a later
     // launch could silently resurrect something the user explicitly disabled.
     clear_update_http_bridge_intent()?;
-    if let Some(mut child) = bridge.child.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    bridge.port = None;
-    bridge.token = None;
-    Ok(HttpBridgeStatus::new(None, None))
+    stop_http_bridge_with(&mut bridge, std::process::Child::kill)
 }
 
 fn resume_http_bridge_after_update(state: &HttpBridgeState) -> Result<bool, String> {
@@ -5423,6 +5445,49 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn stop_http_bridge_failed_kill_keeps_live_state_for_retry() {
+        #[cfg(windows)]
+        let child = std::process::Command::new("ping")
+            .args(["-n", "10", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        #[cfg(not(windows))]
+        let child = std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .unwrap();
+
+        let child_id = child.id();
+        let mut bridge = HttpBridge {
+            child: Some(child),
+            port: Some(9876),
+            token: Some("preserved-secret-token".to_string()),
+        };
+
+        let error = stop_http_bridge_with(&mut bridge, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "kill denied",
+            ))
+        })
+        .err()
+        .expect("failed kill must be reported");
+
+        assert!(error.contains("kill denied"));
+        assert_eq!(bridge.port, Some(9876));
+        assert_eq!(bridge.token.as_deref(), Some("preserved-secret-token"));
+
+        let retained = bridge.child.as_mut().expect("child handle retained");
+        assert_eq!(retained.id(), child_id);
+        assert!(retained.try_wait().unwrap().is_none());
+
+        retained.kill().unwrap();
+        retained.wait().unwrap();
+    }
     #[test]
     fn update_http_bridge_intent_round_trips_exact_token_and_clear_failures_surface() {
         let dir = unique_update_test_dir("update-bridge-intent");
