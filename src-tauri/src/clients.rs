@@ -403,7 +403,10 @@ fn expand_leading_tilde(raw: Option<std::ffi::OsString>) -> Option<std::ffi::OsS
     let rest = if text == "~" {
         ""
     } else if let Some(rest) = text.strip_prefix("~/").or_else(|| text.strip_prefix(r"~\")) {
-        rest
+        // Every further separator has to go too. `~//work/qwen` leaves `/work/qwen`,
+        // which `PathBuf::join` reads as rooted and substitutes for the home dir
+        // instead of appending to it, so the value escapes home entirely.
+        rest.trim_start_matches(['/', '\\'])
     } else {
         return Some(raw);
     };
@@ -6446,6 +6449,36 @@ mod tests {
         // No separator, so it is a literal directory name and not a home
         // reference, the same call Qwen's `resolvePath` makes.
         assert_eq!(qwen_home_from(Some("~work".into())), None);
+    }
+
+    /// A doubled separator after the `~` used to leave a rooted remainder, and
+    /// `PathBuf::join` substitutes a rooted path for the base rather than
+    /// appending to it. `~//work/qwen` resolved to `/work/qwen`, outside the home
+    /// dir the tilde asked for. Every leading separator is stripped now, so an
+    /// expanded value always stays under home.
+    #[test]
+    fn extra_separators_after_the_tilde_cannot_escape_the_home_dir() {
+        let home = home().expect("home dir should be available in tests");
+
+        for raw in ["~", "~/", r"~\", "~//work/qwen", r"~\\work\qwen", "~///"] {
+            let expanded = qwen_home_from(Some(raw.into()))
+                .unwrap_or_else(|| panic!("{raw} should expand to an absolute path"));
+            assert!(
+                expanded.starts_with(&home),
+                "{raw} expanded to {expanded:?}, which escapes {home:?}"
+            );
+        }
+
+        assert_eq!(
+            qwen_home_from(Some("~//work/qwen".into())),
+            Some(home.join("work/qwen"))
+        );
+        assert_eq!(
+            qwen_home_from(Some(r"~\\work\qwen".into())),
+            Some(home.join(r"work\qwen"))
+        );
+        assert_eq!(qwen_home_from(Some("~".into())), Some(home.clone()));
+        assert_eq!(qwen_home_from(Some("~///".into())), Some(home));
     }
 
     /// The tilde rule is Qwen-only on purpose. Codex (`find_codex_home_from_env`),
