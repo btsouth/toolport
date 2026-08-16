@@ -26,6 +26,16 @@ Entries before the rename below shipped under the project's former name, Conduit
   a terminator. The match runs on the folded form, so a close hidden with
   zero-width characters, a Cyrillic homoglyph or fullwidth brackets is caught
   too. (SBS-892)
+- **A Personal-scoped HTTP bearer can no longer call a team server whose id
+  collides after sanitizing.** A personal server named Team Slack becomes
+  `team-slack`; a team server named slack becomes `team_slack`. The HTTP bridge
+  used `sanitize_segment` as the profile allow-set key, and both ids map to
+  `team_slack`, so the Personal token could list and call the team Slack server.
+  Scope now keys on the raw registry id (SBS-866). Tool names are still sanitized.
+  The bridge answers its first `tools/list` and OpenAPI document from the on-disk
+  catalog before any downstream server has connected, so scoping in that window
+  resolves the owning server through the registry and withholds any tool whose
+  prefix two server ids share, instead of guessing from the prefix.
 - **Unreadable activity/security log no longer renders as empty healthy.** A failed
   read of `audit.jsonl`, `security.jsonl`, `inspect.jsonl`, or `search-trace.jsonl`
   used to come back as an empty list, so Activity showed **No tool calls yet** /
