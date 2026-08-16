@@ -170,14 +170,14 @@ below for you, so you never have to edit these by hand.
 | Windsurf        | `~/.codeium/windsurf/mcp_config.json`                                                                  | JSON (`mcpServers`)      |
 | OpenCode        | `~/.config/opencode/opencode.json`                                                                     | JSON (`mcp`)             |
 | Kilo Code       | `~/.config/kilo/kilo.jsonc`                                                                            | JSONC (`mcp`)            |
-| Codex           | `~/.codex/config.toml`                                                                                 | TOML (`mcp_servers`)     |
+| Codex           | `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`)                                             | TOML (`mcp_servers`)     |
 | Copilot CLI     | `~/.copilot/mcp-config.json`                                                                           | JSON (`mcpServers`)      |
-| Grok Build      | `~/.grok/config.toml`                                                                                  | TOML (`mcp_servers`)     |
+| Grok Build      | `$GROK_HOME/config.toml` (default `~/.grok/config.toml`)                                               | TOML (`mcp_servers`)     |
 | Toolport Studio | `~/.toolport-studio/mcp.json`                                                                          | JSON (`mcpServers`)      |
 | Continue        | `~/.continue/config.yaml`                                                                              | YAML (`mcpServers`)      |
 | Antigravity     | `~/.gemini/config/mcp_config.json`                                                                     | JSON (`mcpServers`)      |
-| Gemini CLI      | `~/.gemini/settings.json`                                                                              | JSON (`mcpServers`)      |
-| Qwen Code       | `~/.qwen/settings.json`                                                                                | JSON (`mcpServers`)      |
+| Gemini CLI      | `$GEMINI_CLI_HOME/.gemini/settings.json` (default `~/.gemini/settings.json`)                           | JSON (`mcpServers`)      |
+| Qwen Code       | `$QWEN_HOME/settings.json` (default `~/.qwen/settings.json`)                                           | JSON (`mcpServers`)      |
 | JetBrains Junie | `~/.junie/mcp/mcp.json`                                                                                | JSON (`mcpServers`)      |
 | Cline           | `<config>/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`             | JSON (`mcpServers`)      |
 | Roo Code        | `<config>/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json`               | JSON (`mcpServers`)      |
@@ -201,11 +201,11 @@ below for you, so you never have to edit these by hand.
 
 ### Codex setup walkthrough
 
-Use this when Codex has already created its `~/.codex/` directory.
+Use this when Codex has already created its home directory (`$CODEX_HOME`, or `~/.codex/` when that env is unset).
 
 1. In Toolport, add or enable the MCP servers you want Codex to use.
 2. Open **Clients**, select **Codex**, optionally choose a profile, and click **Connect to Toolport**.
-3. Toolport updates `~/.codex/config.toml` with a single `[mcp_servers.toolport]` entry. That entry runs the resolved `toolport-gateway` binary; existing Codex TOML keys and other MCP servers are preserved, and an existing config is backed up before the write. (Older installs that still have `[mcp_servers.conduit]` are renamed to `toolport` on the next Toolport launch.)
+3. Toolport updates `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) with a single `[mcp_servers.toolport]` entry. That entry runs the resolved `toolport-gateway` binary; existing Codex TOML keys and other MCP servers are preserved, and an existing config is backed up before the write. (Older installs that still have `[mcp_servers.conduit]` are renamed to `toolport` on the next Toolport launch.)
 4. Start a new Codex session so it re-reads the config. In Toolport, the Codex row changes to **connected to Toolport**; in Codex, Toolport-managed tools are served through the one `toolport` MCP server. With lazy discovery enabled, Codex gets Toolport's compact search tools instead of every downstream tool up front.
 
 Gotcha: when running Toolport from source, build the gateway first with `npm run build:gateway`. The desktop dev server does not build the separate binary that Codex spawns, so Codex will report the gateway as missing until that binary exists.

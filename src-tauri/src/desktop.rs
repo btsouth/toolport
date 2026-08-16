@@ -7160,10 +7160,18 @@ mod tests {
     /// Scratch data dir + seeded `http_clients` row. Holds the process-global
     /// hook lock and `data_dir_test_lock` so persist and injected failures cannot
     /// interleave with another test.
+    ///
+    /// Field order IS drop order (unlike locals, struct fields drop in declaration
+    /// order), so the override is declared before the guards that protect it. The
+    /// other way round, teardown released `data_dir_test_lock` while this fixture's
+    /// `DataDirOverride` was still installed; the next test could take the lock and
+    /// install its own override, only for this drop to land and clear it. That
+    /// test's `registry::load()` then read the REAL data dir, where its seeded
+    /// `http_clients` row does not exist.
     struct RevokeFixture {
-        _hooks: std::sync::MutexGuard<'static, ()>,
-        _data_dir: std::sync::MutexGuard<'static, ()>,
         _override: crate::registry::DataDirOverride,
+        _data_dir: std::sync::MutexGuard<'static, ()>,
+        _hooks: std::sync::MutexGuard<'static, ()>,
         state: RegistryState,
         client_id: String,
         http_id: String,
@@ -7196,9 +7204,9 @@ mod tests {
             });
             registry::save(&reg).unwrap();
             Self {
-                _hooks: hooks,
-                _data_dir: data_dir,
                 _override: over,
+                _data_dir: data_dir,
+                _hooks: hooks,
                 state: Mutex::new(reg),
                 client_id,
                 http_id,
