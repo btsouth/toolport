@@ -24,6 +24,10 @@ Entries before the rename below shipped under the project's former name, Conduit
   used `sanitize_segment` as the profile allow-set key, and both ids map to
   `team_slack`, so the Personal token could list and call the team Slack server.
   Scope now keys on the raw registry id (SBS-866). Tool names are still sanitized.
+  The bridge answers its first `tools/list` and OpenAPI document from the on-disk
+  catalog before any downstream server has connected, so scoping in that window
+  resolves the owning server through the registry and withholds any tool whose
+  prefix two server ids share, instead of guessing from the prefix.
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
