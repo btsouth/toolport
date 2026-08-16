@@ -3267,31 +3267,46 @@ fn atomic_write_json_config(
 /// `mcp_servers` table into an existing DocumentMut without losing comments on
 /// every other key (SBS-884).
 fn toml_value_to_item(value: &toml::Value) -> toml_edit::Item {
-    use toml_edit::{value as toml_item, Array, Item, Table};
+    use toml_edit::{Item, Table};
     match value {
-        toml::Value::String(s) => toml_item(s.as_str()),
-        toml::Value::Integer(i) => toml_item(*i),
-        toml::Value::Float(f) => toml_item(*f),
-        toml::Value::Boolean(b) => toml_item(*b),
-        toml::Value::Datetime(dt) => match dt.to_string().parse::<toml_edit::Datetime>() {
-            Ok(parsed) => toml_item(parsed),
-            Err(_) => toml_item(dt.to_string()),
-        },
-        toml::Value::Array(items) => {
-            let mut array = Array::new();
-            for item in items {
-                if let Item::Value(v) = toml_value_to_item(item) {
-                    array.push(v);
-                }
-            }
-            Item::Value(toml_edit::Value::Array(array))
-        }
         toml::Value::Table(map) => {
             let mut table = Table::new();
             for (k, v) in map {
                 table.insert(k, toml_value_to_item(v));
             }
             Item::Table(table)
+        }
+        other => Item::Value(toml_value_to_edit_value(other)),
+    }
+}
+
+/// Value-level counterpart of [`toml_value_to_item`]. A nested table inside an
+/// array has to become an inline table: a standard `Item::Table` is not an
+/// `Item::Value`, so an array-of-tables would otherwise be dropped silently.
+fn toml_value_to_edit_value(value: &toml::Value) -> toml_edit::Value {
+    use toml_edit::{Array, InlineTable, Value};
+    match value {
+        toml::Value::String(s) => Value::from(s.as_str()),
+        toml::Value::Integer(i) => Value::from(*i),
+        toml::Value::Float(f) => Value::from(*f),
+        toml::Value::Boolean(b) => Value::from(*b),
+        toml::Value::Datetime(dt) => match dt.to_string().parse::<toml_edit::Datetime>() {
+            Ok(parsed) => Value::from(parsed),
+            Err(_) => Value::from(dt.to_string()),
+        },
+        toml::Value::Array(items) => {
+            let mut array = Array::new();
+            for item in items {
+                array.push(toml_value_to_edit_value(item));
+            }
+            Value::Array(array)
+        }
+        toml::Value::Table(map) => {
+            let mut inline = InlineTable::new();
+            for (k, v) in map {
+                inline.insert(k, toml_value_to_edit_value(v));
+            }
+            Value::InlineTable(inline)
         }
     }
 }
@@ -3338,6 +3353,26 @@ fn toml_mcp_servers_mut(doc: &mut toml_edit::DocumentMut) -> &mut toml_edit::Tab
     ensure_toml_table(&mut doc["mcp_servers"])
 }
 
+/// Does the document already carry an explicit `[mcp_servers]` header with a
+/// `#` comment on it? An implicit table emits no header line, so making the
+/// table implicit would throw that comment away, the exact loss this path exists
+/// to prevent (SBS-884). Files with a bare header keep the old collapsed
+/// `[mcp_servers.name]` shape.
+fn toml_keeps_servers_header(doc: &toml_edit::DocumentMut) -> bool {
+    let Some(table) = doc.get("mcp_servers").and_then(|item| item.as_table()) else {
+        return false;
+    };
+    if table.is_implicit() {
+        return false;
+    }
+    let decor = table.decor();
+    [decor.prefix(), decor.suffix()]
+        .into_iter()
+        .flatten()
+        .filter_map(|raw| raw.as_str())
+        .any(|text| text.contains('#'))
+}
+
 /// Line-scan state for locating top-level YAML mapping keys without expanding
 /// anchors or dropping comments outside the rewritten node (SBS-884).
 #[derive(Default)]
@@ -3352,9 +3387,16 @@ struct YamlLineState {
     block_scalar_indent: Option<usize>,
 }
 
+/// Byte length of a line's YAML indentation.
+///
+/// Bytes, not characters, because callers use the result as a slice index.
+/// `char::is_whitespace` also matches multi-byte whitespace such as U+00A0 and
+/// U+3000, so a character count is smaller than the byte offset of the first
+/// content byte and the slice lands mid-character (panic). Only space and tab
+/// count: YAML indents with spaces, and everything else is content.
 fn yaml_leading_indent(line: &str) -> usize {
-    line.chars()
-        .take_while(|c| c.is_whitespace() && *c != '\n' && *c != '\r')
+    line.bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
         .count()
 }
 
@@ -3415,6 +3457,36 @@ fn yaml_skip_value_prefixes(s: &str) -> &str {
             continue;
         }
         return rest;
+    }
+}
+
+/// The `&anchor` token defined on a value, if any (`key: &exts`, `key: !!map &exts`).
+/// Returned with its `&` so a rewrite can re-emit it verbatim.
+fn yaml_value_anchor(s: &str) -> Option<&str> {
+    let mut rest = s.trim_start();
+    loop {
+        if !rest.starts_with('&') && !rest.starts_with('!') {
+            return None;
+        }
+        let token_end = rest
+            .find(|c: char| {
+                c.is_whitespace()
+                    || c == '#'
+                    || c == ','
+                    || c == '{'
+                    || c == '['
+                    || c == '}'
+                    || c == ']'
+            })
+            .unwrap_or(rest.len());
+        if token_end <= 1 {
+            return None;
+        }
+        let token = &rest[..token_end];
+        if token.starts_with('&') {
+            return Some(token);
+        }
+        rest = rest[token_end..].trim_start();
     }
 }
 
@@ -3688,31 +3760,67 @@ fn reject_duplicate_top_level_yaml_key(original: &str, key: &str) -> Result<(), 
     Ok(())
 }
 
+/// Indentation the replacement block should give the key's children, taken from
+/// the node already in the file so a 4-space config does not get one node
+/// reformatted to serde_yaml's 2 spaces (SBS-884 review). `span` is the existing
+/// text of the key, first line included. Levels below the first keep
+/// serde_yaml's own step: re-indenting emitted text per level would break
+/// sequence-item alignment and block-scalar content.
+fn yaml_child_indent(span: &str) -> String {
+    const DEFAULT: &str = "  ";
+    for line in span.split_inclusive('\n').skip(1) {
+        let stripped = line.trim_end_matches(['\n', '\r']);
+        let indent = yaml_leading_indent(stripped);
+        let content = &stripped[indent..];
+        if content.is_empty() || content.starts_with('#') {
+            continue;
+        }
+        let ws = &stripped[..indent];
+        // A tab never indents valid YAML, and a 0-indent child is a sequence
+        // written at the parent's column, which a mapping cannot reuse.
+        if (1..=8).contains(&ws.len()) && ws.bytes().all(|b| b == b' ') {
+            return ws.to_string();
+        }
+        break;
+    }
+    DEFAULT.to_string()
+}
+
 /// Render `key: <value>` as a YAML block (mapping/sequence nested under the key).
-fn format_yaml_key_block(key: &str, value: &serde_yaml::Value) -> Result<String, String> {
+/// `anchor` is re-emitted on the key line when the key being replaced defined one.
+fn format_yaml_key_block(
+    key: &str,
+    value: &serde_yaml::Value,
+    anchor: Option<&str>,
+    indent: &str,
+) -> Result<String, String> {
+    let head = match anchor {
+        Some(anchor) => format!("{key}: {anchor}"),
+        None => format!("{key}:"),
+    };
     match value {
         serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_) => {
             let body = serde_yaml::to_string(value).map_err(|e| e.to_string())?;
             let body = body.trim_end_matches('\n');
             if body.is_empty() || body == "{}" || body == "[]" {
-                return Ok(format!("{key}: {body}\n"));
+                return Ok(format!("{head} {body}\n"));
             }
-            let mut out = format!("{key}:\n");
+            let mut out = format!("{head}\n");
             for line in body.lines() {
                 if line.is_empty() {
                     out.push('\n');
                 } else {
-                    out.push_str("  ");
+                    out.push_str(indent);
                     out.push_str(line);
                     out.push('\n');
                 }
             }
             Ok(out)
         }
-        serde_yaml::Value::Null => Ok(format!("{key}: null\n")),
+        serde_yaml::Value::Null => Ok(format!("{head} null\n")),
         other => {
             let body = serde_yaml::to_string(other).map_err(|e| e.to_string())?;
-            Ok(format!("{key}: {}\n", body.trim()))
+            Ok(format!("{head} {}\n", body.trim()))
         }
     }
 }
@@ -3735,14 +3843,23 @@ fn rewrite_yaml_key_preserving(
             hits.len()
         ));
     }
-    let block = format_yaml_key_block(key, new_value)?;
     if let Some((_, start, end)) = hits.first() {
+        let span = &original[*start..*end];
+        // An anchor defined on this key is referenced by `*alias` elsewhere in the
+        // file. Replacing the key line without it leaves every alias undefined and
+        // the config no longer parses, so carry it onto the replacement (SBS-884).
+        // A tag on the key line is dropped on purpose: it described the value we
+        // are replacing, not the new one.
+        let anchor = split_yaml_mapping_key(span.lines().next().unwrap_or_default())
+            .and_then(|(_, rest)| yaml_value_anchor(rest));
+        let block = format_yaml_key_block(key, new_value, anchor, &yaml_child_indent(span))?;
         let mut out = String::with_capacity(original.len() + block.len());
         out.push_str(&original[..*start]);
         out.push_str(&block);
         out.push_str(&original[*end..]);
         Ok(out)
     } else {
+        let block = format_yaml_key_block(key, new_value, None, "  ")?;
         let mut out = original.to_string();
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
@@ -4030,10 +4147,19 @@ fn write_opencode_json(path: &Path, servers: &[ServerEntry]) -> Result<(), Strin
 
 fn write_toml(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
     let mut doc = load_toml_document(path)?;
+    let keep_header = toml_keeps_servers_header(&doc);
+    // Carry the old header's comments and blank lines onto the rebuilt table.
+    let decor = doc
+        .get("mcp_servers")
+        .and_then(|item| item.as_table())
+        .map(|table| table.decor().clone());
     let mut servers_table = toml_edit::Table::new();
-    if !servers.is_empty() {
+    if let Some(decor) = decor {
+        *servers_table.decor_mut() = decor;
+    }
+    if !servers.is_empty() && !keep_header {
         // Implicit so we emit `[mcp_servers.name]` rather than a `[mcp_servers]`
-        // wrapper — same shape Codex already ships.
+        // wrapper, the same shape Codex already ships.
         servers_table.set_implicit(true);
     }
     for s in servers {
@@ -5148,6 +5274,7 @@ fn edit_opencode_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(),
 
 fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
     let mut doc = load_toml_document(path)?;
+    let keep_header = toml_keeps_servers_header(&doc);
     let servers = toml_mcp_servers_mut(&mut doc);
     let doomed: Vec<String> = servers
         .iter()
@@ -5166,9 +5293,11 @@ fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), Str
             toml_value_to_item(&entry_to_toml(entry)),
         );
     }
-    if servers.is_empty() {
+    if servers.is_empty() || keep_header {
         // Keep an explicit empty table so uninstall still leaves `mcp_servers`
         // present, matching the previous toml::Value insert-if-missing path.
+        // An existing commented header stays explicit too, otherwise the comment
+        // has no header line left to hang on.
         servers.set_implicit(false);
     } else {
         servers.set_implicit(true);
@@ -8588,6 +8717,89 @@ extensions:
         assert!(root["extensions"].get("extra").is_some());
     }
 
+    /// SBS-884 review: `yaml_leading_indent` counted characters while the caller
+    /// used the count as a byte index. A U+00A0 in a block scalar's indentation
+    /// made the slice land mid-character and panicked before this fix.
+    #[test]
+    fn rewrite_yaml_key_preserving_survives_multi_byte_whitespace() {
+        let original = concat!(
+            "# Goose config\n",
+            "instructions: |\n",
+            "  \u{a0}review the plan\n",
+            "  then run it\n",
+            "extensions:\n",
+            "  fetch:\n",
+            "    cmd: uvx\n",
+        );
+        // The fixture is valid YAML, so it really can reach the line scanner.
+        serde_yaml::from_str::<serde_yaml::Value>(original).unwrap();
+        let new_exts = serde_yaml::from_str::<serde_yaml::Value>(
+            "fetch:\n  cmd: uvx\ntoolport:\n  cmd: toolport-gateway\n",
+        )
+        .unwrap();
+        let rewritten = rewrite_yaml_key_preserving(original, "extensions", &new_exts).unwrap();
+        let root: serde_yaml::Value = serde_yaml::from_str(&rewritten).unwrap();
+        assert!(root["extensions"].get("toolport").is_some());
+        assert!(
+            root["instructions"]
+                .as_str()
+                .is_some_and(|s| s.contains('\u{a0}')),
+            "block scalar content must be untouched: {rewritten}"
+        );
+        assert!(rewritten.contains("# Goose config"));
+    }
+
+    /// SBS-884 review: an anchor on the rewritten key is referenced by aliases
+    /// elsewhere. Dropping it leaves `*exts` undefined and the config unloadable.
+    #[test]
+    fn rewrite_yaml_key_preserving_keeps_anchor_on_the_rewritten_key() {
+        let original = concat!(
+            "extensions: &exts\n",
+            "  fetch:\n",
+            "    cmd: uvx\n",
+            "shared:\n",
+            "  copy: *exts\n",
+        );
+        let new_exts = serde_yaml::from_str::<serde_yaml::Value>(
+            "fetch:\n  cmd: uvx\ntoolport:\n  cmd: toolport-gateway\n",
+        )
+        .unwrap();
+        let rewritten = rewrite_yaml_key_preserving(original, "extensions", &new_exts).unwrap();
+        assert!(
+            rewritten.contains("extensions: &exts"),
+            "anchor on the rewritten key must survive: {rewritten}"
+        );
+        // The real failure was an unparseable file, so parsing is the assertion
+        // that matters: an undefined alias is a hard error in serde_yaml.
+        let root: serde_yaml::Value = serde_yaml::from_str(&rewritten).unwrap();
+        assert!(root["extensions"].get("toolport").is_some());
+        assert!(root["shared"]["copy"].get("toolport").is_some());
+    }
+
+    /// SBS-884 review: a 4-space config must not get one node reformatted to
+    /// serde_yaml's 2 spaces.
+    #[test]
+    fn rewrite_yaml_key_preserving_matches_existing_indent_width() {
+        let original = concat!(
+            "extensions:\n",
+            "    fetch:\n",
+            "        cmd: uvx\n",
+            "other: 1\n",
+        );
+        let new_exts = serde_yaml::from_str::<serde_yaml::Value>(
+            "fetch:\n  cmd: uvx\ntoolport:\n  cmd: toolport-gateway\n",
+        )
+        .unwrap();
+        let rewritten = rewrite_yaml_key_preserving(original, "extensions", &new_exts).unwrap();
+        assert!(
+            rewritten.contains("\n    toolport:"),
+            "children must keep the file's 4-space indent: {rewritten}"
+        );
+        let root: serde_yaml::Value = serde_yaml::from_str(&rewritten).unwrap();
+        assert!(root["extensions"].get("toolport").is_some());
+        assert_eq!(root["other"].as_i64(), Some(1));
+    }
+
     #[test]
     fn rewrite_yaml_key_preserving_rejects_duplicate_top_level_keys() {
         let original = r#"# keep me
@@ -8832,6 +9044,60 @@ command = "npx"
         assert!(parsed
             .get("mcp_servers")
             .and_then(|m| m.get("existing"))
+            .is_some());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SBS-884 review: a comment on the `[mcp_servers]` header itself only
+    /// survives while the table stays explicit. An implicit table emits no
+    /// header line, so both write paths dropped it.
+    #[test]
+    fn toml_preserves_mcp_servers_header_comment() {
+        let path = temp_path("toml-servers-header");
+        let original = r#"# Codex configuration
+model = "o3"
+
+# gateway servers live below
+[mcp_servers]
+
+[mcp_servers.existing]
+command = "npx"
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        {
+            let entry = sample_gateway(None, "codex");
+            edit_toml_gateway(&path, Some(&entry))
+        }
+        .unwrap();
+        let connected = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            connected.contains("# gateway servers live below"),
+            "comment on the [mcp_servers] header must survive Connect: {connected}"
+        );
+        let parsed: toml::Value = toml::from_str(&connected).unwrap();
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get(GATEWAY_ENTRY_NAME))
+            .is_some());
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get("existing"))
+            .is_some());
+
+        // The inventory write path rebuilds the table from scratch, so it has to
+        // carry the header decor over too.
+        std::fs::write(&path, original).unwrap();
+        write_toml(&path, &[stdio("linear")]).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("# gateway servers live below"),
+            "comment on the [mcp_servers] header must survive write_toml: {written}"
+        );
+        let parsed: toml::Value = toml::from_str(&written).unwrap();
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get("linear"))
             .is_some());
         std::fs::remove_file(&path).ok();
     }
