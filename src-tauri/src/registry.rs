@@ -8,7 +8,7 @@
 //! Secrets are never stored here. Env vars marked `secret` keep their value in
 //! the OS keychain; this file only records that a secret exists.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -81,12 +81,86 @@ impl Drop for TempFileCleanup {
     }
 }
 
+/// Linux `MAXSYMLINKS`. A hop cap is the backstop when a cycle is spelled
+/// differently on each visit (`link` vs `dir/../link`) and the seen-set misses it.
+const ATOMIC_WRITE_MAX_SYMLINK_HOPS: usize = 40;
+
+/// Where `atomic_write` should create its sibling temp file and `rename`.
+///
+/// POSIX `rename` does not follow a destination symlink: it replaces the link
+/// inode with a regular file and leaves the target unchanged. Stow/chezmoi
+/// users then lose the gateway entry on the next apply (SBS-886).
+///
+/// Walk with `read_link` + parent-join. Do **not** `canonicalize`: that fails
+/// on a dangling link (the usual first-Connect case) and would refuse to create
+/// the target. A `symlink_metadata` error other than `NotFound` is not "not a
+/// symlink" — failing open would clobber a link we could not inspect.
+///
+/// This is the shared primitive, so following also applies to a Toolport-owned
+/// file (`registry.json`, pins, audit, secrets.enc) that is already a symlink.
+fn resolve_atomic_write_dest(path: &Path) -> Result<PathBuf, String> {
+    let mut current = path.to_path_buf();
+    let mut seen = HashSet::new();
+
+    for _ in 0..ATOMIC_WRITE_MAX_SYMLINK_HOPS {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if !meta.file_type().is_symlink() {
+                    // Followed a config symlink onto a directory (or a further
+                    // link that resolved to one). Cannot write file bytes there.
+                    if meta.is_dir() && current != path {
+                        return Err(format!(
+                            "{} is a symlink to the directory {}, which cannot be overwritten as a file",
+                            path.display(),
+                            current.display()
+                        ));
+                    }
+                    return Ok(current);
+                }
+                if !seen.insert(current.clone()) {
+                    return Err(format!(
+                        "symlink loop at {} while resolving atomic write destination",
+                        current.display()
+                    ));
+                }
+                let target = std::fs::read_link(&current).map_err(|e| {
+                    format!("could not read symlink {}: {e}", current.display())
+                })?;
+                // Relative targets are relative to the link's parent, not cwd.
+                current = match current.parent() {
+                    Some(parent) => parent.join(target),
+                    None => target,
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Missing original path, or a dangling link's target: write a
+                // regular file there. create_dir_all of the dest parent happens
+                // at the call site so a first write can create the target.
+                return Ok(current);
+            }
+            Err(e) => {
+                return Err(format!(
+                    "could not inspect {} before writing: {e}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "too many symlink hops ({ATOMIC_WRITE_MAX_SYMLINK_HOPS}) resolving {}",
+        path.display()
+    ))
+}
+
 /// Write `contents` to `path` atomically: a uniquely-named sibling temp file,
 /// then rename over the target. The unique name (pid + per-process sequence)
 /// means two writers to the same path can't overwrite each other's half-written
 /// temp. The temp sits in the same directory so the rename stays on one
 /// filesystem (and is therefore atomic). Once created, the temp is guarded so
 /// any permissions, write, sync, or rename failure removes it.
+///
+/// If `path` is a symlink, the temp and rename target the resolved file so the
+/// link inode is left in place (SBS-886).
 pub fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     atomic_write_with_ops(path, contents, &FsAtomicWriteOps)
 }
@@ -96,13 +170,16 @@ fn atomic_write_with_ops(
     contents: &str,
     ops: &impl AtomicWriteOps,
 ) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
+    // SBS-886: rename(2) replaces a destination symlink. Resolve first so the
+    // temp file and rename land next to the real target.
+    let dest = resolve_atomic_write_dest(path)?;
+    if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = PathBuf::from(format!(
         "{}.{}.{}.conduit-tmp",
-        path.display(),
+        dest.display(),
         std::process::id(),
         seq
     ));
@@ -123,12 +200,13 @@ fn atomic_write_with_ops(
     // leave a truncated registry.json. `fs::write` + `rename` alone did not.
     ops.sync_all(&f).map_err(|e| e.to_string())?;
     drop(f);
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
     cleanup.disarm();
     // Best-effort: fsync the containing directory so the rename entry itself is durable
     // (Unix). Opening a directory as a File fails on Windows, where NTFS journals the
-    // rename anyway, so the error is ignored.
-    if let Some(dir) = path.parent() {
+    // rename anyway, so the error is ignored. Fsync the *resolved* parent so a
+    // write-through-symlink still durables the directory that holds the new file.
+    if let Some(dir) = dest.parent() {
         if let Ok(d) = std::fs::File::open(dir) {
             let _ = d.sync_all();
         }
@@ -3774,6 +3852,271 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "overwrite must stay owner-only");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(unix)]
+    fn atomic_write_symlink_scratch(label: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-aw-symlink-{}-{}-{stamp}",
+            std::process::id(),
+            label
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn assert_is_symlink_to(link: &Path, target: &Path) {
+        let meta = std::fs::symlink_metadata(link).expect("link must still exist");
+        assert!(
+            meta.file_type().is_symlink(),
+            "expected {} to remain a symlink, became {:?}",
+            link.display(),
+            meta.file_type()
+        );
+        assert_eq!(
+            std::fs::read_link(link).unwrap(),
+            target,
+            "symlink target must be left unchanged"
+        );
+    }
+
+    /// SBS-886: rename(2) over a symlink dest replaces the link inode and leaves
+    /// the target bytes unchanged. Connect then "succeeds" while the file in the
+    /// dotfiles repo still has the old content.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_follows_existing_symlink() {
+        let dir = atomic_write_symlink_scratch("existing");
+        let target = dir.join("dotfiles").join("config.toml");
+        let link = dir.join("home").join("config.toml");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::write(&target, "old").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        atomic_write(&link, "new").unwrap();
+
+        assert_is_symlink_to(&link, &target);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert!(
+            atomic_temp_files(&target).is_empty(),
+            "temp must land next to the resolved dest and be cleaned up"
+        );
+        assert!(
+            atomic_temp_files(&link).is_empty(),
+            "must not leave a temp next to the symlink"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// SBS-886: a dangling stow/chezmoi link (repo file not created yet) must
+    /// still stay a link; the write creates the target instead of replacing the
+    /// inode under home.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_dangling_symlink_creates_target_and_keeps_link() {
+        let dir = atomic_write_symlink_scratch("dangling");
+        let target = dir
+            .join("dotfiles")
+            .join("codex")
+            .join("config.toml");
+        let link = dir.join("home").join(".codex").join("config.toml");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        // Target parent is missing on purpose: first Connect should create it.
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::symlink_metadata(&target).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        atomic_write(&link, "created").unwrap();
+
+        assert_is_symlink_to(&link, &target);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "created");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// SBS-886: relative link targets are relative to the link's parent, not cwd.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_relative_symlink_target() {
+        let dir = atomic_write_symlink_scratch("relative");
+        let target = dir.join("dotfiles").join("config.toml");
+        let link = dir.join("home").join("config.toml");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::write(&target, "old").unwrap();
+        std::os::unix::fs::symlink("../dotfiles/config.toml", &link).unwrap();
+
+        atomic_write(&link, "via-relative").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("../dotfiles/config.toml")
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "via-relative");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// SBS-886: a chain A -> B -> file must walk to the file, leaving every
+    /// link inode in place.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_walks_nested_symlinks() {
+        let dir = atomic_write_symlink_scratch("nested");
+        let file = dir.join("real.toml");
+        let mid = dir.join("mid.toml");
+        let link = dir.join("home.toml");
+        std::fs::write(&file, "old").unwrap();
+        std::os::unix::fs::symlink(&file, &mid).unwrap();
+        std::os::unix::fs::symlink(&mid, &link).unwrap();
+
+        atomic_write(&link, "nested").unwrap();
+
+        assert_is_symlink_to(&link, &mid);
+        assert_is_symlink_to(&mid, &file);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "nested");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// SBS-886: a loop is its own state. Do not treat it as "not a symlink"
+    /// and replace one of the link inodes.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_symlink_loop_errors() {
+        let dir = atomic_write_symlink_scratch("loop");
+        let a = dir.join("a.toml");
+        let b = dir.join("b.toml");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+
+        let err = atomic_write(&a, "loop").expect_err("a symlink loop must fail");
+        assert!(
+            err.contains("symlink loop") || err.contains("too many symlink hops"),
+            "unexpected loop error: {err}"
+        );
+        assert_is_symlink_to(&a, &b);
+        assert_is_symlink_to(&b, &a);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// SBS-886: writing file bytes over a symlink-to-directory must error
+    /// rather than rename a regular file onto a directory inode.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_symlink_to_dir_errors() {
+        let dir = atomic_write_symlink_scratch("to-dir");
+        let target_dir = dir.join("dotfiles");
+        let link = dir.join("config.toml");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("keep"), "safe").unwrap();
+        std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+
+        let err = atomic_write(&link, "nope").expect_err("symlink-to-dir must fail");
+        assert!(
+            err.contains("directory"),
+            "unexpected symlink-to-dir error: {err}"
+        );
+        assert_is_symlink_to(&link, &target_dir);
+        assert_eq!(
+            std::fs::read_to_string(target_dir.join("keep")).unwrap(),
+            "safe"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A missing path is not a symlink: create a regular file, same as before.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_missing_path_creates_regular_file() {
+        let dir = atomic_write_symlink_scratch("missing");
+        let path = dir.join("new").join("config.toml");
+        atomic_write(&path, "fresh").unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(
+            meta.file_type().is_file() && !meta.file_type().is_symlink(),
+            "a first write to a missing path must create a regular file"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Regular-file dest is unchanged: still overwrite in place, never invent
+    /// a symlink, never write beside a different path.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_regular_file_destination_unchanged() {
+        let dir = atomic_write_symlink_scratch("regular");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "old").unwrap();
+        atomic_write(&path, "new").unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(
+            meta.file_type().is_file() && !meta.file_type().is_symlink(),
+            "a regular file dest must stay a regular file"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// SBS-886: `symlink_metadata` failing for a reason other than NotFound is
+    /// unknown, not "not a symlink". Collapsing those would let the write
+    /// proceed against a path we could not inspect.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_inspect_error_is_not_treated_as_missing() {
+        let dir = atomic_write_symlink_scratch("inspect");
+        let not_a_dir = dir.join("file");
+        std::fs::write(&not_a_dir, "regular").unwrap();
+        // Parent is a regular file: lstat of child is ENOTDIR, never NotFound.
+        let child = not_a_dir.join("config.toml");
+
+        let err = resolve_atomic_write_dest(&child)
+            .expect_err("an inspect failure must not collapse to missing");
+        assert!(
+            err.contains("could not inspect"),
+            "inspect failure must be reported as inspect, not as a write: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&not_a_dir).unwrap(), "regular");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A failed write through a symlink must not replace the link and must
+    /// leave the target bytes and no sibling temp.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_failed_write_through_symlink_keeps_link_and_target() {
+        let dir = atomic_write_symlink_scratch("fail-keep");
+        let target = dir.join("target.toml");
+        let link = dir.join("link.toml");
+        std::fs::write(&target, "original").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = atomic_write_with_ops(
+            &link,
+            "replacement",
+            &FailingAtomicWriteOps(FailingAtomicWriteStep::Write),
+        )
+        .expect_err("injected write must fail");
+        assert!(err.contains("write"), "unexpected error: {err}");
+        assert_is_symlink_to(&link, &target);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+        assert!(atomic_temp_files(&target).is_empty());
+        assert!(atomic_temp_files(&link).is_empty());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     fn quarantine_files(path: &Path) -> Vec<PathBuf> {
