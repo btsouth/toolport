@@ -28,6 +28,13 @@ Entries before the rename below shipped under the project's former name, Conduit
   `mcpServers` node, matching the JSONC CST contract. A user who Connects or
   disconnects now keeps the comments and anchors they had outside that node.
   (SBS-884)
+- **Connect keeps stow/chezmoi config symlinks.** Writing a client config
+  (Connect, Disconnect, migrate, launch-time re-point) used to replace a
+  symlink at the config path with a regular file, leaving the file in the
+  dotfiles repo unchanged. The next `chezmoi apply` / `stow` restored the
+  old content and the gateway entry disappeared. Writes now follow the
+  link and update the target, so the path under home stays a symlink.
+  (SBS-886)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
