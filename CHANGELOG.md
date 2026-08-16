@@ -22,7 +22,10 @@ Entries before the rename below shipped under the project's former name, Conduit
   payload that embedded `[/conduit: end external data]` (or `[/Toolport`) used
   to terminate the wrap and leave a forged `[Toolport: …]` line reading as
   gateway voice. The close tag is now per-call and includes a random nonce,
-  and embedded close prefixes are rewritten to `[/untrusted`. (SBS-892)
+  and an embedded close marker is stripped to a plain note that cannot read as
+  a terminator. The match runs on the folded form, so a close hidden with
+  zero-width characters, a Cyrillic homoglyph or fullwidth brackets is caught
+  too. (SBS-892)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
