@@ -31,7 +31,8 @@ pub fn append(msg: &str) {
 
 /// Append `msg` to `path` and trim if needed, holding the sibling lock across
 /// both so a concurrent writer cannot land a line that this process's stale
-/// trim snapshot then overwrites (SBS-869).
+/// trim snapshot then overwrites (SBS-869). A lock we cannot take degrades to
+/// an unlocked append rather than to a lost line.
 pub(crate) fn append_to(path: &Path, msg: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -39,16 +40,31 @@ pub(crate) fn append_to(path: &Path, msg: &str) {
     // Atomic replacement protects readers from an empty window, but only this
     // shared cross-process critical section prevents a stale trim snapshot
     // from replacing a line another gateway just appended (SBS-869).
-    let _lock = match crate::registry::lock_at(path) {
-        Ok(lock) => lock,
+    match crate::registry::lock_at(path) {
+        Ok(_lock) => {
+            append_line(path, msg);
+            trim_log_if_large(path);
+        }
+        // Never trade a line for the lock. This log exists so a diagnostics
+        // bundle still shows the connect failure, and before SBS-869 the append
+        // ran with no lock at all - so a stale lock file or a contended
+        // deadline must not make us quieter than the code we replaced. Write
+        // the line and skip only the trim, which is the half that is unsafe
+        // unserialized; the next append that does win the lock re-bounds the
+        // file.
         Err(error) => {
             eprintln!(
-                "toolport: gateway log line dropped because the lock for '{}' could not be acquired: {error}",
+                "toolport: appending to '{}' without the gateway log lock ({error}); trim deferred",
                 path.display()
             );
-            return;
+            append_line(path, msg);
         }
-    };
+    }
+}
+
+/// One `O_APPEND` write of the whole record, so even the unlocked fallback
+/// cannot interleave half a line with another writer's.
+fn append_line(path: &Path, msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -56,7 +72,6 @@ pub(crate) fn append_to(path: &Path, msg: &str) {
     {
         let _ = f.write_all(format!("{msg}\n").as_bytes());
     }
-    trim_log_if_large(path);
 }
 
 /// Trim the log to roughly its back half once it exceeds [`GATEWAY_LOG_CAP`],
@@ -215,17 +230,17 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Failure mode: sequential appends plus a trim-triggering append drop a
-    /// unique marker line that another writer just added (SBS-869 race 2).
+    /// Failure mode: the append that crosses [`GATEWAY_LOG_CAP`] trims away a
+    /// line an earlier append just wrote (SBS-869 race 2, one process).
     #[test]
-    fn append_under_lock_retains_unique_marker_lines_across_trim() {
+    fn appends_that_cross_the_cap_keep_every_line_written_after_the_cut() {
         let path = unique_log_path();
-        // Just under the cap so two small appends stay put and the third
-        // unique line is what crosses GATEWAY_LOG_CAP and forces a trim.
-        let prefix_len = GATEWAY_LOG_CAP as usize - 80;
+        // One giant already-over-cap line, so the first append is what runs the
+        // trim and the line-boundary cut lands right after that prefix: the
+        // kept tail is then exactly the appends, with nothing to hide a loss.
         std::fs::write(
             &path,
-            format!("{}\n", "o".repeat(prefix_len.saturating_sub(1))),
+            format!("{}\n", "o".repeat(GATEWAY_LOG_CAP as usize + 4096)),
         )
         .unwrap();
 
@@ -236,11 +251,113 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(
             (after.len() as u64) <= GATEWAY_LOG_CAP,
-            "trim-triggering append left the file over cap"
+            "the trim-triggering append left the file over cap"
         );
-        assert!(after.contains("UNIQUE_A"), "lost UNIQUE_A across trim");
-        assert!(after.contains("UNIQUE_B"), "lost UNIQUE_B across trim");
-        assert!(after.contains("UNIQUE_C"), "lost UNIQUE_C across trim");
+        assert_eq!(after, "UNIQUE_A\nUNIQUE_B\nUNIQUE_C\n");
         cleanup(&path);
+    }
+
+    fn wait_for_path(path: &Path, label: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(path.exists(), "timed out waiting for {label}");
+    }
+
+    fn wait_for_child(child: &mut std::process::Child, label: &str) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match child.try_wait().expect("poll gateway log child") {
+                Some(status) => return status,
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("timed out waiting for {label}");
+                }
+            }
+        }
+    }
+
+    /// The separate process for
+    /// [`append_to_waits_for_a_log_lock_another_process_holds`]. Inert without
+    /// its env vars, so a normal run of this module skips it.
+    #[test]
+    fn gatewaylog_lock_sentinel_child() {
+        let Some(path) = std::env::var_os("TOOLPORT_GATEWAYLOG_SENTINEL_PATH") else {
+            return;
+        };
+        let attempting = PathBuf::from(
+            std::env::var_os("TOOLPORT_GATEWAYLOG_SENTINEL_ATTEMPTING")
+                .expect("sentinel attempting path"),
+        );
+        let done = PathBuf::from(
+            std::env::var_os("TOOLPORT_GATEWAYLOG_SENTINEL_DONE").expect("sentinel done path"),
+        );
+
+        std::fs::write(&attempting, "attempting").expect("signal sentinel append attempt");
+        append_to(Path::new(&path), "UNIQUE_CHILD");
+        std::fs::write(done, "done").expect("signal sentinel append complete");
+    }
+
+    /// Failure mode: `append_to` writes without the shared cross-process lock,
+    /// so a second gateway's line can land inside another process's read-then-
+    /// replace trim window and be lost (SBS-869 race 2, two processes). Drop
+    /// the lock from `append_to` and the child's line lands immediately.
+    #[test]
+    fn append_to_waits_for_a_log_lock_another_process_holds() {
+        let root = std::env::temp_dir().join(format!(
+            "toolport-sbs869-gatewaylog-lock-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("gateway.log");
+        let attempting = root.join("attempting");
+        let done = root.join("done");
+        std::fs::write(&path, "SEED\n").unwrap();
+        // The child has to wait out the hold below, not time out into the
+        // unlocked fallback append. Children inherit the raised deadline.
+        let _lock_budget = crate::registry::LockTimeoutOverride::generous();
+        let held = crate::registry::lock_at(&path).expect("hold the gateway log lock");
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "gatewaylog::tests::gatewaylog_lock_sentinel_child",
+                "--nocapture",
+            ])
+            .env("TOOLPORT_GATEWAYLOG_SENTINEL_PATH", &path)
+            .env("TOOLPORT_GATEWAYLOG_SENTINEL_ATTEMPTING", &attempting)
+            .env("TOOLPORT_GATEWAYLOG_SENTINEL_DONE", &done)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn independent gateway log appender");
+        wait_for_path(&attempting, "sentinel append attempt");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Read the verdict before releasing, but assert after, so a failure
+        // still unblocks and reaps the child.
+        let blocked = !done.exists();
+        drop(held);
+
+        let status = wait_for_child(&mut child, "gateway log sentinel child");
+        assert!(
+            blocked,
+            "a separate process must not append while another holds the log lock"
+        );
+        assert!(status.success(), "sentinel child failed: {status}");
+        assert!(
+            done.exists(),
+            "the child's append must finish once the lock frees"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "SEED\nUNIQUE_CHILD\n"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }
