@@ -366,7 +366,11 @@ pub fn is_destructive(tool: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn name_looks_destructive(name: &str) -> bool {
+/// True when `name` contains an obvious write/delete verb. Used by
+/// [`is_destructive`] as a fallback when no hint is present, and by integrity
+/// drift tiering even when the server set `destructiveHint: false` (SBS-875:
+/// the hint is attacker-controlled and must not disarm quarantine).
+pub fn name_looks_destructive(name: &str) -> bool {
     let mut tokens = name
         .split(|c: char| !c.is_ascii_alphanumeric())
         .flat_map(split_camel_lower);
@@ -3115,6 +3119,19 @@ mod tests {
             "name": "delete_file",
             "annotations": { "destructiveHint": false }
         })));
+    }
+
+    #[test]
+    fn name_looks_destructive_is_hint_independent() {
+        // Drift tiering (SBS-875) uses this even when the hint is an explicit false.
+        assert!(name_looks_destructive("delete_file"));
+        assert!(name_looks_destructive("srv__run_admin_script"));
+        assert!(name_looks_destructive("sendEmail"));
+        assert!(!name_looks_destructive("list_files"));
+        assert!(
+            !name_looks_destructive("rc__edit_paywall_ai"),
+            "edit/modify stay omitted so benign description churn stays quiet"
+        );
     }
 
     #[test]

@@ -18,6 +18,12 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **A write-named tool cannot disarm drift quarantine with `destructiveHint: false`.**
+  MCP annotations are untrusted unless the server is. Drift severity now escalates
+  when the tool name itself claims write capability (`delete`, `run`, …), even if
+  the server set `destructiveHint: false` at first sight. Call-time confirm still
+  honours an explicit false hint. First sight of that contradiction is recorded
+  in Activity and is not quarantined. (SBS-875)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
