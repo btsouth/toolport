@@ -13227,11 +13227,13 @@ fn handle_http_with_headers(
                     "metrics disabled; set TOOLPORT_METRICS=1 on the gateway to enable",
                 );
             }
-            HttpOut::new(
-                200,
-                "text/plain; version=0.0.4; charset=utf-8",
-                conduit_lib::metrics::render(),
-            )
+            match conduit_lib::metrics::render() {
+                Ok(body) => HttpOut::new(200, "text/plain; version=0.0.4; charset=utf-8", body),
+                // A failed read is a failed scrape, not an idle instance: 200 with
+                // no series drops every metric while Prometheus `up` stays 1, so a
+                // persistent permission error looks like silence (SBS-873).
+                Err(error) => HttpOut::json_err(500, &format!("metrics unavailable: {error}")),
+            }
         }
         ("POST", p) => {
             let name = p.trim_start_matches('/');

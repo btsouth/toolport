@@ -804,7 +804,11 @@ fn report_usage(conn: &TeamConnection, token: &str) {
     if team_servers.is_empty() {
         return;
     }
-    let audit_lines = crate::audit::read_recent(usize::MAX);
+    // An unreadable audit log is not "zero usage". Skip this cycle rather than
+    // POST a false empty report (SBS-873).
+    let Ok(audit_lines) = crate::audit::read_recent(usize::MAX) else {
+        return;
+    };
     let savings_lines = crate::savings::entries();
     let mut new_state: HashMap<String, HashMap<String, [u64; 2]>> = HashMap::new();
     let mut changed = false;
@@ -1158,7 +1162,11 @@ fn report_call_events(conn: &TeamConnection, token: &str) {
     if !enabled {
         return;
     }
-    let lines = crate::audit::read_recent(usize::MAX);
+    // An unreadable audit log is not "no new calls". Skip this cycle rather
+    // than POST an empty batch that would advance nothing honestly (SBS-873).
+    let Ok(lines) = crate::audit::read_recent(usize::MAX) else {
+        return;
+    };
     let mut batch: Vec<Value> = Vec::new();
     let mut max_ts = cursor;
     for line in &lines {
