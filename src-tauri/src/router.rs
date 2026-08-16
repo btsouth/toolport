@@ -437,7 +437,9 @@ pub struct ToolPolicy {
     pub quarantined: BTreeSet<String>,
     /// Hide every tool. Used when a cold-start quarantine-store read fails
     /// (SBS-871): there is no prior live set to keep, so the catalog stays
-    /// blocked until a later successful read `requarantine`s a real set.
+    /// blocked until a SUCCESSFUL store read installs a real set through
+    /// [`Router::requarantine_from_store`]. Error paths must use
+    /// [`Router::requarantine`], which leaves this set.
     pub fail_closed_catalog: bool,
 }
 
@@ -591,6 +593,11 @@ pub struct Router {
     prompts: Vec<Value>,
     /// Exposed prompt name -> (server id, original prompt name).
     prompt_routes: HashMap<String, (String, String)>,
+    /// False only for the never-built placeholder the gateway installs before its
+    /// first build. `with_policy` (the constructor every real build uses) sets it,
+    /// so a live router whose connects all failed is still a real prior decision
+    /// and not a cold start (SBS-871).
+    built: bool,
 }
 
 impl Router {
@@ -602,8 +609,16 @@ impl Router {
     pub fn with_policy(policy: ToolPolicy) -> Self {
         Router {
             policy,
+            built: true,
             ..Router::default()
         }
+    }
+
+    /// Whether this router came from a real build rather than the startup
+    /// placeholder. A built router carries a quarantine decision even when it
+    /// connected zero servers (SBS-871).
+    pub fn is_built(&self) -> bool {
+        self.built
     }
 
     /// Set the per-tool exposure overrides. Must be called BEFORE `add`/`refresh`, since
@@ -1076,16 +1091,26 @@ impl Router {
     /// Replace the quarantine set and re-derive the exposed aggregation so newly
     /// quarantined tools are hidden (or re-approved ones restored) without re-querying
     /// downstream. Cheap: it only re-applies the policy to the cached tool lists.
+    ///
+    /// Deliberately does NOT lift a fail-closed catalog (SBS-871): every caller that
+    /// reaches here on a store error would otherwise re-expose the whole catalog while
+    /// the store is still unreadable. Use [`Self::requarantine_from_store`] when the
+    /// set came from a successful read.
     pub fn requarantine(&mut self, quarantined: BTreeSet<String>) {
         self.policy.quarantined = quarantined;
-        // A successful reconcile/rebuild installs a known set, so lift the
-        // cold-start fail-closed hide (SBS-871).
-        self.policy.fail_closed_catalog = false;
         self.rebuild_aggregation();
     }
 
+    /// Install a quarantine set that came from a SUCCESSFUL store read, lifting the
+    /// fail-closed hide (SBS-871). This is the only way the catalog comes back: the
+    /// store answered, so the set is known and enforcement can resume normally.
+    pub fn requarantine_from_store(&mut self, quarantined: BTreeSet<String>) {
+        self.policy.fail_closed_catalog = false;
+        self.requarantine(quarantined);
+    }
+
     /// True when this router is hiding the whole catalog because the quarantine
-    /// store could not be read on a cold start (SBS-871).
+    /// store could not be read and there was no prior live set to keep (SBS-871).
     pub fn catalog_fail_closed(&self) -> bool {
         self.policy.fail_closed_catalog
     }
@@ -1093,6 +1118,11 @@ impl Router {
     /// The quarantine set this router is currently enforcing. Lets a caller diff the
     /// live set against the persisted one and skip `requarantine` (and the client
     /// `list_changed` that follows it) when nothing actually changed.
+    ///
+    /// NOT the whole enforcement picture: while [`Self::catalog_fail_closed`] is true
+    /// every tool is hidden even though this set can be empty, so a caller diffing
+    /// live against persisted MUST check `catalog_fail_closed()` too or it will read
+    /// "blocked everything" as "nothing blocked" (SBS-871).
     pub fn quarantined(&self) -> &BTreeSet<String> {
         &self.policy.quarantined
     }
@@ -3237,12 +3267,52 @@ mod tests {
             "unexpected: {err}"
         );
 
-        router.requarantine(BTreeSet::new());
+        router.requarantine_from_store(BTreeSet::new());
         assert!(!router.catalog_fail_closed());
         assert!(
             !router.aggregated_tools().is_empty(),
             "a later known set must re-expose the catalog"
         );
+    }
+
+    /// SBS-871: the whole point of the hide is that it survives every path that is
+    /// NOT a successful store read. `requarantine` runs on store-error paths
+    /// (integrity write failure, unreadable persisted set), so it must leave the
+    /// catalog hidden; only `requarantine_from_store` lifts it.
+    #[test]
+    fn sbs871_requarantine_on_an_error_path_does_not_lift_fail_closed() {
+        let mut policy = ToolPolicy::default();
+        policy.fail_closed_catalog = true;
+        let mut router = Router::with_policy(policy);
+        router.add(mock_server("github"));
+
+        // The error paths union the live set with the names that triggered the write.
+        router.requarantine(["github__echo".to_string()].into_iter().collect());
+        assert!(
+            router.catalog_fail_closed(),
+            "a store-error requarantine must not re-expose the catalog"
+        );
+        assert!(
+            router.aggregated_tools().is_empty(),
+            "the catalog must stay hidden while the store is still unreadable"
+        );
+        // The reported set is not the whole picture, so callers have to consult
+        // catalog_fail_closed() as well.
+        assert_eq!(router.quarantined().len(), 1);
+
+        router.requarantine_from_store(BTreeSet::new());
+        assert!(!router.catalog_fail_closed());
+        assert!(!router.aggregated_tools().is_empty());
+    }
+
+    /// SBS-871: `Router::new()` is the startup placeholder, but a router that was
+    /// really built and connected nothing is still a prior quarantine decision.
+    #[test]
+    fn sbs871_built_flag_separates_a_placeholder_from_a_live_empty_router() {
+        assert!(!Router::new().is_built(), "placeholder is not a build");
+        let built = Router::with_policy(ToolPolicy::default());
+        assert!(built.is_built(), "a policy build is a real build");
+        assert_eq!(built.server_count(), 0, "even with zero connected servers");
     }
 
     #[test]

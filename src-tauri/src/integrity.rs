@@ -956,6 +956,12 @@ fn missing_quarantine_store(profile: Option<&str>, path: &Path) -> Result<Quaran
 /// not a lost store. Materialize `{}` under the quarantine lock so later
 /// enforcement reads can treat "missing while pins exist" as a rename-window
 /// error (SBS-871) without hiding the catalog on every boot.
+///
+/// Only a `Loaded` pin store earns that `{}`. A `Corrupt` pin store is a destroyed
+/// trust root, which is exactly the input an attacker controls, and writing an empty
+/// quarantine store beside it would hand back "nothing is blocked" on demand. Leave
+/// the file missing there so `missing_quarantine_store` stays `Err` and the caller
+/// fails closed.
 pub fn ensure_quarantine_store_for_existing_pins(profile: Option<&str>) {
     let Some(path) = quarantine_path(profile) else {
         return;
@@ -963,7 +969,7 @@ pub fn ensure_quarantine_store_for_existing_pins(profile: Option<&str>) {
     if path.exists() {
         return;
     }
-    if matches!(load_pins(profile), PinsLoad::Fresh) {
+    if !matches!(load_pins(profile), PinsLoad::Loaded(_)) {
         return;
     }
     let _ = with_store_lock(&path, || {
@@ -3494,12 +3500,100 @@ mod tests {
         );
     }
 
+    fn write_corrupt_pin_store(profile: Option<&str>) {
+        let path = pins_path(profile).expect("pin path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ this is not json").unwrap();
+        assert!(
+            matches!(load_pins(profile), PinsLoad::Corrupt),
+            "fixture must be a real Corrupt pin store"
+        );
+    }
+
     fn reset_sbs871_read_hooks() {
         QUARANTINE_INJECT_READ_NOTFOUND.store(0, std::sync::atomic::Ordering::SeqCst);
         QUARANTINE_READ_IO_ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
         *QUARANTINE_READ_CACHE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// SBS-871: a Corrupt pin store is a destroyed trust root, which is exactly the
+    /// input an attacker controls. Materializing `{}` beside it would create an empty
+    /// quarantine store on demand, and the very next read would answer "nothing is
+    /// blocked" while the real block set stayed gone.
+    #[test]
+    fn sbs871_corrupt_pins_must_not_materialize_an_empty_quarantine_store() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("sbs871-corrupt-pins");
+        let profile = Some("sbs871-corrupt");
+        reset_sbs871_read_hooks();
+        write_corrupt_pin_store(profile);
+        let path = quarantine_path(profile).expect("path");
+        assert!(!path.exists(), "fixture starts with no quarantine file");
+
+        ensure_quarantine_store_for_existing_pins(profile);
+
+        assert!(
+            !path.exists(),
+            "a corrupt trust root must not get an empty quarantine store written for it"
+        );
+        let err = quarantined(profile).expect_err("corrupt pins + no store must fail closed");
+        assert!(
+            is_absent_quarantine_not_fresh(&err),
+            "must stay the SBS-871 missing-not-fresh error, got {err}"
+        );
+        assert!(
+            quarantined_checked(profile).is_err(),
+            "the watcher's cached read must refuse too"
+        );
+        assert!(
+            mandatory_quarantined(profile).is_err(),
+            "the quarantine-off path reads the same store and must also refuse"
+        );
+    }
+
+    /// SBS-871 companion: the heal must still fire for the shape it exists for, an
+    /// upgraded install with real pins and no quarantine file yet. Without this the
+    /// tightening above would hide the catalog on every boot of such an install.
+    #[test]
+    fn sbs871_loaded_pins_still_materialize_the_quarantine_store() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("sbs871-loaded-heal");
+        let profile = Some("sbs871-heal");
+        reset_sbs871_read_hooks();
+        write_loaded_pin_store(profile);
+        let path = quarantine_path(profile).expect("path");
+        assert!(!path.exists(), "fixture starts with no quarantine file");
+
+        ensure_quarantine_store_for_existing_pins(profile);
+
+        assert!(path.exists(), "an upgraded install gets its empty store");
+        assert!(
+            quarantined(profile)
+                .expect("materialized store reads")
+                .is_empty(),
+            "and it reads as a real, empty block set"
+        );
+    }
+
+    /// SBS-871: a genuine first run has no pins either, so there is nothing to heal.
+    /// Writing the store here would be harmless but pointless; assert the shape so a
+    /// later refactor cannot start creating files for profiles that never ran.
+    #[test]
+    fn sbs871_fresh_pins_do_not_materialize_the_quarantine_store() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("sbs871-fresh-heal");
+        let profile = Some("sbs871-fresh-heal");
+        reset_sbs871_read_hooks();
+        assert!(matches!(load_pins(profile), PinsLoad::Fresh));
+
+        ensure_quarantine_store_for_existing_pins(profile);
+
+        assert!(
+            !quarantine_path(profile).expect("path").exists(),
+            "a first run stays a first run"
+        );
     }
 
     /// SBS-871: a missing quarantine file is an honest first-run empty set only
