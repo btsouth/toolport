@@ -6482,6 +6482,60 @@ bad = "not-a-table"
         std::fs::remove_file(&path).ok();
     }
 
+    /// SBS-886: Connect (`edit_json_gateway` / `install_or_remove`) must write
+    /// through a stow/chezmoi symlink. Failure mode: POSIX rename replaced
+    /// `~/.claude.json -> ~/dotfiles/claude.json` with a regular file, the repo
+    /// copy never got the gateway entry, and the next chezmoi apply restored
+    /// the old link and the entry disappeared.
+    #[cfg(unix)]
+    #[test]
+    fn connect_write_through_symlinked_config_keeps_link_and_updates_target() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-sbs886-connect-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("dotfiles").join("claude.json");
+        let link = dir.join("home").join(".claude.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::write(
+            &target,
+            r#"{"theme":"dark","mcpServers":{"existing":{"command":"node","env":{"SECRET":"keepme"}}}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        {
+            let entry = sample_gateway(Some("Billing"), "claude-code");
+            edit_json_gateway(&link, "mcpServers", Some(&entry), true)
+        }
+        .unwrap();
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "Connect must leave the config path a symlink, became {:?}",
+            meta.file_type()
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        let servers = root["mcpServers"].as_object().unwrap();
+        assert!(
+            servers.contains_key(GATEWAY_ENTRY_NAME),
+            "gateway entry must land in the symlink target"
+        );
+        assert!(servers.contains_key("existing"));
+        assert_eq!(root["theme"], "dark");
+        assert_eq!(servers["existing"]["env"]["SECRET"], "keepme");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn droid_install_preserves_existing_factory_server() {
         let path = temp_path("droid-install-json");

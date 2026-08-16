@@ -23,6 +23,13 @@ Entries before the rename below shipped under the project's former name, Conduit
   including wiping cards already on screen when a later refresh failed. A failed load
   is now its own state: empty after a successful read still hides; error shows retry
   and keeps the last loaded queue. (SBS-879)
+- **Connect keeps stow/chezmoi config symlinks.** Writing a client config
+  (Connect, Disconnect, migrate, launch-time re-point) used to replace a
+  symlink at the config path with a regular file, leaving the file in the
+  dotfiles repo unchanged. The next `chezmoi apply` / `stow` restored the
+  old content and the gateway entry disappeared. Writes now follow the
+  link and update the target, so the path under home stays a symlink.
+  (SBS-886)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
