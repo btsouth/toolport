@@ -18,6 +18,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **Windows keyring and install.ps1 tests can now block merge.** Branch
+  protection still requires only the check named `Build + test`. That name now
+  belongs to a merge-gate job that fails unless the Linux suite, the
+  cross-platform headless Rust matrix (including the Windows keyring tests),
+  and the `install.ps1` Pester job all succeeded. Adding those names as
+  separate required contexts still needs a GitHub settings click; this change
+  does not edit branch protection.
+
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
