@@ -3,9 +3,11 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { ThemeProvider } from "@/lib/theme";
+import { toastError } from "@/lib/toast";
 import { SettingsView } from "./SettingsView";
 import {
   approveRoutineSuggestion,
+  clientsNeedingRestart,
   dismissRoutineSuggestion,
   listRoutineSuggestions,
   isAutostartEnabled,
@@ -14,6 +16,10 @@ import {
   setCodeMode,
 } from "@/lib/api";
 import type { Registry, RoutineSuggestion } from "@/lib/types";
+
+vi.mock("@/lib/toast", () => ({
+  toastError: vi.fn(),
+}));
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
@@ -29,6 +35,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     listRoutineSuggestions: vi.fn().mockResolvedValue([]),
     approveRoutineSuggestion: vi.fn(),
     dismissRoutineSuggestion: vi.fn(),
+    clientsNeedingRestart: vi.fn().mockResolvedValue([]),
   };
 });
 vi.mock("@tauri-apps/api/event", () => ({
@@ -44,6 +51,8 @@ const mockedSetCodeMode = vi.mocked(setCodeMode);
 const mockedListRoutineSuggestions = vi.mocked(listRoutineSuggestions);
 const mockedApproveRoutineSuggestion = vi.mocked(approveRoutineSuggestion);
 const mockedDismissRoutineSuggestion = vi.mocked(dismissRoutineSuggestion);
+const mockedClientsNeedingRestart = vi.mocked(clientsNeedingRestart);
+const mockedToastError = vi.mocked(toastError);
 const mockedListen = vi.mocked(listen);
 
 const registry: Registry = {
@@ -277,6 +286,9 @@ describe("SettingsView routine suggestions", () => {
     mockedListen.mockResolvedValue(() => {});
     mockedListRoutineSuggestions.mockReset();
     mockedListRoutineSuggestions.mockResolvedValue([]);
+    mockedClientsNeedingRestart.mockReset();
+    mockedClientsNeedingRestart.mockResolvedValue([]);
+    mockedToastError.mockReset();
   });
 
   const suggestion: RoutineSuggestion = {
@@ -572,5 +584,18 @@ describe("SettingsView launch at login", () => {
     await waitFor(() => expect(control).toBeEnabled());
     expect(control).toHaveAttribute("aria-checked", "true");
     expect(screen.queryByText(/couldn't read the os setting/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("SettingsView restart check", () => {
+  it("shows an error toast when the old-gateway check fails", async () => {
+    mockedClientsNeedingRestart.mockRejectedValue(new Error("backend down"));
+    renderSettings();
+
+    await waitFor(() => {
+      expect(mockedToastError).toHaveBeenCalledWith(
+        "Couldn't check for apps using an old gateway",
+      );
+    });
   });
 });

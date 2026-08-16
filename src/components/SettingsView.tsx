@@ -852,7 +852,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   useEffect(() => {
     clientsNeedingRestart()
       .then(setNeedsRestart)
-      .catch(() => {});
+      .catch(() => toastError("Couldn't check for apps using an old gateway"));
   }, []);
   // Launch-at-login is OS-level state owned by the autostart plugin. Model
   // loading/ready/error explicitly so the switch is never presented as a
