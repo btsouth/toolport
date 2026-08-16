@@ -598,4 +598,26 @@ describe("SettingsView restart check", () => {
       );
     });
   });
+
+  it("retries the check from the error panel", async () => {
+    mockedClientsNeedingRestart
+      .mockRejectedValueOnce(new Error("backend down"))
+      .mockResolvedValueOnce([{ client: "Codex", gateway: "old", clientPid: 1234 }]);
+    const user = userEvent.setup();
+    renderSettings();
+
+    const retry = await screen.findByRole("button", {
+      name: "Retry checking for old gateway",
+    });
+    await user.click(retry);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/1 app is still launching an old gateway/i),
+      ).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByRole("button", { name: "Retry checking for old gateway" }),
+    ).not.toBeInTheDocument();
+  });
 });

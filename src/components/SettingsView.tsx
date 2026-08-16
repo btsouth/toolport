@@ -849,11 +849,19 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   // launch reaper already found them before this view existed; refreshed from the
   // button's own outcome, which merges rather than replaces (SOU-435).
   const [needsRestart, setNeedsRestart] = useState<ClientNeedingRestart[]>([]);
-  useEffect(() => {
-    clientsNeedingRestart()
-      .then(setNeedsRestart)
-      .catch(() => toastError("Couldn't check for apps using an old gateway"));
+  const [restartCheckFailed, setRestartCheckFailed] = useState(false);
+  const loadNeedsRestart = useCallback(async () => {
+    try {
+      setNeedsRestart(await clientsNeedingRestart());
+      setRestartCheckFailed(false);
+    } catch {
+      setRestartCheckFailed(true);
+      toastError("Couldn't check for apps using an old gateway");
+    }
   }, []);
+  useEffect(() => {
+    void loadNeedsRestart();
+  }, [loadNeedsRestart]);
   // Launch-at-login is OS-level state owned by the autostart plugin. Model
   // loading/ready/error explicitly so the switch is never presented as a
   // verified Off while the real OS value is unknown or unreadable (#694).
@@ -1727,6 +1735,19 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             </button>
           </div>
           {reapResult && <p className="text-xs text-muted-foreground">{reapResult}</p>}
+          {restartCheckFailed && (
+            <p className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
+              Couldn&apos;t check for apps using an old gateway.
+              <button
+                type="button"
+                aria-label="Retry checking for old gateway"
+                onClick={() => void loadNeedsRestart()}
+                className="shrink-0 font-medium text-foreground underline underline-offset-2 hover:text-primary"
+              >
+                Retry
+              </button>
+            </p>
+          )}
           {needsRestart.length > 0 && (
             <div className="rounded-md border border-warning/40 bg-warning/5 p-3">
               <p className="text-xs font-medium text-warning">
