@@ -3051,10 +3051,7 @@ fn entry_to_kimi_json(entry: &ServerEntry) -> serde_json::Value {
         let object = value.as_object_mut().unwrap();
         object.remove("type");
         if entry.transport.eq_ignore_ascii_case("sse") {
-            object.insert(
-                "transport".into(),
-                serde_json::Value::String("sse".into()),
-            );
+            object.insert("transport".into(), serde_json::Value::String("sse".into()));
         }
     }
     value
@@ -3186,8 +3183,7 @@ fn reject_duplicate_top_level_key(original: &str, key: &str) -> Result<(), Strin
     use jsonc_parser::cst::CstRootNode;
     use jsonc_parser::ParseOptions;
 
-    let root = CstRootNode::parse(original, &ParseOptions::default())
-        .map_err(|e| e.to_string())?;
+    let root = CstRootNode::parse(original, &ParseOptions::default()).map_err(|e| e.to_string())?;
     let Some(obj) = root.object_value() else {
         return Ok(());
     };
@@ -3213,8 +3209,7 @@ fn rewrite_json_key_preserving(
     use jsonc_parser::cst::CstRootNode;
     use jsonc_parser::ParseOptions;
 
-    let root = CstRootNode::parse(original, &ParseOptions::default())
-        .map_err(|e| e.to_string())?;
+    let root = CstRootNode::parse(original, &ParseOptions::default()).map_err(|e| e.to_string())?;
     // Client configs we edit are always root objects. Non-objects fall through
     // to the pretty-print path via the caller.
     let Some(obj) = root.object_value() else {
@@ -3248,9 +3243,7 @@ fn atomic_write_json_config(
     root: &serde_json::Value,
     changed_key: &str,
 ) -> Result<(), String> {
-    let pretty = || {
-        serde_json::to_string_pretty(root).map_err(|e| e.to_string())
-    };
+    let pretty = || serde_json::to_string_pretty(root).map_err(|e| e.to_string());
 
     let out = match (original, root.get(changed_key)) {
         (Some(src), Some(val)) if !src.trim().is_empty() => {
@@ -3270,6 +3263,659 @@ fn atomic_write_json_config(
     atomic_write(path, &out)
 }
 
+/// Convert a `toml::Value` into a `toml_edit::Item` so we can splice a rewritten
+/// `mcp_servers` table into an existing DocumentMut without losing comments on
+/// every other key (SBS-884).
+fn toml_value_to_item(value: &toml::Value) -> toml_edit::Item {
+    use toml_edit::{Item, Table};
+    match value {
+        toml::Value::Table(map) => {
+            let mut table = Table::new();
+            for (k, v) in map {
+                table.insert(k, toml_value_to_item(v));
+            }
+            Item::Table(table)
+        }
+        other => Item::Value(toml_value_to_edit_value(other)),
+    }
+}
+
+/// Value-level counterpart of [`toml_value_to_item`]. A nested table inside an
+/// array has to become an inline table: a standard `Item::Table` is not an
+/// `Item::Value`, so an array-of-tables would otherwise be dropped silently.
+fn toml_value_to_edit_value(value: &toml::Value) -> toml_edit::Value {
+    use toml_edit::{Array, InlineTable, Value};
+    match value {
+        toml::Value::String(s) => Value::from(s.as_str()),
+        toml::Value::Integer(i) => Value::from(*i),
+        toml::Value::Float(f) => Value::from(*f),
+        toml::Value::Boolean(b) => Value::from(*b),
+        toml::Value::Datetime(dt) => match dt.to_string().parse::<toml_edit::Datetime>() {
+            Ok(parsed) => Value::from(parsed),
+            Err(_) => Value::from(dt.to_string()),
+        },
+        toml::Value::Array(items) => {
+            let mut array = Array::new();
+            for item in items {
+                array.push(toml_value_to_edit_value(item));
+            }
+            Value::Array(array)
+        }
+        toml::Value::Table(map) => {
+            let mut inline = InlineTable::new();
+            for (k, v) in map {
+                inline.insert(k, toml_value_to_edit_value(v));
+            }
+            Value::InlineTable(inline)
+        }
+    }
+}
+
+/// Load a TOML config as a comment-preserving DocumentMut. An unparseable
+/// non-empty file is an error (same fail-closed contract as `read_existing_toml`)
+/// so we never replace Codex/Grok `config.toml` with a pretty-printed stub.
+fn load_toml_document(path: &Path) -> Result<toml_edit::DocumentMut, String> {
+    if !path.exists() {
+        return Ok(toml_edit::DocumentMut::new());
+    }
+    let content = read_config_file(path)?;
+    // Keep the toml 0.8 parse as the public error gate so existing tests and
+    // callers still see "Could not parse the existing config".
+    read_existing_toml(&content)?;
+    if content.trim().is_empty() {
+        return Ok(toml_edit::DocumentMut::new());
+    }
+    content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("Could not parse the existing config ({e}); leaving it untouched."))
+}
+
+/// Guarantee `item` is a standard table. Inline tables and non-table values
+/// (a corrupt-but-parseable `mcp_servers = "..."`) become an empty table, matching
+/// the previous `toml::Value` path that replaced a non-table with `Table::new()`.
+fn ensure_toml_table(item: &mut toml_edit::Item) -> &mut toml_edit::Table {
+    use toml_edit::{Item, Table};
+    if item.as_table().is_some() {
+        return item.as_table_mut().unwrap();
+    }
+    let converted = item.as_inline_table().map(|inline| {
+        let mut table = Table::new();
+        for (k, val) in inline.iter() {
+            table.insert(k, Item::Value(val.clone()));
+        }
+        table
+    });
+    *item = Item::Table(converted.unwrap_or_default());
+    item.as_table_mut().unwrap()
+}
+
+fn toml_mcp_servers_mut(doc: &mut toml_edit::DocumentMut) -> &mut toml_edit::Table {
+    ensure_toml_table(&mut doc["mcp_servers"])
+}
+
+/// Does the document already carry an explicit `[mcp_servers]` header with a
+/// `#` comment on it? An implicit table emits no header line, so making the
+/// table implicit would throw that comment away, the exact loss this path exists
+/// to prevent (SBS-884). Files with a bare header keep the old collapsed
+/// `[mcp_servers.name]` shape.
+fn toml_keeps_servers_header(doc: &toml_edit::DocumentMut) -> bool {
+    let Some(table) = doc.get("mcp_servers").and_then(|item| item.as_table()) else {
+        return false;
+    };
+    if table.is_implicit() {
+        return false;
+    }
+    let decor = table.decor();
+    [decor.prefix(), decor.suffix()]
+        .into_iter()
+        .flatten()
+        .filter_map(|raw| raw.as_str())
+        .any(|text| text.contains('#'))
+}
+
+/// Line-scan state for locating top-level YAML mapping keys without expanding
+/// anchors or dropping comments outside the rewritten node (SBS-884).
+#[derive(Default)]
+struct YamlLineState {
+    in_double: bool,
+    in_single: bool,
+    escape: bool,
+    flow_depth: i32,
+    /// Indent of the key that opened a `|` / `>` block scalar. Lines indented
+    /// further belong to the scalar, so a nested `extensions:` must not look
+    /// like a top-level key.
+    block_scalar_indent: Option<usize>,
+}
+
+/// Byte length of a line's YAML indentation.
+///
+/// Bytes, not characters, because callers use the result as a slice index.
+/// `char::is_whitespace` also matches multi-byte whitespace such as U+00A0 and
+/// U+3000, so a character count is smaller than the byte offset of the first
+/// content byte and the slice lands mid-character (panic). Only space and tab
+/// count: YAML indents with spaces, and everything else is content.
+fn yaml_leading_indent(line: &str) -> usize {
+    line.bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count()
+}
+
+fn yaml_is_doc_marker(line: &str) -> bool {
+    let t = line.trim_end();
+    t == "---"
+        || t == "..."
+        || t.starts_with("--- ")
+        || t.starts_with("---\t")
+        || t.starts_with("---#")
+        || t.starts_with("... ")
+        || t.starts_with("...\t")
+        || t.starts_with("...#")
+}
+
+fn yaml_is_seq_item(line: &str) -> bool {
+    let t = line.trim_start();
+    t == "-"
+        || t.starts_with("- ")
+        || t.starts_with("-\t")
+        || t.starts_with("-[")
+        || t.starts_with("-{")
+}
+
+fn yaml_is_block_scalar_header(s: &str) -> bool {
+    let b = s.as_bytes();
+    if !matches!(b.first(), Some(b'|' | b'>')) {
+        return false;
+    }
+    let mut i = 1;
+    while i < b.len() && matches!(b[i], b'+' | b'-' | b'0'..=b'9') {
+        i += 1;
+    }
+    i == b.len() || b[i].is_ascii_whitespace() || b[i] == b'#'
+}
+
+/// Skip YAML `&anchor`, `*alias`, and `!tag` prefixes that can sit between `:`
+/// and the real value (`key: &foo |`, `key: !!str bar`).
+fn yaml_skip_value_prefixes(s: &str) -> &str {
+    let mut rest = s.trim_start();
+    loop {
+        if rest.starts_with('&') || rest.starts_with('*') || rest.starts_with('!') {
+            let token_end = rest
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || c == '#'
+                        || c == ','
+                        || c == '{'
+                        || c == '['
+                        || c == '}'
+                        || c == ']'
+                })
+                .unwrap_or(rest.len());
+            if token_end == 0 {
+                return rest;
+            }
+            rest = rest[token_end..].trim_start();
+            continue;
+        }
+        return rest;
+    }
+}
+
+/// The `&anchor` token defined on a value, if any (`key: &exts`, `key: !!map &exts`).
+/// Returned with its `&` so a rewrite can re-emit it verbatim.
+fn yaml_value_anchor(s: &str) -> Option<&str> {
+    let mut rest = s.trim_start();
+    loop {
+        if !rest.starts_with('&') && !rest.starts_with('!') {
+            return None;
+        }
+        let token_end = rest
+            .find(|c: char| {
+                c.is_whitespace()
+                    || c == '#'
+                    || c == ','
+                    || c == '{'
+                    || c == '['
+                    || c == '}'
+                    || c == ']'
+            })
+            .unwrap_or(rest.len());
+        if token_end <= 1 {
+            return None;
+        }
+        let token = &rest[..token_end];
+        if token.starts_with('&') {
+            return Some(token);
+        }
+        rest = rest[token_end..].trim_start();
+    }
+}
+
+fn yaml_scan_chars(state: &mut YamlLineState, text: &str) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if state.in_double {
+            if state.escape {
+                state.escape = false;
+            } else if c == '\\' {
+                state.escape = true;
+            } else if c == '"' {
+                state.in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        if state.in_single {
+            if c == '\'' {
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    i += 2;
+                    continue;
+                }
+                state.in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '#' {
+            break;
+        }
+        if c == '"' {
+            state.in_double = true;
+            i += 1;
+            continue;
+        }
+        if c == '\'' {
+            state.in_single = true;
+            i += 1;
+            continue;
+        }
+        if c == '{' || c == '[' {
+            state.flow_depth += 1;
+            i += 1;
+            continue;
+        }
+        if (c == '}' || c == ']') && state.flow_depth > 0 {
+            state.flow_depth -= 1;
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn yaml_scan_after_colon(state: &mut YamlLineState, rest: &str, key_indent: usize) {
+    let rest = yaml_skip_value_prefixes(rest);
+    if yaml_is_block_scalar_header(rest) {
+        state.block_scalar_indent = Some(key_indent);
+        return;
+    }
+    yaml_scan_chars(state, rest);
+}
+
+fn yaml_unquote_double(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Split a YAML mapping line into (unquoted key, text after `:`). Returns
+/// `None` for comments, document markers, and sequence items.
+fn split_yaml_mapping_key(line: &str) -> Option<(String, &str)> {
+    let line = line.trim_end_matches(['\n', '\r']);
+    if line.is_empty()
+        || line.starts_with('#')
+        || yaml_is_doc_marker(line)
+        || yaml_is_seq_item(line)
+    {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    if bytes.first() == Some(&b'"') {
+        let mut i = 1;
+        let mut escape = false;
+        while i < bytes.len() {
+            if escape {
+                escape = false;
+                i += 1;
+                continue;
+            }
+            if bytes[i] == b'\\' {
+                escape = true;
+                i += 1;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                let key = yaml_unquote_double(&line[1..i]);
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b':' {
+                    return Some((key, &line[j + 1..]));
+                }
+                return None;
+            }
+            i += 1;
+        }
+        return None;
+    }
+    if bytes.first() == Some(&b'\'') {
+        let mut i = 1;
+        while i < bytes.len() {
+            if bytes[i] == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                let key = line[1..i].replace("''", "'");
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b':' {
+                    return Some((key, &line[j + 1..]));
+                }
+                return None;
+            }
+            i += 1;
+        }
+        return None;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            let after = i + 1;
+            if after == bytes.len() || bytes[after].is_ascii_whitespace() || bytes[after] == b'#' {
+                let key = line[..i].trim();
+                if key.is_empty() {
+                    return None;
+                }
+                return Some((key.to_string(), &line[after..]));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Locate each top-level block-mapping key and the byte span of its value.
+/// Column-0 comments, `---` markers, and keys inside `|`/`>` scalars are not keys.
+fn top_level_yaml_key_spans(src: &str) -> Vec<(String, usize, usize)> {
+    let (bom_len, src) = match src.strip_prefix('\u{feff}') {
+        Some(rest) => ('\u{feff}'.len_utf8(), rest),
+        None => (0, src),
+    };
+    let mut spans = Vec::new();
+    let mut state = YamlLineState::default();
+    let mut current: Option<(String, usize)> = None;
+    let mut last_value_end = 0usize;
+    let mut offset = 0usize;
+    for line in src.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        let line_end = offset;
+        let stripped = line.trim_end_matches(['\n', '\r']);
+        let indent = yaml_leading_indent(stripped);
+        let content = &stripped[indent.min(stripped.len())..];
+        let at_col0 = indent == 0 && !content.is_empty();
+
+        if let Some(parent_indent) = state.block_scalar_indent {
+            if !content.is_empty() && indent <= parent_indent {
+                state.block_scalar_indent = None;
+            } else {
+                last_value_end = line_end;
+                continue;
+            }
+        }
+
+        if state.in_double || state.in_single || state.flow_depth > 0 {
+            yaml_scan_chars(&mut state, stripped);
+            last_value_end = line_end;
+            continue;
+        }
+
+        if content.is_empty() {
+            continue;
+        }
+
+        if at_col0 && content.starts_with('#') {
+            if let Some((k, start)) = current.take() {
+                spans.push((k, start, last_value_end.max(start)));
+            }
+            continue;
+        }
+        if at_col0 && yaml_is_doc_marker(content) {
+            if let Some((k, start)) = current.take() {
+                spans.push((k, start, last_value_end.max(start)));
+            }
+            continue;
+        }
+        if at_col0 {
+            if let Some((key, rest)) = split_yaml_mapping_key(content) {
+                if let Some((k, start)) = current.take() {
+                    spans.push((k, start, last_value_end.max(start)));
+                }
+                current = Some((key, line_start));
+                last_value_end = line_end;
+                yaml_scan_after_colon(&mut state, rest, 0);
+                continue;
+            }
+            if yaml_is_seq_item(content) {
+                last_value_end = line_end;
+                yaml_scan_chars(&mut state, stripped);
+                continue;
+            }
+        }
+
+        last_value_end = line_end;
+        if let Some((_, rest)) = split_yaml_mapping_key(content) {
+            yaml_scan_after_colon(&mut state, rest, indent);
+        } else {
+            yaml_scan_chars(&mut state, stripped);
+        }
+    }
+    if let Some((k, start)) = current {
+        spans.push((k, start, last_value_end.max(start)));
+    }
+    spans
+        .into_iter()
+        .map(|(k, start, end)| (k, start + bom_len, end + bom_len))
+        .collect()
+}
+
+fn count_top_level_yaml_key(src: &str, key: &str) -> usize {
+    top_level_yaml_key_spans(src)
+        .into_iter()
+        .filter(|(k, _, _)| k == key)
+        .count()
+}
+
+/// Reject duplicate top-level occurrences of `key` in YAML text.
+///
+/// Duplicate keys are ambiguous: a span rewrite only replaces the first, so a
+/// later effective entry can stay stale. Callers must not fall back to
+/// `serde_yaml::to_string` when this fails — the file must remain unchanged
+/// (SBS-884, matching #555).
+fn reject_duplicate_top_level_yaml_key(original: &str, key: &str) -> Result<(), String> {
+    let n = count_top_level_yaml_key(original, key);
+    if n > 1 {
+        return Err(format!(
+            "malformed config: top-level key '{key}' appears {n} times; refusing to write"
+        ));
+    }
+    Ok(())
+}
+
+/// Indentation the replacement block should give the key's children, taken from
+/// the node already in the file so a 4-space config does not get one node
+/// reformatted to serde_yaml's 2 spaces (SBS-884 review). `span` is the existing
+/// text of the key, first line included. Levels below the first keep
+/// serde_yaml's own step: re-indenting emitted text per level would break
+/// sequence-item alignment and block-scalar content.
+fn yaml_child_indent(span: &str) -> String {
+    const DEFAULT: &str = "  ";
+    for line in span.split_inclusive('\n').skip(1) {
+        let stripped = line.trim_end_matches(['\n', '\r']);
+        let indent = yaml_leading_indent(stripped);
+        let content = &stripped[indent..];
+        if content.is_empty() || content.starts_with('#') {
+            continue;
+        }
+        let ws = &stripped[..indent];
+        // A tab never indents valid YAML, and a 0-indent child is a sequence
+        // written at the parent's column, which a mapping cannot reuse.
+        if (1..=8).contains(&ws.len()) && ws.bytes().all(|b| b == b' ') {
+            return ws.to_string();
+        }
+        break;
+    }
+    DEFAULT.to_string()
+}
+
+/// Render `key: <value>` as a YAML block (mapping/sequence nested under the key).
+/// `anchor` is re-emitted on the key line when the key being replaced defined one.
+fn format_yaml_key_block(
+    key: &str,
+    value: &serde_yaml::Value,
+    anchor: Option<&str>,
+    indent: &str,
+) -> Result<String, String> {
+    let head = match anchor {
+        Some(anchor) => format!("{key}: {anchor}"),
+        None => format!("{key}:"),
+    };
+    match value {
+        serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_) => {
+            let body = serde_yaml::to_string(value).map_err(|e| e.to_string())?;
+            let body = body.trim_end_matches('\n');
+            if body.is_empty() || body == "{}" || body == "[]" {
+                return Ok(format!("{head} {body}\n"));
+            }
+            let mut out = format!("{head}\n");
+            for line in body.lines() {
+                if line.is_empty() {
+                    out.push('\n');
+                } else {
+                    out.push_str(indent);
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            Ok(out)
+        }
+        serde_yaml::Value::Null => Ok(format!("{head} null\n")),
+        other => {
+            let body = serde_yaml::to_string(other).map_err(|e| e.to_string())?;
+            Ok(format!("{head} {}\n", body.trim()))
+        }
+    }
+}
+
+/// Rewrite a single top-level mapping key in `original` YAML text, preserving
+/// comments, anchors, aliases, and formatting of everything else. Used so
+/// Goose/Hermes/Continue Connect no longer strips user annotations (SBS-884).
+///
+/// Fails if `key` appears more than once at the top level (ambiguous rewrite).
+fn rewrite_yaml_key_preserving(
+    original: &str,
+    key: &str,
+    new_value: &serde_yaml::Value,
+) -> Result<String, String> {
+    let spans = top_level_yaml_key_spans(original);
+    let hits: Vec<&(String, usize, usize)> = spans.iter().filter(|(k, _, _)| k == key).collect();
+    if hits.len() > 1 {
+        return Err(format!(
+            "malformed config: top-level key '{key}' appears {} times; refusing to write",
+            hits.len()
+        ));
+    }
+    if let Some((_, start, end)) = hits.first() {
+        let span = &original[*start..*end];
+        // An anchor defined on this key is referenced by `*alias` elsewhere in the
+        // file. Replacing the key line without it leaves every alias undefined and
+        // the config no longer parses, so carry it onto the replacement (SBS-884).
+        // A tag on the key line is dropped on purpose: it described the value we
+        // are replacing, not the new one.
+        let anchor = split_yaml_mapping_key(span.lines().next().unwrap_or_default())
+            .and_then(|(_, rest)| yaml_value_anchor(rest));
+        let block = format_yaml_key_block(key, new_value, anchor, &yaml_child_indent(span))?;
+        let mut out = String::with_capacity(original.len() + block.len());
+        out.push_str(&original[..*start]);
+        out.push_str(&block);
+        out.push_str(&original[*end..]);
+        Ok(out)
+    } else {
+        let block = format_yaml_key_block(key, new_value, None, "  ")?;
+        let mut out = original.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&block);
+        Ok(out)
+    }
+}
+
+/// Serialize `root` for disk. When `original` is present, surgically rewrite
+/// only `changed_key` so comments and YAML anchors outside that key survive.
+/// Pretty-print is used only for new/empty files — an existing parseable file
+/// is never replaced with a full `serde_yaml::to_string` dump (that is SBS-884).
+///
+/// Duplicate top-level keys for `changed_key` are a hard error (no pretty fallback)
+/// so the existing file is left untouched.
+fn atomic_write_yaml_config(
+    path: &Path,
+    original: Option<&str>,
+    root: &serde_yaml::Value,
+    changed_key: &str,
+) -> Result<(), String> {
+    let pretty = || serde_yaml::to_string(root).map_err(|e| e.to_string());
+
+    let out = match (original, root.get(changed_key)) {
+        (Some(src), Some(val)) if !src.trim().is_empty() => {
+            reject_duplicate_top_level_yaml_key(src, changed_key)?;
+            rewrite_yaml_key_preserving(src, changed_key, val)?
+        }
+        _ => pretty()?,
+    };
+    atomic_write(path, &out)
+}
+
+fn parse_existing_yaml_content(content: &str) -> Result<serde_yaml::Value, String> {
+    if content.trim().is_empty() {
+        return Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    }
+    serde_yaml::from_str(content).map_err(|e| {
+        format!("Could not parse the existing config.yaml ({e}); leaving it untouched.")
+    })
+}
+
+/// Read an existing YAML config and keep the original text so the write can
+/// surgically replace one key instead of pretty-printing the whole file.
+fn read_existing_yaml_with_source(
+    path: &Path,
+) -> Result<(Option<String>, serde_yaml::Value), String> {
+    if !path.exists() {
+        return Ok((None, serde_yaml::Value::Mapping(serde_yaml::Mapping::new())));
+    }
+    let content = read_config_file(path)?;
+    let value = parse_existing_yaml_content(&content)?;
+    Ok((Some(content), value))
+}
+
 fn validate_amp_settings_shape(root: &serde_json::Value) -> Result<(), String> {
     let object = root
         .as_object()
@@ -3287,7 +3933,10 @@ fn validate_crush_settings_shape(root: &serde_json::Value) -> Result<(), String>
     let object = root
         .as_object()
         .ok_or("Crush config root must be an object; leaving it untouched.")?;
-    if object.get("mcp").is_some_and(|servers| !servers.is_object()) {
+    if object
+        .get("mcp")
+        .is_some_and(|servers| !servers.is_object())
+    {
         return Err("'mcp' must be an object; leaving the Crush config untouched.".into());
     }
     Ok(())
@@ -3307,18 +3956,42 @@ fn write_crush_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> 
 }
 
 fn write_copilot_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    write_json_with(path, "mcpServers", servers, false, entry_to_json, false, true)
+    write_json_with(
+        path,
+        "mcpServers",
+        servers,
+        false,
+        entry_to_json,
+        false,
+        true,
+    )
 }
 
 fn write_droid_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    write_json_with(path, "mcpServers", servers, false, entry_to_droid_json, false, false)
+    write_json_with(
+        path,
+        "mcpServers",
+        servers,
+        false,
+        entry_to_droid_json,
+        false,
+        false,
+    )
 }
 
 /// Kimi Code's `mcp.json` is MCP-only (app settings live in config.toml).
 /// `read_existing_json` ignores the lenient flag and always errors on a parse
 /// failure; pass `true` anyway to match Qwen, the closest analogue.
 fn write_kimi_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    write_json_with(path, "mcpServers", servers, true, entry_to_kimi_json, false, false)
+    write_json_with(
+        path,
+        "mcpServers",
+        servers,
+        true,
+        entry_to_kimi_json,
+        false,
+        false,
+    )
 }
 
 fn write_json_with(
@@ -3380,10 +4053,10 @@ fn write_json_with_body(
         .map(|server| {
             let mut value = entry_to_value(server);
             if include_tools {
-                value.as_object_mut().unwrap().insert(
-                    "tools".into(),
-                    serde_json::json!(["*"]),
-                );
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("tools".into(), serde_json::json!(["*"]));
             }
             (server.name.clone(), value)
         })
@@ -3473,24 +4146,27 @@ fn write_opencode_json(path: &Path, servers: &[ServerEntry]) -> Result<(), Strin
 }
 
 fn write_toml(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    let mut root = if path.exists() {
-        let content = read_config_file(path)?;
-        read_existing_toml(&content)?
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-    if !root.is_table() {
-        root = toml::Value::Table(toml::map::Map::new());
+    let mut doc = load_toml_document(path)?;
+    let keep_header = toml_keeps_servers_header(&doc);
+    // Carry the old header's comments and blank lines onto the rebuilt table.
+    let decor = doc
+        .get("mcp_servers")
+        .and_then(|item| item.as_table())
+        .map(|table| table.decor().clone());
+    let mut servers_table = toml_edit::Table::new();
+    if let Some(decor) = decor {
+        *servers_table.decor_mut() = decor;
     }
-    let table = root.as_table_mut().unwrap();
-    let servers_table: toml::map::Map<String, toml::Value> = servers
-        .iter()
-        .map(|s| (s.name.clone(), entry_to_toml(s)))
-        .collect();
-    table.insert("mcp_servers".into(), toml::Value::Table(servers_table));
-
-    let out = toml::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    atomic_write(path, &out)
+    if !servers.is_empty() && !keep_header {
+        // Implicit so we emit `[mcp_servers.name]` rather than a `[mcp_servers]`
+        // wrapper, the same shape Codex already ships.
+        servers_table.set_implicit(true);
+    }
+    for s in servers {
+        servers_table.insert(&s.name, toml_value_to_item(&entry_to_toml(s)));
+    }
+    doc["mcp_servers"] = toml_edit::Item::Table(servers_table);
+    atomic_write(path, &doc.to_string())
 }
 
 // --- Goose: YAML config.yaml with a top-level `extensions` map ---
@@ -3584,22 +4260,6 @@ fn entry_to_goose_yaml(entry: &ServerEntry) -> serde_yaml::Value {
     serde_yaml::to_value(&v).unwrap_or(serde_yaml::Value::Null)
 }
 
-/// Read an existing config.yaml we're about to modify. Like the JSON lenient path,
-/// an unparseable non-empty file is an ERROR, never replaced - config.yaml also
-/// holds the user's model settings and other extensions, so we must not wipe it.
-fn read_existing_yaml(path: &Path) -> Result<serde_yaml::Value, String> {
-    if !path.exists() {
-        return Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-    }
-    let content = read_config_file(path)?;
-    if content.trim().is_empty() {
-        return Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
-    }
-    serde_yaml::from_str(&content).map_err(|e| {
-        format!("Could not parse the existing config.yaml ({e}); leaving it untouched.")
-    })
-}
-
 fn yaml_extensions_mut(root: &mut serde_yaml::Value) -> &mut serde_yaml::Mapping {
     if !root.is_mapping() {
         *root = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
@@ -3616,7 +4276,7 @@ fn yaml_extensions_mut(root: &mut serde_yaml::Value) -> &mut serde_yaml::Mapping
 }
 
 fn write_yaml_extensions(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    let mut root = read_existing_yaml(path)?;
+    let (original, mut root) = read_existing_yaml_with_source(path)?;
     let exts = yaml_extensions_mut(&mut root);
     // Replace only definitions Toolport can actually import as MCP servers.
     // Goose builtins/platform extensions and unknown shapes share this map but
@@ -3646,12 +4306,11 @@ fn write_yaml_extensions(path: &Path, servers: &[ServerEntry]) -> Result<(), Str
             entry_to_goose_yaml(s),
         );
     }
-    let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
-    atomic_write(path, &out)
+    atomic_write_yaml_config(path, original.as_deref(), &root, "extensions")
 }
 
 fn edit_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    let mut root = read_existing_yaml(path)?;
+    let (original, mut root) = read_existing_yaml_with_source(path)?;
     let exts = yaml_extensions_mut(&mut root);
     let key = serde_yaml::Value::String(GATEWAY_ENTRY_NAME.into());
     exts.retain(|name, definition| {
@@ -3665,8 +4324,7 @@ fn edit_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), Str
     if let Some(entry) = entry {
         exts.insert(key, entry_to_goose_yaml(entry));
     }
-    let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
-    atomic_write(path, &out)
+    atomic_write_yaml_config(path, original.as_deref(), &root, "extensions")
 }
 
 /// Parse Continue's `mcpServers` list into servers. Entries may be local stdio
@@ -3840,7 +4498,7 @@ fn continue_servers_mut(root: &mut serde_yaml::Value) -> &mut Vec<serde_yaml::Va
 }
 
 fn write_continue_yaml_servers(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    let mut root = read_existing_yaml(path)?;
+    let (original, mut root) = read_existing_yaml_with_source(path)?;
 
     let list = continue_servers_mut(&mut root);
 
@@ -3850,13 +4508,11 @@ fn write_continue_yaml_servers(path: &Path, servers: &[ServerEntry]) -> Result<(
         list.push(entry_to_continue_yaml(server));
     }
 
-    let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
-
-    atomic_write(path, &out)
+    atomic_write_yaml_config(path, original.as_deref(), &root, "mcpServers")
 }
 
 fn edit_continue_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    let mut root = read_existing_yaml(path)?;
+    let (original, mut root) = read_existing_yaml_with_source(path)?;
 
     let servers = continue_servers_mut(&mut root);
 
@@ -3876,9 +4532,7 @@ fn edit_continue_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Resul
         servers.push(entry_to_continue_yaml(entry));
     }
 
-    let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
-
-    atomic_write(path, &out)
+    atomic_write_yaml_config(path, original.as_deref(), &root, "mcpServers")
 }
 
 // ---------------------------------------------------------------------------
@@ -4012,13 +4666,6 @@ fn entry_to_hermes_yaml(entry: &ServerEntry) -> serde_yaml::Value {
     serde_yaml::Value::Mapping(cfg)
 }
 
-/// Read a Hermes config.yaml we're about to modify. Same contract as
-/// `read_existing_yaml`: an unparseable non-empty file is an ERROR, never
-/// replaced — config.yaml also holds the user's model and toolsets.
-fn read_existing_hermes_yaml(path: &Path) -> Result<serde_yaml::Value, String> {
-    read_existing_yaml(path)
-}
-
 fn hermes_mcp_servers_mut(root: &mut serde_yaml::Value) -> &mut serde_yaml::Mapping {
     if !root.is_mapping() {
         *root = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
@@ -4035,19 +4682,18 @@ fn hermes_mcp_servers_mut(root: &mut serde_yaml::Value) -> &mut serde_yaml::Mapp
 }
 
 fn write_hermes_yaml_servers(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    let mut root = read_existing_hermes_yaml(path)?;
+    let (original, mut root) = read_existing_yaml_with_source(path)?;
     let mcp_servers = hermes_mcp_servers_mut(&mut root);
     mcp_servers.clear();
     for entry in servers {
         let name_val = serde_yaml::Value::String(entry.name.clone());
         mcp_servers.insert(name_val, entry_to_hermes_yaml(entry));
     }
-    let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
-    atomic_write(path, &out)
+    atomic_write_yaml_config(path, original.as_deref(), &root, "mcp_servers")
 }
 
 fn edit_hermes_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    let mut root = read_existing_hermes_yaml(path)?;
+    let (original, mut root) = read_existing_yaml_with_source(path)?;
     let mcp_servers = hermes_mcp_servers_mut(&mut root);
     let key = serde_yaml::Value::String(GATEWAY_ENTRY_NAME.into());
     mcp_servers.retain(|name, definition| {
@@ -4061,8 +4707,7 @@ fn edit_hermes_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<
     if let Some(entry) = entry {
         mcp_servers.insert(key, entry_to_hermes_yaml(entry));
     }
-    let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
-    atomic_write(path, &out)
+    atomic_write_yaml_config(path, original.as_deref(), &root, "mcp_servers")
 }
 
 /// Write a server set into a client's config, backing up the existing file first
@@ -4498,7 +5143,15 @@ fn edit_copilot_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result
 }
 
 fn edit_droid_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    edit_json_gateway_with(path, "mcpServers", entry, false, Some(entry_to_droid_json), false, false)
+    edit_json_gateway_with(
+        path,
+        "mcpServers",
+        entry,
+        false,
+        Some(entry_to_droid_json),
+        false,
+        false,
+    )
 }
 
 fn edit_json_gateway_with(
@@ -4583,10 +5236,10 @@ fn edit_json_gateway_body(
             entry_to_json(entry)
         };
         if include_tools {
-            value.as_object_mut().unwrap().insert(
-                "tools".into(),
-                serde_json::json!(["*"]),
-            );
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert("tools".into(), serde_json::json!(["*"]));
         }
         servers.insert(GATEWAY_ENTRY_NAME.to_string(), value);
     }
@@ -4620,41 +5273,37 @@ fn edit_opencode_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(),
 }
 
 fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    let mut root = if path.exists() {
-        let content = read_config_file(path)?;
-        read_existing_toml(&content)?
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-    if !root.is_table() {
-        root = toml::Value::Table(toml::map::Map::new());
+    let mut doc = load_toml_document(path)?;
+    let keep_header = toml_keeps_servers_header(&doc);
+    let servers = toml_mcp_servers_mut(&mut doc);
+    let doomed: Vec<String> = servers
+        .iter()
+        .filter(|(name, definition)| {
+            let command = definition.get("command").and_then(|value| value.as_str());
+            gateway_identity_matches(name, name, command)
+        })
+        .map(|(name, _)| name.to_string())
+        .collect();
+    for name in doomed {
+        servers.remove(&name);
     }
-    let table = root.as_table_mut().unwrap();
-    if !table
-        .get("mcp_servers")
-        .map(|v| v.is_table())
-        .unwrap_or(false)
-    {
-        table.insert(
-            "mcp_servers".to_string(),
-            toml::Value::Table(toml::map::Map::new()),
+    if let Some(entry) = entry {
+        servers.insert(
+            GATEWAY_ENTRY_NAME,
+            toml_value_to_item(&entry_to_toml(entry)),
         );
     }
-    let servers = table
-        .get_mut("mcp_servers")
-        .unwrap()
-        .as_table_mut()
-        .unwrap();
-    servers.retain(|name, definition| {
-        let command = definition.get("command").and_then(|value| value.as_str());
-        !gateway_identity_matches(name, name, command)
-    });
-    if let Some(entry) = entry {
-        servers.insert(GATEWAY_ENTRY_NAME.to_string(), entry_to_toml(entry));
+    if servers.is_empty() || keep_header {
+        // Keep an explicit empty table so uninstall still leaves `mcp_servers`
+        // present, matching the previous toml::Value insert-if-missing path.
+        // An existing commented header stays explicit too, otherwise the comment
+        // has no header line left to hang on.
+        servers.set_implicit(false);
+    } else {
+        servers.set_implicit(true);
     }
 
-    let out = toml::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    atomic_write(path, &out)
+    atomic_write(path, &doc.to_string())
 }
 
 /// Clients whose JSON config file holds their ENTIRE application state (project
@@ -4684,18 +5333,12 @@ fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<Wri
     // we put on disk (SOU-406). Strip secrets for the registry record.
     let managed = entry.map(ManagedEntry::from_gateway_entry);
     match def.format {
-        Format::JsonMcpServers => {
-            edit_json_gateway(&path, "mcpServers", entry, lenient)?
-        }
+        Format::JsonMcpServers => edit_json_gateway(&path, "mcpServers", entry, lenient)?,
         Format::JsonCopilotMcpServers => edit_copilot_json_gateway(&path, entry)?,
         Format::JsonDroidMcpServers => edit_droid_json_gateway(&path, entry)?,
-        Format::JsonAmpMcpServers => {
-            edit_json_gateway(&path, "amp.mcpServers", entry, true)?
-        }
+        Format::JsonAmpMcpServers => edit_json_gateway(&path, "amp.mcpServers", entry, true)?,
         Format::JsonQwenMcpServers => edit_json_gateway(&path, "mcpServers", entry, true)?,
-        Format::JsonKimiMcpServers => {
-            edit_json_gateway(&path, "mcpServers", entry, true)?
-        }
+        Format::JsonKimiMcpServers => edit_json_gateway(&path, "mcpServers", entry, true)?,
         Format::JsonServers => edit_json_gateway(&path, "servers", entry, lenient)?,
         Format::JsonMcp => edit_crush_gateway(&path, entry)?,
         Format::JsonOpenCodeMcp => edit_opencode_gateway(&path, entry)?,
@@ -5470,7 +6113,10 @@ mod tests {
         let dir = temp_path("claude-secondary-repair");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let current = dir.join("toolport-gateway-1.13.0").to_string_lossy().into_owned();
+        let current = dir
+            .join("toolport-gateway-1.13.0")
+            .to_string_lossy()
+            .into_owned();
         std::fs::write(&current, b"binary").unwrap();
 
         let write = |name: &str, body: &str| {
@@ -5497,7 +6143,10 @@ mod tests {
             "custom.json",
             r#"{"mcpServers":{"toolport":{"command":"npx","args":["-y","something"]}}}"#,
         );
-        let no_gateway = write("none.json", r#"{"mcpServers":{"sentry":{"command":"npx"}}}"#);
+        let no_gateway = write(
+            "none.json",
+            r#"{"mcpServers":{"sentry":{"command":"npx"}}}"#,
+        );
         let unparseable = write("broken.json", "{ this is not json");
         let missing = dir.join("does-not-exist.json");
 
@@ -6556,10 +7205,7 @@ bad = "not-a-table"
         let servers = root["mcpServers"].as_object().unwrap();
         assert!(servers.contains_key(GATEWAY_ENTRY_NAME));
         assert!(servers.contains_key("filesystem"));
-        assert_eq!(
-            servers["filesystem"]["env"]["HOME"],
-            "/home/user"
-        );
+        assert_eq!(servers["filesystem"]["env"]["HOME"], "/home/user");
         assert_eq!(
             servers[GATEWAY_ENTRY_NAME]["env"][crate::brand::PROFILE],
             "Work"
@@ -7003,9 +7649,8 @@ bad = "not-a-table"
         // disagree on the path while both still name OUR gateway. Reading that as
         // Customized makes repoint_stale_gateways skip the client forever, which
         // is how six clients on a real machine sat on a superseded gateway.
-        let record = managed_record(
-            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe",
-        );
+        let record =
+            managed_record(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe");
         let drifted = detected_server(
             r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0-140f0e8d8cfa.exe",
         );
@@ -7021,9 +7666,8 @@ bad = "not-a-table"
         // The other side of the same rule: #487 must keep working. A record exists,
         // but the command now names something that is not our binary, so the user
         // has taken the entry over and we stand down.
-        let record = managed_record(
-            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe",
-        );
+        let record =
+            managed_record(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe");
         for taken_over in ["npx", "docker", r"C:\Users\me\bin\my-wrapper.cmd"] {
             assert_eq!(
                 resolve_entry_state(&[detected_server(taken_over)], Some(&record)),
@@ -7037,9 +7681,8 @@ bad = "not-a-table"
     fn a_drifted_path_with_changed_args_is_still_customized() {
         // Only the command path is forgiven. Anything else the user touched still
         // counts as customization.
-        let record = managed_record(
-            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe",
-        );
+        let record =
+            managed_record(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe");
         let mut server = detected_server(
             r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0-140f0e8d8cfa.exe",
         );
@@ -7539,10 +8182,8 @@ command = "npx"
 
     #[test]
     fn junie_install_marker_controls_detection_without_config() {
-        let marker = std::env::temp_dir().join(format!(
-            "toolport-junie-marker-{}",
-            std::process::id()
-        ));
+        let marker =
+            std::env::temp_dir().join(format!("toolport-junie-marker-{}", std::process::id()));
         std::fs::remove_dir_all(&marker).ok();
         let config = marker.join("mcp").join("mcp.json");
 
@@ -8069,6 +8710,195 @@ command = "npx"
         assert!(root["context_servers"].get("Toolport").is_some());
     }
 
+    /// SBS-884: a `#` comment and an `&anchor` sitting outside `extensions`
+    /// must survive a surgical YAML rewrite. Pretty-printing the whole file
+    /// expands the alias and drops both.
+    #[test]
+    fn rewrite_yaml_key_preserving_keeps_unrelated_text() {
+        let original = r#"# Goose config
+GOOSE_MODEL: gpt-4o
+defaults: &anchor
+  timeout: 300
+  enabled: true
+extensions:
+  fetch:
+    cmd: uvx
+"#;
+        let new_exts = serde_yaml::from_str::<serde_yaml::Value>(
+            "fetch:\n  cmd: uvx\ntoolport:\n  cmd: toolport-gateway\n",
+        )
+        .unwrap();
+        let rewritten = rewrite_yaml_key_preserving(original, "extensions", &new_exts).unwrap();
+        assert!(
+            rewritten.contains("# Goose config"),
+            "file-level comment must survive: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("&anchor"),
+            "anchor outside extensions must survive: {rewritten}"
+        );
+        assert!(rewritten.contains("GOOSE_MODEL: gpt-4o"));
+        assert!(rewritten.contains("toolport"));
+        let root: serde_yaml::Value = serde_yaml::from_str(&rewritten).unwrap();
+        assert!(root["extensions"].get("toolport").is_some());
+        assert!(root.get("defaults").is_some());
+    }
+
+    /// SBS-884: a `|` block scalar can contain a line that looks like
+    /// `extensions:`; that line is not a top-level key and must not be rewritten.
+    #[test]
+    fn rewrite_yaml_key_preserving_ignores_keys_inside_block_scalars() {
+        let original = r#"prompt: |
+  extensions:
+    fake: true
+extensions:
+  real:
+    cmd: uvx
+"#;
+        let new_exts =
+            serde_yaml::from_str::<serde_yaml::Value>("real:\n  cmd: uvx\nextra: 1\n").unwrap();
+        let rewritten = rewrite_yaml_key_preserving(original, "extensions", &new_exts).unwrap();
+        assert!(
+            rewritten.contains("  extensions:\n    fake: true"),
+            "text inside a block scalar must stay: {rewritten}"
+        );
+        assert!(rewritten.contains("extra: 1") || rewritten.contains("extra:1"));
+        let root: serde_yaml::Value = serde_yaml::from_str(&rewritten).unwrap();
+        assert_eq!(
+            root["prompt"].as_str().map(str::trim),
+            Some("extensions:\n  fake: true")
+        );
+        assert!(root["extensions"].get("extra").is_some());
+    }
+
+    /// SBS-884 review: `yaml_leading_indent` counted characters while the caller
+    /// used the count as a byte index. A U+00A0 in a block scalar's indentation
+    /// made the slice land mid-character and panicked before this fix.
+    #[test]
+    fn rewrite_yaml_key_preserving_survives_multi_byte_whitespace() {
+        let original = concat!(
+            "# Goose config\n",
+            "instructions: |\n",
+            "  \u{a0}review the plan\n",
+            "  then run it\n",
+            "extensions:\n",
+            "  fetch:\n",
+            "    cmd: uvx\n",
+        );
+        // The fixture is valid YAML, so it really can reach the line scanner.
+        serde_yaml::from_str::<serde_yaml::Value>(original).unwrap();
+        let new_exts = serde_yaml::from_str::<serde_yaml::Value>(
+            "fetch:\n  cmd: uvx\ntoolport:\n  cmd: toolport-gateway\n",
+        )
+        .unwrap();
+        let rewritten = rewrite_yaml_key_preserving(original, "extensions", &new_exts).unwrap();
+        let root: serde_yaml::Value = serde_yaml::from_str(&rewritten).unwrap();
+        assert!(root["extensions"].get("toolport").is_some());
+        assert!(
+            root["instructions"]
+                .as_str()
+                .is_some_and(|s| s.contains('\u{a0}')),
+            "block scalar content must be untouched: {rewritten}"
+        );
+        assert!(rewritten.contains("# Goose config"));
+    }
+
+    /// SBS-884 review: an anchor on the rewritten key is referenced by aliases
+    /// elsewhere. Dropping it leaves `*exts` undefined and the config unloadable.
+    #[test]
+    fn rewrite_yaml_key_preserving_keeps_anchor_on_the_rewritten_key() {
+        let original = concat!(
+            "extensions: &exts\n",
+            "  fetch:\n",
+            "    cmd: uvx\n",
+            "shared:\n",
+            "  copy: *exts\n",
+        );
+        let new_exts = serde_yaml::from_str::<serde_yaml::Value>(
+            "fetch:\n  cmd: uvx\ntoolport:\n  cmd: toolport-gateway\n",
+        )
+        .unwrap();
+        let rewritten = rewrite_yaml_key_preserving(original, "extensions", &new_exts).unwrap();
+        assert!(
+            rewritten.contains("extensions: &exts"),
+            "anchor on the rewritten key must survive: {rewritten}"
+        );
+        // The real failure was an unparseable file, so parsing is the assertion
+        // that matters: an undefined alias is a hard error in serde_yaml.
+        let root: serde_yaml::Value = serde_yaml::from_str(&rewritten).unwrap();
+        assert!(root["extensions"].get("toolport").is_some());
+        assert!(root["shared"]["copy"].get("toolport").is_some());
+    }
+
+    /// SBS-884 review: a 4-space config must not get one node reformatted to
+    /// serde_yaml's 2 spaces.
+    #[test]
+    fn rewrite_yaml_key_preserving_matches_existing_indent_width() {
+        let original = concat!(
+            "extensions:\n",
+            "    fetch:\n",
+            "        cmd: uvx\n",
+            "other: 1\n",
+        );
+        let new_exts = serde_yaml::from_str::<serde_yaml::Value>(
+            "fetch:\n  cmd: uvx\ntoolport:\n  cmd: toolport-gateway\n",
+        )
+        .unwrap();
+        let rewritten = rewrite_yaml_key_preserving(original, "extensions", &new_exts).unwrap();
+        assert!(
+            rewritten.contains("\n    toolport:"),
+            "children must keep the file's 4-space indent: {rewritten}"
+        );
+        let root: serde_yaml::Value = serde_yaml::from_str(&rewritten).unwrap();
+        assert!(root["extensions"].get("toolport").is_some());
+        assert_eq!(root["other"].as_i64(), Some(1));
+    }
+
+    #[test]
+    fn rewrite_yaml_key_preserving_rejects_duplicate_top_level_keys() {
+        let original = r#"# keep me
+extensions:
+  a:
+    cmd: old-a
+other: 1
+extensions:
+  b:
+    cmd: old-b
+"#;
+        let err = rewrite_yaml_key_preserving(
+            original,
+            "extensions",
+            &serde_yaml::from_str::<serde_yaml::Value>("toolport:\n  cmd: x\n").unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("appears") && err.contains("2"), "got: {err}");
+    }
+
+    #[test]
+    fn atomic_write_yaml_config_rejects_duplicate_top_level_keys() {
+        let path = temp_path("dup-extensions.yaml");
+        let original = r#"# keep me
+extensions:
+  a:
+    cmd: old-a
+other: 1
+extensions:
+  b:
+    cmd: old-b
+"#;
+        std::fs::write(&path, original).unwrap();
+        let root: serde_yaml::Value =
+            serde_yaml::from_str("other: 1\nextensions:\n  toolport:\n    cmd: toolport-gateway\n")
+                .unwrap();
+        let err = atomic_write_yaml_config(&path, Some(original), &root, "extensions").unwrap_err();
+        assert!(
+            err.contains("malformed") && err.contains("extensions"),
+            "expected malformed duplicate-key error, got: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn atomic_write_json_config_rejects_duplicate_top_level_keys() {
         // Duplicate top-level mcpServers: rewriting only the first would leave a stale second.
@@ -8204,6 +9034,150 @@ command = "npx"
         std::fs::remove_file(&path).ok();
     }
 
+    /// SBS-884: `toml::to_string_pretty` dropped every `#` comment in Codex/Grok
+    /// `config.toml` on Connect and again on uninstall. Hash comments outside
+    /// `mcp_servers` must survive both writes.
+    #[test]
+    fn toml_connect_and_uninstall_preserve_hash_comments() {
+        let path = temp_path("toml-comments-connect");
+        std::fs::write(
+            &path,
+            r#"# Codex configuration
+model = "o3"  # default model
+approval_policy = "on-request"
+
+[profiles.work]
+model = "gpt-5"
+
+[mcp_servers.existing]
+command = "npx"
+"#,
+        )
+        .unwrap();
+
+        {
+            let entry = sample_gateway(None, "codex");
+            edit_toml_gateway(&path, Some(&entry))
+        }
+        .unwrap();
+        let connected = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            connected.contains("# Codex configuration"),
+            "file-level comment must survive Connect: {connected}"
+        );
+        assert!(
+            connected.contains("# default model"),
+            "inline comment on an unrelated key must survive Connect: {connected}"
+        );
+        let parsed: toml::Value = toml::from_str(&connected).unwrap();
+        assert_eq!(parsed.get("model").and_then(|v| v.as_str()), Some("o3"));
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get(GATEWAY_ENTRY_NAME))
+            .is_some());
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get("existing"))
+            .is_some());
+
+        edit_toml_gateway(&path, None).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("# Codex configuration"),
+            "file-level comment must survive uninstall: {after}"
+        );
+        assert!(
+            after.contains("# default model"),
+            "inline comment must survive uninstall: {after}"
+        );
+        let parsed: toml::Value = toml::from_str(&after).unwrap();
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get(GATEWAY_ENTRY_NAME))
+            .is_none());
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get("existing"))
+            .is_some());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SBS-884 review: a comment on the `[mcp_servers]` header itself only
+    /// survives while the table stays explicit. An implicit table emits no
+    /// header line, so both write paths dropped it.
+    #[test]
+    fn toml_preserves_mcp_servers_header_comment() {
+        let path = temp_path("toml-servers-header");
+        let original = r#"# Codex configuration
+model = "o3"
+
+# gateway servers live below
+[mcp_servers]
+
+[mcp_servers.existing]
+command = "npx"
+"#;
+        std::fs::write(&path, original).unwrap();
+
+        {
+            let entry = sample_gateway(None, "codex");
+            edit_toml_gateway(&path, Some(&entry))
+        }
+        .unwrap();
+        let connected = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            connected.contains("# gateway servers live below"),
+            "comment on the [mcp_servers] header must survive Connect: {connected}"
+        );
+        let parsed: toml::Value = toml::from_str(&connected).unwrap();
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get(GATEWAY_ENTRY_NAME))
+            .is_some());
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get("existing"))
+            .is_some());
+
+        // The inventory write path rebuilds the table from scratch, so it has to
+        // carry the header decor over too.
+        std::fs::write(&path, original).unwrap();
+        write_toml(&path, &[stdio("linear")]).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("# gateway servers live below"),
+            "comment on the [mcp_servers] header must survive write_toml: {written}"
+        );
+        let parsed: toml::Value = toml::from_str(&written).unwrap();
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|m| m.get("linear"))
+            .is_some());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SBS-884: inventory write (`write_toml`) used the same pretty-print path
+    /// and stripped comments even when it kept unrelated keys as data.
+    #[test]
+    fn toml_write_preserves_hash_comments() {
+        let path = temp_path("toml-comments-write");
+        std::fs::write(&path, "# keep this comment\nmodel = \"opus\"\n").unwrap();
+        write_toml(&path, &[stdio("linear")]).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("# keep this comment"),
+            "comment must survive write_toml: {content}"
+        );
+        let root: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(root.get("model").and_then(|v| v.as_str()), Some("opus"));
+        assert!(root
+            .get("mcp_servers")
+            .and_then(|v| v.as_table())
+            .map(|t| t.contains_key("linear"))
+            .unwrap_or(false));
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn zed_is_registered_as_context_servers() {
         let d = defs().into_iter().find(|d| d.id == "zed").unwrap();
@@ -8227,11 +9201,7 @@ command = "npx"
             home.join(".config").join("crush").join("crush.json")
         );
         assert_eq!(
-            resolve_crush_path(
-                home,
-                None,
-                Some(std::ffi::OsString::from("xdg-config")),
-            ),
+            resolve_crush_path(home, None, Some(std::ffi::OsString::from("xdg-config")),),
             PathBuf::from("xdg-config").join("crush").join("crush.json")
         );
         assert_eq!(
@@ -8278,10 +9248,7 @@ command = "npx"
             .find(|definition| definition.id == "github-copilot-cli")
             .unwrap();
         assert_eq!(definition.name, "GitHub Copilot CLI");
-        assert!(matches!(
-            definition.format,
-            Format::JsonCopilotMcpServers
-        ));
+        assert!(matches!(definition.format, Format::JsonCopilotMcpServers));
         assert!((definition.path)().is_some());
     }
 
@@ -8307,8 +9274,7 @@ command = "npx"
             edit_copilot_json_gateway(&path, Some(&gateway))
         }
         .unwrap();
-        let installed =
-            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        let installed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
         assert_eq!(installed.len(), 2);
         assert!(installed.iter().any(|server| server.name == "existing"));
         assert!(installed
@@ -8316,18 +9282,14 @@ command = "npx"
             .any(|server| server.name == GATEWAY_ENTRY_NAME));
         let installed_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            installed_json["mcpServers"]["existing"],
-            original_existing
-        );
+        assert_eq!(installed_json["mcpServers"]["existing"], original_existing);
         assert_eq!(
             installed_json["mcpServers"][GATEWAY_ENTRY_NAME]["tools"],
             serde_json::json!(["*"])
         );
 
         edit_copilot_json_gateway(&path, None).unwrap();
-        let removed =
-            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        let removed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].name, "existing");
         let removed_json: serde_json::Value =
@@ -8361,10 +9323,12 @@ command = "npx"
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].name, "existing");
 
-        { let _e = sample_gateway(None, "junie"); edit_json_gateway(&path, "mcpServers", Some(&_e), false) }
-            .unwrap();
-        let installed =
-            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        {
+            let _e = sample_gateway(None, "junie");
+            edit_json_gateway(&path, "mcpServers", Some(&_e), false)
+        }
+        .unwrap();
+        let installed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
         assert_eq!(installed.len(), 2);
         assert!(installed.iter().any(|server| server.name == "existing"));
         assert!(installed
@@ -8372,14 +9336,10 @@ command = "npx"
             .any(|server| server.name == GATEWAY_ENTRY_NAME));
         let installed_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            installed_json["mcpServers"]["existing"],
-            original_existing
-        );
+        assert_eq!(installed_json["mcpServers"]["existing"], original_existing);
 
         edit_json_gateway(&path, "mcpServers", None, false).unwrap();
-        let removed =
-            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        let removed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].name, "existing");
         let removed_json: serde_json::Value =
@@ -8405,8 +9365,8 @@ command = "npx"
     fn kimi_code_config_path_is_under_home_data_root() {
         for platform in Platform::ALL {
             let home = mock_home(platform);
-            let path = resolve_client_config_path("kimi-code", &home, platform)
-                .expect("kimi-code path");
+            let path =
+                resolve_client_config_path("kimi-code", &home, platform).expect("kimi-code path");
             assert_eq!(
                 path,
                 home.join(".kimi-code").join("mcp.json"),
@@ -8418,10 +9378,7 @@ command = "npx"
     #[test]
     fn kimi_code_path_honors_kimi_code_home_override() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let root = std::env::temp_dir().join(format!(
-            "toolport-kimi-home-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("toolport-kimi-home-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let _restore = EnvRestore::set("KIMI_CODE_HOME", &root);
         let resolved = kimi_code_path().expect("kimi-code path with override");
@@ -8524,25 +9481,35 @@ command = "npx"
         let parsed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
         assert_eq!(parsed.len(), 4);
         assert_eq!(
-            parsed.iter().find(|s| s.name == "filesystem").unwrap().transport,
+            parsed
+                .iter()
+                .find(|s| s.name == "filesystem")
+                .unwrap()
+                .transport,
             "stdio"
         );
         assert_eq!(
-            parsed.iter().find(|s| s.name == "remote-http").unwrap().transport,
+            parsed
+                .iter()
+                .find(|s| s.name == "remote-http")
+                .unwrap()
+                .transport,
             "http"
         );
         assert_eq!(
-            parsed.iter().find(|s| s.name == "remote-sse").unwrap().transport,
-            "sse"
-        );
-        assert!(
             parsed
                 .iter()
-                .find(|s| s.name == "bearer-remote")
+                .find(|s| s.name == "remote-sse")
                 .unwrap()
-                .env_keys
-                .is_empty()
+                .transport,
+            "sse"
         );
+        assert!(parsed
+            .iter()
+            .find(|s| s.name == "bearer-remote")
+            .unwrap()
+            .env_keys
+            .is_empty());
 
         // Gateway install preserves existing servers and uses the standard stdio shape.
         {
@@ -8550,12 +9517,9 @@ command = "npx"
             edit_json_gateway(&path, "mcpServers", Some(&_e), true)
         }
         .unwrap();
-        let installed =
-            parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
+        let installed = parse_json(&std::fs::read_to_string(&path).unwrap(), "mcpServers").unwrap();
         assert!(installed.iter().any(|s| s.name == "filesystem"));
-        assert!(installed
-            .iter()
-            .any(|s| s.name == GATEWAY_ENTRY_NAME));
+        assert!(installed.iter().any(|s| s.name == GATEWAY_ENTRY_NAME));
 
         std::fs::remove_file(&path).ok();
     }
@@ -8931,6 +9895,209 @@ command = "npx"
         assert!((d.path)().is_some());
     }
 
+    /// SBS-884: Goose Connect/uninstall pretty-printed `config.yaml` and dropped
+    /// `#` comments plus `&anchor` definitions sitting outside `extensions`.
+    #[test]
+    fn goose_yaml_connect_and_uninstall_preserve_comments_and_anchors() {
+        let path = temp_path("goose-comments-anchors.yaml");
+        std::fs::write(
+            &path,
+            r#"# Goose config
+GOOSE_MODEL: gpt-4o
+defaults: &anchor
+  timeout: 300
+  enabled: true
+extensions:
+  developer:
+    type: builtin
+    enabled: true
+  fetch:
+    type: stdio
+    cmd: uvx
+    args: [mcp-server-fetch]
+"#,
+        )
+        .unwrap();
+
+        {
+            let entry = sample_gateway(None, "goose");
+            edit_yaml_gateway(&path, Some(&entry))
+        }
+        .unwrap();
+        let connected = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            connected.contains("# Goose config"),
+            "hash comment must survive Connect: {connected}"
+        );
+        assert!(
+            connected.contains("&anchor"),
+            "anchor outside extensions must survive Connect: {connected}"
+        );
+        let v: serde_yaml::Value = serde_yaml::from_str(&connected).unwrap();
+        assert_eq!(v["GOOSE_MODEL"].as_str(), Some("gpt-4o"));
+        assert!(v["extensions"].get(GATEWAY_ENTRY_NAME).is_some());
+        assert!(v["extensions"].get("fetch").is_some());
+        assert!(v["extensions"].get("developer").is_some());
+
+        edit_yaml_gateway(&path, None).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("# Goose config"),
+            "hash comment must survive uninstall: {after}"
+        );
+        assert!(
+            after.contains("&anchor"),
+            "anchor must survive uninstall: {after}"
+        );
+        let after_v: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        assert!(after_v["extensions"].get(GATEWAY_ENTRY_NAME).is_none());
+        assert!(after_v["extensions"].get("fetch").is_some());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SBS-884: inventory write must not pretty-print the whole Goose file.
+    #[test]
+    fn goose_yaml_write_preserves_comments_and_anchors() {
+        let path = temp_path("goose-write-comments.yaml");
+        std::fs::write(
+            &path,
+            "# keep this comment\ndefaults: &anchor\n  timeout: 300\nGOOSE_MODEL: gpt-4o\nextensions:\n  developer:\n    type: builtin\n    enabled: true\n",
+        )
+        .unwrap();
+        write_yaml_extensions(&path, &[sample_gateway(None, "goose")]).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("# keep this comment"),
+            "comment must survive write_yaml_extensions: {content}"
+        );
+        assert!(
+            content.contains("&anchor"),
+            "anchor must survive write_yaml_extensions: {content}"
+        );
+        let root: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        assert!(root["extensions"].get("developer").is_some());
+        assert!(root["extensions"].get(GATEWAY_ENTRY_NAME).is_some());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SBS-884: Hermes Connect/uninstall must keep `#` comments and `&anchor`
+    /// outside `mcp_servers`.
+    #[test]
+    fn hermes_yaml_connect_and_uninstall_preserve_comments_and_anchors() {
+        let path = temp_path("hermes-comments-anchors.yaml");
+        std::fs::write(
+            &path,
+            r#"# Hermes config
+model:
+  default: gpt-4o
+shared_headers: &anchor
+  Authorization: Bearer token
+mcp_servers:
+  zread:
+    url: https://mcp.example.com/mcp
+    timeout: 120
+"#,
+        )
+        .unwrap();
+
+        {
+            let entry = sample_gateway(None, "hermes");
+            edit_hermes_yaml_gateway(&path, Some(&entry))
+        }
+        .unwrap();
+        let connected = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            connected.contains("# Hermes config"),
+            "hash comment must survive Connect: {connected}"
+        );
+        assert!(
+            connected.contains("&anchor"),
+            "anchor outside mcp_servers must survive Connect: {connected}"
+        );
+        let v: serde_yaml::Value = serde_yaml::from_str(&connected).unwrap();
+        assert_eq!(v["model"]["default"].as_str(), Some("gpt-4o"));
+        assert!(v["mcp_servers"].get(GATEWAY_ENTRY_NAME).is_some());
+        assert!(v["mcp_servers"].get("zread").is_some());
+
+        edit_hermes_yaml_gateway(&path, None).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("# Hermes config"),
+            "hash comment must survive uninstall: {after}"
+        );
+        assert!(
+            after.contains("&anchor"),
+            "anchor must survive uninstall: {after}"
+        );
+        let after_v: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        assert!(after_v["mcp_servers"].get(GATEWAY_ENTRY_NAME).is_none());
+        assert!(after_v["mcp_servers"].get("zread").is_some());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SBS-884: Continue Connect/uninstall must keep `#` comments and `&anchor`
+    /// outside the `mcpServers` list (column-0 sequence items stay in that node).
+    #[test]
+    fn continue_yaml_connect_and_uninstall_preserve_comments_and_anchors() {
+        let path = temp_path("continue-comments-anchors.yaml");
+        std::fs::write(
+            &path,
+            r#"# Continue config
+models:
+  - title: GPT-4o
+shared: &anchor
+  env:
+    TOKEN: abc
+mcpServers:
+- name: fetch
+  command: uvx
+rules:
+  - Keep responses concise
+"#,
+        )
+        .unwrap();
+
+        {
+            let entry = sample_gateway(None, "continue");
+            edit_continue_yaml_gateway(&path, Some(&entry))
+        }
+        .unwrap();
+        let connected = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            connected.contains("# Continue config"),
+            "hash comment must survive Connect: {connected}"
+        );
+        assert!(
+            connected.contains("&anchor"),
+            "anchor outside mcpServers must survive Connect: {connected}"
+        );
+        let v: serde_yaml::Value = serde_yaml::from_str(&connected).unwrap();
+        let servers = v["mcpServers"].as_sequence().unwrap();
+        assert!(servers
+            .iter()
+            .any(|s| s.get("name").and_then(|n| n.as_str()) == Some(GATEWAY_ENTRY_NAME)));
+        assert!(servers
+            .iter()
+            .any(|s| s.get("name").and_then(|n| n.as_str()) == Some("fetch")));
+        assert_eq!(v["models"][0]["title"].as_str(), Some("GPT-4o"));
+
+        edit_continue_yaml_gateway(&path, None).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("# Continue config"),
+            "hash comment must survive uninstall: {after}"
+        );
+        assert!(
+            after.contains("&anchor"),
+            "anchor must survive uninstall: {after}"
+        );
+        let after_v: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        let servers = after_v["mcpServers"].as_sequence().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["name"].as_str(), Some("fetch"));
+        std::fs::remove_file(&path).ok();
+    }
+
     fn mock_home(platform: Platform) -> PathBuf {
         match platform {
             Platform::Windows => PathBuf::from(r"C:\Users\alice"),
@@ -9150,7 +10317,9 @@ command = "npx"
         let cases: &[(&str, fn(&Path, Platform) -> PathBuf)] = &[
             ("cursor", |home, _| home.join(".cursor").join("mcp.json")),
             ("droid", |home, _| home.join(".factory").join("mcp.json")),
-            ("crush", |home, _| home.join(".config").join("crush").join("crush.json")),
+            ("crush", |home, _| {
+                home.join(".config").join("crush").join("crush.json")
+            }),
             ("grok", |home, _| home.join(".grok").join("config.toml")),
             ("github-copilot-cli", |home, _| {
                 home.join(".copilot").join("mcp-config.json")
@@ -9295,18 +10464,9 @@ command = "npx"
             jan,
             xdg_data.join("Jan").join("data").join("mcp_config.json")
         );
-        assert_eq!(
-            crush,
-            xdg_config.join("crush").join("crush.json")
-        );
-        assert_eq!(
-            zed,
-            xdg_config.join("zed").join("settings.json")
-        );
-        assert_eq!(
-            goose,
-            xdg_config.join("goose").join("config.yaml")
-        );
+        assert_eq!(crush, xdg_config.join("crush").join("crush.json"));
+        assert_eq!(zed, xdg_config.join("zed").join("settings.json"));
+        assert_eq!(goose, xdg_config.join("goose").join("config.yaml"));
         assert_eq!(
             anythingllm,
             xdg_config
@@ -9976,7 +11136,10 @@ extensions:
         let out = stable_gateway_copy_with(&src, dest.clone(), |_, _| {
             Err(std::io::Error::other("ETXTBSY"))
         });
-        assert_eq!(out, None, "an empty leftover must not be handed to a client");
+        assert_eq!(
+            out, None,
+            "an empty leftover must not be handed to a client"
+        );
 
         let _ = std::fs::remove_dir_all(&scratch);
     }
@@ -10034,7 +11197,10 @@ extensions:
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&scratch);
     }
@@ -10061,7 +11227,10 @@ extensions:
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&scratch);
     }

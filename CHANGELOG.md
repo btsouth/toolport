@@ -24,6 +24,29 @@ Entries before the rename below shipped under the project's former name, Conduit
   the server set `destructiveHint: false` at first sight. Call-time confirm still
   honours an explicit false hint. First sight of that contradiction is recorded
   in Activity and is not quarantined. (SBS-875)
+- **Connect and launch-time repoint no longer strip comments from Codex/Grok
+  `config.toml` or comments and YAML anchors from Goose/Hermes/Continue
+  `config.yaml`.** Those writers used to parse with `toml` / `serde_yaml` and
+  pretty-print the whole file, so a Connect click or `repoint_stale_gateways`
+  dropped every `#` comment and expanded every `&anchor`. Unrelated keys
+  survived as data; the annotations did not. TOML now goes through `toml_edit`
+  DocumentMut and YAML rewrites only the `mcp_servers` / `extensions` /
+  `mcpServers` node, matching the JSONC CST contract. A user who Connects or
+  disconnects now keeps the comments and anchors they had outside that node.
+  (SBS-884)
+- **Failed routine-suggestion load no longer hides the save queue.** Settings treated
+  an unreachable `list_routine_suggestions` as "nothing pending" and hid the section,
+  including wiping cards already on screen when a later refresh failed. A failed load
+  is now its own state: empty after a successful read still hides; error shows retry
+  and keeps the last loaded queue. (SBS-879)
+- **A diagnostics bundle or second gateway can no longer see an empty `gateway.log` or lose a connect-failure line.** Trim used to rewrite the shared log in place, so a concurrent diagnostics read could land in the empty window and a concurrent append could be overwritten by the pre-truncate snapshot. Trim now replaces the file atomically under the same lock as append.
+- **SECURITY.md now matches the HTTP bind admission policy.** Every bind, loopback
+  or not, needs HTTP authentication: a bearer token, or at least one registered
+  HTTP client in `registry.json`. A hand-launched loopback gateway with neither
+  does not bind; it exits 1 unless `--insecure-loopback` is passed, and that flag
+  opens an unauthenticated listener only while no token is set and no HTTP clients
+  are registered. SECURITY.md also now explains what a registered HTTP client is
+  and how the desktop app creates one. (SBS-878)
 - **Connect keeps stow/chezmoi config symlinks.** Writing a client config
   (Connect, Disconnect, migrate, launch-time re-point) used to replace a
   symlink at the config path with a regular file, leaving the file in the
