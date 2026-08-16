@@ -55,7 +55,6 @@ import {
   clientRestartHint,
   clientRestartHintAfterRemoval,
   connectSuccessDescription,
-  toolportStudioClientBlurb,
 } from "@/lib/clientConnect";
 
 interface Props {
@@ -150,8 +149,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       title: kind === "applied" ? "Not live yet" : "Still connected until restart",
       text:
         kind === "applied"
-          ? clientRestartHint(client.name, client.id)
-          : clientRestartHintAfterRemoval(client.name, client.id),
+          ? clientRestartHint(client.name)
+          : clientRestartHintAfterRemoval(client.name),
     });
   }
 
@@ -234,7 +233,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         profile
           ? `${client.name} scoped to "${scopeName}".`
           : `${client.name} now follows the active profile.`,
-        { description: clientRestartHint(client.name, client.id) },
+        { description: clientRestartHint(client.name) },
       );
       noteRestartNeeded("applied");
       onChanged();
@@ -251,7 +250,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     try {
       await installGateway(client.id, profile || undefined, true, transport);
       toast.success(`Reset ${client.name} to the default Toolport gateway`, {
-        description: clientRestartHint(client.name, client.id),
+        description: clientRestartHint(client.name),
       });
       noteRestartNeeded("applied");
       setResetOpen(false);
@@ -285,7 +284,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         {
           // Migrate rewrites the whole gateway slot, so it needs the restart line for
           // the same reason Connect does.
-          description: `${client.name} now uses only the Toolport gateway. Config backed up. ${clientRestartHint(client.name, client.id)}`,
+          description: `${client.name} now uses only the Toolport gateway. Config backed up. ${clientRestartHint(client.name)}`,
         },
       );
       noteRestartNeeded("applied");
@@ -384,7 +383,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       if (installed) {
         await uninstallGateway(client.id);
         toast.success(`Disconnected Toolport from ${client.name}`, {
-          description: clientRestartHintAfterRemoval(client.name, client.id),
+          description: clientRestartHintAfterRemoval(client.name),
         });
         noteRestartNeeded("removed");
       } else {
@@ -397,19 +396,15 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         // Restart is the load-bearing line (SOU-317): MCP clients typically do not
         // pick up a new gateway entry until relaunch. Scope/backup are secondary.
         toast.success(`Connected Toolport to ${client.name}`, {
-          description: connectSuccessDescription(
-            client.name,
-            [
-              transport === "sharedHttp"
-                ? "Uses the shared HTTP bridge (one gateway process)."
-                : null,
-              profile
-                ? `Scoped to the "${profiles.find((p) => p.id === profile)?.name ?? profile}" profile.`
-                : null,
-              !profile && outcome.backup ? "Previous config backed up." : null,
-            ],
-            client.id,
-          ),
+          description: connectSuccessDescription(client.name, [
+            transport === "sharedHttp"
+              ? "Uses the shared HTTP bridge (one gateway process)."
+              : null,
+            profile
+              ? `Scoped to the "${profiles.find((p) => p.id === profile)?.name ?? profile}" profile.`
+              : null,
+            !profile && outcome.backup ? "Previous config backed up." : null,
+          ]),
         });
         noteRestartNeeded("applied");
       }
@@ -448,11 +443,6 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                 ? "installed - no MCP config yet"
                 : "not installed on this machine"}
           </p>
-          {client.id === "toolport-studio" && (
-            <p className="mt-1 text-xs text-muted-foreground">
-              {toolportStudioClientBlurb()}
-            </p>
-          )}
           {customized && (
             <p className="mt-1 text-xs text-muted-foreground">
               Custom configuration - not managed by Toolport. Hand-edited gateway entry is

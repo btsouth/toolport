@@ -17,20 +17,19 @@ every AI client, with far fewer tokens.
 
 Toolport is a local MCP (Model Context Protocol) gateway. You set up and
 authenticate each server once, and every AI client (Claude, Cursor, Codex,
-[Toolport Studio](https://github.com/tsouth89/toolport-studio), and the rest)
-points at Toolport and shares them, so you stop configuring the same servers
-separately in each app.
+VS Code, and the rest) points at Toolport and shares them, so you stop
+configuring the same servers separately in each app.
 
 ![Toolport demo: add a server once, connect every AI client, lazy tool discovery, and a destructive call blocked by human approval](docs/demo.gif)
 
 It also fixes what those servers cost your agent. Every MCP server you connect
 dumps all of its tools into context on every single request, and it adds up fast:
-just 3 servers (62 tools) cost ~24,000 tokens of definitions before you've asked
+just 3 servers (63 tools) cost ~19,000 tokens of definitions before you've asked
 anything. Toolport advertises a handful of compact meta-tools the agent searches
-on demand instead, so it pays ~900 tokens (96% less, measured).
+on demand instead, so it pays ~450 tokens (98% less, measured).
 
 **Measured on a frontier model: up to 91% fewer total tokens at the same task
-success** (graded for correct answers, not just completion), plus 96% less
+success** (graded for correct answers, not just completion), plus 98% less
 tool-definition overhead on every request, rising to 99.5% on a real 415-tool
 catalog (see [BENCHMARK.md](BENCHMARK.md)). That holds whether you run one AI tool
 or five, on cloud models (where tokens are your bill) or local ones (where tool defs
@@ -65,9 +64,10 @@ fixes both.
   meta-tools (`toolport_status`, `toolport_search_tools`, `toolport_call_tool`,
   `toolport_fetch_result`) instead of the full catalog, and the agent searches and
   calls on demand, so context stays flat no matter how many servers you connect.
-  (A couple more appear only when you turn the matching feature on: `toolport_confirm`
-  with approvals, enable/disable with agent control.) Benchmarked, graded for correct answers: up to 91% fewer
-  total tokens at the same task success, 96% less tool-definition overhead per request,
+  (A few more appear only when you turn the matching feature on: `toolport_confirm`
+  with approvals, enable/disable with agent control, `toolport_run_script` with code mode,
+  and your saved routines.) Benchmarked, graded for correct answers: up to 91% fewer
+  total tokens at the same task success, 98% less tool-definition overhead per request,
   99.5% at a real 415-tool catalog ([BENCHMARK.md](BENCHMARK.md)). Ask `toolport_status`
   for what it has saved you so far.
 - **Search by intent, not just keywords.** `toolport_search_tools` ranks by relevance
@@ -90,7 +90,7 @@ fixes both.
   server. Newly-authed servers propagate to connected clients without a restart.
 - **No secrets in client configs.** Clients only ever say "talk to Toolport." Keys live
   in the OS keychain and are injected at runtime.
-- **A catalog to grow.** Add popular servers from a curated list of 40+, or search the
+- **A catalog to grow.** Add popular servers from a curated list of 50, or search the
   official MCP Registry, then authenticate through the same flow.
 
 ### Security, because the gateway is on the path
@@ -113,6 +113,14 @@ fixes both.
 
 ### Control and extras
 
+- **Routines: keep the orchestration that worked.** When a multi-step Code Mode run
+  proves itself, promote it to a saved, parameterized routine that survives the session
+  and works from any client. Promotion is the only way in, and every save raises a
+  one-shot desktop approval card showing the summary, the calls, the dependencies, the
+  risk class and the content hash, with no always-allow shortcut. Saved routines are
+  advertised as ordinary tools and check their arguments against the stored schema, and
+  a passive **Suggested routines** queue in Settings collects repeated same-shape calls
+  instead of nagging the agent mid-task. Routine writes are off until you turn them on.
 - **Agent control, on your terms.** Optionally let an agent enable or disable servers
   through the gateway (`toolport_enable_server` / `toolport_disable_server`), reflected in
   the app live. Off by default, and the destructive-tool switch always stays yours.
@@ -155,7 +163,7 @@ and refreshes too.
 
 ## Supported clients
 
-Toolport auto-detects these **35 AI clients**, installs the gateway into each with one
+Toolport auto-detects these **34 AI clients**, installs the gateway into each with one
 click, and can import a client's existing servers. It writes the config file shown
 below for you, so you never have to edit these by hand.
 
@@ -173,7 +181,6 @@ below for you, so you never have to edit these by hand.
 | Codex           | `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`)                                             | TOML (`mcp_servers`)     |
 | Copilot CLI     | `~/.copilot/mcp-config.json`                                                                           | JSON (`mcpServers`)      |
 | Grok Build      | `$GROK_HOME/config.toml` (default `~/.grok/config.toml`)                                               | TOML (`mcp_servers`)     |
-| Toolport Studio | `~/.toolport-studio/mcp.json`                                                                          | JSON (`mcpServers`)      |
 | Continue        | `~/.continue/config.yaml`                                                                              | YAML (`mcpServers`)      |
 | Antigravity     | `~/.gemini/config/mcp_config.json`                                                                     | JSON (`mcpServers`)      |
 | Gemini CLI      | `$GEMINI_CLI_HOME/.gemini/settings.json` (default `~/.gemini/settings.json`)                           | JSON (`mcpServers`)      |
@@ -349,7 +356,7 @@ terminal. The package name is `toolport`.
 
 ```bash
 # Update to a newer version: just install the new .deb, it upgrades in place.
-sudo apt install ./Toolport_1.5.1_amd64.deb
+sudo apt install ./Toolport_1.14.0_amd64.deb
 
 # Uninstall (keeps your config + saved secrets).
 sudo apt remove toolport
@@ -437,9 +444,11 @@ gateway, lazy discovery, per-agent scoping, OAuth/key auth with live propagation
 the catalog, client import/migrate, per-tool and destructive-tool governance, the
 human approval queue, a global Settings view, tool-integrity and content-defense
 detection, an audit log with latency/error stats, resources + prompts proxying, a
-tool playground, and a **headless/container gateway** (MCP over HTTP/SSE, Docker,
+tool playground, code mode with approval-gated saved routines, and a
+**headless/container gateway** (MCP over HTTP/SSE, Docker,
 GHCR image — see [docs/headless.md](docs/headless.md)). See
-[docs/ROADMAP.md](docs/ROADMAP.md) for what is done and planned.
+[CHANGELOG.md](CHANGELOG.md) for what has shipped and
+[docs/ROADMAP.md](docs/ROADMAP.md) for the original build plan.
 
 ## Known issues
 

@@ -6,6 +6,22 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Removed
+
+- **Toolport Studio is no longer a supported client.** The project is discontinued, so
+  detection, the Connect flow, and its `~/.toolport-studio/mcp.json` target are gone,
+  along with the session-scoped restart wording it was the only user of. Toolport now
+  auto-detects 34 clients. If you had connected it, the gateway entry in that file is
+  left where it is and can be deleted by hand; nothing else reads it.
+
+### Added
+
+- **Official brand marks for 14 more clients.** Grok Build, OpenCode, Qwen Code, Kimi
+  Code, JetBrains Junie, Kilo Code, GitHub Copilot CLI, Amp, Pi, Oh My Pi, Factory Droid,
+  BoltAI, AnythingLLM and Continue now show their own logo in the Clients view instead of
+  a letter badge, so 31 of the 34 supported clients now carry their own mark. Crush, Jan
+  and Witsy keep the badge, since none of them publish a usable vector mark.
+
 ## [1.14.0] - 2026-08-16
 
 Agents can now keep what worked. A proven multi-tool orchestration can become a

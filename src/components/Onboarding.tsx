@@ -723,7 +723,7 @@ function ConnectClients({
       // usually only loads it on restart. Verify step also says this; put it on the
       // success toast so it is not delayed until that step.
       toast.success(`Connected Toolport to ${client.name}`, {
-        description: clientRestartHint(client.name, client.id),
+        description: clientRestartHint(client.name),
       });
     } catch (e) {
       toastError(`Couldn't connect: ${e}`);
@@ -1097,7 +1097,7 @@ export function VerifyCall({
               <span>
                 {status === "snapshot"
                   ? "Reading the audit log so older calls cannot count as proof."
-                  : `Waiting for a new call after this check started. Just connected ${client.name}? ${clientRestartHint(client.name, client.id)}`}
+                  : `Waiting for a new call after this check started. Just connected ${client.name}? ${clientRestartHint(client.name)}`}
               </span>
             </div>
           ) : status === "snapshot-failed" ? (
@@ -1121,7 +1121,7 @@ export function VerifyCall({
             <div className="flex flex-col gap-1.5 rounded-md bg-warning/10 px-3 py-2 text-xs">
               <span className="font-medium text-warning">No call yet. Common fixes:</span>
               <ul className="ml-3 list-disc space-y-0.5 text-muted-foreground">
-                <li>{clientRestartHint(client.name, client.id)}</li>
+                <li>{clientRestartHint(client.name)}</li>
                 <li>Make sure it's scoped to a profile that has servers (Settings).</li>
                 <li>If a server needs sign-in, authenticate it first.</li>
                 <li>Check that each server started on the main screen.</li>

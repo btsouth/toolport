@@ -7,6 +7,12 @@ that exposes 4 meta-tools the agent searches on demand, so context stays flat:
 measured ~90% fewer tokens at the same task success. This document is the working
 spec, capturing the architecture decision and the build order.
 
+> **Read this as history, not as current state.** The status notes below are dated
+> snapshots and stop at v1.6.2 (2026-07-09), so their client counts and `CONDUIT_*`
+> env names are period-accurate rather than current. For what ships today, see
+> [CHANGELOG.md](../CHANGELOG.md) and the README; every `CONDUIT_*` name below is
+> spelled `TOOLPORT_*` now (the old spelling still works as an alias).
+
 **Status (2026-07-09):** v1.6.2 published (renamed Conduit -> Toolport at v1.0.0).
 Signed/notarized macOS (Apple Silicon + Intel, data-protection keychain + nested
 gateway, no keychain prompts on update), Windows (Azure Trusted Signing), Linux

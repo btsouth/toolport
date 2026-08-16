@@ -3,7 +3,6 @@ import {
   clientRestartHint,
   clientRestartHintAfterRemoval,
   connectSuccessDescription,
-  toolportStudioClientBlurb,
 } from "./clientConnect";
 
 describe("clientRestartHint / connectSuccessDescription (SOU-317)", () => {
@@ -22,29 +21,6 @@ describe("clientRestartHint / connectSuccessDescription (SOU-317)", () => {
       "Restart Claude Desktop so it loads Toolport.",
     );
   });
-
-  it("uses a session-scoped hint for Toolport Studio", () => {
-    expect(clientRestartHint("Toolport Studio", "toolport-studio")).toBe(
-      "Start a new conversation in Toolport Studio so it picks up this scope.",
-    );
-    expect(clientRestartHint("Toolport Studio", "other-client")).toBe(
-      "Restart Toolport Studio so it loads Toolport.",
-    );
-    expect(
-      connectSuccessDescription(
-        "Toolport Studio",
-        ['Scoped to the "Work" profile.'],
-        "toolport-studio",
-      ),
-    ).toBe(
-      'Start a new conversation in Toolport Studio so it picks up this scope. Scoped to the "Work" profile.',
-    );
-  });
-
-  it("explains zero-config tools vs Connect for Studio", () => {
-    expect(toolportStudioClientBlurb()).toMatch(/discovers Toolport automatically/);
-    expect(toolportStudioClientBlurb()).toMatch(/pin a profile/);
-  });
 });
 
 describe("clientRestartHintAfterRemoval (SBS-336 review)", () => {
@@ -55,16 +31,6 @@ describe("clientRestartHintAfterRemoval (SBS-336 review)", () => {
     );
     expect(clientRestartHintAfterRemoval("Claude Desktop")).not.toContain(
       "so it loads Toolport",
-    );
-  });
-
-  it("keeps Studio's new-conversation wording", () => {
-    expect(clientRestartHintAfterRemoval("Toolport Studio", "toolport-studio")).toBe(
-      "Start a new conversation in Toolport Studio so it stops using Toolport.",
-    );
-    // A different client id must not pick up the Studio phrasing.
-    expect(clientRestartHintAfterRemoval("Other", "other-client")).toBe(
-      "Restart Other so it stops loading Toolport.",
     );
   });
 });
