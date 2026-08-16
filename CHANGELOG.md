@@ -18,10 +18,13 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
-- **SECURITY.md now matches the HTTP bind admission policy.** A hand-launched
-  loopback gateway without a token does not bind; it exits 1 unless
-  `--insecure-loopback` is passed. Non-loopback still requires a token or
-  registered HTTP client. (SBS-878)
+- **SECURITY.md now matches the HTTP bind admission policy.** Every bind, loopback
+  or not, needs HTTP authentication: a bearer token, or at least one registered
+  HTTP client in `registry.json`. A hand-launched loopback gateway with neither
+  does not bind; it exits 1 unless `--insecure-loopback` is passed, and that flag
+  opens an unauthenticated listener only while no token is set and no HTTP clients
+  are registered. SECURITY.md also now explains what a registered HTTP client is
+  and how the desktop app creates one. (SBS-878)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
