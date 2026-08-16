@@ -376,9 +376,46 @@ fn claude_config_dir_override() -> Option<PathBuf> {
 /// Empty or relative values are a misconfiguration, not an instruction to
 /// write relative to Toolport's cwd. Shared by `CLAUDE_CONFIG_DIR`,
 /// `CODEX_HOME`, `GEMINI_CLI_HOME`, `GROK_HOME`, and `QWEN_HOME` (SBS-885).
+///
+/// A literal `~` is NOT a home reference here. Every one of those clients except
+/// Qwen Code uses its env value verbatim (Codex `find_codex_home_from_env`, Grok
+/// `resolve_grok_home_from`, Gemini CLI `homedir()`), so a value the shell left
+/// unexpanded is already broken for the client itself and the default path is the
+/// closer guess. Qwen Code expands it, so `qwen_home_from` runs the value through
+/// [`expand_leading_tilde`] first.
 fn absolute_env_dir(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let dir = PathBuf::from(raw?);
     dir.is_absolute().then_some(dir)
+}
+
+/// Expand a leading `~`, `~/`, or `~\` against the home directory.
+///
+/// Only for env vars whose owning client performs the same expansion; see
+/// [`absolute_env_dir`] for why the rest keep the value verbatim. A bare `~work`
+/// has no separator and is not a home reference, which matches the client. A
+/// non-UTF-8 value, or one read with no home directory available, passes through
+/// untouched so the caller's absolute check still sees the original.
+fn expand_leading_tilde(raw: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    let raw = raw?;
+    let Some(text) = raw.to_str() else {
+        return Some(raw);
+    };
+    let rest = if text == "~" {
+        ""
+    } else if let Some(rest) = text.strip_prefix("~/").or_else(|| text.strip_prefix(r"~\")) {
+        rest
+    } else {
+        return Some(raw);
+    };
+    let Some(home) = home() else {
+        return Some(raw);
+    };
+    let expanded = if rest.is_empty() {
+        home
+    } else {
+        home.join(rest)
+    };
+    Some(expanded.into_os_string())
 }
 
 /// The env-free half of [`claude_config_dir_override`], so the validation rules
@@ -948,8 +985,17 @@ fn gemini_cli_path() -> Option<PathBuf> {
 /// same class as `CODEX_HOME` (SBS-885). Qwen itself also accepts a
 /// relative `QWEN_HOME` resolved against cwd; we do not, because Toolport's
 /// cwd is not Qwen's.
+///
+/// A leading `~` IS honored, unlike the sibling relocate envs: Qwen's
+/// `Storage.resolvePath` expands `~`, `~/`, and `~\` against `os.homedir()`
+/// before any cwd resolve, so `$expanded/settings.json` is the live file. An
+/// unquoted `export QWEN_HOME=~/work` is expanded by the shell before Toolport
+/// sees it, but a quoted export, a PowerShell `$env:QWEN_HOME`, and a Windows
+/// user-env value all stay literal. Dropping those left Connect, migrate, and
+/// the launch re-point writing `~/.qwen/settings.json` while Qwen read the
+/// expanded home.
 fn qwen_home_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    absolute_env_dir(raw)
+    absolute_env_dir(expand_leading_tilde(raw))
 }
 
 fn qwen_settings_path(qwen_home: &Path) -> PathBuf {
@@ -5724,6 +5770,46 @@ mod tests {
         assert_eq!(qwen_home_from(None), None);
         assert_eq!(qwen_home_from(Some("".into())), None);
         assert_eq!(qwen_home_from(Some("relative/dir".into())), None);
+    }
+
+    /// Qwen's own `Storage.resolvePath` expands a leading `~` before it reads
+    /// `$QWEN_HOME/settings.json`, and a quoted export or a PowerShell
+    /// `$env:QWEN_HOME` never gets shell expansion. Dropping the value as "not
+    /// absolute" left Connect writing `~/.qwen/settings.json` while Qwen read
+    /// the expanded home.
+    #[test]
+    fn a_tilde_qwen_home_expands_against_the_home_dir() {
+        let home = home().expect("home dir should be available in tests");
+
+        assert_eq!(qwen_home_from(Some("~".into())), Some(home.clone()));
+        assert_eq!(
+            qwen_home_from(Some("~/work/qwen".into())),
+            Some(home.join("work/qwen"))
+        );
+        assert_eq!(
+            qwen_home_from(Some(r"~\work\qwen".into())),
+            Some(home.join(r"work\qwen"))
+        );
+        assert_eq!(
+            qwen_settings_path(&qwen_home_from(Some("~/work/qwen".into())).expect("expanded")),
+            home.join("work/qwen").join("settings.json")
+        );
+        // No separator, so it is a literal directory name and not a home
+        // reference, the same call Qwen's `resolvePath` makes.
+        assert_eq!(qwen_home_from(Some("~work".into())), None);
+    }
+
+    /// The tilde rule is Qwen-only on purpose. Codex (`find_codex_home_from_env`),
+    /// Grok (`resolve_grok_home_from`), Gemini CLI (`homedir()`), and Claude Code
+    /// all use the env value verbatim, so a literal `~` is already broken for the
+    /// client and the default path is the closer guess. Expanding it here would
+    /// have Toolport write a config the client never reads.
+    #[test]
+    fn a_tilde_is_not_expanded_for_the_verbatim_relocate_envs() {
+        assert_eq!(codex_home_from(Some("~/work/codex".into())), None);
+        assert_eq!(gemini_cli_home_from(Some("~/work/gemini".into())), None);
+        assert_eq!(grok_home_from(Some("~/work/grok".into())), None);
+        assert_eq!(claude_config_dir_from(Some("~/work/claude".into())), None);
     }
 
     fn sample_gateway(profile: Option<&str>, client_id: &str) -> ServerEntry {

@@ -1635,9 +1635,15 @@ mod tests {
     ///
     /// Holds `data_dir_test_lock` for the whole test: the data-dir override and the
     /// backend-selecting env var are both process-global.
+    ///
+    /// Field order IS drop order (unlike locals, struct fields drop in declaration
+    /// order), so the override is declared before the guard that protects it. The
+    /// other way round, teardown released the lock with the override still
+    /// installed, and this drop could then clear the override the NEXT test had
+    /// just installed, sending that test at the REAL data dir.
     struct VaultFixture {
-        _data_dir_lock: std::sync::MutexGuard<'static, ()>,
         _override: crate::registry::DataDirOverride,
+        _data_dir_lock: std::sync::MutexGuard<'static, ()>,
         dir: std::path::PathBuf,
         previous_key: Option<String>,
     }
@@ -1655,8 +1661,8 @@ mod tests {
             let previous_key = std::env::var("TOOLPORT_SECRET_KEY").ok();
             std::env::set_var("TOOLPORT_SECRET_KEY", "sbs-615-unit-test-passphrase");
             Self {
-                _data_dir_lock: lock,
                 _override: over,
+                _data_dir_lock: lock,
                 dir,
                 previous_key,
             }
