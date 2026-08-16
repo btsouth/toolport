@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { ThemeProvider } from "@/lib/theme";
@@ -395,6 +395,116 @@ describe("SettingsView routine suggestions", () => {
     expect(screen.getByText("Suggested routines")).toBeInTheDocument();
     expect(screen.getByText("Calls: 3")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /save routine/i })).toBeInTheDocument();
+  });
+
+  it("ignores a stale failure that settles after a newer success (SBS-879)", async () => {
+    const handlers: Array<() => void> = [];
+    mockedListen.mockImplementation(async (event, handler) => {
+      if (event === "routine-suggestion") {
+        handlers.push(() => {
+          (handler as (event: unknown) => void)({});
+        });
+      }
+      return () => {};
+    });
+    // The mount list hangs; an event starts a later list that succeeds first.
+    const mountRequest = deferred<RoutineSuggestion[]>();
+    mockedListRoutineSuggestions
+      .mockReturnValueOnce(mountRequest.promise)
+      .mockResolvedValueOnce([suggestion]);
+
+    renderSettings();
+    await waitFor(() => expect(handlers.length).toBeGreaterThan(0));
+
+    handlers[0]();
+    expect(await screen.findByText("Suggested routines")).toBeInTheDocument();
+
+    mountRequest.reject(new Error("backend down"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Suggested routines")).toBeInTheDocument();
+    expect(screen.getByText("Calls: 3")).toBeInTheDocument();
+    expect(
+      screen.queryByText(/couldn't load suggested routines/i),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/couldn't refresh suggested routines/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("drops a saved card even when the follow-up refresh fails (SBS-879)", async () => {
+    const user = userEvent.setup();
+    mockedListRoutineSuggestions
+      .mockResolvedValueOnce([suggestion])
+      .mockRejectedValueOnce(new Error("backend down"));
+    mockedApproveRoutineSuggestion.mockResolvedValueOnce({});
+
+    renderSettings();
+
+    expect(await screen.findByText("Suggested routines")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /save routine/i }));
+
+    expect(mockedApproveRoutineSuggestion).toHaveBeenCalledWith(
+      "sha256:fp1",
+      "batch-deepwiki-ask-question",
+    );
+    // The broker already consumed the fingerprint, so the card must not survive the
+    // failed refresh with Save still armed.
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: /save routine/i }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByText("Suggested routines")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/couldn't load suggested routines/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("drops a dismissed card even when the follow-up refresh fails (SBS-879)", async () => {
+    const user = userEvent.setup();
+    mockedListRoutineSuggestions
+      .mockResolvedValueOnce([suggestion])
+      .mockRejectedValueOnce(new Error("backend down"));
+    mockedDismissRoutineSuggestion.mockResolvedValueOnce(undefined);
+
+    renderSettings();
+
+    await screen.findByText("Suggested routines");
+    await user.click(screen.getByRole("button", { name: /dismiss/i }));
+
+    expect(mockedDismissRoutineSuggestion).toHaveBeenCalledWith("sha256:fp1");
+    await waitFor(() =>
+      expect(screen.queryByText("Suggested routines")).not.toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByText(/couldn't load suggested routines/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("disables Retry while a load is in flight (SBS-879)", async () => {
+    const user = userEvent.setup();
+    const retryRequest = deferred<RoutineSuggestion[]>();
+    mockedListRoutineSuggestions
+      .mockRejectedValueOnce(new Error("backend down"))
+      .mockReturnValueOnce(retryRequest.promise);
+
+    renderSettings();
+
+    const error = await screen.findByText(/couldn't load suggested routines/i);
+    const row = error.closest("div")!;
+    await user.click(within(row).getByRole("button", { name: /retry/i }));
+    expect(mockedListRoutineSuggestions).toHaveBeenCalledTimes(2);
+
+    const retry = within(row).getByRole("button", { name: /retry/i });
+    expect(retry).toBeDisabled();
+    await user.click(retry);
+    expect(mockedListRoutineSuggestions).toHaveBeenCalledTimes(2);
+
+    retryRequest.resolve([suggestion]);
+    expect(await screen.findByText("Suggested routines")).toBeInTheDocument();
   });
 
   it("still hides the section after a successful empty read", async () => {
