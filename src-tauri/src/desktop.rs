@@ -1638,34 +1638,43 @@ async fn has_client_secret(server_id: String) -> Result<bool, String> {
 
 /// The most recent tool-call audit entries (newest first).
 #[tauri::command]
-async fn get_audit_log(limit: usize) -> Vec<serde_json::Value> {
+async fn get_audit_log(limit: usize) -> Result<Vec<serde_json::Value>, String> {
     // Async, like every polled reader here: Activity invokes these every few
     // seconds, and as sync commands the file reads ran on the GTK main loop,
     // where a large log made window controls intermittently dead on Linux
-    // (SBS-813). A join failure only means the worker panicked; return the
-    // benign empty shape rather than poisoning the poll loop.
-    tauri::async_runtime::spawn_blocking(move || audit::read_recent(limit))
-        .await
-        .unwrap_or_default()
+    // (SBS-813). An unreadable log or a join failure must reject so Activity
+    // can show error/retry instead of "No tool calls yet" (SBS-873).
+    tauri::async_runtime::spawn_blocking(move || {
+        audit::read_recent(limit).map_err(|e| format!("Couldn't read the activity log: {e}"))
+    })
+    .await
+    .map_err(|e| format!("activity log task join failed: {e}"))?
 }
 
 /// Aggregate the full retained audit log into per-server call/error/latency stats for
 /// the observability dashboard. Bounded by the log's byte cap, so totals are real.
 #[tauri::command]
-async fn audit_stats() -> serde_json::Value {
-    tauri::async_runtime::spawn_blocking(audit::stats)
-        .await
-        .unwrap_or(serde_json::Value::Null)
+async fn audit_stats() -> Result<serde_json::Value, String> {
+    // Rejects on the same unreadable log that makes `get_audit_log` reject. A
+    // `null` here only hides the dashboard, which reads as "no data" rather
+    // than "the read failed" (SBS-873).
+    tauri::async_runtime::spawn_blocking(|| {
+        audit::stats().map_err(|e| format!("Couldn't read the activity log: {e}"))
+    })
+    .await
+    .map_err(|e| format!("activity stats task join failed: {e}"))?
 }
 
 /// Recent tool-definition integrity events (newest first): a previously-approved
 /// tool whose definition changed (rug-pull signal) or a known server that added a
 /// tool. Powers the in-app security notices.
 #[tauri::command]
-async fn get_security_events(limit: usize) -> Vec<serde_json::Value> {
-    tauri::async_runtime::spawn_blocking(move || integrity::read_recent(limit))
-        .await
-        .unwrap_or_default()
+async fn get_security_events(limit: usize) -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        integrity::read_recent(limit).map_err(|e| format!("Couldn't read security events: {e}"))
+    })
+    .await
+    .map_err(|e| format!("security events task join failed: {e}"))?
 }
 
 /// Cumulative tool-definition tokens that lazy discovery has kept out of clients'
@@ -2327,10 +2336,12 @@ fn set_live_inspect(state: State<RegistryState>, enabled: bool) -> Result<Regist
 /// The most recent live-inspection captures (newest first): each tool call's args and
 /// result, only present while live inspection has been on. Empty when off/unused.
 #[tauri::command]
-async fn get_inspect_log(limit: usize) -> Vec<serde_json::Value> {
-    tauri::async_runtime::spawn_blocking(move || inspect::read_recent(limit))
-        .await
-        .unwrap_or_default()
+async fn get_inspect_log(limit: usize) -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        inspect::read_recent(limit).map_err(|e| format!("Couldn't read the inspector log: {e}"))
+    })
+    .await
+    .map_err(|e| format!("inspector log task join failed: {e}"))?
 }
 
 /// Clear the live-inspection ring (delete `inspect.jsonl`), so no captured args/results
@@ -2346,10 +2357,12 @@ fn clear_inspect_log() -> Result<(), String> {
 /// the whole catalog. The in-path proof that lazy discovery is working. Empty when
 /// nothing has searched yet.
 #[tauri::command]
-async fn get_search_traces(limit: usize) -> Vec<serde_json::Value> {
-    tauri::async_runtime::spawn_blocking(move || searchtrace::read_recent(limit))
-        .await
-        .unwrap_or_default()
+async fn get_search_traces(limit: usize) -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        searchtrace::read_recent(limit).map_err(|e| format!("Couldn't read search traces: {e}"))
+    })
+    .await
+    .map_err(|e| format!("search traces task join failed: {e}"))?
 }
 
 /// Clear the search-trace log (delete `search-trace.jsonl`).
@@ -3361,7 +3374,8 @@ fn export_config_to_path(
 /// log, which the audit module already caps.
 #[tauri::command]
 fn export_audit_to_path(path: String, format: String) -> Result<(), String> {
-    let entries = audit::read_recent(usize::MAX);
+    let entries = audit::read_recent(usize::MAX)
+        .map_err(|e| format!("Couldn't read the activity log: {e}"))?;
     let body = if format == "csv" {
         audit::to_csv(&entries)
     } else {
@@ -5438,6 +5452,47 @@ mod tests {
             result.is_err(),
             "a failed secret read must propagate, not resolve to unvaulted: {result:?}"
         );
+    }
+
+    /// An unreadable activity log must reject `audit_stats`, not resolve to
+    /// `null` (SBS-873). Activity hides the dashboard on `null`, so a failed
+    /// read looked like "no data" while `get_audit_log` on the same file
+    /// rejected.
+    #[test]
+    fn audit_stats_rejects_an_unreadable_activity_log() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = unique_update_test_dir("audit-stats-unreadable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let path = audit::audit_path().expect("audit path under override");
+        // IsADirectory: the log path exists but cannot be read as a file.
+        std::fs::create_dir_all(&path).unwrap();
+
+        let result = tauri::async_runtime::block_on(audit_stats());
+        assert!(
+            result.is_err(),
+            "a failed activity-log read must reject, not resolve to null: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the contract: a missing log is an honest empty
+    /// dashboard, so a first run still resolves.
+    #[test]
+    fn audit_stats_resolves_when_the_activity_log_is_missing() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = unique_update_test_dir("audit-stats-missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let path = audit::audit_path().expect("audit path under override");
+        assert!(!path.exists(), "fixture must not create the log");
+
+        let stats = tauri::async_runtime::block_on(audit_stats())
+            .expect("a missing log is an empty dashboard, not a failure");
+        assert!(stats.is_object(), "expected aggregated stats: {stats}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn github_with_secret() -> ServerEntry {
