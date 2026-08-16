@@ -14,6 +14,7 @@ import {
   listServerTools,
   setAllowRoutineWrites,
   setCodeMode,
+  stopStaleGateways,
 } from "@/lib/api";
 import type { Registry, RoutineSuggestion } from "@/lib/types";
 
@@ -36,6 +37,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     approveRoutineSuggestion: vi.fn(),
     dismissRoutineSuggestion: vi.fn(),
     clientsNeedingRestart: vi.fn().mockResolvedValue([]),
+    stopStaleGateways: vi.fn(),
   };
 });
 vi.mock("@tauri-apps/api/event", () => ({
@@ -52,6 +54,7 @@ const mockedListRoutineSuggestions = vi.mocked(listRoutineSuggestions);
 const mockedApproveRoutineSuggestion = vi.mocked(approveRoutineSuggestion);
 const mockedDismissRoutineSuggestion = vi.mocked(dismissRoutineSuggestion);
 const mockedClientsNeedingRestart = vi.mocked(clientsNeedingRestart);
+const mockedStopStaleGateways = vi.mocked(stopStaleGateways);
 const mockedToastError = vi.mocked(toastError);
 const mockedListen = vi.mocked(listen);
 
@@ -619,5 +622,31 @@ describe("SettingsView restart check", () => {
     expect(
       screen.queryByRole("button", { name: "Retry checking for old gateway" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("clears the error panel when Stop old gateways answers the same question", async () => {
+    // A successful run IS a fresh answer to "which apps need a restart", so
+    // leaving the failure panel up would say the check failed directly above
+    // the check's own result.
+    mockedClientsNeedingRestart.mockRejectedValue(new Error("backend down"));
+    mockedStopStaleGateways.mockResolvedValue({
+      killed: [],
+      failed: [],
+      needsRestart: [{ client: "Codex", gateway: "old", clientPid: 1234 }],
+    });
+    const user = userEvent.setup();
+    renderSettings();
+
+    await screen.findByRole("button", { name: "Retry checking for old gateway" });
+    await user.click(screen.getByRole("button", { name: "Run" }));
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "Retry checking for old gateway" }),
+      ).not.toBeInTheDocument();
+    });
+    expect(
+      screen.getByText(/1 app is still launching an old gateway/i),
+    ).toBeInTheDocument();
   });
 });

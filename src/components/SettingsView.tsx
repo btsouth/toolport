@@ -1693,6 +1693,12 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   // clicking Run before a client has respawned cannot blank the
                   // panel below (SOU-435).
                   setNeedsRestart(outcome.needsRestart);
+                  // This outcome IS a fresh answer to "which apps need a
+                  // restart", so a stale "couldn't check" panel must go with it.
+                  // Leaving it up would state the check failed directly above
+                  // the check's own result, which is the same contradiction the
+                  // panel exists to prevent (#730).
+                  setRestartCheckFailed(false);
                   const parts: string[] = [];
                   if (outcome.killed.length > 0) {
                     parts.push(
