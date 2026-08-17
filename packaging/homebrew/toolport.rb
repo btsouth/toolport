@@ -1,13 +1,13 @@
 cask "toolport" do
-  version "1.11.0"
+  version "1.14.0"
 
   on_arm do
-    sha256 "59688fe3e302a88a61b0c093f734b987390dd7c1d16b02083db92fdeaa95c116"
+    sha256 "ab87135036bade39e8aebcb93988a7319cd85c9b83ae1ffe807d9c108446646f"
     url "https://github.com/tsouth89/toolport/releases/download/v#{version}/Toolport_aarch64-apple-darwin.dmg",
         verified: "github.com/tsouth89/toolport/"
   end
   on_intel do
-    sha256 "5ce884fdc62860d235bc4eee4acd9bf45bfc0573d73706f1c45b92956f096f61"
+    sha256 "593f18d73318f0c6d6d672b9feb83fa59e520741141f07d69ab54e18582eff84"
     url "https://github.com/tsouth89/toolport/releases/download/v#{version}/Toolport_x86_64-apple-darwin.dmg",
         verified: "github.com/tsouth89/toolport/"
   end
@@ -16,8 +16,9 @@ cask "toolport" do
   desc "One local gateway for every MCP server, shared by every AI client"
   homepage "https://toolport.app/"
 
-  # The updater ships new versions in-app; livecheck tracks the GitHub releases so
-  # `brew upgrade` also works for anyone who prefers it.
+  # livecheck reports the latest GitHub tag for `brew livecheck`. brew install
+  # and brew upgrade still use the pinned version + sha256 below. Bump those
+  # on each published release (see docs/RELEASING.md).
   livecheck do
     url :url
     strategy :github_latest
@@ -26,8 +27,12 @@ cask "toolport" do
   app "Toolport.app"
 
   # The gateway is a nested helper the app manages; no separate binaries to link.
+  # Application Support: current leaf is Toolport (brand.rs data_dir_leaf_name);
+  # Conduit remains for installs that have not migrated. Cache/pref paths keep
+  # com.tsout.conduit because the bundle id is intentionally unchanged.
   zap trash: [
     "~/Library/Application Support/Conduit",
+    "~/Library/Application Support/Toolport",
     "~/Library/Caches/com.tsout.conduit",
     "~/Library/HTTPStorages/com.tsout.conduit",
     "~/Library/Preferences/com.tsout.conduit.plist",

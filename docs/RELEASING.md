@@ -13,6 +13,10 @@ Releases are built by CI on a version tag (`.github/workflows/release.yml`).
      `packaging/agent-plugin/toolport/.claude-plugin/plugin.json` (`version`) —
      a vitest check (`src/test/agent-plugin.test.ts`) fails CI if these drift
      from `package.json`
+   - `packaging/homebrew/toolport.rb` (`version` + both dmg `sha256`s) — a
+     vitest check (`src/test/homebrew-cask.test.ts`) fails CI if the version
+     drifts from `package.json`. This file is a snapshot; `brew install` reads
+     the live tap, not this copy (see Homebrew tap below)
    - `CHANGELOG.md` — move `[Unreleased]` entries into a dated section
    - `server.json` only when publishing a matching standalone gateway package
    - `scripts/install.ps1` / `scripts/install.sh` only if you changed them, in which
@@ -52,6 +56,45 @@ in all three files, plus `InstallerUrl`, `InstallerSha256`, `ReleaseDate` and
 shipped, so submitting it unchanged re-submits that version's metadata and the new
 release never reaches winget. Check it with `winget validate --manifest <dir>`
 before opening the PR.
+
+Publishing is also when the **Homebrew tap** must be bumped. There is no
+workflow for this next to `winget.yml` (SBS-260 is the backlog for automating
+it). `brew install --cask tsouth89/toolport/toolport` and
+`brew upgrade --cask toolport` install the version + sha256 pinned in
+[`tsouth89/homebrew-toolport`](https://github.com/tsouth89/homebrew-toolport)
+`Casks/toolport.rb`. The `livecheck` / `github_latest` block in that cask only
+feeds `brew livecheck`; it does not move the pin. The copy at
+`packaging/homebrew/toolport.rb` in this repo is a snapshot `brew install` does
+not read.
+
+After the GitHub release is **published** (the `.dmg` URLs 404 while the
+release is still a draft, same reason `winget.yml` waits for `released`):
+
+```bash
+# Hashes must come from the published assets. Do not reuse the previous
+# release's sha256, and do not invent one. Verified for v1.14.0: GitHub's
+# asset digest matched sha256sum of the downloaded dmgs.
+gh release download vX.Y.Z --repo tsouth89/toolport --pattern 'Toolport_*apple-darwin.dmg'
+sha256sum Toolport_aarch64-apple-darwin.dmg Toolport_x86_64-apple-darwin.dmg
+```
+
+Then in `tsouth89/homebrew-toolport` `Casks/toolport.rb` (and the snapshot
+here):
+
+1. Set `version` to the tag without the `v`.
+2. Set the `on_arm` sha256 to the `Toolport_aarch64-apple-darwin.dmg` digest.
+3. Set the `on_intel` sha256 to the `Toolport_x86_64-apple-darwin.dmg` digest.
+4. Keep both zap roots: `~/Library/Application Support/Conduit` (legacy
+   installs that have not migrated) and `~/Library/Application Support/Toolport`
+   (current `data_dir_leaf_name` in `src-tauri/src/brand.rs`). Cache/pref zap
+   paths stay `com.tsout.conduit` because the bundle id is intentionally
+   unchanged.
+5. Open a PR on the tap. `brew install` keeps serving the old pin until that
+   change is on the tap's default branch.
+
+`src/test/homebrew-cask.test.ts` fails CI if the in-repo snapshot version
+drifts from `package.json`, so a release bump that skips this file is loud.
+It cannot see the live tap; that is this checklist.
 
 The **gateway container image** (`ghcr.io/tsouth89/toolport-gateway`) publishes
 separately on every push to `main` via `docker-publish.yml` — no tag required.
