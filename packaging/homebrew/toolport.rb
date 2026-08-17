@@ -17,7 +17,7 @@ cask "toolport" do
   homepage "https://toolport.app/"
 
   # livecheck reports the latest GitHub tag for `brew livecheck`. brew install
-  # and brew upgrade still use the pinned version + sha256 below. Bump those
+  # and brew upgrade still use the pinned version + sha256 above. Bump those
   # on each published release (see docs/RELEASING.md).
   livecheck do
     url :url

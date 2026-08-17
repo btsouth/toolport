@@ -13,10 +13,11 @@ Releases are built by CI on a version tag (`.github/workflows/release.yml`).
      `packaging/agent-plugin/toolport/.claude-plugin/plugin.json` (`version`) —
      a vitest check (`src/test/agent-plugin.test.ts`) fails CI if these drift
      from `package.json`
-   - `packaging/homebrew/toolport.rb` (`version` + both dmg `sha256`s) — a
-     vitest check (`src/test/homebrew-cask.test.ts`) fails CI if the version
-     drifts from `package.json`. This file is a snapshot; `brew install` reads
-     the live tap, not this copy (see Homebrew tap below)
+   - `packaging/homebrew/toolport.rb` (`version`; update both dmg `sha256`s
+     after publishing, in the Homebrew tap step below) — a vitest check
+     (`src/test/homebrew-cask.test.ts`) fails CI if the version drifts from
+     `package.json`. This file is a snapshot; `brew install` reads the live
+     tap, not this copy (see Homebrew tap below)
    - `CHANGELOG.md` — move `[Unreleased]` entries into a dated section
    - `server.json` only when publishing a matching standalone gateway package
    - `scripts/install.ps1` / `scripts/install.sh` only if you changed them, in which
@@ -73,9 +74,10 @@ release is still a draft, same reason `winget.yml` waits for `released`):
 ```bash
 # Hashes must come from the published assets. Do not reuse the previous
 # release's sha256, and do not invent one. Verified for v1.14.0: GitHub's
-# asset digest matched sha256sum of the downloaded dmgs.
-gh release download vX.Y.Z --repo tsouth89/toolport --pattern 'Toolport_*apple-darwin.dmg'
-sha256sum Toolport_aarch64-apple-darwin.dmg Toolport_x86_64-apple-darwin.dmg
+# asset digest matched shasum of the downloaded dmgs. --clobber prevents
+# versionless files left by an earlier run from being reused.
+gh release download vX.Y.Z --repo tsouth89/toolport --pattern 'Toolport_*apple-darwin.dmg' --clobber
+shasum -a 256 Toolport_aarch64-apple-darwin.dmg Toolport_x86_64-apple-darwin.dmg
 ```
 
 Then in `tsouth89/homebrew-toolport` `Casks/toolport.rb` (and the snapshot

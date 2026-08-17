@@ -56,7 +56,7 @@ describe("RELEASING.md Homebrew tap step", () => {
   it("names the live tap and the hash-from-assets checklist", () => {
     expect(releasing).toContain("tsouth89/homebrew-toolport");
     expect(releasing).toContain("Casks/toolport.rb");
-    expect(releasing).toContain("sha256sum");
+    expect(releasing).toContain("shasum -a 256");
     expect(releasing).toContain("Toolport_*apple-darwin.dmg");
   });
 });
