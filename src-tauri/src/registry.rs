@@ -170,6 +170,79 @@ trait AtomicWriteOps {
     fn set_owner_only(&self, file: &std::fs::File) -> std::io::Result<()>;
     fn write_all(&self, file: &mut std::fs::File, contents: &[u8]) -> std::io::Result<()>;
     fn sync_all(&self, file: &std::fs::File) -> std::io::Result<()>;
+
+    /// The rename that publishes the finished temp file over the destination.
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)
+    }
+
+    /// Whether a failed publish rename is worth another attempt.
+    ///
+    /// Split from [`AtomicWriteOps::rename`] so the retry loop itself is testable on every
+    /// platform: the real answer is Windows-only, and a Linux-only test run would otherwise
+    /// never execute the loop it is meant to cover.
+    fn rename_is_retryable(&self, error: &std::io::Error) -> bool {
+        transient_rename_error(error)
+    }
+}
+
+/// Attempts for the publish rename, including the first.
+const RENAME_ATTEMPTS: u32 = 8;
+/// Backoff before the second attempt; doubles up to [`RENAME_BACKOFF_CAP`].
+const RENAME_BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(2);
+const RENAME_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(64);
+
+/// Is this rename failure the transient kind that retrying fixes?
+///
+/// Windows only. There, a rename fails outright while any other handle holds the destination
+/// open, and something usually does: Defender, the search indexer, a backup agent. The handle is
+/// released within milliseconds, so the operation was never impossible - only early.
+///
+/// This is not hypothetical. `hooks::tests::preview_text_is_the_bytes_install_actually_writes`
+/// failed one Windows CI run with `install_at` returning `Err`, while the identical test passed
+/// on every other host and on every other run. Users hit the same edge writing `settings.json`
+/// on a machine with antivirus running; CI just reports it more visibly.
+///
+/// Unix needs none of this: `rename(2)` is atomic against open handles, so a failure there is a
+/// real permission or layout problem and retrying only delays the report.
+#[cfg(windows)]
+fn transient_rename_error(error: &std::io::Error) -> bool {
+    /// `ERROR_SHARING_VIOLATION`. No `std::io::ErrorKind` maps to it, so match the raw code.
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    matches!(error.kind(), std::io::ErrorKind::PermissionDenied)
+        || error.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
+}
+
+#[cfg(not(windows))]
+fn transient_rename_error(_error: &std::io::Error) -> bool {
+    false
+}
+
+/// Publish the temp file, retrying while the failure looks transient.
+///
+/// Bounded on both axes - at most [`RENAME_ATTEMPTS`] tries and a capped backoff - so a
+/// destination that is genuinely locked forever still reports its error instead of hanging.
+/// A non-retryable error returns on the first attempt, unchanged and undelayed.
+fn rename_with_retry(
+    ops: &impl AtomicWriteOps,
+    from: &Path,
+    to: &Path,
+) -> std::io::Result<()> {
+    let mut delay = RENAME_BACKOFF_START;
+    let mut attempt = 1;
+    loop {
+        match ops.rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if attempt >= RENAME_ATTEMPTS || !ops.rename_is_retryable(&error) {
+                    return Err(error);
+                }
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(RENAME_BACKOFF_CAP);
+                attempt += 1;
+            }
+        }
+    }
 }
 
 struct FsAtomicWriteOps;
@@ -344,7 +417,7 @@ fn atomic_write_with_ops(
     // leave a truncated registry.json. `fs::write` + `rename` alone did not.
     ops.sync_all(&f).map_err(|e| e.to_string())?;
     drop(f);
-    std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+    rename_with_retry(ops, &tmp, &dest).map_err(|e| e.to_string())?;
     cleanup.disarm();
     // Best-effort: fsync the containing directory so the rename entry itself is durable
     // (Unix). Opening a directory as a File fails on Windows, where NTFS journals the
@@ -2938,23 +3011,48 @@ fn registry_lock_timeout() -> std::time::Duration {
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 #[doc(hidden)]
 #[must_use = "the override is reverted when the guard drops, so it must be bound"]
-pub struct LockTimeoutOverride(Option<std::ffi::OsString>);
+pub struct LockTimeoutOverride(());
+
+/// Live [`LockTimeoutOverride`] guards, and the value to put back when the last one drops.
+///
+/// Refcounted rather than each guard saving and restoring for itself. Rust runs tests
+/// multi-threaded, and several suites take this override at once. With save-and-restore, the
+/// FIRST guard to drop reverted the variable while later guards were still relying on it: the
+/// survivors silently fell back to the 5s production default part-way through a concurrent-writer
+/// stress test, which is precisely the flake this override exists to prevent (SBS-895) - only
+/// between overriders instead of against production. The baseline is captured once, on the way
+/// in from zero, so an externally set value still survives the whole nest.
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
+static LOCK_TIMEOUT_OVERRIDES: std::sync::Mutex<(usize, Option<std::ffi::OsString>)> =
+    std::sync::Mutex::new((0, None));
 
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 impl LockTimeoutOverride {
     pub fn generous() -> Self {
-        let previous = std::env::var_os("TOOLPORT_LOCK_TIMEOUT_MS");
+        let mut state = LOCK_TIMEOUT_OVERRIDES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.0 == 0 {
+            state.1 = std::env::var_os("TOOLPORT_LOCK_TIMEOUT_MS");
+        }
+        state.0 += 1;
         std::env::set_var("TOOLPORT_LOCK_TIMEOUT_MS", "60000");
-        Self(previous)
+        Self(())
     }
 }
 
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 impl Drop for LockTimeoutOverride {
     fn drop(&mut self) {
-        match &self.0 {
-            Some(value) => std::env::set_var("TOOLPORT_LOCK_TIMEOUT_MS", value),
-            None => std::env::remove_var("TOOLPORT_LOCK_TIMEOUT_MS"),
+        let mut state = LOCK_TIMEOUT_OVERRIDES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.0 = state.0.saturating_sub(1);
+        if state.0 == 0 {
+            match state.1.take() {
+                Some(value) => std::env::set_var("TOOLPORT_LOCK_TIMEOUT_MS", value),
+                None => std::env::remove_var("TOOLPORT_LOCK_TIMEOUT_MS"),
+            }
         }
     }
 }
@@ -4504,6 +4602,130 @@ mod tests {
         Permissions,
         Write,
         Sync,
+    }
+
+    /// Fails the publish rename `fail_times` times, then lets it through.
+    ///
+    /// Reports every failure as retryable so the loop runs on Linux and macOS too. The real
+    /// predicate is Windows-only, so without this override the retry path would be dead code
+    /// on two of the three hosts CI runs.
+    struct FlakyRenameOps {
+        fail_times: std::cell::Cell<u32>,
+        attempts: std::cell::Cell<u32>,
+        retryable: bool,
+    }
+
+    impl FlakyRenameOps {
+        fn new(fail_times: u32, retryable: bool) -> Self {
+            Self {
+                fail_times: std::cell::Cell::new(fail_times),
+                attempts: std::cell::Cell::new(0),
+                retryable,
+            }
+        }
+    }
+
+    impl AtomicWriteOps for FlakyRenameOps {
+        fn set_owner_only(&self, _file: &std::fs::File) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn write_all(&self, file: &mut std::fs::File, contents: &[u8]) -> std::io::Result<()> {
+            std::io::Write::write_all(file, contents)
+        }
+
+        fn sync_all(&self, file: &std::fs::File) -> std::io::Result<()> {
+            file.sync_all()
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.attempts.set(self.attempts.get() + 1);
+            let left = self.fail_times.get();
+            if left > 0 {
+                self.fail_times.set(left - 1);
+                // Shaped like the Windows failure this exists for.
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            std::fs::rename(from, to)
+        }
+
+        fn rename_is_retryable(&self, _error: &std::io::Error) -> bool {
+            self.retryable
+        }
+    }
+
+    /// A destination held open for a moment must not lose the write. On Windows the publish
+    /// rename fails outright while any other handle has the file, which cost one CI run a green
+    /// tick with no defect behind it.
+    #[test]
+    fn atomic_write_retries_a_transient_publish_rename() {
+        let _lock = data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-rename-retry-{}-{}",
+            std::process::id(),
+            ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let ops = FlakyRenameOps::new(3, true);
+        atomic_write_with_ops(&path, "landed", &ops).expect("a transient rename must be retried");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "landed");
+        assert_eq!(ops.attempts.get(), 4, "three refusals then the successful one");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The retry is bounded, and a failure it cannot classify as transient is reported at once
+    /// rather than slept over. A permanently locked destination must still surface its error.
+    #[test]
+    fn atomic_write_gives_up_on_a_rename_that_never_succeeds() {
+        let _lock = data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-rename-giveup-{}-{}",
+            std::process::id(),
+            ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let forever = FlakyRenameOps::new(u32::MAX, true);
+        atomic_write_with_ops(&path, "never", &forever).unwrap_err();
+        assert_eq!(forever.attempts.get(), RENAME_ATTEMPTS, "bounded, not endless");
+        assert!(!path.exists(), "a failed publish leaves no partial file behind");
+
+        // Not classified as transient: reported on the first attempt, with no backoff spent.
+        let permanent = FlakyRenameOps::new(u32::MAX, false);
+        atomic_write_with_ops(&path, "never", &permanent).unwrap_err();
+        assert_eq!(permanent.attempts.get(), 1, "a permanent error is not retried");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An inner override dropping must not disarm an outer one that is still live.
+    ///
+    /// Tests run multi-threaded and several suites take this guard at once, so overlapping
+    /// lifetimes are the normal case, not an exotic one. Save-and-restore let the first
+    /// dropped guard revert the variable out from under the others.
+    #[test]
+    fn overlapping_lock_timeout_overrides_survive_the_first_drop() {
+        let outer = LockTimeoutOverride::generous();
+        {
+            let _inner = LockTimeoutOverride::generous();
+            assert_eq!(
+                std::env::var("TOOLPORT_LOCK_TIMEOUT_MS").as_deref(),
+                Ok("60000")
+            );
+        }
+        assert_eq!(
+            std::env::var("TOOLPORT_LOCK_TIMEOUT_MS").as_deref(),
+            Ok("60000"),
+            "the inner guard's drop must not revert while the outer one is still held"
+        );
+        drop(outer);
+        assert!(
+            std::env::var_os("TOOLPORT_LOCK_TIMEOUT_MS").is_none(),
+            "the last guard out restores the baseline"
+        );
     }
 
     struct FailingAtomicWriteOps(FailingAtomicWriteStep);

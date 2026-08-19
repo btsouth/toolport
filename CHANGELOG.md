@@ -155,6 +155,26 @@ Entries before the rename below shipped under the project's former name, Conduit
   assertion passed on the next host, which is the signature of a race, not a defect. The
   capture is now read only after stderr closes, bounded so a stream that never closes
   cannot wedge a security check.
+- **A Windows write now retries instead of losing the race.** `atomic_write` published its temp
+  file with a single `rename`. On Windows that fails outright while any other handle holds the
+  destination, and something usually does - Defender, the search indexer, a backup agent - for
+  a few milliseconds. `hooks::tests::preview_text_is_the_bytes_install_actually_writes` duly
+  failed one Windows run with `install_at` returning an error while the identical test passed
+  everywhere else. This is not only a test problem: users writing `settings.json` on a machine
+  with antivirus hit the same edge. The publish rename now retries with a capped backoff, bounded
+  at 8 attempts so a genuinely locked destination still reports its error. Unix is untouched,
+  where `rename(2)` is atomic against open handles and a failure is real.
+- **Three more sources of intermittent test failure, found by auditing rather than waiting.**
+  The Windows Job Object test waited for its pid file to _exist_ and then read it once, but the
+  launcher creates the file and fills it in separate operations, so a read in between parses an
+  empty string and panics - the Unix sibling had been fixed for exactly this and the fix was
+  never mirrored. `LockTimeoutOverride` saved and restored the lock-timeout variable per guard,
+  so with several suites holding it at once the first one out reverted it while the others were
+  still relying on it, dropping them to the 5s production default mid-test; it is now refcounted.
+  And the HTTP concurrency test asserted an absolute 400ms wall-clock budget after two
+  guess-sleeps, which a loaded runner can miss while behaving correctly; it now waits for a real
+  signal that the slow call has parked and asserts the property it means - that the fast response
+  came back while the slow one was still in flight.
 
 ## [1.14.0] - 2026-08-16
 

@@ -283,8 +283,16 @@ describe("QuarantineAlert", () => {
     expect(await screen.findByRole("region")).toBeInTheDocument();
 
     listQuarantined.mockRejectedValue(new Error("backend down"));
-    // Give the poll a chance to land and (incorrectly) clear the list.
-    await new Promise((r) => setTimeout(r, 2100));
+    // Wait for a poll to actually land, rather than sleeping past the interval and hoping one
+    // did. The old fixed 2100ms sleep gave a 2000ms timer only 100ms of headroom, and a loaded
+    // runner routinely slips further than that - in which case the failing poll never fired and
+    // the assertion below passed without exercising the failure path at all. Waiting on the call
+    // count makes it impossible to pass for that reason, and returns as soon as the poll lands.
+    const pollsBefore = listQuarantined.mock.calls.length;
+    await waitFor(
+      () => expect(listQuarantined.mock.calls.length).toBeGreaterThan(pollsBefore),
+      { timeout: 8000 },
+    );
     expect(screen.getByRole("region")).toBeInTheDocument();
   });
 });
