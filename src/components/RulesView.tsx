@@ -78,13 +78,22 @@ export function RulesView() {
    * makes the page behind it inert, and this card is deliberately a live panel that clears itself
    * when the editor or the view moves under it. Scrolling keeps that.
    *
-   * `scrollIntoView` is absent in jsdom, hence the optional call.
+   * Both `scrollIntoView` and `matchMedia` are optional calls: jsdom ships neither, and
+   * `src/test/setup.ts` only stubs them for suites that opt in.
    */
   const previewRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    if (preview) {
-      previewRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" });
-    }
+    if (!preview) return;
+    // The `scroll-behavior: auto !important` reduced-motion rule in index.css does NOT cover
+    // this. An explicit `behavior` in the options dict beats the CSS property, so the preference
+    // has to be read here as well. Getting the card on screen is the fix; the smoothness is a
+    // nicety, and the first thing to drop for anyone who asked for less motion.
+    const reduceMotion =
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    previewRef.current?.scrollIntoView?.({
+      behavior: reduceMotion ? "auto" : "smooth",
+      block: "start",
+    });
   }, [preview]);
 
   const active = data?.sets.find((s) => s.id === data.activeSetId) ?? null;

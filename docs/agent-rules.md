@@ -95,10 +95,12 @@ below is the full set rather than what you will see.
 - **Claude Desktop** here means the chat app, which has no rules file. Claude Code running
   _inside_ the desktop app is a separate thing and shares `~/.claude` with the CLI, so it
   is already covered by the Claude Code row above.
-- **Continue** is the one entry that is a choice rather than a limit. It does read
-  `~/.continue/rules/`, so Toolport could write it, but `continuedev/continue` was archived
-  read-only in June 2026, so no adapter is planned. Continue is still detected as an MCP
-  client.
+- **Continue** has no global rules file of the shape Toolport writes. Its `.continue/rules/`
+  directory is per-project, and its user-level rules are a `rules:` array inside
+  `~/.continue/config.yaml` listing hub references or `file://` paths - a YAML list in the
+  same file Toolport already writes MCP config into, not a markdown file it could own or
+  bracket with markers. With `continuedev/continue` archived read-only in June 2026, no
+  adapter is planned. Continue is still detected as an MCP client.
 
 ## Per-client states
 

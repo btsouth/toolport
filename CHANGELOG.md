@@ -116,7 +116,10 @@ Entries before the rename below shipped under the project's former name, Conduit
   the path alone does not settle wherever two clients share one file (Claude Code / VS
   Code, Gemini CLI / Antigravity). Deliberately still an inline card rather than a dialog:
   a modal makes the page behind it inert, and this card is a live panel that clears itself
-  when the editor or the view moves under it.
+  when the editor or the view moves under it. The scroll is not animated for anyone whose
+  system asks for reduced motion: `index.css` already zeroes `scroll-behavior`, but an
+  explicit `behavior` in the options dict beats that CSS property, so the component reads
+  the preference itself.
 - **`docs/agent-rules.md` now names every client with no rules file, not two of them.**
   The "no rules file Toolport can write" section named only Cursor and Warp, but the
   Clients section builds that list from whatever is detected, so a user with LM Studio,
@@ -124,10 +127,26 @@ Entries before the rename below shipped under the project's former name, Conduit
   All seven are now listed with the reason each one is on it, including the note that
   Claude Desktop there is the chat app - Claude Code inside the desktop app shares
   `~/.claude` and is already covered by the Claude Code row. Continue's stale
-  "deferred" comment in `clients.rs` is corrected too: it does read
-  `~/.continue/rules/`, but `continuedev/continue` was archived read-only in June 2026,
-  so no adapter is planned. Continue stays a detected MCP client. Docs and a comment
-  only; no behaviour change.
+  "deferred" comment in `clients.rs` is corrected too: its `.continue/rules/` is
+  per-project and its user-level rules are a `rules:` array inside
+  `~/.continue/config.yaml`, which fits neither of Toolport's strategies, and
+  `continuedev/continue` was archived read-only in June 2026 besides. Continue stays a
+  detected MCP client. Docs and a comment only; no behaviour change.
+
+### Internal
+
+- **Every CI job now has a timeout, and apt retries instead of hanging.** `Rust Clippy`
+  and `Linux build + test` carried no `timeout-minutes`, so they inherited GitHub's
+  6-hour default; the jobs in `audit`, `docker-publish`, `release` and `winget` had none
+  either. A flaky Ubuntu mirror made that concrete on one pull request, stalling
+  `apt-get update` in three separate jobs without ever reaching a compiler. An unbounded
+  hang is the worst shape available: it burns the whole budget, and a run stuck in
+  progress also blocks `gh run rerun --failed` on the jobs that genuinely failed, so
+  recovery needs a manual cancel. All 14 jobs across the 6 workflows now carry an
+  explicit backstop, sized per job and generous where a tight limit could kill a real
+  release. The five `apt-get update` call sites are now one script,
+  `scripts/ci-apt-install.sh`, which bounds each attempt and retries, so a bad mirror
+  costs seconds rather than a job.
 
 ## [1.14.0] - 2026-08-16
 

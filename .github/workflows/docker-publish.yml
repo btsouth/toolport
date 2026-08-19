@@ -26,6 +26,8 @@ env:
 
 jobs:
   build-gateway:
+    # Backstop only - GitHub defaults to 360 minutes. Matches the Rust jobs in ci.yml: this compiles the same crate from a cold cache.
+    timeout-minutes: 30
     name: build gateway binary
     runs-on: ubuntu-22.04
     steps:
@@ -36,9 +38,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev pkg-config libdbus-1-dev
+        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev
 
       # Cache DEPENDENCY build artifacts only, never the workspace's own crates.
       # History: a naive actions/cache of all of `src-tauri/target` keyed on Cargo.lock
@@ -78,6 +78,8 @@ jobs:
           retention-days: 1
 
   publish:
+    # Backstop only - GitHub defaults to 360 minutes. Multi-arch buildx and a registry push, both network-bound.
+    timeout-minutes: 30
     name: build + push image
     needs: build-gateway
     runs-on: ubuntu-22.04

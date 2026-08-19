@@ -10983,10 +10983,13 @@ rules:
     #[test]
     fn rules_target_unsupported_clients_return_none() {
         // Cursor/Warp store globals in UI/cloud; chat/identity apps have no global rules file
-        // we manage. Continue is the one entry here that is a decision rather than a limit: it
-        // does read `~/.continue/rules/`, so an adapter is possible, but `continuedev/continue`
-        // was archived read-only in June 2026 and will not track provider changes, so none is
-        // planned. It stays a detected MCP client for anyone running a pinned build or fork.
+        // we manage. Continue has no global rules FILE either: `.continue/rules/` is
+        // workspace-local, and its user-level rules are a `rules:` array inside
+        // `~/.continue/config.yaml` whose entries are hub refs or `file://` paths. That fits
+        // neither strategy here - it is a YAML list in the same file we already write MCP config
+        // into, not a markdown file we can own or bracket with sentinels. With
+        // `continuedev/continue` archived read-only in June 2026, a third strategy for one dead
+        // client is not worth building. It stays a detected MCP client for pinned builds and forks.
         for id in [
             "cursor",
             "warp",
