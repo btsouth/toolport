@@ -17,6 +17,12 @@ permissions:
 jobs:
   clippy:
     name: Rust Clippy
+    # Without this the job inherits GitHub's 6-hour default. A flaky Ubuntu mirror
+    # hung `apt-get update` here for 34 minutes with no compiler ever reached, and
+    # because the job never ended the whole run stayed in progress - which also
+    # blocks `gh run rerun --failed` on the jobs that DID fail. 30 matches
+    # cross-platform-rust, the other job that compiles this crate from cold.
+    timeout-minutes: 30
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -41,6 +47,12 @@ jobs:
 
   build-test:
     name: Linux build + test
+    # Same gap as clippy above, and this one feeds the required merge gate, so a
+    # hang here stalls every PR rather than one advisory check. Higher than the
+    # rest because this job does strictly the most: frontend build and tests,
+    # Rust tests, the headless gateway build and its smoke test. The number is a
+    # hang backstop, not a target - a cold run is well under it.
+    timeout-minutes: 45
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
