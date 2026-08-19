@@ -292,6 +292,37 @@ describe("RulesView", () => {
     expect(screen.getByLabelText("Rules")).toHaveValue("Always run tests. And lint.");
   });
 
+  it("scrolls the preview into view and names the client it belongs to", async () => {
+    // The card renders after the clients list, so on a short window it opens below the fold and
+    // Preview reads as a dead button. jsdom implements no scrollIntoView, so there is nothing to
+    // spy on until we put one there.
+    const scrollIntoView = vi.fn();
+    const original = Object.getOwnPropertyDescriptor(Element.prototype, "scrollIntoView");
+    Element.prototype.scrollIntoView = scrollIntoView;
+    try {
+      api.rulesPreview.mockResolvedValue({
+        clientId: "codex",
+        path: "/home/a/.codex/AGENTS.md",
+        strategy: "sentinelBlock",
+        before: "",
+        after: "Always run tests.\n",
+        state: "stale",
+      });
+      render(<RulesView />);
+      await screen.findByLabelText("Rules");
+
+      await userEvent.click(screen.getAllByRole("button", { name: /Preview/ })[0]);
+      expect(await screen.findByText("/home/a/.codex/AGENTS.md")).toBeInTheDocument();
+
+      expect(scrollIntoView).toHaveBeenCalled();
+      // Two clients can share one file, so the path alone does not say whose preview this is.
+      expect(screen.getByRole("heading", { name: "Preview: Codex" })).toBeInTheDocument();
+    } finally {
+      if (original) Object.defineProperty(Element.prototype, "scrollIntoView", original);
+      else delete (Element.prototype as Partial<Element>).scrollIntoView;
+    }
+  });
+
   it("clears a stale preview when the view is reseated", async () => {
     api.rulesPreview.mockResolvedValue({
       clientId: "codex",
