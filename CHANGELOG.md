@@ -109,6 +109,25 @@ Entries before the rename below shipped under the project's former name, Conduit
   via Qwen's `url` → `httpUrl` whenever the map key was not VS Code `"servers"`.
   Kimi requires `url` and rejects `httpUrl`. The Kimi writer already emitted the
   right shape; Shared HTTP now uses that same formatter. (SBS-921)
+- **Agent rules Preview no longer looks like a dead button.** The preview card renders
+  after the clients list, so on any window too short to reach it, clicking Preview
+  scrolled nothing and showed nothing: the card was open the whole time, below the fold.
+  Opening a preview now brings the card into view, and its header names the client, which
+  the path alone does not settle wherever two clients share one file (Claude Code / VS
+  Code, Gemini CLI / Antigravity). Deliberately still an inline card rather than a dialog:
+  a modal makes the page behind it inert, and this card is a live panel that clears itself
+  when the editor or the view moves under it.
+- **`docs/agent-rules.md` now names every client with no rules file, not two of them.**
+  The "no rules file Toolport can write" section named only Cursor and Warp, but the
+  Clients section builds that list from whatever is detected, so a user with LM Studio,
+  Jan, Hermes, Claude Desktop or Continue installed saw names the doc never mentioned.
+  All seven are now listed with the reason each one is on it, including the note that
+  Claude Desktop there is the chat app - Claude Code inside the desktop app shares
+  `~/.claude` and is already covered by the Claude Code row. Continue's stale
+  "deferred" comment in `clients.rs` is corrected too: it does read
+  `~/.continue/rules/`, but `continuedev/continue` was archived read-only in June 2026,
+  so no adapter is planned. Continue stays a detected MCP client. Docs and a comment
+  only; no behaviour change.
 
 ## [1.14.0] - 2026-08-16
 
