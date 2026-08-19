@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Eye, FileText, Plus, RefreshCw, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -68,6 +68,33 @@ export function RulesView() {
 
   const [preview, setPreview] = useState<RulesPreview | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+
+  /**
+   * The preview card renders after the clients list, so on a window too short to reach it the
+   * Preview button looks like it does nothing at all - the worst failure available to the one
+   * control whose entire job is to show you something. Bring the card into view when it opens.
+   *
+   * A dialog would also solve this, and the Agent activity tab uses one, but not here: a modal
+   * makes the page behind it inert, and this card is deliberately a live panel that clears itself
+   * when the editor or the view moves under it. Scrolling keeps that.
+   *
+   * Both `scrollIntoView` and `matchMedia` are optional calls: jsdom ships neither, and
+   * `src/test/setup.ts` only stubs them for suites that opt in.
+   */
+  const previewRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!preview) return;
+    // The `scroll-behavior: auto !important` reduced-motion rule in index.css does NOT cover
+    // this. An explicit `behavior` in the options dict beats the CSS property, so the preference
+    // has to be read here as well. Getting the card on screen is the fix; the smoothness is a
+    // nicety, and the first thing to drop for anyone who asked for less motion.
+    const reduceMotion =
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    previewRef.current?.scrollIntoView?.({
+      behavior: reduceMotion ? "auto" : "smooth",
+      block: "start",
+    });
+  }, [preview]);
 
   const active = data?.sets.find((s) => s.id === data.activeSetId) ?? null;
   const dirty =
@@ -273,6 +300,11 @@ export function RulesView() {
   const supported = clients.filter((c) => c.path);
   const unsupported = clients.filter((c) => !c.path);
   const onCount = supported.filter((c) => c.enabled).length;
+  // Name the client in the card header. The path alone is ambiguous wherever two clients share a
+  // file (Claude Code / VS Code, Gemini CLI / Antigravity).
+  const previewClientName = preview
+    ? (clients.find((c) => c.id === preview.clientId)?.name ?? null)
+    : null;
 
   return (
     <div className="flex flex-col gap-5">
@@ -446,9 +478,11 @@ export function RulesView() {
       </div>
 
       {preview && (
-        <div className="rounded-xl border bg-card p-5">
+        <div ref={previewRef} className="scroll-mt-4 rounded-xl border bg-card p-5">
           <div className="mb-1 flex items-center justify-between gap-3">
-            <h2 className="text-sm font-medium">Preview</h2>
+            <h2 className="text-sm font-medium">
+              Preview{previewClientName ? `: ${previewClientName}` : ""}
+            </h2>
             <button
               type="button"
               onClick={() => setPreview(null)}

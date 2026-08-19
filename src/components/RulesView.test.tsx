@@ -292,6 +292,91 @@ describe("RulesView", () => {
     expect(screen.getByLabelText("Rules")).toHaveValue("Always run tests. And lint.");
   });
 
+  it("scrolls the preview into view and names the client it belongs to", async () => {
+    // The card renders after the clients list, so on a short window it opens below the fold and
+    // Preview reads as a dead button. `src/test/setup.ts` stubs scrollIntoView as a no-op, so
+    // swap in a spy for the length of this test and put the stub back afterwards.
+    const scrollIntoView = vi.fn();
+    const original = Object.getOwnPropertyDescriptor(Element.prototype, "scrollIntoView");
+    Element.prototype.scrollIntoView = scrollIntoView;
+    try {
+      api.rulesPreview.mockResolvedValue({
+        clientId: "codex",
+        path: "/home/a/.codex/AGENTS.md",
+        strategy: "sentinelBlock",
+        before: "",
+        after: "Always run tests.\n",
+        state: "stale",
+      });
+      render(<RulesView />);
+      await screen.findByLabelText("Rules");
+
+      await userEvent.click(screen.getAllByRole("button", { name: /Preview/ })[0]);
+      expect(await screen.findByText("/home/a/.codex/AGENTS.md")).toBeInTheDocument();
+
+      // Smooth by default; the reduced-motion branch is covered below.
+      expect(scrollIntoView).toHaveBeenCalledWith({
+        behavior: "smooth",
+        block: "start",
+      });
+      // Two clients can share one file, so the path alone does not say whose preview this is.
+      expect(screen.getByRole("heading", { name: "Preview: Codex" })).toBeInTheDocument();
+    } finally {
+      if (original) Object.defineProperty(Element.prototype, "scrollIntoView", original);
+      else delete (Element.prototype as Partial<Element>).scrollIntoView;
+    }
+  });
+
+  it("does not animate the preview scroll for a reduced-motion reader", async () => {
+    // index.css already zeroes scroll-behavior under prefers-reduced-motion, but an explicit
+    // `behavior` in the options dict beats that CSS property, so the component has to read the
+    // preference itself. Without that, this is the one animation the stylesheet cannot reach.
+    const scrollIntoView = vi.fn();
+    const originalScroll = Object.getOwnPropertyDescriptor(
+      Element.prototype,
+      "scrollIntoView",
+    );
+    Element.prototype.scrollIntoView = scrollIntoView;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation(
+      (query: string) =>
+        ({
+          matches: query.includes("prefers-reduced-motion"),
+          media: query,
+          onchange: null,
+          addListener: () => {},
+          removeListener: () => {},
+          addEventListener: () => {},
+          removeEventListener: () => {},
+          dispatchEvent: () => false,
+        }) as unknown as MediaQueryList,
+    );
+    try {
+      api.rulesPreview.mockResolvedValue({
+        clientId: "codex",
+        path: "/home/a/.codex/AGENTS.md",
+        strategy: "sentinelBlock",
+        before: "",
+        after: "Always run tests.\n",
+        state: "stale",
+      });
+      render(<RulesView />);
+      await screen.findByLabelText("Rules");
+
+      await userEvent.click(screen.getAllByRole("button", { name: /Preview/ })[0]);
+      expect(await screen.findByText("/home/a/.codex/AGENTS.md")).toBeInTheDocument();
+
+      // Still scrolled - the card must reach the screen either way. Just not animated.
+      expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "auto", block: "start" });
+    } finally {
+      matchMedia.mockRestore();
+      if (originalScroll) {
+        Object.defineProperty(Element.prototype, "scrollIntoView", originalScroll);
+      } else {
+        delete (Element.prototype as Partial<Element>).scrollIntoView;
+      }
+    }
+  });
+
   it("clears a stale preview when the view is reseated", async () => {
     api.rulesPreview.mockResolvedValue({
       clientId: "codex",

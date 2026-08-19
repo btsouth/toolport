@@ -89,6 +89,37 @@ function startGateway({ port, host, authToken, insecureLoopback = false }) {
   return { child, stderr: boundedStderr(child) };
 }
 
+/**
+ * Wait, bounded, for a child's stderr to close.
+ *
+ * `waitForExit` resolves on `exit`, which Node fires as soon as the process ends - while the
+ * piped stderr can still hold bytes that have not been delivered. Anything reading the captured
+ * stderr at that moment can therefore see a truncated message.
+ *
+ * That is not theoretical. The Windows runner once reported `refusing to bind 0.0.0.0` without
+ * the `without HTTP authentication` tail that `expectBindRefusal` matches on, failing a run in
+ * which the gateway had done exactly the right thing. The same assertion passed on the next
+ * host, which is the signature of a race rather than a defect.
+ *
+ * Resolving on `end`/`close` means the capture is complete before it is read. The timeout keeps
+ * a stream that never closes from wedging a security smoke test.
+ */
+function drainStderr(child, timeoutMs = 2_000) {
+  const stream = child.stderr;
+  if (!stream || stream.readableEnded || stream.destroyed) return Promise.resolve();
+  return new Promise((resolve) => {
+    function finish() {
+      clearTimeout(timer);
+      stream.off("end", finish);
+      stream.off("close", finish);
+      resolve();
+    }
+    const timer = setTimeout(finish, timeoutMs);
+    stream.once("end", finish);
+    stream.once("close", finish);
+  });
+}
+
 function waitForExit(child, timeoutMs) {
   if (child.exitCode !== null || child.signalCode !== null) {
     return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
@@ -315,6 +346,9 @@ async function expectBindRefusal({ name, host }) {
   const { child, stderr } = startGateway({ port, host });
   try {
     const exited = await waitForExit(child, 10_000);
+    // Read the capture only once stderr has closed: `exit` alone does not guarantee the whole
+    // refusal message has arrived, and a half-delivered one fails an assertion the gateway passed.
+    await drainStderr(child);
     const output = stderr();
     if (
       exited &&

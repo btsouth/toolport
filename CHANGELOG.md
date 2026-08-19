@@ -109,6 +109,72 @@ Entries before the rename below shipped under the project's former name, Conduit
   via Qwen's `url` → `httpUrl` whenever the map key was not VS Code `"servers"`.
   Kimi requires `url` and rejects `httpUrl`. The Kimi writer already emitted the
   right shape; Shared HTTP now uses that same formatter. (SBS-921)
+- **Agent rules Preview no longer looks like a dead button.** The preview card renders
+  after the clients list, so on any window too short to reach it, clicking Preview
+  scrolled nothing and showed nothing: the card was open the whole time, below the fold.
+  Opening a preview now brings the card into view, and its header names the client, which
+  the path alone does not settle wherever two clients share one file (Claude Code / VS
+  Code, Gemini CLI / Antigravity). Deliberately still an inline card rather than a dialog:
+  a modal makes the page behind it inert, and this card is a live panel that clears itself
+  when the editor or the view moves under it. The scroll is not animated for anyone whose
+  system asks for reduced motion: `index.css` already zeroes `scroll-behavior`, but an
+  explicit `behavior` in the options dict beats that CSS property, so the component reads
+  the preference itself.
+- **`docs/agent-rules.md` now names every client with no rules file, not two of them.**
+  The "no rules file Toolport can write" section named only Cursor and Warp, but the
+  Clients section builds that list from whatever is detected, so a user with LM Studio,
+  Jan, Hermes, Claude Desktop or Continue installed saw names the doc never mentioned.
+  All seven are now listed with the reason each one is on it, including the note that
+  Claude Desktop there is the chat app - Claude Code inside the desktop app shares
+  `~/.claude` and is already covered by the Claude Code row. Continue's stale
+  "deferred" comment in `clients.rs` is corrected too: its `.continue/rules/` is
+  per-project and its user-level rules are a `rules:` array inside
+  `~/.continue/config.yaml`, which fits neither of Toolport's strategies, and
+  `continuedev/continue` was archived read-only in June 2026 besides. Continue stays a
+  detected MCP client. Docs and a comment only; no behaviour change.
+
+### Internal
+
+- **Every CI job now has a timeout, and apt retries instead of hanging.** `Rust Clippy`
+  and `Linux build + test` carried no `timeout-minutes`, so they inherited GitHub's
+  6-hour default; the jobs in `audit`, `docker-publish`, `release` and `winget` had none
+  either. A flaky Ubuntu mirror made that concrete on one pull request, stalling
+  `apt-get update` in three separate jobs without ever reaching a compiler. An unbounded
+  hang is the worst shape available: it burns the whole budget, and a run stuck in
+  progress also blocks `gh run rerun --failed` on the jobs that genuinely failed, so
+  recovery needs a manual cancel. All 14 jobs across the 6 workflows now carry an
+  explicit backstop, sized per job and generous where a tight limit could kill a real
+  release. The five `apt-get update` call sites are now one script,
+  `scripts/ci-apt-install.sh`, which bounds each attempt and retries, so a bad mirror
+  costs seconds rather than a job.
+- **The headless security smoke no longer fails on a stderr race.** `expectBindRefusal`
+  read the gateway's captured stderr as soon as the process emitted `exit`, but Node fires
+  that while piped stdio can still hold undelivered bytes. The Windows runner duly reported
+  `refusing to bind 0.0.0.0` without the `without HTTP authentication` tail the assertion
+  matches on, failing a run in which the gateway had behaved correctly - and the identical
+  assertion passed on the next host, which is the signature of a race, not a defect. The
+  capture is now read only after stderr closes, bounded so a stream that never closes
+  cannot wedge a security check.
+- **A Windows write now retries instead of losing the race.** `atomic_write` published its temp
+  file with a single `rename`. On Windows that fails outright while any other handle holds the
+  destination, and something usually does - Defender, the search indexer, a backup agent - for
+  a few milliseconds. `hooks::tests::preview_text_is_the_bytes_install_actually_writes` duly
+  failed one Windows run with `install_at` returning an error while the identical test passed
+  everywhere else. This is not only a test problem: users writing `settings.json` on a machine
+  with antivirus hit the same edge. The publish rename now retries with a capped backoff, bounded
+  at 8 attempts so a genuinely locked destination still reports its error. Unix is untouched,
+  where `rename(2)` is atomic against open handles and a failure is real.
+- **Three more sources of intermittent test failure, found by auditing rather than waiting.**
+  The Windows Job Object test waited for its pid file to _exist_ and then read it once, but the
+  launcher creates the file and fills it in separate operations, so a read in between parses an
+  empty string and panics - the Unix sibling had been fixed for exactly this and the fix was
+  never mirrored. `LockTimeoutOverride` saved and restored the lock-timeout variable per guard,
+  so with several suites holding it at once the first one out reverted it while the others were
+  still relying on it, dropping them to the 5s production default mid-test; it is now refcounted.
+  And the HTTP concurrency test asserted an absolute 400ms wall-clock budget after two
+  guess-sleeps, which a loaded runner can miss while behaving correctly; it now waits for a real
+  signal that the slow call has parked and asserts the property it means - that the fast response
+  came back while the slow one was still in flight.
 
 ## [1.14.0] - 2026-08-16
 

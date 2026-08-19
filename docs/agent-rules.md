@@ -80,10 +80,27 @@ assistant in VS Code, paste the rules into its own file.
 
 ### Clients with no rules file Toolport can write
 
-**Cursor** and **Warp** keep their global rules in their own UI or account rather
-than in a file on disk. They have no checkbox; the Clients section names them
-underneath ("No rules file Toolport can write for Cursor, Warp"), so you know to
-paste your rules in yourself. Toolport does not silently skip them.
+Some clients keep their global rules somewhere Toolport cannot write. They have no
+checkbox; the Clients section lists whichever of them it detects underneath ("No rules
+file Toolport can write for ..."), so you know to paste your rules in yourself. Toolport
+does not silently skip them. Which names appear depends on what is installed, so the list
+below is the full set rather than what you will see.
+
+- **Cursor** and **Warp** keep global rules in their own UI or account: Cursor's User
+  rules in _Customize -> Rules_, Warp's in Warp Drive. Both also read per-project files
+  (`.cursor/rules/`, `AGENTS.md`, `WARP.md`), which Agent rules does not cover yet either
+  (see [Project-level rules](#project-level-rules)).
+- **LM Studio**, **Jan** and **Hermes** keep the system prompt per chat or per model in
+  their own store, not in a global file.
+- **Claude Desktop** here means the chat app, which has no rules file. Claude Code running
+  _inside_ the desktop app is a separate thing and shares `~/.claude` with the CLI, so it
+  is already covered by the Claude Code row above.
+- **Continue** has no global rules file of the shape Toolport writes. Its `.continue/rules/`
+  directory is per-project, and its user-level rules are a `rules:` array inside
+  `~/.continue/config.yaml` listing hub references or `file://` paths - a YAML list in the
+  same file Toolport already writes MCP config into, not a markdown file it could own or
+  bracket with markers. With `continuedev/continue` archived read-only in June 2026, no
+  adapter is planned. Continue is still detected as an MCP client.
 
 ## Per-client states
 

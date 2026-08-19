@@ -27,6 +27,8 @@ permissions:
 
 jobs:
   submit:
+    # Backstop only - GitHub defaults to 360 minutes. Manifest submission is network-bound and small.
+    timeout-minutes: 20
     # Prereleases are not what `winget install` should hand people. On a manual
     # run `github.event.release` is null, so the tag is checked below instead.
     if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}

@@ -20502,7 +20502,10 @@ mod tests {
     fn http_slow_call_does_not_block_other_requests() {
         // A downstream whose tools/call blocks ~800ms; initialize/tools/list stay fast
         // so the connect handshake and routing (`s__wait`) work normally.
-        struct SlowRoute;
+        struct SlowRoute {
+            /// Set the instant the blocking call actually reaches dispatch.
+            entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
         impl conduit_lib::downstream::Transport for SlowRoute {
             fn request(
                 &mut self,
@@ -20513,6 +20516,8 @@ mod tests {
                     "initialize" => Ok(json!({ "protocolVersion": "2025-06-18" })),
                     "tools/list" => Ok(json!({ "tools": [{ "name": "wait", "description": "" }] })),
                     "tools/call" => {
+                        self.entered
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(800));
                         Ok(json!({ "content": [{ "type": "text", "text": "done" }] }))
                     }
@@ -20530,7 +20535,14 @@ mod tests {
             }
         }
 
-        let ds = DownstreamServer::connect("s".into(), Box::new(SlowRoute)).unwrap();
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ds = DownstreamServer::connect(
+            "s".into(),
+            Box::new(SlowRoute {
+                entered: entered.clone(),
+            }),
+        )
+        .unwrap();
         let mut router = Router::new();
         router.add(ds);
         let mut state = http_state(false);
@@ -20543,22 +20555,41 @@ mod tests {
         std::thread::spawn(move || serve_http_loop(server, state, None, search, confirm, true));
         std::thread::sleep(Duration::from_millis(50)); // let the listener come up
 
-        // Kick off the slow (blocking) call on its own thread, then let it get parked
-        // in dispatch before timing the fast request.
-        let slow = std::thread::spawn(move || http_post(port, "/s__wait", "{}"));
-        std::thread::sleep(Duration::from_millis(150));
+        // Kick off the slow (blocking) call on its own thread. `slow_done` flips only once
+        // that request has fully returned.
+        let slow_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let slow_done_writer = slow_done.clone();
+        let slow = std::thread::spawn(move || {
+            let response = http_post(port, "/s__wait", "{}");
+            slow_done_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+            response
+        });
 
-        // A concurrent fast request must return well before the slow call's 800ms sleep.
-        let t0 = Instant::now();
+        // Wait for the slow call to be genuinely parked in dispatch instead of guessing at it.
+        // A fixed sleep here is a bet that 150ms is enough on every runner; when it is not, the
+        // measurement below starts before the slow call has even begun and the test fails for a
+        // reason that has nothing to do with the behaviour it covers.
+        let parked_deadline = Instant::now() + Duration::from_secs(10);
+        while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                Instant::now() < parked_deadline,
+                "the slow call never reached dispatch, so nothing was being blocked on"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
         let fast = http_get(port, "/");
-        let elapsed = t0.elapsed();
         assert!(
             fast.contains("Toolport gateway"),
             "fast response was: {fast}"
         );
+        // The property is ordering, not milliseconds: the fast request came back while the slow
+        // one was still in flight. Under a serialized accept loop that is impossible, so this
+        // discriminates exactly what the test is named for - and unlike a wall-clock budget it
+        // does not also fail when a loaded runner simply descheduled this thread for a while.
         assert!(
-            elapsed < Duration::from_millis(400),
-            "fast request was blocked behind the slow call ({elapsed:?}); the loop serialized"
+            !slow_done.load(std::sync::atomic::Ordering::SeqCst),
+            "fast request only returned after the slow call finished; the loop serialized"
         );
 
         // The slow call still completes correctly.

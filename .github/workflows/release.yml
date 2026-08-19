@@ -26,6 +26,9 @@ permissions:
 
 jobs:
   build:
+    # Backstop only - GitHub defaults to 360 minutes. Deliberately generous: bundles Tauri on four targets and waits on Apple notarisation.
+    # A tight limit here would kill a legitimate release, which costs more than a hang.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -81,12 +84,10 @@ jobs:
 
       - name: Install Linux build dependencies
         if: matrix.os == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          # pkg-config + libdbus-1-dev are required to build libdbus-sys, pulled in
-          # by the Secret Service keychain backend; without them the Linux build
-          # fails to compile.
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev
+        # pkg-config + libdbus-1-dev are required to build libdbus-sys, pulled in
+        # by the Secret Service keychain backend; without them the Linux build
+        # fails to compile.
+        run: scripts/ci-apt-install.sh libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev
 
       - name: Add the macOS Rust target
         if: matrix.target
@@ -282,6 +283,8 @@ jobs:
   # fails. Keep this job independent of the build matrix and upload its asset to
   # the same draft release.
   agent-plugin:
+    # Backstop only - GitHub defaults to 360 minutes. Packaging and upload only.
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -329,6 +332,8 @@ jobs:
   # installers are uploaded to the draft. If this job fails the draft still has
   # working installers - only auto-update is affected.
   updater-manifest:
+    # Backstop only - GitHub defaults to 360 minutes. Writes and uploads one JSON manifest.
+    timeout-minutes: 15
     needs: build
     runs-on: ubuntu-latest
     steps:

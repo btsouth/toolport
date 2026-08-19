@@ -7029,15 +7029,25 @@ mod tests {
         let transport = StdioTransport::spawn("powershell.exe", &args, &[], None)
             .expect("spawn Job Object-owned launcher");
 
+        // Poll for parsable CONTENT, not mere existence - the same fix the Unix sibling
+        // below already carries, and for the same reason. `WriteAllText` creates the file
+        // and fills it as separate operations, so a read landing between the two returns an
+        // empty string and `parse` panics on a test that was about to pass. Waiting on
+        // `exists()` is waiting on the wrong event.
         let created_deadline = Instant::now() + Duration::from_secs(8);
-        while !pid_file.exists() && Instant::now() < created_deadline {
+        let grandchild_pid: u32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < created_deadline,
+                "launcher should record its grandchild pid"
+            );
             std::thread::sleep(Duration::from_millis(25));
-        }
-        let grandchild_pid: u32 = std::fs::read_to_string(&pid_file)
-            .expect("launcher should record its grandchild pid")
-            .trim()
-            .parse()
-            .expect("grandchild pid should be numeric");
+        };
         assert!(
             process_is_running(grandchild_pid),
             "grandchild must be alive before the Job Object closes"

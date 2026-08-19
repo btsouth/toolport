@@ -17,6 +17,12 @@ permissions:
 jobs:
   clippy:
     name: Rust Clippy
+    # Without this the job inherits GitHub's 6-hour default. A flaky Ubuntu mirror
+    # hung `apt-get update` here for 34 minutes with no compiler ever reached, and
+    # because the job never ended the whole run stayed in progress - which also
+    # blocks `gh run rerun --failed` on the jobs that DID fail. 30 matches
+    # cross-platform-rust, the other job that compiles this crate from cold.
+    timeout-minutes: 30
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -30,9 +36,7 @@ jobs:
       # Same headless dependency set as build-test: no GTK/WebKit, because the
       # lint below skips the Tauri desktop feature for the same reason.
       - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev pkg-config libdbus-1-dev
+        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev
 
       # --no-default-features matches every other Rust job here. With the desktop
       # feature on, this needs the GTK and WebKit headers and dies building gdk-sys.
@@ -41,6 +45,12 @@ jobs:
 
   build-test:
     name: Linux build + test
+    # Same gap as clippy above, and this one feeds the required merge gate, so a
+    # hang here stalls every PR rather than one advisory check. Higher than the
+    # rest because this job does strictly the most: frontend build and tests,
+    # Rust tests, the headless gateway build and its smoke test. The number is a
+    # hang backstop, not a target - a cold run is well under it.
+    timeout-minutes: 45
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -55,11 +65,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          # Same set as the release workflow: WebKitGTK + the Secret Service
-          # (libdbus) deps the Tauri lib needs to compile on Linux.
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev
+        # Same set as the release workflow: WebKitGTK + the Secret Service
+        # (libdbus) deps the Tauri lib needs to compile on Linux.
+        run: scripts/ci-apt-install.sh libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev
 
       - name: Give the runner headroom (a cold build links WebKitGTK)
         run: |
@@ -133,9 +141,7 @@ jobs:
       # needs libdbus headers and pkg-config at compile time.
       - name: Install Linux build dependencies
         if: matrix.os == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev pkg-config libdbus-1-dev
+        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev
 
       - name: Cache cargo + target
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
