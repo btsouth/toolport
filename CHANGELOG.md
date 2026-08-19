@@ -147,6 +147,14 @@ Entries before the rename below shipped under the project's former name, Conduit
   release. The five `apt-get update` call sites are now one script,
   `scripts/ci-apt-install.sh`, which bounds each attempt and retries, so a bad mirror
   costs seconds rather than a job.
+- **The headless security smoke no longer fails on a stderr race.** `expectBindRefusal`
+  read the gateway's captured stderr as soon as the process emitted `exit`, but Node fires
+  that while piped stdio can still hold undelivered bytes. The Windows runner duly reported
+  `refusing to bind 0.0.0.0` without the `without HTTP authentication` tail the assertion
+  matches on, failing a run in which the gateway had behaved correctly - and the identical
+  assertion passed on the next host, which is the signature of a race, not a defect. The
+  capture is now read only after stderr closes, bounded so a stream that never closes
+  cannot wedge a security check.
 
 ## [1.14.0] - 2026-08-16
 
