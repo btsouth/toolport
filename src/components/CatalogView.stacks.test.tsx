@@ -80,6 +80,35 @@ describe("CatalogView stack loading", () => {
     expect(listStacks).toHaveBeenCalledTimes(2);
   });
 
+  it("shows stacks when the popular catalog is empty", async () => {
+    vi.mocked(popularCatalog).mockResolvedValueOnce([]);
+    vi.mocked(listStacks).mockResolvedValueOnce([stack]);
+
+    render(<CatalogView registry={registry} onAdded={vi.fn()} />);
+
+    expect(await screen.findByText("Developer")).toBeInTheDocument();
+    expect(screen.getByText("No popular servers available")).toBeInTheDocument();
+  });
+
+  it("keeps stack failure and retry visible when the popular catalog is empty", async () => {
+    vi.mocked(popularCatalog).mockResolvedValueOnce([]);
+    vi.mocked(listStacks)
+      .mockRejectedValueOnce(new Error("registry unavailable"))
+      .mockResolvedValueOnce([stack]);
+    const user = userEvent.setup();
+
+    render(<CatalogView registry={registry} onAdded={vi.fn()} />);
+
+    expect(await screen.findByText("Stacks couldn't load")).toBeInTheDocument();
+    expect(screen.getByText("No popular servers available")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Try again" }));
+
+    expect(await screen.findByText("Developer")).toBeInTheDocument();
+    expect(screen.queryByText("Stacks couldn't load")).not.toBeInTheDocument();
+    expect(listStacks).toHaveBeenCalledTimes(2);
+  });
+
   it("shows a skeleton while loading and stays quiet for an empty stack catalog", async () => {
     const pending = deferred<Stack[]>();
     vi.mocked(listStacks).mockReturnValueOnce(pending.promise);

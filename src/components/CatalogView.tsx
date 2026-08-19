@@ -249,6 +249,42 @@ export function CatalogView({ registry, onAdded }: Props) {
         )}
       </div>
 
+      {browsing &&
+        (stacksLoading ? (
+          <div
+            role="status"
+            aria-label="Loading stacks"
+            className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3"
+          >
+            {Array.from({ length: 3 }).map((_, i) => (
+              <Skeleton key={i} className="h-32 rounded-lg" />
+            ))}
+          </div>
+        ) : stacksError ? (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5"
+          >
+            <div>
+              <p className="text-sm font-medium">Stacks couldn't load</p>
+              <p className="text-xs text-muted-foreground">
+                Toolport couldn't load the one-click bundles. Try again in a moment.
+              </p>
+            </div>
+            <Button variant="outline" size="sm" onClick={reloadStacks}>
+              Try again
+            </Button>
+          </div>
+        ) : stacks.length > 0 ? (
+          <StacksSection
+            stacks={stacks}
+            haveNames={have}
+            busyId={stackBusy}
+            onSetup={setupStack}
+          />
+        ) : null)}
+
       {shown.length === 0 ? (
         browsing && popularLoading ? (
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
@@ -325,40 +361,6 @@ export function CatalogView({ registry, onAdded }: Props) {
         )
       ) : browsing ? (
         <div className="flex flex-col gap-6">
-          {stacksLoading ? (
-            <div
-              role="status"
-              aria-label="Loading stacks"
-              className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3"
-            >
-              {Array.from({ length: 3 }).map((_, i) => (
-                <Skeleton key={i} className="h-32 rounded-lg" />
-              ))}
-            </div>
-          ) : stacksError ? (
-            <div
-              role="status"
-              aria-live="polite"
-              className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5"
-            >
-              <div>
-                <p className="text-sm font-medium">Stacks couldn't load</p>
-                <p className="text-xs text-muted-foreground">
-                  Toolport couldn't load the one-click bundles. Try again in a moment.
-                </p>
-              </div>
-              <Button variant="outline" size="sm" onClick={reloadStacks}>
-                Try again
-              </Button>
-            </div>
-          ) : stacks.length > 0 ? (
-            <StacksSection
-              stacks={stacks}
-              haveNames={have}
-              busyId={stackBusy}
-              onSetup={setupStack}
-            />
-          ) : null}
           {byCategory.map(([cat, entries]) => (
             <section key={cat}>
               <h2 className="mb-2 flex items-center gap-2 text-xs font-medium tracking-wide text-muted-foreground uppercase">
