@@ -2232,27 +2232,105 @@ mod tests {
         );
     }
 
-    /// A small, long-running binary to stand in for a gateway image.
+    /// A small, long-running binary to stand in for a gateway image, and the
+    /// arguments that keep it alive.
     ///
     /// Searches `PATH` rather than assuming `/bin/sleep`, so the tests still run on
     /// layouts that put it elsewhere (NixOS, busybox images, minimal containers).
+    ///
+    /// The candidate is *probed*, never trusted. Ubuntu 26.04 ships uutils coreutils
+    /// as a single multi-call binary that every `/usr/bin/<tool>` hardlinks to, and it
+    /// dispatches on `argv[0]`: copied to `toolport-gateway` it prints
+    /// `coreutils: unknown program 'toolport-gateway'` and exits, so every process
+    /// [`SpawnedGateway`] spawns is already dead by the time the enumeration under
+    /// test runs and three reaper tests fail for a reason that has nothing to do with
+    /// the reaper. Nothing on disk gives it away - the copy is a plain ELF, the link
+    /// is a hardlink rather than a symlink, and `canonicalize` still ends in `sleep` -
+    /// so the only reliable check is behavioural: copy the candidate under a foreign
+    /// name, run it, and see whether it is still alive a moment later.
+    ///
+    /// The fallback is a shell blocking on `read`, for two properties `sleep` cannot
+    /// be relied on for here: a shell must ignore `argv[0]` (POSIX gives it meaning
+    /// only for a leading `-`), and reading a pipe this process holds open blocks
+    /// forever without forking a child that would outlive the kill.
+    ///
+    /// Probed once per test binary and memoized, so the 250ms costs one test run, not
+    /// one spawn.
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn stand_in_binary_source() -> PathBuf {
-        if let Some(path) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&path) {
-                let candidate = dir.join("sleep");
-                if candidate.is_file() {
-                    return candidate;
+    fn stand_in_binary() -> &'static (PathBuf, Vec<&'static str>) {
+        static CHOICE: std::sync::OnceLock<(PathBuf, Vec<&'static str>)> =
+            std::sync::OnceLock::new();
+        CHOICE.get_or_init(|| {
+            let mut candidates: Vec<(PathBuf, Vec<&'static str>)> = Vec::new();
+            let mut push = |path: PathBuf, args: Vec<&'static str>| {
+                if path.is_file() && !candidates.iter().any(|(p, _)| *p == path) {
+                    candidates.push((path, args));
+                }
+            };
+            if let Some(path) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&path) {
+                    push(dir.join("sleep"), vec!["300"]);
                 }
             }
+            for fixed in ["/bin/sleep", "/usr/bin/sleep"] {
+                push(PathBuf::from(fixed), vec!["300"]);
+            }
+            for shell in ["/bin/sh", "/bin/dash", "/bin/bash", "/usr/bin/sh"] {
+                push(PathBuf::from(shell), vec!["-c", "read _standin"]);
+            }
+            candidates
+                .into_iter()
+                .find(|(path, args)| stand_in_survives_rename(path, args))
+                .expect(
+                    "no binary on this system stays alive when copied to a gateway's \
+                     name, so no reaper test can spawn anything to enumerate",
+                )
+        })
+    }
+
+    /// True when `source`, copied under a gateway's name and run with `args`, is still
+    /// running a moment later. The behavioural half of [`stand_in_binary`].
+    ///
+    /// Every failure is a `false` rather than a panic: a candidate that cannot be
+    /// copied, chmod'd or spawned is simply not the one to use, and the next one gets
+    /// a turn. That includes a spurious `ETXTBSY` from another thread's fork, which
+    /// costs a usable `sleep` its place and falls through to the shell - a worse
+    /// stand-in, not a broken one.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn stand_in_survives_rename(source: &Path, args: &[&str]) -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-standin-probe-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return false;
         }
-        // into_iter, not iter().map(Path::new): the latter returns a &Path borrowed
-        // from the temporary array, which does not outlive the statement.
-        ["/bin/sleep", "/usr/bin/sleep"]
-            .into_iter()
-            .map(PathBuf::from)
-            .find(|p| p.is_file())
-            .expect("no sleep binary on PATH to stand in for a gateway")
+        let exe = dir.join("toolport-gateway");
+        let alive = (|| {
+            std::fs::copy(source, &exe).ok()?;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).ok()?;
+            let mut child = std::process::Command::new(&exe)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok()?;
+            // Long enough for a multi-call binary to reject the name and exit, short
+            // enough that a healthy candidate is not worth optimising further.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let alive = matches!(child.try_wait(), Ok(None));
+            let _ = child.kill();
+            let _ = child.wait();
+            Some(alive)
+        })()
+        .unwrap_or(false);
+        let _ = std::fs::remove_dir_all(&dir);
+        alive
     }
 
     /// Scratch tree removed on drop.
@@ -2352,7 +2430,8 @@ mod tests {
             if let Some(parent) = exe.parent() {
                 std::fs::create_dir_all(parent).expect("create gateway dir");
             }
-            std::fs::copy(stand_in_binary_source(), &exe).expect("copy stand-in binary");
+            let (stand_in, stand_in_args) = stand_in_binary();
+            std::fs::copy(stand_in, &exe).expect("copy stand-in binary");
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod +x");
 
@@ -2372,7 +2451,14 @@ mod tests {
             // unprotected version was 5/8.
             let mut waited = std::time::Duration::ZERO;
             let child = loop {
-                match std::process::Command::new(&exe).arg("300").spawn() {
+                match std::process::Command::new(&exe)
+                    .args(stand_in_args)
+                    // The stand-in may block on stdin rather than on a timer. `Child`
+                    // owns the write end and nothing takes it, so the pipe stays open
+                    // for exactly as long as this `SpawnedGateway` does.
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                {
                     Ok(child) => break child,
                     // ETXTBSY. Matched on the raw errno so this does not depend on
                     // `ErrorKind::ExecutableFileBusy`, and the block is Linux-only.
