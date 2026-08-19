@@ -10982,8 +10982,11 @@ rules:
 
     #[test]
     fn rules_target_unsupported_clients_return_none() {
-        // Cursor/Warp store globals in UI/cloud; Continue is deferred; chat/identity apps have
-        // no global rules file we manage.
+        // Cursor/Warp store globals in UI/cloud; chat/identity apps have no global rules file
+        // we manage. Continue is the one entry here that is a decision rather than a limit: it
+        // does read `~/.continue/rules/`, so an adapter is possible, but `continuedev/continue`
+        // was archived read-only in June 2026 and will not track provider changes, so none is
+        // planned. It stays a detected MCP client for anyone running a pinned build or fork.
         for id in [
             "cursor",
             "warp",
