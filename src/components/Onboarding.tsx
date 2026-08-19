@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   ArrowLeft,
   ArrowRight,
@@ -47,6 +47,7 @@ import { openExternal } from "@/lib/openUrl";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
+import { Skeleton } from "@/components/ui/skeleton";
 
 interface Props {
   /** Step to open at (0 = Welcome). Used to resume mid-flow. */
@@ -568,16 +569,25 @@ function AddServers({
   const [importPreview, setImportPreview] = useState<ImportItem[] | null>(null);
   const [imported, setImported] = useState<number | null>(null);
   const [stacks, setStacks] = useState<Stack[]>([]);
+  const [stacksLoading, setStacksLoading] = useState(true);
+  const [stacksError, setStacksError] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [applying, setApplying] = useState(false);
   // True once the user has added a stack or imported, so "Next" replaces "later".
   const [touched, setTouched] = useState(false);
 
-  useEffect(() => {
+  const reloadStacks = useCallback(() => {
+    setStacksLoading(true);
+    setStacksError(false);
     listStacks()
       .then(setStacks)
-      .catch(() => {});
+      .catch(() => setStacksError(true))
+      .finally(() => setStacksLoading(false));
   }, []);
+
+  useEffect(() => {
+    reloadStacks();
+  }, [reloadStacks]);
 
   const have = new Set(registry.servers.map((s) => s.name.toLowerCase()));
   const stack = stacks.find((s) => s.id === selected) ?? null;
@@ -657,7 +667,33 @@ function AddServers({
 
       <div className="flex flex-col gap-3">
         {/* Role picker: each stack is a use case / role. */}
-        {stacks.length > 0 && (
+        {stacksLoading ? (
+          <div
+            role="status"
+            aria-label="Loading starter stacks"
+            className="flex flex-wrap gap-1.5"
+          >
+            {Array.from({ length: 3 }).map((_, i) => (
+              <Skeleton key={i} className="h-7 w-24 rounded-full" />
+            ))}
+          </div>
+        ) : stacksError ? (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5"
+          >
+            <div>
+              <p className="text-sm font-medium">Starter stacks couldn't load</p>
+              <p className="text-xs text-muted-foreground">
+                Try again to see role-based recommendations.
+              </p>
+            </div>
+            <Button variant="outline" size="sm" onClick={reloadStacks}>
+              Try again
+            </Button>
+          </div>
+        ) : stacks.length > 0 ? (
           <div className="flex flex-col gap-1.5">
             <span className="text-xs text-muted-foreground">What do you work on?</span>
             <div className="flex flex-wrap gap-1.5">
@@ -678,7 +714,7 @@ function AddServers({
               ))}
             </div>
           </div>
-        )}
+        ) : null}
 
         {/* The recommended stack for the chosen role. */}
         {stack && (
