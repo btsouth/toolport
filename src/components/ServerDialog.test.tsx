@@ -130,6 +130,48 @@ describe("ServerDialog", () => {
     expect(screen.getByRole("button", { name: "Add" })).toBeEnabled();
   });
 
+  it("keeps an in-flight test busy when parsed config replaces the form", async () => {
+    const request = deferred<ProbeResult>();
+    api.testServer.mockReturnValueOnce(request.promise);
+    api.parseServerSnippet.mockResolvedValueOnce([
+      {
+        name: "parsed",
+        transport: "stdio",
+        command: "parsed-command",
+        args: [],
+        url: null,
+        env: [],
+      },
+    ]);
+    const user = userEvent.setup();
+
+    render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Add server" }));
+    await fillServer(user, "working-command");
+    await user.click(screen.getByRole("button", { name: "Test connection" }));
+
+    await user.click(screen.getByRole("button", { name: "Paste from client config" }));
+    await user.type(
+      screen.getByPlaceholderText(/Paste a config snippet/i),
+      "parsed config",
+    );
+    await user.click(screen.getByRole("button", { name: "Parse & fill" }));
+
+    await waitFor(() =>
+      expect(screen.getByLabelText("Command")).toHaveValue("parsed-command"),
+    );
+    expect(screen.getByRole("button", { name: /testing/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
+
+    await act(async () => request.resolve(success));
+
+    expect(screen.queryByText(/Connected\. Found/)).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Test connection" })).toBeEnabled(),
+    );
+    expect(screen.getByRole("button", { name: "Add" })).toBeEnabled();
+  });
+
   it("keeps a newer result when tests resolve out of order after reopening", async () => {
     const first = deferred<ProbeResult>();
     const second = deferred<ProbeResult>();

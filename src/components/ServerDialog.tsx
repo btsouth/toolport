@@ -184,7 +184,7 @@ export function ServerDialog({
           value: e.value ?? "",
         })),
       );
-      setTest(IDLE_TEST);
+      clearTest();
       if (servers.length > 1) {
         toast.info(
           `Found ${servers.length} servers, filled "${s.name}". Add the rest separately.`,
