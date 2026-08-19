@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -60,6 +60,15 @@ interface Props {
   urlHint?: string;
 }
 
+type TestState =
+  | { status: "idle"; message: "" }
+  | { status: "testing"; message: ""; requestId: number; stale: boolean }
+  | { status: "ok" | "fail"; message: string };
+
+type TestResult = Extract<TestState, { status: "ok" | "fail" }>;
+
+const IDLE_TEST: TestState = { status: "idle", message: "" };
+
 export function ServerDialog({
   trigger,
   onSaved,
@@ -85,10 +94,8 @@ export function ServerDialog({
     initial?.env.map((e) => ({ key: e.key, value: "" })) ?? [],
   );
   const [busy, setBusy] = useState(false);
-  const [test, setTest] = useState<{
-    status: "idle" | "testing" | "ok" | "fail";
-    message: string;
-  }>({ status: "idle", message: "" });
+  const [test, setTest] = useState<TestState>(IDLE_TEST);
+  const testRequestId = useRef(0);
   const isStdio = form.transport === "stdio";
   const editing = editId !== undefined;
 
@@ -97,15 +104,23 @@ export function ServerDialog({
   const [pasteText, setPasteText] = useState("");
   const [parsing, setParsing] = useState(false);
 
-  // A prior test result is stale the moment the connection details change.
+  // A completed result clears immediately when the connection details change. An in-flight
+  // test stays visibly busy until it settles, but its result is then discarded as stale.
   function clearTest() {
-    setTest((t) => (t.status === "idle" ? t : { status: "idle", message: "" }));
+    setTest((current) => {
+      if (current.status === "idle") return current;
+      if (current.status === "testing") {
+        return current.stale ? current : { ...current, stale: true };
+      }
+      return IDLE_TEST;
+    });
   }
 
   // The dialog instance is mounted persistently (e.g. the header "Add server"
   // button), so reset the form each time it opens - otherwise it keeps the last
   // entry's values instead of starting blank (or re-deriving from `initial`).
   function onOpenChange(next: boolean) {
+    if (!next) setTest(IDLE_TEST);
     if (!next && onClose) {
       onClose();
       return;
@@ -120,7 +135,7 @@ export function ServerDialog({
         cwd: initial?.cwd ?? "",
       });
       setEnvRows(initial?.env.map((e) => ({ key: e.key, value: "" })) ?? []);
-      setTest({ status: "idle", message: "" });
+      setTest(IDLE_TEST);
       setShowPaste(false);
       setPasteText("");
     }
@@ -169,7 +184,7 @@ export function ServerDialog({
           value: e.value ?? "",
         })),
       );
-      setTest({ status: "idle", message: "" });
+      setTest(IDLE_TEST);
       if (servers.length > 1) {
         toast.info(
           `Found ${servers.length} servers, filled "${s.name}". Add the rest separately.`,
@@ -229,17 +244,25 @@ export function ServerDialog({
     (existingNames ?? []).some((n) => n.trim().toLowerCase() === nameTrim.toLowerCase());
   const canSave = errors.length === 0 && !busy && test.status !== "testing";
 
+  function finishTest(requestId: number, result: TestResult) {
+    setTest((current) => {
+      if (current.status !== "testing" || current.requestId !== requestId) return current;
+      return current.stale ? IDLE_TEST : result;
+    });
+  }
+
   async function handleTest() {
-    setTest({ status: "testing", message: "" });
+    const requestId = ++testRequestId.current;
+    setTest({ status: "testing", message: "", requestId, stale: false });
     try {
       const r = await testServer(buildEntry(true));
       if (r.ok) {
-        setTest({
+        finishTest(requestId, {
           status: "ok",
           message: `Connected. Found ${r.toolCount} tool${r.toolCount === 1 ? "" : "s"}.`,
         });
       } else {
-        setTest({
+        finishTest(requestId, {
           status: "fail",
           message: r.authRequired
             ? `Reachable, but needs credentials: ${r.error ?? "authentication required"}`
@@ -247,7 +270,7 @@ export function ServerDialog({
         });
       }
     } catch (e) {
-      setTest({ status: "fail", message: String(e) });
+      finishTest(requestId, { status: "fail", message: String(e) });
     }
   }
 
