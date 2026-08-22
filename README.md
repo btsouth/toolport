@@ -354,6 +354,12 @@ the AUR** on Arch and its derivatives (Manjaro, EndeavourOS, Omarchy). The
 Ubuntu 22.04's WebKitGTK, which a rolling release's Mesa is too new for (see
 Troubleshooting). To run from source, see Development below.
 
+**Exception: Arch with the proprietary NVIDIA driver.** The EGL failure that
+motivates the native package is a *Mesa* one, and NVIDIA's EGL is a separate
+implementation that does not hit it. On those machines the advice inverts: the
+native package is the one that breaks, and the **AppImage is the working
+install** (see Troubleshooting). Pick by driver, not by distro.
+
 ```bash
 # Arch / Manjaro / EndeavourOS
 paru -S toolport-bin        # or: yay -S toolport-bin
@@ -472,6 +478,31 @@ The frontend is typechecked with `npx tsc --noEmit`.
   launch and you get a grey window. None of `WEBKIT_DISABLE_DMABUF_RENDERER`,
   `WEBKIT_DISABLE_COMPOSITING_MODE` or `WEBKIT_FORCE_SANDBOX=0` avoids that one.
   (This is a packaging/GPU-stack issue, not a Toolport bug.)
+
+  **On NVIDIA's proprietary driver, do the opposite: use the AppImage.**
+  Everything above is a *Mesa* failure. NVIDIA ships its own EGL, never hits it,
+  and there the native package is the broken one. `conduit` from the `.deb`
+  payload exits immediately at startup with:
+
+  ```
+  Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display.
+  ```
+
+  Forcing `GDK_BACKEND=x11` gets past that, but the window then cannot allocate
+  any buffers and the app is unusable:
+
+  ```
+  Failed to create GBM buffer of size 1240x820: Invalid argument
+  ```
+
+  The AppImage bundles its own GTK and WebKitGTK, sidesteps both, and renders
+  correctly. Verified on Omarchy (Hyprland via uwsm), RTX 4070 SUPER,
+  `nvidia-open-dkms` 610.57.04, against system GTK 3.24.52 / WebKitGTK 2.52.6.
+
+  Note Omarchy already exports `GDK_BACKEND=wayland,x11,*` (from
+  `/usr/share/omarchy/default/hypr/envs.lua`), so the AppImage's own
+  `GDK_BACKEND="${GDK_BACKEND:-x11}"` default never applies and it runs on
+  Wayland, which is the path that works. Don't override it.
 
   **If the AppImage is all you have** (a distro with no `.deb` and no AUR), the
   older workarounds are still worth a try, because a virtualized GPU can fail EGL
