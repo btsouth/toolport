@@ -510,6 +510,10 @@ export interface Registry {
   /** Consumers registered to reach the gateway over the HTTP/OpenAPI bridge,
    * each with its own hashed token and scope (multi-tenant bridge). */
   httpClients?: HttpClient[];
+  /** Whether the supervised HTTP endpoint should return after an app restart. */
+  httpBridgeEnabled?: boolean;
+  /** Last port selected for the supervised HTTP endpoint. */
+  httpBridgePort?: number | null;
 }
 
 /** Snapshot of the gateway entry Toolport last wrote (SOU-406/407). */

@@ -900,6 +900,13 @@ pub struct Registry {
     /// only the legacy single `CONDUIT_HTTP_TOKEN` (back-compat).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub http_clients: Vec<HttpClient>,
+    /// Whether the user wants Toolport's supervised HTTP endpoint restored on
+    /// future launches. The bearer itself remains in the OS keychain.
+    #[serde(default)]
+    pub http_bridge_enabled: bool,
+    /// Port last selected for the supervised HTTP endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_bridge_port: Option<u16>,
     /// Bumped when vaulted secrets change so running gateways reload even when
     /// the rest of the registry JSON is unchanged.
     #[serde(default)]
@@ -1184,6 +1191,8 @@ impl Default for Registry {
             client_discovery: HashMap::new(),
             client_managed_entries: HashMap::new(),
             http_clients: Vec::new(),
+            http_bridge_enabled: false,
+            http_bridge_port: None,
             secrets_generation: 0,
             rule_sets: Vec::new(),
             active_rule_set_id: None,
@@ -4442,12 +4451,17 @@ mod tests {
         let id = r.add_server(sample_server("vercel"));
         r.set_server_enabled("default", &id, true).unwrap();
         r.add_profile("Work");
+        r.http_bridge_enabled = true;
+        r.http_bridge_port = Some(9876);
 
         let mut path = std::env::temp_dir();
         path.push(format!("conduit-test-{}.json", std::process::id()));
         save_to(&path, &r).unwrap();
         let loaded = load_from(&path).unwrap();
         std::fs::remove_file(&path).ok();
+
+        assert!(loaded.http_bridge_enabled);
+        assert_eq!(loaded.http_bridge_port, Some(9876));
 
         assert_eq!(loaded.servers, r.servers);
         assert_eq!(loaded.profiles, r.profiles);
