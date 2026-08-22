@@ -421,6 +421,7 @@ struct HttpBridge {
     token: Option<String>,
 }
 type HttpBridgeState = Mutex<HttpBridge>;
+static HTTP_BRIDGE_LIFECYCLE: Mutex<()> = Mutex::new(());
 
 const HTTP_BRIDGE_VAULT_SERVER: &str = "__toolport_http_bridge__";
 const HTTP_BRIDGE_VAULT_KEY: &str = "bearer";
@@ -4111,6 +4112,9 @@ fn stop_spawned_gateways(bridge: State<HttpBridgeState>) -> UpdateShutdownReport
         FailedBeforeIntent(String),
     }
 
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let owned_bridge = {
         let mut bridge = bridge
             .lock()
@@ -4213,9 +4217,12 @@ struct UpdateRecoveryReport {
 /// would create disconnected processes and a false recovery claim.
 #[tauri::command]
 fn recover_update_gateways(
-    bridge: State<HttpBridgeState>,
+    app: AppHandle,
     http_bridge_port: Option<u16>,
 ) -> Result<UpdateRecoveryReport, String> {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(port) = http_bridge_port else {
         return Ok(UpdateRecoveryReport::default());
     };
@@ -4227,7 +4234,12 @@ fn recover_update_gateways(
             intent.port
         ));
     }
-    ensure_http_bridge_at(bridge.inner(), port, Some(intent.token))?;
+    ensure_http_bridge_at(
+        app.state::<HttpBridgeState>().inner(),
+        port,
+        Some(intent.token.clone()),
+    )?;
+    persist_restored_http_bridge(app.state::<RegistryState>().inner(), port, &intent.token)?;
     let cleanup_warning = clear_update_http_bridge_intent().err();
     Ok(UpdateRecoveryReport {
         http_bridge_recovered: true,
@@ -4388,6 +4400,9 @@ fn announce_restart_needed(
 /// Connected clients are unaffected by the new process: they authenticate with the
 /// per-client bearers in `http_clients`, not the bridge's own env token.
 fn reap_stale_and_restore_bridge(bridge: &HttpBridgeState, advice: &RestartAdvice) -> ReapOutcome {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut extra_keep = Vec::new();
     if let Some(p) = clients::resolve_gateway_path() {
         extra_keep.push(p);
@@ -4524,6 +4539,9 @@ fn start_persisted_http_bridge(
     registry: &RegistryState,
     port: Option<u16>,
 ) -> Result<HttpBridgeStatus, String> {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let was_alive = {
         let mut bridge = state
             .lock()
@@ -4702,7 +4720,11 @@ fn stop_http_bridge_with(
 #[tauri::command]
 async fn stop_http_bridge(app: AppHandle) -> Result<HttpBridgeStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let registry = app.state::<RegistryState>();
+        clear_update_http_bridge_intent()?;
         write_registry(registry.inner(), |reg| {
             reg.http_bridge_enabled = false;
             Ok(())
@@ -4711,9 +4733,6 @@ async fn stop_http_bridge(app: AppHandle) -> Result<HttpBridgeStatus, String> {
         let mut bridge = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Clear the update marker before stopping the live endpoint. The durable
-        // preference is already off, so a later launch cannot resurrect it.
-        clear_update_http_bridge_intent()?;
         stop_http_bridge_with(&mut bridge, std::process::Child::kill)
     })
     .await
@@ -4721,6 +4740,9 @@ async fn stop_http_bridge(app: AppHandle) -> Result<HttpBridgeStatus, String> {
 }
 
 fn restore_persisted_http_bridge(state: &HttpBridgeState) -> Result<bool, String> {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let registry = registry::load()?;
     if !registry.http_bridge_enabled {
         return Ok(false);
@@ -4734,11 +4756,35 @@ fn restore_persisted_http_bridge(state: &HttpBridgeState) -> Result<bool, String
     Ok(true)
 }
 
-fn resume_http_bridge_after_update(state: &HttpBridgeState) -> Result<bool, String> {
+/// Make an update-restored endpoint durable before its one-shot recovery marker
+/// is removed, including when upgrading from a version without registry state.
+fn persist_restored_http_bridge(
+    registry: &RegistryState,
+    port: u16,
+    token: &str,
+) -> Result<(), String> {
+    secrets::set_secret(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY, token)
+        .map_err(|error| format!("Could not save the HTTP endpoint token: {error}"))?;
+    write_registry(registry, |reg| {
+        reg.http_bridge_enabled = true;
+        reg.http_bridge_port = Some(port);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn resume_http_bridge_after_update(
+    state: &HttpBridgeState,
+    registry: &RegistryState,
+) -> Result<bool, String> {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(intent) = load_update_http_bridge_intent()? else {
         return Ok(false);
     };
-    ensure_http_bridge_at(state, intent.port, Some(intent.token))?;
+    ensure_http_bridge_at(state, intent.port, Some(intent.token.clone()))?;
+    persist_restored_http_bridge(registry, intent.port, &intent.token)?;
     if let Err(error) = clear_update_http_bridge_intent() {
         eprintln!(
             "toolport: restored the HTTP endpoint, but could not clear its update resume state: {error}"
@@ -5407,6 +5453,7 @@ pub fn run() {
                 // restores connectivity without rotating credentials.
                 match resume_http_bridge_after_update(
                     migrate_handle.state::<HttpBridgeState>().inner(),
+                    migrate_handle.state::<RegistryState>().inner(),
                 ) {
                     Ok(true) => eprintln!(
                         "toolport: restored the HTTP endpoint after the in-app update"
