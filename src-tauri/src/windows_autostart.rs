@@ -5,7 +5,7 @@
 //! timestamp is not a reliable enabled flag after a restart.
 
 use std::io::ErrorKind;
-use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+use winreg::enums::{RegType, HKEY_CURRENT_USER, KEY_READ};
 use winreg::RegKey;
 
 const RUN_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
@@ -16,9 +16,15 @@ const STARTUP_APPROVED_KEY: &str =
 /// converting an unknown or malformed value into a false Off state.
 pub fn is_enabled(app_name: &str) -> Result<bool, String> {
     let current_user = RegKey::predef(HKEY_CURRENT_USER);
-    let run = current_user
-        .open_subkey_with_flags(RUN_KEY, KEY_READ)
-        .map_err(|error| format!("Could not read the Windows startup registry: {error}"))?;
+    let run = match current_user.open_subkey_with_flags(RUN_KEY, KEY_READ) {
+        Ok(key) => key,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "Could not read the Windows startup registry: {error}"
+            ))
+        }
+    };
     match run.get_value::<String, _>(app_name) {
         Ok(_) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
@@ -35,8 +41,15 @@ pub fn is_enabled(app_name: &str) -> Result<bool, String> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(format!("Could not read Windows startup approval: {error}")),
     };
-    startup_approved_enabled(&raw.bytes)
+    startup_approved_value_enabled(raw.vtype, &raw.bytes)
         .ok_or_else(|| "Windows returned an invalid startup approval value".to_string())
+}
+
+fn startup_approved_value_enabled(vtype: RegType, bytes: &[u8]) -> Option<bool> {
+    if vtype != RegType::REG_BINARY || bytes.len() != 12 {
+        return None;
+    }
+    startup_approved_enabled(bytes)
 }
 
 /// Windows uses 1, 3, and 7 for disabled states. Known enabled states include
@@ -51,7 +64,8 @@ fn startup_approved_enabled(bytes: &[u8]) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::startup_approved_enabled;
+    use super::{startup_approved_enabled, startup_approved_value_enabled};
+    use winreg::enums::RegType;
 
     #[test]
     fn startup_approval_uses_state_byte_not_timestamp() {
@@ -66,5 +80,22 @@ mod tests {
         assert_eq!(startup_approved_enabled(&[7, 0, 0, 0]), Some(false));
         assert_eq!(startup_approved_enabled(&[]), None);
         assert_eq!(startup_approved_enabled(&[9]), None);
+    }
+
+    #[test]
+    fn startup_approval_rejects_wrong_type_and_length() {
+        let enabled = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            startup_approved_value_enabled(RegType::REG_SZ, &enabled),
+            None
+        );
+        assert_eq!(
+            startup_approved_value_enabled(RegType::REG_BINARY, &enabled[..4]),
+            None
+        );
+        assert_eq!(
+            startup_approved_value_enabled(RegType::REG_BINARY, &enabled),
+            Some(true)
+        );
     }
 }
