@@ -4206,6 +4206,9 @@ struct UpdateRecoveryReport {
     /// True only when an HTTP endpoint existed before shutdown and is available
     /// again. External stdio clients are deliberately not represented as restored.
     http_bridge_recovered: bool,
+    /// The endpoint is live, but its durable token or registry state could not
+    /// be saved. The recovery marker is retained so a later launch can retry.
+    persistence_warning: Option<String>,
     /// Endpoint availability and marker cleanup are separate facts. A failed
     /// delete must not turn a verified live endpoint into a false "not restored"
     /// message, but the retained marker still needs to be surfaced.
@@ -4242,12 +4245,13 @@ fn recover_update_gateways(
     let persistence_warning =
         persist_restored_http_bridge(app.state::<RegistryState>().inner(), port, &intent.token)
             .err();
-    let cleanup_warning = match persistence_warning {
-        Some(error) => Some(error),
-        None => clear_update_http_bridge_intent().err(),
-    };
+    let cleanup_warning = persistence_warning
+        .is_none()
+        .then(clear_update_http_bridge_intent)
+        .and_then(Result::err);
     Ok(UpdateRecoveryReport {
         http_bridge_recovered: true,
+        persistence_warning,
         cleanup_warning,
     })
 }

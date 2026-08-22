@@ -221,6 +221,7 @@ describe("installUpdate", () => {
       if (command === "recover_update_gateways") {
         return {
           httpBridgeRecovered: true,
+          persistenceWarning: null,
           cleanupWarning: "access denied",
         };
       }
@@ -235,6 +236,31 @@ describe("installUpdate", () => {
     expect(advice).toContain("endpoint is available");
     expect(advice).toContain("access denied");
     expect(advice).not.toContain("could not restore its HTTP endpoint");
+  });
+
+  it("labels endpoint persistence failures accurately", async () => {
+    const download = vi.fn().mockResolvedValue(undefined);
+    const install = vi.fn().mockRejectedValue(new Error("installer rejected"));
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "stop_spawned_gateways") {
+        return { ...cleanShutdown, httpBridgePort: 8765 };
+      }
+      if (command === "recover_update_gateways") {
+        return {
+          httpBridgeRecovered: true,
+          persistenceWarning: "keychain locked",
+          cleanupWarning: null,
+        };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const failure = await installUpdate({ download, install } as unknown as Update).catch(
+      (error: unknown) => error,
+    );
+    const advice = (failure as UpdateInstallError).recoveryAdvice;
+    expect(advice).toContain("could not save its persistent state: keychain locked");
+    expect(advice).not.toContain("could not clear its update recovery marker");
   });
 
   it("gives generic restart guidance only for a proven but unnamed external client", async () => {

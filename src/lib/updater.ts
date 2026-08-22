@@ -33,6 +33,7 @@ export interface UpdateShutdownReport {
 
 interface UpdateRecoveryReport {
   httpBridgeRecovered: boolean;
+  persistenceWarning: string | null;
   cleanupWarning: string | null;
 }
 
@@ -110,6 +111,11 @@ function recoveryAdvice(
       advice.push(
         `Toolport restored its HTTP endpoint on port ${shutdown.httpBridgePort}.`,
       );
+      if (recovery.persistenceWarning) {
+        advice.push(
+          `The endpoint is available, but Toolport could not save its persistent state: ${recovery.persistenceWarning}.`,
+        );
+      }
       if (recovery.cleanupWarning) {
         advice.push(
           `The endpoint is available, but Toolport could not clear its update recovery marker: ${recovery.cleanupWarning}.`,
