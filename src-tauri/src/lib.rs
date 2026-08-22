@@ -3,6 +3,8 @@ pub mod approval;
 mod approval_broker;
 pub mod audit;
 pub mod autostart;
+#[cfg(target_os = "windows")]
+pub mod windows_autostart;
 pub mod brand;
 pub mod catalog;
 pub mod clients;

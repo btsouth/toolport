@@ -5146,7 +5146,11 @@ fn is_launch_at_login_enabled(app: AppHandle) -> Result<bool, String> {
     {
         return crate::autostart::is_enabled_linux(&app.package_info().name);
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        return crate::windows_autostart::is_enabled(&app.package_info().name);
+    }
+    #[cfg(target_os = "macos")]
     {
         use tauri_plugin_autostart::ManagerExt;
         app.autolaunch().is_enabled().map_err(|e| e.to_string())
