@@ -4239,8 +4239,13 @@ fn recover_update_gateways(
         port,
         Some(intent.token.clone()),
     )?;
-    persist_restored_http_bridge(app.state::<RegistryState>().inner(), port, &intent.token)?;
-    let cleanup_warning = clear_update_http_bridge_intent().err();
+    let persistence_warning =
+        persist_restored_http_bridge(app.state::<RegistryState>().inner(), port, &intent.token)
+            .err();
+    let cleanup_warning = match persistence_warning {
+        Some(error) => Some(error),
+        None => clear_update_http_bridge_intent().err(),
+    };
     Ok(UpdateRecoveryReport {
         http_bridge_recovered: true,
         cleanup_warning,
@@ -4784,7 +4789,12 @@ fn resume_http_bridge_after_update(
         return Ok(false);
     };
     ensure_http_bridge_at(state, intent.port, Some(intent.token.clone()))?;
-    persist_restored_http_bridge(registry, intent.port, &intent.token)?;
+    if let Err(error) = persist_restored_http_bridge(registry, intent.port, &intent.token) {
+        eprintln!(
+            "toolport: restored the HTTP endpoint, but could not save its persistent state: {error}"
+        );
+        return Ok(true);
+    }
     if let Err(error) = clear_update_http_bridge_intent() {
         eprintln!(
             "toolport: restored the HTTP endpoint, but could not clear its update resume state: {error}"
