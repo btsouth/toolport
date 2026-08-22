@@ -355,7 +355,7 @@ Ubuntu 22.04's WebKitGTK, which a rolling release's Mesa is too new for (see
 Troubleshooting). To run from source, see Development below.
 
 **Exception: Arch with the proprietary NVIDIA driver.** The EGL failure that
-motivates the native package is a *Mesa* one, and NVIDIA's EGL is a separate
+motivates the native package is a _Mesa_ one, and NVIDIA's EGL is a separate
 implementation that does not hit it. On those machines the advice inverts: the
 native package is the one that breaks, and the **AppImage is the working
 install** (see Troubleshooting). Pick by driver, not by distro.
@@ -480,7 +480,7 @@ The frontend is typechecked with `npx tsc --noEmit`.
   (This is a packaging/GPU-stack issue, not a Toolport bug.)
 
   **On NVIDIA's proprietary driver, do the opposite: use the AppImage.**
-  Everything above is a *Mesa* failure. NVIDIA ships its own EGL, never hits it,
+  Everything above is a _Mesa_ failure. NVIDIA ships its own EGL, never hits it,
   and there the native package is the broken one. `conduit` from the `.deb`
   payload exits immediately at startup with:
 

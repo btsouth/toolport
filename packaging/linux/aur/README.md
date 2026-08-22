@@ -8,7 +8,7 @@ the AppImage.
 > to avoid is Mesa-specific. NVIDIA's EGL is a separate implementation that never
 > hits it, and there this package is the one that fails: `conduit` exits at
 > startup with `Gdk-Message: Error 71 (Protocol error) dispatching to Wayland
-> display`, and under `GDK_BACKEND=x11` it survives but cannot allocate buffers
+display`, and under `GDK_BACKEND=x11` it survives but cannot allocate buffers
 > (`Failed to create GBM buffer of size 1240x820: Invalid argument`). Send NVIDIA
 > users to the AppImage, which bundles its own GTK/WebKitGTK and renders fine.
 > Verified on Omarchy/Hyprland, RTX 4070 SUPER, `nvidia-open-dkms` 610.57.04,
