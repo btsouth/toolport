@@ -39,12 +39,12 @@ pub fn is_enabled(app_name: &str) -> Result<bool, String> {
         .ok_or_else(|| "Windows returned an invalid startup approval value".to_string())
 }
 
-/// Windows uses 1 and 3 for disabled states. Known enabled states include 0, 2,
-/// and 6. Reject other values so Settings can show an unreadable state, not Off.
+/// Windows uses 1, 3, and 7 for disabled states. Known enabled states include
+/// 0, 2, and 6. Reject other values so Settings can show unreadable, not Off.
 fn startup_approved_enabled(bytes: &[u8]) -> Option<bool> {
     match bytes.first().copied()? {
         0 | 2 | 6 => Some(true),
-        1 | 3 => Some(false),
+        1 | 3 | 7 => Some(false),
         _ => None,
     }
 }
@@ -63,6 +63,7 @@ mod tests {
             startup_approved_enabled(&[3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
             Some(false)
         );
+        assert_eq!(startup_approved_enabled(&[7, 0, 0, 0]), Some(false));
         assert_eq!(startup_approved_enabled(&[]), None);
         assert_eq!(startup_approved_enabled(&[9]), None);
     }
