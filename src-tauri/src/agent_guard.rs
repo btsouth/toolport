@@ -54,6 +54,13 @@ const CURSOR_EVENTS: [&str; 3] = ["beforeShellExecution", "beforeMCPExecution", 
 /// Seconds Cursor should allow the hook. A wedged guard must cost a bounded pause.
 const GUARD_TIMEOUT_SECS: u64 = 10;
 
+/// Cap on the payload read from stdin. Generous on purpose: a `beforeReadFile` payload
+/// embeds the file's content, and in Enforce a call the guard cannot see is DENIED, so a
+/// small cap would turn every large read into a refusal. Past this the payload is
+/// truncated, unparseable, and - in Enforce - denied, which is also what stops an agent
+/// from padding a denied command past the cap to slip it through.
+pub const MAX_GUARD_STDIN_BYTES: u64 = 64 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Policy evaluation (pure)
 // ---------------------------------------------------------------------------
@@ -190,27 +197,84 @@ fn split_compound(command: &str) -> Vec<String> {
     parts.push(cur);
     parts
         .into_iter()
-        .map(|p| strip_wrappers(p.trim()))
+        .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
         .collect()
 }
 
-/// Drop a leading `timeout N`, `time`, `nice`, `nohup` so `Bash(npm test *)` also sees
-/// `timeout 30 npm test`, as Claude Code does.
+/// Drop leading wrappers - `timeout [options] DURATION`, `time [options]`, `nice [options]`,
+/// `nohup` - so `Bash(npm test *)` also sees `timeout 30 npm test`, as Claude Code does.
+/// Options are consumed properly (`nice -n 19`, `timeout --preserve-status -s KILL 5`), so a
+/// wrapper cannot smuggle a denied command past a rule by carrying a flag the stripper did
+/// not expect. When a wrapper's shape is not understood the command is left as it is.
 fn strip_wrappers(command: &str) -> String {
     let mut words: Vec<&str> = command.split_whitespace().collect();
     loop {
-        match words.first().copied() {
-            Some("time") | Some("nice") | Some("nohup") => {
+        let Some(&first) = words.first() else { break };
+        match first {
+            "nohup" => {
                 words.remove(0);
             }
-            Some("timeout") if words.len() > 1 => {
-                words.drain(0..2);
+            "time" => {
+                words.remove(0);
+                // `time -p`, `time -v`, `time -f FMT`, `time -o FILE`, `--format=`, ...
+                while let Some(&w) = words.first() {
+                    if !w.starts_with('-') {
+                        break;
+                    }
+                    let takes_value = matches!(w, "-f" | "-o" | "--format" | "--output");
+                    words.remove(0);
+                    if takes_value && !words.is_empty() {
+                        words.remove(0);
+                    }
+                }
+            }
+            "nice" => {
+                words.remove(0);
+                while let Some(&w) = words.first() {
+                    if !w.starts_with('-') {
+                        break;
+                    }
+                    let takes_value = matches!(w, "-n" | "--adjustment");
+                    words.remove(0);
+                    if takes_value && !words.is_empty() {
+                        words.remove(0);
+                    }
+                }
+            }
+            "timeout" => {
+                words.remove(0);
+                while let Some(&w) = words.first() {
+                    if !w.starts_with('-') {
+                        break;
+                    }
+                    let takes_value = matches!(w, "-s" | "-k" | "--signal" | "--kill-after");
+                    words.remove(0);
+                    if takes_value && !words.is_empty() {
+                        words.remove(0);
+                    }
+                }
+                // The duration, then the command.
+                if !words.is_empty() {
+                    words.remove(0);
+                }
             }
             _ => break,
         }
     }
     words.join(" ")
+}
+
+/// Every reading of a command part a deny or ask must be checked against: as written, and
+/// with wrappers stripped. Matching any of them is enough to refuse; an allow rule has to
+/// match the stripped form, which is the command that actually runs.
+fn readings(part: &str) -> Vec<String> {
+    let stripped = strip_wrappers(part);
+    let mut v = vec![part.to_string()];
+    if stripped != part {
+        v.push(stripped);
+    }
+    v
 }
 
 /// Claude Code's Bash specifier semantics on ONE (non-compound) command.
@@ -257,12 +321,15 @@ fn rule_matches(rule: &PermissionRule, subject: &Subject) -> bool {
                 return false;
             }
             match rule.action {
-                // A deny or ask fires if any part matches; an allow covers the command only
-                // if every part is allowed (Claude Code's compound-command rule).
-                PermissionAction::Deny | PermissionAction::Ask => {
-                    parts.iter().any(|p| bash_spec_matches(spec, p))
-                }
-                PermissionAction::Allow => parts.iter().all(|p| bash_spec_matches(spec, p)),
+                // A deny or ask fires if any part, in any reading, matches; an allow covers
+                // the command only if every part's stripped form is allowed (Claude Code's
+                // compound-command rule).
+                PermissionAction::Deny | PermissionAction::Ask => parts
+                    .iter()
+                    .any(|p| readings(p).iter().any(|r| bash_spec_matches(spec, r))),
+                PermissionAction::Allow => parts
+                    .iter()
+                    .all(|p| bash_spec_matches(spec, &strip_wrappers(p))),
             }
         }
         Subject::Read { path, root, home } => {
@@ -374,12 +441,30 @@ fn truncate(s: &str, n: usize) -> String {
 
 /// Run the guard for one Cursor call: returns the JSON to print and the exit code. Always
 /// exit 0 with a complete response; `deny` is expressed in the JSON, as Cursor documents.
-pub fn handle_stdin(agent: &str, stdin: &str) -> (String, i32) {
-    let out = handle(agent, stdin);
+/// `truncated` says the payload hit [`MAX_GUARD_STDIN_BYTES`] and is not whole.
+pub fn handle_stdin(agent: &str, stdin: &str, truncated: bool) -> (String, i32) {
+    let out = handle(agent, stdin, truncated);
     (out.to_string(), 0)
 }
 
-fn handle(agent: &str, stdin: &str) -> Value {
+/// What the guard answers when it cannot judge a call: in Enforce, deny - an agent must
+/// not be able to slip a call past a rule by making the payload unreadable (padding it past
+/// the cap, say), and Cursor's `failClosed` would not catch a well-formed allow. Otherwise
+/// allow, and record that it could not judge.
+fn cannot_judge(reg: &crate::registry::Registry, why: &str) -> Value {
+    if reg.guard_cursor_mode == GuardMode::Enforce {
+        json!({
+            "continue": true,
+            "permission": "deny",
+            "user_message": format!("Toolport: this call was refused because the guard could not read it ({why}). Switch the Cursor guard to Observe if this keeps happening."),
+            "agent_message": format!("Toolport could not evaluate this call ({why}) and is enforcing, so it was refused. Do not retry it in a different form; tell the user."),
+        })
+    } else {
+        allow_response()
+    }
+}
+
+fn handle(agent: &str, stdin: &str, truncated: bool) -> Value {
     if agent != "cursor" {
         crate::gatewaylog::append(&format!("toolport: guard invoked for unknown agent {agent:?}"));
         return allow_response();
@@ -387,16 +472,24 @@ fn handle(agent: &str, stdin: &str) -> Value {
     let reg = match crate::registry::load() {
         Ok(reg) => reg,
         Err(error) => {
+            // No registry means no mode to read either; the hook would not be installed
+            // without one, so this is a broken install. Say so, stand aside.
             crate::gatewaylog::append(&format!("toolport: guard could not load the registry: {error}"));
             return allow_response();
         }
     };
+    // Cursor on Windows is documented to prefix hook stdin with a UTF-8 BOM.
+    let stdin = stdin.trim_start_matches('\u{FEFF}');
+    if truncated {
+        record(json!({ "agent": "cursor", "event": "guard", "malformed": true, "truncated": true, "decision": if reg.guard_cursor_mode == GuardMode::Enforce { "deny" } else { "allow" }, "mode": reg.guard_cursor_mode }));
+        return cannot_judge(&reg, "the payload was larger than the guard reads");
+    }
     let payload: Value = match serde_json::from_str(stdin) {
         Ok(v) => v,
         Err(error) => {
-            record(json!({ "agent": "cursor", "event": "guard", "malformed": true, "decision": "allow", "mode": reg.guard_cursor_mode }));
+            record(json!({ "agent": "cursor", "event": "guard", "malformed": true, "decision": if reg.guard_cursor_mode == GuardMode::Enforce { "deny" } else { "allow" }, "mode": reg.guard_cursor_mode }));
             crate::gatewaylog::append(&format!("toolport: guard payload did not parse: {error}"));
-            return allow_response();
+            return cannot_judge(&reg, "the payload did not parse");
         }
     };
     let event = payload
@@ -404,10 +497,18 @@ fn handle(agent: &str, stdin: &str) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("workspace_roots").and_then(Value::as_array).and_then(|a| a.first()).and_then(Value::as_str))
+        .map(str::to_string);
     let home = dirs::home_dir().map(|h| h.to_string_lossy().to_string());
     let Some((subject, what)) = cursor_subject(&event, &payload, home.as_deref()) else {
-        record(json!({ "agent": "cursor", "event": "guard", "hookEvent": event, "unhandled": true, "decision": "allow", "mode": reg.guard_cursor_mode }));
-        return allow_response();
+        // An event we did not register for, or one of ours missing its subject field. The
+        // first is benign (allow); the second, in Enforce, is a call we cannot judge.
+        let registered = CURSOR_EVENTS.contains(&event.as_str());
+        record(json!({ "agent": "cursor", "event": "guard", "hookEvent": event, "cwd": cwd, "unhandled": true, "decision": if registered && reg.guard_cursor_mode == GuardMode::Enforce { "deny" } else { "allow" }, "mode": reg.guard_cursor_mode }));
+        return if registered { cannot_judge(&reg, "the call had no command, path or tool to check") } else { allow_response() };
     };
     let verdict = evaluate(&reg.agent_permission_rules, &subject);
     let (tool, hash_src) = match &subject {
@@ -425,6 +526,7 @@ fn handle(agent: &str, stdin: &str) -> Value {
         "agent": "cursor",
         "event": "guard",
         "hookEvent": event,
+        "cwd": cwd,
         "tool": tool,
         "argsHash": crate::audit::args_hash(&json!({ "subject": hash_src })),
         "mode": reg.guard_cursor_mode,
@@ -768,6 +870,14 @@ mod tests {
         assert!(hit(&deny("Bash(rm -rf *)"), "cd /tmp; rm -rf x"));
         assert!(hit(&deny("Bash(rm -rf *)"), "timeout 30 rm -rf x"));
         assert!(hit(&deny("Bash(rm -rf *)"), "nohup rm -rf x"));
+        // Wrappers with options cannot smuggle a denied command past the rule.
+        assert!(hit(&deny("Bash(rm -rf *)"), "nice -n 19 rm -rf x"));
+        assert!(hit(&deny("Bash(rm -rf *)"), "nice --adjustment 5 rm -rf x"));
+        assert!(hit(&deny("Bash(rm -rf *)"), "timeout --preserve-status -s KILL 5 rm -rf x"));
+        assert!(hit(&deny("Bash(rm -rf *)"), "timeout -k 2 10 rm -rf x"));
+        assert!(hit(&deny("Bash(rm -rf *)"), "time -p nohup rm -rf x"));
+        // A wrapper whose own name is denied is still denied as written.
+        assert!(hit(&deny("Bash(timeout *)"), "timeout 5 ls"));
         assert!(!hit(&deny("Bash(rm -rf *)"), "echo 'rm -rf' && ls"), "quoted operators do not split; the echo is not rm");
         // Allow covers a compound only when every part is allowed.
         let allow = vec![rule("Bash(npm *)", Allow)];
@@ -827,6 +937,18 @@ mod tests {
         assert_eq!(r["permission"], "ask");
         assert_eq!(decision_response(Allow, "x", "y"), allow_response());
         assert_eq!(allow_response(), serde_json::json!({ "continue": true, "permission": "allow" }));
+    }
+
+    #[test]
+    fn unjudgeable_input_is_denied_only_when_enforcing() {
+        let enforce = crate::registry::Registry { guard_cursor_mode: GuardMode::Enforce, ..Default::default() };
+        let observe = crate::registry::Registry { guard_cursor_mode: GuardMode::Observe, ..Default::default() };
+        assert_eq!(cannot_judge(&enforce, "x")["permission"], "deny");
+        assert_eq!(cannot_judge(&observe, "x"), allow_response());
+        // A BOM-prefixed payload parses once the BOM is stripped.
+        let bom = "\u{FEFF}{\"hook_event_name\":\"beforeShellExecution\",\"command\":\"ls\"}";
+        assert!(serde_json::from_str::<Value>(bom).is_err());
+        assert!(serde_json::from_str::<Value>(bom.trim_start_matches('\u{FEFF}')).is_ok());
     }
 
     #[test]

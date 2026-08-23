@@ -15154,8 +15154,11 @@ fn main() {
             // read. The ONLY difference is that this one speaks: its stdout is the
             // decision the agent acts on, and it always exits 0 with a complete
             // response - a deny is said in the JSON, never by crashing out.
-            let (payload, _truncated) = conduit_lib::hooks::read_payload(std::io::stdin());
-            let (out, code) = conduit_lib::agent_guard::handle_stdin(&agent, &payload);
+            let (payload, truncated) = conduit_lib::hooks::read_payload_capped(
+                std::io::stdin(),
+                conduit_lib::agent_guard::MAX_GUARD_STDIN_BYTES,
+            );
+            let (out, code) = conduit_lib::agent_guard::handle_stdin(&agent, &payload, truncated);
             println!("{out}");
             std::process::exit(code);
         }

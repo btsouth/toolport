@@ -449,9 +449,14 @@ export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
                     // before letting it act.
                     <span
                       className={`ml-2 rounded px-1 text-[10px] ${
-                        r.decision === "deny"
+                        // In observe mode the answer is always allow; colour by what the
+                        // rules WOULD have done, which is the thing worth seeing.
+                        (r.mode === "observe" ? (r.wouldBe ?? "allow") : r.decision) ===
+                        "deny"
                           ? "bg-destructive/15 text-destructive"
-                          : r.decision === "ask"
+                          : (r.mode === "observe"
+                                ? (r.wouldBe ?? "allow")
+                                : r.decision) === "ask"
                             ? "bg-warning/15 text-warning"
                             : "bg-muted text-muted-foreground"
                       }`}

@@ -349,6 +349,13 @@ fn epoch_millis() -> u64 {
 /// after writing and kills a hook that overruns its own timeout, so waiting on EOF is
 /// bounded by the caller rather than by us.
 pub fn read_payload(reader: impl std::io::Read) -> (String, bool) {
+    read_payload_capped(reader, MAX_HOOK_STDIN_BYTES)
+}
+
+/// [`read_payload`] with an explicit cap. The guard (SBS-1059) reads far more than the
+/// sensor: a `beforeReadFile` payload embeds the file's content, and a guard that cannot
+/// see a call must fail closed, so a small cap would turn every large read into a denial.
+pub fn read_payload_capped(reader: impl std::io::Read, cap: u64) -> (String, bool) {
     use std::io::Read as _;
 
     // BYTES, not a String, and this is load-bearing for the exit-0 guarantee:
@@ -368,10 +375,10 @@ pub fn read_payload(reader: impl std::io::Read) -> (String, bool) {
     let mut bytes: Vec<u8> = Vec::new();
     // cap + 1 so filling the cap is distinguishable from a payload that ends exactly
     // on it.
-    let _ = reader.take(MAX_HOOK_STDIN_BYTES + 1).read_to_end(&mut bytes);
-    let truncated = bytes.len() as u64 > MAX_HOOK_STDIN_BYTES;
+    let _ = reader.take(cap + 1).read_to_end(&mut bytes);
+    let truncated = bytes.len() as u64 > cap;
     if truncated {
-        bytes.truncate(MAX_HOOK_STDIN_BYTES as usize);
+        bytes.truncate(cap as usize);
     }
     (String::from_utf8_lossy(&bytes).into_owned(), truncated)
 }

@@ -58,6 +58,9 @@ export function AgentPermissionsView() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<PermissionsPreview[] | null>(null);
+  // Cursor's hooks.json dry run, kept apart from the Claude Code one so the dialog can say
+  // which file and which key it is about.
+  const [guardPreview, setGuardPreview] = useState<PermissionsPreview[] | null>(null);
   const [pattern, setPattern] = useState("");
   const [action, setAction] = useState<PermissionAction>("deny");
   // The Cursor guard hook (SBS-1059): same rules, enforced by a hook because Cursor has no
@@ -156,7 +159,7 @@ export function AgentPermissionsView() {
     setError(null);
     try {
       const p = await agentGuardPreview(mode);
-      setPreview(p ? [p] : []);
+      setGuardPreview(p ? [p] : []);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -440,7 +443,10 @@ export function AgentPermissionsView() {
                     value={value}
                     checked={guard.cursorMode === value}
                     disabled={
-                      busy || preview !== null || (value !== "off" && !guard.binary)
+                      busy ||
+                      preview !== null ||
+                      guardPreview !== null ||
+                      (value !== "off" && !guard.binary)
                     }
                     aria-label={`Cursor guard ${label}`}
                     onChange={() => void setCursorMode(value)}
@@ -515,6 +521,12 @@ export function AgentPermissionsView() {
       </div>
 
       <PreviewDialog previews={preview} onClose={() => setPreview(null)} />
+      <PreviewDialog
+        previews={guardPreview}
+        onClose={() => setGuardPreview(null)}
+        keyName="hooks"
+        emptyText="Cursor's config folder could not be resolved, so there is nothing to write."
+      />
     </div>
   );
 }
@@ -522,9 +534,14 @@ export function AgentPermissionsView() {
 function PreviewDialog({
   previews,
   onClose,
+  keyName = "permissions",
+  emptyText = "No Claude Code profile was found, so there is nothing to write.",
 }: {
   previews: PermissionsPreview[] | null;
   onClose: () => void;
+  /** The one top-level key the write touches, named in the footer. */
+  keyName?: string;
+  emptyText?: string;
 }) {
   return (
     <Dialog open={previews !== null} onOpenChange={(open) => !open && onClose()}>
@@ -534,9 +551,7 @@ function PreviewDialog({
         </DialogHeader>
         <div className="grid gap-4 overflow-auto">
           {previews?.length === 0 && (
-            <p className="text-sm text-muted-foreground">
-              No Claude Code profile was found, so there is nothing to write.
-            </p>
+            <p className="text-sm text-muted-foreground">{emptyText}</p>
           )}
           {previews?.map((p) => (
             <div key={p.path} className="grid gap-1">
@@ -561,9 +576,9 @@ function PreviewDialog({
           ))}
         </div>
         <DialogFooter className="text-xs text-muted-foreground sm:justify-start">
-          Nothing has been written. Only the{" "}
-          <span className="font-mono">permissions</span> key changes; everything else in
-          the file, including your comments, is left exactly as it is.
+          Nothing has been written. Only the <span className="font-mono">{keyName}</span>{" "}
+          key changes; everything else in the file, including your comments, is left
+          exactly as it is.
         </DialogFooter>
       </DialogContent>
     </Dialog>

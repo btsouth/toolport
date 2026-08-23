@@ -78,6 +78,21 @@ describe("AgentPermissionsView", () => {
     expect(screen.getByLabelText("Cursor guard Enforce")).toBeChecked();
   });
 
+  it("the Cursor preview names hooks.json's key, not Claude Code's", async () => {
+    api.agentGuardPreview.mockResolvedValue({
+      path: "/home/a/.cursor/hooks.json",
+      before: "{}\n",
+      after: '{\n  "version": 1,\n  "hooks": { "beforeShellExecution": [] }\n}\n',
+    });
+    render(<AgentPermissionsView />);
+    await screen.findByLabelText("Cursor guard Off");
+    await userEvent.click(screen.getByRole("button", { name: "Preview hooks.json" }));
+    await waitFor(() => expect(api.agentGuardPreview).toHaveBeenCalledWith("observe"));
+    expect(await screen.findByText("What would be written")).toBeInTheDocument();
+    expect(screen.getByText(/Only the/).textContent).toContain("hooks");
+    expect(screen.getByText(/Only the/).textContent).not.toContain("permissions");
+  });
+
   it("without a published gateway binary the guard cannot be switched on", async () => {
     api.agentGuardView.mockResolvedValue(guard({ binary: undefined }));
     render(<AgentPermissionsView />);
