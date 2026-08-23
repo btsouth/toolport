@@ -4,6 +4,31 @@ All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 Entries before the rename below shipped under the project's former name, Conduit.
 
+## [Unreleased]
+
+### Security
+
+- **A process that bound the approval broker's endpoint after the app had gone could
+  approve gated calls in its place, and be handed the arguments first.** The gateway
+  dialed whatever `approval-endpoint.json` named and believed whatever came back. The
+  descriptor survives a crash or a force-kill, and nothing authenticated the peer that
+  answered: the literal bytes `"approved"` were a complete decision. Because the
+  request is written before the reply is read, such a peer also received the call's
+  real arguments, including the rehydrated values behind a PII release. The gateway now
+  opens every dial with a random challenge that the broker must answer with an
+  HMAC-SHA256 proof of the shared token, and sends nothing until the proof checks out;
+  a peer that cannot read the owner-only descriptor cannot produce it, so it sees no
+  request and its answer is never read. The failure is reported as `unreachable`, so a
+  restarted app is still found on the re-read, and it is still fail-closed. On Unix the
+  broker also moves off loopback TCP onto a socket file in a `0700` directory under the
+  data dir, so such a peer cannot connect at all (loopback TCP remains as the fallback
+  and on Windows; the challenge protects both). A gateway from before this change is
+  still answered by the new broker. (SBS-867)
+
+  What this does not claim: a process running as the same user as Toolport can read
+  the descriptor and `registry.json` alike, and can switch human approval off directly;
+  that is a sandboxing question (SBS-185), not an authentication one.
+
 ## [1.16.0] - 2026-08-22
 
 ### Fixed

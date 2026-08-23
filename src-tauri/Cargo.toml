@@ -66,6 +66,9 @@ toml_edit = "0.22"
 dirs = "5"
 ureq = { version = "2", features = ["json"] }
 sha2 = "0.10"
+# HMAC-SHA256 for the approval broker's challenge-response (SBS-867); already in
+# the tree transitively, promoted to a direct dep.
+hmac = "0.12"
 subtle = "2.6"
 # Pure-Rust JS engine for server-side "code mode" orchestration (SOU-184): run one
 # agent script that calls many downstream tools, so an N-step task costs one round-trip

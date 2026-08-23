@@ -816,6 +816,7 @@ dependencies = [
  "dirs 5.0.1",
  "fs2",
  "getrandom 0.2.17",
+ "hmac",
  "json5",
  "jsonc-parser",
  "jsonschema",

@@ -3906,8 +3906,10 @@ enum BrokerAttempt {
 }
 
 /// One dial to the broker described by `desc`. FAIL-CLOSED throughout: the arguments travel
-/// over the socket and never touch disk. Transport is loopback TCP + token for now;
-/// hardening to an OS-permissioned named-pipe / uds is a follow-up.
+/// over the socket and never touch disk. The dial itself ([`approval::dial_broker`]) makes
+/// the peer prove it holds the descriptor's token before a byte of the request is written,
+/// so a process that merely binds the published endpoint after the app has gone gets
+/// neither the arguments nor a say in the decision (SBS-867).
 ///
 /// The key invariant: `Unreachable` is returned ONLY when the request never reached a
 /// broker (so no human saw it). Once the request is written, any later failure - including
@@ -3918,12 +3920,13 @@ fn try_decide_once(
     req: &mut approval::ApprovalRequest,
 ) -> BrokerAttempt {
     use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpStream;
     let Some(desc) = desc else {
         return BrokerAttempt::Unreachable;
     };
     req.token = desc.token.clone();
-    let Ok(mut stream) = TcpStream::connect(&desc.endpoint) else {
+    // Connect refused, no answer to the challenge, or a wrong proof: in every case the
+    // request was never written, so no human was asked and a re-dial is safe.
+    let Ok(mut stream) = approval::dial_broker(&desc) else {
         return BrokerAttempt::Unreachable;
     };
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
@@ -6050,11 +6053,12 @@ fn publish_routine_suggestion(suggestion: routines::RoutineSuggestion, client: O
     );
     std::thread::spawn(move || {
         use std::io::{BufRead, BufReader, Write};
-        use std::net::TcpStream;
         let Some(desc) = read_endpoint_descriptor() else {
             return;
         };
-        let Ok(mut stream) = TcpStream::connect(&desc.endpoint) else {
+        // Same handshake as an approval: the envelope below carries the token, and a peer
+        // that cannot prove it already holds it must not be handed it (SBS-867).
+        let Ok(mut stream) = approval::dial_broker(&desc) else {
             return;
         };
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -15759,6 +15763,28 @@ mod tests {
         }
     }
 
+    /// Serve the gateway's handshake on a stub broker: answer the opening challenge with
+    /// the proof for `token`, then return the line that follows (the request). `None` if
+    /// the gateway hung up first - which is what a gateway does to a peer that fails the
+    /// challenge.
+    fn stub_handshake(stream: &mut TcpStream, token: &str) -> Option<String> {
+        use std::io::{BufRead, BufReader, Write};
+        let mut reader = BufReader::new(stream.try_clone().ok()?);
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        if let Some(proof) = approval::answer_challenge(line.as_bytes(), token) {
+            writeln!(stream, "{proof}").ok()?;
+            stream.flush().ok()?;
+            line.clear();
+            if reader.read_line(&mut line).ok()? == 0 {
+                return None;
+            }
+        }
+        Some(line)
+    }
+
     /// Publish a stub broker into `env`'s data dir that answers one request with
     /// `decision`, handing back what it was asked.
     fn stub_broker(
@@ -15793,20 +15819,17 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader, Write};
-            let Ok((stream, _)) = listener.accept() else {
+            use std::io::Write;
+            let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
-            let mut line = String::new();
-            let reader_stream = stream.try_clone().expect("a clonable stream");
-            if BufReader::new(reader_stream).read_line(&mut line).is_err() {
+            let Some(line) = stub_handshake(&mut stream, "stub-broker-token") else {
                 return;
-            }
+            };
             if let Ok(req) = serde_json::from_str::<approval::ApprovalRequest>(&line) {
                 let _ = tx.send(req);
             }
             during();
-            let mut stream = stream;
             let answer = serde_json::to_string(&decision).expect("a serializable decision");
             let _ = stream.write_all(answer.as_bytes());
             let _ = stream.write_all(b"\n");
@@ -17294,6 +17317,67 @@ mod tests {
         let d = decide_via_broker(bad, &mut r);
         assert!(!d.is_approved());
         assert_eq!(d, approval::ApprovalDecision::Unreachable);
+    }
+
+    /// SBS-867: the gateway must not believe a decision from a peer that merely holds the
+    /// published endpoint. The impostor here answers the very first line with `"approved"`,
+    /// which is exactly what a pre-handshake gateway would have accepted. It must get no
+    /// request (so no arguments and no PII leave the gateway) and the outcome must be
+    /// fail-closed - as Unreachable, so the self-healing re-read may still find the app.
+    #[test]
+    fn an_impostor_broker_gets_no_request_and_no_approval() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");
+        let endpoint = listener.local_addr().expect("a bound address").to_string();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().expect("clonable"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                let _ = seen_tx.send(line.clone());
+                line.clear();
+                if writeln!(stream, "\"approved\"").is_err() {
+                    break;
+                }
+            }
+        });
+        let mut req = approval::ApprovalRequest {
+            token: String::new(),
+            id: "id".into(),
+            client: None,
+            server: "crm".into(),
+            tool: "export_all".into(),
+            reason: approval::ApprovalReason::Destructive,
+            arguments: serde_json::json!({ "secret": "hunter2" }),
+            tool_fingerprint: Some("v2:abc".into()),
+            url_elicitation: None,
+            pii_release: None,
+        };
+        let desc = Some(approval::EndpointDescriptor {
+            endpoint,
+            token: "the-real-token".into(),
+        });
+        let d = decide_via_broker(desc, &mut req);
+        assert_eq!(d, approval::ApprovalDecision::Unreachable);
+        assert!(!d.is_approved());
+        let first = seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the impostor saw the challenge");
+        assert!(
+            first.contains("toolportApprovalChallenge"),
+            "first line is the challenge, got {first}"
+        );
+        assert!(
+            !first.contains("the-real-token") && !first.contains("hunter2"),
+            "nothing confidential before the proof: {first}"
+        );
+        assert!(
+            seen_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the request must never be sent to a peer that failed the challenge"
+        );
     }
 
     /// The audit record and the agent-facing envelope must name every outcome the same way,
@@ -19820,7 +19904,7 @@ mod tests {
         std::thread::JoinHandle<()>,
         std::sync::mpsc::Receiver<approval::ApprovalRequest>,
     ) {
-        use std::io::{BufRead, Write};
+        use std::io::Write;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = listener.local_addr().unwrap().to_string();
@@ -19836,11 +19920,8 @@ mod tests {
         let (request_tx, request_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut line = String::new();
-            {
-                let mut reader = std::io::BufReader::new(&mut stream);
-                reader.read_line(&mut line).unwrap();
-            }
+            let line = stub_handshake(&mut stream, "routine-approval-token")
+                .expect("the gateway sends its request once the broker has proved the token");
             let request: approval::ApprovalRequest = serde_json::from_str(&line).unwrap();
             request_tx.send(request).unwrap();
             if let Some(before_reply) = before_reply {

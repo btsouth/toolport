@@ -6,16 +6,19 @@
 //! do not hold a gateway request. This is the counterpart to the gateway's
 //! `request_human_decision` (see `bin/toolport-gateway.rs`).
 //!
-//! Protocol: the gateway connects over loopback TCP, sends one JSON line
-//! ([`ApprovalRequest`]) carrying the shared token, and reads one JSON line back
+//! Protocol: the gateway connects (a socket file in a private directory on Unix, loopback
+//! TCP on Windows), opens with a challenge the broker must answer with a proof of the
+//! shared token ([`crate::approval::dial_broker`]), then sends one JSON line
+//! ([`ApprovalRequest`]) carrying that token, and reads one JSON line back
 //! ([`ApprovalDecision`]). Arguments travel over the socket and are never written to
 //! disk. The only thing on disk is the endpoint descriptor (address + token). The
-//! human decides in the app UI; a fail-closed timeout denies. Transport is loopback
-//! TCP + token for now; hardening to a named-pipe / uds is a follow-up.
+//! human decides in the app UI; a fail-closed timeout denies. The challenge is what keeps
+//! a process that merely binds the published endpoint after the app has gone from
+//! answering in its place (SBS-867); the transport choice is defense in depth on top.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -27,8 +30,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::approval::{
-    ApprovalDecision, ApprovalReason, ApprovalRequest, EndpointDescriptor, PiiReleaseRequest,
-    UrlElicitationRequest, DEFAULT_TIMEOUT_SECS, ENDPOINT_FILE,
+    ApprovalDecision, ApprovalReason, ApprovalRequest, BrokerStream, EndpointDescriptor,
+    PiiReleaseRequest, UrlElicitationRequest, DEFAULT_TIMEOUT_SECS, ENDPOINT_FILE,
 };
 
 /// A pending approval as the UI sees it. The auth token is deliberately NOT included.
@@ -349,66 +352,156 @@ pub fn start(app: AppHandle) -> ApprovalBroker {
         }),
     };
 
-    match TcpListener::bind(("127.0.0.1", 0)) {
-        Ok(listener) => {
-            if let Some(port) = listener.local_addr().ok().map(|a| a.port()) {
-                if let Some(dir) = crate::registry::conduit_dir() {
-                    let desc = EndpointDescriptor {
-                        endpoint: format!("127.0.0.1:{port}"),
-                        token,
-                    };
-                    let path = dir.join(ENDPOINT_FILE);
-                    // A stale descriptor (app crashed) points at a dead port, so a gateway
-                    // connect fails and denies - fail-closed either way. The gateway also
-                    // re-reads the descriptor and retries once, which self-heals the case
-                    // where the app restarted and rebound to a new port.
-                    // Written via atomic_write so the HITL endpoint + auth token land
-                    // owner-only (0600) on Unix rather than world-readable: a same-user
-                    // process reading the token could otherwise spoof approval decisions.
-                    let _ = crate::registry::atomic_write(
-                        &path,
-                        &serde_json::to_string(&desc).unwrap_or_default(),
-                    );
-                    // Record WHERE we published, into the same always-on log the gateway
-                    // writes its `dir_resolution=` line to. If a client-spawned gateway
-                    // resolves the data dir differently from the app (MSIX virtualization,
-                    // a differently-spelled HOME), that mismatch is now a one-line read
-                    // instead of a multi-hour hunt - it was the root cause of a live
-                    // "HITL blocks every call but no prompt appears" incident.
-                    log_broker_event(&format!(
-                        "bound 127.0.0.1:{port}; endpoint published at {}",
-                        path.display()
-                    ));
-                } else {
-                    log_broker_event(
-                        "conduit_dir() unavailable; endpoint NOT published (HITL fails closed)",
-                    );
-                }
-                let accept_broker = broker.clone();
-                std::thread::spawn(move || {
-                    let active_workers = Arc::new(AtomicUsize::new(0));
-                    for conn in listener.incoming().flatten() {
-                        let Some(permit) = try_acquire_connection(&active_workers) else {
-                            // Closing immediately is fail-closed and keeps a slow or
-                            // stalled peer from consuming an unbounded thread count.
-                            drop(conn);
-                            continue;
-                        };
-                        let b = accept_broker.clone();
-                        let a = app.clone();
-                        let _ = std::thread::Builder::new()
-                            .name("toolport-approval".into())
-                            .spawn(move || {
-                                let _permit = permit;
-                                handle_conn(conn, b, a);
-                            });
-                    }
-                });
+    match bind_listener() {
+        Some((listener, endpoint)) => {
+            if let Some(dir) = crate::registry::conduit_dir() {
+                let desc = EndpointDescriptor {
+                    endpoint: endpoint.clone(),
+                    token,
+                };
+                let path = dir.join(ENDPOINT_FILE);
+                // A stale descriptor (app crashed) points at a dead endpoint, so a gateway
+                // connect fails and denies - fail-closed either way. The gateway also
+                // re-reads the descriptor and retries once, which self-heals the case
+                // where the app restarted and rebound somewhere new. Should some other
+                // process bind the stale endpoint instead, the gateway's challenge refuses
+                // it before a byte of any request is sent (SBS-867).
+                // Written via atomic_write so the HITL endpoint + auth token land
+                // owner-only (0600) on Unix rather than world-readable: the token is what
+                // the challenge proves, so nothing but the app (or a process that can
+                // already read its data dir) may hold it.
+                let _ = crate::registry::atomic_write(
+                    &path,
+                    &serde_json::to_string(&desc).unwrap_or_default(),
+                );
+                // Record WHERE we published, into the same always-on log the gateway
+                // writes its `dir_resolution=` line to. If a client-spawned gateway
+                // resolves the data dir differently from the app (MSIX virtualization,
+                // a differently-spelled HOME), that mismatch is now a one-line read
+                // instead of a multi-hour hunt - it was the root cause of a live
+                // "HITL blocks every call but no prompt appears" incident.
+                log_broker_event(&format!(
+                    "bound {endpoint}; endpoint published at {}",
+                    path.display()
+                ));
+            } else {
+                log_broker_event(
+                    "conduit_dir() unavailable; endpoint NOT published (HITL fails closed)",
+                );
             }
+            let accept_broker = broker.clone();
+            std::thread::spawn(move || {
+                let active_workers = Arc::new(AtomicUsize::new(0));
+                loop {
+                    let conn = match listener.accept() {
+                        Ok(conn) => conn,
+                        Err(_) => {
+                            // Transient (EMFILE, EINTR): don't spin flat out on it.
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                    };
+                    let Some(permit) = try_acquire_connection(&active_workers) else {
+                        // Closing immediately is fail-closed and keeps a slow or
+                        // stalled peer from consuming an unbounded thread count.
+                        drop(conn);
+                        continue;
+                    };
+                    let b = accept_broker.clone();
+                    let a = app.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("toolport-approval".into())
+                        .spawn(move || {
+                            let _permit = permit;
+                            handle_conn(conn, b, a);
+                        });
+                }
+            });
         }
-        Err(_) => { /* inert broker; HITL never fires, gateways fail-closed */ }
+        None => { /* inert broker; HITL never fires, gateways fail-closed */ }
     }
     broker
+}
+
+/// The listener the broker accepts on, over whichever transport [`bind_listener`] got.
+enum Listener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixListener),
+}
+
+impl Listener {
+    fn accept(&self) -> io::Result<BrokerStream> {
+        match self {
+            Listener::Tcp(l) => l.accept().map(|(s, _)| BrokerStream::Tcp(s)),
+            #[cfg(unix)]
+            Listener::Unix(l) => l.accept().map(|(s, _)| BrokerStream::Unix(s)),
+        }
+    }
+}
+
+/// Where the Unix broker socket lives: a 0700 directory of its own under the data dir, so
+/// no other user can connect to it. The data dir's own mode is whatever the platform gave
+/// it, and the socket path ends up in a log line, so the directory carries the guarantee.
+#[cfg(unix)]
+fn unix_socket_path() -> Option<std::path::PathBuf> {
+    Some(
+        crate::registry::conduit_dir()?
+            .join("broker")
+            .join("approval.sock"),
+    )
+}
+
+/// Bind the broker's listener and return it with the endpoint string to publish. Unix
+/// prefers a socket file in a private directory and falls back to loopback TCP if that
+/// cannot be had (data dir unavailable, or a path too long for `sun_path`); the challenge
+/// in [`crate::approval::dial_broker`] protects both equally, so the fallback loses defense
+/// in depth, not the guarantee. Windows is loopback TCP.
+fn bind_listener() -> Option<(Listener, String)> {
+    #[cfg(unix)]
+    match bind_unix_listener() {
+        Ok(bound) => return Some(bound),
+        Err(e) => log_broker_event(&format!(
+            "unix socket unavailable ({e}); falling back to loopback TCP"
+        )),
+    }
+    let listener = TcpListener::bind(("127.0.0.1", 0)).ok()?;
+    let port = listener.local_addr().ok()?.port();
+    Some((Listener::Tcp(listener), format!("127.0.0.1:{port}")))
+}
+
+#[cfg(unix)]
+fn bind_unix_listener() -> io::Result<(Listener, String)> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let path = unix_socket_path().ok_or_else(|| io::Error::other("data dir unavailable"))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::other("socket path has no parent"))?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    // `create` leaves a pre-existing directory's mode alone; make the private mode hold
+    // across runs and across anything else that may have created it.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    // A socket file survives a crash or a force-kill. Nothing is listening on it (the app
+    // is single-instance), so a connect would only ever be refused; unlink it so the bind
+    // below does not fail on EADDRINUSE.
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let listener = std::os::unix::net::UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok((
+        Listener::Unix(listener),
+        format!(
+            "{}{}",
+            crate::approval::UNIX_ENDPOINT_PREFIX,
+            path.display()
+        ),
+    ))
 }
 
 /// Append a line to the shared, always-on gateway log, so the broker's bind/publish
@@ -427,6 +520,10 @@ pub fn clear_endpoint() {
         if std::fs::remove_file(dir.join(ENDPOINT_FILE)).is_ok() {
             log_broker_event("endpoint descriptor cleared on shutdown");
         }
+    }
+    #[cfg(unix)]
+    if let Some(path) = unix_socket_path() {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -480,17 +577,37 @@ fn preflight(
 
 /// Serve one gateway connection: read the request, authenticate it, park it for a human
 /// decision (or a fail-closed timeout), and write the decision back.
-fn handle_conn(stream: TcpStream, broker: ApprovalBroker, app: AppHandle) {
+fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, app: AppHandle) {
     // Read the request promptly; a slow/stalled sender must not tie up a thread.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let reader_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
     };
-    let line = match read_approval_request(&mut BufReader::new(reader_stream)) {
+    let mut reader = BufReader::new(reader_stream);
+    let mut line = match read_approval_request(&mut reader) {
         Ok(line) => line,
         Err(_) => return,
     };
+    // A current gateway opens with a challenge and sends nothing else until it is
+    // answered: prove we hold the token, then read the request on the same buffered
+    // reader. A gateway from before the handshake sends its request first, and that line
+    // IS the request. Either way the request is authenticated below exactly as before;
+    // the handshake only adds the other direction (SBS-867).
+    if let Some(proof) = crate::approval::answer_challenge(&line, &broker.inner.token) {
+        let mut out = match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if writeln!(out, "{proof}").and_then(|_| out.flush()).is_err() {
+            return;
+        }
+        line = match read_approval_request(&mut reader) {
+            Ok(line) => line,
+            Err(_) => return,
+        };
+    }
 
     // A routine-save suggestion rides the same authenticated endpoint but is
     // fire-and-forget: store, notify the UI, acknowledge, done. Nothing parks and
@@ -520,7 +637,7 @@ fn handle_conn(stream: TcpStream, broker: ApprovalBroker, app: AppHandle) {
     };
 
     let mut out = stream;
-    let deny = |out: &mut TcpStream| {
+    let deny = |out: &mut BrokerStream| {
         let _ = out.set_write_timeout(Some(Duration::from_secs(10)));
         let _ = writeln!(
             out,
