@@ -15035,6 +15035,10 @@ enum ArgAction {
     /// flag was written without one - [`conduit_lib::hooks::handle_event`] treats
     /// that as an unknown event rather than a reason to fail.
     Hook(String),
+    /// Invoked as an agent's blocking guard hook (`--toolport-guard <agent>`). Read the
+    /// call from stdin, evaluate the permission policy, print the agent's decision JSON
+    /// to stdout, exit 0. Carries the agent name.
+    Guard(String),
     /// Nothing that changes startup mode; fall through to normal gateway
     /// startup.
     Run,
@@ -15063,6 +15067,12 @@ fn parse_args(args: &[String]) -> ArgAction {
     {
         return ArgAction::Hook(args.get(index + 1).cloned().unwrap_or_default());
     }
+    if let Some(index) = args
+        .iter()
+        .position(|a| a == conduit_lib::agent_guard::GUARD_MARKER)
+    {
+        return ArgAction::Guard(args.get(index + 1).cloned().unwrap_or_default());
+    }
     for arg in args {
         if arg.starts_with('-') && !KNOWN_FLAGS.contains(&arg.as_str()) {
             return ArgAction::Unknown(arg.clone());
@@ -15086,6 +15096,9 @@ fn usage() -> String {
          \x20   --selftest-secrets    Diagnostic: read every vaulted secret and report\n\
          \x20   --toolport-hook EVENT Record one agent lifecycle event and exit (installed\n\
          \x20                         into an agent's settings by Toolport; always exits 0)\n\
+         \x20   --toolport-guard AGENT Decide one native tool call against the permission\n\
+         \x20                         policy and print the agent's decision JSON (installed\n\
+         \x20                         into an agent's hooks by Toolport; always exits 0)\n\
          \x20   -h, --help            Print this message and exit\n\
          \x20   -V, --version         Print the version and exit\n\
          \n\
@@ -15135,6 +15148,16 @@ fn main() {
             let (payload, _truncated) = conduit_lib::hooks::read_payload(std::io::stdin());
             conduit_lib::hooks::handle_event(&event, &payload);
             std::process::exit(0);
+        }
+        ArgAction::Guard(agent) => {
+            // Same discipline as the sensor: first thing, no gateway startup, bounded
+            // read. The ONLY difference is that this one speaks: its stdout is the
+            // decision the agent acts on, and it always exits 0 with a complete
+            // response - a deny is said in the JSON, never by crashing out.
+            let (payload, _truncated) = conduit_lib::hooks::read_payload(std::io::stdin());
+            let (out, code) = conduit_lib::agent_guard::handle_stdin(&agent, &payload);
+            println!("{out}");
+            std::process::exit(code);
         }
         ArgAction::Run => {}
     }

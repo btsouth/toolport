@@ -36,6 +36,9 @@ import type {
   PermissionRule,
   PermissionsPreview,
   PermissionsView,
+  GuardMode,
+  GuardPreview,
+  GuardView,
 } from "./types";
 
 /** The hand-verified popular catalog (offline, instant). */
@@ -1038,6 +1041,18 @@ export function agentPermissionsPreview(
   return invoke<PermissionsPreview[]>("agent_permissions_preview", {
     rules: rules ?? null,
   });
+}
+
+// ---- Guard hook for Cursor (SBS-1059) ----
+
+export function agentGuardView(): Promise<GuardView> {
+  return invoke<GuardView>("agent_guard_view");
+}
+export function agentGuardSetCursorMode(mode: GuardMode): Promise<GuardView> {
+  return invoke<GuardView>("agent_guard_set_cursor_mode", { mode });
+}
+export function agentGuardPreview(mode: GuardMode): Promise<GuardPreview | null> {
+  return invoke<GuardPreview | null>("agent_guard_preview", { mode });
 }
 
 export function hooksView(): Promise<HooksViewData> {

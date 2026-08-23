@@ -21,10 +21,11 @@ Claude Code's rule syntax needs no hook and no Toolport process in the loop to b
 enforced; it needs to be in the file, in every profile, and to come back out cleanly.
 That is the whole of this feature.
 
-It is **Claude Code only** for now. Cursor has hooks but no settings-level rule list;
-Codex uses approval and sandbox settings of a different shape; Gemini CLI is mixed. The
-tab says so rather than pretending. The gateway's own gates still cover every MCP call
-from every client.
+Claude Code enforces the rules itself. **Cursor** has no settings-level rule list, so
+Toolport enforces the same rules there through a guard hook - see
+[Cursor](#cursor) below. Codex uses approval and sandbox settings of a different shape
+and Gemini CLI is mixed; neither is covered yet, and the tab says so rather than
+pretending. The gateway's own gates still cover every MCP call from every client.
 
 ## Rules
 
@@ -72,8 +73,52 @@ rules is put back at the next start - these are restrictions you asked for, so, 
 A `settings.json` that cannot be parsed is reported, left untouched, and does not stop
 the other profiles from being written or cleaned.
 
+## Cursor
+
+Cursor has hooks (`beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`) but no
+rule list, so Toolport installs a small **guard hook** into `~/.cursor/hooks.json`: before
+a shell command runs, an MCP tool is called, or a file is read, Cursor runs
+`toolport-gateway --toolport-guard cursor` with the call on stdin and acts on the JSON it
+prints - `allow`, `deny`, or `ask`. The guard evaluates the **same rules** as above, so
+you write them once.
+
+Because the rule language is Claude Code's, here is exactly what carries over:
+
+| Rule                                             | Cursor event           | Notes                                                                                       |
+| ------------------------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------- |
+| `Bash(...)`                                      | `beforeShellExecution` | Matched against the command as Cursor reports it, with Claude Code's semantics below.       |
+| `Read(...)`                                      | `beforeReadFile`       | `~/` is your home, `//` is absolute, anything else is relative to the workspace root.       |
+| `mcp__server__tool`                              | `beforeMCPExecution`   | Cursor names the tool, not the server, so the server part cannot be checked and is ignored. |
+| `Edit`, `WebFetch`, `Agent`, `Tool(param:value)` | -                      | No Cursor event; these rules do nothing in Cursor (they still work in Claude Code).         |
+
+Matching follows Claude Code where it documents it: `*` spans anything including
+spaces; a trailing ` *` needs a word boundary (`Bash(ls *)` matches `ls -la` but not
+`lsof`); `:*` is the same as ` *`; a compound command (`&&`, `||`, `;`, `|`) is denied
+or asked if **any** part matches and allowed only if **every** part is; `timeout N`,
+`time`, `nice` and `nohup` are stripped first. Deny beats ask beats allow when more than
+one rule matches.
+
+Three modes, chosen in the tab:
+
+- **Off** - no hook installed (the default).
+- **Observe** - the hook is installed, every call is evaluated and recorded in **Agent
+  activity** with what the rules _would_ have decided, and the answer is always allow.
+  Use this to read a policy's effect before letting it act.
+- **Enforce** - Never and Ask first take effect. "Ask first" uses Cursor's own
+  confirmation prompt. The hook is installed with Cursor's `failClosed` set, so if the
+  guard itself crashes or times out Cursor blocks the call rather than letting it through.
+
+When no rule matches, the guard answers Cursor's own canonical "proceed" response. When
+the guard cannot judge a call - a payload it does not understand - it answers the same
+and records that it could not, because a guard that breaks your work over its own parse
+error is worse than one that stands aside; in Enforce, `failClosed` still covers a crash.
+
+Only entries carrying `--toolport-guard` are ever added to or removed from
+`hooks.json`; your own hooks stay exactly where they are, and the file's formatting is
+preserved. A Preview shows the exact bytes before the first write.
+
 ## Next
 
-A `PreToolUse` hook that asks through Toolport's own approval window, records every
-decision in Agent activity, and can start in observe-only mode is the next step; it
-builds on this and on the authenticated approval broker shipped in 1.17.
+Routing "ask" through Toolport's own approval window (instead of Cursor's prompt) and a
+`PreToolUse` guard for Claude Code for the same purpose are the next steps; they build
+on this and on the authenticated approval broker shipped in 1.17.

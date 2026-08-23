@@ -620,6 +620,26 @@ impl PermissionAction {
     }
 }
 
+/// How a guard hook acts on the permission rules (SBS-1059).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardMode {
+    /// Hook not installed.
+    #[default]
+    Off,
+    /// Hook installed; every call is evaluated and the decision recorded, but the answer is
+    /// always "allow". For seeing what a policy WOULD do before letting it act.
+    Observe,
+    /// Hook installed; deny and ask rules take effect.
+    Enforce,
+}
+
+impl GuardMode {
+    pub fn is_off(&self) -> bool {
+        *self == GuardMode::Off
+    }
+}
+
 /// One native permission rule: a pattern in Claude Code's rule syntax (`Bash(rm -rf *)`,
 /// `Read(./.env)`, `WebFetch(domain:example.com)`, `mcp__server__tool`) and what to do.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -987,6 +1007,13 @@ pub struct Registry {
     /// written only by an explicit Apply for that project, never at startup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules_projects: Vec<RulesProject>,
+    /// Cursor guard hook (SBS-1059): how the `--toolport-guard cursor` hook Toolport installs
+    /// into `~/.cursor/hooks.json` treats the same permission rules. `Off` = not installed.
+    #[serde(default, skip_serializing_if = "GuardMode::is_off")]
+    pub guard_cursor_mode: GuardMode,
+    /// Absolute paths of the hooks files the guard has been written into, for exact cleanup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guard_targets: Vec<String>,
     /// Native permission policy for Claude Code (SBS-1058): rules in Claude Code's own
     /// `permissions` syntax that Toolport writes into every profile's `settings.json`. Off
     /// until the user opts in; nothing is written until then. See [`crate::agent_permissions`].
@@ -1270,6 +1297,8 @@ impl Default for Registry {
             rules_clients: HashMap::new(),
             rules_targets: Vec::new(),
             rules_projects: Vec::new(),
+            guard_cursor_mode: GuardMode::Off,
+            guard_targets: Vec::new(),
             agent_permissions_enabled: false,
             agent_permission_rules: Vec::new(),
             agent_permission_targets: HashMap::new(),

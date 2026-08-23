@@ -443,6 +443,25 @@ export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
               >
                 <span className="min-w-0 flex-1 truncate font-mono text-foreground">
                   {r.tool ?? r.event ?? "unknown"}
+                  {r.event === "guard" && r.decision && (
+                    // A guard row (Cursor hook): what the hook answered, and in observe mode
+                    // what it would have answered, so the user can read the policy's effect
+                    // before letting it act.
+                    <span
+                      className={`ml-2 rounded px-1 text-[10px] ${
+                        r.decision === "deny"
+                          ? "bg-destructive/15 text-destructive"
+                          : r.decision === "ask"
+                            ? "bg-warning/15 text-warning"
+                            : "bg-muted text-muted-foreground"
+                      }`}
+                      title={r.rule ? `rule ${r.rule}` : undefined}
+                    >
+                      {r.mode === "observe" && r.wouldBe && r.wouldBe !== "allow"
+                        ? `would ${r.wouldBe}`
+                        : r.decision}
+                    </span>
+                  )}
                 </span>
                 <span
                   className="min-w-0 flex-1 truncate text-muted-foreground"

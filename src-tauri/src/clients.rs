@@ -663,8 +663,20 @@ pub(crate) fn write_settings_key(
     root: &serde_json::Value,
     key: &str,
 ) -> Result<(), String> {
+    write_settings_key_for("claude-code", path, original, root, key)
+}
+
+/// [`write_settings_key`] for another client's JSON settings file (the Cursor guard writes
+/// `~/.cursor/hooks.json`); the backup is filed under that client.
+pub(crate) fn write_settings_key_for(
+    client_id: &str,
+    path: &Path,
+    original: Option<&str>,
+    root: &serde_json::Value,
+    key: &str,
+) -> Result<(), String> {
     if original.is_some() {
-        backup_file_named("claude-code", path, &claude_settings_backup_name(path))?;
+        backup_file_named(client_id, path, &claude_settings_backup_name(path))?;
     }
     atomic_write(path, &render_settings_key(original, root, key)?)
 }

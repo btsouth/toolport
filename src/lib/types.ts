@@ -809,4 +809,35 @@ export interface HookEvent {
   /** Absent means UNKNOWN, never success. */
   ok?: boolean;
   malformed?: boolean;
+  /** Guard rows (SBS-1059): the Cursor event, what the hook answered, and the rule that decided. */
+  hookEvent?: string;
+  decision?: string;
+  rule?: string | null;
+  mode?: string;
+  /** In observe mode: what the answer WOULD have been. */
+  wouldBe?: string | null;
+}
+
+// ---- Guard hook for Cursor (SBS-1059) ----
+
+export type GuardMode = "off" | "observe" | "enforce";
+
+export interface GuardProfile {
+  path: string;
+  installed: boolean;
+  error?: string;
+}
+
+export interface GuardView {
+  cursorMode: GuardMode;
+  cursor?: GuardProfile;
+  events: string[];
+  binary?: string;
+}
+
+export interface GuardPreview {
+  path: string;
+  before: string;
+  after: string;
+  error?: string;
 }

@@ -11,12 +11,17 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
+  agentGuardPreview,
+  agentGuardSetCursorMode,
+  agentGuardView,
   agentPermissionsPreview,
   agentPermissionsSetEnabled,
   agentPermissionsSetRules,
   agentPermissionsView,
 } from "@/lib/api";
 import type {
+  GuardMode,
+  GuardView,
   PermissionAction,
   PermissionRule,
   PermissionsPreview,
@@ -55,9 +60,19 @@ export function AgentPermissionsView() {
   const [preview, setPreview] = useState<PermissionsPreview[] | null>(null);
   const [pattern, setPattern] = useState("");
   const [action, setAction] = useState<PermissionAction>("deny");
+  // The Cursor guard hook (SBS-1059): same rules, enforced by a hook because Cursor has no
+  // settings-level rule list. Loaded beside the policy; absent until it arrives.
+  const [guard, setGuard] = useState<GuardView | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    agentGuardView()
+      .then((g) => {
+        if (!cancelled) setGuard(g);
+      })
+      .catch(() => {
+        // The guard card says "could not load" on its own; the policy still renders.
+      });
     agentPermissionsView()
       .then((v) => {
         if (!cancelled) setData(v);
@@ -117,6 +132,36 @@ export function AgentPermissionsView() {
     const isThere =
       next?.rules.some((r) => r.pattern === p && r.action === action) ?? false;
     if (isThere && !wasThere) setPattern("");
+  }
+
+  async function setCursorMode(mode: GuardMode) {
+    setBusy(true);
+    setError(null);
+    try {
+      setGuard(await agentGuardSetCursorMode(mode));
+    } catch (e) {
+      setError(String(e));
+      try {
+        setGuard(await agentGuardView());
+      } catch {
+        // the first error is the one worth showing
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openGuardPreview(mode: GuardMode) {
+    setBusy(true);
+    setError(null);
+    try {
+      const p = await agentGuardPreview(mode);
+      setPreview(p ? [p] : []);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function openPreview() {
@@ -354,6 +399,99 @@ export function AgentPermissionsView() {
       </div>
 
       <div className="rounded-xl border bg-card p-5">
+        <h2 className="mb-1 text-sm font-medium">Cursor</h2>
+        <p className="mb-3 text-xs text-muted-foreground">
+          Cursor has no settings-level rule list, so Toolport installs a small guard hook
+          into <span className="font-mono">~/.cursor/hooks.json</span> that evaluates the
+          same rules before a shell command runs, an MCP tool is called, or a file is
+          read. <span className="font-mono">Bash(&hellip;)</span> rules guard shell
+          commands, <span className="font-mono">Read(&hellip;)</span> rules guard file
+          reads, <span className="font-mono">mcp__server__tool</span> rules guard MCP
+          tools (Cursor names the tool, not the server, so the server part is not
+          checked); <span className="font-mono">Edit</span> and{" "}
+          <span className="font-mono">WebFetch</span> rules have no Cursor event and do
+          nothing there. &ldquo;Ask first&rdquo; uses Cursor&rsquo;s own confirmation.
+          Every decision is recorded in Agent activity.
+        </p>
+        {guard === null ? (
+          <p className="text-sm text-muted-foreground">Loading&hellip;</p>
+        ) : (
+          <>
+            <div
+              role="radiogroup"
+              aria-label="Cursor guard mode"
+              className="mb-2 flex flex-wrap gap-3 text-sm"
+            >
+              {(
+                [
+                  ["off", "Off", "No hook installed."],
+                  [
+                    "observe",
+                    "Observe",
+                    "Hook installed; every call is recorded with what the rules would decide, but nothing is blocked or asked.",
+                  ],
+                  ["enforce", "Enforce", "Never and Ask first take effect in Cursor."],
+                ] as [GuardMode, string, string][]
+              ).map(([value, label, help]) => (
+                <label key={value} className="flex items-start gap-2" title={help}>
+                  <input
+                    type="radio"
+                    name="cursor-guard-mode"
+                    value={value}
+                    checked={guard.cursorMode === value}
+                    disabled={
+                      busy || preview !== null || (value !== "off" && !guard.binary)
+                    }
+                    aria-label={`Cursor guard ${label}`}
+                    onChange={() => void setCursorMode(value)}
+                    className="mt-1"
+                  />
+                  <span>
+                    <span className="font-medium">{label}</span>
+                    <span className="block text-xs text-muted-foreground">{help}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+            {guard.cursor ? (
+              <p className="mb-2 text-xs text-muted-foreground">
+                <span className="font-mono">{guard.cursor.path}</span>{" "}
+                {guard.cursor.error ? (
+                  <span className="text-destructive">&mdash; {guard.cursor.error}</span>
+                ) : guard.cursor.installed ? (
+                  <span className="text-success">&mdash; guard installed</span>
+                ) : (
+                  <span>&mdash; no guard installed</span>
+                )}
+              </p>
+            ) : (
+              <p className="mb-2 text-xs text-muted-foreground">
+                Cursor&rsquo;s config folder could not be resolved.
+              </p>
+            )}
+            {!guard.binary && (
+              <p className="mb-2 text-xs text-warning">
+                No gateway binary has been published yet, so the hook cannot be installed.
+              </p>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={busy || !guard.binary}
+              onClick={() =>
+                void openGuardPreview(
+                  guard.cursorMode === "off" ? "observe" : guard.cursorMode,
+                )
+              }
+            >
+              <Eye className="size-3.5" />
+              Preview hooks.json
+            </Button>
+          </>
+        )}
+      </div>
+
+      <div className="rounded-xl border bg-card p-5">
         <h2 className="mb-1 text-sm font-medium">Which agents this reaches</h2>
         <ul className="grid gap-1 text-xs text-muted-foreground">
           <li>
@@ -362,11 +500,16 @@ export function AgentPermissionsView() {
             native tool call.
           </li>
           <li>
-            <span className="text-foreground">Cursor, Codex, Gemini CLI</span> &mdash; not
-            yet. Cursor has hooks but no settings-level rule list; Codex uses approval and
-            sandbox settings of a different shape; Gemini CLI is mixed. Toolport says so
-            rather than pretending. The gateway&rsquo;s own approval and destructive-call
-            gates still cover every MCP call from every client.
+            <span className="text-foreground">Cursor</span> &mdash; enforced by the guard
+            hook above for shell commands, file reads and MCP tools, once you set it to
+            Enforce.
+          </li>
+          <li>
+            <span className="text-foreground">Codex, Gemini CLI</span> &mdash; not yet.
+            Codex uses approval and sandbox settings of a different shape; Gemini CLI is
+            mixed. Toolport says so rather than pretending. The gateway&rsquo;s own
+            approval and destructive-call gates still cover every MCP call from every
+            client.
           </li>
         </ul>
       </div>

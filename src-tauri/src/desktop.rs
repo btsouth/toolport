@@ -12,6 +12,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::approval;
+use crate::agent_guard;
 use crate::agent_permissions;
 use crate::approval_broker;
 use crate::audit;
@@ -3281,6 +3282,33 @@ async fn rules_apply() -> Result<rules::RulesView, String> {
         .map_err(|e| e.to_string())?
 }
 
+// --- Guard hook for Cursor (SBS-1059) ----------------------------------------------
+
+#[tauri::command]
+async fn agent_guard_view() -> Result<agent_guard::GuardView, String> {
+    tauri::async_runtime::spawn_blocking(agent_guard::view)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn agent_guard_set_cursor_mode(
+    mode: agent_guard::GuardMode,
+) -> Result<agent_guard::GuardView, String> {
+    tauri::async_runtime::spawn_blocking(move || agent_guard::set_cursor_mode(mode))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn agent_guard_preview(
+    mode: agent_guard::GuardMode,
+) -> Result<Option<agent_guard::GuardPreview>, String> {
+    tauri::async_runtime::spawn_blocking(move || agent_guard::preview(mode))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 // --- Native permission policy for Claude Code (SBS-1058) -------------------------
 //
 // Same shape as the hook sensor: every one of these reads or writes an agent settings
@@ -5566,6 +5594,9 @@ pub fn run() {
             rules_project_preview,
             rules_import_candidates,
             rules_import_file,
+            agent_guard_view,
+            agent_guard_set_cursor_mode,
+            agent_guard_preview,
             agent_permissions_view,
             agent_permissions_set_enabled,
             agent_permissions_set_rules,
@@ -5776,6 +5807,7 @@ pub fn run() {
                 // turned on.
                 hooks::apply_on_startup();
                 agent_permissions::apply_on_startup();
+                agent_guard::apply_on_startup();
 
                 // Stop obsolete gateway processes. Path-based identity on all OS
                 // (SOU-414); not gated on repoint (SOU-306).
