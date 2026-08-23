@@ -77,11 +77,13 @@ export function AgentPermissionsView() {
     };
   }, []);
 
-  async function act(fn: () => Promise<PermissionsViewData>) {
+  /** Run a mutating call; `true` when it succeeded. */
+  async function act(fn: () => Promise<PermissionsViewData>): Promise<boolean> {
     setBusy(true);
     setError(null);
     try {
       setData(await fn());
+      return true;
     } catch (e) {
       setError(String(e));
       // Reseat on what the backend actually did, so a failed write cannot leave the switch
@@ -91,6 +93,7 @@ export function AgentPermissionsView() {
       } catch {
         // the first error is the one worth showing
       }
+      return false;
     } finally {
       setBusy(false);
     }
@@ -104,8 +107,8 @@ export function AgentPermissionsView() {
     if (!data) return;
     const p = pattern.trim();
     if (!p) return;
-    await withRules([...data.rules, { pattern: p, action }]);
-    setPattern("");
+    // Clear the input only once the rule is in; a refused pattern stays put to be fixed.
+    if (await withRules([...data.rules, { pattern: p, action }])) setPattern("");
   }
 
   async function openPreview() {
@@ -269,8 +272,11 @@ export function AgentPermissionsView() {
           </p>
           <div className="flex flex-wrap gap-1.5">
             {data.presets.map((p) => {
+              // A pattern already in the list is never overridden by a preset (your "never" is
+              // not downgraded to a preset's "ask"), so the preset has nothing to add exactly
+              // when every one of its patterns is already present, whatever the action.
               const already = p.rules.every((r) =>
-                data.rules.some((x) => x.pattern === r.pattern && x.action === r.action),
+                data.rules.some((x) => x.pattern === r.pattern),
               );
               return (
                 <Button
@@ -280,7 +286,7 @@ export function AgentPermissionsView() {
                   disabled={busy || already}
                   title={
                     already
-                      ? "Already in the list"
+                      ? "Every pattern in this preset is already in the list"
                       : p.rules
                           .map((r) => `${ACTION_LABEL[r.action]}: ${r.pattern}`)
                           .join("\n")
