@@ -6,6 +6,12 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-08-23
+
+Toolport 1.17.0 brings one permission policy to Claude Code and Cursor, makes
+agent rules project-aware and safe around hand edits, hardens approval and Teams
+trust boundaries, and fixes fresh Codex gateway startup on Omarchy.
+
 ### Security
 
 - **A process that bound the approval broker's endpoint after the app had gone could
@@ -3143,7 +3149,9 @@ driven by the agent on your terms, and supports two more clients.
 - First public release: local MCP gateway and manager with lazy discovery,
   per-agent profiles, the catalog, the tool playground, and the activity log.
 
-[Unreleased]: https://github.com/tsouth89/toolport/compare/v1.6.2...HEAD
+[Unreleased]: https://github.com/tsouth89/toolport/compare/v1.17.0...HEAD
+[1.17.0]: https://github.com/tsouth89/toolport/compare/v1.16.0...v1.17.0
+[1.16.0]: https://github.com/tsouth89/toolport/releases/tag/v1.16.0
 [1.6.2]: https://github.com/tsouth89/toolport/compare/v1.6.1...v1.6.2
 [1.6.1]: https://github.com/tsouth89/toolport/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/tsouth89/toolport/releases/tag/v1.6.0

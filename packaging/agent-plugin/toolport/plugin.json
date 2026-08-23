@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "toolport",
-  "version": "1.16.0",
+  "version": "1.17.0",
   "description": "Every tool. One port. Connects this agent to your local Toolport gateway: every MCP server you set up in Toolport, exposed through a handful of compact meta-tools instead of hundreds of tool definitions (~90% fewer tokens, measured).",
   "author": { "name": "Toolport", "url": "https://toolport.app" },
   "homepage": "https://toolport.app",
