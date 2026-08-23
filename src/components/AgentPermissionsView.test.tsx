@@ -122,6 +122,29 @@ describe("AgentPermissionsView", () => {
     expect(screen.getByLabelText("Rule pattern")).toHaveValue("rm -rf *");
   });
 
+  it("a rule that saved but failed to reach one profile still clears the input and shows the error", async () => {
+    api.agentPermissionsSetRules.mockRejectedValue(
+      new Error(
+        "The policy was saved, but one profile could not be updated: /x/settings.json: not JSON",
+      ),
+    );
+    // The refresh after the error shows the rule in the list (it was saved).
+    api.agentPermissionsView
+      .mockResolvedValueOnce(view())
+      .mockResolvedValueOnce(
+        view({ rules: [{ pattern: "Bash(rm -rf *)", action: "deny" }] }),
+      );
+    render(<AgentPermissionsView />);
+    await screen.findByText(/No rules yet/);
+    await userEvent.type(screen.getByLabelText("Rule pattern"), "Bash(rm -rf *)");
+    await userEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("could not be updated");
+    await waitFor(() => expect(screen.getByLabelText("Rule pattern")).toHaveValue(""));
+    expect(
+      screen.getByRole("button", { name: "Remove rule Bash(rm -rf *)" }),
+    ).toBeInTheDocument();
+  });
+
   it("a preset whose patterns are all present, even under another action, is disabled", async () => {
     api.agentPermissionsView.mockResolvedValue(
       view({

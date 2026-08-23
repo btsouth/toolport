@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { Eye, Plus, ShieldCheck, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/Callout";
@@ -56,10 +56,6 @@ export function AgentPermissionsView() {
   const [pattern, setPattern] = useState("");
   const [action, setAction] = useState<PermissionAction>("deny");
 
-  const refresh = useCallback(async () => {
-    setData(await agentPermissionsView());
-  }, []);
-
   useEffect(() => {
     let cancelled = false;
     agentPermissionsView()
@@ -77,23 +73,30 @@ export function AgentPermissionsView() {
     };
   }, []);
 
-  /** Run a mutating call; `true` when it succeeded. */
-  async function act(fn: () => Promise<PermissionsViewData>): Promise<boolean> {
+  /**
+   * Run a mutating call and return the view it left behind: the call's own result, or,
+   * when it failed, the backend's current state (a failed profile write still saves the
+   * policy, and the rows must show what the files really hold). `null` only when even that
+   * could not be read.
+   */
+  async function act(
+    fn: () => Promise<PermissionsViewData>,
+  ): Promise<PermissionsViewData | null> {
     setBusy(true);
     setError(null);
     try {
-      setData(await fn());
-      return true;
+      const next = await fn();
+      setData(next);
+      return next;
     } catch (e) {
       setError(String(e));
-      // Reseat on what the backend actually did, so a failed write cannot leave the switch
-      // or the list claiming something the files do not hold.
       try {
-        await refresh();
+        const next = await agentPermissionsView();
+        setData(next);
+        return next;
       } catch {
-        // the first error is the one worth showing
+        return null; // the first error is the one worth showing
       }
-      return false;
     } finally {
       setBusy(false);
     }
@@ -107,8 +110,10 @@ export function AgentPermissionsView() {
     if (!data) return;
     const p = pattern.trim();
     if (!p) return;
-    // Clear the input only once the rule is in; a refused pattern stays put to be fixed.
-    if (await withRules([...data.rules, { pattern: p, action }])) setPattern("");
+    // Clear the input once the rule is in the list - including when a profile write failed
+    // after the policy saved - and keep a refused pattern put to be fixed.
+    const next = await withRules([...data.rules, { pattern: p, action }]);
+    if (next?.rules.some((r) => r.pattern === p)) setPattern("");
   }
 
   async function openPreview() {
