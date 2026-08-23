@@ -15169,6 +15169,10 @@ fn main() {
             "toolport-gateway: recovered the Linux session bus at {}",
             bus.display()
         );
+        glog(&format!(
+            "recovered the Linux session bus at {}",
+            bus.display()
+        ));
     }
     // Persist org rate-limit counters across restarts (SOU-340). Safe if dir missing;
     // counters then stay process-local until the first successful bind.
