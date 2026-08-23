@@ -730,7 +730,10 @@ mod tests {
             .unwrap()
             .push(rule("Bash(git push*)", Ask));
         assert_eq!(view_with(&reg_with_leftover, &profiles).profiles[1].state, "stale");
-        apply_to(None, None, &profiles).unwrap();
+        // Put the hand-edited file back to a plain state so the final teardown below is
+        // about our own strings only.
+        std::fs::write(&b, "{}\n").unwrap();
+        apply_to(None, Some(policy2.clone()), &profiles).unwrap();
 
         // Off: exactly ours leaves; the user's own Read(./.env) in `a` stays.
         apply_to(Some(false), None, &profiles).unwrap();
