@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
+import { createHmac } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -289,15 +290,29 @@ async function startApprovalBroker() {
     socket.setEncoding("utf8");
     socket.on("data", (chunk) => {
       buffer += chunk;
-      const newline = buffer.indexOf("\n");
-      if (newline < 0) return;
-      try {
-        const approval = JSON.parse(buffer.slice(0, newline));
-        resolveRequest(approval);
-        socket.end(`${JSON.stringify("approved")}\n`);
-      } catch (error) {
-        rejectRequest(error);
-        socket.destroy();
+      // Line-oriented: the gateway opens with a challenge it expects a proof for
+      // before it will send the request (SBS-867), then sends the request itself.
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) return;
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        try {
+          const message = JSON.parse(line);
+          const nonce = message?.toolportApprovalChallenge;
+          if (typeof nonce === "string") {
+            const proof = createHmac("sha256", approvalToken).update(nonce).digest("hex");
+            socket.write(`${JSON.stringify({ toolportApprovalProof: proof })}\n`);
+            continue;
+          }
+          resolveRequest(message);
+          socket.end(`${JSON.stringify("approved")}\n`);
+          return;
+        } catch (error) {
+          rejectRequest(error);
+          socket.destroy();
+          return;
+        }
       }
     });
     socket.once("error", rejectRequest);
