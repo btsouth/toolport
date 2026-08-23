@@ -55,6 +55,21 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Added
 
+- **Agent permissions: the same rules now reach Cursor, through a guard hook.** Cursor has
+  hooks but no settings-level rule list, so Toolport installs a small guard into
+  `~/.cursor/hooks.json` that runs `toolport-gateway --toolport-guard cursor` before a
+  shell command runs, an MCP tool is called, or a file is read, and answers allow / deny /
+  ask from the permission rules you already wrote - `Bash(...)` for shell commands,
+  `Read(...)` for file reads, `mcp__server__tool` for MCP tools, with Claude Code's
+  matching semantics (wildcards, the word-boundary trailing ` *`, compound commands
+  judged per part, wrappers stripped). Three modes: Off (default), Observe (installed,
+  every call recorded in Agent activity with what the rules would have decided, nothing
+  blocked) and Enforce (Never and Ask first take effect; Ask uses Cursor's own prompt;
+  the hook is installed fail-closed). Only Toolport's own entries are ever added or
+  removed; a Preview shows the bytes first. `Edit` / `WebFetch` rules have no Cursor
+  event and the tab says so. See
+  [docs/agent-permissions.md](docs/agent-permissions.md#cursor). (SBS-1059)
+
 - **Agent permissions: rules Claude Code enforces on its own native tool calls.** A new
   Agent permissions tab holds a policy in Claude Code's own rule syntax (`Bash(rm -rf *)`,
   `Read(./.env)`, `WebFetch(domain:...)`, `mcp__server__tool`, each set to never / ask
