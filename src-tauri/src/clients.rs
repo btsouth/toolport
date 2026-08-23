@@ -831,9 +831,10 @@ fn resolve_rules_target(
     };
     let target = match client_id {
         // Strategy A — Toolport owns a whole file in the client's rules DIRECTORY.
-        // Claude Code's `~/.claude/rules/` is also read by VS Code Copilot (Claude-compat
-        // paths), so both map here; path-dedup writes it once when both are installed and a
-        // standalone VS Code install is still covered.
+        // Claude Code's `~/.claude/rules/` is also read by VS Code: its custom-instructions
+        // docs list "User profile: ~/.copilot/instructions or ~/.claude/rules" as a user-level
+        // location (verified 2026-08-22, SBS-916), so both map here; path-dedup writes it once
+        // when both are installed and a standalone VS Code install is still covered.
         "claude-code" | "vscode" => owned(home.join(".claude").join("rules")),
         "kiro" => owned(home.join(".kiro").join("steering")),
         "roo-code" => owned(home.join(".roo").join("rules")),

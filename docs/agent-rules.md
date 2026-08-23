@@ -72,12 +72,12 @@ they use the roaming config directory.
 Where two clients share a file, Toolport writes it once. Both are covered even if
 only one is installed.
 
-The VS Code row resolves to Claude Code's rules directory, which is what Toolport
-has always done for team instructions. That covers a VS Code install running a
-Claude-compatible extension. It is **not** a claim that GitHub Copilot Chat reads
-that directory: Copilot's own instruction files are `.github/copilot-instructions.md`
-and repo-level `AGENTS.md`, which Toolport does not write. If Copilot is your only
-assistant in VS Code, paste the rules into its own file.
+The VS Code row resolves to Claude Code's rules directory because VS Code reads it:
+its [custom instructions documentation](https://code.visualstudio.com/docs/copilot/customization/custom-instructions)
+lists `~/.claude/rules` (alongside `~/.copilot/instructions`) as a user-profile
+instructions location, and `~/.claude/CLAUDE.md` as personal instructions across all
+projects. So the file Toolport writes there reaches GitHub Copilot Chat as well as the
+Claude Code extension, and one write covers both when both are installed.
 
 ### Clients with no rules file Toolport can write
 
