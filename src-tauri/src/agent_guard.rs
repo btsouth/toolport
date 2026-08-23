@@ -181,12 +181,13 @@ fn split_compound(command: &str) -> Vec<String> {
             continue;
         }
         let two: String = chars[i..(i + 2).min(chars.len())].iter().collect();
-        if two == "&&" || two == "||" {
+        if two == "&&" || two == "||" || two == "|&" {
             parts.push(std::mem::take(&mut cur));
             i += 2;
             continue;
         }
-        if c == ';' || c == '|' || c == '\n' {
+        // `;`, a pipe, a newline, and a lone `&` (background) all start a new command.
+        if c == ';' || c == '|' || c == '\n' || c == '&' {
             parts.push(std::mem::take(&mut cur));
             i += 1;
             continue;
@@ -209,9 +210,10 @@ fn split_compound(command: &str) -> Vec<String> {
 /// not expect. When a wrapper's shape is not understood the command is left as it is.
 fn strip_wrappers(command: &str) -> String {
     let mut words: Vec<&str> = command.split_whitespace().collect();
-    loop {
-        let Some(&first) = words.first() else { break };
-        match first {
+    while let Some(&first) = words.first() {
+        // `/usr/bin/timeout` is `timeout`: a wrapper named by path is still that wrapper.
+        let name = first.rsplit('/').next().unwrap_or(first);
+        match name {
             "nohup" => {
                 words.remove(0);
             }
@@ -292,19 +294,49 @@ fn bash_spec_matches(spec: &str, command: &str) -> bool {
 
 fn resolve_read_spec(spec: &str, root: Option<&str>, home: Option<&str>) -> String {
     let spec = spec.replace('\\', "/");
-    if let Some(rest) = spec.strip_prefix("~/") {
-        return format!("{}/{}", home.unwrap_or("~").trim_end_matches('/'), rest);
+    let resolved = if let Some(rest) = spec.strip_prefix("~/") {
+        format!("{}/{}", home.unwrap_or("~").trim_end_matches('/'), rest)
+    } else if let Some(rest) = spec.strip_prefix("//") {
+        format!("/{rest}")
+    } else if spec.starts_with('/') {
+        spec
+    } else {
+        let rel = spec.strip_prefix("./").unwrap_or(&spec);
+        match root {
+            Some(r) => format!("{}/{}", r.trim_end_matches('/').replace('\\', "/"), rel),
+            None => rel.to_string(),
+        }
+    };
+    normalize_path(&resolved)
+}
+
+/// Lexical normalisation so two spellings of one file compare equal: backslashes to
+/// slashes, `.` and doubled slashes dropped, `..` folded, and on the case-insensitive
+/// filesystems (macOS, Windows) everything lower-cased. A path that reaches a denied file
+/// through `..` or a different case must not slip past the rule.
+fn normalize_path(path: &str) -> String {
+    let p = path.replace('\\', "/");
+    let absolute = p.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if out.last().is_some_and(|s| *s != "..") {
+                    out.pop();
+                } else if !absolute {
+                    out.push("..");
+                }
+            }
+            s => out.push(s),
+        }
     }
-    if let Some(rest) = spec.strip_prefix("//") {
-        return format!("/{rest}");
-    }
-    if spec.starts_with('/') {
-        return spec;
-    }
-    let rel = spec.strip_prefix("./").unwrap_or(&spec);
-    match root {
-        Some(r) => format!("{}/{}", r.trim_end_matches('/').replace('\\', "/"), rel),
-        None => rel.to_string(),
+    let joined = out.join("/");
+    let joined = if absolute { format!("/{joined}") } else { joined };
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        joined.to_lowercase()
+    } else {
+        joined
     }
 }
 
@@ -338,7 +370,7 @@ fn rule_matches(rule: &PermissionRule, subject: &Subject) -> bool {
             }
             let Some(spec) = spec else { return true };
             let want = resolve_read_spec(spec, *root, *home);
-            let have = path.replace('\\', "/");
+            let have = normalize_path(path);
             path_glob_match(&want, &have)
         }
         Subject::Mcp { tool: name } => {
@@ -878,6 +910,11 @@ mod tests {
         assert!(hit(&deny("Bash(rm -rf *)"), "time -p nohup rm -rf x"));
         // A wrapper whose own name is denied is still denied as written.
         assert!(hit(&deny("Bash(timeout *)"), "timeout 5 ls"));
+        // Background `&`, `|&`, and a wrapper named by path are all seen through.
+        assert!(hit(&deny("Bash(rm -rf *)"), "sleep 1 & rm -rf x"));
+        assert!(hit(&deny("Bash(rm -rf *)"), "ls |& rm -rf x"));
+        assert!(hit(&deny("Bash(rm -rf *)"), "/usr/bin/timeout 5 rm -rf x"));
+        assert!(hit(&deny("Bash(rm -rf *)"), "/usr/bin/nice -n 5 /usr/bin/nohup rm -rf x"));
         assert!(!hit(&deny("Bash(rm -rf *)"), "echo 'rm -rf' && ls"), "quoted operators do not split; the echo is not rm");
         // Allow covers a compound only when every part is allowed.
         let allow = vec![rule("Bash(npm *)", Allow)];
@@ -909,6 +946,13 @@ mod tests {
         assert!(hit(&deny("Read(src/**/*.key)"), "/work/repo/src/c.key"), "`**/` also matches zero directories");
         assert!(!hit(&deny("Read(src/*.key)"), "/work/repo/src/a/c.key"), "`*` stays in one segment");
         assert!(hit(&deny("Read(//etc/passwd)"), "/etc/passwd"));
+        // Lexically equivalent spellings reach the same rule.
+        assert!(hit(&deny("Read(~/.ssh/**)"), "/home/u/proj/../.ssh/id_ed25519"));
+        assert!(hit(&deny("Read(./.env)"), "/work/repo/./sub/..//.env"));
+        assert!(hit(&deny("Read(~/.ssh/**)"), "/home/u/.ssh/./keys/../id_rsa"));
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            assert!(hit(&deny("Read(~/.ssh/**)"), "/home/u/.SSH/ID_RSA"));
+        }
         assert!(hit(&deny("Read"), "/anything"));
         assert!(!hit(&deny("Bash(cat *)"), "/work/repo/.env"));
     }
