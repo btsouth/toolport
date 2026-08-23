@@ -124,6 +124,15 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **Linux gateways launched without the desktop session environment can reach the
+  Secret Service again.** Orca and some AI clients start MCP children with only
+  `HOME` and `USER`; on Omarchy that left the gateway without a D-Bus address, so
+  vaulted servers such as Linear appeared in the cached catalog but every call failed
+  with `no route for tool`. When the address is absent, the gateway now recovers the
+  current user's standard systemd session bus after verifying the runtime directory
+  and Unix socket are owned by that user. Explicit environment values are left alone.
+  (SBS-1060)
+
 - **Team Instructions: losing a write race no longer deletes the winner's block.** When
   the team changed or was cleared while an apply was writing its files, the apply that
   lost the compare-and-set removed every file it had just written. If the apply that won

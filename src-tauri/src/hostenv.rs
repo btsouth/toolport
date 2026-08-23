@@ -47,6 +47,84 @@
 
 use std::process::Command;
 
+#[cfg(target_os = "linux")]
+use std::ffi::OsStr;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+#[cfg(target_os = "linux")]
+use std::path::{Path, PathBuf};
+
+/// Restore the standard per-user D-Bus address when a terminal or agent launcher
+/// stripped the desktop session environment.
+///
+/// systemd-logind creates `/run/user/<uid>` and its `bus` socket on Omarchy and
+/// other systemd Linux desktops. Some AI clients launch MCP children with only
+/// `HOME` and `USER`; Secret Service then attempts X11 autolaunch, which is disabled
+/// on Wayland, and every vaulted server disappears from the live router. Recover only
+/// the current user's owned runtime directory and owned Unix socket. An explicit
+/// `DBUS_SESSION_BUS_ADDRESS` is authoritative and is never replaced.
+#[cfg(target_os = "linux")]
+pub fn restore_session_bus_env() -> Option<PathBuf> {
+    let dbus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR");
+    let uid = effective_uid();
+    let (runtime_dir, bus) = session_bus_candidate(
+        dbus.as_deref(),
+        runtime.as_deref(),
+        uid,
+        Path::new("/run/user"),
+    )?;
+
+    if runtime.as_ref().map_or(true, |v| v.is_empty()) {
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+    }
+    std::env::set_var(
+        "DBUS_SESSION_BUS_ADDRESS",
+        format!("unix:path={}", bus.to_str()?),
+    );
+    Some(bus)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn restore_session_bus_env() -> Option<std::path::PathBuf> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn effective_uid() -> u32 {
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    // SAFETY: geteuid takes no arguments and has no failure mode.
+    unsafe { geteuid() }
+}
+
+#[cfg(target_os = "linux")]
+fn session_bus_candidate(
+    dbus: Option<&OsStr>,
+    runtime: Option<&OsStr>,
+    uid: u32,
+    runtime_root: &Path,
+) -> Option<(PathBuf, PathBuf)> {
+    if dbus.is_some_and(|value| !value.is_empty()) {
+        return None;
+    }
+    let runtime_dir = runtime
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_root.join(uid.to_string()));
+    let runtime_meta = std::fs::symlink_metadata(&runtime_dir).ok()?;
+    if !runtime_meta.file_type().is_dir() || runtime_meta.uid() != uid {
+        return None;
+    }
+    let bus = runtime_dir.join("bus");
+    let bus_meta = std::fs::symlink_metadata(&bus).ok()?;
+    if !bus_meta.file_type().is_socket() || bus_meta.uid() != uid {
+        return None;
+    }
+    Some((runtime_dir, bus))
+}
+
 /// Every variable `AppRun.wrapped` and `apprun-hooks/linuxdeploy-plugin-gtk.sh`
 /// export, minus the two handled specially below (`XDG_DATA_DIRS`, which is
 /// prepended to rather than replaced, and `PATH`, see the module docs).
@@ -190,5 +268,66 @@ mod tests {
             std::env::set_var("APPDIR", v);
         }
         assert!(empty, "nothing should be changed outside an AppImage");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovers_an_owned_systemd_session_bus_from_a_stripped_environment() {
+        use std::os::unix::net::UnixListener;
+
+        let dir =
+            std::env::temp_dir().join(format!("toolport-hostenv-recover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let runtime = dir.join(effective_uid().to_string());
+        std::fs::create_dir(&runtime).unwrap();
+        let bus = runtime.join("bus");
+        let _listener = UnixListener::bind(&bus).unwrap();
+
+        assert_eq!(
+            session_bus_candidate(None, None, effective_uid(), &dir),
+            Some((runtime, bus))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn never_replaces_an_explicit_bus_or_trusts_an_unsafe_candidate() {
+        use std::os::unix::net::UnixListener;
+
+        let dir =
+            std::env::temp_dir().join(format!("toolport-hostenv-unsafe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let runtime = dir.join(effective_uid().to_string());
+        std::fs::create_dir(&runtime).unwrap();
+        let bus = runtime.join("bus");
+        let listener = UnixListener::bind(&bus).unwrap();
+
+        assert_eq!(
+            session_bus_candidate(
+                Some(OsStr::new("unix:path=/explicit/bus")),
+                Some(runtime.as_os_str()),
+                effective_uid(),
+                &dir,
+            ),
+            None
+        );
+        assert_eq!(
+            session_bus_candidate(None, Some(runtime.as_os_str()), effective_uid() + 1, &dir),
+            None,
+            "a runtime directory owned by another uid is not trusted"
+        );
+
+        drop(listener);
+        std::fs::remove_file(&bus).unwrap();
+        std::fs::write(&bus, "not a socket").unwrap();
+        assert_eq!(
+            session_bus_candidate(None, Some(runtime.as_os_str()), effective_uid(), &dir),
+            None,
+            "a regular file named bus is not trusted"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
