@@ -145,6 +145,21 @@ describe("AgentPermissionsView", () => {
     ).toBeInTheDocument();
   });
 
+  it("a refused duplicate keeps the typed pattern even though the list already has it", async () => {
+    api.agentPermissionsView.mockResolvedValue(
+      view({ rules: [{ pattern: "Bash(rm -rf *)", action: "deny" }] }),
+    );
+    api.agentPermissionsSetRules.mockRejectedValue(
+      new Error('"Bash(rm -rf *)" appears more than once. A pattern maps to one action.'),
+    );
+    render(<AgentPermissionsView />);
+    await screen.findByRole("button", { name: "Remove rule Bash(rm -rf *)" });
+    await userEvent.type(screen.getByLabelText("Rule pattern"), "Bash(rm -rf *)");
+    await userEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("more than once");
+    expect(screen.getByLabelText("Rule pattern")).toHaveValue("Bash(rm -rf *)");
+  });
+
   it("a preset whose patterns are all present, even under another action, is disabled", async () => {
     api.agentPermissionsView.mockResolvedValue(
       view({

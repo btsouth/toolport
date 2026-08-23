@@ -112,8 +112,11 @@ export function AgentPermissionsView() {
     if (!p) return;
     // Clear the input once the rule is in the list - including when a profile write failed
     // after the policy saved - and keep a refused pattern put to be fixed.
+    const wasThere = data.rules.some((r) => r.pattern === p);
     const next = await withRules([...data.rules, { pattern: p, action }]);
-    if (next?.rules.some((r) => r.pattern === p)) setPattern("");
+    const isThere =
+      next?.rules.some((r) => r.pattern === p && r.action === action) ?? false;
+    if (isThere && !wasThere) setPattern("");
   }
 
   async function openPreview() {
