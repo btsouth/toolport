@@ -28,10 +28,17 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EndpointDescriptor {
-    /// The address a gateway connects to: `127.0.0.1:PORT` for loopback TCP, or
-    /// `unix:/absolute/path` for a Unix domain socket (see [`UNIX_ENDPOINT_PREFIX`]).
-    /// Opaque to policy; [`BrokerStream::connect`] understands both.
+    /// The loopback TCP address a gateway connects to (`127.0.0.1:PORT`). Always present,
+    /// so a gateway from before [`Self::unix_endpoint`] existed - which reads only this field
+    /// and dials only TCP - still finds the broker.
     pub endpoint: String,
+    /// On Unix, the broker's socket file as well (`unix:/absolute/path`, see
+    /// [`UNIX_ENDPOINT_PREFIX`]). A gateway that knows the field prefers it and falls back to
+    /// `endpoint` if the connect fails. Additive and optional on purpose: long-lived
+    /// client-spawned gateways outlive app updates, and one that predates this field must not
+    /// be cut off from the broker by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix_endpoint: Option<String>,
     /// A random token both sides hold. The gateway presents it in every request, and the
     /// broker proves it holds it before the gateway sends anything (see [`dial_broker`]).
     /// Defense-in-depth over the local-user filesystem trust boundary: only a process that
@@ -225,9 +232,10 @@ pub fn fingerprint_allow_key(server: &str, tool: &str, fingerprint: &str) -> Str
 // random nonce; the broker answers with HMAC-SHA256(token, nonce); the gateway verifies that
 // against the token in the descriptor it read, and only then sends the request. A peer that
 // cannot read the descriptor cannot produce the proof, so it never sees the request and its
-// decision is never read. Unix additionally moves the listener off loopback TCP onto a
-// socket file in a 0700 directory, so such a peer cannot connect at all; the challenge still
-// runs there, so the guarantee does not depend on which transport was chosen.
+// decision is never read. On Unix the broker additionally listens on a socket file in a 0700
+// directory, which a current gateway prefers, so such a peer cannot even connect on that
+// path; the loopback listener stays for gateways that predate the field, and the challenge
+// runs on both, so the guarantee does not depend on which transport was chosen.
 //
 // Out of scope, on purpose: a process running as the SAME user as Toolport. It can read the
 // descriptor and registry.json alike, so it can answer the challenge - and it can switch
@@ -393,7 +401,14 @@ pub fn dial_broker(desc: &EndpointDescriptor) -> io::Result<BrokerStream> {
     getrandom::getrandom(&mut nonce).map_err(|_| io::Error::other("CSPRNG unavailable"))?;
     let nonce = hex(&nonce);
 
-    let mut stream = BrokerStream::connect(&desc.endpoint)?;
+    // Prefer the socket file when the broker published one; a connect failure there (stale
+    // path, or a platform without it) falls back to the loopback address. The challenge below
+    // protects both the same way, so the fallback changes nothing about the guarantee.
+    let mut stream = match desc.unix_endpoint.as_deref() {
+        Some(unix) => BrokerStream::connect(unix)
+            .or_else(|_| BrokerStream::connect(&desc.endpoint))?,
+        None => BrokerStream::connect(&desc.endpoint)?,
+    };
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let challenge = serde_json::to_string(&BrokerChallenge {
@@ -539,11 +554,31 @@ mod tests {
         let d = EndpointDescriptor {
             endpoint: "127.0.0.1:8790".into(),
             token: "s3cret".into(),
+            unix_endpoint: None,
         };
-        let round: EndpointDescriptor =
-            serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(
+            !json.contains("unixEndpoint"),
+            "an absent socket file is not written, so the shape an older gateway parses is byte-identical to before: {json}"
+        );
+        let round: EndpointDescriptor = serde_json::from_str(&json).unwrap();
         assert_eq!(round.endpoint, "127.0.0.1:8790");
         assert_eq!(round.token, "s3cret");
+        assert_eq!(round.unix_endpoint, None);
+
+        // A descriptor an older app wrote (no socket field) still parses, and one with the
+        // field round-trips.
+        let legacy: EndpointDescriptor =
+            serde_json::from_str(r#"{"endpoint":"127.0.0.1:1","token":"t"}"#).unwrap();
+        assert_eq!(legacy.unix_endpoint, None);
+        let with_unix = EndpointDescriptor {
+            endpoint: "127.0.0.1:8790".into(),
+            token: "s3cret".into(),
+            unix_endpoint: Some("unix:/tmp/x/approval.sock".into()),
+        };
+        let round: EndpointDescriptor =
+            serde_json::from_str(&serde_json::to_string(&with_unix).unwrap()).unwrap();
+        assert_eq!(round.unix_endpoint.as_deref(), Some("unix:/tmp/x/approval.sock"));
     }
 
     #[test]
@@ -626,6 +661,7 @@ mod tests {
         EndpointDescriptor {
             endpoint,
             token: token.into(),
+            unix_endpoint: None,
         }
     }
 
@@ -726,10 +762,28 @@ mod tests {
             stream.write_all(proof.as_bytes()).unwrap();
             stream.write_all(b"\n").unwrap();
         });
-        let endpoint = format!("{UNIX_ENDPOINT_PREFIX}{}", path.display());
-        let stream = dial_broker(&desc(endpoint, "tok")).expect("uds broker passes");
+        // The socket file is preferred over the loopback address when both are published;
+        // port 1 would refuse, so reaching Ok proves the unix path was taken.
+        let mut d = desc("127.0.0.1:1".into(), "tok");
+        d.unix_endpoint = Some(format!("{UNIX_ENDPOINT_PREFIX}{}", path.display()));
+        let stream = dial_broker(&d).expect("uds broker passes");
         assert!(matches!(stream, BrokerStream::Unix(_)));
         drop(stream);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dial_falls_back_to_loopback_when_the_socket_file_is_gone() {
+        let (endpoint, _seen) = scripted_peer(|line| {
+            answer_challenge(line.as_bytes(), "tok").unwrap_or_default()
+        });
+        let mut d = desc(endpoint, "tok");
+        d.unix_endpoint = Some(format!(
+            "{UNIX_ENDPOINT_PREFIX}/nonexistent/toolport-{}/approval.sock",
+            std::process::id()
+        ));
+        let stream = dial_broker(&d).expect("falls back to the loopback listener");
+        assert!(matches!(stream, BrokerStream::Tcp(_)));
     }
 }

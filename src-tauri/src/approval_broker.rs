@@ -6,9 +6,10 @@
 //! do not hold a gateway request. This is the counterpart to the gateway's
 //! `request_human_decision` (see `bin/toolport-gateway.rs`).
 //!
-//! Protocol: the gateway connects (a socket file in a private directory on Unix, loopback
-//! TCP on Windows), opens with a challenge the broker must answer with a proof of the
-//! shared token ([`crate::approval::dial_broker`]), then sends one JSON line
+//! Protocol: the gateway connects (loopback TCP everywhere; on Unix a socket file in a
+//! private directory is published as well and preferred by gateways that know of it),
+//! opens with a challenge the broker must answer with a proof of the shared token
+//! ([`crate::approval::dial_broker`]), then sends one JSON line
 //! ([`ApprovalRequest`]) carrying that token, and reads one JSON line back
 //! ([`ApprovalDecision`]). Arguments travel over the socket and are never written to
 //! disk. The only thing on disk is the endpoint descriptor (address + token). The
@@ -352,12 +353,13 @@ pub fn start(app: AppHandle) -> ApprovalBroker {
         }),
     };
 
-    match bind_listener() {
-        Some((listener, endpoint)) => {
+    match bind_listeners() {
+        Some(bound) => {
             if let Some(dir) = crate::registry::conduit_dir() {
                 let desc = EndpointDescriptor {
-                    endpoint: endpoint.clone(),
+                    endpoint: bound.endpoint.clone(),
                     token,
+                    unix_endpoint: bound.unix_endpoint.clone(),
                 };
                 let path = dir.join(ENDPOINT_FILE);
                 // A stale descriptor (app crashed) points at a dead endpoint, so a gateway
@@ -381,7 +383,13 @@ pub fn start(app: AppHandle) -> ApprovalBroker {
                 // instead of a multi-hour hunt - it was the root cause of a live
                 // "HITL blocks every call but no prompt appears" incident.
                 log_broker_event(&format!(
-                    "bound {endpoint}; endpoint published at {}",
+                    "bound {}{}; endpoint published at {}",
+                    bound.endpoint,
+                    bound
+                        .unix_endpoint
+                        .as_deref()
+                        .map(|u| format!(" and {u}"))
+                        .unwrap_or_default(),
                     path.display()
                 ));
             } else {
@@ -389,41 +397,72 @@ pub fn start(app: AppHandle) -> ApprovalBroker {
                     "conduit_dir() unavailable; endpoint NOT published (HITL fails closed)",
                 );
             }
-            let accept_broker = broker.clone();
-            std::thread::spawn(move || {
-                let active_workers = Arc::new(AtomicUsize::new(0));
-                loop {
-                    let conn = match listener.accept() {
-                        Ok(conn) => conn,
-                        Err(_) => {
-                            // Transient (EMFILE, EINTR): don't spin flat out on it.
-                            std::thread::sleep(Duration::from_millis(20));
-                            continue;
-                        }
-                    };
-                    let Some(permit) = try_acquire_connection(&active_workers) else {
-                        // Closing immediately is fail-closed and keeps a slow or
-                        // stalled peer from consuming an unbounded thread count.
-                        drop(conn);
-                        continue;
-                    };
-                    let b = accept_broker.clone();
-                    let a = app.clone();
-                    let _ = std::thread::Builder::new()
-                        .name("toolport-approval".into())
-                        .spawn(move || {
-                            let _permit = permit;
-                            handle_conn(conn, b, a);
-                        });
-                }
-            });
+            // One worker budget across every listener: the cap is on concurrent
+            // connections, not per transport.
+            let active_workers = Arc::new(AtomicUsize::new(0));
+            for listener in bound.listeners {
+                let b = broker.clone();
+                let a = app.clone();
+                let workers = Arc::clone(&active_workers);
+                std::thread::spawn(move || accept_loop(listener, b, a, workers));
+            }
         }
-        None => { /* inert broker; HITL never fires, gateways fail-closed */ }
+        None => {
+            // Inert broker: HITL never fires and every gateway fails closed. Say so in
+            // the log, since "no prompt ever appears" is otherwise a silent mystery.
+            log_broker_event(
+                "could not bind a loopback listener; HITL fails closed until restart",
+            );
+        }
     }
     broker
 }
 
-/// The listener the broker accepts on, over whichever transport [`bind_listener`] got.
+/// Accept on one listener until it errors out for good, handing each connection to a
+/// bounded worker. Shared across transports through `active_workers`.
+fn accept_loop(
+    listener: Listener,
+    broker: ApprovalBroker,
+    app: AppHandle,
+    active_workers: Arc<AtomicUsize>,
+) {
+    loop {
+        let conn = match listener.accept() {
+            Ok(conn) => conn,
+            Err(_) => {
+                // Transient (EMFILE, EINTR): don't spin flat out on it.
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+        };
+        let Some(permit) = try_acquire_connection(&active_workers) else {
+            // Closing immediately is fail-closed and keeps a slow or
+            // stalled peer from consuming an unbounded thread count.
+            drop(conn);
+            continue;
+        };
+        let b = broker.clone();
+        let a = app.clone();
+        let _ = std::thread::Builder::new()
+            .name("toolport-approval".into())
+            .spawn(move || {
+                let _permit = permit;
+                handle_conn(conn, b, a);
+            });
+    }
+}
+
+/// What [`bind_listeners`] got: every listener to accept on, plus the endpoint strings to
+/// publish for each.
+struct Bound {
+    listeners: Vec<Listener>,
+    /// Loopback TCP, always. The field a pre-socket gateway reads.
+    endpoint: String,
+    /// The socket file, on Unix when it could be had.
+    unix_endpoint: Option<String>,
+}
+
+/// The listener the broker accepts on, for one transport.
 enum Listener {
     Tcp(TcpListener),
     #[cfg(unix)]
@@ -452,22 +491,34 @@ fn unix_socket_path() -> Option<std::path::PathBuf> {
     )
 }
 
-/// Bind the broker's listener and return it with the endpoint string to publish. Unix
-/// prefers a socket file in a private directory and falls back to loopback TCP if that
-/// cannot be had (data dir unavailable, or a path too long for `sun_path`); the challenge
-/// in [`crate::approval::dial_broker`] protects both equally, so the fallback loses defense
-/// in depth, not the guarantee. Windows is loopback TCP.
-fn bind_listener() -> Option<(Listener, String)> {
+/// Bind the broker's listeners. Loopback TCP is required and always published as
+/// `endpoint`: gateways that predate the socket field read only that, and long-lived
+/// client-spawned gateways outlive app updates, so dropping it would cut them off from
+/// approvals until their client restarts them. On Unix a socket file in a private directory
+/// is bound as well and published as `unix_endpoint`, which current gateways prefer; if it
+/// cannot be had (data dir unavailable, or a path too long for `sun_path`) the broker is
+/// TCP-only, which loses defense in depth, not the guarantee - the challenge in
+/// [`crate::approval::dial_broker`] protects both the same way. Windows is TCP-only.
+fn bind_listeners() -> Option<Bound> {
+    let tcp = TcpListener::bind(("127.0.0.1", 0)).ok()?;
+    let port = tcp.local_addr().ok()?.port();
+    let mut listeners = vec![Listener::Tcp(tcp)];
+    let mut unix_endpoint = None;
     #[cfg(unix)]
     match bind_unix_listener() {
-        Ok(bound) => return Some(bound),
+        Ok((listener, endpoint)) => {
+            listeners.push(listener);
+            unix_endpoint = Some(endpoint);
+        }
         Err(e) => log_broker_event(&format!(
-            "unix socket unavailable ({e}); falling back to loopback TCP"
+            "unix socket unavailable ({e}); loopback TCP only"
         )),
     }
-    let listener = TcpListener::bind(("127.0.0.1", 0)).ok()?;
-    let port = listener.local_addr().ok()?.port();
-    Some((Listener::Tcp(listener), format!("127.0.0.1:{port}")))
+    Some(Bound {
+        listeners,
+        endpoint: format!("127.0.0.1:{port}"),
+        unix_endpoint,
+    })
 }
 
 #[cfg(unix)]

@@ -15812,6 +15812,7 @@ mod tests {
             serde_json::to_string(&approval::EndpointDescriptor {
                 endpoint,
                 token: "stub-broker-token".to_string(),
+                unix_endpoint: None,
             })
             .expect("a serializable descriptor"),
         )
@@ -17313,6 +17314,7 @@ mod tests {
         let bad = Some(approval::EndpointDescriptor {
             endpoint: "127.0.0.1:1".into(),
             token: "t".into(),
+            unix_endpoint: None,
         });
         let d = decide_via_broker(bad, &mut r);
         assert!(!d.is_approved());
@@ -17359,6 +17361,7 @@ mod tests {
         let desc = Some(approval::EndpointDescriptor {
             endpoint,
             token: "the-real-token".into(),
+            unix_endpoint: None,
         });
         let d = decide_via_broker(desc, &mut req);
         assert_eq!(d, approval::ApprovalDecision::Unreachable);
@@ -19911,6 +19914,7 @@ mod tests {
         let descriptor = approval::EndpointDescriptor {
             endpoint,
             token: "routine-approval-token".to_string(),
+            unix_endpoint: None,
         };
         registry::atomic_write(
             &dir.join(approval::ENDPOINT_FILE),

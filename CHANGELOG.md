@@ -20,10 +20,11 @@ Entries before the rename below shipped under the project's former name, Conduit
   a peer that cannot read the owner-only descriptor cannot produce it, so it sees no
   request and its answer is never read. The failure is reported as `unreachable`, so a
   restarted app is still found on the re-read, and it is still fail-closed. On Unix the
-  broker also moves off loopback TCP onto a socket file in a `0700` directory under the
-  data dir, so such a peer cannot connect at all (loopback TCP remains as the fallback
-  and on Windows; the challenge protects both). A gateway from before this change is
-  still answered by the new broker. (SBS-867)
+  broker also listens on a socket file in a `0700` directory under the data dir, which
+  a current gateway prefers, so such a peer cannot even connect on that path; the
+  loopback listener stays (and is all there is on Windows), and the challenge protects
+  both the same way. A gateway from before this change still reads only the loopback
+  address, still reaches the broker, and is still answered. (SBS-867)
 
   What this does not claim: a process running as the same user as Toolport can read
   the descriptor and `registry.json` alike, and can switch human approval off directly;
