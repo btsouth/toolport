@@ -66,6 +66,14 @@ export function AgentPermissionsView() {
   // The Cursor guard hook (SBS-1059): same rules, enforced by a hook because Cursor has no
   // settings-level rule list. Loaded beside the policy; absent until it arrives.
   const [guard, setGuard] = useState<GuardView | null>(null);
+  const [guardError, setGuardError] = useState<string | null>(null);
+
+  function loadGuard() {
+    setGuardError(null);
+    agentGuardView()
+      .then(setGuard)
+      .catch((e) => setGuardError(String(e)));
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -73,8 +81,8 @@ export function AgentPermissionsView() {
       .then((g) => {
         if (!cancelled) setGuard(g);
       })
-      .catch(() => {
-        // The guard card says "could not load" on its own; the policy still renders.
+      .catch((e) => {
+        if (!cancelled) setGuardError(String(e));
       });
     agentPermissionsView()
       .then((v) => {
@@ -228,7 +236,12 @@ export function AgentPermissionsView() {
           </span>
         </label>
         <div className="mt-3 flex flex-wrap items-center gap-2 border-t pt-3">
-          <Button variant="outline" size="sm" disabled={busy} onClick={openPreview}>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={busy || guardPreview !== null}
+            onClick={openPreview}
+          >
             <Eye className="size-3.5" />
             Preview what would be written
           </Button>
@@ -416,7 +429,14 @@ export function AgentPermissionsView() {
           nothing there. &ldquo;Ask first&rdquo; uses Cursor&rsquo;s own confirmation.
           Every decision is recorded in Agent activity.
         </p>
-        {guard === null ? (
+        {guardError ? (
+          <div className="flex items-center gap-2 text-sm text-destructive">
+            <span>Could not load the Cursor guard: {guardError}</span>
+            <Button variant="outline" size="sm" onClick={loadGuard}>
+              Retry
+            </Button>
+          </div>
+        ) : guard === null ? (
           <p className="text-sm text-muted-foreground">Loading&hellip;</p>
         ) : (
           <>
@@ -483,7 +503,7 @@ export function AgentPermissionsView() {
             <Button
               variant="outline"
               size="sm"
-              disabled={busy || !guard.binary}
+              disabled={busy || !guard.binary || preview !== null}
               onClick={() =>
                 void openGuardPreview(
                   guard.cursorMode === "off" ? "observe" : guard.cursorMode,

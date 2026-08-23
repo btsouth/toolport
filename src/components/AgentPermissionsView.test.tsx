@@ -101,6 +101,16 @@ describe("AgentPermissionsView", () => {
     expect(screen.getByText(/No gateway binary has been published/)).toBeInTheDocument();
   });
 
+  it("shows a Cursor guard load error and retries it", async () => {
+    api.agentGuardView
+      .mockRejectedValueOnce(new Error("registry unavailable"))
+      .mockResolvedValueOnce(guard());
+    render(<AgentPermissionsView />);
+    expect(await screen.findByText(/registry unavailable/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByLabelText("Cursor guard Off")).toBeChecked();
+  });
+
   it("starts off and empty, and adding a rule sends the whole list without writing", async () => {
     api.agentPermissionsSetRules.mockResolvedValue(
       view({ rules: [{ pattern: "Bash(rm -rf *)", action: "deny" }] }),

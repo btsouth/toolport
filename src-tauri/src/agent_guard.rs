@@ -186,8 +186,10 @@ fn split_compound(command: &str) -> Vec<String> {
             i += 2;
             continue;
         }
-        // `;`, a pipe, a newline, and a lone `&` (background) all start a new command.
-        if c == ';' || c == '|' || c == '\n' || c == '&' {
+        // An ampersand next to `>` belongs to a redirection (`2>&1`, `&>`, `>&`).
+        let redirect_ampersand = c == '&'
+            && (i.checked_sub(1).is_some_and(|j| chars[j] == '>') || chars.get(i + 1) == Some(&'>'));
+        if c == ';' || c == '|' || c == '\n' || (c == '&' && !redirect_ampersand) {
             parts.push(std::mem::take(&mut cur));
             i += 1;
             continue;
@@ -212,7 +214,7 @@ fn strip_wrappers(command: &str) -> String {
     let mut words: Vec<&str> = command.split_whitespace().collect();
     while let Some(&first) = words.first() {
         // `/usr/bin/timeout` is `timeout`: a wrapper named by path is still that wrapper.
-        let name = first.rsplit('/').next().unwrap_or(first);
+        let name = first.rsplit(['/', '\\']).next().unwrap_or(first);
         match name {
             "nohup" => {
                 words.remove(0);
@@ -496,18 +498,29 @@ fn cannot_judge(reg: &crate::registry::Registry, why: &str) -> Value {
     }
 }
 
+fn registry_unavailable(why: &str) -> Value {
+    json!({
+        "continue": true,
+        "permission": "deny",
+        "user_message": format!("Toolport: this call was refused because the guard could not load its policy ({why})."),
+        "agent_message": format!("Toolport could not load its permission policy ({why}), so it refused this call. Tell the user."),
+    })
+}
+
 fn handle(agent: &str, stdin: &str, truncated: bool) -> Value {
     if agent != "cursor" {
         crate::gatewaylog::append(&format!("toolport: guard invoked for unknown agent {agent:?}"));
         return allow_response();
     }
-    let reg = match crate::registry::load() {
-        Ok(reg) => reg,
+    let reg = match crate::registry::load_resolved_with_source() {
+        Ok((reg, source)) if source.is_authoritative() => reg,
+        Ok((_reg, source)) => {
+            crate::gatewaylog::append(&format!("toolport: guard registry is not authoritative: {source:?}"));
+            return registry_unavailable("the registry was recovered or unreadable");
+        }
         Err(error) => {
-            // No registry means no mode to read either; the hook would not be installed
-            // without one, so this is a broken install. Say so, stand aside.
             crate::gatewaylog::append(&format!("toolport: guard could not load the registry: {error}"));
-            return allow_response();
+            return registry_unavailable("the registry could not be read");
         }
     };
     // Cursor on Windows is documented to prefix hook stdin with a UTF-8 BOM.
@@ -821,7 +834,7 @@ fn apply_to(
 fn install_at(path: &Path, binary: &Path, enforce: bool) -> Result<(), String> {
     let (root, original) = crate::clients::read_settings_json(path)?;
     let updated = upsert_guard(&root, binary, enforce)?;
-    if updated == root {
+    if updated.get("hooks") == root.get("hooks") {
         return Ok(());
     }
     crate::clients::write_settings_key_for("cursor", path, original.as_deref(), &updated, "hooks")
@@ -914,7 +927,11 @@ mod tests {
         assert!(hit(&deny("Bash(rm -rf *)"), "sleep 1 & rm -rf x"));
         assert!(hit(&deny("Bash(rm -rf *)"), "ls |& rm -rf x"));
         assert!(hit(&deny("Bash(rm -rf *)"), "/usr/bin/timeout 5 rm -rf x"));
+        assert!(hit(&deny("Bash(rm -rf *)"), r"C:\tools\timeout 5 rm -rf x"));
         assert!(hit(&deny("Bash(rm -rf *)"), "/usr/bin/nice -n 5 /usr/bin/nohup rm -rf x"));
+        let allow_redirects = vec![rule("Bash(npm test *)", Allow)];
+        assert_eq!(evaluate(&allow_redirects, &Subject::Shell("npm test 2>&1")).action, Some(Allow));
+        assert_eq!(evaluate(&allow_redirects, &Subject::Shell("npm test &>out.log")).action, Some(Allow));
         assert!(!hit(&deny("Bash(rm -rf *)"), "echo 'rm -rf' && ls"), "quoted operators do not split; the echo is not rm");
         // Allow covers a compound only when every part is allowed.
         let allow = vec![rule("Bash(npm *)", Allow)];
@@ -977,6 +994,7 @@ mod tests {
         assert_eq!(r["continue"], true);
         assert!(r["user_message"].as_str().unwrap().contains("Bash(rm -rf *)"));
         assert!(r["agent_message"].as_str().unwrap().contains("Do not retry"));
+        assert_eq!(registry_unavailable("test failure")["permission"], "deny");
         let r = decision_response(Ask, "Bash(git push*)", "x");
         assert_eq!(r["permission"], "ask");
         assert_eq!(decision_response(Allow, "x", "y"), allow_response());
