@@ -109,9 +109,12 @@ Three modes, chosen in the tab:
   guard itself crashes or times out Cursor blocks the call rather than letting it through.
 
 When no rule matches, the guard answers Cursor's own canonical "proceed" response. When
-the guard cannot judge a call - a payload it does not understand - it answers the same
-and records that it could not, because a guard that breaks your work over its own parse
-error is worse than one that stands aside; in Enforce, `failClosed` still covers a crash.
+the guard cannot judge a call - a payload it does not understand, or one larger than it
+reads (64 MiB; a file read carries the file's content) - it depends on the mode: in
+**Observe** it answers allow and records that it could not judge; in **Enforce** it
+**refuses**, with a message saying why, because an agent must not be able to get a call
+past a rule by making the payload unreadable, and Cursor's `failClosed` would not catch
+a well-formed allow. Cursor's `failClosed` still covers the guard crashing or timing out.
 
 Only entries carrying `--toolport-guard` are ever added to or removed from
 `hooks.json`; your own hooks stay exactly where they are, and the file's formatting is
