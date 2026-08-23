@@ -689,7 +689,19 @@ mod tests {
             let _ = listener.accept(); // accept, then drop immediately
         });
         let err = dial_broker(&desc(endpoint, "tok")).expect_err("a hang-up is an error");
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+        // Whether the OS reports the early close as a clean EOF or as a reset depends on
+        // whether our challenge write had landed when the peer dropped; either way the
+        // caller sees an error, and the caller maps every error to Unreachable.
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+            ),
+            "{err:?}"
+        );
     }
 
     #[cfg(unix)]
