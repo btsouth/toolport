@@ -94,6 +94,12 @@ fixes both.
   file or owns a marked block and leaves every other byte alone, and turning a client
   off removes what it wrote. Each client is off until you turn it on, and a preview
   shows the exact bytes first. See [docs/agent-rules.md](docs/agent-rules.md).
+- **Rules Claude Code enforces itself.** Write a permission policy once - never
+  `rm -rf`, never force-push, ask before any push, never read `.env` - in Claude Code's
+  own rule syntax, and Toolport writes it into every Claude Code profile's
+  `settings.json`, where Claude Code refuses or asks before a matching native tool call
+  on every call, whatever any hook says. Off and empty by default; only what Toolport
+  added is ever removed. See [docs/agent-permissions.md](docs/agent-permissions.md).
 - **Obvious auth.** OAuth or API key, stored once in the OS keychain, a single click per
   server. Newly-authed servers propagate to connected clients without a restart.
 - **No secrets in client configs.** Clients only ever say "talk to Toolport." Keys live

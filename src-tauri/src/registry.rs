@@ -599,6 +599,36 @@ pub struct RuleSet {
     pub revision: i64,
 }
 
+/// What Claude Code should do with a native tool call that matches a rule (SBS-1058). The
+/// names are Claude Code's own `permissions` list names, so a rule maps to one list.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionAction {
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl PermissionAction {
+    /// The key under `permissions` this action writes to.
+    pub fn list_key(self) -> &'static str {
+        match self {
+            PermissionAction::Allow => "allow",
+            PermissionAction::Ask => "ask",
+            PermissionAction::Deny => "deny",
+        }
+    }
+}
+
+/// One native permission rule: a pattern in Claude Code's rule syntax (`Bash(rm -rf *)`,
+/// `Read(./.env)`, `WebFetch(domain:example.com)`, `mcp__server__tool`) and what to do.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRule {
+    pub pattern: String,
+    pub action: PermissionAction,
+}
+
 /// One registered project folder for project-level agent rules (SBS-1037). The consent unit
 /// inside it is a FILE, not a client: at project level nearly every client reads the root
 /// `AGENTS.md`, Gemini reads `GEMINI.md`, Claude Code and VS Code read `.claude/rules/`, so
@@ -957,6 +987,18 @@ pub struct Registry {
     /// written only by an explicit Apply for that project, never at startup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules_projects: Vec<RulesProject>,
+    /// Native permission policy for Claude Code (SBS-1058): rules in Claude Code's own
+    /// `permissions` syntax that Toolport writes into every profile's `settings.json`. Off
+    /// until the user opts in; nothing is written until then. See [`crate::agent_permissions`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_permissions_enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_permission_rules: Vec<PermissionRule>,
+    /// Per settings file, exactly the rule strings Toolport ADDED there (a rule the user
+    /// already had is not added and not recorded, so it is never removed). Removal and
+    /// policy changes strip exactly these. Same role as `hook_targets` / `rules_targets`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub agent_permission_targets: HashMap<String, Vec<PermissionRule>>,
     /// Whether the native-agent hook sensor is installed. OFF until the user opts in:
     /// it writes into a settings file they own and it observes every native tool call
     /// their agent makes. See [`crate::hooks`].
@@ -1228,6 +1270,9 @@ impl Default for Registry {
             rules_clients: HashMap::new(),
             rules_targets: Vec::new(),
             rules_projects: Vec::new(),
+            agent_permissions_enabled: false,
+            agent_permission_rules: Vec::new(),
+            agent_permission_targets: HashMap::new(),
             hooks_enabled: false,
             hook_targets: Vec::new(),
             unknown_fields: serde_json::Map::new(),

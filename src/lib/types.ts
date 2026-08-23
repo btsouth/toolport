@@ -9,6 +9,7 @@ export type View =
   | "playground"
   | "rules"
   | "hooks"
+  | "permissions"
   | "teams"
   | "settings";
 
@@ -740,6 +741,44 @@ export interface HooksView {
   /** Absent when no gateway binary has been published yet, which is the one thing that stops
    *  the sensor being installable. */
   binary?: string;
+}
+
+// ---- Native permission policy for Claude Code (SBS-1058) ----
+
+export type PermissionAction = "allow" | "ask" | "deny";
+
+/** One rule in Claude Code's own syntax (`Bash(rm -rf *)`, `Read(./.env)`, `mcp__server__tool`). */
+export interface PermissionRule {
+  pattern: string;
+  action: PermissionAction;
+}
+
+export interface PermissionProfileStatus {
+  path: string;
+  /** applied | stale | off | error */
+  state: string;
+  /** How many of the policy's rules Toolport itself added to this file. */
+  added: number;
+  error?: string;
+}
+
+export interface PermissionPreset {
+  label: string;
+  rules: PermissionRule[];
+}
+
+export interface PermissionsView {
+  enabled: boolean;
+  rules: PermissionRule[];
+  profiles: PermissionProfileStatus[];
+  presets: PermissionPreset[];
+}
+
+export interface PermissionsPreview {
+  path: string;
+  before: string;
+  after: string;
+  error?: string;
 }
 
 /** A dry run of one profile's write. Nothing is written to produce it. */

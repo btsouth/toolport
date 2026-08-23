@@ -652,10 +652,21 @@ pub(crate) fn write_settings_json(
     original: Option<&str>,
     root: &serde_json::Value,
 ) -> Result<(), String> {
+    write_settings_key(path, original, root, "hooks")
+}
+
+/// [`write_settings_json`] for a caller that owns a different top-level key (the
+/// permission policy owns `permissions`). Same backup, same CST rewrite of only that key.
+pub(crate) fn write_settings_key(
+    path: &Path,
+    original: Option<&str>,
+    root: &serde_json::Value,
+    key: &str,
+) -> Result<(), String> {
     if original.is_some() {
         backup_file_named("claude-code", path, &claude_settings_backup_name(path))?;
     }
-    atomic_write(path, &render_settings_json(original, root)?)
+    atomic_write(path, &render_settings_key(original, root, key)?)
 }
 
 /// The exact bytes [`write_settings_json`] would put on disk.
@@ -667,13 +678,23 @@ pub(crate) fn render_settings_json(
     original: Option<&str>,
     root: &serde_json::Value,
 ) -> Result<String, String> {
-    match (original, root.get("hooks")) {
+    render_settings_key(original, root, "hooks")
+}
+
+/// [`render_settings_json`] for one top-level `key`: rewrite that key through the CST,
+/// or delete it through the CST when `root` no longer has it.
+pub(crate) fn render_settings_key(
+    original: Option<&str>,
+    root: &serde_json::Value,
+    key: &str,
+) -> Result<String, String> {
+    match (original, root.get(key)) {
         // The key is gone, which is what uninstall produces. `render_json_config`
         // only rewrites a key it can still find, so this case would fall through to a
         // pretty-print of the whole file and strip every comment in it. Delete the key
         // through the CST instead.
-        (Some(src), None) if !src.trim().is_empty() => remove_json_key_preserving(src, "hooks"),
-        _ => render_json_config(original, root, "hooks"),
+        (Some(src), None) if !src.trim().is_empty() => remove_json_key_preserving(src, key),
+        _ => render_json_config(original, root, key),
     }
 }
 

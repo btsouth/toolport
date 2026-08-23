@@ -93,6 +93,11 @@ const PlaygroundView = lazy(() =>
 const RulesView = lazy(() =>
   import("@/components/RulesView").then((m) => ({ default: m.RulesView })),
 );
+const AgentPermissionsView = lazy(() =>
+  import("@/components/AgentPermissionsView").then((m) => ({
+    default: m.AgentPermissionsView,
+  })),
+);
 const HooksView = lazy(() =>
   import("@/components/HooksView").then((m) => ({ default: m.HooksView })),
 );
@@ -884,13 +889,15 @@ function App() {
                           ? "Agent rules"
                           : view === "hooks"
                             ? "Agent activity"
-                            : view === "teams"
-                              ? "Teams"
-                              : view === "settings"
-                                ? "Settings"
-                                : view === "clients"
-                                  ? (selectedClient?.name ?? "Clients")
-                                  : "Servers"}
+                            : view === "permissions"
+                              ? "Agent permissions"
+                              : view === "teams"
+                                ? "Teams"
+                                : view === "settings"
+                                  ? "Settings"
+                                  : view === "clients"
+                                    ? (selectedClient?.name ?? "Clients")
+                                    : "Servers"}
                 </h1>
                 <p className="truncate text-sm text-muted-foreground">
                   {view === "activity"
@@ -903,17 +910,19 @@ function App() {
                           ? "Write your rules once, apply them to every AI client"
                           : view === "hooks"
                             ? "See what your agents do outside Toolport"
-                            : view === "teams"
-                              ? "Share one MCP server set across your team"
-                              : view === "settings"
-                                ? "Global discovery and security policy"
-                                : view === "clients"
-                                  ? selectedClient
-                                    ? "MCP client"
-                                    : "Manage Toolport in your installed AI tools"
-                                  : loading || !registry
-                                    ? "Loading…"
-                                    : "One gateway in front of every MCP server you run"}
+                            : view === "permissions"
+                              ? "Rules Claude Code enforces on its own native tool calls"
+                              : view === "teams"
+                                ? "Share one MCP server set across your team"
+                                : view === "settings"
+                                  ? "Global discovery and security policy"
+                                  : view === "clients"
+                                    ? selectedClient
+                                      ? "MCP client"
+                                      : "Manage Toolport in your installed AI tools"
+                                    : loading || !registry
+                                      ? "Loading…"
+                                      : "One gateway in front of every MCP server you run"}
                 </p>
               </div>
             </div>
@@ -1076,6 +1085,8 @@ function App() {
                     <RulesView />
                   ) : view === "hooks" ? (
                     <HooksView refreshKey={activityKey} />
+                  ) : view === "permissions" ? (
+                    <AgentPermissionsView />
                   ) : view === "teams" ? (
                     <TeamsView
                       registry={registry}

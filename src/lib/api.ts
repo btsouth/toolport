@@ -33,6 +33,9 @@ import type {
   ToolCallResult,
   Stack,
   WriteOutcome,
+  PermissionRule,
+  PermissionsPreview,
+  PermissionsView,
 } from "./types";
 
 /** The hand-verified popular catalog (offline, instant). */
@@ -1015,6 +1018,28 @@ export function disableAutostart(): Promise<void> {
 // on. Every mutating call returns the refreshed view, so the tab never re-fetches to stay honest.
 
 /** Current state: the opt-in, the events registered, and every Claude Code profile found. */
+// ---- Native permission policy for Claude Code (SBS-1058) ----
+
+export function agentPermissionsView(): Promise<PermissionsView> {
+  return invoke<PermissionsView>("agent_permissions_view");
+}
+export function agentPermissionsSetEnabled(enabled: boolean): Promise<PermissionsView> {
+  return invoke<PermissionsView>("agent_permissions_set_enabled", { enabled });
+}
+export function agentPermissionsSetRules(
+  rules: PermissionRule[],
+): Promise<PermissionsView> {
+  return invoke<PermissionsView>("agent_permissions_set_rules", { rules });
+}
+/** Dry run with the given rules (an unsaved policy) or, when omitted, the saved one. */
+export function agentPermissionsPreview(
+  rules?: PermissionRule[],
+): Promise<PermissionsPreview[]> {
+  return invoke<PermissionsPreview[]>("agent_permissions_preview", {
+    rules: rules ?? null,
+  });
+}
+
 export function hooksView(): Promise<HooksViewData> {
   return invoke<HooksViewData>("hooks_view");
 }

@@ -55,6 +55,19 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Added
 
+- **Agent permissions: rules Claude Code enforces on its own native tool calls.** A new
+  Agent permissions tab holds a policy in Claude Code's own rule syntax (`Bash(rm -rf *)`,
+  `Read(./.env)`, `WebFetch(domain:...)`, `mcp__server__tool`, each set to never / ask
+  first / always allow) and writes it into every Claude Code profile's `settings.json`
+  under `permissions`, so Claude Code itself refuses, or asks before, a matching shell
+  command, file read or edit, web fetch or MCP call - on every call, whatever any hook
+  says. Off by default and empty by default; presets (never delete recursively, never
+  force-push, ask before any push, never read `.env` or SSH keys) are one-click adds.
+  Only the rule strings Toolport added are ever added or removed, so a rule you already
+  had in the file stays; a profile that appears later picks the policy up at the next
+  start. Claude Code only for now, and the tab says so. See
+  [docs/agent-permissions.md](docs/agent-permissions.md). (SBS-1058)
+
 - **Agent rules: start a new set from a rules file you already have.** The tab opened on an
   empty editor, and the first thing it asked of someone with a `~/.claude/CLAUDE.md` or a
   `~/.codex/AGENTS.md` was to retype it. **Start from a file** lists the rules files the

@@ -15,6 +15,7 @@ pub mod downstream;
 pub mod gateway_publish;
 pub mod gatewaylog;
 pub mod hooks;
+pub mod agent_permissions;
 pub mod hostenv;
 pub mod inspect;
 pub mod instructions;
