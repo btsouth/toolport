@@ -15111,6 +15111,41 @@ fn usage() -> String {
     )
 }
 
+/// Leave the launcher's terminal session before normal gateway startup.
+///
+/// Some clients, including Codex, make each MCP child a process-group leader.
+/// `setsid` rejects a process-group leader with `EPERM`, so briefly rejoin the
+/// launcher's group and retry. The second call then creates a new session with no
+/// controlling terminal before PATH discovery or any downstream child can receive
+/// a job-control signal.
+#[cfg(unix)]
+fn detach_from_client_session() {
+    unsafe {
+        extern "C" {
+            fn getpgid(pid: i32) -> i32;
+            fn getpgrp() -> i32;
+            fn getpid() -> i32;
+            fn getppid() -> i32;
+            fn setpgid(pid: i32, pgid: i32) -> i32;
+            fn setsid() -> i32;
+        }
+
+        // SAFETY: these POSIX calls take and return integer process identifiers.
+        // This runs before gateway threads start; a failed fallback leaves the
+        // process in a valid group and preserves the old best-effort behavior.
+        if setsid() >= 0 || getpgrp() != getpid() {
+            return;
+        }
+        let parent_group = getpgid(getppid());
+        if parent_group >= 0 && setpgid(0, parent_group) == 0 {
+            let _ = setsid();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_from_client_session() {}
+
 fn main() {
     // `--help`/`--version`/an unrecognized flag are decided before anything
     // else touches disk, the keychain, or stdin - see #605. Positional args
@@ -15164,6 +15199,10 @@ fn main() {
         }
         ArgAction::Run => {}
     }
+    let selftest_secrets = cli_args.first().map(String::as_str) == Some("--selftest-secrets");
+    if !selftest_secrets {
+        detach_from_client_session();
+    }
     if let Some(bus) = conduit_lib::hostenv::restore_session_bus_env() {
         eprintln!(
             "toolport-gateway: recovered the Linux session bus at {}",
@@ -15184,7 +15223,7 @@ fn main() {
     // shared-access ACL: this runs as a separate process from the app, exactly the
     // cross-process read path. If it reads the secrets with NO keychain prompt, the
     // gateway has silent access and the fix works.
-    if std::env::args().nth(1).as_deref() == Some("--selftest-secrets") {
+    if selftest_secrets {
         let reg = match registry::load_resolved() {
             Ok(r) => r,
             Err(e) => {
@@ -15229,29 +15268,6 @@ fn main() {
         println!("\nselftest-secrets: {ok} read OK, {unset} unset, {err} errors");
         println!("If NO keychain prompt appeared, the gateway has silent access (the ACL works).");
         std::process::exit(0);
-    }
-
-    // Detach from the spawning client's session so the gateway and its
-    // downstream server children run in their own session/process group with
-    // no controlling terminal. Without this, the gateway and every downstream
-    // server it spawns share the AI client's process group, so terminal
-    // job-control signals (SIGTTIN/SIGTTOU) generated during child startup
-    // can propagate to the client and disrupt its terminal I/O. TUI clients
-    // holding the terminal in raw mode around a blocking stdin read are
-    // especially sensitive. A multi-spawn gateway should not share a process
-    // group with its parent client.
-    //
-    // setsid() creates a new session; EPERM (already a session leader) is
-    // harmless. Unix only: Windows has no controlling-terminal analog.
-    #[cfg(unix)]
-    unsafe {
-        extern "C" {
-            fn setsid() -> i32;
-        }
-        // SAFETY: setsid() is a POSIX syscall taking no pointers and returning
-        // an integer. The worst case is EPERM (already a session leader),
-        // which we ignore. The signature matches libc::setsid exactly.
-        let _ = setsid();
     }
 
     // Discovery mode resolves from an explicit env override first (per-client), then

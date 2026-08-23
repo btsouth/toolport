@@ -124,6 +124,13 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **A gateway launched by Codex no longer stops before answering its first call.**
+  Codex starts each MCP child as a process-group leader, which made the gateway's
+  terminal-session detach fail; its login-shell PATH probe could then receive SIGTTIN
+  as a background group and stop the whole gateway. Normal Unix startup now handles
+  that launch shape and leaves the client's terminal session before any probe or
+  downstream spawn. (SBS-1063)
+
 - **Linux gateways launched without the desktop session environment can reach the
   Secret Service again.** Orca and some AI clients start MCP children with only
   `HOME` and `USER`; on Omarchy that left the gateway without a D-Bus address, so
