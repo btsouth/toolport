@@ -302,16 +302,23 @@ fn view_with(reg: &crate::registry::Registry, profiles: &[PathBuf]) -> Permissio
         .iter()
         .map(|path| {
             let key = path.display().to_string();
-            let added = reg
+            let recorded = reg
                 .agent_permission_targets
                 .get(&key)
-                .map(|v| v.len())
-                .unwrap_or(0);
+                .cloned()
+                .unwrap_or_default();
+            let added = recorded.len();
             match crate::clients::read_settings_json(path) {
                 Ok((root, _)) => {
+                    // A rule we added that the policy no longer has, still on disk, is a
+                    // write that did not land: it keeps enforcing, so the row must not read
+                    // Applied just because the surviving rules are present.
+                    let leftover = recorded
+                        .iter()
+                        .any(|r| !reg.agent_permission_rules.contains(r) && contains(&root, r));
                     let state = if reg.agent_permissions_enabled {
                         // An empty policy is trivially applied.
-                        if is_applied(&root, &reg.agent_permission_rules) {
+                        if is_applied(&root, &reg.agent_permission_rules) && !leftover {
                             "applied"
                         } else {
                             "stale"
@@ -348,7 +355,7 @@ fn view_with(reg: &crate::registry::Registry, profiles: &[PathBuf]) -> Permissio
 /// Turn the policy on or off, then make every profile match. Opt-in and write commit
 /// together (see [`crate::hooks::set_enabled`] for why).
 pub fn set_enabled(enabled: bool) -> Result<PermissionsView, String> {
-    apply_with(Some(enabled), None)?;
+    report(apply_with(Some(enabled), None)?)?;
     Ok(view())
 }
 
@@ -356,8 +363,29 @@ pub fn set_enabled(enabled: bool) -> Result<PermissionsView, String> {
 /// written for an invalid policy.
 pub fn set_rules(rules: Vec<PermissionRule>) -> Result<PermissionsView, String> {
     validate_rules(&rules)?;
-    apply_with(None, Some(rules))?;
+    report(apply_with(None, Some(rules))?)?;
     Ok(view())
+}
+
+/// A profile that could not be written or cleaned is an error the caller must see, not a
+/// row that quietly reads wrong. The registry change itself stands (the policy is what the
+/// user asked for; the other profiles got it), so the message names the file(s) and the
+/// view, refreshed, shows their real state.
+fn report(statuses: Vec<ProfileStatus>) -> Result<(), String> {
+    let failed: Vec<String> = statuses
+        .iter()
+        .filter(|s| s.state == "error")
+        .map(|s| format!("{}: {}", s.path, s.error.clone().unwrap_or_default()))
+        .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "The policy was saved, but {} could not be updated: {}",
+            if failed.len() == 1 { "one profile" } else { "some profiles" },
+            failed.join("; ")
+        ))
+    }
 }
 
 /// Write the policy into every profile when enabled, and remove what was recorded
@@ -681,7 +709,27 @@ mod tests {
         let statuses = apply_to(None, None, &profiles).unwrap();
         assert_eq!(statuses.iter().filter(|s| s.state == "error").count(), 1);
         assert!(crate::registry::load().unwrap().agent_permission_targets.contains_key(&b.display().to_string()));
+        // And the user-facing setters say so rather than returning a clean view.
+        let err = report(statuses).unwrap_err();
+        assert!(err.contains("could not be updated") && err.contains("settings.json"), "{err}");
         std::fs::write(&b, "{}\n").unwrap();
+        apply_to(None, None, &profiles).unwrap();
+
+        // A rule dropped from the policy whose removal did not land (here: the file was
+        // restored by hand to an older state that still carries it) must not read Applied
+        // just because the remaining rules are present.
+        let policy3 = vec![rule("Read(./.env)", Deny)];
+        apply_to(None, Some(policy3.clone()), &profiles).unwrap();
+        std::fs::write(&b, "{\n  \"permissions\": { \"deny\": [\"Read(./.env)\"], \"ask\": [\"Bash(git push*)\"] }\n}\n").unwrap();
+        let reg = crate::registry::load().unwrap();
+        // Simulate the record still naming the dropped rule (a failed strip keeps it).
+        let mut reg_with_leftover = reg.clone();
+        reg_with_leftover
+            .agent_permission_targets
+            .get_mut(&b.display().to_string())
+            .unwrap()
+            .push(rule("Bash(git push*)", Ask));
+        assert_eq!(view_with(&reg_with_leftover, &profiles).profiles[1].state, "stale");
         apply_to(None, None, &profiles).unwrap();
 
         // Off: exactly ours leaves; the user's own Read(./.env) in `a` stays.
