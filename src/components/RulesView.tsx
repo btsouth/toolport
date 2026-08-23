@@ -301,7 +301,7 @@ export function RulesView() {
   const unsupported = clients.filter((c) => !c.path);
   const onCount = supported.filter((c) => c.enabled).length;
   // Name the client in the card header. The path alone is ambiguous wherever two clients share a
-  // file (Claude Code / VS Code, Gemini CLI / Antigravity).
+  // file (Gemini CLI / Antigravity).
   const previewClientName = preview
     ? (clients.find((c) => c.id === preview.clientId)?.name ?? null)
     : null;

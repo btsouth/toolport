@@ -95,7 +95,7 @@ fn installed_targets() -> Vec<ClientTarget> {
 }
 
 /// The distinct paths to write this pass: opted-in clients only, de-duped by path so a file two
-/// clients share (Claude Code + VS Code Copilot, Gemini CLI + Antigravity) is written once.
+/// clients share (Gemini CLI + Antigravity) is written once.
 fn enabled_targets(reg: &crate::registry::Registry, installed: &[ClientTarget]) -> Vec<Target> {
     let mut seen = std::collections::HashSet::new();
     installed

@@ -4,6 +4,21 @@ All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 Entries before the rename below shipped under the project's former name, Conduit.
 
+## [Unreleased]
+
+### Fixed
+
+- **Agent rules and Team Instructions no longer report VS Code as "Applied" for a
+  file it never reads.** VS Code was mapped onto Claude Code's `~/.claude/rules/`
+  directory on the claim that Copilot reads it. Nothing supports that: Copilot's
+  instruction files are `.github/copilot-instructions.md` and repo-level
+  `AGENTS.md`, both project-scoped, so for a Copilot-only install the rules landed in a
+  directory nothing looked at while both the Agent rules tab and the Teams coverage
+  receipt said they had been applied. VS Code now reports as a client with no rules
+  file Toolport can write, alongside Cursor and Warp, so you know to paste them in.
+  The Claude Code VS Code extension shares `~/.claude` with the CLI and was, and is,
+  covered by the Claude Code row. (SBS-916)
+
 ## [1.16.0] - 2026-08-22
 
 ### Fixed

@@ -52,7 +52,6 @@ own text.
 | Client                  | Rules file                                                                       | Strategy     |
 | ----------------------- | -------------------------------------------------------------------------------- | ------------ |
 | Claude Code             | `~/.claude/rules/toolport-rules.md`                                              | Owned file   |
-| VS Code                 | `~/.claude/rules/toolport-rules.md` (shared with Claude Code)                    | Owned file   |
 | Kiro                    | `~/.kiro/steering/toolport-rules.md`                                             | Owned file   |
 | Roo Code                | `~/.roo/rules/toolport-rules.md`                                                 | Owned file   |
 | Cline                   | `~/Documents/Cline/Rules/toolport-rules.md`                                      | Owned file   |
@@ -72,12 +71,14 @@ they use the roaming config directory.
 Where two clients share a file, Toolport writes it once. Both are covered even if
 only one is installed.
 
-The VS Code row resolves to Claude Code's rules directory, which is what Toolport
-has always done for team instructions. That covers a VS Code install running a
-Claude-compatible extension. It is **not** a claim that GitHub Copilot Chat reads
-that directory: Copilot's own instruction files are `.github/copilot-instructions.md`
-and repo-level `AGENTS.md`, which Toolport does not write. If Copilot is your only
-assistant in VS Code, paste the rules into its own file.
+There is no VS Code row. Toolport detects VS Code by its own MCP config, which is
+the GitHub Copilot integration, and Copilot's instruction files are
+`.github/copilot-instructions.md` and repo-level `AGENTS.md`: project files, which
+Toolport does not write (see [Project-level rules](#project-level-rules)). Earlier
+versions mapped VS Code onto Claude Code's rules directory and reported it as applied;
+nothing we can cite reads it there, so VS Code is now listed among the clients
+Toolport cannot write for. If you use the Claude Code extension inside VS Code, it
+shares `~/.claude` with the CLI and is covered by the Claude Code row.
 
 ### Clients with no rules file Toolport can write
 
@@ -87,6 +88,9 @@ file Toolport can write for ..."), so you know to paste your rules in yourself. 
 does not silently skip them. Which names appear depends on what is installed, so the list
 below is the full set rather than what you will see.
 
+- **VS Code** (GitHub Copilot) has no global instructions file. Its instruction files
+  are per-project (`.github/copilot-instructions.md`, `AGENTS.md`), which Agent rules does
+  not cover yet. The Claude Code extension is covered by the Claude Code row.
 - **Cursor** and **Warp** keep global rules in their own UI or account: Cursor's User
   rules in _Customize -> Rules_, Warp's in Warp Drive. Both also read per-project files
   (`.cursor/rules/`, `AGENTS.md`, `WARP.md`), which Agent rules does not cover yet either

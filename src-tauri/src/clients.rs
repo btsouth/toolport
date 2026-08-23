@@ -798,8 +798,11 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
 /// This is DISTINCT from the client's MCP-config path — e.g. Claude Code's config is
 /// `~/.claude.json` but its rules live under `~/.claude/rules/`. `None` means the client has
 /// no global-rules location we write: either its globals are UI/cloud-stored (Cursor, Warp),
-/// or it's covered transitively by another client's file (Antigravity reads Gemini's
-/// `GEMINI.md`; VS Code Copilot reads Claude Code's `~/.claude` rules). Most of these
+/// it's covered transitively by another client's file (Antigravity reads Gemini's
+/// `GEMINI.md`), or we cannot show the client reads anywhere we could write (VS Code: the
+/// detection is VS Code's own `mcp.json`, i.e. Copilot, whose instruction files are
+/// repo-scoped; a Claude Code extension install is the `claude-code` row, since it shares
+/// `~/.claude`). Most of these
 /// paths are home-anchored. Goose and Zed on Linux follow `XDG_CONFIG_HOME` via
 /// [`client_rules_target`] / `dirs::config_dir()`, matching [`client_config_path`]
 /// (SBS-899 / #757). Goose also honours absolute `GOOSE_PATH_ROOT`, which relocates
@@ -831,10 +834,13 @@ fn resolve_rules_target(
     };
     let target = match client_id {
         // Strategy A — Toolport owns a whole file in the client's rules DIRECTORY.
-        // Claude Code's `~/.claude/rules/` is also read by VS Code Copilot (Claude-compat
-        // paths), so both map here; path-dedup writes it once when both are installed and a
-        // standalone VS Code install is still covered.
-        "claude-code" | "vscode" => owned(home.join(".claude").join("rules")),
+        // `vscode` used to map here too, on the claim that VS Code Copilot reads Claude Code's
+        // `~/.claude/rules/`. No citation supports that: Copilot's instruction files are
+        // `.github/copilot-instructions.md` and repo-level `AGENTS.md`, which are project-scoped
+        // and not written here. Mapping it produced a false Applied for a file nothing read,
+        // which is worse than the honest Unsupported it reports now (SBS-916). The Claude Code
+        // VS Code extension shares `~/.claude` and so is the `claude-code` row already.
+        "claude-code" => owned(home.join(".claude").join("rules")),
         "kiro" => owned(home.join(".kiro").join("steering")),
         "roo-code" => owned(home.join(".roo").join("rules")),
         "cline" => owned(home.join("Documents").join("Cline").join("Rules")),
@@ -11047,7 +11053,7 @@ rules:
         use crate::instructions::Scope;
         let home = mock_home(Platform::MacOs);
         let p = Platform::MacOs;
-        for client in ["claude-code", "vscode", "kiro", "roo-code", "cline"] {
+        for client in ["claude-code", "kiro", "roo-code", "cline"] {
             let team = resolve_rules_target(client, &home, p, Scope::Team).expect("supported");
             let personal =
                 resolve_rules_target(client, &home, p, Scope::Personal).expect("supported");
@@ -11199,10 +11205,13 @@ rules:
             team_rules_target("gemini-cli", &home, p),
             "Antigravity shares Gemini's GEMINI.md"
         );
+        // VS Code used to be mapped onto Claude Code's rules directory. Nothing we can cite reads
+        // it there (Copilot's instruction files are repo-scoped), so it reports Unsupported
+        // rather than a false Applied (SBS-916).
         assert_eq!(
             team_rules_target("vscode", &home, p),
-            team_rules_target("claude-code", &home, p),
-            "VS Code Copilot shares Claude Code's rules file"
+            None,
+            "VS Code has no global rules file Toolport can show it reads"
         );
     }
 
