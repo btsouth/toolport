@@ -118,6 +118,23 @@ describe("AgentPermissionsView", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("not a tool name");
     expect(screen.getByText(/No rules yet/)).toBeInTheDocument();
     expect(api.agentPermissionsView).toHaveBeenCalledTimes(2);
+    // The refused pattern stays in the box to be fixed, not wiped.
+    expect(screen.getByLabelText("Rule pattern")).toHaveValue("rm -rf *");
+  });
+
+  it("a preset whose patterns are all present, even under another action, is disabled", async () => {
+    api.agentPermissionsView.mockResolvedValue(
+      view({
+        rules: [
+          { pattern: "Bash(git push --force*)", action: "ask" },
+          { pattern: "Bash(git push -f *)", action: "ask" },
+        ],
+      }),
+    );
+    render(<AgentPermissionsView />);
+    expect(
+      await screen.findByRole("button", { name: "Never force-push" }),
+    ).toBeDisabled();
   });
 
   it("preview shows the bytes and writes nothing", async () => {
