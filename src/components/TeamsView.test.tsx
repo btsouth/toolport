@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { Registry } from "@/lib/types";
+import type { InstructionsStatusView, Registry } from "@/lib/types";
 
 const api = vi.hoisted(() => ({
   teamConnect: vi.fn(),
@@ -169,6 +169,119 @@ describe("TeamsView shared-server update", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Update shared servers" }));
     await waitFor(() => expect(api.teamPushPreview).toHaveBeenCalledTimes(2));
+  });
+});
+
+describe("TeamsView instructions status", () => {
+  const instructions: InstructionsStatusView = {
+    content: "Use the approved tools.",
+    version: 6,
+    clients: [{ id: "claude", name: "Claude", state: "applied" }],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("keeps the last status after a failed refresh and retries", async () => {
+    const refreshed: InstructionsStatusView = {
+      content: "Use the newly approved tools.",
+      version: 7,
+      clients: [{ id: "claude", name: "Claude", state: "stale" }],
+    };
+    api.teamInstructionsStatus
+      .mockResolvedValueOnce(instructions)
+      .mockRejectedValueOnce(new Error("temporary read failure"))
+      .mockResolvedValueOnce(refreshed);
+    const onRegistryChange = vi.fn();
+    const { rerender } = render(
+      <TeamsView registry={registry} onRegistryChange={onRegistryChange} />,
+    );
+
+    expect(await screen.findByText(instructions.content)).toBeInTheDocument();
+    expect(screen.getByText("Applied")).toBeInTheDocument();
+
+    rerender(
+      <TeamsView
+        registry={{
+          ...registry,
+          team: { ...registry.team!, lastVersion: 7 },
+        }}
+        onRegistryChange={onRegistryChange}
+      />,
+    );
+
+    expect(
+      await screen.findByText("Couldn't refresh this status. Showing the last result."),
+    ).toBeInTheDocument();
+    expect(screen.getByText(instructions.content)).toBeInTheDocument();
+    expect(screen.getByText("Applied")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Try again" }));
+
+    expect(await screen.findByText(refreshed.content)).toBeInTheDocument();
+    expect(screen.getByText("Not applied yet")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Couldn't refresh this status. Showing the last result."),
+    ).not.toBeInTheDocument();
+    expect(api.teamInstructionsStatus).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not show another team's cached instructions after a failed refresh", async () => {
+    api.teamInstructionsStatus
+      .mockResolvedValueOnce(instructions)
+      .mockRejectedValueOnce(new Error("temporary read failure"));
+    const onRegistryChange = vi.fn();
+    const { rerender } = render(
+      <TeamsView registry={registry} onRegistryChange={onRegistryChange} />,
+    );
+
+    expect(await screen.findByText(instructions.content)).toBeInTheDocument();
+
+    rerender(
+      <TeamsView
+        registry={{
+          ...registry,
+          team: { ...registry.team!, teamId: "team-2", lastVersion: 1 },
+        }}
+        onRegistryChange={onRegistryChange}
+      />,
+    );
+
+    expect(
+      await screen.findByText("Toolport couldn't load the instructions status."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(instructions.content)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+  });
+
+  it("clears the card when a successful refresh reports no active instructions", async () => {
+    api.teamInstructionsStatus
+      .mockResolvedValueOnce(instructions)
+      .mockResolvedValueOnce(null);
+    const onRegistryChange = vi.fn();
+    const { rerender } = render(
+      <TeamsView registry={registry} onRegistryChange={onRegistryChange} />,
+    );
+
+    expect(await screen.findByText(instructions.content)).toBeInTheDocument();
+
+    rerender(
+      <TeamsView
+        registry={{
+          ...registry,
+          team: { ...registry.team!, lastVersion: 7 },
+        }}
+        onRegistryChange={onRegistryChange}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.queryByText(instructions.content)).not.toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByRole("heading", { name: "Team instructions" }),
+    ).not.toBeInTheDocument();
   });
 });
 

@@ -74,22 +74,35 @@ export function TeamsView({
   // The member-facing Team Instructions status on this machine (spec W4): what the org pushed
   // and how each installed AI client currently holds it. Refetched on connect and whenever a sync
   // bumps the config version, so it tracks the files the writer just wrote.
-  const [instr, setInstr] = useState<InstructionsStatusView | null>(null);
+  const [instrSnapshot, setInstrSnapshot] = useState<{
+    teamId: string;
+    status: InstructionsStatusView | null;
+  } | null>(null);
+  const [instrErrorTeamId, setInstrErrorTeamId] = useState<string | null>(null);
+  const [instrRetry, setInstrRetry] = useState(0);
+  const instrTeamId = team?.teamId ?? null;
+  // A last-good result is safe to preserve across version refreshes for the same team, but
+  // must never appear after switching organizations.
+  const instr = instrSnapshot?.teamId === instrTeamId ? instrSnapshot.status : null;
+  const instrError = instrTeamId !== null && instrErrorTeamId === instrTeamId;
   useEffect(() => {
     // The command returns null when there's no team (or no active instructions), so there's no
     // synchronous clear here — the result always lands via the async resolution.
     let cancelled = false;
+    const requestedTeamId = instrTeamId;
     teamInstructionsStatus()
       .then((s) => {
-        if (!cancelled) setInstr(s);
+        if (cancelled) return;
+        setInstrSnapshot(requestedTeamId ? { teamId: requestedTeamId, status: s } : null);
+        setInstrErrorTeamId(null);
       })
       .catch(() => {
-        if (!cancelled) setInstr(null);
+        if (!cancelled) setInstrErrorTeamId(requestedTeamId);
       });
     return () => {
       cancelled = true;
     };
-  }, [team?.teamId, team?.lastVersion]);
+  }, [instrTeamId, team?.lastVersion, instrRetry]);
   // Set while an approval-gated join waits for an admin. Holds the connect inputs so a poll
   // uses the values from when the request was made, not whatever the fields say later.
   const [pending, setPending] = useState<{
@@ -706,36 +719,77 @@ export function TeamsView({
             )}
           </div>
 
-          {instr && (
+          {(instr || instrError) && (
             <div className="rounded-xl border bg-card p-5">
               <div className="mb-1 flex items-center gap-2">
                 <FileText className="size-4 text-muted-foreground" />
                 <h3 className="text-sm font-medium">Team instructions</h3>
-                <span className="text-xs text-muted-foreground">v{instr.version}</span>
+                {instr && (
+                  <span className="text-xs text-muted-foreground">v{instr.version}</span>
+                )}
               </div>
-              <p className="mb-3 text-xs text-muted-foreground">
-                Org-managed agent rules, written to your AI clients alongside — never over
-                — your own instructions. Leaving the team removes them.
-              </p>
-              <pre className="mb-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg border bg-muted/20 p-3 font-mono text-xs text-foreground">
-                {instr.content}
-              </pre>
-              {instr.clients.length === 0 ? (
-                <p className="text-xs text-muted-foreground">
-                  No supported AI clients detected on this machine.
-                </p>
-              ) : (
-                <ul className="grid gap-1.5">
-                  {instr.clients.map((c) => (
-                    <li
-                      key={c.id}
-                      className="flex items-center justify-between gap-3 text-sm"
+              {instr ? (
+                <>
+                  <p className="mb-3 text-xs text-muted-foreground">
+                    Org-managed agent rules, written to your AI clients alongside — never
+                    over — your own instructions. Leaving the team removes them.
+                  </p>
+                  {instrError && (
+                    <Callout
+                      variant="warning"
+                      role="status"
+                      className="mb-3 flex items-center justify-between gap-3"
                     >
-                      <span className="truncate">{c.name}</span>
-                      <RuleStateBadge state={c.state} />
-                    </li>
-                  ))}
-                </ul>
+                      <span>Couldn't refresh this status. Showing the last result.</span>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="shrink-0"
+                        onClick={() => setInstrRetry((n) => n + 1)}
+                      >
+                        <RefreshCw className="size-3.5" />
+                        Try again
+                      </Button>
+                    </Callout>
+                  )}
+                  <pre className="mb-3 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg border bg-muted/20 p-3 font-mono text-xs text-foreground">
+                    {instr.content}
+                  </pre>
+                  {instr.clients.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      No supported AI clients detected on this machine.
+                    </p>
+                  ) : (
+                    <ul className="grid gap-1.5">
+                      {instr.clients.map((c) => (
+                        <li
+                          key={c.id}
+                          className="flex items-center justify-between gap-3 text-sm"
+                        >
+                          <span className="truncate">{c.name}</span>
+                          <RuleStateBadge state={c.state} />
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </>
+              ) : (
+                <Callout
+                  variant="danger"
+                  role="status"
+                  className="mt-3 flex items-center justify-between gap-3"
+                >
+                  <span>Toolport couldn't load the instructions status.</span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="shrink-0"
+                    onClick={() => setInstrRetry((n) => n + 1)}
+                  >
+                    <RefreshCw className="size-3.5" />
+                    Try again
+                  </Button>
+                </Callout>
               )}
             </div>
           )}
