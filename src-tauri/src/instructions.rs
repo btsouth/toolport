@@ -301,7 +301,11 @@ pub fn upsert_block(existing: &str, scope: Scope, id: &str, version: i64, conten
     }
     // Append after the user's content. Guarantee the block starts at column 0 with exactly one
     // blank line of separation, without rewriting any existing byte: only newlines are added.
-    let sep = if existing.ends_with('\n') { "\n" } else { "\n\n" };
+    let sep = if existing.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
     format!("{existing}{sep}{block}\n")
 }
 
@@ -673,7 +677,10 @@ mod tests {
             } else {
                 format!("{user}\n")
             };
-            assert_eq!(back, normalized, "full cycle must restore user content for {user:?}");
+            assert_eq!(
+                back, normalized,
+                "full cycle must restore user content for {user:?}"
+            );
         }
     }
 
@@ -976,11 +983,17 @@ mod tests {
         let s = Scratch::new();
         let path = s.path("GEMINI.md"); // does not exist yet
         let t = block_target(path.clone(), Scope::Team);
-        assert_eq!(write_target(&t, TEAM, 1, "Only org content"), ApplyState::Applied);
+        assert_eq!(
+            write_target(&t, TEAM, 1, "Only org content"),
+            ApplyState::Applied
+        );
         assert!(path.exists());
         // The whole file was ours -> stripping the block leaves nothing -> delete.
         remove_recorded(&path, Scope::Team);
-        assert!(!path.exists(), "a file that held only our block should be removed");
+        assert!(
+            !path.exists(),
+            "a file that held only our block should be removed"
+        );
     }
 
     #[test]
@@ -996,7 +1009,10 @@ mod tests {
             char_cap: None,
             blocked_if_present: Some(shadow),
         };
-        assert_eq!(write_target(&t, TEAM, 1, "Org rule"), ApplyState::BlockedOverride);
+        assert_eq!(
+            write_target(&t, TEAM, 1, "Org rule"),
+            ApplyState::BlockedOverride
+        );
         assert!(!target_path.exists(), "must not write when shadowed");
     }
 
@@ -1011,7 +1027,10 @@ mod tests {
             char_cap: Some(10),
             blocked_if_present: None,
         };
-        assert_eq!(write_target(&t, TEAM, 1, "way over the tiny cap"), ApplyState::TooLong);
+        assert_eq!(
+            write_target(&t, TEAM, 1, "way over the tiny cap"),
+            ApplyState::TooLong
+        );
         assert!(!path.exists());
     }
 
@@ -1022,7 +1041,12 @@ mod tests {
         // in sentinel content would truncate the block. Both must be refused, nothing written.
         let owned = owned_target(s.path("owned.md"), Scope::Team);
         assert_eq!(
-            write_target(&owned, TEAM, 1, &format!("evil {SENTINEL_START_PREFIX} x -->")),
+            write_target(
+                &owned,
+                TEAM,
+                1,
+                &format!("evil {SENTINEL_START_PREFIX} x -->")
+            ),
             ApplyState::Error
         );
         assert!(!owned.path.exists());
@@ -1042,7 +1066,12 @@ mod tests {
         let s = Scratch::new();
         let personal = block_target(s.path("AGENTS.md"), Scope::Personal);
         assert_eq!(
-            write_target(&personal, SET, 1, &format!("evil {SENTINEL_START_PREFIX} x -->")),
+            write_target(
+                &personal,
+                SET,
+                1,
+                &format!("evil {SENTINEL_START_PREFIX} x -->")
+            ),
             ApplyState::Error
         );
         assert_eq!(
@@ -1062,7 +1091,12 @@ mod tests {
             ApplyState::Error
         );
         assert_eq!(
-            write_target(&team, TEAM, 1, &format!("evil {PERSONAL_SENTINEL_END} tail")),
+            write_target(
+                &team,
+                TEAM,
+                1,
+                &format!("evil {PERSONAL_SENTINEL_END} tail")
+            ),
             ApplyState::Error
         );
         assert!(!team.path.exists());
@@ -1079,7 +1113,10 @@ mod tests {
         std::fs::write(&path, user).unwrap();
         let team = block_target(path.clone(), Scope::Team);
         let personal = block_target(path.clone(), Scope::Personal);
-        assert_eq!(write_target(&team, TEAM, 1, "Org rule"), ApplyState::Applied);
+        assert_eq!(
+            write_target(&team, TEAM, 1, "Org rule"),
+            ApplyState::Applied
+        );
         assert_eq!(
             write_target(&personal, SET, 1, "My rule"),
             ApplyState::Applied
@@ -1107,11 +1144,11 @@ mod tests {
         let s = Scratch::new();
         let dir = s.path("rules");
         let team = owned_target(dir.join(Scope::Team.owned_file_name()), Scope::Team);
-        let personal = owned_target(
-            dir.join(Scope::Personal.owned_file_name()),
-            Scope::Personal,
+        let personal = owned_target(dir.join(Scope::Personal.owned_file_name()), Scope::Personal);
+        assert_eq!(
+            write_target(&team, TEAM, 1, "Org rule"),
+            ApplyState::Applied
         );
-        assert_eq!(write_target(&team, TEAM, 1, "Org rule"), ApplyState::Applied);
         assert_eq!(
             write_target(&personal, SET, 1, "My rule"),
             ApplyState::Applied
@@ -1120,7 +1157,10 @@ mod tests {
 
         // Pointing a personal cleanup at the TEAM file is a no-op: the header prefix is not ours.
         remove_recorded(&team.path, Scope::Personal);
-        assert!(team.path.exists(), "team file must survive a personal cleanup");
+        assert!(
+            team.path.exists(),
+            "team file must survive a personal cleanup"
+        );
 
         remove_recorded(&personal.path, Scope::Personal);
         assert!(!personal.path.exists());
@@ -1224,7 +1264,10 @@ mod tests {
             char_cap: None,
             blocked_if_present: Some(shadow),
         };
-        assert_eq!(current_state(&shadowed, TEAM, 1, "c"), ApplyState::BlockedOverride);
+        assert_eq!(
+            current_state(&shadowed, TEAM, 1, "c"),
+            ApplyState::BlockedOverride
+        );
     }
 
     /// SBS-1036: drift is "our block, our id, our version, not our body". Everything else is
@@ -1236,15 +1279,29 @@ mod tests {
         // Sentinel: write v2, then edit the body by hand inside the markers.
         let block = block_target(s.path("AGENTS.md"), personal);
         std::fs::write(&block.path, "# mine\n").unwrap();
-        assert_eq!(write_target(&block, "set", 2, "Be brief."), ApplyState::Applied);
-        assert_eq!(drifted_body(&block, "set", 2, "Be brief."), None, "identical is not drift");
+        assert_eq!(
+            write_target(&block, "set", 2, "Be brief."),
+            ApplyState::Applied
+        );
+        assert_eq!(
+            drifted_body(&block, "set", 2, "Be brief."),
+            None,
+            "identical is not drift"
+        );
         let on_disk = std::fs::read_to_string(&block.path).unwrap();
-        std::fs::write(&block.path, on_disk.replace("Be brief.", "Be brief.\nAnd kind.")).unwrap();
+        std::fs::write(
+            &block.path,
+            on_disk.replace("Be brief.", "Be brief.\nAnd kind."),
+        )
+        .unwrap();
         assert_eq!(
             drifted_body(&block, "set", 2, "Be brief.").as_deref(),
             Some("Be brief.\nAnd kind.")
         );
-        assert_eq!(current_state(&block, "set", 2, "Be brief."), ApplyState::Stale);
+        assert_eq!(
+            current_state(&block, "set", 2, "Be brief."),
+            ApplyState::Stale
+        );
         // The same file seen from a newer revision of the set is an unapplied change, not drift.
         assert_eq!(drifted_body(&block, "set", 3, "Be brief."), None);
         // And from another set it is that set's stale write.
@@ -1255,12 +1312,26 @@ mod tests {
 
         // Owned file: same rules, body is everything under the header.
         let owned = owned_target(s.path("toolport-rules.md"), personal);
-        assert_eq!(write_target(&owned, "set", 1, "Run tests.\n"), ApplyState::Applied);
+        assert_eq!(
+            write_target(&owned, "set", 1, "Run tests.\n"),
+            ApplyState::Applied
+        );
         assert_eq!(drifted_body(&owned, "set", 1, "Run tests."), None);
         let on_disk = std::fs::read_to_string(&owned.path).unwrap();
-        std::fs::write(&owned.path, on_disk.replace("Run tests.", "Run tests twice.")).unwrap();
-        assert_eq!(drifted_body(&owned, "set", 1, "Run tests.").as_deref(), Some("Run tests twice."));
-        assert_eq!(drifted_body(&owned, "set", 2, "Run tests."), None, "newer revision: stale, not drift");
+        std::fs::write(
+            &owned.path,
+            on_disk.replace("Run tests.", "Run tests twice."),
+        )
+        .unwrap();
+        assert_eq!(
+            drifted_body(&owned, "set", 1, "Run tests.").as_deref(),
+            Some("Run tests twice.")
+        );
+        assert_eq!(
+            drifted_body(&owned, "set", 2, "Run tests."),
+            None,
+            "newer revision: stale, not drift"
+        );
         // A file that is not ours at all (no header) is not drift either.
         std::fs::write(&owned.path, "somebody else's file\n").unwrap();
         assert_eq!(drifted_body(&owned, "set", 1, "Run tests."), None);
@@ -1287,7 +1358,10 @@ mod tests {
         let path = s.path("someones.md");
         let foreign = "# not ours\njust user content\n";
         std::fs::write(&path, foreign).unwrap();
-        assert!(remove_recorded(&path, Scope::Team), "nothing of ours to clean");
+        assert!(
+            remove_recorded(&path, Scope::Team),
+            "nothing of ours to clean"
+        );
         assert!(remove_recorded(&path, Scope::Personal));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), foreign);
     }
@@ -1315,9 +1389,15 @@ mod tests {
             });
 
             let after = std::fs::read_to_string(&path).unwrap();
-            assert!(after.starts_with(user), "round {round}: user bytes preserved");
+            assert!(
+                after.starts_with(user),
+                "round {round}: user bytes preserved"
+            );
             assert!(after.contains("Org rule"), "round {round}: team block lost");
-            assert!(after.contains("My rule"), "round {round}: personal block lost");
+            assert!(
+                after.contains("My rule"),
+                "round {round}: personal block lost"
+            );
         }
     }
 
@@ -1351,7 +1431,10 @@ mod tests {
             // and then strips the team span from it. Either way the team block is gone and the
             // new personal block is there. Unserialized, one of the two is lost.
             let after = std::fs::read_to_string(&path).unwrap();
-            assert!(after.starts_with(user), "round {round}: user bytes preserved");
+            assert!(
+                after.starts_with(user),
+                "round {round}: user bytes preserved"
+            );
             assert!(
                 after.contains("My rule v2"),
                 "round {round}: the personal write was swallowed by the team removal"
@@ -1405,7 +1488,10 @@ mod tests {
         let s = Scratch::new();
 
         // Absent file: nothing of ours can be there.
-        assert!(remove_recorded(&s.path("never-existed.md"), Scope::Personal));
+        assert!(remove_recorded(
+            &s.path("never-existed.md"),
+            Scope::Personal
+        ));
 
         // A real removal.
         let t = block_target(s.path("AGENTS.md"), Scope::Personal);

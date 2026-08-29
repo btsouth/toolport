@@ -102,9 +102,8 @@ struct UpstreamEraGuard(Option<String>);
 
 impl UpstreamEraGuard {
     fn enter(version: Option<String>) -> Self {
-        let previous = ACTIVE_REQUEST_CONTEXT.with(|cell| {
-            std::mem::replace(&mut cell.borrow_mut().upstream_version, version)
-        });
+        let previous = ACTIVE_REQUEST_CONTEXT
+            .with(|cell| std::mem::replace(&mut cell.borrow_mut().upstream_version, version));
         UpstreamEraGuard(previous)
     }
 }
@@ -154,9 +153,8 @@ struct McpSessionGuard(Option<String>);
 
 impl McpSessionGuard {
     fn enter(session: Option<String>) -> Self {
-        let previous = ACTIVE_REQUEST_CONTEXT.with(|cell| {
-            std::mem::replace(&mut cell.borrow_mut().mcp_session, session)
-        });
+        let previous = ACTIVE_REQUEST_CONTEXT
+            .with(|cell| std::mem::replace(&mut cell.borrow_mut().mcp_session, session));
         Self(previous)
     }
 }
@@ -177,9 +175,8 @@ struct UpstreamTransportGuard(UpstreamTransport);
 
 impl UpstreamTransportGuard {
     fn enter(transport: UpstreamTransport) -> Self {
-        let previous = ACTIVE_REQUEST_CONTEXT.with(|cell| {
-            std::mem::replace(&mut cell.borrow_mut().upstream_transport, transport)
-        });
+        let previous = ACTIVE_REQUEST_CONTEXT
+            .with(|cell| std::mem::replace(&mut cell.borrow_mut().upstream_transport, transport));
         Self(previous)
     }
 }
@@ -193,9 +190,7 @@ impl Drop for UpstreamTransportGuard {
 }
 
 fn active_upstream_is_stdio() -> bool {
-    ACTIVE_REQUEST_CONTEXT.with(|cell| {
-        cell.borrow().upstream_transport == UpstreamTransport::Stdio
-    })
+    ACTIVE_REQUEST_CONTEXT.with(|cell| cell.borrow().upstream_transport == UpstreamTransport::Stdio)
 }
 
 /// Installs a complete request context on a worker that continues work for a
@@ -2019,8 +2014,7 @@ fn set_server_enabled_via_agent(
     }
     // A scoped client sees (and can toggle) only servers in its allowed set; an
     // out-of-scope server is indistinguishable from a non-existent one.
-    let in_scope =
-        |s: &ServerEntry| allowed.map_or(true, |set| set.contains(&s.id));
+    let in_scope = |s: &ServerEntry| allowed.map_or(true, |set| set.contains(&s.id));
     let server = match reg.servers.iter().find(|s| {
         in_scope(s) && (s.id.eq_ignore_ascii_case(target) || s.name.eq_ignore_ascii_case(target))
     }) {
@@ -3826,7 +3820,8 @@ fn resolve_http_caller(
     // SBS-900: `reg.http_clients.is_empty()` is also true when boot `load_resolved`
     // returned Err and fell back to `Registry::default()`. That is not "no clients
     // configured". A missing registry file is `Ok(default)` and is not this case.
-    if allow_insecure_open && env_token.is_none() && registry_loaded && reg.http_clients.is_empty() {
+    if allow_insecure_open && env_token.is_none() && registry_loaded && reg.http_clients.is_empty()
+    {
         return Some((
             None,
             HttpCaller {
@@ -9980,19 +9975,16 @@ fn maybe_check_integrity(
     // no setting may turn destruction of the trust root into a fail-open catalog.
     if quarantine_on || integrity::baseline_tamper_detected(&events) {
         let pending = integrity::quarantine_candidates(tools, &events);
-        integrity::apply_quarantine(profile, tools, &events)
-            .map_err(|e| (e, pending.clone()))?;
+        integrity::apply_quarantine(profile, tools, &events).map_err(|e| (e, pending.clone()))?;
         // `check_staged` deliberately kept these old pins until the quarantine write was
         // durable. Accept from that durable record so a failed pin write or process exit can
         // recover even after the router filters the quarantined tool from its next catalog.
-        integrity::accept_quarantined_pins(profile)
-            .map_err(|e| (e, pending.clone()))?;
+        integrity::accept_quarantined_pins(profile).map_err(|e| (e, pending.clone()))?;
         Ok((!pending.is_empty()).then_some(pending))
     } else {
         // Optional quarantine is off, so accept the observed high-risk definitions after
         // recording them; only the mandatory lost-baseline case above blocks independently.
-        integrity::accept_staged_pins(profile, tools, &events)
-            .map_err(|e| (e, BTreeSet::new()))?;
+        integrity::accept_staged_pins(profile, tools, &events).map_err(|e| (e, BTreeSet::new()))?;
         Ok(None)
     }
 }
@@ -10007,19 +9999,15 @@ fn requarantine_if_needed(
     profile: Option<&str>,
 ) -> Vec<Value> {
     match maybe_check_integrity(registry, &tools, profile) {
-        Ok(Some(pending)) => requarantine_after_integrity_change(
-            router,
-            pending,
-            integrity::quarantined(profile),
-        ),
+        Ok(Some(pending)) => {
+            requarantine_after_integrity_change(router, pending, integrity::quarantined(profile))
+        }
         Ok(None) => tools,
         Err((e, pending)) => {
             glog(&format!(
                 "SECURITY: integrity store update failed: {e}; keeping the live blocked set"
             ));
-            eprintln!(
-                "toolport: integrity store update failed: {e}; keeping the live blocked set"
-            );
+            eprintln!("toolport: integrity store update failed: {e}; keeping the live blocked set");
             fail_closed_integrity_catalog(router, profile, pending)
         }
     }
@@ -13687,7 +13675,16 @@ fn handle_mcp_http(
             // Notifications / JSON-RPC responses: 202 with empty body.
             if !has_id {
                 let _session = McpSessionGuard::enter(session_id.clone());
-                let _ = process_request(state, &req, guard, confirm, allowed, None, client, client_name);
+                let _ = process_request(
+                    state,
+                    &req,
+                    guard,
+                    confirm,
+                    allowed,
+                    None,
+                    client,
+                    client_name,
+                );
                 let out = HttpOut::new(202, "text/plain", String::new());
                 return match session_id.as_deref() {
                     Some(sid) => out.with_header("Mcp-Session-Id", sid),
@@ -13696,7 +13693,16 @@ fn handle_mcp_http(
             }
 
             let _session = McpSessionGuard::enter(session_id.clone());
-            let resp = process_request(state, &req, guard, confirm, allowed, None, client, client_name);
+            let resp = process_request(
+                state,
+                &req,
+                guard,
+                confirm,
+                allowed,
+                None,
+                client,
+                client_name,
+            );
             match resp {
                 Some(resp) => {
                     let status = if is_modern {
@@ -13843,7 +13849,16 @@ fn handle_http_with_headers(
                 "method": "tools/call",
                 "params": { "name": name, "arguments": args }
             });
-            match process_request(state, &req, guard, confirm, allowed, None, client, client_name) {
+            match process_request(
+                state,
+                &req,
+                guard,
+                confirm,
+                allowed,
+                None,
+                client,
+                client_name,
+            ) {
                 Some(resp) => {
                     if let Some(err) = resp.get("error") {
                         let msg = err
@@ -17803,7 +17818,17 @@ mod tests {
                        return { name: a.structuredContent.user.name, \
                                 sum: a.structuredContent.user.age + b.structuredContent.user.age };"
         });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
         assert_eq!(result["isError"].as_bool(), Some(false));
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
         assert_eq!(result["structuredContent"]["toolportScript"]["calls"], 2);
@@ -18220,7 +18245,17 @@ mod tests {
             ];"
         });
 
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
         let serialized = serde_json::to_string(&result).unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
 
@@ -18270,7 +18305,17 @@ mod tests {
                        var t = r.content[0].text; \
                        return { len: t.length, head: t.slice(0, 8), shaped: t.indexOf('Toolport shaped') >= 0 };"
         });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
         assert_eq!(result["isError"].as_bool(), Some(false));
         let v = &result["structuredContent"]["result"];
         assert_eq!(v["shaped"], false);
@@ -18490,8 +18535,17 @@ mod tests {
         let args = json!({
             "script": "var a = servers.s.big({}); return a.structuredContent.user.name;"
         });
-        let result =
-            run_script_dispatch(&reg, Some(&router), &cached, None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &cached,
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
         assert_eq!(result["isError"].as_bool(), Some(false));
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
         assert_eq!(result["structuredContent"]["toolportScript"]["calls"], 1);
@@ -18510,8 +18564,17 @@ mod tests {
         // Mark the tool destructive via the cached catalog the fail-closed resolver checks.
         let cached = vec![json!({ "name": "s__big", "annotations": { "destructiveHint": true } })];
         let args = json!({ "script": "return toolport.call('s__big', {});" });
-        let result =
-            run_script_dispatch(&reg, Some(&router), &cached, None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &cached,
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
         let call_result = &result["structuredContent"]["result"];
         assert_eq!(call_result["isError"].as_bool(), Some(true));
@@ -18574,7 +18637,17 @@ mod tests {
         let reg = Registry::default();
         let router = Arc::new(paging_router("x".to_string()));
         let args = json!({ "script": "this is not valid javascript )(" });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
         assert_eq!(result["isError"].as_bool(), Some(true));
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], false);
     }
@@ -18724,8 +18797,17 @@ mod tests {
             "validate": true,
             "script": "toolport.call('s__tool', { id: 1 }); toolport.call('s__tool', { id: 2 }); return 'done';"
         });
-        let result =
-            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &catalog,
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
 
         assert_eq!(result["isError"].as_bool(), Some(false));
         let validate = &result["structuredContent"]["toolportValidate"];
@@ -18754,8 +18836,17 @@ mod tests {
             "validate": true,
             "script": "toolport.call('s__tool', {}); toolport.call('s__missing', {}); return 'done';"
         });
-        let result =
-            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &catalog,
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
 
         assert_eq!(result["isError"].as_bool(), Some(true));
         let validate = &result["structuredContent"]["toolportValidate"];
@@ -18831,8 +18922,17 @@ mod tests {
             "validate": true,
             "script": "toolport.call('a__one', {}); toolport.call('b__two', {}); return 'done';"
         });
-        let result =
-            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &catalog,
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
 
         let unresolved = &result["structuredContent"]["toolportValidate"]["unresolved"];
         assert_eq!(unresolved.as_array().map(Vec::len), Some(2));
@@ -18856,8 +18956,17 @@ mod tests {
             "validate": true,
             "script": "var r = toolport.call('s__tool', {}); if (r.structuredContent.rows) { toolport.call('s__tool', { follow: true }); } return 'done';"
         });
-        let result =
-            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &catalog,
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
 
         let validate = &result["structuredContent"]["toolportValidate"];
         assert_eq!(validate["finished"], true, "the guarded read never throws");
@@ -18890,8 +18999,17 @@ mod tests {
             "validate": true,
             "script": "toolport.call('s__tool', { totally: 'wrong' }); return 'done';"
         });
-        let result =
-            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &catalog,
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
 
         assert_eq!(result["structuredContent"]["toolportValidate"]["ok"], true);
         let text = result["content"][0]["text"].as_str().unwrap_or_default();
@@ -18907,8 +19025,17 @@ mod tests {
         let router = Arc::new(routed_router("s", "tool"));
         let catalog = validate_catalog();
         let args = json!({ "validate": true, "script": "this is not valid javascript )(" });
-        let result =
-            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &catalog,
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
 
         assert_eq!(result["isError"].as_bool(), Some(true));
         let validate = &result["structuredContent"]["toolportValidate"];
@@ -18966,8 +19093,17 @@ mod tests {
             "validate": true,
             "script": "return servers.nope.missing({});"
         });
-        let result =
-            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &catalog,
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
 
         assert_eq!(result["isError"].as_bool(), Some(true));
         assert_eq!(result["structuredContent"]["toolportValidate"]["ok"], false);
@@ -18993,7 +19129,17 @@ mod tests {
         let args = json!({
             "script": "toolport.call('s__tool', {}); throw new Error('E'.repeat(20000));"
         });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
 
         // Restore before asserting so a failure cannot leak the override.
         match previous {
@@ -19031,7 +19177,17 @@ mod tests {
         let args = json!({
             "script": "toolport.checkpoint({ resume: 'x'.repeat(1000) }); try { toolport.checkpoint({ resume: 'y'.repeat(4000) }); } catch (_) {} throw new Error('E'.repeat(20000));"
         });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
 
         match previous {
             Some(value) => std::env::set_var("TOOLPORT_RESULT_BUDGET", value),
@@ -19062,7 +19218,17 @@ mod tests {
         let args = json!({
             "script": "toolport.checkpoint({ lastInsertedId: 7 }); throw new Error('boom');"
         });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
 
         assert_eq!(result["isError"].as_bool(), Some(true));
         assert_eq!(
@@ -19076,7 +19242,17 @@ mod tests {
         let reg = Registry::default();
         let router = Arc::new(routed_router("s", "tool"));
         let args = json!({ "script": "throw new Error('boom');" });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            &args,
+            None,
+        );
 
         assert_eq!(result["isError"].as_bool(), Some(true));
         let text = result["content"][0]["text"].as_str().unwrap_or_default();
@@ -21572,8 +21748,7 @@ mod tests {
         let authenticated_startup_allows_open = http_allows_insecure_open(true, true, true, true);
         reg.http_clients.clear();
         assert!(
-            resolve_http_scope(&reg, None, None, authenticated_startup_allows_open, true)
-                .is_none()
+            resolve_http_scope(&reg, None, None, authenticated_startup_allows_open, true).is_none()
         );
         let explicit_open_startup = http_allows_insecure_open(true, false, true, true);
         assert_eq!(
@@ -21666,8 +21841,7 @@ mod tests {
 
         assert_eq!(call.status, 200, "body={}", call.body);
 
-        let audit = std::fs::read_to_string(dir.join("audit.jsonl"))
-            .expect("audit log exists");
+        let audit = std::fs::read_to_string(dir.join("audit.jsonl")).expect("audit log exists");
 
         let entry: Value = audit
             .lines()
@@ -23221,7 +23395,10 @@ mod tests {
             !set.contains("team_slack"),
             "sanitized collision must not put the team server in Personal scope"
         );
-        assert_eq!(caller.session_owner.scope, Some(vec!["team-slack".to_string()]));
+        assert_eq!(
+            caller.session_owner.scope,
+            Some(vec!["team-slack".to_string()])
+        );
         assert!(server_in_allowed_scope("team-slack", &set));
         assert!(!server_in_allowed_scope("team_slack", &set));
     }
@@ -25434,12 +25611,10 @@ mod tests {
         let meta = json!({ "progressToken": "must-not-route" });
         let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
         assert!(registration.is_none());
-        assert!(
-            relayed
-                .expect("metadata is relayed without progress")
-                .get("progressToken")
-                .is_none()
-        );
+        assert!(relayed
+            .expect("metadata is relayed without progress")
+            .get("progressToken")
+            .is_none());
     }
 
     #[test]
@@ -25455,10 +25630,7 @@ mod tests {
         let _http = UpstreamTransportGuard::enter(UpstreamTransport::Http);
         // Thread-local, and libtest may reuse this thread for another test, so
         // assert the default rather than assuming it and leaving it changed.
-        assert!(
-            active_mcp_session().is_none(),
-            "no session on this thread"
-        );
+        assert!(active_mcp_session().is_none(), "no session on this thread");
         assert_eq!(
             progress_target(),
             None,
@@ -25486,10 +25658,7 @@ mod tests {
         let _stdio = UpstreamTransportGuard::enter(UpstreamTransport::Stdio);
         // Thread-local, and libtest may reuse this thread for another test, so
         // assert the default rather than assuming it and leaving it changed.
-        assert!(
-            active_mcp_session().is_none(),
-            "no session on this thread"
-        );
+        assert!(active_mcp_session().is_none(), "no session on this thread");
         assert_eq!(
             progress_target().as_deref(),
             Some(RESOURCE_SUB_STDIO),
@@ -26726,11 +26895,7 @@ mod tests {
             Arc::make_mut(&mut guard).requarantine(set_of(&["srv__already_blocked"]));
         }
 
-        fail_closed_integrity_catalog(
-            &router,
-            Some("sbs714-gateway"),
-            set_of(&["srv__new_drift"]),
-        );
+        fail_closed_integrity_catalog(&router, Some("sbs714-gateway"), set_of(&["srv__new_drift"]));
 
         assert_eq!(
             router.lock().unwrap().quarantined(),
@@ -26888,9 +27053,7 @@ mod tests {
         let events = vec![json!({
             "server": "srv", "tool": "srv__wipe", "change": "poison", "severity": "high"
         })];
-        assert!(
-            conduit_lib::integrity::apply_quarantine(profile, &current, &events).unwrap()
-        );
+        assert!(conduit_lib::integrity::apply_quarantine(profile, &current, &events).unwrap());
 
         let mut reg = Registry::default();
         reg.quarantine_on_drift = true;
@@ -26939,10 +27102,8 @@ mod tests {
     #[test]
     fn watch_tick_http_mode_keeps_profile_none_after_registry_reload() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-http-profile-none-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("toolport-http-profile-none-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
 
@@ -27097,9 +27258,7 @@ mod tests {
         let events = vec![json!({
             "server": "srv", "tool": "srv__wipe", "change": "poison", "severity": "high"
         })];
-        assert!(
-            conduit_lib::integrity::apply_quarantine(profile, &current, &events).unwrap()
-        );
+        assert!(conduit_lib::integrity::apply_quarantine(profile, &current, &events).unwrap());
 
         let mut reg = Registry::default();
         reg.quarantine_on_drift = true;

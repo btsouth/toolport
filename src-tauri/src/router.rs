@@ -108,8 +108,8 @@ fn decode_task_id(exposed: &str) -> Result<(String, String), String> {
     let plain = cipher
         .decrypt(XNonce::from_slice(nonce), ciphertext)
         .map_err(|_| "task id was not issued by Toolport".to_string())?;
-    let (server, task): (String, String) = serde_json::from_slice(&plain)
-        .map_err(|_| "malformed Toolport task id".to_string())?;
+    let (server, task): (String, String) =
+        serde_json::from_slice(&plain).map_err(|_| "malformed Toolport task id".to_string())?;
     if server.is_empty() || task.is_empty() {
         return Err("malformed Toolport task id".to_string());
     }
@@ -147,7 +147,13 @@ fn retry_wait(retry_after: Option<std::time::Duration>, attempt: u32) -> std::ti
 /// (`[A-Za-z0-9_]`); every other character becomes `_`.
 pub fn sanitize_segment(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -314,7 +320,10 @@ fn has_ref(node: &Value) -> bool {
 /// pointer collapses to a permissive `{}` so NO `$ref` ever leaks to a consumer that
 /// can't resolve it. Cycles thus terminate with a wildcard rather than recursing.
 fn inline_node(node: &mut Value, root: &Value, active: &mut HashSet<String>) {
-    let ref_str = node.get("$ref").and_then(|v| v.as_str()).map(str::to_string);
+    let ref_str = node
+        .get("$ref")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     if let Some(r) = ref_str {
         let mut resolved = None;
         if let Some(ptr) = r.strip_prefix('#') {
@@ -477,9 +486,7 @@ impl ToolPolicy {
             return Some("blocked by the destructive-tool policy");
         }
         if self.fail_closed_catalog {
-            return Some(
-                "quarantine store unreadable; catalog blocked until the store reads",
-            );
+            return Some("quarantine store unreadable; catalog blocked until the store reads");
         }
         if self.quarantined.contains(exposed) {
             return Some("quarantined after a high-risk change; re-approve to restore");
@@ -636,7 +643,9 @@ impl Router {
     /// than string-splitting the exposed name on `__` — that split silently mis-derives the
     /// server for a renamed tool (overrides) or any server id containing `__`.
     pub fn route_of(&self, exposed: &str) -> Option<(&str, &str)> {
-        self.routes.get(exposed).map(|(s, t)| (s.as_str(), t.as_str()))
+        self.routes
+            .get(exposed)
+            .map(|(s, t)| (s.as_str(), t.as_str()))
     }
 
     /// Index one server's advertised tools/resources/templates/prompts into the
@@ -745,9 +754,11 @@ impl Router {
                         // The route may already have come from this server's MCP
                         // App tool metadata. Keep the explicit resource visible in
                         // resources/list, while still deduplicating repeated rows.
-                        if !self.resources.iter().any(|listed| {
-                            listed.get("uri").and_then(Value::as_str) == Some(uri)
-                        }) {
+                        if !self
+                            .resources
+                            .iter()
+                            .any(|listed| listed.get("uri").and_then(Value::as_str) == Some(uri))
+                        {
                             self.resources.push(resource.clone());
                         }
                     }
@@ -853,7 +864,11 @@ impl Router {
         let mut order: Vec<usize> = (0..items.len()).collect();
         // Ties (a server listing the same raw name twice) fall back to list
         // position, which keeps the sort total and the result reproducible.
-        order.sort_by(|&a, &b| raw_name(&items[a]).cmp(&raw_name(&items[b])).then(a.cmp(&b)));
+        order.sort_by(|&a, &b| {
+            raw_name(&items[a])
+                .cmp(&raw_name(&items[b]))
+                .then(a.cmp(&b))
+        });
         let mut out = vec![None; items.len()];
         for i in order {
             if let Some(orig) = raw_name(&items[i]) {
@@ -996,14 +1011,19 @@ impl Router {
             if server.tool_cache_hint().needs_refresh() {
                 kinds |= crate::downstream::change::TOOLS;
             }
-            if server.resource_cache_hint().is_some_and(|hint| hint.needs_refresh())
+            if server
+                .resource_cache_hint()
+                .is_some_and(|hint| hint.needs_refresh())
                 || server
                     .resource_template_cache_hint()
                     .is_some_and(|hint| hint.needs_refresh())
             {
                 kinds |= crate::downstream::change::RESOURCES;
             }
-            if server.prompt_cache_hint().is_some_and(|hint| hint.needs_refresh()) {
+            if server
+                .prompt_cache_hint()
+                .is_some_and(|hint| hint.needs_refresh())
+            {
                 kinds |= crate::downstream::change::PROMPTS;
             }
         }
@@ -1181,14 +1201,18 @@ impl Router {
                 self.blocked.insert(exposed.to_string(), reason.to_string());
                 continue;
             }
-            self.routes
-                .insert(exposed.to_string(), (server_id.to_string(), original.to_string()));
+            self.routes.insert(
+                exposed.to_string(),
+                (server_id.to_string(), original.to_string()),
+            );
             // Re-adopt the exposed tool entry so aggregated_tools() and the
             // quarantine/fingerprint paths see the restored tool, matching what
             // the cache advertises.
-            if !self.tools.iter().any(|t| {
-                t.get("name").and_then(Value::as_str) == Some(exposed)
-            }) {
+            if !self
+                .tools
+                .iter()
+                .any(|t| t.get("name").and_then(Value::as_str) == Some(exposed))
+            {
                 self.tools.push(tool.clone());
             }
             self.seen.insert(exposed.to_string());
@@ -1263,9 +1287,7 @@ impl Router {
     where
         F: FnMut(&mut DownstreamServer) -> Result<T, TransportError>,
     {
-        if !dispatch_cancelled_continuation
-            && cancel.is_some_and(CancelContext::is_cancelled)
-        {
+        if !dispatch_cancelled_continuation && cancel.is_some_and(CancelContext::is_cancelled) {
             return Err("request cancelled before downstream attempt".to_string());
         }
         // Circuit breaker: a server that just failed repeatedly is fast-failed here,
@@ -1292,13 +1314,14 @@ impl Router {
         };
         let mut attempt = 0u32;
         loop {
-            if !dispatch_cancelled_continuation
-                && cancel.is_some_and(CancelContext::is_cancelled)
-            {
+            if !dispatch_cancelled_continuation && cancel.is_some_and(CancelContext::is_cancelled) {
                 return Err("request cancelled before downstream attempt".to_string());
             }
             let result = {
-                let mut server = slot.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut server = slot
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 f(&mut server)
             };
             match result {
@@ -1309,7 +1332,10 @@ impl Router {
                         .record_success();
                     return Ok(v);
                 }
-                Err(TransportError::Retry { retry_after, message }) if attempt < HTTP_MAX_RETRIES => {
+                Err(TransportError::Retry {
+                    retry_after,
+                    message,
+                }) if attempt < HTTP_MAX_RETRIES => {
                     let wait = retry_wait(retry_after, attempt);
                     eprintln!("conduit: retrying downstream call after {wait:?}: {message}");
                     wait_for_retry_or_cancel(wait, cancel).map_err(|error| error.to_string())?;
@@ -1328,7 +1354,9 @@ impl Router {
                         // probe so a live server is never re-spawned on a transient blip.
                         if is_probe {
                             if cancel.is_some_and(CancelContext::is_cancelled) {
-                                return Err("request cancelled before downstream reconnect".to_string());
+                                return Err(
+                                    "request cancelled before downstream reconnect".to_string()
+                                );
                             }
                             if let Some(v) = self.reconnect_and_retry(slot, cancel, &mut f) {
                                 return v;
@@ -1362,7 +1390,10 @@ impl Router {
         let factory = slot.reconnect.as_ref()?;
         eprintln!("conduit: server '{}' is down; re-spawning it", slot.id);
         let Some(fresh) = factory() else {
-            eprintln!("conduit: re-spawn of '{}' failed; leaving it fast-failed", slot.id);
+            eprintln!(
+                "conduit: re-spawn of '{}' failed; leaving it fast-failed",
+                slot.id
+            );
             return None; // still unreachable: fall through to record_failure
         };
         if cancel.is_some_and(CancelContext::is_cancelled) {
@@ -1371,7 +1402,10 @@ impl Router {
             ));
         }
         let retry = {
-            let mut server = slot.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut server = slot
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *server = fresh; // swap the live child/connection for the fresh one
             f(&mut server)
         };
@@ -1450,25 +1484,18 @@ impl Router {
             cancel.as_ref(),
             mrtr.is_some_and(|request| !request.is_empty()),
             |server| {
-            let supports_tasks = server
-                .extensions()
-                .contains_key("io.modelcontextprotocol/tasks");
-            server
-                .call_with_cancel_and_mrtr(
-                    tool,
-                    arguments.clone(),
-                    cancel.clone(),
-                    meta,
-                    mrtr,
-                )
-                .map(|result| (result, supports_tasks))
+                let supports_tasks = server
+                    .extensions()
+                    .contains_key("io.modelcontextprotocol/tasks");
+                server
+                    .call_with_cancel_and_mrtr(tool, arguments.clone(), cancel.clone(), meta, mrtr)
+                    .map(|result| (result, supports_tasks))
             },
         )?;
         if result.get("resultType").and_then(Value::as_str) == Some("task") {
             if !client_supports_tasks(meta) {
                 return Err(
-                    "downstream returned a task without the required client capability"
-                        .to_string(),
+                    "downstream returned a task without the required client capability".to_string(),
                 );
             }
             if !downstream_supports_tasks {
@@ -1561,15 +1588,15 @@ impl Router {
 
     /// The server that owns resource template `uri_template`, if any.
     pub fn resource_template_server(&self, uri_template: &str) -> Option<&str> {
-        self.template_routes
-            .get(uri_template)
-            .map(String::as_str)
+        self.template_routes.get(uri_template).map(String::as_str)
     }
 
     /// The server that owns the exposed prompt `name`, if any. Used to scope a
     /// registered HTTP client's prompt access to its allowed server set.
     pub fn prompt_server(&self, exposed_name: &str) -> Option<&str> {
-        self.prompt_routes.get(exposed_name).map(|(s, _)| s.as_str())
+        self.prompt_routes
+            .get(exposed_name)
+            .map(|(s, _)| s.as_str())
     }
 
     /// The original (downstream) prompt name for an exposed prompt, if any.
@@ -1595,10 +1622,7 @@ impl Router {
     /// Resolve which server owns a `completion/complete` reference, and the
     /// params to forward (prompt names un-namespaced). Returns
     /// `(server_id, downstream_params)`.
-    pub fn resolve_completion(
-        &self,
-        params: &Value,
-    ) -> Result<(String, Value), String> {
+    pub fn resolve_completion(&self, params: &Value) -> Result<(String, Value), String> {
         let ref_obj = params
             .get("ref")
             .ok_or_else(|| "completion/complete requires params.ref".to_string())?;
@@ -1639,9 +1663,7 @@ impl Router {
                     .get(uri)
                     .cloned()
                     .or_else(|| self.resource_server(uri).map(str::to_string))
-                    .ok_or_else(|| {
-                        format!("no server owns resource template or uri '{uri}'")
-                    })?;
+                    .ok_or_else(|| format!("no server owns resource template or uri '{uri}'"))?;
                 Ok((server_id, forwarded))
             }
             other => Err(format!("unsupported completion ref type '{other}'")),
@@ -1680,9 +1702,7 @@ impl Router {
             &slot,
             cancel.as_ref(),
             mrtr.is_some_and(|request| !request.is_empty()),
-            |server| {
-            server.read_resource_with_cancel_and_mrtr(uri, cancel.clone(), meta, mrtr)
-            },
+            |server| server.read_resource_with_cancel_and_mrtr(uri, cancel.clone(), meta, mrtr),
         )
     }
 
@@ -1720,7 +1740,9 @@ impl Router {
         uri: &str,
     ) -> Result<Value, String> {
         let slot = self.slot_for(server_id)?;
-        self.call_with_retry(&slot, None, false, |server| server.unsubscribe_resource(uri))
+        self.call_with_retry(&slot, None, false, |server| {
+            server.unsubscribe_resource(uri)
+        })
     }
 
     /// Get a prompt by its exposed name, forwarding the server's real name.
@@ -1758,13 +1780,13 @@ impl Router {
             cancel.as_ref(),
             mrtr.is_some_and(|request| !request.is_empty()),
             |server| {
-            server.get_prompt_with_cancel_and_mrtr(
-                &name,
-                arguments.clone(),
-                cancel.clone(),
-                meta,
-                mrtr,
-            )
+                server.get_prompt_with_cancel_and_mrtr(
+                    &name,
+                    arguments.clone(),
+                    cancel.clone(),
+                    meta,
+                    mrtr,
+                )
             },
         )
     }
@@ -1848,7 +1870,7 @@ mod tests {
         b.record_failure(t0);
         b.record_failure(t0);
         b.record_success(); // a good call clears the streak
-        // Two failures alone no longer open it (needs THRESHOLD consecutive).
+                            // Two failures alone no longer open it (needs THRESHOLD consecutive).
         b.record_failure(t0);
         b.record_failure(t0);
         assert!(b.open_remaining(t0).is_none(), "success reset the streak");
@@ -1861,7 +1883,10 @@ mod tests {
     fn retry_wait_clamps_large_retry_after() {
         // A downstream advertising a huge Retry-After is clamped to our cap so it
         // can't pin the calling thread.
-        assert_eq!(retry_wait(Some(Duration::from_secs(3600)), 0), HTTP_RETRY_CAP);
+        assert_eq!(
+            retry_wait(Some(Duration::from_secs(3600)), 0),
+            HTTP_RETRY_CAP
+        );
         // A reasonable Retry-After under the cap is honored as-is.
         assert_eq!(
             retry_wait(Some(Duration::from_secs(2)), 0),
@@ -1975,7 +2000,9 @@ mod tests {
                 })),
                 "resources/read" => {
                     let uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
-                    Ok(json!({ "contents": [{ "uri": uri, "text": format!("{}-body", self.label) }] }))
+                    Ok(
+                        json!({ "contents": [{ "uri": uri, "text": format!("{}-body", self.label) }] }),
+                    )
                 }
                 "resources/subscribe" | "resources/unsubscribe" => {
                     let uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
@@ -1986,7 +2013,9 @@ mod tests {
                 })),
                 "prompts/get" => {
                     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    Ok(json!({ "messages": [{ "role": "user", "content": format!("{}:{}", self.label, name) }] }))
+                    Ok(
+                        json!({ "messages": [{ "role": "user", "content": format!("{}:{}", self.label, name) }] }),
+                    )
                 }
                 "completion/complete" => {
                     let ref_type = params
@@ -2069,11 +2098,8 @@ mod tests {
     }
 
     fn extension_server(id: &str, extensions: Value) -> DownstreamServer {
-        DownstreamServer::connect(
-            id.to_string(),
-            Box::new(ExtensionTransport { extensions }),
-        )
-        .unwrap()
+        DownstreamServer::connect(id.to_string(), Box::new(ExtensionTransport { extensions }))
+            .unwrap()
     }
 
     struct AppTransport {
@@ -2305,7 +2331,10 @@ mod tests {
                     }))
                 }
                 "tasks/get" => {
-                    self.seen.lock().unwrap().push((method.to_string(), params.clone()));
+                    self.seen
+                        .lock()
+                        .unwrap()
+                        .push((method.to_string(), params.clone()));
                     Ok(json!({
                         "resultType": "complete",
                         "taskId": params["taskId"],
@@ -2317,7 +2346,10 @@ mod tests {
                     }))
                 }
                 "tasks/update" | "tasks/cancel" => {
-                    self.seen.lock().unwrap().push((method.to_string(), params.clone()));
+                    self.seen
+                        .lock()
+                        .unwrap()
+                        .push((method.to_string(), params.clone()));
                     Ok(json!({ "resultType": "complete", "taskId": params["taskId"] }))
                 }
                 other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
@@ -2362,7 +2394,10 @@ mod tests {
             .unwrap();
         let alpha_id = alpha["taskId"].as_str().unwrap();
         let beta_id = beta["taskId"].as_str().unwrap();
-        assert_ne!(alpha_id, beta_id, "same native id on two servers must not collide");
+        assert_ne!(
+            alpha_id, beta_id,
+            "same native id on two servers must not collide"
+        );
         assert_eq!(router.task_server(alpha_id).as_deref(), Some("alpha"));
         assert_eq!(router.task_server(beta_id).as_deref(), Some("beta"));
         assert_eq!(
@@ -2372,7 +2407,11 @@ mod tests {
         );
         let mut tampered = alpha_id.to_string();
         let changed = TASK_HANDLE_PREFIX.len() + 5;
-        let replacement = if &tampered[changed..=changed] == "A" { "B" } else { "A" };
+        let replacement = if &tampered[changed..=changed] == "A" {
+            "B"
+        } else {
+            "A"
+        };
         tampered.replace_range(changed..=changed, replacement);
         assert!(
             router.task_server(&tampered).is_none(),
@@ -2412,15 +2451,28 @@ mod tests {
         assert_eq!(cancelled["taskId"], alpha_id);
 
         let seen = alpha_seen.lock().unwrap();
-        for (method, params) in seen.iter().filter(|(method, _)| method.starts_with("tasks/")) {
-            assert_eq!(params["taskId"], "same-native-id", "{method} must use native id");
+        for (method, params) in seen
+            .iter()
+            .filter(|(method, _)| method.starts_with("tasks/"))
+        {
+            assert_eq!(
+                params["taskId"], "same-native-id",
+                "{method} must use native id"
+            );
             assert_eq!(
                 params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
                     ["io.modelcontextprotocol/tasks"],
                 json!({})
             );
         }
-        assert!(router.route_task("tasks/get", json!({ "taskId": "forged" }), None, Some(&meta)).is_err());
+        assert!(router
+            .route_task(
+                "tasks/get",
+                json!({ "taskId": "forged" }),
+                None,
+                Some(&meta)
+            )
+            .is_err());
         assert!(router
             .route_task("tasks/get", json!({ "taskId": alpha_id }), None, None)
             .unwrap_err()
@@ -2537,7 +2589,12 @@ mod tests {
         // The live connection was swapped in, so subsequent calls hit the healthy one.
         assert!(slot.inner.lock().unwrap().call("echo", json!({})).is_ok());
         // A successful recovery closes the breaker.
-        assert!(slot.breaker.lock().unwrap().open_remaining(Instant::now()).is_none());
+        assert!(slot
+            .breaker
+            .lock()
+            .unwrap()
+            .open_remaining(Instant::now())
+            .is_none());
     }
 
     #[test]
@@ -2548,7 +2605,10 @@ mod tests {
         let slot = dead_slot(Some(Box::new(|| None)));
         let out: Option<Result<Value, String>> =
             router.reconnect_and_retry(&slot, None, &mut |ds| ds.call("echo", json!({})));
-        assert!(out.is_none(), "a failed re-spawn falls through to the breaker");
+        assert!(
+            out.is_none(),
+            "a failed re-spawn falls through to the breaker"
+        );
     }
 
     #[test]
@@ -2638,7 +2698,10 @@ mod tests {
         router.add(mock_server("postgres"));
         // Resources keep their server-scoped uris; the map resolves the owner.
         assert_eq!(router.resource_server("github://readme"), Some("github"));
-        assert_eq!(router.resource_server("postgres://readme"), Some("postgres"));
+        assert_eq!(
+            router.resource_server("postgres://readme"),
+            Some("postgres")
+        );
         assert_eq!(router.resource_server("unknown://x"), None);
         // Prompts resolve by their exposed (namespaced) name.
         let prompts = router.aggregated_prompts();
@@ -2694,7 +2757,10 @@ mod tests {
         let hint = public.tools_cache_hint().unwrap();
         assert!(hint.is_public());
         let ttl = hint.remaining_ttl_ms();
-        assert!(ttl > 0 && ttl <= 30_000, "minimum contributor TTL should win: {ttl}");
+        assert!(
+            ttl > 0 && ttl <= 30_000,
+            "minimum contributor TTL should win: {ttl}"
+        );
 
         let mut mixed = Router::new();
         mixed.add(hinted_server("public", 60_000, "public"));
@@ -2720,7 +2786,9 @@ mod tests {
         router.add(mock_server("github"));
         router.add(mock_server("postgres"));
 
-        let result = router.route_call("postgres__add", json!({ "a": 1 })).unwrap();
+        let result = router
+            .route_call("postgres__add", json!({ "a": 1 }))
+            .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, "postgres:add");
     }
@@ -2732,18 +2800,26 @@ mod tests {
         let mut srv = HashMap::new();
         srv.insert(
             "echo".to_string(),
-            ToolOverride { name: Some("say".into()), description: Some("say it back".into()) },
+            ToolOverride {
+                name: Some("say".into()),
+                description: Some("say it back".into()),
+            },
         );
         srv.insert(
             "add".to_string(),
-            ToolOverride { name: None, description: Some("cleaned".into()) },
+            ToolOverride {
+                name: None,
+                description: Some("cleaned".into()),
+            },
         );
         router.set_overrides(HashMap::from([("srv".to_string(), srv)]));
         router.add(mock_server("srv"));
 
         let tools = router.aggregated_tools();
-        let by_name: HashMap<&str, &Value> =
-            tools.iter().map(|t| (t["name"].as_str().unwrap(), t)).collect();
+        let by_name: HashMap<&str, &Value> = tools
+            .iter()
+            .map(|t| (t["name"].as_str().unwrap(), t))
+            .collect();
 
         // echo is renamed to "say" (its original exposed name is gone) and re-described.
         assert!(by_name.contains_key("say"));
@@ -2769,7 +2845,10 @@ mod tests {
         let mut srv = HashMap::new();
         srv.insert(
             "echo".to_string(),
-            ToolOverride { name: Some("say".into()), description: None },
+            ToolOverride {
+                name: Some("say".into()),
+                description: None,
+            },
         );
         let policy = ToolPolicy {
             quarantined: BTreeSet::from(["say".to_string()]),
@@ -2785,7 +2864,10 @@ mod tests {
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
             .collect();
-        assert!(!names.contains(&"say".to_string()), "quarantined rename must be hidden");
+        assert!(
+            !names.contains(&"say".to_string()),
+            "quarantined rename must be hidden"
+        );
         // ...and blocked on a direct call, with the quarantine reason.
         let err = router.route_call("say", json!({})).unwrap_err();
         assert!(err.contains("quarantine"), "unexpected: {err}");
@@ -2799,7 +2881,10 @@ mod tests {
         let mut srv = HashMap::new();
         srv.insert(
             "echo".to_string(),
-            ToolOverride { name: Some("say".into()), description: None },
+            ToolOverride {
+                name: Some("say".into()),
+                description: None,
+            },
         );
         let policy = ToolPolicy {
             quarantined: BTreeSet::from(["srv__echo".to_string()]),
@@ -2810,7 +2895,10 @@ mod tests {
         router.add(mock_server("srv"));
 
         assert_eq!(router.route_of("say"), Some(("srv", "echo")));
-        assert!(router.route_call("say", json!({})).is_ok(), "stale entry must not block");
+        assert!(
+            router.route_call("say", json!({})).is_ok(),
+            "stale entry must not block"
+        );
     }
 
     #[test]
@@ -2836,7 +2924,10 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert(
             "echo".to_string(),
-            ToolOverride { name: Some("search".into()), description: None },
+            ToolOverride {
+                name: Some("search".into()),
+                description: None,
+            },
         );
         let mut router = Router::new();
         router.set_overrides(HashMap::from([("srv".to_string(), overrides)]));
@@ -2859,7 +2950,10 @@ mod tests {
 
         // The persisted set the watcher reads carries the renamed name...
         let persisted = integrity::quarantined(profile).expect("quarantine store readable");
-        assert!(persisted.contains("search"), "quarantine is keyed by the exposed name");
+        assert!(
+            persisted.contains("search"),
+            "quarantine is keyed by the exposed name"
+        );
 
         // ...and feeding it to the router hides and blocks the renamed tool.
         router.requarantine(persisted);
@@ -2868,9 +2962,15 @@ mod tests {
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
             .collect();
-        assert!(!visible.contains(&"search".to_string()), "quarantined rename must be hidden");
+        assert!(
+            !visible.contains(&"search".to_string()),
+            "quarantined rename must be hidden"
+        );
         let err = router.route_call("search", json!({})).unwrap_err();
-        assert!(err.contains("quarantine"), "a call to a quarantined rename must block: {err}");
+        assert!(
+            err.contains("quarantine"),
+            "a call to a quarantined rename must block: {err}"
+        );
 
         // Re-approve: release clears the persisted set and the router restores the tool.
         assert!(
@@ -2878,7 +2978,10 @@ mod tests {
             "release must clear the entry"
         );
         let after = integrity::quarantined(profile).expect("quarantine store readable");
-        assert!(!after.contains("search"), "a released tool leaves the persisted set");
+        assert!(
+            !after.contains("search"),
+            "a released tool leaves the persisted set"
+        );
         router.requarantine(after);
         assert!(
             router.route_call("search", json!({})).is_ok(),
@@ -2898,7 +3001,10 @@ mod tests {
         let mut router = Router::new();
         let srv = HashMap::from([(
             "add".to_string(),
-            ToolOverride { name: Some("srv__echo".into()), description: None },
+            ToolOverride {
+                name: Some("srv__echo".into()),
+                description: None,
+            },
         )]);
         router.set_overrides(HashMap::from([("srv".to_string(), srv)]));
         router.add(mock_server("srv"));
@@ -2907,8 +3013,14 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"srv__echo"), "the real echo keeps the name");
         assert!(names.contains(&"srv__add"), "add fell back to its own name");
-        assert_eq!(router.route_call("srv__echo", json!({})).unwrap()["content"][0]["text"], "srv:echo");
-        assert_eq!(router.route_call("srv__add", json!({})).unwrap()["content"][0]["text"], "srv:add");
+        assert_eq!(
+            router.route_call("srv__echo", json!({})).unwrap()["content"][0]["text"],
+            "srv:echo"
+        );
+        assert_eq!(
+            router.route_call("srv__add", json!({})).unwrap()["content"][0]["text"],
+            "srv:add"
+        );
     }
 
     #[test]
@@ -2919,14 +3031,29 @@ mod tests {
         let mut router = Router::new();
         let srv = HashMap::from([(
             "echo".to_string(),
-            ToolOverride { name: Some("say".into()), description: None },
+            ToolOverride {
+                name: Some("say".into()),
+                description: None,
+            },
         )]);
         router.set_overrides(HashMap::from([("srv".to_string(), srv)]));
         router.add(mock_server("srv"));
 
-        assert_eq!(router.route_of("say"), Some(("srv", "echo")), "renamed tool resolves to origin");
-        assert_eq!(router.route_of("srv__add"), Some(("srv", "add")), "normal tool resolves");
-        assert_eq!(router.route_of("nope"), None, "unknown name resolves to nothing");
+        assert_eq!(
+            router.route_of("say"),
+            Some(("srv", "echo")),
+            "renamed tool resolves to origin"
+        );
+        assert_eq!(
+            router.route_of("srv__add"),
+            Some(("srv", "add")),
+            "normal tool resolves"
+        );
+        assert_eq!(
+            router.route_of("nope"),
+            None,
+            "unknown name resolves to nothing"
+        );
     }
 
     /// A transport that advertises `n` tools (`t0`..`t(n-1)`) and echoes calls
@@ -3002,17 +3129,21 @@ mod tests {
         rebuilt.adopt_restored_routes(&previous, &guarded);
 
         // Every advertised tool now routes, to the ORIGINAL downstream name.
-        assert_eq!(rebuilt.route_of("atlassian__t39"), Some(("atlassian", "t39")));
-        assert_eq!(rebuilt.route_of("atlassian__t37"), Some(("atlassian", "t37")));
+        assert_eq!(
+            rebuilt.route_of("atlassian__t39"),
+            Some(("atlassian", "t39"))
+        );
+        assert_eq!(
+            rebuilt.route_of("atlassian__t37"),
+            Some(("atlassian", "t37"))
+        );
         assert_eq!(
             rebuilt.route_of("github__t4"),
             Some(("github", "t4")),
             "healthy server's own routes are untouched"
         );
         // A call to one of the 37 restored tools reaches the downstream server.
-        let result = rebuilt
-            .route_call("atlassian__t39", json!({}))
-            .unwrap();
+        let result = rebuilt.route_call("atlassian__t39", json!({})).unwrap();
         assert_eq!(
             result["content"][0]["text"].as_str().unwrap(),
             "atlassian:t39",
@@ -3149,9 +3280,13 @@ mod tests {
 
     #[test]
     fn is_destructive_reads_annotations() {
-        assert!(is_destructive(&json!({ "annotations": { "destructiveHint": true } })));
+        assert!(is_destructive(
+            &json!({ "annotations": { "destructiveHint": true } })
+        ));
         assert!(is_destructive(&json!({ "destructiveHint": true }))); // top-level fallback
-        assert!(!is_destructive(&json!({ "annotations": { "destructiveHint": false } })));
+        assert!(!is_destructive(
+            &json!({ "annotations": { "destructiveHint": false } })
+        ));
         assert!(!is_destructive(&json!({ "name": "x" })));
     }
 
@@ -3186,9 +3321,10 @@ mod tests {
     #[test]
     fn disabled_tool_is_hidden_and_blocked() {
         let mut policy = ToolPolicy::default();
-        policy
-            .disabled
-            .insert("github".to_string(), ["echo".to_string()].into_iter().collect());
+        policy.disabled.insert(
+            "github".to_string(),
+            ["echo".to_string()].into_iter().collect(),
+        );
         let mut router = Router::with_policy(policy);
         router.add(mock_server("github"));
 
@@ -3341,7 +3477,12 @@ mod tests {
         router.add(mock_server("github"));
 
         assert!(router.block_reason("github__add").is_none());
-        assert_eq!(router.block_reason("github__echo").map(|r| r.contains("quarantined")), Some(true));
+        assert_eq!(
+            router
+                .block_reason("github__echo")
+                .map(|r| r.contains("quarantined")),
+            Some(true)
+        );
         let err = router.route_call("github__echo", json!({})).unwrap_err();
         assert!(err.contains("quarantined"), "unexpected: {err}");
     }
@@ -3496,10 +3637,7 @@ mod tests {
                 "argument": { "name": "topic", "value": "py" }
             }))
             .unwrap();
-        assert_eq!(
-            prompt["completion"]["values"][0],
-            "github:prompt:greet:py"
-        );
+        assert_eq!(prompt["completion"]["values"][0], "github:prompt:greet:py");
 
         // Resource-template completion: routes by uriTemplate ownership.
         let resource = router
@@ -3524,10 +3662,7 @@ mod tests {
             "fixture://item/06/extra",
             "fixture://item/{id}"
         ));
-        assert!(uri_matches_template(
-            "file:///a/b/c.txt",
-            "file:///{+path}"
-        ));
+        assert!(uri_matches_template("file:///a/b/c.txt", "file:///{+path}"));
         assert!(!uri_matches_template("other://x", "fixture://item/{id}"));
     }
 
@@ -3654,7 +3789,11 @@ mod tests {
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
             .collect();
-        assert_eq!(names, vec!["db__echo"], "only the allow-listed tool is exposed");
+        assert_eq!(
+            names,
+            vec!["db__echo"],
+            "only the allow-listed tool is exposed"
+        );
 
         // Hidden, and also blocked on a direct call (not merely invisible).
         let err = router.route_call("db__add", json!({})).unwrap_err();
@@ -3695,7 +3834,11 @@ mod tests {
         let before = names(&router);
         assert_eq!(before, vec!["s__a_b", "s__a_b_2"]);
         router.refresh_tools();
-        assert_eq!(names(&router), before, "refresh shuffled the collision suffixes");
+        assert_eq!(
+            names(&router),
+            before,
+            "refresh shuffled the collision suffixes"
+        );
     }
 
     #[test]
@@ -3834,7 +3977,9 @@ mod tests {
                         })
                     } else {
                         let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        Ok(json!({ "messages": [{ "role": "user", "content": format!("gp:{name}") }] }))
+                        Ok(
+                            json!({ "messages": [{ "role": "user", "content": format!("gp:{name}") }] }),
+                        )
                     }
                 }
                 other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
@@ -3850,7 +3995,9 @@ mod tests {
         fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
             match method {
                 "initialize" => Ok(json!({ "protocolVersion": "2025-06-18" })),
-                "tools/list" => Ok(json!({ "tools": [{ "name": "boom", "description": "always fails" }] })),
+                "tools/list" => {
+                    Ok(json!({ "tools": [{ "name": "boom", "description": "always fails" }] }))
+                }
                 "tools/call" => Err(TransportError::Fatal("HTTP 500: server error".to_string())),
                 other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
             }
@@ -3860,7 +4007,12 @@ mod tests {
         }
     }
 
-    fn retry_server(id: &str, tool_failures: u32, resource_failures: u32, prompt_failures: u32) -> DownstreamServer {
+    fn retry_server(
+        id: &str,
+        tool_failures: u32,
+        resource_failures: u32,
+        prompt_failures: u32,
+    ) -> DownstreamServer {
         let mut ds = DownstreamServer::connect(
             id.to_string(),
             Box::new(RetryMock {
@@ -3940,7 +4092,10 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(10));
         let fast_result = router.route_call("fast__echo", json!({}));
-        assert!(fast_result.is_ok(), "fast server should not block behind slow retry");
+        assert!(
+            fast_result.is_ok(),
+            "fast server should not block behind slow retry"
+        );
 
         let slow_result = handle.join().unwrap();
         assert!(slow_result.is_ok(), "slow server should eventually succeed");
@@ -3966,7 +4121,10 @@ mod tests {
         // Call the stable tool on the SAME server. If the fix is correct, the
         // lock was released during the backoff sleep, so this succeeds immediately.
         let result_b = router.route_call("srv__stable", json!({}));
-        assert!(result_b.is_ok(), "same-server call should succeed during backoff sleep");
+        assert!(
+            result_b.is_ok(),
+            "same-server call should succeed during backoff sleep"
+        );
         let result = result_b.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, "stable-ok");
@@ -4004,7 +4162,11 @@ mod tests {
         while entries.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
             std::thread::yield_now();
         }
-        assert_eq!(entries.load(Ordering::SeqCst), 1, "first attempt must run once");
+        assert_eq!(
+            entries.load(Ordering::SeqCst),
+            1,
+            "first attempt must run once"
+        );
         assert!(cancellations.cancel("cancel-retry-1", Some("user pressed stop")));
 
         let error = handle.join().unwrap().unwrap_err();
@@ -4019,7 +4181,10 @@ mod tests {
             breaker.consecutive_failures, 0,
             "upstream cancellation must not count as a downstream health failure"
         );
-        assert!(breaker.open_until.is_none(), "cancellation must leave the breaker closed");
+        assert!(
+            breaker.open_until.is_none(),
+            "cancellation must leave the breaker closed"
+        );
         cancellations.finish_client_request("cancel-retry-1");
     }
 }

@@ -262,7 +262,10 @@ fn split_spec(spec: &str) -> Option<(String, Option<String>)> {
     }
     let (name, version) = if let Some(rest) = spec.strip_prefix('@') {
         match rest.find('@') {
-            Some(idx) => (format!("@{}", &rest[..idx]), Some(rest[idx + 1..].to_string())),
+            Some(idx) => (
+                format!("@{}", &rest[..idx]),
+                Some(rest[idx + 1..].to_string()),
+            ),
             None => (spec.to_string(), None),
         }
     } else {
@@ -744,8 +747,11 @@ mod tests {
     #[test]
     fn parses_scoped_names_versions_and_windows_shims() {
         // A scoped name keeps its scope; the version splits off the second `@`.
-        let plan = parse_launcher("npx.CMD", &s(&["-y", "@scope/server@1.2.3", "--port", "8080"]))
-            .expect("scoped spec must parse");
+        let plan = parse_launcher(
+            "npx.CMD",
+            &s(&["-y", "@scope/server@1.2.3", "--port", "8080"]),
+        )
+        .expect("scoped spec must parse");
         assert_eq!(plan.package, "@scope/server");
         assert_eq!(plan.requested_version.as_deref(), Some("1.2.3"));
         assert_eq!(plan.forwarded, s(&["--port", "8080"]));
@@ -900,8 +906,8 @@ mod tests {
         fx.package("rel", "srv", "1.4.0", serde_json::json!("index.js"));
         let node = fx.node();
 
-        let direct =
-            resolve_fixture("npx", &s(&["srv"]), &fx.roots(), &node).expect("cached package resolves");
+        let direct = resolve_fixture("npx", &s(&["srv"]), &fx.roots(), &node)
+            .expect("cached package resolves");
         assert!(
             direct.args[0].replace('\\', "/").contains("/rel/"),
             "expected the 1.4.0 release copy, got {}",
@@ -931,7 +937,12 @@ mod tests {
     #[test]
     fn falls_back_when_the_package_is_not_cached_or_the_entry_is_missing() {
         let fx = Fixture::new("missing");
-        fx.package("h", "srv", "1.0.0", serde_json::json!({ "srv": "bin/cli.js" }));
+        fx.package(
+            "h",
+            "srv",
+            "1.0.0",
+            serde_json::json!({ "srv": "bin/cli.js" }),
+        );
         let node = fx.node();
 
         // Never installed.
@@ -989,7 +1000,12 @@ mod tests {
     fn only_javascript_entries_are_rewritten() {
         let fx = Fixture::new("nonjs");
         // A package whose bin is a shell script, not something node can run.
-        fx.package("h", "srv", "1.0.0", serde_json::json!({ "srv": "bin/cli.sh" }));
+        fx.package(
+            "h",
+            "srv",
+            "1.0.0",
+            serde_json::json!({ "srv": "bin/cli.sh" }),
+        );
         assert!(resolve_fixture("npx", &s(&["srv"]), &fx.roots(), &fx.node()).is_none());
     }
 
@@ -1009,7 +1025,10 @@ IF EXIST "%dp0%\node.exe" (
 endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\..\toolport-mcp-servers\bin\cli.js" %*
 "#;
         let found = shim_script_candidates(shim);
-        assert_eq!(found, vec!["..\\toolport-mcp-servers\\bin\\cli.js".to_string()]);
+        assert_eq!(
+            found,
+            vec!["..\\toolport-mcp-servers\\bin\\cli.js".to_string()]
+        );
         // node.exe references are not .js and must not be mistaken for the entry.
         assert!(!found.iter().any(|f| f.contains("node.exe")));
     }
@@ -1050,10 +1069,12 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\..\to
             &["..\\pkg\\bin\\cli.js"],
         );
 
-        let direct = resolve_shim(&shim, &s(&["--flag"]), &node, &host_lookup)
-            .expect("shim must resolve");
+        let direct =
+            resolve_shim(&shim, &s(&["--flag"]), &node, &host_lookup).expect("shim must resolve");
         assert_eq!(direct.command, node.to_string_lossy());
-        assert!(direct.args[0].replace('\\', "/").ends_with("pkg/bin/cli.js"));
+        assert!(direct.args[0]
+            .replace('\\', "/")
+            .ends_with("pkg/bin/cli.js"));
         assert_eq!(direct.args[1], "--flag", "shim args pass through");
     }
 
@@ -1086,7 +1107,10 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\..\to
             "@ECHO off\r\n\"%dp0%\\..\\..\\outside.js\" %*\r\n",
             &[],
         );
-        assert!(outside.is_file(), "the decoy must exist for this to prove anything");
+        assert!(
+            outside.is_file(),
+            "the decoy must exist for this to prove anything"
+        );
         assert!(resolve_shim(&shim, &[], &node, &host_lookup).is_none());
     }
 
@@ -1104,11 +1128,8 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\..\to
 
     #[test]
     fn a_shim_relative_path_climbs_out_of_dot_bin() {
-        let joined = safe_join_shim(
-            Path::new("/root/node_modules/.bin"),
-            "..\\pkg\\bin\\cli.js",
-        )
-        .expect("npm shims legitimately use ..");
+        let joined = safe_join_shim(Path::new("/root/node_modules/.bin"), "..\\pkg\\bin\\cli.js")
+            .expect("npm shims legitimately use ..");
         assert_eq!(
             joined.to_string_lossy().replace('\\', "/"),
             "/root/node_modules/pkg/bin/cli.js"

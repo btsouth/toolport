@@ -25,9 +25,12 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use fs2::FileExt;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
+#[cfg(feature = "desktop")]
 use tauri::{AppHandle, Emitter, Manager};
+#[cfg(feature = "desktop")]
 use tauri_plugin_notification::NotificationExt;
 
 use crate::approval::{
@@ -81,6 +84,9 @@ struct Inner {
     /// Fingerprints the user dismissed this app run; a re-publish of the same definition
     /// stays out of the list instead of nagging.
     dismissed_suggestions: Mutex<HashSet<String>>,
+    /// Held for the broker lifetime so two desktop shells cannot replace each
+    /// other's endpoint or Unix socket during a simultaneous startup.
+    _owner_lock: Option<std::fs::File>,
 }
 
 /// Cap on simultaneously-pending approvals, so a misbehaving client can't grow the
@@ -180,7 +186,39 @@ pub struct ApprovalBroker {
     inner: Arc<Inner>,
 }
 
+#[derive(Clone)]
+struct BrokerHost {
+    persistent_allowed: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    pending: Arc<dyn Fn(&PendingView) + Send + Sync>,
+    resolved: Arc<dyn Fn(&str) + Send + Sync>,
+    suggestion: Arc<dyn Fn() + Send + Sync>,
+}
+
+#[cfg_attr(
+    all(feature = "gtk-desktop", not(feature = "desktop")),
+    allow(dead_code)
+)]
 impl ApprovalBroker {
+    pub fn owns_endpoint(&self) -> bool {
+        self.inner._owner_lock.is_some()
+    }
+
+    /// Remove only the endpoint owned by this broker instance.
+    pub fn clear_endpoint(&self) {
+        if !self.owns_endpoint() {
+            return;
+        }
+        if let Some(dir) = crate::registry::conduit_dir() {
+            if std::fs::remove_file(dir.join(ENDPOINT_FILE)).is_ok() {
+                log_broker_event("endpoint descriptor cleared on shutdown");
+            }
+        }
+        #[cfg(unix)]
+        if let Some(path) = unix_socket_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// Snapshot the pending queue for the UI.
     pub fn list(&self) -> Vec<PendingView> {
         self.inner
@@ -337,11 +375,54 @@ impl ApprovalBroker {
 /// the Tauri commands have state to bind to; if binding/publishing fails, the broker is
 /// inert (no listener) and HITL simply never receives approvals - gateways then fail
 /// closed on their own (a connect to nothing denies). Never panics.
+#[cfg(feature = "desktop")]
 pub fn start(app: AppHandle) -> ApprovalBroker {
+    let allowed_app = app.clone();
+    let pending_app = app.clone();
+    let resolved_app = app.clone();
+    let suggestion_app = app;
+    start_with_host(BrokerHost {
+        persistent_allowed: Arc::new(move |key| registry_allows(&allowed_app, key)),
+        pending: Arc::new(move |view| {
+            let _ = pending_app.emit("approval-pending", view);
+            notify_pending(&pending_app, view);
+        }),
+        resolved: Arc::new(move |id| {
+            let _ = resolved_app.emit("approval-resolved", id);
+        }),
+        suggestion: Arc::new(move || {
+            let _ = suggestion_app.emit("routine-suggestion", serde_json::json!({}));
+        }),
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "gtk-desktop"))]
+pub fn start_native() -> ApprovalBroker {
+    start_with_host(BrokerHost {
+        persistent_allowed: Arc::new(|key| {
+            crate::registry::load()
+                .map(|registry| registry.is_tool_allowed(key))
+                .unwrap_or(false)
+        }),
+        pending: Arc::new(|_| {}),
+        resolved: Arc::new(|_| {}),
+        suggestion: Arc::new(|| {}),
+    })
+}
+
+fn start_with_host(host: BrokerHost) -> ApprovalBroker {
     let mut tok = [0u8; 24];
     let token: String = match getrandom::getrandom(&mut tok) {
         Ok(()) => tok.iter().map(|b| format!("{b:02x}")).collect(),
         Err(_) => String::new(),
+    };
+    if existing_broker_is_live() {
+        log_broker_event("another Toolport process already owns the approval endpoint");
+        return inert_broker(token);
+    }
+    let Some(owner_lock) = acquire_owner_lock() else {
+        log_broker_event("another Toolport process is starting the approval broker");
+        return inert_broker(token);
     };
     let broker = ApprovalBroker {
         inner: Arc::new(Inner {
@@ -350,6 +431,7 @@ pub fn start(app: AppHandle) -> ApprovalBroker {
             session_allow: Mutex::new(HashSet::new()),
             suggestions: Mutex::new(Vec::new()),
             dismissed_suggestions: Mutex::new(HashSet::new()),
+            _owner_lock: Some(owner_lock),
         }),
     };
 
@@ -402,20 +484,66 @@ pub fn start(app: AppHandle) -> ApprovalBroker {
             let active_workers = Arc::new(AtomicUsize::new(0));
             for listener in bound.listeners {
                 let b = broker.clone();
-                let a = app.clone();
+                let host = host.clone();
                 let workers = Arc::clone(&active_workers);
-                std::thread::spawn(move || accept_loop(listener, b, a, workers));
+                std::thread::spawn(move || accept_loop(listener, b, host, workers));
             }
         }
         None => {
             // Inert broker: HITL never fires and every gateway fails closed. Say so in
             // the log, since "no prompt ever appears" is otherwise a silent mystery.
-            log_broker_event(
-                "could not bind a loopback listener; HITL fails closed until restart",
-            );
+            log_broker_event("could not bind a loopback listener; HITL fails closed until restart");
         }
     }
     broker
+}
+
+fn inert_broker(token: String) -> ApprovalBroker {
+    ApprovalBroker {
+        inner: Arc::new(Inner {
+            token,
+            pending: Mutex::new(HashMap::new()),
+            session_allow: Mutex::new(HashSet::new()),
+            suggestions: Mutex::new(Vec::new()),
+            dismissed_suggestions: Mutex::new(HashSet::new()),
+            _owner_lock: None,
+        }),
+    }
+}
+
+fn acquire_owner_lock() -> Option<std::fs::File> {
+    let dir = crate::registry::conduit_dir()?.join("broker");
+    acquire_owner_lock_at(&dir)
+}
+
+fn acquire_owner_lock_at(dir: &std::path::Path) -> Option<std::fs::File> {
+    std::fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(dir.join("owner.lock"))
+        .ok()?;
+    file.try_lock_exclusive().ok()?;
+    Some(file)
+}
+
+fn existing_broker_is_live() -> bool {
+    let Some(path) = crate::registry::conduit_dir().map(|dir| dir.join(ENDPOINT_FILE)) else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(descriptor) = serde_json::from_str::<EndpointDescriptor>(&raw) else {
+        return false;
+    };
+    crate::approval::dial_broker(&descriptor).is_ok()
 }
 
 /// Accept on one listener until it errors out for good, handing each connection to a
@@ -423,7 +551,7 @@ pub fn start(app: AppHandle) -> ApprovalBroker {
 fn accept_loop(
     listener: Listener,
     broker: ApprovalBroker,
-    app: AppHandle,
+    host: BrokerHost,
     active_workers: Arc<AtomicUsize>,
 ) {
     loop {
@@ -442,12 +570,12 @@ fn accept_loop(
             continue;
         };
         let b = broker.clone();
-        let a = app.clone();
+        let host = host.clone();
         let _ = std::thread::Builder::new()
             .name("toolport-approval".into())
             .spawn(move || {
                 let _permit = permit;
-                handle_conn(conn, b, a);
+                handle_conn(conn, b, host);
             });
     }
 }
@@ -510,9 +638,7 @@ fn bind_listeners() -> Option<Bound> {
             listeners.push(listener);
             unix_endpoint = Some(endpoint);
         }
-        Err(e) => log_broker_event(&format!(
-            "unix socket unavailable ({e}); loopback TCP only"
-        )),
+        Err(e) => log_broker_event(&format!("unix socket unavailable ({e}); loopback TCP only")),
     }
     Some(Bound {
         listeners,
@@ -560,22 +686,6 @@ fn bind_unix_listener() -> io::Result<(Listener, String)> {
 /// failure never touches an approval decision.
 fn log_broker_event(msg: &str) {
     crate::gatewaylog::append(&format!("[broker] {msg}"));
-}
-
-/// Best-effort removal of the endpoint descriptor on app shutdown, so a gateway that dials
-/// after the app is gone reads no descriptor (a clean `Unreachable`) instead of connecting
-/// to a dead port left behind. Safe to call when none exists. Call ONLY on final exit, not
-/// on a cancelable exit-request: while the broker is still bound the descriptor must stand.
-pub fn clear_endpoint() {
-    if let Some(dir) = crate::registry::conduit_dir() {
-        if std::fs::remove_file(dir.join(ENDPOINT_FILE)).is_ok() {
-            log_broker_event("endpoint descriptor cleared on shutdown");
-        }
-    }
-    #[cfg(unix)]
-    if let Some(path) = unix_socket_path() {
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 /// What the broker can settle about a request before a human is involved.
@@ -628,7 +738,7 @@ fn preflight(
 
 /// Serve one gateway connection: read the request, authenticate it, park it for a human
 /// decision (or a fail-closed timeout), and write the decision back.
-fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, app: AppHandle) {
+fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, host: BrokerHost) {
     // Read the request promptly; a slow/stalled sender must not tie up a thread.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
@@ -676,7 +786,7 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, app: AppHandle) {
             return;
         }
         if broker.push_suggestion(envelope.suggestion) {
-            let _ = app.emit("routine-suggestion", serde_json::json!({}));
+            (host.suggestion)();
         }
         let _ = writeln!(out, "\"ok\"");
         return;
@@ -698,7 +808,7 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, app: AppHandle) {
     };
 
     match preflight(&req, &broker.inner.token, |key| {
-        broker.session_contains(key) || registry_allows(&app, key)
+        broker.session_contains(key) || (host.persistent_allowed)(key)
     }) {
         Preflight::Deny => {
             deny(&mut out);
@@ -757,12 +867,8 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, app: AppHandle) {
         );
     }
 
-    // Surface it to the UI (best-effort; the poll-based list() is the source of truth).
-    let _ = app.emit("approval-pending", &view);
-    // The call BLOCKS and auto-denies on timeout, so a person who isn't looking at the
-    // (often backgrounded) app would silently miss it. Raise an OS notification and flash
-    // the taskbar so the pending decision is noticed while there's still time to make it.
-    notify_pending(&app, &view);
+    // Surface it to the active shell. The poll-based list remains the source of truth.
+    (host.pending)(&view);
 
     // Block for the human decision or the fail-closed timeout.
     let decision = rx
@@ -775,7 +881,7 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, app: AppHandle) {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .remove(&req.id);
-    let _ = app.emit("approval-resolved", &req.id);
+    (host.resolved)(&req.id);
 
     let _ = out.set_write_timeout(Some(Duration::from_secs(10)));
     let _ = writeln!(
@@ -787,6 +893,7 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, app: AppHandle) {
 
 /// Whether the tool `key` is on the registry's persistent always-allow list. Reads the
 /// app-managed registry state; false if unavailable.
+#[cfg(feature = "desktop")]
 fn registry_allows(app: &AppHandle, key: &str) -> bool {
     app.try_state::<Mutex<crate::registry::Registry>>()
         .map(|s| {
@@ -801,6 +908,7 @@ fn registry_allows(app: &AppHandle, key: &str) -> bool {
 /// flash on the main window. Best-effort and non-blocking - if either fails (permission
 /// off, no window) the in-app overlay is still the source of truth. We flash rather than
 /// force-focus so we don't yank the user out of what they're doing.
+#[cfg(feature = "desktop")]
 fn notify_pending(app: &AppHandle, view: &PendingView) {
     let who = view
         .client
@@ -824,12 +932,7 @@ fn notify_pending(app: &AppHandle, view: &PendingView) {
             ),
         )
     };
-    let _ = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .show();
+    let _ = app.notification().builder().title(title).body(body).show();
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.request_user_attention(Some(tauri::UserAttentionType::Critical));
     }
@@ -847,6 +950,7 @@ mod tests {
                 session_allow: Mutex::new(HashSet::new()),
                 suggestions: Mutex::new(Vec::new()),
                 dismissed_suggestions: Mutex::new(HashSet::new()),
+                _owner_lock: None,
             }),
         }
     }
@@ -995,6 +1099,77 @@ mod tests {
         assert!(!token_eq("token123", "token124"));
         assert!(!token_eq("token123", "token1234"));
         assert!(!token_eq("", "token123"));
+    }
+
+    #[test]
+    fn owner_lock_allows_only_one_broker() {
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-broker-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = acquire_owner_lock_at(&dir).expect("first broker owns the lock");
+        assert!(
+            acquire_owner_lock_at(&dir).is_none(),
+            "a second broker must not replace the first"
+        );
+        drop(first);
+        assert!(
+            acquire_owner_lock_at(&dir).is_some(),
+            "the lock must be reusable after shutdown"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn shell_neutral_host_observes_pending_and_resolved_lifecycle() {
+        let broker = broker();
+        let (pending_tx, pending_rx) = channel::<String>();
+        let (resolved_tx, resolved_rx) = channel::<String>();
+        let host = BrokerHost {
+            persistent_allowed: Arc::new(|_| false),
+            pending: Arc::new(move |view| {
+                let _ = pending_tx.send(view.id.clone());
+            }),
+            resolved: Arc::new(move |id| {
+                let _ = resolved_tx.send(id.to_string());
+            }),
+            suggestion: Arc::new(|| {}),
+        };
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let serving = broker.clone();
+        let worker =
+            std::thread::spawn(move || handle_conn(BrokerStream::Tcp(server), serving, host));
+
+        writeln!(
+            client,
+            "{}",
+            serde_json::to_string(&request("tok", Some("v2:abc"))).unwrap()
+        )
+        .unwrap();
+        client.flush().unwrap();
+        assert_eq!(
+            pending_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "req-1"
+        );
+        broker.decide("req-1", true).unwrap();
+        assert_eq!(
+            resolved_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "req-1"
+        );
+        let mut decision = String::new();
+        BufReader::new(client).read_line(&mut decision).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ApprovalDecision>(decision.trim()).unwrap(),
+            ApprovalDecision::Approved
+        );
+        worker.join().unwrap();
     }
 
     #[test]
@@ -1164,6 +1339,9 @@ mod tests {
         let rx = park(&b, "z");
         let view = b.decide("z", true).unwrap();
         assert_eq!(view.tool, "drop");
-        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), ApprovalDecision::Approved);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ApprovalDecision::Approved
+        );
     }
 }

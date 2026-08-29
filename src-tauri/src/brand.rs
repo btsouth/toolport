@@ -178,10 +178,7 @@ mod tests {
 
     #[test]
     fn data_dir_uses_new_leaf_when_present() {
-        let root = std::env::temp_dir().join(format!(
-            "toolport-brand-new-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("toolport-brand-new-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join(data_dir_leaf_name())).unwrap();
         fs::create_dir_all(root.join(legacy_data_dir_leaf_name())).unwrap();
@@ -192,10 +189,8 @@ mod tests {
 
     #[test]
     fn data_dir_keeps_legacy_until_migrated() {
-        let root = std::env::temp_dir().join(format!(
-            "toolport-brand-legacy-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("toolport-brand-legacy-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let legacy = root.join(legacy_data_dir_leaf_name());
         fs::create_dir_all(&legacy).unwrap();
@@ -214,10 +209,8 @@ mod tests {
 
     #[test]
     fn data_dir_fresh_install_targets_new_leaf() {
-        let root = std::env::temp_dir().join(format!(
-            "toolport-brand-fresh-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("toolport-brand-fresh-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let resolved = resolve_data_dir_under(&root);

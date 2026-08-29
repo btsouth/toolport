@@ -56,19 +56,31 @@ pub struct CatalogEntry {
 /// entry list itself untouched; the UI orders the sections, not the arm order here.
 fn category_for(name: &str) -> &'static str {
     match name {
-        "GitHub" | "Vercel" | "Sentry" | "Cloudflare Docs" | "AWS" | "Kubernetes" | "Linode"
-        | "Vercel (Full API)" | "Cloudflare (Full API)" | "Clerk (Full API)" => {
-            "Code & infrastructure"
-        }
+        "GitHub"
+        | "Vercel"
+        | "Sentry"
+        | "Cloudflare Docs"
+        | "AWS"
+        | "Kubernetes"
+        | "Linode"
+        | "Vercel (Full API)"
+        | "Cloudflare (Full API)"
+        | "Clerk (Full API)" => "Code & infrastructure",
         "Supabase" | "Neon" | "PostgreSQL" | "MongoDB" | "Elasticsearch" | "Qdrant" => "Databases",
         "Context7" | "DeepWiki" | "Hugging Face" | "OpenRouter" | "Parallel Search"
         | "Brave Search" | "Exa" | "Tavily" | "Perplexity" | "DataForSEO" => "Search & knowledge",
         "Firecrawl" | "Apify" | "Browserbase" => "Web & automation",
         "Stripe" | "Stripe (Full API)" | "Notion" | "Composio" | "Linear" | "Atlassian"
-        | "Asana" | "Airtable" | "Todoist" | "Slack" | "Resend" | "Figma" | "Postiz"
-        | "Twilio" | "n8n" | "Langfuse" => "Apps & productivity",
-        "Filesystem" | "Fetch" | "Git" | "Playwright" | "Sequential Thinking" | "Memory"
-        | "Time" | "Chrome DevTools" => "Local tools",
+        | "Asana" | "Airtable" | "Todoist" | "Slack" | "Resend" | "Figma" | "Postiz" | "Twilio"
+        | "n8n" | "Langfuse" => "Apps & productivity",
+        "Filesystem"
+        | "Fetch"
+        | "Git"
+        | "Playwright"
+        | "Sequential Thinking"
+        | "Memory"
+        | "Time"
+        | "Chrome DevTools" => "Local tools",
         _ => "",
     }
 }

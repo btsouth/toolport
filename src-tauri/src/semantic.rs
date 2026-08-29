@@ -46,8 +46,7 @@ impl SemanticConfig {
         };
         SemanticConfig {
             enabled,
-            endpoint: env("TOOLPORT_EMBED_ENDPOINT", "CONDUIT_EMBED_ENDPOINT")
-                .unwrap_or(endpoint),
+            endpoint: env("TOOLPORT_EMBED_ENDPOINT", "CONDUIT_EMBED_ENDPOINT").unwrap_or(endpoint),
             model: env("TOOLPORT_EMBED_MODEL", "CONDUIT_EMBED_MODEL").unwrap_or(model),
             blend: env("TOOLPORT_EMBED_BLEND", "CONDUIT_EMBED_BLEND")
                 .and_then(|v| v.parse().ok())
@@ -60,7 +59,10 @@ impl SemanticConfig {
 /// lexical ranker reads, so both score the same signal.
 pub fn tool_document(tool: &Value) -> String {
     let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-    let desc = tool.get("description").and_then(Value::as_str).unwrap_or("");
+    let desc = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let server = name.split("__").next().unwrap_or("");
     format!("{server} {name}: {desc}")
 }
@@ -128,11 +130,11 @@ fn embed_batch(cfg: &SemanticConfig, inputs: &[String]) -> Option<Vec<Vec<f32>>>
     // and loopback addresses remain allowed because local Ollama/LM Studio endpoints
     // are a supported configuration. Keep the short timeout so any failure falls back
     // promptly to the pure-lexical ranker.
-    let agent = crate::downstream::guarded_agent_with_timeout(
-        false,
-        std::time::Duration::from_secs(10),
-    );
-    let mut req = agent.post(&cfg.endpoint).set("Content-Type", "application/json");
+    let agent =
+        crate::downstream::guarded_agent_with_timeout(false, std::time::Duration::from_secs(10));
+    let mut req = agent
+        .post(&cfg.endpoint)
+        .set("Content-Type", "application/json");
     if let Some(key) = crate::brand::env_var("TOOLPORT_EMBED_KEY", "CONDUIT_EMBED_KEY") {
         if !key.is_empty() {
             req = req.set("Authorization", &format!("Bearer {key}"));
@@ -162,7 +164,9 @@ fn embed_batch(cfg: &SemanticConfig, inputs: &[String]) -> Option<Vec<Vec<f32>>>
 
 /// Embed a single string (e.g. the query).
 pub fn embed_query(cfg: &SemanticConfig, text: &str) -> Option<Vec<f32>> {
-    embed_batch(cfg, std::slice::from_ref(&text.to_string()))?.into_iter().next()
+    embed_batch(cfg, std::slice::from_ref(&text.to_string()))?
+        .into_iter()
+        .next()
 }
 
 /// Embeddings for each tool (keyed by tool name), using the on-disk cache and
@@ -255,9 +259,21 @@ mod tests {
             blend: 0.5,
         };
         assert!(base.is_active());
-        assert!(!SemanticConfig { enabled: false, ..base.clone() }.is_active());
-        assert!(!SemanticConfig { endpoint: "".into(), ..base.clone() }.is_active());
-        assert!(!SemanticConfig { model: "".into(), ..base }.is_active());
+        assert!(!SemanticConfig {
+            enabled: false,
+            ..base.clone()
+        }
+        .is_active());
+        assert!(!SemanticConfig {
+            endpoint: "".into(),
+            ..base.clone()
+        }
+        .is_active());
+        assert!(!SemanticConfig {
+            model: "".into(),
+            ..base
+        }
+        .is_active());
     }
 
     #[test]
@@ -268,11 +284,9 @@ mod tests {
         let server = std::thread::spawn(move || {
             let request = listener.recv().unwrap();
             let body = r#"{"data":[{"embedding":[1.0,2.0]}]}"#;
-            let content_type = tiny_http::Header::from_bytes(
-                &b"Content-Type"[..],
-                &b"application/json"[..],
-            )
-            .unwrap();
+            let content_type =
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                    .unwrap();
             request
                 .respond(tiny_http::Response::from_string(body).with_header(content_type))
                 .unwrap();
@@ -298,12 +312,10 @@ mod tests {
         let endpoint = format!("http://127.0.0.1:{port}/v1/embeddings");
         let server = std::thread::spawn(move || {
             let request = redirector.recv().unwrap();
-            let location = tiny_http::Header::from_bytes(&b"Location"[..], target_url.as_bytes())
-                .unwrap();
+            let location =
+                tiny_http::Header::from_bytes(&b"Location"[..], target_url.as_bytes()).unwrap();
             request
-                .respond(
-                    tiny_http::Response::empty(302).with_header(location),
-                )
+                .respond(tiny_http::Response::empty(302).with_header(location))
                 .unwrap();
         });
 

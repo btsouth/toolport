@@ -177,9 +177,7 @@ pub fn validate_rules(rules: &[PermissionRule]) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn list(root: &Value, action: PermissionAction) -> Option<&Vec<Value>> {
-    root.get("permissions")?
-        .get(action.list_key())?
-        .as_array()
+    root.get("permissions")?.get(action.list_key())?.as_array()
 }
 
 fn contains(root: &Value, r: &PermissionRule) -> bool {
@@ -382,7 +380,11 @@ fn report(statuses: Vec<ProfileStatus>) -> Result<(), String> {
     } else {
         Err(format!(
             "The policy was saved, but {} could not be updated: {}",
-            if failed.len() == 1 { "one profile" } else { "some profiles" },
+            if failed.len() == 1 {
+                "one profile"
+            } else {
+                "some profiles"
+            },
             failed.join("; ")
         ))
     }
@@ -398,7 +400,11 @@ fn apply_with(
     set_enabled: Option<bool>,
     set_rules: Option<Vec<PermissionRule>>,
 ) -> Result<Vec<ProfileStatus>, String> {
-    apply_to(set_enabled, set_rules, &crate::clients::claude_settings_paths())
+    apply_to(
+        set_enabled,
+        set_rules,
+        &crate::clients::claude_settings_paths(),
+    )
 }
 
 /// [`apply_with`] over an explicit profile set, so tests drive known files. Runs inside
@@ -523,7 +529,11 @@ pub fn preview(rules: Option<Vec<PermissionRule>>) -> Result<Vec<PermissionsPrev
     let reg = crate::registry::load()?;
     let rules = rules.unwrap_or_else(|| reg.agent_permission_rules.clone());
     validate_rules(&rules)?;
-    Ok(preview_to(&reg, &rules, &crate::clients::claude_settings_paths()))
+    Ok(preview_to(
+        &reg,
+        &rules,
+        &crate::clients::claude_settings_paths(),
+    ))
 }
 
 fn preview_to(
@@ -542,7 +552,11 @@ fn preview_to(
                 .unwrap_or_default();
             let rendered = crate::clients::read_settings_json(path).and_then(|(root, original)| {
                 let (updated, _) = upsert_rules(&root, rules, &previous)?;
-                let after = crate::clients::render_settings_key(original.as_deref(), &updated, "permissions")?;
+                let after = crate::clients::render_settings_key(
+                    original.as_deref(),
+                    &updated,
+                    "permissions",
+                )?;
                 Ok((original.unwrap_or_default(), after))
             });
             match rendered {
@@ -600,10 +614,20 @@ mod tests {
             rule("Bash(git push*)", Ask),
         ];
         let (with, added) = upsert_rules(&theirs, &policy, &[]).unwrap();
-        assert_eq!(added, vec![rule("Bash(rm -rf *)", Deny), rule("Bash(git push*)", Ask)]);
-        assert_eq!(with["permissions"]["deny"], json!(["Read(./.env)", "Bash(rm -rf *)"]));
+        assert_eq!(
+            added,
+            vec![rule("Bash(rm -rf *)", Deny), rule("Bash(git push*)", Ask)]
+        );
+        assert_eq!(
+            with["permissions"]["deny"],
+            json!(["Read(./.env)", "Bash(rm -rf *)"])
+        );
         assert_eq!(with["permissions"]["ask"], json!(["Bash(git push*)"]));
-        assert_eq!(with["permissions"]["allow"], json!(["Bash(npm test)"]), "untouched");
+        assert_eq!(
+            with["permissions"]["allow"],
+            json!(["Bash(npm test)"]),
+            "untouched"
+        );
         assert_eq!(with["theme"], "dark");
         assert!(is_applied(&with, &policy));
 
@@ -621,7 +645,10 @@ mod tests {
         let moved = vec![rule("Bash(git push*)", Deny)];
         let (moved_root, moved_added) = upsert_rules(&with, &moved, &added).unwrap();
         assert_eq!(moved_root["permissions"].get("ask"), None);
-        assert_eq!(moved_root["permissions"]["deny"], json!(["Read(./.env)", "Bash(git push*)"]));
+        assert_eq!(
+            moved_root["permissions"]["deny"],
+            json!(["Read(./.env)", "Bash(git push*)"])
+        );
         assert_eq!(moved_added, moved);
     }
 
@@ -630,8 +657,15 @@ mod tests {
         let fresh = json!({ "model": "opus" });
         let policy = vec![rule("Bash(rm -rf *)", Deny)];
         let (with, added) = upsert_rules(&fresh, &policy, &[]).unwrap();
-        assert_eq!(with, json!({ "model": "opus", "permissions": { "deny": ["Bash(rm -rf *)"] } }));
-        assert_eq!(strip_rules(&with, &added), fresh, "the shape we created is removed with it");
+        assert_eq!(
+            with,
+            json!({ "model": "opus", "permissions": { "deny": ["Bash(rm -rf *)"] } })
+        );
+        assert_eq!(
+            strip_rules(&with, &added),
+            fresh,
+            "the shape we created is removed with it"
+        );
         // A list the user left empty cannot be told from one we created once we have
         // filled and emptied it, so it is pruned; it carried no rule, so nothing is lost.
         let empty = json!({ "permissions": { "deny": [] } });
@@ -655,10 +689,8 @@ mod tests {
     #[test]
     fn apply_writes_reconciles_and_cleans_exactly_what_it_owns() {
         let _dirs = crate::registry::data_dir_test_lock();
-        let scratch = std::env::temp_dir().join(format!(
-            "toolport-agent-permissions-{}",
-            std::process::id()
-        ));
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-agent-permissions-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).unwrap();
         let _data = crate::registry::DataDirOverride::set(scratch.join("data"));
@@ -666,7 +698,11 @@ mod tests {
         let b = scratch.join("b").join("settings.json");
         std::fs::create_dir_all(a.parent().unwrap()).unwrap();
         std::fs::create_dir_all(b.parent().unwrap()).unwrap();
-        std::fs::write(&a, "{\n  \"theme\": \"dark\",\n  \"permissions\": { \"deny\": [\"Read(./.env)\"] }\n}\n").unwrap();
+        std::fs::write(
+            &a,
+            "{\n  \"theme\": \"dark\",\n  \"permissions\": { \"deny\": [\"Read(./.env)\"] }\n}\n",
+        )
+        .unwrap();
         // b does not exist yet: a fresh profile.
         let profiles = vec![a.clone(), b.clone()];
         let policy = vec![rule("Read(./.env)", Deny), rule("Bash(rm -rf *)", Deny)];
@@ -678,21 +714,39 @@ mod tests {
 
         // On: both written; `a` owns only the rule it did not already have.
         let statuses = apply_to(Some(true), None, &profiles).unwrap();
-        assert!(statuses.iter().all(|s| s.state == "applied"), "{statuses:?}");
+        assert!(
+            statuses.iter().all(|s| s.state == "applied"),
+            "{statuses:?}"
+        );
         let reg = crate::registry::load().unwrap();
-        assert_eq!(reg.agent_permission_targets[&a.display().to_string()], vec![rule("Bash(rm -rf *)", Deny)]);
-        assert_eq!(reg.agent_permission_targets[&b.display().to_string()], policy);
+        assert_eq!(
+            reg.agent_permission_targets[&a.display().to_string()],
+            vec![rule("Bash(rm -rf *)", Deny)]
+        );
+        assert_eq!(
+            reg.agent_permission_targets[&b.display().to_string()],
+            policy
+        );
         let a_text = std::fs::read_to_string(&a).unwrap();
-        assert!(a_text.contains("\"theme\": \"dark\""), "user formatting kept: {a_text}");
+        assert!(
+            a_text.contains("\"theme\": \"dark\""),
+            "user formatting kept: {a_text}"
+        );
         assert!(a_text.contains("Bash(rm -rf *)"));
-        assert!(std::fs::read_to_string(&b).unwrap().contains("Read(./.env)"));
+        assert!(std::fs::read_to_string(&b)
+            .unwrap()
+            .contains("Read(./.env)"));
         let view = view_with(&reg, &profiles);
         assert!(view.profiles.iter().all(|p| p.state == "applied"));
         assert_eq!(view.profiles[0].added, 1);
         assert_eq!(view.profiles[1].added, 2);
 
         // Hand-edit b to drop a rule: stale in the view, and startup puts it back.
-        std::fs::write(&b, "{\n  \"permissions\": { \"deny\": [\"Read(./.env)\"] }\n}\n").unwrap();
+        std::fs::write(
+            &b,
+            "{\n  \"permissions\": { \"deny\": [\"Read(./.env)\"] }\n}\n",
+        )
+        .unwrap();
         assert_eq!(view_with(&reg, &profiles).profiles[1].state, "stale");
         apply_to(None, None, &profiles).unwrap();
         assert!(std::fs::read_to_string(&b).unwrap().contains("rm -rf"));
@@ -701,17 +755,26 @@ mod tests {
         let policy2 = vec![rule("Read(./.env)", Deny), rule("Bash(git push*)", Ask)];
         apply_to(None, Some(policy2.clone()), &profiles).unwrap();
         let a_text = std::fs::read_to_string(&a).unwrap();
-        assert!(!a_text.contains("rm -rf") && a_text.contains("git push*"), "{a_text}");
+        assert!(
+            !a_text.contains("rm -rf") && a_text.contains("git push*"),
+            "{a_text}"
+        );
 
         // A profile that cannot be parsed is reported, the other still applies, and the
         // broken one's record is kept (we cannot see whether our strings are in it).
         std::fs::write(&b, "{ not json").unwrap();
         let statuses = apply_to(None, None, &profiles).unwrap();
         assert_eq!(statuses.iter().filter(|s| s.state == "error").count(), 1);
-        assert!(crate::registry::load().unwrap().agent_permission_targets.contains_key(&b.display().to_string()));
+        assert!(crate::registry::load()
+            .unwrap()
+            .agent_permission_targets
+            .contains_key(&b.display().to_string()));
         // And the user-facing setters say so rather than returning a clean view.
         let err = report(statuses).unwrap_err();
-        assert!(err.contains("could not be updated") && err.contains("settings.json"), "{err}");
+        assert!(
+            err.contains("could not be updated") && err.contains("settings.json"),
+            "{err}"
+        );
         std::fs::write(&b, "{}\n").unwrap();
         apply_to(None, None, &profiles).unwrap();
 
@@ -729,7 +792,10 @@ mod tests {
             .get_mut(&b.display().to_string())
             .unwrap()
             .push(rule("Bash(git push*)", Ask));
-        assert_eq!(view_with(&reg_with_leftover, &profiles).profiles[1].state, "stale");
+        assert_eq!(
+            view_with(&reg_with_leftover, &profiles).profiles[1].state,
+            "stale"
+        );
         // Put the hand-edited file back to a plain state so the final teardown below is
         // about our own strings only.
         std::fs::write(&b, "{}\n").unwrap();
@@ -738,9 +804,15 @@ mod tests {
         // Off: exactly ours leaves; the user's own Read(./.env) in `a` stays.
         apply_to(Some(false), None, &profiles).unwrap();
         let a_text = std::fs::read_to_string(&a).unwrap();
-        assert!(a_text.contains("Read(./.env)") && !a_text.contains("git push"), "{a_text}");
+        assert!(
+            a_text.contains("Read(./.env)") && !a_text.contains("git push"),
+            "{a_text}"
+        );
         assert!(!std::fs::read_to_string(&b).unwrap().contains("git push"));
-        assert!(crate::registry::load().unwrap().agent_permission_targets.is_empty());
+        assert!(crate::registry::load()
+            .unwrap()
+            .agent_permission_targets
+            .is_empty());
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }

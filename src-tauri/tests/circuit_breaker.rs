@@ -32,7 +32,9 @@ fn circuit_opens_after_a_server_dies_and_fast_fails() {
     // (threshold is 3). Each returns an error, but from the dead transport, not the breaker.
     for _ in 0..2 {
         assert!(
-            router.route_call("mock__echo", json!({ "text": "x" })).is_err(),
+            router
+                .route_call("mock__echo", json!({ "text": "x" }))
+                .is_err(),
             "a call to a dead server should error"
         );
     }

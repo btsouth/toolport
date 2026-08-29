@@ -132,9 +132,14 @@ pub fn render_from_parts(entries: &[Value], tokens_saved: u64, quarantined_tools
     out.push_str("# TYPE toolport_tokens_saved_total counter\n");
     out.push_str(&format!("toolport_tokens_saved_total {}\n", tokens_saved));
 
-    out.push_str("# HELP toolport_quarantined_tools Tools currently quarantined after high-risk drift\n");
+    out.push_str(
+        "# HELP toolport_quarantined_tools Tools currently quarantined after high-risk drift\n",
+    );
     out.push_str("# TYPE toolport_quarantined_tools gauge\n");
-    out.push_str(&format!("toolport_quarantined_tools {}\n", quarantined_tools));
+    out.push_str(&format!(
+        "toolport_quarantined_tools {}\n",
+        quarantined_tools
+    ));
 
     out
 }
@@ -173,11 +178,21 @@ mod tests {
             json!({"server":"s1","tool":"wipe","ok":true,"held":true}),
         ];
         let text = render_from_parts(&entries, 42, 1);
-        assert!(text.contains("toolport_tool_calls_total{server=\"s1\",tool=\"echo\",client=\"web\",ok=\"true\"} 1"));
-        assert!(text.contains("toolport_tool_calls_total{server=\"s1\",tool=\"echo\",client=\"web\",ok=\"false\"} 1"));
-        assert!(text.contains("toolport_held_calls_total{server=\"s1\",tool=\"wipe\",client=\"\"} 1"));
-        assert!(text.contains("toolport_tool_call_duration_milliseconds_sum{server=\"s1\",tool=\"echo\"} 30"));
-        assert!(text.contains("toolport_tool_call_duration_milliseconds_count{server=\"s1\",tool=\"echo\"} 2"));
+        assert!(text.contains(
+            "toolport_tool_calls_total{server=\"s1\",tool=\"echo\",client=\"web\",ok=\"true\"} 1"
+        ));
+        assert!(text.contains(
+            "toolport_tool_calls_total{server=\"s1\",tool=\"echo\",client=\"web\",ok=\"false\"} 1"
+        ));
+        assert!(
+            text.contains("toolport_held_calls_total{server=\"s1\",tool=\"wipe\",client=\"\"} 1")
+        );
+        assert!(text.contains(
+            "toolport_tool_call_duration_milliseconds_sum{server=\"s1\",tool=\"echo\"} 30"
+        ));
+        assert!(text.contains(
+            "toolport_tool_call_duration_milliseconds_count{server=\"s1\",tool=\"echo\"} 2"
+        ));
         assert!(text.contains("toolport_tokens_saved_total 42"));
         assert!(text.contains("toolport_quarantined_tools 1"));
         assert!(text.contains("# TYPE toolport_tool_calls_total counter"));

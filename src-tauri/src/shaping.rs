@@ -125,8 +125,8 @@ fn extract_body(result: &Value) -> String {
     out
 }
 
-fn value_size(value: &Value) -> usize { 
-    serde_json::to_string(value) .map(|s| s.len()) .unwrap_or(0) 
+fn value_size(value: &Value) -> usize {
+    serde_json::to_string(value).map(|s| s.len()).unwrap_or(0)
 }
 
 fn text_result(text: String, is_error: bool) -> Value {
@@ -226,7 +226,9 @@ pub fn shape_result_preserving_prefix(
         .as_object()
         .map(|obj| {
             obj.iter()
-                .filter(|(key, _)| !matches!(key.as_str(), "content" | "structuredContent" | "isError"))
+                .filter(|(key, _)| {
+                    !matches!(key.as_str(), "content" | "structuredContent" | "isError")
+                })
                 .map(|(key, value)| key.len() + value_size(value) + 4)
                 .sum()
         })
@@ -376,7 +378,13 @@ pub fn stash_payload(body: String, structured: Option<Value>, owner: Option<&str
 
 /// Return the next slice of a cached shaped result, by cursor + character offset.
 /// `len` of 0 means "use the current budget".
-pub fn fetch_result(cursor: &str, offset: usize, len: usize, requester: Option<&str>, projection: Option<&str>,) -> Value {
+pub fn fetch_result(
+    cursor: &str,
+    offset: usize,
+    len: usize,
+    requester: Option<&str>,
+    projection: Option<&str>,
+) -> Value {
     let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
     sweep(&mut map);
     // Scope: a cached result is readable only by the client that stashed it. Owner
@@ -398,31 +406,28 @@ pub fn fetch_result(cursor: &str, offset: usize, len: usize, requester: Option<&
         }
     };
     if let Some(path) = projection {
-    let structured = match &c.structured {
-        Some(value) => value,
-        None => {
-            return text_result(
-                "[Toolport: this cached result has no structuredContent.]".to_string(),
-                true,
-            );
-        }
-    };
+        let structured = match &c.structured {
+            Some(value) => value,
+            None => {
+                return text_result(
+                    "[Toolport: this cached result has no structuredContent.]".to_string(),
+                    true,
+                );
+            }
+        };
 
-    let value = match project(structured, path) {
-        Some(value) => value,
-        None => {
-            return text_result(
-                format!("[Toolport: projection \"{path}\" not found.]"),
-                true,
-            );
-        }
-    };
+        let value = match project(structured, path) {
+            Some(value) => value,
+            None => {
+                return text_result(
+                    format!("[Toolport: projection \"{path}\" not found.]"),
+                    true,
+                );
+            }
+        };
 
-    return text_result(
-        serde_json::to_string(value).unwrap_or_default(),
-        false,
-    );
-}
+        return text_result(serde_json::to_string(value).unwrap_or_default(), false);
+    }
     let total = c.body.chars().count();
     if offset >= total {
         return text_result(
@@ -434,11 +439,11 @@ pub fn fetch_result(cursor: &str, offset: usize, len: usize, requester: Option<&
         );
     }
     let len = if len == 0 {
-    let (budget, warning) = budget();
-    if let Some(msg) = warning {
-        eprintln!("{msg}");
-    }
-    budget
+        let (budget, warning) = budget();
+        if let Some(msg) = warning {
+            eprintln!("{msg}");
+        }
+        budget
     } else {
         len
     };
@@ -568,7 +573,7 @@ mod tests {
         // cursors exist. The stash is process-global, so in HTTP mode this is the only
         // thing stopping one client from reading another's result by guessing r{n}.
         assert_eq!(
-            fetch_result(&cursor, 0, 100, Some("mallory"),None)["isError"].as_bool(),
+            fetch_result(&cursor, 0, 100, Some("mallory"), None)["isError"].as_bool(),
             Some(true)
         );
         assert_eq!(
@@ -634,9 +639,13 @@ mod tests {
         let kept = relayable_meta(Some(&meta)).expect("some keys survive");
         assert_eq!(kept["traceparent"], "00-abc-def-01");
         assert_eq!(kept["com.example/unknown"]["a"], 1);
-        assert!(kept.get("io.modelcontextprotocol/protocolVersion").is_none());
+        assert!(kept
+            .get("io.modelcontextprotocol/protocolVersion")
+            .is_none());
         assert!(kept.get("io.modelcontextprotocol/clientInfo").is_none());
-        assert!(kept.get("io.modelcontextprotocol/clientCapabilities").is_none());
+        assert!(kept
+            .get("io.modelcontextprotocol/clientCapabilities")
+            .is_none());
         // Relayed since SOU-444 part 2: the gateway now routes the resulting
         // `notifications/progress` back to the client that minted the token.
         assert_eq!(kept["progressToken"], "p-1");
@@ -656,7 +665,9 @@ mod tests {
         });
         sanitize_forwarded_meta(&mut params);
         assert_eq!(params["_meta"]["keep"], 1);
-        assert!(params["_meta"].get("io.modelcontextprotocol/clientInfo").is_none());
+        assert!(params["_meta"]
+            .get("io.modelcontextprotocol/clientInfo")
+            .is_none());
 
         // ...and removes `_meta` entirely when nothing survives.
         let mut params = json!({
@@ -683,7 +694,9 @@ mod tests {
         const MARKER_RESERVE: usize = 450;
 
         let budget = 4096;
-        for meta_len in [0, 500, 1_000, 2_000, 3_000, 3_400, 3_600, 3_800, 4_000, 4_100] {
+        for meta_len in [
+            0, 500, 1_000, 2_000, 3_000, 3_400, 3_600, 3_800, 4_000, 4_100,
+        ] {
             let mut r = json!({
                 "content": [{ "type": "text", "text": "x".repeat(50_000) }],
                 "isError": false,
@@ -746,7 +759,10 @@ mod tests {
             "a shaped result must fit the budget, got {size} bytes against {budget}"
         );
         // ...and the bulky field really was preserved, not dropped to make it fit.
-        assert_eq!(r["_meta"]["com.example/ctx"].as_str().map(str::len), Some(2_000));
+        assert_eq!(
+            r["_meta"]["com.example/ctx"].as_str().map(str::len),
+            Some(2_000)
+        );
     }
 
     #[test]
@@ -763,7 +779,10 @@ mod tests {
         });
         assert!(shape_result(&mut r, 1024, None));
 
-        assert_eq!(r["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "srv");
+        assert_eq!(
+            r["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "srv"
+        );
         assert_eq!(r["somethingAFutureSpecAdded"]["keep"], true);
         // ...while the body really was shaped.
         assert!(r["content"][0]["text"]
@@ -896,7 +915,10 @@ mod tests {
         map.insert("oldest".to_string(), cached_entry(HUGE, 60));
         map.insert("middle".to_string(), cached_entry(HUGE, 40));
         map.insert("newest".to_string(), cached_entry(HUGE, 20));
-        assert!(map.len() < MAX_CACHE_ENTRIES, "must exercise the byte cap, not the entry cap");
+        assert!(
+            map.len() < MAX_CACHE_ENTRIES,
+            "must exercise the byte cap, not the entry cap"
+        );
 
         let new_entry_size = 1024 * 1024;
         evict_to_fit(&mut map, new_entry_size);
@@ -908,8 +930,14 @@ mod tests {
             "cached bytes grew to {total}, past the {MAX_CACHE_BYTES} cap"
         );
         // Oldest-by-insertion-time goes first, and only as far as needed.
-        assert!(!map.contains_key("oldest"), "the oldest entry must be evicted first");
-        assert!(map.contains_key("middle"), "eviction must stop once the new body fits");
+        assert!(
+            !map.contains_key("oldest"),
+            "the oldest entry must be evicted first"
+        );
+        assert!(
+            map.contains_key("middle"),
+            "eviction must stop once the new body fits"
+        );
         assert!(map.contains_key("newest"));
         assert!(map.contains_key("incoming"));
     }
@@ -923,7 +951,10 @@ mod tests {
         map.insert("stale".to_string(), cached_entry(1024, 60));
 
         evict_to_fit(&mut map, MAX_CACHE_BYTES + 1);
-        assert!(map.is_empty(), "everything older must be evicted to make room");
+        assert!(
+            map.is_empty(),
+            "everything older must be evicted to make room"
+        );
 
         // Eviction stops at an empty cache, so the caller's own over-cap result is
         // still inserted rather than discarded. It is over the cap by construction;
@@ -955,7 +986,9 @@ mod tests {
         let cursor = cursor_of(&r);
 
         let map = cache().lock().unwrap_or_else(|e| e.into_inner());
-        let entry = map.get(&cursor).expect("the shaped result is cached under its cursor");
+        let entry = map
+            .get(&cursor)
+            .expect("the shaped result is cached under its cursor");
         assert_eq!(
             entry.size,
             entry.body.len() + entry.structured.as_ref().map(value_size).unwrap_or(0),
@@ -985,7 +1018,10 @@ mod tests {
         );
         let text = r["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("Toolport shaped this result"));
-        assert!(text.contains("\"cursor\":\"r"), "the failure must stay pageable");
+        assert!(
+            text.contains("\"cursor\":\"r"),
+            "the failure must stay pageable"
+        );
     }
 
     #[test]
@@ -1027,13 +1063,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let projected = fetch_result(
-            &cursor,
-            0,
-            0,
-            None,
-            Some("data.users.1.profile.age"),
-        );
+        let projected = fetch_result(&cursor, 0, 0, None, Some("data.users.1.profile.age"));
 
         assert!(!projected["isError"].as_bool().unwrap());
 

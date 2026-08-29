@@ -236,7 +236,9 @@ mod tests {
         strip_for_appdir(
             &mut cmd,
             appdir,
-            Some(&format!("{appdir}/usr/share:/usr/share:/home/u/.local/share")),
+            Some(&format!(
+                "{appdir}/usr/share:/usr/share:/home/u/.local/share"
+            )),
         );
         let dirs = env_of(&cmd)
             .into_iter()

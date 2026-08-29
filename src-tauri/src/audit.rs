@@ -685,6 +685,12 @@ pub fn stats() -> std::io::Result<Value> {
     Ok(aggregate(&read_all()?))
 }
 
+/// [`stats`] over entries the caller already read, so a view that needs both the
+/// raw entries and the aggregation only reads the log once.
+pub fn stats_for_entries(entries: &[Value]) -> Value {
+    aggregate(entries)
+}
+
 /// Pure aggregation of audit entries into per-server + global stats. Split from
 /// `stats` so the dashboard math is testable without touching the on-disk log.
 fn aggregate(entries: &[Value]) -> Value {

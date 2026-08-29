@@ -1783,18 +1783,10 @@ fn stamp_elicitation_source(request: &mut Value, server: &str) {
     let Some(params) = request.get_mut("params").and_then(Value::as_object_mut) else {
         return;
     };
-    if params
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("form")
-        != "form"
-    {
+    if params.get("mode").and_then(Value::as_str).unwrap_or("form") != "form" {
         return;
     }
-    let message = params
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let message = params.get("message").and_then(Value::as_str).unwrap_or("");
     // Lines are split on anything a renderer would treat as a line break, not only `\n`:
     // U+2028/U+2029 are line breaks to a UI and invisible to `str::lines`. A line is an
     // imitation if the prefix follows nothing but whitespace or zero-width/format characters
@@ -1818,7 +1810,13 @@ fn stamp_elicitation_source(request: &mut Value, server: &str) {
     // a second provenance-looking line into the stamp itself.
     let server: String = server
         .chars()
-        .map(|c| if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     stamped.push_str(&format!(
         "{ELICITATION_SOURCE_PREFIX}the \"{server}\" MCP server (not Toolport)"
@@ -7936,7 +7934,10 @@ mod tests {
         });
         let before = url_mode.clone();
         super::stamp_elicitation_source(&mut url_mode, "s");
-        assert_eq!(url_mode, before, "URL mode keeps its own destination line only");
+        assert_eq!(
+            url_mode, before,
+            "URL mode keeps its own destination line only"
+        );
 
         let mut roots = json!({ "method": "roots/list", "params": {} });
         let before = roots.clone();
@@ -12051,7 +12052,10 @@ mod tests {
         let n = super::read_capped_line(&mut reader, &mut line, 5).unwrap();
 
         assert_eq!(n, 5);
-        assert!(line.ends_with('\n'), "lossy decoding must preserve the raw terminator");
+        assert!(
+            line.ends_with('\n'),
+            "lossy decoding must preserve the raw terminator"
+        );
         assert!(
             !super::is_unterminated_capped_line(n, &line, 5),
             "a newline-terminated raw line must not be rejected as unterminated"

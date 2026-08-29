@@ -49,20 +49,26 @@ fn require_secure_team_url(server_url: &str) -> Result<(), String> {
     let host = crate::oauth::host_of_url(server_url).unwrap_or_default();
     let loopback = host.eq_ignore_ascii_case("localhost")
         || host.to_ascii_lowercase().ends_with(".localhost")
-        || host.parse::<std::net::IpAddr>().ok().map_or(false, |ip| match ip {
-            std::net::IpAddr::V4(v4) => v4.is_loopback(),
-            std::net::IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6
-                        .to_ipv4_mapped()
-                        .map(|v4| v4.is_loopback())
-                        .unwrap_or(false)
-            }
-        });
+        || host
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map_or(false, |ip| match ip {
+                std::net::IpAddr::V4(v4) => v4.is_loopback(),
+                std::net::IpAddr::V6(v6) => {
+                    v6.is_loopback()
+                        || v6
+                            .to_ipv4_mapped()
+                            .map(|v4| v4.is_loopback())
+                            .unwrap_or(false)
+                }
+            });
     if loopback {
         Ok(())
     } else {
-        Err("team server URL must use https:// unless it is loopback HTTP for local development".to_string())
+        Err(
+            "team server URL must use https:// unless it is loopback HTTP for local development"
+                .to_string(),
+        )
     }
 }
 
@@ -166,11 +172,20 @@ fn joined_from(v: &Value) -> Result<Joined, String> {
 
 /// Redeem an invite or join-link code. A normal code joins immediately; an approval-gated link
 /// returns `Pending` with a token to poll.
-pub fn join(server_url: &str, invite_code: &str, member_name: Option<&str>) -> Result<JoinResult, String> {
+pub fn join(
+    server_url: &str,
+    invite_code: &str,
+    member_name: Option<&str>,
+) -> Result<JoinResult, String> {
     require_secure_team_url(server_url)?;
     let url = format!("{}/join", base(server_url));
     let body = serde_json::json!({ "invite_code": invite_code, "member_name": member_name });
-    let resp = require_no_redirect(agent(server_url).post(&url).send_json(body).map_err(stringify)?)?;
+    let resp = require_no_redirect(
+        agent(server_url)
+            .post(&url)
+            .send_json(body)
+            .map_err(stringify)?,
+    )?;
     let v: Value = resp.into_json().map_err(|e| e.to_string())?;
     // An approval-gated link hands back a request token instead of a member token.
     if v["pending"].as_bool().unwrap_or(false) {
@@ -205,10 +220,17 @@ pub fn poll_join(
     require_secure_team_url(server_url)?;
     let url = format!("{}/join/status", base(server_url));
     let body = serde_json::json!({ "request_token": request_token });
-    let resp = require_no_redirect(agent(server_url).post(&url).send_json(body).map_err(stringify)?)?;
+    let resp = require_no_redirect(
+        agent(server_url)
+            .post(&url)
+            .send_json(body)
+            .map_err(stringify)?,
+    )?;
     let v: Value = resp.into_json().map_err(|e| e.to_string())?;
     match v["status"].as_str().unwrap_or("") {
-        "approved" => complete_join(server_url, member_name, joined_from(&v)?).map(JoinPoll::Connected),
+        "approved" => {
+            complete_join(server_url, member_name, joined_from(&v)?).map(JoinPoll::Connected)
+        }
         "denied" => Ok(JoinPoll::Denied),
         "pending" => Ok(JoinPoll::Pending),
         _ => Ok(JoinPoll::Unknown),
@@ -351,9 +373,7 @@ fn fetch_config_for_update(
                 .as_i64()
                 .ok_or("team server returned a config without a version")?;
             let config = v.get("config").cloned().unwrap_or(Value::Null);
-            if !config.is_object()
-                || !config.get("servers").map(Value::is_array).unwrap_or(false)
-            {
+            if !config.is_object() || !config.get("servers").map(Value::is_array).unwrap_or(false) {
                 return Err("team server returned a config without a server list".into());
             }
             Ok((version, config))
@@ -561,7 +581,11 @@ pub enum ConnectOutcome {
 
 /// Join a team: redeem the code, and for a normal join vault the token, record the connection,
 /// and do the first pull + merge. An approval-gated link returns `Pending` and stores nothing.
-pub fn connect(server_url: &str, invite_code: &str, member_name: Option<&str>) -> Result<ConnectOutcome, String> {
+pub fn connect(
+    server_url: &str,
+    invite_code: &str,
+    member_name: Option<&str>,
+) -> Result<ConnectOutcome, String> {
     match join(server_url, invite_code, member_name)? {
         JoinResult::Joined(joined) => {
             complete_join(server_url, member_name, joined).map(ConnectOutcome::Connected)
@@ -572,7 +596,11 @@ pub fn connect(server_url: &str, invite_code: &str, member_name: Option<&str>) -
 
 /// Finalize an approved join: vault the token, record the connection, and do the first
 /// pull + merge. Shared by the direct-connect and approval-poll paths.
-fn complete_join(server_url: &str, member_name: Option<&str>, joined: Joined) -> Result<MergeOutcome, String> {
+fn complete_join(
+    server_url: &str,
+    member_name: Option<&str>,
+    joined: Joined,
+) -> Result<MergeOutcome, String> {
     save_token(&joined.member_token)?;
     // The token is now in the keychain. Any failure past this point must clear it,
     // or we'd orphan a live bearer token with no local record of the connection.
@@ -583,7 +611,11 @@ fn complete_join(server_url: &str, member_name: Option<&str>, joined: Joined) ->
         })
 }
 
-fn finish_connect(server_url: &str, member_name: Option<&str>, joined: Joined) -> Result<(TeamConnection, MergeOutcome), String> {
+fn finish_connect(
+    server_url: &str,
+    member_name: Option<&str>,
+    joined: Joined,
+) -> Result<(TeamConnection, MergeOutcome), String> {
     let conn = TeamConnection {
         server_url: base(server_url),
         team_id: joined.team_id.clone(),
@@ -607,7 +639,14 @@ fn finish_connect(server_url: &str, member_name: Option<&str>, joined: Joined) -
     // multi-second) network round trip and apply onto that — mirroring `sync_inner`.
     // Loading first and saving here would clobber any change another command made to the
     // registry while we were waiting on the join window's pull.
-    let pulled = pull_config(&base(server_url), &joined.team_id, &joined.member_token, 0, None, 0)?;
+    let pulled = pull_config(
+        &base(server_url),
+        &joined.team_id,
+        &joined.member_token,
+        0,
+        None,
+        0,
+    )?;
     // Capture the org instructions before the closure consumes `pulled`; applied to disk after
     // the save (outside the lock).
     let desired_instr = pulled
@@ -630,7 +669,10 @@ fn finish_connect(server_url: &str, member_name: Option<&str>, joined: Joined) -
     if let Some((version, desired)) = desired_instr {
         apply_instructions(&joined.team_id, version, desired.as_deref());
     }
-    let conn = reg.team.clone().ok_or_else(|| "team connection lost after save".to_string())?;
+    let conn = reg
+        .team
+        .clone()
+        .ok_or_else(|| "team connection lost after save".to_string())?;
     Ok((conn, outcome))
 }
 
@@ -734,7 +776,13 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
     })?;
     let applied = match result {
         // Skipped (disconnected / switched teams mid-sync): don't report usage for it.
-        None => return Ok(SyncResult::Ok { role, role_changed, applied: None }),
+        None => {
+            return Ok(SyncResult::Ok {
+                role,
+                role_changed,
+                applied: None,
+            })
+        }
         Some(applied) => applied,
     };
     // Write/refresh the org instructions to each installed client's rules file (skips unless the
@@ -794,7 +842,9 @@ fn merge_reported(
 fn report_usage(conn: &TeamConnection, token: &str) {
     let tag = tag_for(&conn.team_id);
     let (team_servers, reported) = {
-        let Ok(reg) = crate::registry::load() else { return };
+        let Ok(reg) = crate::registry::load() else {
+            return;
+        };
         // The user disconnected or switched teams mid-sync: report nothing.
         match reg.team.as_ref() {
             Some(t) if t.team_id == conn.team_id => {}
@@ -848,7 +898,15 @@ fn report_usage(conn: &TeamConnection, token: &str) {
                 })
             })
             .collect();
-        match post_usage_day(&conn.server_url, &conn.team_id, token, &day, rows, None, None) {
+        match post_usage_day(
+            &conn.server_url,
+            &conn.team_id,
+            token,
+            &day,
+            rows,
+            None,
+            None,
+        ) {
             Ok(true) => {
                 new_state.insert(day, merged);
                 changed = true;
@@ -1699,19 +1757,22 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
         .filter(|s| is_team_server(s, &tag))
         .map(|s| (s.id.clone(), consent_fingerprint(s)))
         .collect();
-    let prev_enabled_by_profile: std::collections::HashMap<String, std::collections::HashSet<String>> =
-        reg.profiles
-            .iter()
-            .map(|p| {
-                let enabled: std::collections::HashSet<String> = p
-                    .enabled_server_ids
-                    .iter()
-                    .filter(|id| old_ids.contains(id))
-                    .cloned()
-                    .collect();
-                (p.id.clone(), enabled)
-            })
-            .collect();
+    let prev_enabled_by_profile: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = reg
+        .profiles
+        .iter()
+        .map(|p| {
+            let enabled: std::collections::HashSet<String> = p
+                .enabled_server_ids
+                .iter()
+                .filter(|id| old_ids.contains(id))
+                .cloned()
+                .collect();
+            (p.id.clone(), enabled)
+        })
+        .collect();
     reg.servers.retain(|s| !is_team_server(s, &tag));
     for p in &mut reg.profiles {
         p.enabled_server_ids.retain(|id| !old_ids.contains(id));
@@ -1949,7 +2010,11 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
     let str_array = |k: &str| {
         s.get(k)
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let env = s
@@ -2069,7 +2134,13 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
 
 fn slugify_id(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()
@@ -2127,7 +2198,11 @@ mod tests {
             json!({ "instructions": { "enabled": true } }),
             json!({ "servers": [] }), // key absent (e.g. Free/lapsed team, soft-dropped)
         ] {
-            assert_eq!(desired_instructions(&cfg), None, "should mean removal: {cfg}");
+            assert_eq!(
+                desired_instructions(&cfg),
+                None,
+                "should mean removal: {cfg}"
+            );
         }
     }
 
@@ -2419,8 +2494,10 @@ mod tests {
 
         let _env = crate::clients::env_test_lock();
         let _dirs = crate::registry::data_dir_test_lock();
-        let scratch =
-            std::env::temp_dir().join(format!("toolport-sbs917-uninstalled-{}", std::process::id()));
+        let scratch = std::env::temp_dir().join(format!(
+            "toolport-sbs917-uninstalled-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).unwrap();
         let _data = crate::registry::DataDirOverride::set(scratch.join("data"));
@@ -2515,7 +2592,10 @@ mod tests {
         // The path must remain recorded or no later sync would know to retry it.
         std::fs::write(
             &path,
-            format!("{}\nunterminated", crate::instructions::SENTINEL_START_PREFIX),
+            format!(
+                "{}\nunterminated",
+                crate::instructions::SENTINEL_START_PREFIX
+            ),
         )
         .unwrap();
         apply_instructions_to(TEAM, 2, None, &[]);
@@ -2529,8 +2609,14 @@ mod tests {
         std::fs::write(&path, valid).unwrap();
         apply_instructions_to(TEAM, 2, None, &[]);
         let (_, _, recorded) = loaded_instructions();
-        assert!(!path.exists(), "the repaired recorded path should be cleaned");
-        assert!(recorded.is_empty(), "a successful retry may forget the path");
+        assert!(
+            !path.exists(),
+            "the repaired recorded path should be cleaned"
+        );
+        assert!(
+            recorded.is_empty(),
+            "a successful retry may forget the path"
+        );
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
@@ -2560,7 +2646,11 @@ mod tests {
         // `connect` gives the team instruction content (the realistic winner of a switch);
         // `team_c` below is the content-less case.
         let connect = |team: &str| {
-            let content = if team == "team_c" { Value::Null } else { json!(format!("{team}'s rules")) };
+            let content = if team == "team_c" {
+                Value::Null
+            } else {
+                json!(format!("{team}'s rules"))
+            };
             let conn: TeamConnection = serde_json::from_value(json!({
                 "serverUrl": "https://teams.example.com",
                 "teamId": team,
@@ -2576,16 +2666,33 @@ mod tests {
         };
 
         // The loser (team_a) finished writing; by the time it records, team_b has won.
-        assert_eq!(instructions::write_target(&target, "team_a", 3, "a's rules"), ApplyState::Applied);
+        assert_eq!(
+            instructions::write_target(&target, "team_a", 3, "a's rules"),
+            ApplyState::Applied
+        );
         connect("team_b");
-        record_applied_instructions("team_a", Some("a's rules".into()), 3, vec![key.clone()], &[key.clone()]);
+        record_applied_instructions(
+            "team_a",
+            Some("a's rules".into()),
+            3,
+            vec![key.clone()],
+            &[key.clone()],
+        );
         assert!(
             instructions::is_present(&path, Scope::Team),
             "the block is left for the winner to reconcile, not deleted"
         );
         let (content, _, recorded) = loaded_instructions();
-        assert_eq!(content.as_deref(), Some("team_b's rules"), "the loser's watermark is not written over the winner's");
-        assert_eq!(recorded, vec![key.clone()], "the winner's record now owns the path");
+        assert_eq!(
+            content.as_deref(),
+            Some("team_b's rules"),
+            "the loser's watermark is not written over the winner's"
+        );
+        assert_eq!(
+            recorded,
+            vec![key.clone()],
+            "the winner's record now owns the path"
+        );
         // The winner's next apply sees the path as Stale for its own content and rewrites it.
         assert_eq!(
             instructions::current_state(&target, "team_b", 1, "b's rules"),
@@ -2595,31 +2702,68 @@ mod tests {
         // A winner with NO instruction content (mid-connect, or org instructions off) still
         // adopts the path - it may be about to fill content in - and its own next apply with
         // nothing desired cleans every recorded path, so the block does not linger.
-        assert_eq!(instructions::write_target(&target, "team_a", 3, "a's rules"), ApplyState::Applied);
+        assert_eq!(
+            instructions::write_target(&target, "team_a", 3, "a's rules"),
+            ApplyState::Applied
+        );
         connect("team_c");
-        record_applied_instructions("team_a", Some("a's rules".into()), 3, vec![key.clone()], &[key.clone()]);
+        record_applied_instructions(
+            "team_a",
+            Some("a's rules".into()),
+            3,
+            vec![key.clone()],
+            &[key.clone()],
+        );
         assert!(path.exists(), "adoption never deletes");
         let (_, _, recorded) = loaded_instructions();
-        assert_eq!(recorded, vec![key.clone()], "the content-less winner now owns the path");
+        assert_eq!(
+            recorded,
+            vec![key.clone()],
+            "the content-less winner now owns the path"
+        );
         apply_instructions_to("team_c", 1, None, &[target.clone()]);
-        assert!(!path.exists(), "the winner's no-content pass cleans the adopted block");
+        assert!(
+            !path.exists(),
+            "the winner's no-content pass cleans the adopted block"
+        );
         let (_, _, recorded) = loaded_instructions();
         assert!(recorded.is_empty());
 
         // A disconnect that won leaves no team: nothing could want the block, so it goes.
-        assert_eq!(instructions::write_target(&target, "team_a", 4, "a's rules"), ApplyState::Applied);
+        assert_eq!(
+            instructions::write_target(&target, "team_a", 4, "a's rules"),
+            ApplyState::Applied
+        );
         crate::registry::update(|reg| {
             reg.team = None;
             Ok(())
         })
         .unwrap();
-        record_applied_instructions("team_a", Some("a's rules".into()), 4, vec![key.clone()], &[key.clone()]);
-        assert!(!path.exists(), "with no team left, our block (and the file we created) is removed");
+        record_applied_instructions(
+            "team_a",
+            Some("a's rules".into()),
+            4,
+            vec![key.clone()],
+            &[key.clone()],
+        );
+        assert!(
+            !path.exists(),
+            "with no team left, our block (and the file we created) is removed"
+        );
 
         // The ordinary case: the set holds and everything is recorded as before.
-        assert_eq!(instructions::write_target(&target, "team_a", 5, "a's rules"), ApplyState::Applied);
+        assert_eq!(
+            instructions::write_target(&target, "team_a", 5, "a's rules"),
+            ApplyState::Applied
+        );
         connect("team_a");
-        record_applied_instructions("team_a", Some("a's rules".into()), 5, vec![key.clone()], &[key.clone()]);
+        record_applied_instructions(
+            "team_a",
+            Some("a's rules".into()),
+            5,
+            vec![key.clone()],
+            &[key.clone()],
+        );
         let (content, version, recorded) = loaded_instructions();
         assert_eq!(content.as_deref(), Some("a's rules"));
         assert_eq!(version, 5);
@@ -2632,8 +2776,20 @@ mod tests {
         // A log rotation can shrink the local rollup mid-day; the already-reported
         // watermark must win so the re-send never erases counts the server has.
         let mut local = BTreeMap::new();
-        local.insert("github".to_string(), usage_report::Row { calls: 3, tokens_saved: 900 });
-        local.insert("stripe".to_string(), usage_report::Row { calls: 7, tokens_saved: 0 });
+        local.insert(
+            "github".to_string(),
+            usage_report::Row {
+                calls: 3,
+                tokens_saved: 900,
+            },
+        );
+        local.insert(
+            "stripe".to_string(),
+            usage_report::Row {
+                calls: 7,
+                tokens_saved: 0,
+            },
+        );
         let mut reported = HashMap::new();
         reported.insert("github".to_string(), [10, 100]); // rotation ate 7 calls; saved grew
         let merged = merge_reported(&local, Some(&reported));
@@ -2679,7 +2835,12 @@ mod tests {
 
     fn active_enabled(r: &Registry) -> Vec<String> {
         let active = r.active_profile_id.clone().unwrap();
-        r.profiles.iter().find(|p| p.id == active).unwrap().enabled_server_ids.clone()
+        r.profiles
+            .iter()
+            .find(|p| p.id == active)
+            .unwrap()
+            .enabled_server_ids
+            .clone()
     }
 
     #[test]
@@ -2692,16 +2853,25 @@ mod tests {
         ]});
         assert_eq!(apply_team_config(&mut r, "t1", &cfg).applied, 2);
 
-        assert!(r.servers.iter().any(|s| s.id == "mine"), "local server preserved");
+        assert!(
+            r.servers.iter().any(|s| s.id == "mine"),
+            "local server preserved"
+        );
         let gh = r.servers.iter().find(|s| s.id == "team_github").unwrap();
         assert_eq!(gh.source.as_deref(), Some("team:t1"));
         assert_eq!(gh.env[0].key, "TOKEN");
-        assert!(gh.env[0].value.is_none(), "no secret value carried from the team");
+        assert!(
+            gh.env[0].value.is_none(),
+            "no secret value carried from the team"
+        );
 
         let enabled = active_enabled(&r);
         assert!(enabled.contains(&"team_github".to_string()));
         assert!(enabled.contains(&"team_stripe".to_string()));
-        assert!(enabled.contains(&"mine".to_string()), "local enablement preserved");
+        assert!(
+            enabled.contains(&"mine".to_string()),
+            "local enablement preserved"
+        );
     }
 
     #[test]
@@ -2733,8 +2903,14 @@ mod tests {
         assert_eq!(team_ids.len(), 2);
         assert!(team_ids.contains(&"team_a".to_string()));
         assert!(team_ids.contains(&"team_c".to_string()));
-        assert!(!team_ids.contains(&"team_b".to_string()), "removed team server is gone");
-        assert!(!active_enabled(&r).contains(&"team_b".to_string()), "no stale profile entry");
+        assert!(
+            !team_ids.contains(&"team_b".to_string()),
+            "removed team server is gone"
+        );
+        assert!(
+            !active_enabled(&r).contains(&"team_b".to_string()),
+            "no stale profile entry"
+        );
     }
 
     #[test]
@@ -2793,9 +2969,17 @@ mod tests {
             .filter(|s| s.source.as_deref() == Some("team:t1"))
             .map(|s| s.id.clone())
             .collect();
-        assert_eq!(team_ids.len(), 2, "two team server entries, not one overwriting the other");
+        assert_eq!(
+            team_ids.len(),
+            2,
+            "two team server entries, not one overwriting the other"
+        );
         let unique: std::collections::HashSet<&String> = team_ids.iter().collect();
-        assert_eq!(unique.len(), 2, "the colliding ids were deduped to distinct ids");
+        assert_eq!(
+            unique.len(),
+            2,
+            "the colliding ids were deduped to distinct ids"
+        );
     }
 
     #[test]
@@ -2829,13 +3013,25 @@ mod tests {
             "no duplicate id: the local server is not clobbered"
         );
         assert_eq!(
-            r.servers.iter().find(|s| s.id == "team_github").unwrap().source.as_deref(),
+            r.servers
+                .iter()
+                .find(|s| s.id == "team_github")
+                .unwrap()
+                .source
+                .as_deref(),
             Some("manual"),
         );
         // The team server took a distinct, deduped id.
-        let team: Vec<_> = r.servers.iter().filter(|s| s.source.as_deref() == Some("team:t1")).collect();
+        let team: Vec<_> = r
+            .servers
+            .iter()
+            .filter(|s| s.source.as_deref() == Some("team:t1"))
+            .collect();
         assert_eq!(team.len(), 1);
-        assert_ne!(team[0].id, "team_github", "team server deduped away from the local id");
+        assert_ne!(
+            team[0].id, "team_github",
+            "team server deduped away from the local id"
+        );
     }
 
     #[test]
@@ -2974,9 +3170,15 @@ mod tests {
     fn receipt_fresh_requires_matching_fingerprint_and_recent_send() {
         let fp = "abc";
         assert!(!receipt_fresh(None, None, fp));
-        assert!(!receipt_fresh(Some(fp), None, fp), "no timestamp -> not fresh");
+        assert!(
+            !receipt_fresh(Some(fp), None, fp),
+            "no timestamp -> not fresh"
+        );
         assert!(!receipt_fresh(Some("other"), Some(now_ms()), fp));
-        assert!(receipt_fresh(Some(fp), Some(now_ms()), fp), "just sent -> fresh");
+        assert!(
+            receipt_fresh(Some(fp), Some(now_ms()), fp),
+            "just sent -> fresh"
+        );
         // Older than heartbeat window -> not fresh (forces re-send to refresh server stamp).
         let stale_at = now_ms().saturating_sub(RECEIPT_HEARTBEAT_MS + 1);
         assert!(!receipt_fresh(Some(fp), Some(stale_at), fp));
@@ -2986,15 +3188,29 @@ mod tests {
     fn team_forced_deny_destructive_is_releasable_and_leaves_the_member_untouched() {
         let mut r = base_registry();
         r.deny_destructive = false; // member's own choice: off
-        apply_team_config(&mut r, "t1", &json!({ "servers": [], "denyDestructive": true }));
-        assert!(r.team_forced_deny_destructive, "org force recorded separately");
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({ "servers": [], "denyDestructive": true }),
+        );
+        assert!(
+            r.team_forced_deny_destructive,
+            "org force recorded separately"
+        );
         assert!(!r.deny_destructive, "member's own setting is untouched");
-        assert!(r.deny_destructive_effective(), "enforced while the org forces it");
+        assert!(
+            r.deny_destructive_effective(),
+            "enforced while the org forces it"
+        );
         // Org drops the flag -> released, gate follows the member's own (off).
         apply_team_config(&mut r, "t1", &json!({ "servers": [] }));
         assert!(!r.deny_destructive_effective(), "org released the lock");
         // And leaving the team releases it too.
-        apply_team_config(&mut r, "t1", &json!({ "servers": [], "denyDestructive": true }));
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({ "servers": [], "denyDestructive": true }),
+        );
         remove_team(&mut r, "t1");
         assert!(!r.team_forced_deny_destructive, "leaving clears the lock");
         assert!(!r.deny_destructive_effective());
@@ -3014,14 +3230,26 @@ mod tests {
                 "forceQuarantineOnDrift": true,
             }}),
         );
-        assert!(r.content_defense_effective(), "org forced content defense on");
-        assert!(r.quarantine_on_drift_effective(), "org forced drift-quarantine on");
-        assert!(!r.content_defense, "member's own content-defense is untouched");
+        assert!(
+            r.content_defense_effective(),
+            "org forced content defense on"
+        );
+        assert!(
+            r.quarantine_on_drift_effective(),
+            "org forced drift-quarantine on"
+        );
+        assert!(
+            !r.content_defense,
+            "member's own content-defense is untouched"
+        );
 
         // Org dropping the policy releases both to the member's own (off), no permanent lock.
         apply_team_config(&mut r, "t1", &json!({ "servers": [] }));
         assert!(!r.content_defense_effective(), "content defense released");
-        assert!(!r.quarantine_on_drift_effective(), "drift-quarantine released");
+        assert!(
+            !r.quarantine_on_drift_effective(),
+            "drift-quarantine released"
+        );
     }
 
     #[test]
@@ -3083,9 +3311,18 @@ mod tests {
             "t1",
             &json!({ "servers": [], "screeningPolicy": { "forceHumanApproval": true }}),
         );
-        assert!(r.team_forced_human_approval, "org force recorded separately");
-        assert!(!r.human_approval, "member's own setting is never overwritten by the org");
-        assert!(r.human_approval_effective(), "gate is active while the org forces it");
+        assert!(
+            r.team_forced_human_approval,
+            "org force recorded separately"
+        );
+        assert!(
+            !r.human_approval,
+            "member's own setting is never overwritten by the org"
+        );
+        assert!(
+            r.human_approval_effective(),
+            "gate is active while the org forces it"
+        );
 
         // The org disabling its policy RELEASES the lock (the old code left it stuck on), and
         // the gate reverts to the member's own choice.
@@ -3095,7 +3332,10 @@ mod tests {
             &json!({ "servers": [], "screeningPolicy": { "forceHumanApproval": false }}),
         );
         assert!(!r.team_forced_human_approval, "org released the force");
-        assert!(!r.human_approval_effective(), "gate follows the member's own choice again");
+        assert!(
+            !r.human_approval_effective(),
+            "gate follows the member's own choice again"
+        );
     }
 
     #[test]
@@ -3111,8 +3351,14 @@ mod tests {
         assert!(r.human_approval_effective(), "forced on while in the team");
 
         remove_team(&mut r, "t1");
-        assert!(!r.team_forced_human_approval, "leaving the team clears the org lock");
-        assert!(!r.human_approval_effective(), "no team, no force -> follows member's choice");
+        assert!(
+            !r.team_forced_human_approval,
+            "leaving the team clears the org lock"
+        );
+        assert!(
+            !r.human_approval_effective(),
+            "no team, no force -> follows member's choice"
+        );
     }
 
     #[test]
@@ -3125,9 +3371,15 @@ mod tests {
             &json!({ "servers": [], "screeningPolicy": { "forceHumanApproval": false }}),
         );
         assert!(!r.team_forced_human_approval);
-        assert!(r.human_approval_effective(), "the member's own on-setting is preserved");
+        assert!(
+            r.human_approval_effective(),
+            "the member's own on-setting is preserved"
+        );
         remove_team(&mut r, "t1");
-        assert!(r.human_approval_effective(), "leaving doesn't disable the member's own choice");
+        assert!(
+            r.human_approval_effective(),
+            "leaving doesn't disable the member's own choice"
+        );
     }
 
     #[test]
@@ -3190,11 +3442,20 @@ mod tests {
             }),
         );
         let receipt = build_policy_receipt(&r);
-        assert_eq!(receipt["denyDestructive"], true, "member own deny still enforced");
-        assert_eq!(receipt["forceContentDefense"], true, "org force makes content defense effective");
+        assert_eq!(
+            receipt["denyDestructive"], true,
+            "member own deny still enforced"
+        );
+        assert_eq!(
+            receipt["forceContentDefense"], true,
+            "org force makes content defense effective"
+        );
         assert_eq!(receipt["forceQuarantineOnDrift"], false);
         assert_eq!(receipt["forceHumanApproval"], true);
-        assert_eq!(receipt["forceBlockOnInjection"], true, "org force makes block-on-injection effective");
+        assert_eq!(
+            receipt["forceBlockOnInjection"], true,
+            "org force makes block-on-injection effective"
+        );
     }
 
     #[test]
@@ -3285,23 +3546,33 @@ mod tests {
         let exported = team_server_export(&reg);
         let entry = exported
             .as_array()
-            .and_then(|a| a.iter().find(|s| s.get("id").and_then(Value::as_str) == Some("mine")))
+            .and_then(|a| {
+                a.iter()
+                    .find(|s| s.get("id").and_then(Value::as_str) == Some("mine"))
+            })
             .expect("the server must be exported");
         assert_eq!(
-            entry.get("clientCredentials").and_then(|c| c.get("clientId")),
+            entry
+                .get("clientCredentials")
+                .and_then(|c| c.get("clientId")),
             Some(&Value::String("client-abc".into())),
             "export dropped the config: {entry}"
         );
         // The secret is per member and must never ride along.
         assert!(
-            !serde_json::to_string(entry).unwrap().contains("clientSecret"),
+            !serde_json::to_string(entry)
+                .unwrap()
+                .contains("clientSecret"),
             "a client secret must never be pushed to the org: {entry}"
         );
 
         match classify_team_server(entry, "team:t1") {
             TeamClass::Review(imported) | TeamClass::Ready(imported) => {
                 assert_eq!(
-                    imported.client_credentials.as_ref().map(|c| c.client_id.as_str()),
+                    imported
+                        .client_credentials
+                        .as_ref()
+                        .map(|c| c.client_id.as_str()),
                     Some("client-abc"),
                     "import dropped the config"
                 );
@@ -3332,7 +3603,10 @@ mod tests {
 
         let exported = team_server_export(&reg);
         let serialized = serde_json::to_string(&exported).unwrap();
-        assert!(!serialized.contains("team-secret"), "secret leaked: {serialized}");
+        assert!(
+            !serialized.contains("team-secret"),
+            "secret leaked: {serialized}"
+        );
         assert!(serialized.contains("<redacted>"));
     }
 
@@ -3475,12 +3749,14 @@ mod tests {
     #[test]
     fn team_server_export_excludes_gateway_and_team_servers() {
         let mut r = base_registry(); // has "mine" (manual)
-        // Toolport's own gateway entry: infra, must never be pushed to the team.
+                                     // Toolport's own gateway entry: infra, must never be pushed to the team.
         r.servers.push(ServerEntry {
             id: "toolport".into(),
             name: "Toolport".into(),
             transport: "stdio".into(),
-            command: Some(r"C:\projects\personal\conduit\src-tauri\target\debug\conduit-gateway.exe".into()),
+            command: Some(
+                r"C:\projects\personal\conduit\src-tauri\target\debug\conduit-gateway.exe".into(),
+            ),
             args: vec![],
             env: vec![],
             url: None,
@@ -3512,7 +3788,11 @@ mod tests {
             .iter()
             .filter_map(|s| s["id"].as_str())
             .collect();
-        assert_eq!(ids, vec!["mine"], "only the member's own non-gateway server is pushed");
+        assert_eq!(
+            ids,
+            vec!["mine"],
+            "only the member's own non-gateway server is pushed"
+        );
     }
 
     #[test]
@@ -3566,7 +3846,10 @@ mod tests {
             assert!(is_redirect_status(status), "{status} must be a redirect");
         }
         for status in [200u16, 204, 304, 400, 401, 404] {
-            assert!(!is_redirect_status(status), "{status} must not be treated as a redirect");
+            assert!(
+                !is_redirect_status(status),
+                "{status} must not be treated as a redirect"
+            );
         }
     }
 
@@ -3579,8 +3862,14 @@ mod tests {
             &json!({ "servers": [{ "id": "a", "name": "A", "transport": "http", "url": "https://1.2.3.4/mcp" }] }),
         );
         remove_team(&mut r, "t1");
-        assert!(r.servers.iter().all(|s| s.source.as_deref() != Some("team:t1")));
-        assert!(r.servers.iter().any(|s| s.id == "mine"), "local server preserved");
+        assert!(r
+            .servers
+            .iter()
+            .all(|s| s.source.as_deref() != Some("team:t1")));
+        assert!(
+            r.servers.iter().any(|s| s.id == "mine"),
+            "local server preserved"
+        );
         assert!(!active_enabled(&r).iter().any(|id| id.starts_with("team_")));
     }
 
@@ -3597,23 +3886,56 @@ mod tests {
             { "id": "lan", "name": "LAN", "transport": "http", "url": "http://127.0.0.1:9000/mcp" }
         ]});
         let outcome = apply_team_config(&mut r, "t1", &cfg);
-        assert_eq!(outcome.applied, 1, "only the public remote server auto-enables");
-        assert_eq!(outcome.review, 3, "two local commands + one loopback URL need review");
-        assert_eq!(outcome.blocked, 1, "the link-local/metadata URL is blocked outright");
+        assert_eq!(
+            outcome.applied, 1,
+            "only the public remote server auto-enables"
+        );
+        assert_eq!(
+            outcome.review, 3,
+            "two local commands + one loopback URL need review"
+        );
+        assert_eq!(
+            outcome.blocked, 1,
+            "the link-local/metadata URL is blocked outright"
+        );
 
-        let team: Vec<_> = r.servers.iter().filter(|s| s.source.as_deref() == Some("team:t1")).collect();
-        assert_eq!(team.len(), 4, "ready + review servers sync; only the blocked one is dropped");
-        assert!(!team.iter().any(|s| s.id == "team_meta"), "link-local server never synced");
+        let team: Vec<_> = r
+            .servers
+            .iter()
+            .filter(|s| s.source.as_deref() == Some("team:t1"))
+            .collect();
+        assert_eq!(
+            team.len(),
+            4,
+            "ready + review servers sync; only the blocked one is dropped"
+        );
+        assert!(
+            !team.iter().any(|s| s.id == "team_meta"),
+            "link-local server never synced"
+        );
 
         // The review stdio server carries its command so the member can run it AFTER opt-in...
-        let rce = r.servers.iter().find(|s| s.id == "team_rce").expect("review server synced");
+        let rce = r
+            .servers
+            .iter()
+            .find(|s| s.id == "team_rce")
+            .expect("review server synced");
         assert_eq!(rce.command.as_deref(), Some("powershell"));
 
         // ...but only the public remote server is enabled; review servers stay OFF.
         let enabled = active_enabled(&r);
-        assert!(enabled.contains(&"team_safe".to_string()), "ready server auto-enabled");
-        assert!(!enabled.contains(&"team_rce".to_string()), "local-command server stays off");
-        assert!(!enabled.contains(&"team_lan".to_string()), "loopback server stays off");
+        assert!(
+            enabled.contains(&"team_safe".to_string()),
+            "ready server auto-enabled"
+        );
+        assert!(
+            !enabled.contains(&"team_rce".to_string()),
+            "local-command server stays off"
+        );
+        assert!(
+            !enabled.contains(&"team_lan".to_string()),
+            "loopback server stays off"
+        );
     }
 
     #[test]
@@ -3624,13 +3946,24 @@ mod tests {
         ]});
         // First sync: the stdio server is added but OFF (needs review).
         apply_team_config(&mut r, "t1", &cfg);
-        assert!(!active_enabled(&r).contains(&"team_tool".to_string()), "review server starts off");
+        assert!(
+            !active_enabled(&r).contains(&"team_tool".to_string()),
+            "review server starts off"
+        );
         // Member consents by enabling it.
         let active = r.active_profile_id.clone().unwrap();
-        r.profiles.iter_mut().find(|p| p.id == active).unwrap().enabled_server_ids.push("team_tool".into());
+        r.profiles
+            .iter_mut()
+            .find(|p| p.id == active)
+            .unwrap()
+            .enabled_server_ids
+            .push("team_tool".into());
         // Re-sync (config unchanged): consent is preserved, the server stays enabled.
         apply_team_config(&mut r, "t1", &cfg);
-        assert!(active_enabled(&r).contains(&"team_tool".to_string()), "prior consent survives re-sync");
+        assert!(
+            active_enabled(&r).contains(&"team_tool".to_string()),
+            "prior consent survives re-sync"
+        );
     }
 
     /// Enable `id` in the active profile, the way the member's review-and-enable does.
@@ -3666,15 +3999,25 @@ mod tests {
             !active_enabled(&r).contains(&"team_tool".to_string()),
             "a swapped command stays off until the member enables it again"
         );
-        assert_eq!(outcome.review, 1, "the changed server is counted for review again");
+        assert_eq!(
+            outcome.review, 1,
+            "the changed server is counted for review again"
+        );
         let entry = r.servers.iter().find(|s| s.id == "team_tool").unwrap();
-        assert_eq!(entry.command.as_deref(), Some("bash"), "the new definition is synced, just not enabled");
+        assert_eq!(
+            entry.command.as_deref(),
+            Some("bash"),
+            "the new definition is synced, just not enabled"
+        );
 
         // Re-consent under the new definition, then an unchanged re-sync keeps it.
         consent_to(&mut r, "team_tool");
         let again = apply_team_config(&mut r, "t1", &swapped);
         assert!(active_enabled(&r).contains(&"team_tool".to_string()));
-        assert_eq!(again.review, 0, "nothing left to review once consent matches the definition");
+        assert_eq!(
+            again.review, 0,
+            "nothing left to review once consent matches the definition"
+        );
     }
 
     #[test]
@@ -3690,17 +4033,46 @@ mod tests {
         consent_to(&mut r, "team_tool");
 
         // A rename changes nothing that runs: consent carries over.
-        apply_team_config(&mut r, "t1", &mk("Tool (renamed)", vec!["-y", "pkg"], vec!["TOKEN"]));
-        assert!(active_enabled(&r).contains(&"team_tool".to_string()), "a rename keeps consent");
+        apply_team_config(
+            &mut r,
+            "t1",
+            &mk("Tool (renamed)", vec!["-y", "pkg"], vec!["TOKEN"]),
+        );
+        assert!(
+            active_enabled(&r).contains(&"team_tool".to_string()),
+            "a rename keeps consent"
+        );
 
         // An extra arg is a different invocation: consent does not carry over.
-        apply_team_config(&mut r, "t1", &mk("Tool (renamed)", vec!["-y", "pkg", "--unsafe"], vec!["TOKEN"]));
-        assert!(!active_enabled(&r).contains(&"team_tool".to_string()), "new args need new consent");
+        apply_team_config(
+            &mut r,
+            "t1",
+            &mk(
+                "Tool (renamed)",
+                vec!["-y", "pkg", "--unsafe"],
+                vec!["TOKEN"],
+            ),
+        );
+        assert!(
+            !active_enabled(&r).contains(&"team_tool".to_string()),
+            "new args need new consent"
+        );
         consent_to(&mut r, "team_tool");
 
         // A new env key changes what the member is asked to vault and what the process sees.
-        apply_team_config(&mut r, "t1", &mk("Tool (renamed)", vec!["-y", "pkg", "--unsafe"], vec!["TOKEN", "AWS_SECRET"]));
-        assert!(!active_enabled(&r).contains(&"team_tool".to_string()), "new env keys need new consent");
+        apply_team_config(
+            &mut r,
+            "t1",
+            &mk(
+                "Tool (renamed)",
+                vec!["-y", "pkg", "--unsafe"],
+                vec!["TOKEN", "AWS_SECRET"],
+            ),
+        );
+        assert!(
+            !active_enabled(&r).contains(&"team_tool".to_string()),
+            "new env keys need new consent"
+        );
     }
 
     /// The worse variant from SBS-1017: a public remote server is auto-enabled with no member
@@ -3714,7 +4086,10 @@ mod tests {
         ]});
         let first = apply_team_config(&mut r, "t1", &remote);
         assert_eq!(first.applied, 1);
-        assert!(active_enabled(&r).contains(&"team_helper".to_string()), "public remote auto-enables");
+        assert!(
+            active_enabled(&r).contains(&"team_helper".to_string()),
+            "public remote auto-enables"
+        );
 
         let local = json!({ "servers": [
             { "id": "helper", "name": "Helper", "transport": "stdio", "command": "sh", "args": ["-c", "id"] }
@@ -3736,7 +4111,18 @@ mod tests {
             transport: "stdio".into(),
             command: Some("npx".into()),
             args: vec!["-y".into(), "pkg".into()],
-            env: vec![EnvVar { key: "B".into(), value: None, secret: true }, EnvVar { key: "A".into(), value: None, secret: true }],
+            env: vec![
+                EnvVar {
+                    key: "B".into(),
+                    value: None,
+                    secret: true,
+                },
+                EnvVar {
+                    key: "A".into(),
+                    value: None,
+                    secret: true,
+                },
+            ],
             url: None,
             source: Some("team:t1".into()),
             disabled_tools: vec![],
@@ -3749,11 +4135,19 @@ mod tests {
         let mut renamed = base.clone();
         renamed.name = "Y".into();
         renamed.disabled_tools = vec!["scary".into()];
-        assert_eq!(consent_fingerprint(&renamed), fp, "name and tool scope are not execution");
+        assert_eq!(
+            consent_fingerprint(&renamed),
+            fp,
+            "name and tool scope are not execution"
+        );
 
         let mut env_reordered = base.clone();
         env_reordered.env.reverse();
-        assert_eq!(consent_fingerprint(&env_reordered), fp, "env key order is not execution");
+        assert_eq!(
+            consent_fingerprint(&env_reordered),
+            fp,
+            "env key order is not execution"
+        );
 
         let mut other_cmd = base.clone();
         other_cmd.command = Some("bash".into());

@@ -391,10 +391,9 @@ fn store_checkpoint(
         )));
     }
     let parsed: Value = serde_json::from_str(raw).map_err(|error| {
-        JsError::from_native(
-            JsNativeError::error()
-                .with_message(format!("toolport.checkpoint received invalid JSON: {error}")),
-        )
+        JsError::from_native(JsNativeError::error().with_message(format!(
+            "toolport.checkpoint received invalid JSON: {error}"
+        )))
     })?;
     *checkpoint.borrow_mut() = Some(parsed);
     Ok(())
@@ -728,7 +727,9 @@ pub fn run_script_with_input(
                 progress: Vec::new(),
                 final_result_bytes: 0,
                 checkpoint: None,
-                error: Some(format!("toolport code mode: failed to create JS context: {e}")),
+                error: Some(format!(
+                    "toolport code mode: failed to create JS context: {e}"
+                )),
             };
         }
     };
@@ -817,11 +818,9 @@ pub fn run_script_with_input(
     {
         return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
     }
-    if let Err(e) = context.register_global_callable(
-        js_string!("__toolport_checkpoint"),
-        1,
-        checkpoint_native,
-    ) {
+    if let Err(e) =
+        context.register_global_callable(js_string!("__toolport_checkpoint"), 1, checkpoint_native)
+    {
         return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
     }
 
@@ -862,10 +861,7 @@ pub fn run_script_with_input(
                         .with_message("toolport.fetchResult requires a non-empty cursor"),
                 ));
             }
-            let offset = spec
-                .get("offset")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
+            let offset = spec.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let len = spec.get("len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             let projection = spec
                 .get("projection")
@@ -1129,8 +1125,7 @@ fn flush_pending_host_calls(context: &mut Context, state: &HostState) -> Result<
         }
 
         for (pending_call, result) in batch.into_iter().zip(results.into_iter()) {
-            let result_str =
-                serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string());
+            let result_str = serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string());
             let js_result = JsValue::from(js_string!(result_str));
             pending_call
                 .resolvers
@@ -1199,7 +1194,12 @@ fn run_calls_parallel(call: &CallBinding, items: Vec<(String, Value)>) -> Vec<Va
 /// runtime-limit errors (loop/recursion caps) panic when converted to an opaque JS value,
 /// and `Display` yields a usable message (`Uncaught Error: ...`, `RuntimeLimit: ...`) for
 /// every error kind.
-fn fail(calls: usize, progress: Vec<CallRecord>, checkpoint: Option<Value>, err: JsError) -> ScriptOutcome {
+fn fail(
+    calls: usize,
+    progress: Vec<CallRecord>,
+    checkpoint: Option<Value>,
+    err: JsError,
+) -> ScriptOutcome {
     ScriptOutcome {
         value: json!(null),
         calls,
@@ -2208,7 +2208,12 @@ mod tests {
     #[test]
     fn checkpoint_is_none_on_a_script_that_never_compiles() {
         let call = Arc::new(|_: &str, _: Value| Value::Null);
-        let out = run("this is not ( valid javascript", json!({}), call, Limits::default());
+        let out = run(
+            "this is not ( valid javascript",
+            json!({}),
+            call,
+            Limits::default(),
+        );
         assert!(out.error.is_some());
         assert_eq!(out.checkpoint, None);
     }
@@ -2229,7 +2234,10 @@ mod tests {
             Limits::default(),
         );
         let err = out.error.expect("an oversized checkpoint must fail closed");
-        assert!(err.contains("4096"), "error should name the byte cap: {err}");
+        assert!(
+            err.contains("4096"),
+            "error should name the byte cap: {err}"
+        );
         // The prior good checkpoint is untouched by the rejected call.
         assert_eq!(out.checkpoint, Some(json!({ "ok": true })));
     }

@@ -55,7 +55,11 @@ fn no_production_log_opens_append_mode_directly() {
     let src = manifest.join("src");
     let mut files = Vec::new();
     rust_sources(&src, &mut files);
-    assert!(!files.is_empty(), "no sources found under {}", src.display());
+    assert!(
+        !files.is_empty(),
+        "no sources found under {}",
+        src.display()
+    );
 
     let mut offenders = Vec::new();
     for file in files {
@@ -162,10 +166,7 @@ fn open_append_private_tightens_a_file_that_is_already_world_readable() {
 
 #[cfg(unix)]
 fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "toolport-sbs868-{label}-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("toolport-sbs868-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir

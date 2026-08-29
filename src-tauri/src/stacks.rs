@@ -144,7 +144,10 @@ mod tests {
 
     #[test]
     fn stack_servers_carry_credential_hints_where_expected() {
-        let infra = stacks().into_iter().find(|s| s.id == "infra-devops").unwrap();
+        let infra = stacks()
+            .into_iter()
+            .find(|s| s.id == "infra-devops")
+            .unwrap();
         let linode = infra.servers.iter().find(|e| e.name == "Linode").unwrap();
         // Linode is token-based: it should carry a creds URL + a setup hint.
         assert!(linode.credentials_url.is_some());

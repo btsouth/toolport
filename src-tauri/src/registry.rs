@@ -133,7 +133,8 @@ pub(crate) fn append_line_locked(
     if !bytes.ends_with('\n') {
         bytes.push('\n');
     }
-    file.write_all(bytes.as_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(bytes.as_bytes())
+        .map_err(|e| e.to_string())?;
     // Query size through the handle we already opened instead of reopening the
     // path for metadata. Drop it before rotation so Windows can atomically replace
     // the log when the cap is crossed.
@@ -223,11 +224,7 @@ fn transient_rename_error(_error: &std::io::Error) -> bool {
 /// Bounded on both axes - at most [`RENAME_ATTEMPTS`] tries and a capped backoff - so a
 /// destination that is genuinely locked forever still reports its error instead of hanging.
 /// A non-retryable error returns on the first attempt, unchanged and undelayed.
-fn rename_with_retry(
-    ops: &impl AtomicWriteOps,
-    from: &Path,
-    to: &Path,
-) -> std::io::Result<()> {
+fn rename_with_retry(ops: &impl AtomicWriteOps, from: &Path, to: &Path) -> std::io::Result<()> {
     let mut delay = RENAME_BACKOFF_START;
     let mut attempt = 1;
     loop {
@@ -340,9 +337,8 @@ fn resolve_atomic_write_dest(path: &Path) -> Result<PathBuf, String> {
                         current.display()
                     ));
                 }
-                let target = std::fs::read_link(&current).map_err(|e| {
-                    format!("could not read symlink {}: {e}", current.display())
-                })?;
+                let target = std::fs::read_link(&current)
+                    .map_err(|e| format!("could not read symlink {}: {e}", current.display()))?;
                 // Relative targets are relative to the link's parent, not cwd.
                 current = match current.parent() {
                     Some(parent) => parent.join(target),
@@ -1394,7 +1390,13 @@ pub fn unmigrated_legacy_profile_store(profile: &str, pins: bool) -> bool {
 fn legacy_profile_store_slug(profile_ref: &str) -> String {
     profile_ref
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -1432,8 +1434,12 @@ impl ProfileStoreKind {
 }
 
 fn write_new_profile_store(path: &Path, contents: &str) -> Result<(), String> {
-    let _lock = lock_at(path)
-        .map_err(|e| format!("could not lock profile store {} for migration: {e}", path.display()))?;
+    let _lock = lock_at(path).map_err(|e| {
+        format!(
+            "could not lock profile store {} for migration: {e}",
+            path.display()
+        )
+    })?;
     if path.exists() {
         return Ok(());
     }
@@ -1447,11 +1453,14 @@ fn merge_legacy_quarantines(paths: &[PathBuf]) -> Result<String, String> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("could not read legacy quarantine {}: {e}", path.display()))?;
         let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-            format!("could not parse legacy quarantine {} during migration: {e}", path.display())
+            format!(
+                "could not parse legacy quarantine {} during migration: {e}",
+                path.display()
+            )
         })?;
-        let object = value.as_object().ok_or_else(|| {
-            format!("legacy quarantine {} is not an object", path.display())
-        })?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("legacy quarantine {} is not an object", path.display()))?;
         for (tool, record) in object {
             // Every record blocks the same namespaced tool. Keeping the first
             // record is conservative; ambiguity is resolved by the corrupt-pin
@@ -1469,7 +1478,9 @@ fn merge_legacy_quarantines(paths: &[PathBuf]) -> Result<String, String> {
 /// rebuilt, pin stores receive an intentionally invalid marker (so integrity
 /// fails closed), and quarantine records are unioned into every claimant.
 pub fn migrate_profile_stores(registry: &Registry) -> Result<(), String> {
-    let Some(dir) = conduit_dir() else { return Ok(()) };
+    let Some(dir) = conduit_dir() else {
+        return Ok(());
+    };
     if !dir.exists() {
         return Ok(());
     }
@@ -1485,15 +1496,23 @@ pub fn migrate_profile_stores(registry: &Registry) -> Result<(), String> {
         .filter(|slug| !slug.is_empty())
         .collect::<BTreeSet<_>>();
         for slug in &slugs {
-            claims.entry(slug.clone()).or_default().insert(profile.id.clone());
+            claims
+                .entry(slug.clone())
+                .or_default()
+                .insert(profile.id.clone());
         }
         profile_slugs.insert(profile.id.clone(), slugs);
     }
 
     for profile in &registry.profiles {
-        let Some(slugs) = profile_slugs.get(&profile.id) else { continue };
-        for kind in [ProfileStoreKind::Cache, ProfileStoreKind::Pins, ProfileStoreKind::Quarantine]
-        {
+        let Some(slugs) = profile_slugs.get(&profile.id) else {
+            continue;
+        };
+        for kind in [
+            ProfileStoreKind::Cache,
+            ProfileStoreKind::Pins,
+            ProfileStoreKind::Quarantine,
+        ] {
             let target = dir.join(format!(
                 "{}{}.json",
                 kind.stable_prefix(),
@@ -1505,7 +1524,10 @@ pub fn migrate_profile_stores(registry: &Registry) -> Result<(), String> {
             let mut sources = slugs
                 .iter()
                 .map(|slug| {
-                    (Some(slug), dir.join(format!("{}{slug}.json", kind.legacy_prefix())))
+                    (
+                        Some(slug),
+                        dir.join(format!("{}{slug}.json", kind.legacy_prefix())),
+                    )
                 })
                 .filter(|(_, path)| path.exists())
                 .collect::<Vec<_>>();
@@ -1519,7 +1541,10 @@ pub fn migrate_profile_stores(registry: &Registry) -> Result<(), String> {
             if sources.is_empty() {
                 continue;
             }
-            let mut source_paths = sources.iter().map(|(_, path)| path.clone()).collect::<Vec<_>>();
+            let mut source_paths = sources
+                .iter()
+                .map(|(_, path)| path.clone())
+                .collect::<Vec<_>>();
             source_paths.sort();
             source_paths.dedup();
             let _source_locks = if kind == ProfileStoreKind::Cache {
@@ -1544,7 +1569,10 @@ pub fn migrate_profile_stores(registry: &Registry) -> Result<(), String> {
                 };
             if unambiguous {
                 let raw = std::fs::read_to_string(&sources[0].1).map_err(|e| {
-                    format!("could not read legacy profile store {}: {e}", sources[0].1.display())
+                    format!(
+                        "could not read legacy profile store {}: {e}",
+                        sources[0].1.display()
+                    )
                 })?;
                 write_new_profile_store(&target, &raw)?;
                 continue;
@@ -1562,7 +1590,10 @@ pub fn migrate_profile_stores(registry: &Registry) -> Result<(), String> {
                     )?;
                 }
                 ProfileStoreKind::Quarantine => {
-                    let paths = sources.into_iter().map(|(_, path)| path).collect::<Vec<_>>();
+                    let paths = sources
+                        .into_iter()
+                        .map(|(_, path)| path)
+                        .collect::<Vec<_>>();
                     let merged = merge_legacy_quarantines(&paths)?;
                     write_new_profile_store(&target, &merged)?;
                 }
@@ -1641,7 +1672,10 @@ impl Registry {
                 return String::new();
             }
             resolve(profile_ref).unwrap_or_else(|| {
-                format!("{INVALID_PROFILE_REF_PREFIX}{}", sha256_hex(profile_ref.trim()))
+                format!(
+                    "{INVALID_PROFILE_REF_PREFIX}{}",
+                    sha256_hex(profile_ref.trim())
+                )
             })
         };
         if let Some(active) = self.active_profile_id.clone() {
@@ -1705,7 +1739,8 @@ impl Registry {
         let prefix = format!("{sanitized_id}/");
         self.injection_block_exempt.remove(&sanitized_id);
         self.result_budgets.remove(&sanitized_id);
-        self.human_approval_allow.retain(|k| !k.starts_with(&prefix));
+        self.human_approval_allow
+            .retain(|k| !k.starts_with(&prefix));
         Ok(())
     }
 
@@ -1971,7 +2006,10 @@ impl Registry {
         if ov.name.is_none() && ov.description.is_none() {
             self.clear_tool_override(&server, &tool);
         } else {
-            self.tool_overrides.entry(server).or_default().insert(tool, ov);
+            self.tool_overrides
+                .entry(server)
+                .or_default()
+                .insert(tool, ov);
         }
     }
 
@@ -2317,7 +2355,9 @@ impl Registry {
     /// SHA-256, if any. The bridge uses this to resolve a bearer to its scope.
     pub fn http_client_for_token(&self, token: &str) -> Option<&HttpClient> {
         let h = sha256_hex(token);
-        self.http_clients.iter().find(|c| ct_eq(&c.token_sha256, &h))
+        self.http_clients
+            .iter()
+            .find(|c| ct_eq(&c.token_sha256, &h))
     }
 }
 
@@ -2626,7 +2666,9 @@ fn record_registry_recovery(reason: &str, quarantine: Option<PathBuf>) {
     let notice = RegistryRecoveryNotice {
         recovered_at_ms,
         reason: reason.to_string(),
-        quarantine_path: quarantine.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        quarantine_path: quarantine
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
     };
     if let Ok(json) = serde_json::to_string_pretty(&notice) {
         let _ = atomic_write(&path, &json);
@@ -2682,8 +2724,7 @@ const BACKUP_GENERATIONS: usize = 5;
 /// `<registry>.bak` (no trailing timestamp) and the `.unreadable-*` quarantine
 /// files, which use a different prefix.
 fn backup_generations(path: &Path) -> Vec<PathBuf> {
-    let (Some(dir), Some(base)) = (path.parent(), path.file_name().and_then(|f| f.to_str()))
-    else {
+    let (Some(dir), Some(base)) = (path.parent(), path.file_name().and_then(|f| f.to_str())) else {
         return Vec::new();
     };
     let prefix = format!("{base}.bak.");
@@ -2866,8 +2907,7 @@ fn quarantine_unreadable(path: &Path, content: &str) -> Option<PathBuf> {
     let dest = PathBuf::from(name);
     atomic_write(&dest, content).ok()?;
     // Prune older quarantine files beyond the newest KEEP.
-    let (Some(dir), Some(base)) = (path.parent(), path.file_name().and_then(|f| f.to_str()))
-    else {
+    let (Some(dir), Some(base)) = (path.parent(), path.file_name().and_then(|f| f.to_str())) else {
         return None;
     };
     let prefix = format!("{base}.unreadable-");
@@ -3018,7 +3058,10 @@ pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
     // HashMap key-order jitter across a load->save round-trip can't masquerade as a change.
     if let Some(cur) = existing.as_deref() {
         if let Ok(cur_val) = serde_json::from_str::<serde_json::Value>(cur) {
-            if serde_json::to_value(registry).map(|v| v == cur_val).unwrap_or(false) {
+            if serde_json::to_value(registry)
+                .map(|v| v == cur_val)
+                .unwrap_or(false)
+            {
                 return Ok(());
             }
         }
@@ -3896,7 +3939,10 @@ mod tests {
         })
         .unwrap();
         assert!(out.deny_destructive, "our change applied");
-        assert!(out.allow_agent_control, "the concurrent write was NOT reverted");
+        assert!(
+            out.allow_agent_control,
+            "the concurrent write was NOT reverted"
+        );
 
         let reloaded = load_from(&path).unwrap();
         assert!(reloaded.deny_destructive && reloaded.allow_agent_control);
@@ -4049,12 +4095,12 @@ mod tests {
         let id = r.add_server(sample_server("Github MCP"));
         let sanitized_id = sanitize_segment(&id);
         r.set_tool_override(
-        id.clone(),
-        "search".to_string(),
-        ToolOverride {
-            name: Some("repo-search".to_string()),
-            description: None,
-          },
+            id.clone(),
+            "search".to_string(),
+            ToolOverride {
+                name: Some("repo-search".to_string()),
+                description: None,
+            },
         );
         r.set_tool_pinned(&id, "create_issue", true);
         let key = fingerprint_allow_key(&sanitized_id, "create_issue", "v2:testfp");
@@ -4070,7 +4116,8 @@ mod tests {
         assert_eq!(new_id, id);
         assert!(r.tool_overrides.get(&new_id).is_none());
         assert!(!r.is_tool_pinned(&new_id, "create_issue"));
-        let new_key = fingerprint_allow_key(&sanitize_segment(&new_id), "create_issue", "v2:testfp");
+        let new_key =
+            fingerprint_allow_key(&sanitize_segment(&new_id), "create_issue", "v2:testfp");
         assert!(!r.is_tool_allowed(&new_key));
         assert!(!r.injection_block_exempt.contains_key(&sanitized_id));
         assert!(!r.result_budgets.contains_key(&sanitized_id));
@@ -4155,9 +4202,17 @@ mod tests {
         r.set_server_enabled(&billing, &pay, true).unwrap();
 
         // Resolve by name (case-insensitive) and by id, independent of active.
-        let by_name: Vec<_> = r.enabled_servers_for("billing").iter().map(|s| s.id.clone()).collect();
+        let by_name: Vec<_> = r
+            .enabled_servers_for("billing")
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
         assert_eq!(by_name, vec![pay.clone()]);
-        let by_id: Vec<_> = r.enabled_servers_for("default").iter().map(|s| s.id.clone()).collect();
+        let by_id: Vec<_> = r
+            .enabled_servers_for("default")
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
         assert_eq!(by_id, vec![db]);
         // A NAMED reference that matches no profile (deleted/renamed) fails CLOSED:
         // an empty set, NOT a silent widening to the active profile's servers.
@@ -4192,7 +4247,10 @@ mod tests {
             r.profile_for_root("/home/me/work/client-a/repo"),
             Some("ClientA".into())
         );
-        assert_eq!(r.profile_for_root("/home/me/personal/notes"), Some("Personal".into()));
+        assert_eq!(
+            r.profile_for_root("/home/me/personal/notes"),
+            Some("Personal".into())
+        );
         // No mapping -> None (caller falls back to the configured profile).
         assert_eq!(r.profile_for_root("/tmp/other"), None);
         // Boundary: a sibling sharing a NAME prefix must not match ("work" vs "workspace").
@@ -4216,7 +4274,7 @@ mod tests {
         assert!(r.profile_allows_tool("default", &gh, "search"));
         assert!(!r.profile_allows_tool("default", &gh, "create_issue")); // not allow-listed
         assert!(r.profile_allows_tool("default", &db, "query")); // no scope on db -> all allowed
-        // Resolves by profile NAME too, like the other scope lookups.
+                                                                 // Resolves by profile NAME too, like the other scope lookups.
         assert!(!r.profile_allows_tool("Default", &gh, "create_issue"));
 
         // Clearing restores all-allowed and leaves the map empty (backward compatible).
@@ -4230,7 +4288,8 @@ mod tests {
         let mut r = Registry::default();
         let gh = r.add_server(sample_server("github"));
         // Some(empty) = expose NO tools on this server (not the same as "all tools").
-        r.set_profile_server_tools("default", &gh, Some(vec![])).unwrap();
+        r.set_profile_server_tools("default", &gh, Some(vec![]))
+            .unwrap();
         assert!(!r.profile_allows_tool("default", &gh, "search"));
         assert!(!r.profile_allows_tool("default", &gh, "anything"));
         assert!(r.profiles[0].tool_scope.contains_key(&gh));
@@ -4299,7 +4358,10 @@ mod tests {
         }];
         // A trailing slash on the mapping and backslash separators in the root both normalize.
         assert_eq!(r.profile_for_root("/home/me/work"), Some("Work".into()));
-        assert_eq!(r.profile_for_root(r"\home\me\work\sub"), Some("Work".into()));
+        assert_eq!(
+            r.profile_for_root(r"\home\me\work\sub"),
+            Some("Work".into())
+        );
     }
 
     #[test]
@@ -4332,7 +4394,10 @@ mod tests {
     fn client_scope_records_and_clears() {
         let mut r = Registry::default();
         r.set_client_scope("cursor", Some("Billing"));
-        assert_eq!(r.client_scopes.get("cursor").map(String::as_str), Some("Billing"));
+        assert_eq!(
+            r.client_scopes.get("cursor").map(String::as_str),
+            Some("Billing")
+        );
         // Whitespace-only / empty / None all clear the binding.
         r.set_client_scope("cursor", Some("  "));
         assert!(!r.client_scopes.contains_key("cursor"));
@@ -4391,7 +4456,10 @@ mod tests {
         assert!(r.client_scopes.contains_key("cursor"));
         // Re-scoping to a named profile replaces the marker; uninstall clears it.
         r.set_client_scope("cursor", Some("Billing"));
-        assert_eq!(r.client_scopes.get("cursor").map(String::as_str), Some("Billing"));
+        assert_eq!(
+            r.client_scopes.get("cursor").map(String::as_str),
+            Some("Billing")
+        );
         r.set_client_scope("cursor", None);
         assert!(!r.client_scopes.contains_key("cursor"));
     }
@@ -4407,7 +4475,10 @@ mod tests {
             profile: "Billing".into(),
         });
         // The plaintext token resolves to its client; a wrong token doesn't.
-        assert_eq!(r.http_client_for_token(token).map(|c| c.profile.as_str()), Some("Billing"));
+        assert_eq!(
+            r.http_client_for_token(token).map(|c| c.profile.as_str()),
+            Some("Billing")
+        );
         assert!(r.http_client_for_token("tok_wrong").is_none());
         // The hash is deterministic and not the plaintext.
         assert_eq!(sha256_hex(token), sha256_hex(token));
@@ -4428,22 +4499,38 @@ mod tests {
         r.set_server_enabled(&support, &c, true).unwrap();
         // Base alone (no clients) connects only the active profile's server.
         assert_eq!(
-            r.bridge_enabled_servers(None).iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            r.bridge_enabled_servers(None)
+                .iter()
+                .map(|s| s.id.clone())
+                .collect::<Vec<_>>(),
             vec![a.clone()]
         );
         // Two clients scoped to Billing and Support -> the bridge connects the union.
         r.http_clients.push(HttpClient {
-            id: "1".into(), label: "x".into(), token_sha256: "h1".into(), profile: "Billing".into(),
+            id: "1".into(),
+            label: "x".into(),
+            token_sha256: "h1".into(),
+            profile: "Billing".into(),
         });
         r.http_clients.push(HttpClient {
-            id: "2".into(), label: "y".into(), token_sha256: "h2".into(), profile: "Support".into(),
+            id: "2".into(),
+            label: "y".into(),
+            token_sha256: "h2".into(),
+            profile: "Support".into(),
         });
-        let ids: Vec<_> = r.bridge_enabled_servers(None).iter().map(|s| s.id.clone()).collect();
+        let ids: Vec<_> = r
+            .bridge_enabled_servers(None)
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
         assert!(ids.contains(&a) && ids.contains(&b) && ids.contains(&c));
         assert_eq!(ids.len(), 3);
         // An unscoped (empty-profile) client adds nothing beyond the union.
         r.http_clients.push(HttpClient {
-            id: "3".into(), label: "z".into(), token_sha256: "h3".into(), profile: String::new(),
+            id: "3".into(),
+            label: "z".into(),
+            token_sha256: "h3".into(),
+            profile: String::new(),
         });
         assert_eq!(r.bridge_enabled_servers(None).len(), 3);
     }
@@ -4463,7 +4550,13 @@ mod tests {
         // Re-enable removes it.
         r.set_tool_enabled(&id, "create_issue", true).unwrap();
         assert!(r.is_tool_enabled(&id, "create_issue"));
-        assert!(r.servers.iter().find(|s| s.id == id).unwrap().disabled_tools.is_empty());
+        assert!(r
+            .servers
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap()
+            .disabled_tools
+            .is_empty());
     }
 
     #[test]
@@ -4544,7 +4637,10 @@ mod tests {
         // (no new key), and that JSON - which lacks the field, like every old registry -
         // round-trips back to None.
         let json = serde_json::to_string(&Registry::default()).unwrap();
-        assert!(!json.contains("discovery_mode"), "None must not be serialized");
+        assert!(
+            !json.contains("discovery_mode"),
+            "None must not be serialized"
+        );
         let back: Registry = serde_json::from_str(&json).unwrap();
         assert_eq!(back.discovery_mode, None);
     }
@@ -4577,7 +4673,10 @@ mod tests {
         let _guard = REGISTRY_ENV_LOCK.lock().unwrap();
 
         let mut path = std::env::temp_dir();
-        path.push(format!("conduit-registry-override-{}.json", std::process::id()));
+        path.push(format!(
+            "conduit-registry-override-{}.json",
+            std::process::id()
+        ));
         let previous = std::env::var_os("CONDUIT_REGISTRY");
         struct RestoreEnv(Option<std::ffi::OsString>);
         impl Drop for RestoreEnv {
@@ -4607,10 +4706,7 @@ mod tests {
     #[test]
     fn update_saves_to_the_same_resolved_path_it_locked() {
         let _guard = REGISTRY_ENV_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-update-path-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("toolport-update-path-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let locked_path = dir.join("locked.json");
         let redirected_path = dir.join("redirected.json");
@@ -4686,11 +4782,10 @@ mod tests {
             s.ends_with(&format!(
                 "AppData\\Roaming\\{}",
                 crate::brand::data_dir_leaf_name()
-            ))
-                || s.ends_with(&format!(
-                    "AppData\\Roaming\\{}",
-                    crate::brand::legacy_data_dir_leaf_name()
-                )),
+            )) || s.ends_with(&format!(
+                "AppData\\Roaming\\{}",
+                crate::brand::legacy_data_dir_leaf_name()
+            )),
             "unexpected data dir: {s}"
         );
         assert!(!s.starts_with(r"\\"));
@@ -4790,7 +4885,11 @@ mod tests {
         atomic_write_with_ops(&path, "landed", &ops).expect("a transient rename must be retried");
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "landed");
-        assert_eq!(ops.attempts.get(), 4, "three refusals then the successful one");
+        assert_eq!(
+            ops.attempts.get(),
+            4,
+            "three refusals then the successful one"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4809,13 +4908,24 @@ mod tests {
 
         let forever = FlakyRenameOps::new(u32::MAX, true);
         atomic_write_with_ops(&path, "never", &forever).unwrap_err();
-        assert_eq!(forever.attempts.get(), RENAME_ATTEMPTS, "bounded, not endless");
-        assert!(!path.exists(), "a failed publish leaves no partial file behind");
+        assert_eq!(
+            forever.attempts.get(),
+            RENAME_ATTEMPTS,
+            "bounded, not endless"
+        );
+        assert!(
+            !path.exists(),
+            "a failed publish leaves no partial file behind"
+        );
 
         // Not classified as transient: reported on the first attempt, with no backoff spent.
         let permanent = FlakyRenameOps::new(u32::MAX, false);
         atomic_write_with_ops(&path, "never", &permanent).unwrap_err();
-        assert_eq!(permanent.attempts.get(), 1, "a permanent error is not retried");
+        assert_eq!(
+            permanent.attempts.get(),
+            1,
+            "a permanent error is not retried"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4996,7 +5106,10 @@ mod tests {
         drop(guard);
 
         let loaded = reader.join().unwrap().expect("reader loads newest primary");
-        assert!(loaded.allow_agent_control, "reader must not return the stale backup");
+        assert!(
+            loaded.allow_agent_control,
+            "reader must not return the stale backup"
+        );
         let persisted: Registry =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(
@@ -5089,10 +5202,7 @@ mod tests {
     #[test]
     fn atomic_write_dangling_symlink_creates_target_and_keeps_link() {
         let dir = atomic_write_symlink_scratch("dangling");
-        let target = dir
-            .join("dotfiles")
-            .join("codex")
-            .join("config.toml");
+        let target = dir.join("dotfiles").join("codex").join("config.toml");
         let link = dir.join("home").join(".codex").join("config.toml");
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
         // Target parent is missing on purpose: first Connect should create it.
@@ -5289,7 +5399,10 @@ mod tests {
 
     fn quarantine_files(path: &Path) -> Vec<PathBuf> {
         let dir = path.parent().unwrap();
-        let prefix = format!("{}.unreadable-", path.file_name().unwrap().to_str().unwrap());
+        let prefix = format!(
+            "{}.unreadable-",
+            path.file_name().unwrap().to_str().unwrap()
+        );
         let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -5336,7 +5449,10 @@ mod tests {
         let q = quarantine_files(&path);
         assert_eq!(q.len(), 1, "unreadable primary must be quarantined");
         let kept = std::fs::read_to_string(&q[0]).unwrap();
-        assert!(kept.contains("future-shape"), "quarantine holds the exact bytes");
+        assert!(
+            kept.contains("future-shape"),
+            "quarantine holds the exact bytes"
+        );
 
         cleanup_quarantine(&path);
         std::fs::remove_file(&path).ok();
@@ -5477,7 +5593,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(15));
         save_to(&path, &reg).unwrap();
         let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
-        assert_eq!(mtime1, mtime2, "an identical save must not rewrite the file");
+        assert_eq!(
+            mtime1, mtime2,
+            "an identical save must not rewrite the file"
+        );
         assert!(!bak.exists(), "an identical save must not create a backup");
         assert!(
             backup_generations(&path).is_empty(),
@@ -5487,7 +5606,10 @@ mod tests {
         // A genuine change still writes (and snapshots the prior state).
         reg.add_server(sample_server("beta"));
         save_to(&path, &reg).unwrap();
-        assert!(bak.exists(), "a real change snapshots the prior state to .bak");
+        assert!(
+            bak.exists(),
+            "a real change snapshots the prior state to .bak"
+        );
         assert_eq!(
             load_from(&path).unwrap().servers.len(),
             2,
@@ -5512,9 +5634,16 @@ mod tests {
 
         std::fs::write(&path, r#"{"servers": 42}"#).unwrap();
         save_to(&path, &Registry::default()).unwrap();
-        assert!(!bak.exists(), "unparseable existing must never become the .bak");
+        assert!(
+            !bak.exists(),
+            "unparseable existing must never become the .bak"
+        );
         let q = quarantine_files(&path);
-        assert_eq!(q.len(), 1, "the bytes we overwrote must survive in quarantine");
+        assert_eq!(
+            q.len(),
+            1,
+            "the bytes we overwrote must survive in quarantine"
+        );
         assert!(std::fs::read_to_string(&q[0]).unwrap().contains("42"));
 
         cleanup_quarantine(&path);
@@ -5582,8 +5711,7 @@ mod tests {
         let round: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
-            round["servers"][0]["futureServerFlag"]["enabled"],
-            true,
+            round["servers"][0]["futureServerFlag"]["enabled"], true,
             "unknown per-server fields must round-trip, not be stripped"
         );
 
@@ -5604,7 +5732,10 @@ mod tests {
         let q = quarantine_files(&path);
         assert_eq!(q.len(), 3, "quarantine must stay bounded");
         let newest = std::fs::read_to_string(q.last().unwrap()).unwrap();
-        assert_eq!(newest, "junk-4", "pruning removes the oldest, keeps the newest");
+        assert_eq!(
+            newest, "junk-4",
+            "pruning removes the oldest, keeps the newest"
+        );
         cleanup_quarantine(&path);
     }
 
@@ -5688,7 +5819,10 @@ mod tests {
     #[test]
     fn recovery_uses_the_journal_when_bak_is_gone() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("conduit-reg-recover-journal-{}.json", std::process::id()));
+        let path = dir.join(format!(
+            "conduit-reg-recover-journal-{}.json",
+            std::process::id()
+        ));
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(backup_path(&path)).ok();
         for g in backup_generations(&path) {
@@ -5754,7 +5888,10 @@ mod tests {
 
         let recovered = load_from(&path).unwrap();
         assert_eq!(recovered.servers.len(), 2);
-        assert!(recovered.servers.iter().any(|server| server.name == "fresh"));
+        assert!(recovered
+            .servers
+            .iter()
+            .any(|server| server.name == "fresh"));
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(backup_path(&path)).ok();
@@ -5789,8 +5926,8 @@ mod tests {
         std::fs::write(&bak, serde_json::to_string(&fresh).unwrap()).unwrap();
         std::fs::write(&sequence_path, "200").unwrap();
 
-        let tied_time = std::time::SystemTime::UNIX_EPOCH
-            + std::time::Duration::from_secs(1_700_000_000);
+        let tied_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let times = std::fs::FileTimes::new().set_modified(tied_time);
         std::fs::OpenOptions::new()
             .write(true)
@@ -5808,7 +5945,10 @@ mod tests {
 
         let recovered = load_from(&path).unwrap();
         assert_eq!(recovered.servers.len(), 2);
-        assert!(recovered.servers.iter().any(|server| server.name == "fresh"));
+        assert!(recovered
+            .servers
+            .iter()
+            .any(|server| server.name == "fresh"));
 
         for candidate in [&path, &bak, &sequence_path, &generation] {
             std::fs::remove_file(candidate).ok();
@@ -5898,8 +6038,16 @@ mod tests {
         let work_slash = registry.add_profile("Work/Prod");
         let solo = registry.add_profile("Solo");
 
-        std::fs::write(dir.join("tool-cache-work-prod.json"), r#"{"owner":"collided"}"#).unwrap();
-        std::fs::write(dir.join("tool-pins-work-prod.json"), r#"{"shared":{"fp":"x"}}"#).unwrap();
+        std::fs::write(
+            dir.join("tool-cache-work-prod.json"),
+            r#"{"owner":"collided"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tool-pins-work-prod.json"),
+            r#"{"shared":{"fp":"x"}}"#,
+        )
+        .unwrap();
         std::fs::write(
             dir.join("quarantine-work-prod.json"),
             r#"{"alpha__tool":{"tool":"alpha__tool","reason":"a"},"beta__tool":{"tool":"beta__tool","reason":"b"}}"#,
@@ -5985,17 +6133,10 @@ mod tests {
         let mut registry = Registry::default();
         let billing = registry.add_profile("Customer Billing");
         save_to(&dir.join("registry.json"), &registry).unwrap();
-        std::fs::write(
-            dir.join("tool-pins-customer-billing.json"),
-            r#"{"x":{}}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join("tool-pins-customer-billing.json"), r#"{"x":{}}"#).unwrap();
         assert!(unmigrated_legacy_profile_store(&billing, true));
         assert!(!unmigrated_legacy_profile_store(&billing, false));
-        let v2 = dir.join(format!(
-            "tool-pins-v2-{}.json",
-            profile_store_key(&billing)
-        ));
+        let v2 = dir.join(format!("tool-pins-v2-{}.json", profile_store_key(&billing)));
         std::fs::write(&v2, "{}").unwrap();
         assert!(!unmigrated_legacy_profile_store(&billing, true));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6074,8 +6215,15 @@ mod tests {
             "the log must have been trimmed, not just appended to"
         );
         let text = String::from_utf8_lossy(&after);
-        assert_eq!(text.lines().count(), 2, "keep_lines still bounds it: {text}");
-        assert!(text.ends_with("{\"i\":2}\n"), "the new line survives: {text}");
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "keep_lines still bounds it: {text}"
+        );
+        assert!(
+            text.ends_with("{\"i\":2}\n"),
+            "the new line survives: {text}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

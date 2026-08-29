@@ -147,7 +147,13 @@ mod tests {
         ];
         let rows = rollup("2026-07-08", &audit, &[], &team(&["github", "stripe"]));
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows["github"], Row { calls: 2, tokens_saved: 0 });
+        assert_eq!(
+            rows["github"],
+            Row {
+                calls: 2,
+                tokens_saved: 0
+            }
+        );
     }
 
     /// Approval rows are `ok:true` by design; an omitted-ok advisor is not
@@ -182,7 +188,13 @@ mod tests {
             json!({ "ts": TS_A, "saved": 777, "tools": 10 }), // legacy line, no attribution
         ];
         let rows = rollup("2026-07-08", &[], &savings, &team(&["github"]));
-        assert_eq!(rows["github"], Row { calls: 0, tokens_saved: 580 });
+        assert_eq!(
+            rows["github"],
+            Row {
+                calls: 0,
+                tokens_saved: 580
+            }
+        );
         assert!(!rows.contains_key("personal"));
     }
 
@@ -192,7 +204,13 @@ mod tests {
         let savings =
             vec![json!({ "ts": TS_B, "saved": 50, "tools": 3, "byServer": { "github": 40 } })];
         let rows = rollup("2026-07-08", &audit, &savings, &team(&["github"]));
-        assert_eq!(rows["github"], Row { calls: 1, tokens_saved: 40 });
+        assert_eq!(
+            rows["github"],
+            Row {
+                calls: 1,
+                tokens_saved: 40
+            }
+        );
     }
 
     #[test]

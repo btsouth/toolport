@@ -44,9 +44,8 @@ fn prompt_names(router: &Router) -> Vec<String> {
 fn live_tool_change_surfaces_via_refresh_without_respawn() {
     let mock = env!("CARGO_BIN_EXE_mock-mcp-server");
     let dirty = Arc::new(AtomicU8::new(0));
-    let transport =
-        StdioTransport::spawn_watched(mock, &[], &[], None, Arc::clone(&dirty), None)
-            .expect("spawn mock");
+    let transport = StdioTransport::spawn_watched(mock, &[], &[], None, Arc::clone(&dirty), None)
+        .expect("spawn mock");
     let mut server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect mock");
     // connect() only loads tools; pull the baseline resources/prompts so the
@@ -60,7 +59,10 @@ fn live_tool_change_surfaces_via_refresh_without_respawn() {
     // have falsely flagged dirty (the watch is only armed post-handshake).
     let before = tool_names(&router);
     assert!(before.contains(&"mock__grow".to_string()), "got {before:?}");
-    assert!(!before.contains(&"mock__greet".to_string()), "got {before:?}");
+    assert!(
+        !before.contains(&"mock__greet".to_string()),
+        "got {before:?}"
+    );
     assert!(resource_uris(&router).contains(&"mock://base".to_string()));
     assert!(prompt_names(&router).contains(&"mock__hi".to_string()));
     assert_eq!(dirty.load(Ordering::SeqCst), 0, "nothing changed yet");

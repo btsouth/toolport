@@ -6536,8 +6536,11 @@ mod tests {
         });
         // The override commonly IS the default profile; writing it twice would take
         // two backups of one file and rewrite it needlessly.
-        let paths =
-            claude_settings_paths_from(&home, Some(&home.join(".claude")), &[".claude".to_string()]);
+        let paths = claude_settings_paths_from(
+            &home,
+            Some(&home.join(".claude")),
+            &[".claude".to_string()],
+        );
         assert_eq!(paths, vec![home.join(".claude").join("settings.json")]);
     }
 
@@ -8978,7 +8981,7 @@ command = "npx"
         assert!(install_override("kiro").unwrap().ends_with(".kiro"));
         assert!(install_override("junie").unwrap().ends_with(".junie"));
         let _ = install_override("warp"); // env-dependent; just ensure no panic.
-        // Well-behaved clients have no override (they use the config-parent heuristic).
+                                          // Well-behaved clients have no override (they use the config-parent heuristic).
         assert!(install_override("cursor").is_none());
         assert!(install_override("codex").is_none());
         assert!(install_override("vscode").is_none());
@@ -10210,8 +10213,8 @@ command = "npx"
         let root = std::env::temp_dir().join(format!("toolport-codex-home-{}", std::process::id()));
         let _restore = EnvRestore::set("CODEX_HOME", &root);
         assert_eq!(codex_path(), Some(root.join("config.toml")));
-        let rules = client_rules_target("codex", crate::instructions::Scope::Team)
-            .expect("codex rules");
+        let rules =
+            client_rules_target("codex", crate::instructions::Scope::Team).expect("codex rules");
         assert_eq!(rules.path, root.join("AGENTS.md"));
         assert_eq!(
             rules.blocked_if_present,
@@ -10432,8 +10435,7 @@ command = "npx"
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let slot = &written["mcpServers"][GATEWAY_ENTRY_NAME];
         assert_eq!(
-            slot["url"],
-            spec.url,
+            slot["url"], spec.url,
             "Kimi Shared HTTP must write url: {slot}"
         );
         assert!(
@@ -11090,7 +11092,10 @@ rules:
                 personal.path.parent(),
                 "{client}: both scopes live in the same rules directory"
             );
-            assert_ne!(team.path, personal.path, "{client}: scopes must not share a file");
+            assert_ne!(
+                team.path, personal.path,
+                "{client}: scopes must not share a file"
+            );
             assert!(team.path.ends_with(Scope::Team.owned_file_name()));
             assert!(personal.path.ends_with(Scope::Personal.owned_file_name()));
             assert_eq!(personal.scope, Scope::Personal);
@@ -11104,7 +11109,16 @@ rules:
         use crate::instructions::Scope;
         let home = mock_home(Platform::MacOs);
         let p = Platform::MacOs;
-        for client in ["codex", "gemini-cli", "windsurf", "devin-cli", "goose", "zed", "pi", "omp"] {
+        for client in [
+            "codex",
+            "gemini-cli",
+            "windsurf",
+            "devin-cli",
+            "goose",
+            "zed",
+            "pi",
+            "omp",
+        ] {
             let team = resolve_rules_target(client, &home, p, Scope::Team).expect("supported");
             let personal =
                 resolve_rules_target(client, &home, p, Scope::Personal).expect("supported");

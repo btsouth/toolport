@@ -107,7 +107,9 @@ impl Config {
         Self {
             revision: Revision::from_env(),
             strict: std::env::var("MOCK_MCP_STRICT").as_deref() == Ok("1"),
-            transcript: std::env::var("MOCK_MCP_TRANSCRIPT").ok().filter(|p| !p.is_empty()),
+            transcript: std::env::var("MOCK_MCP_TRANSCRIPT")
+                .ok()
+                .filter(|p| !p.is_empty()),
         }
     }
 }
@@ -141,7 +143,11 @@ fn record(cfg: &Config, req: &Value) {
     let Some(path) = cfg.transcript.as_deref() else {
         return;
     };
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{req}");
         let _ = f.flush();
     }
@@ -207,7 +213,8 @@ fn tool_list(cfg: &Config, grown: bool) -> Value {
     // them through untouched even though it does not consume them (SOU-452).
     if cfg.revision.has_icons() {
         if let Some(first) = tools.first_mut() {
-            first["icons"] = json!([{ "src": "https://example.invalid/echo.png", "sizes": "48x48" }]);
+            first["icons"] =
+                json!([{ "src": "https://example.invalid/echo.png", "sizes": "48x48" }]);
         }
     }
     json!({ "tools": tools })
@@ -371,13 +378,22 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
         "prompts/list" => prompt_list(state.grown),
         "tools/call" => {
             let params = req.get("params");
-            let name = params.and_then(|p| p.get("name")).and_then(|n| n.as_str()).unwrap_or("");
-            let args = params.and_then(|p| p.get("arguments")).cloned().unwrap_or_else(|| json!({}));
+            let name = params
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let args = params
+                .and_then(|p| p.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             // `echo_meta` reflects the request's `_meta` back as structured
             // content so a test can assert end-to-end propagation through the
             // gateway without reading the transcript file.
             if name == "echo_meta" {
-                let meta = params.and_then(|p| p.get("_meta")).cloned().unwrap_or(Value::Null);
+                let meta = params
+                    .and_then(|p| p.get("_meta"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 let text = serde_json::to_string(&meta).unwrap_or_else(|_| "null".to_string());
                 return Some(success(
                     id,
@@ -464,7 +480,11 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
                 return None;
             }
             let text = match name {
-                "echo" => args.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                "echo" => args
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 "add" => {
                     let a = args.get("a").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let b = args.get("b").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -524,21 +544,25 @@ fn header_gate(
         .and_then(|v| v.as_str());
     match (header_version, body_version) {
         (Some(h), Some(b)) if h == b => {}
-        (None, _) => return Some(error(
-            id.clone(),
-            HEADER_MISMATCH,
-            "missing required MCP-Protocol-Version header",
-            None,
-        )),
-        (Some(h), b) => return Some(error(
-            id.clone(),
-            HEADER_MISMATCH,
-            &format!(
-                "MCP-Protocol-Version header '{h}' does not match body _meta '{}'",
-                b.unwrap_or("<absent>")
-            ),
-            None,
-        )),
+        (None, _) => {
+            return Some(error(
+                id.clone(),
+                HEADER_MISMATCH,
+                "missing required MCP-Protocol-Version header",
+                None,
+            ))
+        }
+        (Some(h), b) => {
+            return Some(error(
+                id.clone(),
+                HEADER_MISMATCH,
+                &format!(
+                    "MCP-Protocol-Version header '{h}' does not match body _meta '{}'",
+                    b.unwrap_or("<absent>")
+                ),
+                None,
+            ))
+        }
     }
     let body_method = req.get("method").and_then(Value::as_str);
     if header_method != body_method {
@@ -589,11 +613,7 @@ fn header_gate(
 /// ephemeral port.
 fn serve_http(cfg: &Config) {
     let server = tiny_http::Server::http("127.0.0.1:0").expect("bind fixture port");
-    let port = server
-        .server_addr()
-        .to_ip()
-        .expect("ip addr")
-        .port();
+    let port = server.server_addr().to_ip().expect("ip addr").port();
     println!("MOCK_MCP_URL=http://127.0.0.1:{port}/mcp");
     let _ = std::io::stdout().flush();
 
@@ -623,9 +643,8 @@ fn serve_http(cfg: &Config) {
         let req: Value = match serde_json::from_str(body.trim()) {
             Ok(v) => v,
             Err(_) => {
-                let _ = request.respond(
-                    tiny_http::Response::from_string("bad json").with_status_code(400),
-                );
+                let _ = request
+                    .respond(tiny_http::Response::from_string("bad json").with_status_code(400));
                 continue;
             }
         };

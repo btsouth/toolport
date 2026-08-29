@@ -125,9 +125,12 @@ pub fn select_client_auth_method(
     // RFC 8414: when the server omits the field, `client_secret_basic` is the
     // assumed default. Treat an empty list the same way rather than concluding
     // that nothing is supported.
-    let supported: Option<Vec<ClientAuthMethod>> = advertised
-        .filter(|list| !list.is_empty())
-        .map(|list| list.iter().filter_map(|m| ClientAuthMethod::parse(m)).collect());
+    let supported: Option<Vec<ClientAuthMethod>> =
+        advertised.filter(|list| !list.is_empty()).map(|list| {
+            list.iter()
+                .filter_map(|m| ClientAuthMethod::parse(m))
+                .collect()
+        });
 
     if let Some(method) = configured {
         if !method.is_implemented() {
@@ -425,13 +428,19 @@ fn screen_addrs(addrs: &[std::net::SocketAddr], block_private: bool) -> std::io:
         if ip_is_link_local(&sa.ip()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("SSRF guard: refusing link-local / cloud-metadata address {}", sa.ip()),
+                format!(
+                    "SSRF guard: refusing link-local / cloud-metadata address {}",
+                    sa.ip()
+                ),
             ));
         }
         if block_private && ip_is_private(&sa.ip()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("SSRF guard: refusing private/loopback address {} for a public server", sa.ip()),
+                format!(
+                    "SSRF guard: refusing private/loopback address {} for a public server",
+                    sa.ip()
+                ),
             ));
         }
     }
@@ -446,7 +455,10 @@ fn screen_addrs(addrs: &[std::net::SocketAddr], block_private: bool) -> std::io:
 /// that rebinds public->private between the pre-check and the connect is still refused here.
 /// The OAuth endpoints come from an attacker-influenceable metadata document, so this is the
 /// load-bearing SSRF guard.
-pub(crate) fn screened_resolve(netloc: &str, block_private: bool) -> std::io::Result<Vec<std::net::SocketAddr>> {
+pub(crate) fn screened_resolve(
+    netloc: &str,
+    block_private: bool,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
     use std::net::ToSocketAddrs;
     let addrs: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
     screen_addrs(&addrs, block_private)?;
@@ -726,6 +738,88 @@ pub fn ip_is_link_local(ip: &std::net::IpAddr) -> bool {
                     .unwrap_or(false)
         }
     }
+}
+
+/// Validate a URL that is about to be handed to the OS browser.
+///
+/// Some of these URLs come from registry, vendor, or MCP-server data, which is
+/// not fully trusted. Handing a `file://` (Windows SMB -> NTLM-hash leak) or a
+/// custom-scheme handler URI to the OS opener is a real risk, so only `http`
+/// and `https` pass, and hosts that reach a metadata service are refused. Both
+/// desktop shells use this same check, so neither can drift into refusing a
+/// smaller set than the other.
+pub fn validate_web_url(url: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(url).map_err(|_| "not a URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("only http and https URLs can be opened".into());
+    }
+    let host = parsed.host_str().ok_or("URL has no host")?;
+    if host_reaches_metadata(host) {
+        return Err("refusing to open a link-local/metadata address".into());
+    }
+    Ok(parsed)
+}
+
+/// [`validate_web_url`], then the same sanitised browser spawn OAuth sign-in
+/// uses. The only path either shell may use to open an externally supplied
+/// link.
+pub fn open_web_url(url: &str) -> Result<(), String> {
+    let parsed = validate_web_url(url)?;
+    open_browser(parsed.as_str());
+    Ok(())
+}
+
+/// Hosts that must never reach the OS browser.
+///
+/// This mirrors `isLinkLocalHost` in `src/lib/openUrl.ts` case for case, and the
+/// tests below use that file's vectors. It has to: the point of checking here is
+/// that a compromised renderer cannot `invoke` its way past the frontend guard,
+/// and a backend check that is a strict subset of the frontend one does not do
+/// that. `ip_is_link_local` alone is such a subset - it has no opinion on
+/// CGNAT, unspecified or broadcast addresses - so it is one input here, not the
+/// whole answer.
+///
+/// Deliberately narrower than `ip_is_private`: loopback and RFC1918 LAN
+/// hosts are legitimate browser targets (locally served docs, an intranet page).
+/// Only the ranges that reach a metadata service are refused.
+pub fn host_reaches_metadata(host: &str) -> bool {
+    // WHATWG keeps a trailing dot on named hosts and brackets on IPv6 literals.
+    let host = host.trim_matches(['[', ']']);
+    let host = host.strip_suffix('.').unwrap_or(host);
+    // Well-known metadata names resolve to the service without a link-local
+    // literal ever appearing in the URL, so match them directly.
+    if host.eq_ignore_ascii_case("metadata.google.internal")
+        || host.eq_ignore_ascii_case("metadata")
+    {
+        return true;
+    }
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    ip_reaches_metadata(&ip)
+}
+
+fn ip_reaches_metadata(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    // Covers 169.254/16 (incl. 169.254.169.254), fe80::/10, fd00:ec2::254, and
+    // the IPv4-mapped forms of the first.
+    if ip_is_link_local(ip) {
+        return true;
+    }
+    let v4 = match ip {
+        IpAddr::V4(v4) => Some(*v4),
+        IpAddr::V6(v6) => {
+            if v6.is_unspecified() {
+                return true; // `::`
+            }
+            v6.to_ipv4_mapped()
+        }
+    };
+    let Some(v4) = v4 else { return false };
+    let [a, b, ..] = v4.octets();
+    // CGNAT 100.64/10 (Alibaba/OCI metadata), "this network" 0/8 (0.0.0.0
+    // reaches loopback/IMDS on some stacks), and the broadcast address.
+    (a == 100 && b & 0xc0 == 64) || a == 0 || v4.is_broadcast()
 }
 
 pub(crate) fn ip_is_private(ip: &std::net::IpAddr) -> bool {
@@ -1021,7 +1115,11 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
                 require_https(reg, "registration endpoint")?;
             }
             // SSRF: a public server must not point these at a private/loopback host.
-            guard_endpoint(&meta.authorization_endpoint, server_local, "authorization endpoint")?;
+            guard_endpoint(
+                &meta.authorization_endpoint,
+                server_local,
+                "authorization endpoint",
+            )?;
             guard_endpoint(&meta.token_endpoint, server_local, "token endpoint")?;
             if let Some(reg) = &meta.registration_endpoint {
                 guard_endpoint(reg, server_local, "registration endpoint")?;
@@ -1043,10 +1141,8 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
                 }),
                 authorization_response_iss_parameter_supported: meta
                     .authorization_response_iss_parameter_supported,
-                client_id_metadata_document_supported: meta
-                    .client_id_metadata_document_supported,
-                token_endpoint_auth_methods_supported: meta
-                    .token_endpoint_auth_methods_supported,
+                client_id_metadata_document_supported: meta.client_id_metadata_document_supported,
+                token_endpoint_auth_methods_supported: meta.token_endpoint_auth_methods_supported,
             });
         }
     }
@@ -1102,7 +1198,11 @@ pub fn build_authorize_url(
     let enc = |s: &str| urlencoding::encode(s).into_owned();
     // RFC 6749 §3.1: the metadata's authorization_endpoint may already carry a
     // query component (some enterprise/B2C providers); join with `&` then.
-    let sep = if authorization_endpoint.contains('?') { '&' } else { '?' };
+    let sep = if authorization_endpoint.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
     let mut url = format!(
         "{authorization_endpoint}{sep}response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state={}&resource={}",
         enc(client_id),
@@ -1416,7 +1516,8 @@ fn wait_for_code(
                 // it back to blocking so read_callback_query's read timeout applies.
                 let _ = stream.set_nonblocking(false);
                 let query = read_callback_query(&mut stream);
-                let mut params: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                let mut params: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
                 for kv in query.split('&') {
                     let mut it = kv.splitn(2, '=');
                     let k = it.next().unwrap_or("");
@@ -1454,7 +1555,10 @@ fn wait_for_code(
                 // error. RFC 9207 explicitly forbids displaying attacker-supplied
                 // error details when the response issuer does not match.
                 if params.get("state").map(String::as_str) != Some(expected_state) {
-                    write_callback_page(&mut stream, "Authorization could not be verified. You can close this window.");
+                    write_callback_page(
+                        &mut stream,
+                        "Authorization could not be verified. You can close this window.",
+                    );
                     return Err("state mismatch (possible CSRF); try connecting again".to_string());
                 }
                 if let Err(e) = validate_authorization_response_issuer(
@@ -1462,7 +1566,10 @@ fn wait_for_code(
                     expected_issuer,
                     issuer_parameter_required,
                 ) {
-                    write_callback_page(&mut stream, "Authorization could not be verified. You can close this window.");
+                    write_callback_page(
+                        &mut stream,
+                        "Authorization could not be verified. You can close this window.",
+                    );
                     return Err(e);
                 }
 
@@ -1471,18 +1578,29 @@ fn wait_for_code(
                         .get("error_description")
                         .map(|d| format!(": {d}"))
                         .unwrap_or_default();
-                    write_callback_page(&mut stream, "Authorization failed. You can close this window and return to Toolport.");
-                    return Err(format!("authorization server returned an error ({error}){desc}"));
+                    write_callback_page(
+                        &mut stream,
+                        "Authorization failed. You can close this window and return to Toolport.",
+                    );
+                    return Err(format!(
+                        "authorization server returned an error ({error}){desc}"
+                    ));
                 }
 
                 let Some(code) = code.filter(|code| !code.trim().is_empty()) else {
-                    write_callback_page(&mut stream, "Authorization failed. You can close this window and return to Toolport.");
+                    write_callback_page(
+                        &mut stream,
+                        "Authorization failed. You can close this window and return to Toolport.",
+                    );
                     return Err(
-                        "authorization server returned an empty authorization code".to_string(),
+                        "authorization server returned an empty authorization code".to_string()
                     );
                 };
 
-                write_callback_page(&mut stream, "Authorization complete. You can close this window and return to Toolport.");
+                write_callback_page(
+                    &mut stream,
+                    "Authorization complete. You can close this window and return to Toolport.",
+                );
                 return Ok(code.clone());
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1535,9 +1653,8 @@ fn read_callback_query(stream: &mut std::net::TcpStream) -> String {
 }
 
 fn write_callback_page(stream: &mut std::net::TcpStream, message: &str) {
-    let html = format!(
-        "<html><body style='font-family:sans-serif;padding:2rem'>{message}</body></html>"
-    );
+    let html =
+        format!("<html><body style='font-family:sans-serif;padding:2rem'>{message}</body></html>");
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         html.len(),
@@ -1595,7 +1712,10 @@ pub fn authenticate_with_scope(
             register_client(registration_endpoint, &redirect_uri, block_private)?
         }
     };
-    debug_log(&format!("client_id='{client_id}' (len {})", client_id.len()));
+    debug_log(&format!(
+        "client_id='{client_id}' (len {})",
+        client_id.len()
+    ));
     if client_id.trim().is_empty() {
         return Err("dynamic registration returned an empty client_id".to_string());
     }
@@ -1662,13 +1782,75 @@ pub fn authenticate_with_scope(
 mod tests {
     use super::*;
 
+    /// The vectors are lifted from `src/lib/openUrl.test.ts`. Keeping them
+    /// identical is the point: this guard exists so a compromised renderer
+    /// cannot `invoke` past the frontend one, which it could if the backend
+    /// refused a smaller set.
+    #[test]
+    fn refuses_every_host_the_renderer_refuses() {
+        for host in [
+            "169.254.169.254",
+            "169.254.169.254.", // WHATWG keeps the trailing dot
+            "100.100.100.200",  // CGNAT 100.64/10
+            "0.0.0.0",
+            "255.255.255.255",
+            "[fe80::1]",
+            "[::ffff:169.254.169.254]",
+            "[::]",
+            "[fd00:ec2::254]",
+            "metadata.google.internal",
+            "metadata",
+            "METADATA.GOOGLE.INTERNAL",
+        ] {
+            assert!(host_reaches_metadata(host), "{host} should be refused");
+        }
+    }
+
+    /// Narrower than `ip_is_private` on purpose: locally served docs and an
+    /// intranet page are ordinary browsing.
+    #[test]
+    fn keeps_loopback_lan_and_the_public_internet_reachable() {
+        for host in [
+            "example.com",
+            "localhost",
+            "127.0.0.1",
+            "192.168.1.10",
+            "10.0.0.5",
+            "[::1]",
+            "100.32.0.1", // 100.32/11, outside CGNAT
+            "1.1.1.1",
+        ] {
+            assert!(!host_reaches_metadata(host), "{host} should be allowed");
+        }
+    }
+
+    #[test]
+    fn only_web_schemes_reach_the_browser() {
+        for url in [
+            "file:///etc/passwd",
+            "smb://attacker/share",
+            "javascript:alert(1)",
+            "vscode://malicious",
+            "http://169.254.169.254/latest/meta-data/",
+            "not a url",
+        ] {
+            assert!(validate_web_url(url).is_err(), "{url} should be refused");
+        }
+        assert!(validate_web_url("https://example.com/docs").is_ok());
+        assert!(validate_web_url("http://localhost:8080/").is_ok());
+    }
+
     #[test]
     fn screen_addrs_refuses_link_local_and_metadata() {
         use std::net::SocketAddr;
         let p = |s: &str| s.parse::<SocketAddr>().unwrap();
         // AWS/GCP/Azure IPv4 metadata, AWS IPv6 ULA metadata, and the IPv4-mapped form.
         // Link-local / metadata is refused regardless of block_private.
-        for bad in ["169.254.169.254:80", "[fd00:ec2::254]:80", "[::ffff:169.254.169.254]:80"] {
+        for bad in [
+            "169.254.169.254:80",
+            "[fd00:ec2::254]:80",
+            "[::ffff:169.254.169.254]:80",
+        ] {
             assert!(screen_addrs(&[p(bad)], false).is_err(), "must refuse {bad}");
         }
         // A public address is always allowed.
@@ -1686,8 +1868,17 @@ mod tests {
         let p = |s: &str| s.parse::<SocketAddr>().unwrap();
         // With block_private set (public-provenance server), a rebind to loopback /
         // RFC1918 / CGNAT / IPv6-ULA is refused - closing the DNS-rebind SSRF window.
-        for bad in ["127.0.0.1:8080", "10.0.0.5:443", "192.168.1.1:80", "100.64.0.1:80", "[fc00::1]:80"] {
-            assert!(screen_addrs(&[p(bad)], true).is_err(), "must refuse {bad} for a public server");
+        for bad in [
+            "127.0.0.1:8080",
+            "10.0.0.5:443",
+            "192.168.1.1:80",
+            "100.64.0.1:80",
+            "[fc00::1]:80",
+        ] {
+            assert!(
+                screen_addrs(&[p(bad)], true).is_err(),
+                "must refuse {bad} for a public server"
+            );
         }
         // A public IP still resolves for the public server.
         assert!(screen_addrs(&[p("8.8.8.8:443")], true).is_ok());
@@ -1738,17 +1929,32 @@ mod tests {
 
     #[test]
     fn origin_strips_path() {
-        assert_eq!(origin_of("https://mcp.example.com/mcp"), "https://mcp.example.com");
+        assert_eq!(
+            origin_of("https://mcp.example.com/mcp"),
+            "https://mcp.example.com"
+        );
         assert_eq!(origin_of("https://a.b:8080/x/y"), "https://a.b:8080");
     }
 
     #[test]
     fn host_of_url_extracts_host() {
-        assert_eq!(host_of_url("https://example.com/x").as_deref(), Some("example.com"));
-        assert_eq!(host_of_url("https://example.com:8443/x").as_deref(), Some("example.com"));
+        assert_eq!(
+            host_of_url("https://example.com/x").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            host_of_url("https://example.com:8443/x").as_deref(),
+            Some("example.com")
+        );
         assert_eq!(host_of_url("http://[::1]:7000/cb").as_deref(), Some("::1"));
-        assert_eq!(host_of_url("https://user:pw@host.tld/p").as_deref(), Some("host.tld"));
-        assert_eq!(host_of_url("https://127.0.0.1/x").as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            host_of_url("https://user:pw@host.tld/p").as_deref(),
+            Some("host.tld")
+        );
+        assert_eq!(
+            host_of_url("https://127.0.0.1/x").as_deref(),
+            Some("127.0.0.1")
+        );
     }
 
     #[test]
@@ -1963,9 +2169,13 @@ mod tests {
                 let Ok(mut stream) = std::net::TcpStream::connect(address) else {
                     break;
                 };
-                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 if stream
-                    .write_all(format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes())
+                    .write_all(
+                        format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes(),
+                    )
                     .is_err()
                 {
                     break;
@@ -2045,7 +2255,10 @@ mod tests {
     #[test]
     fn callback_stray_request_is_not_treated_as_a_csrf_failure() {
         let result = callback_result(
-            &["/favicon.ico?v=2", "/callback?code=good-code&state=expected"],
+            &[
+                "/favicon.ico?v=2",
+                "/callback?code=good-code&state=expected",
+            ],
             "expected",
         );
         match result {
@@ -2072,16 +2285,14 @@ mod tests {
 
     #[test]
     fn metadata_issuer_must_match_the_selected_authorization_server() {
-        assert!(validate_metadata_issuer(
-            "https://auth.example.com",
-            "https://auth.example.com"
-        )
-        .is_ok());
-        assert!(validate_metadata_issuer(
-            "https://auth.example.com",
-            "https://other.example.com"
-        )
-        .is_err());
+        assert!(
+            validate_metadata_issuer("https://auth.example.com", "https://auth.example.com")
+                .is_ok()
+        );
+        assert!(
+            validate_metadata_issuer("https://auth.example.com", "https://other.example.com")
+                .is_err()
+        );
     }
 
     #[test]
@@ -2201,11 +2412,7 @@ mod tests {
     #[test]
     fn protected_resource_scope_absence_does_not_expand_to_all_as_scopes() {
         assert_eq!(
-            initial_scope(
-                true,
-                None,
-                Some(vec!["openid".into(), "admin".into()])
-            ),
+            initial_scope(true, None, Some(vec!["openid".into(), "admin".into()])),
             None
         );
         assert_eq!(
@@ -2225,11 +2432,8 @@ mod tests {
             authorization_servers: Some(vec!["https://auth.example.com".into()]),
             scopes_supported: None,
         };
-        let error = validated_protected_resource(
-            "https://mcp.example.com/mcp",
-            missing_resource,
-        )
-        .unwrap_err();
+        let error = validated_protected_resource("https://mcp.example.com/mcp", missing_resource)
+            .unwrap_err();
         assert!(error.contains("no resource identifier"));
 
         let wrong_resource = ProtectedResource {
@@ -2237,11 +2441,9 @@ mod tests {
             authorization_servers: Some(vec!["https://auth.example.com".into()]),
             scopes_supported: None,
         };
-        assert!(validated_protected_resource(
-            "https://mcp.example.com/mcp",
-            wrong_resource
-        )
-        .is_err());
+        assert!(
+            validated_protected_resource("https://mcp.example.com/mcp", wrong_resource).is_err()
+        );
 
         let no_issuer = ProtectedResource {
             resource: Some("https://mcp.example.com/mcp".into()),
@@ -2331,8 +2533,7 @@ mod tests {
                 .expect("challenge probe");
             request
                 .respond(
-                    tiny_http::Response::from_string("method not allowed")
-                        .with_status_code(405),
+                    tiny_http::Response::from_string("method not allowed").with_status_code(405),
                 )
                 .unwrap();
         });
@@ -2382,22 +2583,20 @@ mod tests {
                         tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
                             .unwrap(),
                     ),
-                    "/.well-known/oauth-authorization-server" => {
-                        tiny_http::Response::from_string(
-                            serde_json::json!({
-                                "issuer": expected_origin,
-                                "authorization_endpoint": format!("{expected_origin}/authorize"),
-                                "token_endpoint": format!("{expected_origin}/token"),
-                                "registration_endpoint": format!("{expected_origin}/register"),
-                                "scopes_supported": ["admin"]
-                            })
-                            .to_string(),
-                        )
-                        .with_header(
-                            tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
-                                .unwrap(),
-                        )
-                    }
+                    "/.well-known/oauth-authorization-server" => tiny_http::Response::from_string(
+                        serde_json::json!({
+                            "issuer": expected_origin,
+                            "authorization_endpoint": format!("{expected_origin}/authorize"),
+                            "token_endpoint": format!("{expected_origin}/token"),
+                            "registration_endpoint": format!("{expected_origin}/register"),
+                            "scopes_supported": ["admin"]
+                        })
+                        .to_string(),
+                    )
+                    .with_header(
+                        tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                            .unwrap(),
+                    ),
                     path => panic!("unexpected OAuth discovery path: {path}"),
                 };
                 request.respond(response).unwrap();
@@ -2457,20 +2656,18 @@ mod tests {
                                 .unwrap(),
                         )
                     }
-                    "/.well-known/oauth-authorization-server" => {
-                        tiny_http::Response::from_string(
-                            serde_json::json!({
-                                "issuer": expected_origin,
-                                "authorization_endpoint": format!("{expected_origin}/authorize"),
-                                "token_endpoint": format!("{expected_origin}/token")
-                            })
-                            .to_string(),
-                        )
-                        .with_header(
-                            tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
-                                .unwrap(),
-                        )
-                    }
+                    "/.well-known/oauth-authorization-server" => tiny_http::Response::from_string(
+                        serde_json::json!({
+                            "issuer": expected_origin,
+                            "authorization_endpoint": format!("{expected_origin}/authorize"),
+                            "token_endpoint": format!("{expected_origin}/token")
+                        })
+                        .to_string(),
+                    )
+                    .with_header(
+                        tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                            .unwrap(),
+                    ),
                     path => panic!("unexpected OAuth discovery path: {path}"),
                 };
                 request.respond(response).unwrap();
@@ -2498,8 +2695,7 @@ mod tests {
                     .expect("OAuth discovery request");
                 let response = match request.url() {
                     "/mcp" => {
-                        let challenge =
-                            format!("Bearer resource_metadata=\"{resource_metadata}\"");
+                        let challenge = format!("Bearer resource_metadata=\"{resource_metadata}\"");
                         tiny_http::Response::from_string("authorization required")
                             .with_status_code(401)
                             .with_header(
@@ -2636,14 +2832,13 @@ mod tests {
     #[test]
     fn step_up_scope_union_preserves_prior_access_and_deduplicates() {
         assert_eq!(
-            scope_union(
-                Some("files:read profile"),
-                Some("files:write files:read")
-            )
-            .as_deref(),
+            scope_union(Some("files:read profile"), Some("files:write files:read")).as_deref(),
             Some("files:read profile files:write")
         );
-        assert_eq!(scope_union(None, Some("  files:read  ")).as_deref(), Some("files:read"));
+        assert_eq!(
+            scope_union(None, Some("  files:read  ")).as_deref(),
+            Some("files:read")
+        );
         assert_eq!(scope_union(Some(""), None), None);
     }
 
@@ -2672,7 +2867,9 @@ mod tests {
                 false,
                 Some("https://auth.example.com/register".into())
             )),
-            Ok(ClientRegistration::Dynamic("https://auth.example.com/register"))
+            Ok(ClientRegistration::Dynamic(
+                "https://auth.example.com/register"
+            ))
         ));
         assert!(select_client_registration(&endpoints(false, None)).is_err());
     }
@@ -2795,7 +2992,10 @@ mod tests {
             Some(&methods(&["private_key_jwt", "tls_client_auth"])),
         )
         .unwrap_err();
-        assert!(err.contains("SBS-599"), "error should point at the follow-up: {err}");
+        assert!(
+            err.contains("SBS-599"),
+            "error should point at the follow-up: {err}"
+        );
     }
 
     /// Configuring an unimplemented method fails rather than quietly downgrading
@@ -2932,7 +3132,10 @@ mod tests {
     #[test]
     fn client_secret_basic_leaves_unreserved_credentials_alone() {
         assert_eq!(
-            decode_basic(&client_secret_basic_header("client-abc", "s3cret_value.1~x")),
+            decode_basic(&client_secret_basic_header(
+                "client-abc",
+                "s3cret_value.1~x"
+            )),
             "client-abc:s3cret_value.1~x"
         );
     }
@@ -2942,11 +3145,8 @@ mod tests {
     /// redaction in the error path would no longer cover every copy.
     #[test]
     fn client_secret_post_sends_the_secret_in_the_form_body_only() {
-        let auth = client_authentication(
-            ClientAuthMethod::ClientSecretPost,
-            "client:id",
-            "s+cr:et/1",
-        );
+        let auth =
+            client_authentication(ClientAuthMethod::ClientSecretPost, "client:id", "s+cr:et/1");
 
         assert!(
             auth.authorization.is_none(),
@@ -2959,9 +3159,15 @@ mod tests {
         );
 
         // And the Basic method is the mirror image: header only, nothing in the body.
-        let basic =
-            client_authentication(ClientAuthMethod::ClientSecretBasic, "client:id", "s+cr:et/1");
-        assert!(basic.form_fields.is_empty(), "the secret must not ride twice");
+        let basic = client_authentication(
+            ClientAuthMethod::ClientSecretBasic,
+            "client:id",
+            "s+cr:et/1",
+        );
+        assert!(
+            basic.form_fields.is_empty(),
+            "the secret must not ride twice"
+        );
         assert_eq!(
             basic.authorization.as_deref(),
             Some(client_secret_basic_header("client:id", "s+cr:et/1").as_str())

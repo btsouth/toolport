@@ -1248,13 +1248,11 @@ mod tests {
 
         let a = lock_oauth_refresh("server-a").expect("a data dir is set, so a lock exists");
         let b = lock_oauth_refresh("server-b").expect("a different server must not block");
-        let contention = match lock_oauth_refresh_for(
-            "server-a",
-            std::time::Duration::from_millis(40),
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("contention must remain distinguishable from a missing data dir"),
-        };
+        let contention =
+            match lock_oauth_refresh_for("server-a", std::time::Duration::from_millis(40)) {
+                Err(error) => error,
+                Ok(_) => panic!("contention must remain distinguishable from a missing data dir"),
+            };
         assert!(contention.contains("locked by another Toolport process"));
         assert!(
             OAUTH_REFRESH_LOCK_TIMEOUT >= std::time::Duration::from_secs(30),
@@ -1607,8 +1605,14 @@ mod tests {
         );
         // Case anywhere else counts as changed too. Over-reporting is the safe
         // direction: re-acquiring is cheap and non-interactive by construction.
-        assert!(resource_binding_changed(vaulted, "https://MCP.example.com/MCP"));
-        assert!(resource_binding_changed(vaulted, "https://mcp.example.com/MCP/v2"));
+        assert!(resource_binding_changed(
+            vaulted,
+            "https://MCP.example.com/MCP"
+        ));
+        assert!(resource_binding_changed(
+            vaulted,
+            "https://mcp.example.com/MCP/v2"
+        ));
     }
 
     /// Surrounding whitespace is not a resource change: a URL pasted with a

@@ -29,7 +29,7 @@ pub fn should_publish_client_gateway() -> bool {
             return !lower.contains("\\target\\");
         }
     }
-    
+
     false
 }
 
@@ -43,9 +43,7 @@ fn manifest_path() -> Option<PathBuf> {
 
 fn versioned_dest(version: &str) -> Option<PathBuf> {
     let ext = std::env::consts::EXE_SUFFIX;
-    Some(
-        gateway_bin_dir()?.join(format!("toolport-gateway-{version}{ext}")),
-    )
+    Some(gateway_bin_dir()?.join(format!("toolport-gateway-{version}{ext}")))
 }
 
 /// Gateway binary bundled next to the running app (install dir).
@@ -376,14 +374,8 @@ fn default_keep_paths() -> Vec<PathBuf> {
     }
     if let Some(dir) = gateway_bin_dir() {
         let ext = std::env::consts::EXE_SUFFIX;
-        push(
-            &mut paths,
-            dir.join(format!("toolport-gateway{ext}")),
-        );
-        push(
-            &mut paths,
-            dir.join(format!("conduit-gateway{ext}")),
-        );
+        push(&mut paths, dir.join(format!("toolport-gateway{ext}")));
+        push(&mut paths, dir.join(format!("conduit-gateway{ext}")));
     }
     paths
 }
@@ -1602,7 +1594,6 @@ fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
     procs
 }
 
-
 /// Full executable path for a pid via libproc (handles spaces and symlinks).
 #[cfg(target_os = "macos")]
 fn macos_proc_pidpath(pid: u32) -> Option<PathBuf> {
@@ -1814,7 +1805,11 @@ mod tests {
     #[test]
     fn decide_keeps_current_versioned_basename() {
         // SOU-306 regression: current versioned Windows binary must survive.
-        let c = ctx("1.9.6", &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.6.exe"], false);
+        let c = ctx(
+            "1.9.6",
+            &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.6.exe"],
+            false,
+        );
         assert_eq!(
             decide_reap(
                 &proc(
@@ -1839,17 +1834,18 @@ mod tests {
             ReapDecision::Keep
         );
         assert!(
-            !basename_matches_current_version(
-                "toolport-gateway-1.9.6-not-a-digest.exe",
-                "1.9.6"
-            ),
+            !basename_matches_current_version("toolport-gateway-1.9.6-not-a-digest.exe", "1.9.6"),
             "only the publisher's 12-hex content suffix is current"
         );
     }
 
     #[test]
     fn decide_kills_older_versioned_basenames() {
-        let c = ctx("1.9.6", &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.6.exe"], false);
+        let c = ctx(
+            "1.9.6",
+            &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.6.exe"],
+            false,
+        );
         for (name, path) in [
             (
                 "toolport-gateway-1.9.4.exe",
@@ -1896,7 +1892,11 @@ mod tests {
 
     #[test]
     fn decide_keeps_dev_target_paths() {
-        let c = ctx("1.9.6", &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.6.exe"], false);
+        let c = ctx(
+            "1.9.6",
+            &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.6.exe"],
+            false,
+        );
         assert_eq!(
             decide_reap(
                 &proc(
@@ -1913,10 +1913,18 @@ mod tests {
     #[test]
     fn decide_keeps_unknown_location_unversioned() {
         // Do not kill a foreign binary that happens to share the name.
-        let c = ctx("1.9.6", &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.6.exe"], false);
+        let c = ctx(
+            "1.9.6",
+            &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.6.exe"],
+            false,
+        );
         assert_eq!(
             decide_reap(
-                &proc(6, "toolport-gateway", Some("/opt/other-vendor/toolport-gateway")),
+                &proc(
+                    6,
+                    "toolport-gateway",
+                    Some("/opt/other-vendor/toolport-gateway")
+                ),
                 &c
             ),
             ReapDecision::Keep
@@ -2012,7 +2020,11 @@ mod tests {
             "1.9.7"
         ));
 
-        let c = ctx("1.10.0", &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.10.0.exe"], false);
+        let c = ctx(
+            "1.10.0",
+            &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.10.0.exe"],
+            false,
+        );
         assert_eq!(
             decide_reap(
                 &proc(
@@ -2044,7 +2056,11 @@ mod tests {
         let c = ctx("1.9.6", &[r"C:\keep\toolport-gateway-1.9.6.exe"], true);
         assert_eq!(
             decide_reap(
-                &proc(10, "toolport-gateway-1.9.6.exe", Some(r"C:\keep\toolport-gateway-1.9.6.exe")),
+                &proc(
+                    10,
+                    "toolport-gateway-1.9.6.exe",
+                    Some(r"C:\keep\toolport-gateway-1.9.6.exe")
+                ),
                 &c
             ),
             ReapDecision::Kill
@@ -2056,7 +2072,11 @@ mod tests {
     #[test]
     fn keep_pids_outrank_every_kill_rule() {
         let deleted = PathBuf::from("/home/u/.local/share/toolport/toolport-gateway (deleted)");
-        let mut stale = ctx("1.9.6", &["/home/u/.local/share/toolport/toolport-gateway"], false);
+        let mut stale = ctx(
+            "1.9.6",
+            &["/home/u/.local/share/toolport/toolport-gateway"],
+            false,
+        );
         let me = proc(4242, "toolport-gateway", deleted.to_str());
         // Control: unprotected, this is exactly the WS4-3 Kill case.
         assert_eq!(decide_reap(&me, &stale), ReapDecision::Kill);
@@ -2100,7 +2120,11 @@ mod tests {
         ] {
             assert_eq!(
                 decide_reap(
-                    &proc(std::process::id(), "toolport-gateway", Some("/opt/toolport/toolport-gateway")),
+                    &proc(
+                        std::process::id(),
+                        "toolport-gateway",
+                        Some("/opt/toolport/toolport-gateway")
+                    ),
                     &ctx
                 ),
                 ReapDecision::Keep
@@ -2188,7 +2212,10 @@ mod tests {
             Some((45678, 4321, "toolport-gateway-1.9.4".into()))
         );
         assert_eq!(parse_ps_pid_ppid_name_line(""), None);
-        assert_eq!(parse_ps_pid_ppid_name_line("not-a-pid 1 toolport-gateway"), None);
+        assert_eq!(
+            parse_ps_pid_ppid_name_line("not-a-pid 1 toolport-gateway"),
+            None
+        );
         // A missing ppid column must not be read as the name, which is how a wrong
         // `-o` argv would silently produce nonsense parents rather than nothing.
         assert_eq!(parse_ps_pid_ppid_name_line("99 toolport-gateway"), None);
@@ -2226,9 +2253,8 @@ mod tests {
 
     #[test]
     fn same_version_rebuild_gets_content_addressed_leaf() {
-        let base = PathBuf::from(
-            r"C:\Users\u\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe",
-        );
+        let base =
+            PathBuf::from(r"C:\Users\u\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe");
         assert_eq!(
             content_addressed_dest(
                 &base,
@@ -3061,13 +3087,35 @@ mod tests {
         // One app that respawned the same gateway three times is one thing to do.
         let advice = clients_needing_restart(
             &[
-                proc_with_parent(10, "toolport-gateway-1.9.4.exe", stale_str, 77, "claude.exe"),
-                proc_with_parent(11, "toolport-gateway-1.9.4.exe", stale_str, 77, "claude.exe"),
-                proc_with_parent(12, "toolport-gateway-1.9.4.exe", stale_str, 77, "claude.exe"),
+                proc_with_parent(
+                    10,
+                    "toolport-gateway-1.9.4.exe",
+                    stale_str,
+                    77,
+                    "claude.exe",
+                ),
+                proc_with_parent(
+                    11,
+                    "toolport-gateway-1.9.4.exe",
+                    stale_str,
+                    77,
+                    "claude.exe",
+                ),
+                proc_with_parent(
+                    12,
+                    "toolport-gateway-1.9.4.exe",
+                    stale_str,
+                    77,
+                    "claude.exe",
+                ),
             ],
             &ctx,
         );
-        assert_eq!(advice.len(), 1, "one entry per app to act on, not per respawn");
+        assert_eq!(
+            advice.len(),
+            1,
+            "one entry per app to act on, not per respawn"
+        );
     }
 
     /// The ordering requirement that three review rounds kept relocating: advice is
@@ -3081,8 +3129,20 @@ mod tests {
         let ctx = advice_ctx(&keep);
 
         let procs = vec![
-            proc_with_parent(10, "toolport-gateway-1.9.4.exe", stale.to_str(), 77, "claude.exe"),
-            proc_with_parent(11, "toolport-gateway-9.9.9.exe", keep.to_str(), 78, "cursor.exe"),
+            proc_with_parent(
+                10,
+                "toolport-gateway-1.9.4.exe",
+                stale.to_str(),
+                77,
+                "claude.exe",
+            ),
+            proc_with_parent(
+                11,
+                "toolport-gateway-9.9.9.exe",
+                keep.to_str(),
+                78,
+                "cursor.exe",
+            ),
         ];
         let plan = plan_reap(&procs, &ctx);
 
@@ -3159,10 +3219,7 @@ mod tests {
             PruneDecision::Keep(_)
         ));
         assert_eq!(
-            decide_prune(
-                &bin(&dir, "toolport-gateway-1.10.0-0123456789ab.exe"),
-                &ctx
-            ),
+            decide_prune(&bin(&dir, "toolport-gateway-1.10.0-0123456789ab.exe"), &ctx),
             PruneDecision::Keep("current version")
         );
     }

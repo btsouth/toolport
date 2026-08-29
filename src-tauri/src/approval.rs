@@ -289,8 +289,7 @@ pub fn challenge_proof(token: &str, nonce: &str) -> String {
 
 /// Constant-time comparison of a presented proof against the expected one.
 pub fn proof_matches(expected: &str, presented: &str) -> bool {
-    expected.len() == presented.len()
-        && bool::from(expected.as_bytes().ct_eq(presented.as_bytes()))
+    expected.len() == presented.len() && bool::from(expected.as_bytes().ct_eq(presented.as_bytes()))
 }
 
 /// Broker side: if `first_line` is a [`BrokerChallenge`], the [`BrokerProof`] line to write
@@ -405,8 +404,9 @@ pub fn dial_broker(desc: &EndpointDescriptor) -> io::Result<BrokerStream> {
     // path, or a platform without it) falls back to the loopback address. The challenge below
     // protects both the same way, so the fallback changes nothing about the guarantee.
     let mut stream = match desc.unix_endpoint.as_deref() {
-        Some(unix) => BrokerStream::connect(unix)
-            .or_else(|_| BrokerStream::connect(&desc.endpoint))?,
+        Some(unix) => {
+            BrokerStream::connect(unix).or_else(|_| BrokerStream::connect(&desc.endpoint))?
+        }
         None => BrokerStream::connect(&desc.endpoint)?,
     };
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
@@ -466,8 +466,14 @@ mod tests {
 
     #[test]
     fn gate_covers_destructive_and_untrusted() {
-        assert_eq!(gate_reason(true, true, false), Some(ApprovalReason::Destructive));
-        assert_eq!(gate_reason(true, false, true), Some(ApprovalReason::UntrustedSource));
+        assert_eq!(
+            gate_reason(true, true, false),
+            Some(ApprovalReason::Destructive)
+        );
+        assert_eq!(
+            gate_reason(true, false, true),
+            Some(ApprovalReason::UntrustedSource)
+        );
         assert_eq!(
             gate_reason(true, true, true),
             Some(ApprovalReason::DestructiveAndUntrusted)
@@ -578,7 +584,10 @@ mod tests {
         };
         let round: EndpointDescriptor =
             serde_json::from_str(&serde_json::to_string(&with_unix).unwrap()).unwrap();
-        assert_eq!(round.unix_endpoint.as_deref(), Some("unix:/tmp/x/approval.sock"));
+        assert_eq!(
+            round.unix_endpoint.as_deref(),
+            Some("unix:/tmp/x/approval.sock")
+        );
     }
 
     #[test]
@@ -589,8 +598,14 @@ mod tests {
             challenge_proof("Jefe", "what do ya want for nothing?"),
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
-        assert_ne!(challenge_proof("tok", "nonce-a"), challenge_proof("tok", "nonce-b"));
-        assert_ne!(challenge_proof("tok-a", "nonce"), challenge_proof("tok-b", "nonce"));
+        assert_ne!(
+            challenge_proof("tok", "nonce-a"),
+            challenge_proof("tok", "nonce-b")
+        );
+        assert_ne!(
+            challenge_proof("tok-a", "nonce"),
+            challenge_proof("tok-b", "nonce")
+        );
         assert!(proof_matches("abc", "abc"));
         assert!(!proof_matches("abc", "abd"));
         assert!(!proof_matches("abc", "abcd"));
@@ -605,7 +620,10 @@ mod tests {
         .unwrap();
         let answer = answer_challenge(&line, "tok").expect("a challenge is answered");
         let proof: BrokerProof = serde_json::from_str(&answer).unwrap();
-        assert_eq!(proof.toolport_approval_proof, challenge_proof("tok", "00ff"));
+        assert_eq!(
+            proof.toolport_approval_proof,
+            challenge_proof("tok", "00ff")
+        );
 
         // A pre-handshake gateway's request is not a challenge: the caller treats it as
         // the request itself, authenticated by its own token field exactly as before.
@@ -673,7 +691,10 @@ mod tests {
         let mut stream = dial_broker(&desc(endpoint, "tok")).expect("an honest broker passes");
         let first = seen.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(first.contains("toolportApprovalChallenge"), "{first}");
-        assert!(!first.contains("tok"), "the token never travels in the clear: {first}");
+        assert!(
+            !first.contains("tok"),
+            "the token never travels in the clear: {first}"
+        );
 
         // The stream is usable for the request/decision exchange afterwards.
         stream.write_all(b"{\"request\":1}\n").unwrap();
@@ -746,7 +767,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "toolport-broker-uds-{}-{}",
             std::process::id(),
-            challenge_proof("salt", "dial_works_over_a_unix_socket_endpoint").get(..8).unwrap()
+            challenge_proof("salt", "dial_works_over_a_unix_socket_endpoint")
+                .get(..8)
+                .unwrap()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("approval.sock");
@@ -775,9 +798,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dial_falls_back_to_loopback_when_the_socket_file_is_gone() {
-        let (endpoint, _seen) = scripted_peer(|line| {
-            answer_challenge(line.as_bytes(), "tok").unwrap_or_default()
-        });
+        let (endpoint, _seen) =
+            scripted_peer(|line| answer_challenge(line.as_bytes(), "tok").unwrap_or_default());
         let mut d = desc(endpoint, "tok");
         d.unix_endpoint = Some(format!(
             "{UNIX_ENDPOINT_PREFIX}/nonexistent/toolport-{}/approval.sock",

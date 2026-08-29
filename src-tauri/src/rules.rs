@@ -295,10 +295,7 @@ fn apply_to(installed: &[ClientTarget], mode: ApplyMode) -> Result<RulesView, St
         let mut uncleaned: Vec<String> = Vec::new();
         for old in &prev_targets {
             if !desired.iter().any(|d| d == old)
-                && !instructions::remove_recorded(
-                    std::path::Path::new(old),
-                    Scope::Personal,
-                )
+                && !instructions::remove_recorded(std::path::Path::new(old), Scope::Personal)
             {
                 uncleaned.push(old.clone());
             }
@@ -470,7 +467,6 @@ pub fn set_client_enabled(client_id: &str, enabled: bool) -> Result<RulesView, S
     apply()
 }
 
-
 // ---------------------------------------------------------------------------------------
 // Project-level rules (SBS-1037)
 // ---------------------------------------------------------------------------------------
@@ -584,9 +580,7 @@ pub struct ProjectStatus {
 
 /// The files offered for any project on this machine: those read by at least one installed
 /// client, with the installed clients' display names.
-fn offered_project_files(
-    installed: &[ClientTarget],
-) -> Vec<(&'static ProjectFile, Vec<String>)> {
+fn offered_project_files(installed: &[ClientTarget]) -> Vec<(&'static ProjectFile, Vec<String>)> {
     PROJECT_FILES
         .iter()
         .filter_map(|f| {
@@ -626,8 +620,9 @@ fn project_statuses(
                             }
                         }
                         Some(s) => {
-                            match instructions::current_state(&target, &s.id, s.revision, &s.content)
-                            {
+                            match instructions::current_state(
+                                &target, &s.id, s.revision, &s.content,
+                            ) {
                                 ApplyState::Stale => match instructions::drifted_body(
                                     &target, &s.id, s.revision, &s.content,
                                 ) {
@@ -1186,7 +1181,10 @@ mod tests {
         // reads the project AGENTS.md, so it must appear under that file.
         let installed = vec![
             client("codex", Some(sentinel(s.path("AGENTS.md")))),
-            client("claude-code", Some(owned(s.path("rules").join("toolport-rules.md")))),
+            client(
+                "claude-code",
+                Some(owned(s.path("rules").join("toolport-rules.md"))),
+            ),
             client("cursor", None),
         ];
         crate::registry::update(|reg| reg.upsert_rule_set(None, "Work", "Be brief.").map(|_| ()))
@@ -1234,14 +1232,19 @@ mod tests {
         std::fs::write(root_path.join("AGENTS.md"), THEIRS).unwrap();
         let installed = vec![
             client("codex", Some(sentinel(s.path("AGENTS.md")))),
-            client("claude-code", Some(owned(s.path("rules").join("toolport-rules.md")))),
+            client(
+                "claude-code",
+                Some(owned(s.path("rules").join("toolport-rules.md"))),
+            ),
             client("gemini-cli", Some(sentinel(s.path("GEMINI.md")))),
         ];
         let set_id = crate::registry::update(|reg| reg.upsert_rule_set(None, "Work", "Be brief."))
             .unwrap()
             .1;
         project_add(&root).unwrap();
-        let pid = crate::registry::load().unwrap().rules_projects[0].id.clone();
+        let pid = crate::registry::load().unwrap().rules_projects[0]
+            .id
+            .clone();
 
         // No set yet: Apply refuses rather than writing nothing silently.
         assert!(apply_project_with(&pid, &installed)
@@ -1250,12 +1253,18 @@ mod tests {
         project_set_set(&pid, Some(&set_id)).unwrap();
         assert!(project_set_set(&pid, Some("ghost")).is_err());
         // Picking a set writes nothing either.
-        assert_eq!(std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(), THEIRS);
+        assert_eq!(
+            std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(),
+            THEIRS
+        );
 
         // Switch AGENTS.md on (still nothing written) and apply: the block is appended, the
         // user's text is untouched, the other files are not created.
         project_set_file_enabled(&pid, "agents-md", true).unwrap();
-        assert_eq!(std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(), THEIRS);
+        assert_eq!(
+            std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(),
+            THEIRS
+        );
         let view = apply_project_with(&pid, &installed).unwrap();
         let agents = std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap();
         assert!(agents.starts_with(THEIRS), "{agents}");
@@ -1266,7 +1275,11 @@ mod tests {
         let file = |k: &str| proj.files.iter().find(|f| f.key == k).unwrap().clone();
         assert_eq!(file("agents-md").state, ApplyState::Applied);
         assert!(file("agents-md").enabled);
-        assert_eq!(file("claude-rules").state, ApplyState::Stale, "off: not written");
+        assert_eq!(
+            file("claude-rules").state,
+            ApplyState::Stale,
+            "off: not written"
+        );
         assert_eq!(file("gemini-md").state, ApplyState::Stale);
         let reg = crate::registry::load().unwrap();
         assert_eq!(
@@ -1276,8 +1289,13 @@ mod tests {
 
         // Switching a file OFF removes the block now; the user's text is exactly as before.
         project_set_file_enabled(&pid, "agents-md", false).unwrap();
-        assert_eq!(std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(), THEIRS);
-        assert!(crate::registry::load().unwrap().rules_projects[0].targets.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(),
+            THEIRS
+        );
+        assert!(crate::registry::load().unwrap().rules_projects[0]
+            .targets
+            .is_empty());
 
         // A toggle-off whose cleanup fails says so and leaves the file switched on and on
         // record, rather than showing an unchecked box over a block still in the repo.
@@ -1285,7 +1303,10 @@ mod tests {
         apply_project_with(&pid, &installed).unwrap();
         std::fs::write(
             root_path.join("AGENTS.md"),
-            format!("{}\nunterminated", crate::instructions::PERSONAL_SENTINEL_START_PREFIX),
+            format!(
+                "{}\nunterminated",
+                crate::instructions::PERSONAL_SENTINEL_START_PREFIX
+            ),
         )
         .unwrap();
         let err = project_set_file_enabled(&pid, "agents-md", false).unwrap_err();
@@ -1297,16 +1318,25 @@ mod tests {
         std::fs::write(root_path.join("AGENTS.md"), THEIRS).unwrap();
         apply_project_with(&pid, &installed).unwrap();
         project_set_file_enabled(&pid, "agents-md", false).unwrap();
-        assert_eq!(std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(), THEIRS);
+        assert_eq!(
+            std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(),
+            THEIRS
+        );
 
         // An owned file in a nested dir is created on apply and deleted whole on remove.
         project_set_file_enabled(&pid, "claude-rules", true).unwrap();
         apply_project_with(&pid, &installed).unwrap();
-        let owned_path = root_path.join(".claude").join("rules").join("toolport-rules.md");
+        let owned_path = root_path
+            .join(".claude")
+            .join("rules")
+            .join("toolport-rules.md");
         assert!(owned_path.exists());
         project_remove(&pid).unwrap();
         assert!(!owned_path.exists(), "remove cleans what was written");
-        assert_eq!(std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(), THEIRS);
+        assert_eq!(
+            std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(),
+            THEIRS
+        );
         assert!(crate::registry::load().unwrap().rules_projects.is_empty());
     }
 
@@ -1322,7 +1352,9 @@ mod tests {
             .unwrap()
             .1;
         project_add(&root).unwrap();
-        let pid = crate::registry::load().unwrap().rules_projects[0].id.clone();
+        let pid = crate::registry::load().unwrap().rules_projects[0]
+            .id
+            .clone();
         project_set_set(&pid, Some(&set_id)).unwrap();
         project_set_file_enabled(&pid, "agents-md", true).unwrap();
 
@@ -1359,7 +1391,10 @@ mod tests {
         let agents = root_path.join("AGENTS.md");
         std::fs::write(
             &agents,
-            format!("{}\nunterminated", crate::instructions::PERSONAL_SENTINEL_START_PREFIX),
+            format!(
+                "{}\nunterminated",
+                crate::instructions::PERSONAL_SENTINEL_START_PREFIX
+            ),
         )
         .unwrap();
         delete_set(&set2).unwrap();
@@ -1417,13 +1452,27 @@ mod tests {
         );
         let imported = import_file(path.to_str().unwrap(), Some("Claude Code")).unwrap();
         assert_eq!(imported.content, "");
-        assert!(imported.stripped_ours, "an owned file is entirely Toolport's");
+        assert!(
+            imported.stripped_ours,
+            "an owned file is entirely Toolport's"
+        );
 
         // A line that only LOOKS like the header is the user's text, not ours.
         let lookalike = s.path("lookalike.md");
-        std::fs::write(&lookalike, format!("{} but not really\nrules\n", Scope::Team.owned_header_prefix())).unwrap();
+        std::fs::write(
+            &lookalike,
+            format!(
+                "{} but not really\nrules\n",
+                Scope::Team.owned_header_prefix()
+            ),
+        )
+        .unwrap();
         let imported = import_file(lookalike.to_str().unwrap(), None).unwrap();
-        assert!(imported.content.contains("but not really"), "{}", imported.content);
+        assert!(
+            imported.content.contains("but not really"),
+            "{}",
+            imported.content
+        );
         assert!(!imported.stripped_ours);
 
         // A file with nothing of ours in it imports verbatim (trimmed) and says so.
@@ -1482,7 +1531,10 @@ mod tests {
         let empty = s.path("empty.md");
         std::fs::write(&empty, "").unwrap();
         let installed = vec![
-            client("claude-code", Some(owned(rules_dir.join("toolport-rules.md")))),
+            client(
+                "claude-code",
+                Some(owned(rules_dir.join("toolport-rules.md"))),
+            ),
             client("codex", Some(sentinel(agents.clone()))),
             client("gemini-cli", Some(sentinel(gemini.clone()))),
             client("antigravity", Some(sentinel(gemini.clone()))),
@@ -1498,8 +1550,17 @@ mod tests {
         assert_eq!(
             paths,
             vec![
-                ("claude-code", home.join(".claude").join("CLAUDE.md").to_string_lossy().to_string()),
-                ("claude-code", rules_dir.join("style.md").to_string_lossy().to_string()),
+                (
+                    "claude-code",
+                    home.join(".claude")
+                        .join("CLAUDE.md")
+                        .to_string_lossy()
+                        .to_string()
+                ),
+                (
+                    "claude-code",
+                    rules_dir.join("style.md").to_string_lossy().to_string()
+                ),
                 ("codex", agents.to_string_lossy().to_string()),
                 ("gemini-cli", gemini.to_string_lossy().to_string()),
             ],
@@ -1513,12 +1574,16 @@ mod tests {
     #[test]
     fn a_new_set_becomes_active_when_nothing_else_is() {
         let mut reg = crate::registry::Registry::default();
-        let id = reg.upsert_rule_set(None, "Work", "Always run tests.").expect("create");
+        let id = reg
+            .upsert_rule_set(None, "Work", "Always run tests.")
+            .expect("create");
         assert_eq!(reg.active_rule_set_id.as_deref(), Some(id.as_str()));
         assert_eq!(reg.active_rule_set().map(|s| s.revision), Some(1));
 
         // A SECOND set does not steal the selection.
-        let other = reg.upsert_rule_set(None, "Personal", "Be brief.").expect("create");
+        let other = reg
+            .upsert_rule_set(None, "Personal", "Be brief.")
+            .expect("create");
         assert_ne!(other, id, "ids must be unique");
         assert_eq!(reg.active_rule_set_id.as_deref(), Some(id.as_str()));
     }
@@ -1531,11 +1596,13 @@ mod tests {
 
         // A rename rides in the marker but is not a content change, so rewriting every client's
         // file for it would be pure churn.
-        reg.upsert_rule_set(Some(&id), "Renamed", "v1").expect("update");
+        reg.upsert_rule_set(Some(&id), "Renamed", "v1")
+            .expect("update");
         assert_eq!(reg.active_rule_set().unwrap().revision, 1);
         assert_eq!(reg.active_rule_set().unwrap().name, "Renamed");
 
-        reg.upsert_rule_set(Some(&id), "Renamed", "v2").expect("update");
+        reg.upsert_rule_set(Some(&id), "Renamed", "v2")
+            .expect("update");
         assert_eq!(reg.active_rule_set().unwrap().revision, 2);
     }
 
@@ -1546,7 +1613,10 @@ mod tests {
         let err = reg
             .upsert_rule_set(Some("deleted-in-another-window"), "Work", "v2")
             .expect_err("an unknown id must not create");
-        assert!(err.contains("no longer exists"), "unexpected message: {err}");
+        assert!(
+            err.contains("no longer exists"),
+            "unexpected message: {err}"
+        );
         assert_eq!(reg.rule_sets.len(), 1, "must not grow a duplicate set");
         assert_eq!(reg.active_rule_set().unwrap().id, id);
         assert_eq!(
@@ -1571,13 +1641,19 @@ mod tests {
         reg.set_active_rule_set(Some(&b));
         assert_eq!(reg.active_rule_set_id.as_deref(), Some(b.as_str()));
         reg.set_active_rule_set(Some("nope"));
-        assert_eq!(reg.active_rule_set_id, None, "unknown id clears, never panics");
+        assert_eq!(
+            reg.active_rule_set_id, None,
+            "unknown id clears, never panics"
+        );
     }
 
     #[test]
     fn a_client_is_opted_out_until_the_user_says_otherwise() {
         let mut reg = crate::registry::Registry::default();
-        assert!(!reg.rules_client_enabled("claude-code"), "absent must mean off");
+        assert!(
+            !reg.rules_client_enabled("claude-code"),
+            "absent must mean off"
+        );
         reg.set_rules_client_enabled("claude-code", true);
         assert!(reg.rules_client_enabled("claude-code"));
         reg.set_rules_client_enabled("claude-code", false);
@@ -1720,7 +1796,9 @@ mod tests {
             instructions::write_target(&foreign, &rules.id, rules.revision, &rules.content),
             ApplyState::Applied
         );
-        assert!(std::fs::read_to_string(&foreign.path).unwrap().starts_with(user));
+        assert!(std::fs::read_to_string(&foreign.path)
+            .unwrap()
+            .starts_with(user));
 
         // Owned files are ours whole, and a foreign file at the owned path is never deleted.
         let own = owned(s.path("rules").join(Scope::Personal.owned_file_name()));
@@ -1768,7 +1846,9 @@ mod tests {
         let codex = client("codex", Some(sentinel(s.path("AGENTS.md"))));
         let claude = client(
             "claude-code",
-            Some(owned(s.path("rules").join(Scope::Personal.owned_file_name()))),
+            Some(owned(
+                s.path("rules").join(Scope::Personal.owned_file_name()),
+            )),
         );
         let cursor = client("cursor", None);
         let installed = vec![codex.clone(), claude.clone(), cursor.clone()];
@@ -1806,7 +1886,9 @@ mod tests {
         let codex = client("codex", Some(sentinel(s.path("AGENTS.md"))));
         let claude = client(
             "claude-code",
-            Some(owned(s.path("rules").join(Scope::Personal.owned_file_name()))),
+            Some(owned(
+                s.path("rules").join(Scope::Personal.owned_file_name()),
+            )),
         );
         let installed = vec![codex.clone(), claude.clone()];
         seed_and_apply("Be brief.", &["codex", "claude-code"], &installed);
@@ -1825,8 +1907,12 @@ mod tests {
         // and reports them, body included, so the UI can show the difference.
         let view = apply_to(&installed, ApplyMode::Reconcile).unwrap();
         assert_eq!(std::fs::read_to_string(&codex_path).unwrap(), edited_codex);
-        assert_eq!(std::fs::read_to_string(&claude_path).unwrap(), edited_claude);
-        let by_id = |v: &RulesView, id: &str| v.clients.iter().find(|c| c.id == id).unwrap().clone();
+        assert_eq!(
+            std::fs::read_to_string(&claude_path).unwrap(),
+            edited_claude
+        );
+        let by_id =
+            |v: &RulesView, id: &str| v.clients.iter().find(|c| c.id == id).unwrap().clone();
         for id in ["codex", "claude-code"] {
             let row = by_id(&view, id);
             assert_eq!(row.state, ApplyState::Drifted, "{id}");
@@ -1838,7 +1924,9 @@ mod tests {
         // A change to the SET is a newer revision: the user moved the source of truth, and the
         // reconcile writes it (the hand edit goes; the UI offered Pull first).
         let view = seed_and_apply("Be brief. Always.", &[], &installed);
-        assert!(std::fs::read_to_string(&codex_path).unwrap().contains("Be brief. Always."));
+        assert!(std::fs::read_to_string(&codex_path)
+            .unwrap()
+            .contains("Be brief. Always."));
         assert_eq!(by_id(&view, "codex").state, ApplyState::Applied);
 
         // Drift BOTH again. Overwriting one client's file leaves the other's edit alone.
@@ -1850,12 +1938,24 @@ mod tests {
         assert_eq!(by_id(&view, "codex").state, ApplyState::Drifted);
         assert_eq!(by_id(&view, "claude-code").state, ApplyState::Drifted);
         let view = apply_to(&installed, ApplyMode::OverwriteOnly(claude_path.clone())).unwrap();
-        assert_eq!(by_id(&view, "claude-code").state, ApplyState::Applied, "the one asked for");
-        assert_eq!(by_id(&view, "codex").state, ApplyState::Drifted, "the other is untouched");
-        assert!(std::fs::read_to_string(&codex_path).unwrap().contains("Never."));
+        assert_eq!(
+            by_id(&view, "claude-code").state,
+            ApplyState::Applied,
+            "the one asked for"
+        );
+        assert_eq!(
+            by_id(&view, "codex").state,
+            ApplyState::Drifted,
+            "the other is untouched"
+        );
+        assert!(std::fs::read_to_string(&codex_path)
+            .unwrap()
+            .contains("Never."));
         // And the explicit overwrite-everything reverts the rest.
         let view = apply_to(&installed, ApplyMode::Overwrite).unwrap();
-        assert!(std::fs::read_to_string(&codex_path).unwrap().contains("Be brief. Always."));
+        assert!(std::fs::read_to_string(&codex_path)
+            .unwrap()
+            .contains("Be brief. Always."));
         assert_eq!(by_id(&view, "codex").state, ApplyState::Applied);
         assert_eq!(by_id(&view, "codex").on_disk, None);
 
@@ -1884,7 +1984,9 @@ mod tests {
 
         seed_and_apply("Be brief.", &["codex", "zed"], &installed);
         assert!(zed_path.exists());
-        assert!(std::fs::read_to_string(&codex_path).unwrap().contains("Be brief."));
+        assert!(std::fs::read_to_string(&codex_path)
+            .unwrap()
+            .contains("Be brief."));
 
         crate::registry::update(|reg| {
             reg.set_rules_client_enabled("codex", false);
@@ -1900,7 +2002,10 @@ mod tests {
         );
         assert!(zed_path.exists(), "the other client is untouched");
         let reg = crate::registry::load().unwrap();
-        assert_eq!(reg.rules_targets, vec![zed_path.to_string_lossy().to_string()]);
+        assert_eq!(
+            reg.rules_targets,
+            vec![zed_path.to_string_lossy().to_string()]
+        );
     }
 
     /// A write that fails must NOT be treated as an opt-out. The client is still enabled, so its
@@ -2058,7 +2163,10 @@ mod tests {
             .clone();
 
         for bad in [
-            format!("{} set=x v=1 -->", instructions::PERSONAL_SENTINEL_START_PREFIX),
+            format!(
+                "{} set=x v=1 -->",
+                instructions::PERSONAL_SENTINEL_START_PREFIX
+            ),
             instructions::PERSONAL_SENTINEL_END.to_string(),
             instructions::SENTINEL_END.to_string(),
         ] {
@@ -2150,9 +2258,13 @@ mod tests {
         .unwrap();
         std::fs::write(data.join("registry.json"), "{ not json").unwrap();
 
-        let error = apply_to(&[], ApplyMode::Reconcile).expect_err("backup recovery must refuse filesystem changes");
+        let error = apply_to(&[], ApplyMode::Reconcile)
+            .expect_err("backup recovery must refuse filesystem changes");
 
-        assert!(error.contains("not authoritative"), "unexpected error: {error}");
+        assert!(
+            error.contains("not authoritative"),
+            "unexpected error: {error}"
+        );
         assert_eq!(
             std::fs::read_to_string(&target.path).unwrap(),
             before,
@@ -2233,7 +2345,9 @@ mod tests {
 
         // A second set replaces the first set's span rather than stacking a second block.
         crate::registry::update(|reg| {
-            let id = reg.upsert_rule_set(None, "Other", "Rules B.").expect("create");
+            let id = reg
+                .upsert_rule_set(None, "Other", "Rules B.")
+                .expect("create");
             reg.set_active_rule_set(Some(&id));
             Ok(())
         })
@@ -2241,9 +2355,14 @@ mod tests {
         apply_to(&installed, ApplyMode::Reconcile).unwrap();
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("Rules B."));
-        assert!(!after.contains("Rules A."), "the old set's span is replaced, not appended to");
+        assert!(
+            !after.contains("Rules A."),
+            "the old set's span is replaced, not appended to"
+        );
         assert_eq!(
-            after.matches(instructions::PERSONAL_SENTINEL_START_PREFIX).count(),
+            after
+                .matches(instructions::PERSONAL_SENTINEL_START_PREFIX)
+                .count(),
             1,
             "exactly one personal block, whichever set wrote it"
         );
@@ -2284,7 +2403,10 @@ mod tests {
         instructions::remove_recorded(&path, Scope::Personal);
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.starts_with(user), "user bytes survive");
-        assert!(after.contains("Org rule"), "the team block is not ours to remove");
+        assert!(
+            after.contains("Org rule"),
+            "the team block is not ours to remove"
+        );
         assert!(!after.contains("Be brief."), "our span is gone");
     }
 }

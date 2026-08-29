@@ -53,7 +53,11 @@ fn scratch_path(tag: &str) -> std::path::PathBuf {
     ))
 }
 
-fn env_for(revision: Option<&str>, strict: bool, transcript: Option<&str>) -> Vec<(String, String)> {
+fn env_for(
+    revision: Option<&str>,
+    strict: bool,
+    transcript: Option<&str>,
+) -> Vec<(String, String)> {
     let mut env = Vec::new();
     if let Some(rev) = revision {
         env.push(("MOCK_MCP_REVISION".to_string(), rev.to_string()));
@@ -155,7 +159,10 @@ fn methods_of(transcript: &[Value]) -> Vec<String> {
 fn fixture_default_revision_is_unchanged() {
     let mut t = raw_transport(&env_for(None, false, None));
     let init = t
-        .request("initialize", json!({ "protocolVersion": FIXTURE_DEFAULT, "capabilities": {} }))
+        .request(
+            "initialize",
+            json!({ "protocolVersion": FIXTURE_DEFAULT, "capabilities": {} }),
+        )
         .expect("default fixture should answer initialize");
     assert_eq!(init["protocolVersion"], FIXTURE_DEFAULT);
 }
@@ -165,7 +172,10 @@ fn fixture_reports_each_legacy_revision() {
     for rev in LEGACY_REVISIONS {
         let mut t = raw_transport(&env_for(Some(rev), false, None));
         let init = t
-            .request("initialize", json!({ "protocolVersion": rev, "capabilities": {} }))
+            .request(
+                "initialize",
+                json!({ "protocolVersion": rev, "capabilities": {} }),
+            )
             .unwrap_or_else(|e| panic!("{rev} fixture should answer initialize: {e}"));
         assert_eq!(init["protocolVersion"], rev, "fixture pinned to {rev}");
 
@@ -191,8 +201,11 @@ fn fixture_reports_each_legacy_revision() {
 #[test]
 fn fixture_advertises_icons_from_2025_11_25() {
     let mut t = raw_transport(&env_for(Some("2025-11-25"), false, None));
-    t.request("initialize", json!({ "protocolVersion": "2025-11-25", "capabilities": {} }))
-        .expect("initialize");
+    t.request(
+        "initialize",
+        json!({ "protocolVersion": "2025-11-25", "capabilities": {} }),
+    )
+    .expect("initialize");
     let tools = t.request("tools/list", json!({})).expect("tools/list");
     let echo = tools["tools"]
         .as_array()
@@ -200,12 +213,18 @@ fn fixture_advertises_icons_from_2025_11_25() {
         .iter()
         .find(|t| t["name"] == "echo")
         .expect("echo tool");
-    assert!(echo.get("icons").is_some(), "2025-11-25 fixture should carry icons");
+    assert!(
+        echo.get("icons").is_some(),
+        "2025-11-25 fixture should carry icons"
+    );
 
     // ...and must not appear on older revisions, so a test can tell eras apart.
     let mut old = raw_transport(&env_for(Some("2025-06-18"), false, None));
-    old.request("initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {} }))
-        .expect("initialize");
+    old.request(
+        "initialize",
+        json!({ "protocolVersion": "2025-06-18", "capabilities": {} }),
+    )
+    .expect("initialize");
     let old_tools = old.request("tools/list", json!({})).expect("tools/list");
     let old_echo = old_tools["tools"]
         .as_array()
@@ -223,7 +242,10 @@ fn fixture_advertises_icons_from_2025_11_25() {
 fn modern_fixture_rejects_initialize_and_names_supported_versions() {
     let mut t = raw_transport(&env_for(Some(MODERN), true, None));
     let err = t
-        .request("initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {} }))
+        .request(
+            "initialize",
+            json!({ "protocolVersion": "2025-06-18", "capabilities": {} }),
+        )
         .expect_err("a modern server must not implement initialize");
     let err = error_json(&err);
     assert_eq!(err["code"], -32601, "unknown method");
@@ -241,7 +263,10 @@ fn modern_fixture_answers_server_discover() {
         .expect("a modern server MUST implement server/discover");
 
     assert_eq!(result["supportedVersions"][0], MODERN);
-    assert_eq!(result["resultType"], "complete", "every result carries resultType");
+    assert_eq!(
+        result["resultType"], "complete",
+        "every result carries resultType"
+    );
     assert_eq!(
         result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
         "mock-mcp-server"
@@ -257,7 +282,10 @@ fn modern_fixture_answers_server_discover() {
 fn modern_fixture_rejects_request_without_protocol_version() {
     let mut t = raw_transport(&env_for(Some(MODERN), true, None));
 
-    let err = error_json(&t.request("tools/list", json!({})).expect_err("missing _meta version"));
+    let err = error_json(
+        &t.request("tools/list", json!({}))
+            .expect_err("missing _meta version"),
+    );
     assert_eq!(err["code"], -32022);
     assert_eq!(err["data"]["supported"][0], MODERN);
 
@@ -285,13 +313,23 @@ fn modern_fixture_rejects_request_without_protocol_version() {
 #[test]
 fn strict_legacy_fixture_requires_initialize_first() {
     let mut t = raw_transport(&env_for(Some("2025-06-18"), true, None));
-    let err = error_json(&t.request("tools/list", json!({})).expect_err("handshake not done"));
+    let err = error_json(
+        &t.request("tools/list", json!({}))
+            .expect_err("handshake not done"),
+    );
     assert_eq!(err["code"], -32600);
 
-    t.request("initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {} }))
-        .expect("initialize");
-    t.notify("notifications/initialized", json!({})).expect("initialized");
-    assert!(t.request("tools/list", json!({})).is_ok(), "handshake complete");
+    t.request(
+        "initialize",
+        json!({ "protocolVersion": "2025-06-18", "capabilities": {} }),
+    )
+    .expect("initialize");
+    t.notify("notifications/initialized", json!({}))
+        .expect("initialized");
+    assert!(
+        t.request("tools/list", json!({})).is_ok(),
+        "handshake complete"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +352,9 @@ fn downstream_transcript_pins_current_wire_format() {
     let mut server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
     server.load_resources_prompts();
-    server.call("echo", json!({ "text": "hi" })).expect("echo call");
+    server
+        .call("echo", json!({ "text": "hi" }))
+        .expect("echo call");
     drop(server);
 
     let transcript = read_transcript(&path);
@@ -331,7 +371,10 @@ fn downstream_transcript_pins_current_wire_format() {
     );
 
     for expected in ["tools/list", "resources/list", "prompts/list", "tools/call"] {
-        assert!(methods.iter().any(|m| m == expected), "missing {expected} in {methods:?}");
+        assert!(
+            methods.iter().any(|m| m == expected),
+            "missing {expected} in {methods:?}"
+        );
     }
 
     // The `tools/call` envelope for a call carrying no client metadata. Since
@@ -393,8 +436,7 @@ fn client_meta_reaches_downstream_server() {
     }));
 
     assert_eq!(
-        received["traceparent"],
-        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        received["traceparent"], "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
         "OTel trace context is explicitly meant to propagate across hops"
     );
     assert_eq!(
@@ -489,7 +531,11 @@ fn downstream_progress_notification_reaches_the_bound_sink() {
     // The notification is emitted before the response, so by the time the call
     // returns the drain has already seen it.
     let got = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    assert_eq!(got.len(), 1, "expected exactly one progress notification, got {got:?}");
+    assert_eq!(
+        got.len(),
+        1,
+        "expected exactly one progress notification, got {got:?}"
+    );
     assert_eq!(got[0]["method"], "notifications/progress");
     assert_eq!(
         got[0]["params"]["progressToken"], "tok-e2e",
@@ -531,7 +577,9 @@ fn gateway_connects_to_a_modern_server() {
     // The connection is not merely established: it is usable. The strict fixture
     // rejects any request lacking the protocol `_meta`, so a successful call
     // proves the transport is stamping every request, not just the handshake.
-    let result = server.call("echo", json!({ "text": "hi" })).expect("call a modern server");
+    let result = server
+        .call("echo", json!({ "text": "hi" }))
+        .expect("call a modern server");
     assert_eq!(result["content"][0]["text"], "hi");
     assert_eq!(result["resultType"], "complete");
     drop(server);
@@ -554,7 +602,9 @@ fn gateway_connects_to_a_modern_server() {
     // Every post-handshake request carries its own protocol version and identity.
     // Counted so the loop cannot pass by matching nothing.
     let mut checked = 0;
-    for record in transcript.iter().filter(|r| r["method"] == "tools/list" || r["method"] == "tools/call")
+    for record in transcript
+        .iter()
+        .filter(|r| r["method"] == "tools/list" || r["method"] == "tools/call")
     {
         checked += 1;
         let meta = &record["params"]["_meta"];
@@ -612,8 +662,7 @@ fn legacy_client_is_shimmed_across_a_modern_mrtr_server() {
     let calls: Vec<&Value> = transcript
         .iter()
         .filter(|request| {
-            request["method"] == "tools/call"
-                && request["params"]["name"] == "mrtr_confirm"
+            request["method"] == "tools/call" && request["params"]["name"] == "mrtr_confirm"
         })
         .collect();
     assert_eq!(calls.len(), 2, "MRTR retry must be a new request");
@@ -654,13 +703,7 @@ fn modern_client_controls_native_mrtr_retry_fields() {
         request_state: Some(json!("mock-state-byte-exact")),
     };
     let complete = server
-        .call_with_cancel_and_mrtr(
-            "mrtr_confirm",
-            json!({}),
-            None,
-            Some(&meta),
-            Some(&retry),
-        )
+        .call_with_cancel_and_mrtr("mrtr_confirm", json!({}), None, Some(&meta), Some(&retry))
         .expect("native MRTR retry");
     assert_eq!(complete["resultType"], "complete");
     assert_eq!(complete["content"][0]["text"], "confirmed");
@@ -670,14 +713,19 @@ fn modern_client_controls_native_mrtr_retry_fields() {
     let calls: Vec<&Value> = transcript
         .iter()
         .filter(|request| {
-            request["method"] == "tools/call"
-                && request["params"]["name"] == "mrtr_confirm"
+            request["method"] == "tools/call" && request["params"]["name"] == "mrtr_confirm"
         })
         .collect();
     assert_eq!(calls.len(), 2);
     assert_ne!(calls[0]["id"], calls[1]["id"]);
-    assert_eq!(calls[1]["params"]["requestState"], retry.request_state.unwrap());
-    assert_eq!(calls[1]["params"]["inputResponses"], retry.input_responses.unwrap());
+    assert_eq!(
+        calls[1]["params"]["requestState"],
+        retry.request_state.unwrap()
+    );
+    assert_eq!(
+        calls[1]["params"]["inputResponses"],
+        retry.input_responses.unwrap()
+    );
     let _ = std::fs::remove_file(&path);
 }
 
@@ -697,13 +745,7 @@ fn modern_client_resumes_legacy_stdio_hitl_without_replaying_the_tool() {
     let meta = json!({ "io.modelcontextprotocol/protocolVersion": MODERN });
 
     let incomplete = server
-        .call_with_cancel_and_mrtr(
-            "legacy_elicitation",
-            json!({}),
-            None,
-            Some(&meta),
-            None,
-        )
+        .call_with_cancel_and_mrtr("legacy_elicitation", json!({}), None, Some(&meta), None)
         .expect("legacy server request should become MRTR");
     assert_eq!(incomplete["resultType"], "input_required");
     let state = incomplete["requestState"].clone();
@@ -736,16 +778,23 @@ fn modern_client_resumes_legacy_stdio_hitl_without_replaying_the_tool() {
     let calls: Vec<&Value> = transcript
         .iter()
         .filter(|request| {
-            request["method"] == "tools/call"
-                && request["params"]["name"] == "legacy_elicitation"
+            request["method"] == "tools/call" && request["params"]["name"] == "legacy_elicitation"
         })
         .collect();
-    assert_eq!(calls.len(), 1, "the modern retry must not replay tools/call");
+    assert_eq!(
+        calls.len(),
+        1,
+        "the modern retry must not replay tools/call"
+    );
     let replies: Vec<&Value> = transcript
         .iter()
         .filter(|request| request["id"] == "mock-legacy-elicitation")
         .collect();
-    assert_eq!(replies.len(), 1, "one input response resumes the legacy call");
+    assert_eq!(
+        replies.len(),
+        1,
+        "one input response resumes the legacy call"
+    );
     let _ = std::fs::remove_file(&path);
 }
 
@@ -918,7 +967,10 @@ fn legacy_server_that_rejects_initialize_still_fails_fast() {
     let probe = server.request("server/discover", json!({}));
     let elapsed = started.elapsed();
 
-    assert!(probe.is_err(), "a legacy fixture never answers server/discover");
+    assert!(
+        probe.is_err(),
+        "a legacy fixture never answers server/discover"
+    );
     // The point is the bound, not the exact number: silence must not cost the
     // full launcher budget.
     assert!(
@@ -974,7 +1026,10 @@ fn legacy_servers_see_no_era_detection_traffic() {
             "legacy requests carry no protocol _meta, got {record}"
         );
     }
-    assert!(checked >= 3, "expected several records to check, saw {checked}");
+    assert!(
+        checked >= 3,
+        "expected several records to check, saw {checked}"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
@@ -1010,7 +1065,10 @@ fn the_gateway_forwards_icons_through_tool_aggregation() {
         .tools
         .iter()
         .any(|t| t["name"] == "echo" && t.get("icons").is_some());
-    assert!(raw_has_icons, "fixture must supply icons for this test to mean anything");
+    assert!(
+        raw_has_icons,
+        "fixture must supply icons for this test to mean anything"
+    );
 
     let mut router = Router::new();
     router.add(server);
@@ -1049,7 +1107,10 @@ fn a_legacy_server_sees_client_meta_relayed_but_never_protocol_meta() {
         .expect("spawn fixture");
     let mut server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
-    assert!(!server.era().is_modern(), "this pin is about the legacy hop");
+    assert!(
+        !server.era().is_modern(),
+        "this pin is about the legacy hop"
+    );
 
     // Includes a per-hop key on purpose. Sending only client-owned keys made the
     // "never protocol meta" loop below vacuous: it proved the legacy transport

@@ -49,7 +49,11 @@ use crate::registry::{PermissionAction, PermissionRule};
 pub const GUARD_MARKER: &str = "--toolport-guard";
 
 /// Cursor events the guard registers, with the subject each carries.
-const CURSOR_EVENTS: [&str; 3] = ["beforeShellExecution", "beforeMCPExecution", "beforeReadFile"];
+const CURSOR_EVENTS: [&str; 3] = [
+    "beforeShellExecution",
+    "beforeMCPExecution",
+    "beforeReadFile",
+];
 
 /// Seconds Cursor should allow the hook. A wedged guard must cost a bounded pause.
 const GUARD_TIMEOUT_SECS: u64 = 10;
@@ -92,7 +96,9 @@ pub struct Verdict {
 
 fn split_rule(pattern: &str) -> (&str, Option<&str>) {
     match pattern.find('(') {
-        Some(i) if pattern.ends_with(')') => (&pattern[..i], Some(&pattern[i + 1..pattern.len() - 1])),
+        Some(i) if pattern.ends_with(')') => {
+            (&pattern[..i], Some(&pattern[i + 1..pattern.len() - 1]))
+        }
         _ => (pattern, None),
     }
 }
@@ -154,7 +160,10 @@ fn path_glob_match(pattern: &str, path: &str) -> bool {
 }
 
 fn regex_syntax_special(c: char) -> bool {
-    matches!(c, '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\')
+    matches!(
+        c,
+        '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\'
+    )
 }
 
 /// Command separators Claude Code recognises; a compound command is judged per part.
@@ -188,7 +197,8 @@ fn split_compound(command: &str) -> Vec<String> {
         }
         // An ampersand next to `>` belongs to a redirection (`2>&1`, `&>`, `>&`).
         let redirect_ampersand = c == '&'
-            && (i.checked_sub(1).is_some_and(|j| chars[j] == '>') || chars.get(i + 1) == Some(&'>'));
+            && (i.checked_sub(1).is_some_and(|j| chars[j] == '>')
+                || chars.get(i + 1) == Some(&'>'));
         if c == ';' || c == '|' || c == '\n' || (c == '&' && !redirect_ampersand) {
             parts.push(std::mem::take(&mut cur));
             i += 1;
@@ -283,7 +293,10 @@ fn readings(part: &str) -> Vec<String> {
 
 /// Claude Code's Bash specifier semantics on ONE (non-compound) command.
 fn bash_spec_matches(spec: &str, command: &str) -> bool {
-    let spec = spec.strip_suffix(":*").map(|s| format!("{s} *")).unwrap_or_else(|| spec.to_string());
+    let spec = spec
+        .strip_suffix(":*")
+        .map(|s| format!("{s} *"))
+        .unwrap_or_else(|| spec.to_string());
     if spec == "*" {
         return true;
     }
@@ -334,7 +347,11 @@ fn normalize_path(path: &str) -> String {
         }
     }
     let joined = out.join("/");
-    let joined = if absolute { format!("/{joined}") } else { joined };
+    let joined = if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    };
     if cfg!(any(target_os = "macos", target_os = "windows")) {
         joined.to_lowercase()
     } else {
@@ -399,7 +416,11 @@ pub fn evaluate(rules: &[PermissionRule], subject: &Subject) -> Verdict {
         PermissionAction::Allow => 1,
     };
     for r in rules {
-        if rule_matches(r, subject) && best.map(|b| rank(r.action) > rank(b.action)).unwrap_or(true) {
+        if rule_matches(r, subject)
+            && best
+                .map(|b| rank(r.action) > rank(b.action))
+                .unwrap_or(true)
+        {
             best = Some(r);
         }
     }
@@ -451,15 +472,24 @@ fn cursor_subject<'a>(
     match event {
         "beforeShellExecution" => {
             let command = payload.get("command")?.as_str()?;
-            Some((Subject::Shell(command), format!("the shell command `{}`", truncate(command, 120))))
+            Some((
+                Subject::Shell(command),
+                format!("the shell command `{}`", truncate(command, 120)),
+            ))
         }
         "beforeReadFile" => {
             let path = payload.get("file_path")?.as_str()?;
-            Some((Subject::Read { path, root, home }, format!("reading `{}`", truncate(path, 160))))
+            Some((
+                Subject::Read { path, root, home },
+                format!("reading `{}`", truncate(path, 160)),
+            ))
         }
         "beforeMCPExecution" => {
             let tool = payload.get("tool_name")?.as_str()?;
-            Some((Subject::Mcp { tool }, format!("the MCP tool `{}`", truncate(tool, 80))))
+            Some((
+                Subject::Mcp { tool },
+                format!("the MCP tool `{}`", truncate(tool, 80)),
+            ))
         }
         _ => None,
     }
@@ -509,30 +539,40 @@ fn registry_unavailable(why: &str) -> Value {
 
 fn handle(agent: &str, stdin: &str, truncated: bool) -> Value {
     if agent != "cursor" {
-        crate::gatewaylog::append(&format!("toolport: guard invoked for unknown agent {agent:?}"));
+        crate::gatewaylog::append(&format!(
+            "toolport: guard invoked for unknown agent {agent:?}"
+        ));
         return allow_response();
     }
     let reg = match crate::registry::load_resolved_with_source() {
         Ok((reg, source)) if source.is_authoritative() => reg,
         Ok((_reg, source)) => {
-            crate::gatewaylog::append(&format!("toolport: guard registry is not authoritative: {source:?}"));
+            crate::gatewaylog::append(&format!(
+                "toolport: guard registry is not authoritative: {source:?}"
+            ));
             return registry_unavailable("the registry was recovered or unreadable");
         }
         Err(error) => {
-            crate::gatewaylog::append(&format!("toolport: guard could not load the registry: {error}"));
+            crate::gatewaylog::append(&format!(
+                "toolport: guard could not load the registry: {error}"
+            ));
             return registry_unavailable("the registry could not be read");
         }
     };
     // Cursor on Windows is documented to prefix hook stdin with a UTF-8 BOM.
     let stdin = stdin.trim_start_matches('\u{FEFF}');
     if truncated {
-        record(json!({ "agent": "cursor", "event": "guard", "malformed": true, "truncated": true, "decision": if reg.guard_cursor_mode == GuardMode::Enforce { "deny" } else { "allow" }, "mode": reg.guard_cursor_mode }));
+        record(
+            json!({ "agent": "cursor", "event": "guard", "malformed": true, "truncated": true, "decision": if reg.guard_cursor_mode == GuardMode::Enforce { "deny" } else { "allow" }, "mode": reg.guard_cursor_mode }),
+        );
         return cannot_judge(&reg, "the payload was larger than the guard reads");
     }
     let payload: Value = match serde_json::from_str(stdin) {
         Ok(v) => v,
         Err(error) => {
-            record(json!({ "agent": "cursor", "event": "guard", "malformed": true, "decision": if reg.guard_cursor_mode == GuardMode::Enforce { "deny" } else { "allow" }, "mode": reg.guard_cursor_mode }));
+            record(
+                json!({ "agent": "cursor", "event": "guard", "malformed": true, "decision": if reg.guard_cursor_mode == GuardMode::Enforce { "deny" } else { "allow" }, "mode": reg.guard_cursor_mode }),
+            );
             crate::gatewaylog::append(&format!("toolport: guard payload did not parse: {error}"));
             return cannot_judge(&reg, "the payload did not parse");
         }
@@ -545,15 +585,27 @@ fn handle(agent: &str, stdin: &str, truncated: bool) -> Value {
     let cwd = payload
         .get("cwd")
         .and_then(Value::as_str)
-        .or_else(|| payload.get("workspace_roots").and_then(Value::as_array).and_then(|a| a.first()).and_then(Value::as_str))
+        .or_else(|| {
+            payload
+                .get("workspace_roots")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(Value::as_str)
+        })
         .map(str::to_string);
     let home = dirs::home_dir().map(|h| h.to_string_lossy().to_string());
     let Some((subject, what)) = cursor_subject(&event, &payload, home.as_deref()) else {
         // An event we did not register for, or one of ours missing its subject field. The
         // first is benign (allow); the second, in Enforce, is a call we cannot judge.
         let registered = CURSOR_EVENTS.contains(&event.as_str());
-        record(json!({ "agent": "cursor", "event": "guard", "hookEvent": event, "cwd": cwd, "unhandled": true, "decision": if registered && reg.guard_cursor_mode == GuardMode::Enforce { "deny" } else { "allow" }, "mode": reg.guard_cursor_mode }));
-        return if registered { cannot_judge(&reg, "the call had no command, path or tool to check") } else { allow_response() };
+        record(
+            json!({ "agent": "cursor", "event": "guard", "hookEvent": event, "cwd": cwd, "unhandled": true, "decision": if registered && reg.guard_cursor_mode == GuardMode::Enforce { "deny" } else { "allow" }, "mode": reg.guard_cursor_mode }),
+        );
+        return if registered {
+            cannot_judge(&reg, "the call had no command, path or tool to check")
+        } else {
+            allow_response()
+        };
     };
     let verdict = evaluate(&reg.agent_permission_rules, &subject);
     let (tool, hash_src) = match &subject {
@@ -580,7 +632,9 @@ fn handle(agent: &str, stdin: &str, truncated: bool) -> Value {
         "decision": decision,
     }));
     match (enforced, verdict.action) {
-        (true, Some(action)) => decision_response(action, verdict.rule.as_deref().unwrap_or("?"), &what),
+        (true, Some(action)) => {
+            decision_response(action, verdict.rule.as_deref().unwrap_or("?"), &what)
+        }
         _ => allow_response(),
     }
 }
@@ -600,7 +654,8 @@ fn record(mut row: Value) {
     let Some(path) = crate::hooks::log_path() else {
         return;
     };
-    let _ = crate::registry::append_line_locked(&path, &row.to_string(), 4 * 1024 * 1024, 10_000, None);
+    let _ =
+        crate::registry::append_line_locked(&path, &row.to_string(), 4 * 1024 * 1024, 10_000, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -776,7 +831,10 @@ fn report(profiles: Vec<GuardProfile>) -> Result<(), String> {
     if failed.is_empty() {
         Ok(())
     } else {
-        Err(format!("The mode was saved, but the hooks file could not be updated: {}", failed.join("; ")))
+        Err(format!(
+            "The mode was saved, but the hooks file could not be updated: {}",
+            failed.join("; ")
+        ))
     }
 }
 
@@ -808,13 +866,21 @@ fn apply_to(
             match install_at(path, &binary, *enforce) {
                 Ok(()) => {
                     targets.push(key.clone());
-                    statuses.push(GuardProfile { path: key, installed: true, error: None });
+                    statuses.push(GuardProfile {
+                        path: key,
+                        installed: true,
+                        error: None,
+                    });
                 }
                 Err(error) => {
                     if reg.guard_targets.contains(&key) {
                         targets.push(key.clone());
                     }
-                    statuses.push(GuardProfile { path: key, installed: false, error: Some(error) });
+                    statuses.push(GuardProfile {
+                        path: key,
+                        installed: false,
+                        error: Some(error),
+                    });
                 }
             }
         }
@@ -822,7 +888,11 @@ fn apply_to(
         for stale in reg.guard_targets.iter().filter(|t| !wanted.contains(t)) {
             if let Err(error) = remove_at(Path::new(stale)) {
                 targets.push(stale.clone());
-                statuses.push(GuardProfile { path: stale.clone(), installed: false, error: Some(error) });
+                statuses.push(GuardProfile {
+                    path: stale.clone(),
+                    installed: false,
+                    error: Some(error),
+                });
             }
         }
         reg.guard_targets = targets;
@@ -881,8 +951,18 @@ fn preview_at(path: &Path, binary: &Path, mode: GuardMode) -> GuardPreview {
         Ok((original.unwrap_or_default(), after))
     });
     match rendered {
-        Ok((before, after)) => GuardPreview { path: path.display().to_string(), before, after, error: None },
-        Err(error) => GuardPreview { path: path.display().to_string(), before: String::new(), after: String::new(), error: Some(error) },
+        Ok((before, after)) => GuardPreview {
+            path: path.display().to_string(),
+            before,
+            after,
+            error: None,
+        },
+        Err(error) => GuardPreview {
+            path: path.display().to_string(),
+            before: String::new(),
+            after: String::new(),
+            error: Some(error),
+        },
     }
 }
 
@@ -892,19 +972,27 @@ mod tests {
     use PermissionAction::{Allow, Ask, Deny};
 
     fn rule(p: &str, a: PermissionAction) -> PermissionRule {
-        PermissionRule { pattern: p.into(), action: a }
+        PermissionRule {
+            pattern: p.into(),
+            action: a,
+        }
     }
 
     #[test]
     fn bash_rules_follow_claude_codes_matching() {
         let deny = |p: &str| vec![rule(p, Deny)];
-        let hit = |rules: &[PermissionRule], cmd: &str| evaluate(rules, &Subject::Shell(cmd)).action == Some(Deny);
+        let hit = |rules: &[PermissionRule], cmd: &str| {
+            evaluate(rules, &Subject::Shell(cmd)).action == Some(Deny)
+        };
         // Exact, prefix with word boundary, `:*`, wildcards anywhere, bare tool.
         assert!(hit(&deny("Bash(npm run build)"), "npm run build"));
         assert!(!hit(&deny("Bash(npm run build)"), "npm run build --watch"));
         assert!(hit(&deny("Bash(ls *)"), "ls"));
         assert!(hit(&deny("Bash(ls *)"), "ls -la"));
-        assert!(!hit(&deny("Bash(ls *)"), "lsof -i"), "a trailing ` *` needs a word boundary");
+        assert!(
+            !hit(&deny("Bash(ls *)"), "lsof -i"),
+            "a trailing ` *` needs a word boundary"
+        );
         assert!(hit(&deny("Bash(ls:*)"), "ls -la"));
         assert!(hit(&deny("Bash(git * main)"), "git push origin main"));
         assert!(hit(&deny("Bash(* --version)"), "node --version"));
@@ -918,7 +1006,10 @@ mod tests {
         // Wrappers with options cannot smuggle a denied command past the rule.
         assert!(hit(&deny("Bash(rm -rf *)"), "nice -n 19 rm -rf x"));
         assert!(hit(&deny("Bash(rm -rf *)"), "nice --adjustment 5 rm -rf x"));
-        assert!(hit(&deny("Bash(rm -rf *)"), "timeout --preserve-status -s KILL 5 rm -rf x"));
+        assert!(hit(
+            &deny("Bash(rm -rf *)"),
+            "timeout --preserve-status -s KILL 5 rm -rf x"
+        ));
         assert!(hit(&deny("Bash(rm -rf *)"), "timeout -k 2 10 rm -rf x"));
         assert!(hit(&deny("Bash(rm -rf *)"), "time -p nohup rm -rf x"));
         // A wrapper whose own name is denied is still denied as written.
@@ -928,45 +1019,106 @@ mod tests {
         assert!(hit(&deny("Bash(rm -rf *)"), "ls |& rm -rf x"));
         assert!(hit(&deny("Bash(rm -rf *)"), "/usr/bin/timeout 5 rm -rf x"));
         assert!(hit(&deny("Bash(rm -rf *)"), r"C:\tools\timeout 5 rm -rf x"));
-        assert!(hit(&deny("Bash(rm -rf *)"), "/usr/bin/nice -n 5 /usr/bin/nohup rm -rf x"));
+        assert!(hit(
+            &deny("Bash(rm -rf *)"),
+            "/usr/bin/nice -n 5 /usr/bin/nohup rm -rf x"
+        ));
         let allow_redirects = vec![rule("Bash(npm test *)", Allow)];
-        assert_eq!(evaluate(&allow_redirects, &Subject::Shell("npm test 2>&1")).action, Some(Allow));
-        assert_eq!(evaluate(&allow_redirects, &Subject::Shell("npm test &>out.log")).action, Some(Allow));
-        assert!(!hit(&deny("Bash(rm -rf *)"), "echo 'rm -rf' && ls"), "quoted operators do not split; the echo is not rm");
+        assert_eq!(
+            evaluate(&allow_redirects, &Subject::Shell("npm test 2>&1")).action,
+            Some(Allow)
+        );
+        assert_eq!(
+            evaluate(&allow_redirects, &Subject::Shell("npm test &>out.log")).action,
+            Some(Allow)
+        );
+        assert!(
+            !hit(&deny("Bash(rm -rf *)"), "echo 'rm -rf' && ls"),
+            "quoted operators do not split; the echo is not rm"
+        );
         // Allow covers a compound only when every part is allowed.
         let allow = vec![rule("Bash(npm *)", Allow)];
-        assert_eq!(evaluate(&allow, &Subject::Shell("npm test && npm run lint")).action, Some(Allow));
-        assert_eq!(evaluate(&allow, &Subject::Shell("npm test && curl evil")).action, None);
+        assert_eq!(
+            evaluate(&allow, &Subject::Shell("npm test && npm run lint")).action,
+            Some(Allow)
+        );
+        assert_eq!(
+            evaluate(&allow, &Subject::Shell("npm test && curl evil")).action,
+            None
+        );
         // Precedence: deny beats ask beats allow when several match.
-        let mixed = vec![rule("Bash(git push*)", Ask), rule("Bash(git *)", Allow), rule("Bash(git push --force*)", Deny)];
-        assert_eq!(evaluate(&mixed, &Subject::Shell("git push --force origin main")).action, Some(Deny));
-        assert_eq!(evaluate(&mixed, &Subject::Shell("git push origin main")).action, Some(Ask));
-        assert_eq!(evaluate(&mixed, &Subject::Shell("git status")).action, Some(Allow));
+        let mixed = vec![
+            rule("Bash(git push*)", Ask),
+            rule("Bash(git *)", Allow),
+            rule("Bash(git push --force*)", Deny),
+        ];
+        assert_eq!(
+            evaluate(&mixed, &Subject::Shell("git push --force origin main")).action,
+            Some(Deny)
+        );
+        assert_eq!(
+            evaluate(&mixed, &Subject::Shell("git push origin main")).action,
+            Some(Ask)
+        );
+        assert_eq!(
+            evaluate(&mixed, &Subject::Shell("git status")).action,
+            Some(Allow)
+        );
         assert_eq!(evaluate(&mixed, &Subject::Shell("ls")).action, None);
         // A Read rule never matches a shell command and vice versa.
-        assert_eq!(evaluate(&[rule("Read(./.env)", Deny)], &Subject::Shell("cat .env")).action, None);
+        assert_eq!(
+            evaluate(&[rule("Read(./.env)", Deny)], &Subject::Shell("cat .env")).action,
+            None
+        );
     }
 
     #[test]
     fn read_rules_resolve_against_workspace_and_home() {
         let deny = |p: &str| vec![rule(p, Deny)];
         let hit = |rules: &[PermissionRule], path: &str| {
-            evaluate(rules, &Subject::Read { path, root: Some("/work/repo"), home: Some("/home/u") }).action == Some(Deny)
+            evaluate(
+                rules,
+                &Subject::Read {
+                    path,
+                    root: Some("/work/repo"),
+                    home: Some("/home/u"),
+                },
+            )
+            .action
+                == Some(Deny)
         };
         assert!(hit(&deny("Read(./.env)"), "/work/repo/.env"));
-        assert!(!hit(&deny("Read(./.env)"), "/work/repo/sub/.env"), "`./.env` is the root one");
+        assert!(
+            !hit(&deny("Read(./.env)"), "/work/repo/sub/.env"),
+            "`./.env` is the root one"
+        );
         assert!(hit(&deny("Read(./.env.*)"), "/work/repo/.env.local"));
         assert!(hit(&deny("Read(~/.ssh/**)"), "/home/u/.ssh/id_ed25519"));
-        assert!(hit(&deny("Read(~/.ssh)"), "/home/u/.ssh/id_ed25519"), "a directory rule covers what is under it");
+        assert!(
+            hit(&deny("Read(~/.ssh)"), "/home/u/.ssh/id_ed25519"),
+            "a directory rule covers what is under it"
+        );
         assert!(!hit(&deny("Read(~/.ssh/**)"), "/home/u/.sshx/key"));
         assert!(hit(&deny("Read(src/**/*.key)"), "/work/repo/src/a/b/c.key"));
-        assert!(hit(&deny("Read(src/**/*.key)"), "/work/repo/src/c.key"), "`**/` also matches zero directories");
-        assert!(!hit(&deny("Read(src/*.key)"), "/work/repo/src/a/c.key"), "`*` stays in one segment");
+        assert!(
+            hit(&deny("Read(src/**/*.key)"), "/work/repo/src/c.key"),
+            "`**/` also matches zero directories"
+        );
+        assert!(
+            !hit(&deny("Read(src/*.key)"), "/work/repo/src/a/c.key"),
+            "`*` stays in one segment"
+        );
         assert!(hit(&deny("Read(//etc/passwd)"), "/etc/passwd"));
         // Lexically equivalent spellings reach the same rule.
-        assert!(hit(&deny("Read(~/.ssh/**)"), "/home/u/proj/../.ssh/id_ed25519"));
+        assert!(hit(
+            &deny("Read(~/.ssh/**)"),
+            "/home/u/proj/../.ssh/id_ed25519"
+        ));
         assert!(hit(&deny("Read(./.env)"), "/work/repo/./sub/..//.env"));
-        assert!(hit(&deny("Read(~/.ssh/**)"), "/home/u/.ssh/./keys/../id_rsa"));
+        assert!(hit(
+            &deny("Read(~/.ssh/**)"),
+            "/home/u/.ssh/./keys/../id_rsa"
+        ));
         if cfg!(any(target_os = "macos", target_os = "windows")) {
             assert!(hit(&deny("Read(~/.ssh/**)"), "/home/u/.SSH/ID_RSA"));
         }
@@ -977,9 +1129,14 @@ mod tests {
     #[test]
     fn mcp_rules_match_the_tool_name_and_globs() {
         let deny = |p: &str| vec![rule(p, Deny)];
-        let hit = |rules: &[PermissionRule], tool: &str| evaluate(rules, &Subject::Mcp { tool }).action == Some(Deny);
+        let hit = |rules: &[PermissionRule], tool: &str| {
+            evaluate(rules, &Subject::Mcp { tool }).action == Some(Deny)
+        };
         assert!(hit(&deny("mcp__github__create_issue"), "create_issue"));
-        assert!(hit(&deny("mcp__github__create_issue"), "github__create_issue"));
+        assert!(hit(
+            &deny("mcp__github__create_issue"),
+            "github__create_issue"
+        ));
         assert!(!hit(&deny("mcp__github__create_issue"), "list_issues"));
         assert!(hit(&deny("mcp__github__*"), "anything"));
         assert!(hit(&deny("mcp__*"), "anything"));
@@ -992,19 +1149,34 @@ mod tests {
         let r = decision_response(Deny, "Bash(rm -rf *)", "the shell command `rm -rf x`");
         assert_eq!(r["permission"], "deny");
         assert_eq!(r["continue"], true);
-        assert!(r["user_message"].as_str().unwrap().contains("Bash(rm -rf *)"));
-        assert!(r["agent_message"].as_str().unwrap().contains("Do not retry"));
+        assert!(r["user_message"]
+            .as_str()
+            .unwrap()
+            .contains("Bash(rm -rf *)"));
+        assert!(r["agent_message"]
+            .as_str()
+            .unwrap()
+            .contains("Do not retry"));
         assert_eq!(registry_unavailable("test failure")["permission"], "deny");
         let r = decision_response(Ask, "Bash(git push*)", "x");
         assert_eq!(r["permission"], "ask");
         assert_eq!(decision_response(Allow, "x", "y"), allow_response());
-        assert_eq!(allow_response(), serde_json::json!({ "continue": true, "permission": "allow" }));
+        assert_eq!(
+            allow_response(),
+            serde_json::json!({ "continue": true, "permission": "allow" })
+        );
     }
 
     #[test]
     fn unjudgeable_input_is_denied_only_when_enforcing() {
-        let enforce = crate::registry::Registry { guard_cursor_mode: GuardMode::Enforce, ..Default::default() };
-        let observe = crate::registry::Registry { guard_cursor_mode: GuardMode::Observe, ..Default::default() };
+        let enforce = crate::registry::Registry {
+            guard_cursor_mode: GuardMode::Enforce,
+            ..Default::default()
+        };
+        let observe = crate::registry::Registry {
+            guard_cursor_mode: GuardMode::Observe,
+            ..Default::default()
+        };
         assert_eq!(cannot_judge(&enforce, "x")["permission"], "deny");
         assert_eq!(cannot_judge(&observe, "x"), allow_response());
         // A BOM-prefixed payload parses once the BOM is stripped.
@@ -1022,10 +1194,22 @@ mod tests {
         assert!(what.contains("rm -rf x"));
         let p = serde_json::json!({ "hook_event_name": "beforeReadFile", "file_path": "/w/.env", "workspace_roots": ["/w"] });
         let (s, _) = cursor_subject("beforeReadFile", &p, home).unwrap();
-        assert_eq!(s, Subject::Read { path: "/w/.env", root: Some("/w"), home });
+        assert_eq!(
+            s,
+            Subject::Read {
+                path: "/w/.env",
+                root: Some("/w"),
+                home
+            }
+        );
         let p = serde_json::json!({ "hook_event_name": "beforeMCPExecution", "tool_name": "create_issue", "tool_input": "{}" });
         let (s, _) = cursor_subject("beforeMCPExecution", &p, home).unwrap();
-        assert_eq!(s, Subject::Mcp { tool: "create_issue" });
+        assert_eq!(
+            s,
+            Subject::Mcp {
+                tool: "create_issue"
+            }
+        );
         assert!(cursor_subject("afterFileEdit", &p, home).is_none());
         assert!(cursor_subject("beforeShellExecution", &serde_json::json!({}), home).is_none());
     }
@@ -1043,9 +1227,18 @@ mod tests {
         let shell = with["hooks"]["beforeShellExecution"].as_array().unwrap();
         assert_eq!(shell.len(), 2, "ours is added beside theirs");
         assert_eq!(shell[0]["command"], "./my-own.sh");
-        assert_eq!(shell[1]["command"], "\"/opt/toolport/toolport-gateway\" --toolport-guard cursor");
+        assert_eq!(
+            shell[1]["command"],
+            "\"/opt/toolport/toolport-gateway\" --toolport-guard cursor"
+        );
         assert_eq!(shell[1]["failClosed"], true);
-        assert_eq!(with["hooks"]["beforeMCPExecution"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            with["hooks"]["beforeMCPExecution"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(with["hooks"]["beforeReadFile"].as_array().unwrap().len(), 1);
         assert_eq!(with["hooks"]["stop"], theirs["hooks"]["stop"]);
         // Idempotent, and re-upserting with observe flips only failClosed.
@@ -1056,7 +1249,11 @@ mod tests {
         assert_eq!(strip_guard(&with), theirs);
         let fresh = upsert_guard(&serde_json::json!({}), bin, false).unwrap();
         assert_eq!(fresh["version"], 1);
-        assert_eq!(strip_guard(&fresh), serde_json::json!({ "version": 1 }), "version was ours to add but is the file's to keep");
+        assert_eq!(
+            strip_guard(&fresh),
+            serde_json::json!({ "version": 1 }),
+            "version was ours to add but is the file's to keep"
+        );
     }
 
     #[test]
@@ -1075,13 +1272,20 @@ mod tests {
 
         // Off: nothing written.
         apply_to(None, Some(&hooks), &resolve).unwrap();
-        assert!(!std::fs::read_to_string(&hooks).unwrap().contains("toolport-guard"));
+        assert!(!std::fs::read_to_string(&hooks)
+            .unwrap()
+            .contains("toolport-guard"));
 
         // Observe: installed, failClosed false, user's hook kept and formatting too.
         let st = apply_to(Some(GuardMode::Observe), Some(&hooks), &resolve).unwrap();
         assert!(st[0].installed && st[0].error.is_none(), "{st:?}");
         let text = std::fs::read_to_string(&hooks).unwrap();
-        assert!(text.contains("toolport-guard cursor") && text.contains("\"failClosed\": false") && text.contains("./done.sh"), "{text}");
+        assert!(
+            text.contains("toolport-guard cursor")
+                && text.contains("\"failClosed\": false")
+                && text.contains("./done.sh"),
+            "{text}"
+        );
         let reg = crate::registry::load().unwrap();
         assert_eq!(reg.guard_targets, vec![hooks.display().to_string()]);
         assert!(view_with(&reg, Some(&hooks)).cursor.unwrap().installed);
@@ -1089,17 +1293,27 @@ mod tests {
         // Enforce: same entries, failClosed true.
         apply_to(Some(GuardMode::Enforce), Some(&hooks), &resolve).unwrap();
         let text = std::fs::read_to_string(&hooks).unwrap();
-        assert!(text.contains("\"failClosed\": true") && !text.contains("\"failClosed\": false"), "{text}");
+        assert!(
+            text.contains("\"failClosed\": true") && !text.contains("\"failClosed\": false"),
+            "{text}"
+        );
 
         // A hand-removed entry comes back at startup reconcile.
         std::fs::write(&hooks, "{\n  \"version\": 1,\n  \"hooks\": { \"stop\": [{ \"command\": \"./done.sh\" }] }\n}\n").unwrap();
         apply_to(None, Some(&hooks), &resolve).unwrap();
-        assert!(std::fs::read_to_string(&hooks).unwrap().contains("toolport-guard"));
+        assert!(std::fs::read_to_string(&hooks)
+            .unwrap()
+            .contains("toolport-guard"));
 
         // Off: exactly ours leaves; the user's stop hook and version stay.
         apply_to(Some(GuardMode::Off), Some(&hooks), &resolve).unwrap();
         let text = std::fs::read_to_string(&hooks).unwrap();
-        assert!(!text.contains("toolport-guard") && text.contains("./done.sh") && text.contains("\"version\": 1"), "{text}");
+        assert!(
+            !text.contains("toolport-guard")
+                && text.contains("./done.sh")
+                && text.contains("\"version\": 1"),
+            "{text}"
+        );
         assert!(crate::registry::load().unwrap().guard_targets.is_empty());
         let _ = std::fs::remove_dir_all(&scratch);
     }

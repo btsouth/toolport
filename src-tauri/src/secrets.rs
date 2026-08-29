@@ -282,7 +282,9 @@ mod platform {
             return Ok(());
         }
         if update_status != -25300 {
-            return Err(format!("SecItemUpdate with shared access failed: {update_status}"));
+            return Err(format!(
+                "SecItemUpdate with shared access failed: {update_status}"
+            ));
         }
 
         // 3. No prior item: add it WITH the shared-access ACL atomically.
@@ -294,7 +296,10 @@ mod platform {
             (k_access, access_cf),
         ]);
         let st = unsafe {
-            SecItemAdd(add.as_concrete_TypeRef() as *const c_void, std::ptr::null_mut())
+            SecItemAdd(
+                add.as_concrete_TypeRef() as *const c_void,
+                std::ptr::null_mut(),
+            )
         };
         if st != 0 {
             return Err(format!("SecItemAdd with shared access failed: {st}"));
@@ -425,10 +430,16 @@ mod platform {
                 k(unsafe { kSecAttrAccessibleAfterFirstUnlock }),
             ));
             let add = CFDictionary::from_CFType_pairs(&pairs);
-            let st =
-                unsafe { SecItemAdd(add.as_concrete_TypeRef() as *const c_void, std::ptr::null_mut()) };
+            let st = unsafe {
+                SecItemAdd(
+                    add.as_concrete_TypeRef() as *const c_void,
+                    std::ptr::null_mut(),
+                )
+            };
             if st != 0 {
-                return Err(format!("SecItemAdd (data-protection keychain) failed: {st}"));
+                return Err(format!(
+                    "SecItemAdd (data-protection keychain) failed: {st}"
+                ));
             }
             Ok(())
         }
@@ -438,8 +449,14 @@ mod platform {
         /// to `Ok(None)`; the returned CFData is decoded to a `String`.
         pub fn get(account_str: &str) -> Result<Option<String>, String> {
             let mut pairs = base_query(account_str);
-            pairs.push((k(unsafe { kSecReturnData }), CFBoolean::true_value().as_CFType()));
-            pairs.push((k(unsafe { kSecMatchLimit }), k(unsafe { kSecMatchLimitOne })));
+            pairs.push((
+                k(unsafe { kSecReturnData }),
+                CFBoolean::true_value().as_CFType(),
+            ));
+            pairs.push((
+                k(unsafe { kSecMatchLimit }),
+                k(unsafe { kSecMatchLimitOne }),
+            ));
             let query = CFDictionary::from_CFType_pairs(&pairs);
 
             let mut result: *const c_void = std::ptr::null_mut();
@@ -474,7 +491,9 @@ mod platform {
             if st == 0 || st == ERR_SEC_ITEM_NOT_FOUND {
                 Ok(())
             } else {
-                Err(format!("SecItemDelete (data-protection keychain) failed: {st}"))
+                Err(format!(
+                    "SecItemDelete (data-protection keychain) failed: {st}"
+                ))
             }
         }
     }
@@ -974,8 +993,7 @@ mod platform {
         /// nothing, so check the slots are actually used.
         #[test]
         fn the_retry_stagger_uses_every_slot() {
-            let used: std::collections::HashSet<u64> =
-                (4_000_u32..4_100).map(retry_slot).collect();
+            let used: std::collections::HashSet<u64> = (4_000_u32..4_100).map(retry_slot).collect();
             assert_eq!(
                 used.len() as u64,
                 RETRY_SLOTS,
@@ -1273,7 +1291,10 @@ fn env_secret_override(key: &str) -> Option<String> {
 }
 
 fn bare_secret_env_enabled() -> bool {
-    crate::brand::env_flag("TOOLPORT_ALLOW_BARE_SECRET_ENV", "CONDUIT_ALLOW_BARE_SECRET_ENV")
+    crate::brand::env_flag(
+        "TOOLPORT_ALLOW_BARE_SECRET_ENV",
+        "CONDUIT_ALLOW_BARE_SECRET_ENV",
+    )
 }
 
 fn env_var_nonblank(name: &str) -> Option<String> {
@@ -1362,9 +1383,7 @@ pub fn migrate_legacy_entries(secret_keys: &[(String, String)]) -> MigrationRepo
         //    flips the file backend on for this install. If it fails (locked
         //    keychain), don't write the marker — retry on the next launch.
         if let Err(e) = platform::ensure_master_key() {
-            eprintln!(
-                "conduit: could not ensure secrets master key, will retry next launch ({e})"
-            );
+            eprintln!("conduit: could not ensure secrets master key, will retry next launch ({e})");
             return MigrationReport::default();
         }
 
@@ -1598,10 +1617,16 @@ mod tests {
 
         delete_secret(&sid, key).unwrap();
         set_secret(&sid, key, &first).unwrap();
-        assert_eq!(get_secret_result(&sid, key).unwrap().as_deref(), Some(first.as_str()));
+        assert_eq!(
+            get_secret_result(&sid, key).unwrap().as_deref(),
+            Some(first.as_str())
+        );
 
         set_secret(&sid, key, &second).unwrap();
-        assert_eq!(get_secret_result(&sid, key).unwrap().as_deref(), Some(second.as_str()));
+        assert_eq!(
+            get_secret_result(&sid, key).unwrap().as_deref(),
+            Some(second.as_str())
+        );
 
         set_secret(&sid, key, "short replacement").unwrap();
         assert_eq!(get_secret(&sid, key).as_deref(), Some("short replacement"));
@@ -1612,7 +1637,10 @@ mod tests {
 
         let reserved = "toolport-chunked-v1:0123456789abcdef0123456789abcdef:1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         set_secret(&sid, key, reserved).unwrap();
-        assert_eq!(get_secret_result(&sid, key).unwrap().as_deref(), Some(reserved));
+        assert_eq!(
+            get_secret_result(&sid, key).unwrap().as_deref(),
+            Some(reserved)
+        );
 
         platform::set_raw_for_test(&sid, key, "toolport-chunked-v1:damaged").unwrap();
         set_secret(&sid, key, "recovered after corrupt manifest").unwrap();
@@ -1722,7 +1750,10 @@ mod tests {
         );
 
         // The injection is consumed, so the secret reads normally again.
-        assert_eq!(get_secret_result(&sid, key).unwrap().as_deref(), Some(value));
+        assert_eq!(
+            get_secret_result(&sid, key).unwrap().as_deref(),
+            Some(value)
+        );
         delete_secret(&sid, key).unwrap();
         assert_eq!(get_secret_result(&sid, key).unwrap(), None);
     }
@@ -1774,7 +1805,10 @@ mod tests {
         let cleanup = SecretCleanupGuard::new(&sid, key);
         set_secret(&sid, key, &"x".repeat(5_000)).unwrap();
         let raw_entries = platform::raw_entries_for_test(&sid, key).unwrap();
-        assert!(raw_entries.len() > 1, "fixture must create chunk credentials");
+        assert!(
+            raw_entries.len() > 1,
+            "fixture must create chunk credentials"
+        );
 
         let unwound = std::panic::catch_unwind(|| {
             let _cleanup = cleanup;
@@ -1838,7 +1872,11 @@ mod tests {
         assert_eq!(env_secret_override(key), None);
 
         std::env::set_var(key, "from-bare");
-        assert_eq!(env_secret_override(key), None, "bare key blocked without opt-in");
+        assert_eq!(
+            env_secret_override(key),
+            None,
+            "bare key blocked without opt-in"
+        );
 
         std::env::set_var("CONDUIT_ALLOW_BARE_SECRET_ENV", "1");
         assert_eq!(env_secret_override(key).as_deref(), Some("from-bare"));
@@ -2070,8 +2108,7 @@ mod tests {
         let _ = platform::delete_secret(sid, key);
 
         let keys = vec![(sid.to_string(), key.to_string())];
-        let report =
-            platform::migrate_legacy_to_dpk(&keys).expect("migration should succeed");
+        let report = platform::migrate_legacy_to_dpk(&keys).expect("migration should succeed");
 
         assert_eq!(report.migrated, 0, "nothing to migrate");
         assert_eq!(report.failed, 0, "missing keys are not failures");

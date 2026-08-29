@@ -86,7 +86,12 @@ pub fn per_server_tokens(
 /// `by_server` attributes the catalog's tokens to their servers so team usage
 /// reporting can build per-server rows; empty (old callers, no routes) is fine and
 /// simply leaves this serve out of the per-server rollup.
-pub fn record(full_tokens: u64, meta_tokens: u64, catalog_tools: u64, by_server: BTreeMap<String, u64>) {
+pub fn record(
+    full_tokens: u64,
+    meta_tokens: u64,
+    catalog_tools: u64,
+    by_server: BTreeMap<String, u64>,
+) {
     let saved = full_tokens.saturating_sub(meta_tokens);
     if saved == 0 {
         return;
@@ -178,8 +183,11 @@ fn fold(entries: &[Value]) -> Value {
         // rotation nor a code-mode run inflates the list-load count.
         loads = loads.saturating_add(e.get("loads").and_then(Value::as_u64).unwrap_or(1));
         peak = peak.max(e.get("tools").and_then(Value::as_u64).unwrap_or(0));
-        round_trips = round_trips
-            .saturating_add(e.get("roundTripsSaved").and_then(Value::as_u64).unwrap_or(0));
+        round_trips = round_trips.saturating_add(
+            e.get("roundTripsSaved")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
         let ts = e.get("ts").and_then(Value::as_u64).unwrap_or(0);
         if ts > 0 && (since == 0 || ts < since) {
             since = ts;

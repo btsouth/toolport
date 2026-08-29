@@ -187,7 +187,12 @@ pub struct TopologySnapshot {
 }
 
 impl TopologySnapshot {
-    pub fn new(role: GatewayRole, compat: &CompatKey, sessions: usize, launches: Vec<LaunchKey>) -> Self {
+    pub fn new(
+        role: GatewayRole,
+        compat: &CompatKey,
+        sessions: usize,
+        launches: Vec<LaunchKey>,
+    ) -> Self {
         let mut launches = launches;
         launches.sort();
         Self {
@@ -307,14 +312,23 @@ mod tests {
             1,
         );
         let encoded = serde_json::to_string(&key).unwrap();
-        assert!(!encoded.contains("ghp_"), "no value should be reachable: {encoded}");
+        assert!(
+            !encoded.contains("ghp_"),
+            "no value should be reachable: {encoded}"
+        );
         // The NAME is fine and useful; the value never enters the material at all.
         assert!(encoded.contains("gh"));
 
         let remote = LaunchKey::remote("api", "https://user:hunter2@example.com/mcp?k=abc", 1);
         let encoded = serde_json::to_string(&remote).unwrap();
-        assert!(!encoded.contains("hunter2"), "userinfo must not survive: {encoded}");
-        assert!(!encoded.contains("example.com"), "host must not survive: {encoded}");
+        assert!(
+            !encoded.contains("hunter2"),
+            "userinfo must not survive: {encoded}"
+        );
+        assert!(
+            !encoded.contains("example.com"),
+            "host must not survive: {encoded}"
+        );
     }
 
     /// Two launches may only be pooled when everything that changes the child's
@@ -353,7 +367,8 @@ mod tests {
         assert_ne!(base, extra, "env var set must split");
 
         // Args and command, obviously.
-        let other_args = LaunchKey::stdio("gh", "npx", &["-y".into()], None, &names(&["API_KEY"]), 7);
+        let other_args =
+            LaunchKey::stdio("gh", "npx", &["-y".into()], None, &names(&["API_KEY"]), 7);
         assert_ne!(base, other_args);
         let other_cmd = LaunchKey::stdio(
             "gh",
@@ -379,9 +394,18 @@ mod tests {
     #[test]
     fn compat_keys_separate_builds_and_data_dirs() {
         let a = CompatKey::new("1.13.0", "C:/data");
-        assert_eq!(a.fingerprint(), CompatKey::new("1.13.0", "C:/data").fingerprint());
-        assert_ne!(a.fingerprint(), CompatKey::new("1.14.0", "C:/data").fingerprint());
-        assert_ne!(a.fingerprint(), CompatKey::new("1.13.0", "D:/data").fingerprint());
+        assert_eq!(
+            a.fingerprint(),
+            CompatKey::new("1.13.0", "C:/data").fingerprint()
+        );
+        assert_ne!(
+            a.fingerprint(),
+            CompatKey::new("1.14.0", "C:/data").fingerprint()
+        );
+        assert_ne!(
+            a.fingerprint(),
+            CompatKey::new("1.13.0", "D:/data").fingerprint()
+        );
         // The fingerprint is what a rendezvous descriptor would publish, so it must not
         // leak the path it was built from.
         assert!(!a.fingerprint().contains("data"));
@@ -415,9 +439,15 @@ mod tests {
         let host = HostTopology::from_snapshots(&snapshots);
 
         assert_eq!(host.sessions, 3);
-        assert_eq!(host.router_owners, 3, "one router per session is the defect");
+        assert_eq!(
+            host.router_owners, 3,
+            "one router per session is the defect"
+        );
         assert_eq!(host.total_launches, 12, "4 servers x 3 sessions");
-        assert_eq!(host.distinct_launches, 4, "but only 4 distinct servers exist");
+        assert_eq!(
+            host.distinct_launches, 4,
+            "but only 4 distinct servers exist"
+        );
         assert_eq!(
             host.duplication_factor(),
             3.0,

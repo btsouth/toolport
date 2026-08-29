@@ -227,18 +227,19 @@ fn cleanup_chunks(base: &str, manifest: &ChunkManifest) {
 
 pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
     let base = account(server_id, key);
-    let previous_manifest = read_entry(&base)?
-        .as_deref()
-        .and_then(|value| match parse_manifest(value) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                // A damaged manifest must not permanently block reauthentication.
-                // Its chunks may be unreachable, but replacing the base repairs the
-                // user-visible credential and future writes.
-                eprintln!("toolport: replacing invalid Windows credential manifest: {error}");
-                None
-            }
-        });
+    let previous_manifest =
+        read_entry(&base)?
+            .as_deref()
+            .and_then(|value| match parse_manifest(value) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    // A damaged manifest must not permanently block reauthentication.
+                    // Its chunks may be unreachable, but replacing the base repairs the
+                    // user-visible credential and future writes.
+                    eprintln!("toolport: replacing invalid Windows credential manifest: {error}");
+                    None
+                }
+            });
 
     let direct = direct_value(value);
     if direct.encode_utf16().count() <= CHUNK_UTF16_UNITS {
@@ -373,8 +374,7 @@ pub fn raw_entries_for_test(server_id: &str, key: &str) -> Result<Vec<String>, S
     if let Some(raw) = read_entry(&base)? {
         if let Some(manifest) = parse_manifest(&raw)? {
             accounts.extend(
-                (0..manifest.count)
-                    .map(|index| chunk_account(&base, &manifest.generation, index)),
+                (0..manifest.count).map(|index| chunk_account(&base, &manifest.generation, index)),
             );
         }
     }

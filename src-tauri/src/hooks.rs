@@ -129,9 +129,7 @@ fn hook_command(binary: &Path, event_arg: &str) -> String {
 fn validate_hook_binary(binary: &Path) -> Result<(), String> {
     let path = binary.to_string_lossy();
     let unsafe_char = path.chars().any(|c| {
-        c.is_control()
-            || matches!(c, '"' | '`' | '$')
-            || (cfg!(not(windows)) && c == '\\')
+        c.is_control() || matches!(c, '"' | '`' | '$') || (cfg!(not(windows)) && c == '\\')
     });
     if unsafe_char {
         return Err(format!(
@@ -505,7 +503,9 @@ pub fn apply_on_startup() {
         return;
     }
     if let Err(error) = apply() {
-        crate::gatewaylog::append(&format!("toolport: hook sensor startup apply failed: {error}"));
+        crate::gatewaylog::append(&format!(
+            "toolport: hook sensor startup apply failed: {error}"
+        ));
     }
 }
 
@@ -619,9 +619,8 @@ fn apply_to(
         if reg.hooks_enabled {
             // Resolved before any write. Failing here aborts the whole transaction, so
             // an un-installable build leaves the opt-in exactly as it was.
-            let binary = resolve_binary().ok_or_else(|| {
-                "no gateway binary is available to run as a hook".to_string()
-            })?;
+            let binary = resolve_binary()
+                .ok_or_else(|| "no gateway binary is available to run as a hook".to_string())?;
             for path in candidates.iter().map(Path::new) {
                 statuses.push(match install_at(path, &binary) {
                     Ok(()) => {
@@ -815,7 +814,9 @@ mod tests {
             out["hooks"].get("PreToolUse").is_none(),
             "the sensor must not register on the blocking event"
         );
-        assert!(!SENSOR_EVENTS.iter().any(|(event, _)| *event == "PreToolUse"));
+        assert!(!SENSOR_EVENTS
+            .iter()
+            .any(|(event, _)| *event == "PreToolUse"));
     }
 
     #[test]
@@ -850,9 +851,15 @@ mod tests {
 
         let installed = upsert_hooks(&before, &binary()).unwrap();
         assert_eq!(installed["model"], json!("opus"));
-        assert_eq!(installed["permissions"]["allow"][0], json!("Bash(git status)"));
+        assert_eq!(
+            installed["permissions"]["allow"][0],
+            json!("Bash(git status)")
+        );
         // Ours is added alongside theirs, and their PreToolUse hook is untouched.
-        assert_eq!(installed["hooks"]["PostToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            installed["hooks"]["PostToolUse"].as_array().unwrap().len(),
+            2
+        );
         assert_eq!(installed["hooks"]["PreToolUse"], json!([foreign_group()]));
 
         let removed = strip_hooks(&installed);
@@ -932,7 +939,10 @@ mod tests {
 
     #[test]
     fn the_command_is_quoted_so_an_installed_path_with_spaces_survives_a_shell() {
-        let command = hook_command(Path::new("/Applications/My Toolport/toolport-gateway"), "tool");
+        let command = hook_command(
+            Path::new("/Applications/My Toolport/toolport-gateway"),
+            "tool",
+        );
         assert!(command.starts_with('"'));
         assert!(command.contains("My Toolport"));
         assert!(command.ends_with(&format!("{HOOK_MARKER} tool")));
@@ -1061,7 +1071,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let over = crate::registry::DataDirOverride::set(&dir);
-        ScratchEnv { dir, _override: over, _lock: lock }
+        ScratchEnv {
+            dir,
+            _override: over,
+            _lock: lock,
+        }
     }
 
     fn read(path: &Path) -> String {
@@ -1080,7 +1094,6 @@ mod tests {
         assert!(is_installed(&root));
         // A file we created holds nothing but our block.
         assert_eq!(root.as_object().unwrap().len(), 1);
-
     }
 
     #[test]
@@ -1111,7 +1124,6 @@ mod tests {
             root.get("hooks").is_none(),
             "uninstall must not leave an empty hooks object: {restored}"
         );
-
     }
 
     #[test]
@@ -1125,7 +1137,6 @@ mod tests {
         install_at(&path, &binary()).unwrap();
 
         assert_eq!(first, read(&path), "a second apply must not rewrite bytes");
-
     }
 
     #[test]
@@ -1139,7 +1150,6 @@ mod tests {
 
         assert!(install_at(&path, &binary()).is_err());
         assert_eq!(read(&path), original, "the file must be untouched");
-
     }
 
     #[test]
@@ -1151,9 +1161,11 @@ mod tests {
         std::fs::write(&path, original).unwrap();
 
         assert!(install_at(&path, &binary()).is_err());
-        assert!(remove_at(&path).is_err(), "removal must not rewrite it either");
+        assert!(
+            remove_at(&path).is_err(),
+            "removal must not rewrite it either"
+        );
         assert_eq!(read(&path), original);
-
     }
 
     #[test]
@@ -1185,7 +1197,6 @@ mod tests {
 
         let root: Value = crate::clients::read_settings_json(&path).unwrap().0;
         assert_eq!(root["hooks"]["PostToolUse"], json!([foreign_group()]));
-
     }
 
     #[test]
@@ -1206,8 +1217,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["tool"], json!("Bash"));
         assert_eq!(rows[0]["sessionId"], json!("s1"));
-        assert!(!dir.join("registry.json").exists(), "no registry was created");
-
+        assert!(
+            !dir.join("registry.json").exists(),
+            "no registry was created"
+        );
     }
 
     #[test]
@@ -1241,7 +1254,10 @@ mod tests {
         let _env = scratch_env("order");
 
         handle_event("session-start", &json!({ "session_id": "s1" }).to_string());
-        handle_event("tool", &json!({ "session_id": "s1", "tool_name": "Read" }).to_string());
+        handle_event(
+            "tool",
+            &json!({ "session_id": "s1", "tool_name": "Read" }).to_string(),
+        );
         handle_event("session-end", &json!({ "session_id": "s1" }).to_string());
 
         let raw = std::fs::read_to_string(log_path().unwrap()).unwrap();
@@ -1250,7 +1266,6 @@ mod tests {
         let rows = read_recent(10).unwrap();
         assert_eq!(rows[0]["event"], json!("session-end"));
         assert_eq!(rows[2]["event"], json!("session-start"));
-
     }
 
     #[test]
@@ -1267,7 +1282,6 @@ mod tests {
             !dir.join("registry.json").exists(),
             "a launch with the sensor off must not write anything"
         );
-
     }
 
     #[test]
@@ -1284,7 +1298,6 @@ mod tests {
             "an unparseable file must not report a successful removal"
         );
         assert!(path.exists(), "and must not be deleted or rewritten");
-
     }
 
     #[test]
@@ -1383,8 +1396,14 @@ mod tests {
 
         let (read, truncated) = read_payload(raw.as_slice());
         assert!(!truncated);
-        assert!(read.contains("Bash"), "the readable part must survive: {read}");
-        assert!(read.contains('\u{fffd}'), "the bad byte becomes a replacement char");
+        assert!(
+            read.contains("Bash"),
+            "the readable part must survive: {read}"
+        );
+        assert!(
+            read.contains('\u{fffd}'),
+            "the bad byte becomes a replacement char"
+        );
     }
 
     #[test]
@@ -1405,7 +1424,6 @@ mod tests {
             crate::registry::load().unwrap().hook_targets.is_empty(),
             "a profile we never wrote must not be recorded as ours"
         );
-
     }
 
     #[test]
@@ -1431,7 +1449,6 @@ mod tests {
             vec![profile.display().to_string()],
             "a profile we wrote must stay recorded through a read failure"
         );
-
     }
 
     #[test]
@@ -1441,8 +1458,7 @@ mod tests {
         let env = scratch_env("preview-bytes");
         let dir = env.dir.clone();
         let path = dir.join("settings.json");
-        let original =
-            "{\n  // the model I actually want\n  \"model\": \"opus\"\n}\n";
+        let original = "{\n  // the model I actually want\n  \"model\": \"opus\"\n}\n";
         std::fs::write(&path, original).unwrap();
 
         // Drive preview() itself, not just the renderer underneath it, so swapping the
@@ -1458,7 +1474,6 @@ mod tests {
             "preview text and the written file must be byte-identical"
         );
         assert!(previews[0].after.contains("// the model I actually want"));
-
     }
 
     #[test]
@@ -1471,8 +1486,10 @@ mod tests {
         let previews = preview_to(&[path.clone()], &binary()).unwrap();
         assert!(previews[0].before.is_empty());
         assert!(previews[0].after.contains(HOOK_MARKER));
-        assert!(!path.exists(), "a dry run must not create the settings file");
-
+        assert!(
+            !path.exists(),
+            "a dry run must not create the settings file"
+        );
     }
 
     #[test]
@@ -1498,7 +1515,6 @@ mod tests {
             "the healthy profile still previews: {:?}",
             previews[1]
         );
-
     }
 
     #[test]
@@ -1523,7 +1539,6 @@ mod tests {
             !profile.exists(),
             "and must not have written a settings file first"
         );
-
     }
 
     #[test]
@@ -1553,7 +1568,6 @@ mod tests {
         assert!(!is_installed(
             &crate::clients::read_settings_json(&profile).unwrap().0
         ));
-
     }
 
     #[test]
@@ -1580,8 +1594,11 @@ mod tests {
             .iter()
             .filter_map(|r| r.get("tool").and_then(Value::as_str))
             .collect();
-        assert_eq!(tools, vec!["Bash", "Read"], "newest first, torn line dropped");
-
+        assert_eq!(
+            tools,
+            vec!["Bash", "Read"],
+            "newest first, torn line dropped"
+        );
     }
 
     #[test]
@@ -1601,7 +1618,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(calls.get(), 0, "the disable path asked for a binary");
-
     }
 
     #[test]
@@ -1615,6 +1631,5 @@ mod tests {
             read_recent(10).is_err(),
             "an unreadable log must not read as an empty one (SBS-873)"
         );
-
     }
 }
