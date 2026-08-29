@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Toolport Native Preview
+Comment=One local MCP gateway for every AI client
+Exec=toolport-gtk %U
+Icon=toolport
+Terminal=false
+Categories=Development;
+Keywords=MCP;AI;agents;tools;
+StartupNotify=true
+StartupWMClass=com.tsout.Toolport.NativePreview
+X-GNOME-UsesNotifications=true
+MimeType=x-scheme-handler/toolport;x-scheme-handler/conduit;

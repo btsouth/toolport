@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.tsout.Toolport.NativePreview</id>
+  <name>Toolport Native Preview</name>
+  <summary>One local MCP gateway for every AI client</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="com.tsout">
+    <name>South Forge AI</name>
+  </developer>
+  <description>
+    <p>
+      Toolport manages MCP servers once and makes them available to supported AI
+      clients with approvals, audit history, rules, and local credential storage.
+    </p>
+    <p>
+      This additive Linux-native preview uses GTK4, follows the active Omarchy
+      palette, and behaves as a regular Wayland window under Hyprland.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.tsout.Toolport.NativePreview.desktop</launchable>
+  <provides>
+    <binary>toolport-gtk</binary>
+    <mediatype>x-scheme-handler/toolport</mediatype>
+    <mediatype>x-scheme-handler/conduit</mediatype>
+  </provides>
+  <url type="homepage">https://github.com/tsouth89/toolport</url>
+  <url type="bugtracker">https://github.com/tsouth89/toolport/issues</url>
+  <content_rating type="oars-1.1" />
+</component>

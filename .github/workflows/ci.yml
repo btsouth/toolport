@@ -15,6 +15,40 @@ permissions:
   contents: read
 
 jobs:
+  linux-native:
+    name: Linux-native GTK preview
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      # The native shell deliberately skips WebKit/Tauri. Ubuntu 24.04 provides
+      # GTK >= 4.10 and libadwaita >= 1.4, the floor for adaptive navigation.
+      - name: Install GTK build dependencies
+        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev libgtk-4-dev libadwaita-1-dev
+
+      - name: Cache cargo + target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-gtk-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-gtk-cargo-
+
+      - name: Build the opt-in native preview
+        run: cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --features gtk-desktop --bin toolport-gtk
+
+      - name: Test the native shell module
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml --no-default-features
+          --features gtk-desktop --lib linux_native::
+
   clippy:
     name: Rust Clippy
     # Without this the job inherits GitHub's 6-hour default. A flaky Ubuntu mirror
