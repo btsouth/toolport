@@ -71,6 +71,7 @@ claude|claude-code
 codex|codex
 grok|grok
 agy|antigravity
+gemini|gemini-cli
 copilot|github-copilot-cli
 crush|crush
 AGENTS

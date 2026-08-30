@@ -6431,6 +6431,144 @@ mod tests {
     use super::*;
     use crate::registry::EnvVar;
 
+    /// Opt-in release check run by `scripts/test-omarchy-client-roundtrip.sh`.
+    ///
+    /// This changes HOME-class process environment, so it must stay out of the
+    /// parallel unit suite. The wrapper starts a dedicated test process with an
+    /// isolated home and explicitly relocated client directories.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run through scripts/test-omarchy-client-roundtrip.sh"]
+    fn omarchy_clients_round_trip_without_losing_existing_config() {
+        let root = std::env::var_os("TOOLPORT_OMARCHY_CLIENT_TEST_ROOT")
+            .map(PathBuf::from)
+            .expect("the Omarchy round-trip wrapper must provide its isolated root");
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("the Omarchy round-trip wrapper must provide HOME");
+        assert!(
+            home.starts_with(&root),
+            "refusing to run the release mutation test outside its isolated root"
+        );
+
+        let _env = env_test_lock();
+        let _data_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = crate::registry::DataDirOverride::set(root.join("toolport-data"));
+
+        // A test executable lives under target/debug/deps. Production resolution
+        // expects the gateway beside the app, so provide a harmless sidecar whose
+        // path can be written into the fixture configs. It is never executed.
+        let sidecar = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(format!("toolport-gateway{}", std::env::consts::EXE_SUFFIX));
+        assert!(
+            !sidecar.exists(),
+            "refusing to replace an existing gateway sidecar at {}",
+            sidecar.display()
+        );
+        std::fs::write(&sidecar, b"toolport omarchy release fixture\n").unwrap();
+        struct RemoveSidecar(PathBuf);
+        impl Drop for RemoveSidecar {
+            fn drop(&mut self) {
+                std::fs::remove_file(&self.0).ok();
+            }
+        }
+        let _remove_sidecar = RemoveSidecar(sidecar);
+
+        let client_ids = [
+            "antigravity",
+            "claude-code",
+            "codex",
+            "github-copilot-cli",
+            "crush",
+            "gemini-cli",
+            "grok",
+            "omp",
+            "opencode",
+            "pi",
+        ];
+        let definitions = defs();
+        let empty_managed = HashMap::new();
+
+        for client_id in client_ids {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.id == client_id)
+                .unwrap_or_else(|| panic!("missing client definition for {client_id}"));
+            let path = resolved_definition_path(definition).unwrap();
+            assert!(
+                path.starts_with(&root),
+                "{client_id} resolved outside the isolated root: {}",
+                path.display()
+            );
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let fixture = match definition.format {
+                Format::TomlMcpServers => "sentinel = \"keep\"\n",
+                _ => "{\"sentinel\":\"keep\"}\n",
+            };
+            std::fs::write(&path, fixture).unwrap();
+
+            let rollback_error = crate::registry_controller::connect_client_stdio_with(
+                client_id,
+                None,
+                false,
+                &empty_managed,
+                |_| Err("intentional release-test registry failure".into()),
+            )
+            .expect_err("a registry failure must fail the connection");
+            assert!(rollback_error.contains("rolled back"), "{rollback_error}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                fixture,
+                "{client_id} rollback did not restore the original config"
+            );
+
+            let installed = install_gateway(client_id, None).unwrap();
+            assert!(
+                installed.managed.is_some(),
+                "{client_id} lost ownership data"
+            );
+            let detected = read_client(definition);
+            assert!(
+                detected.error.is_none(),
+                "{client_id}: {:?}",
+                detected.error
+            );
+            assert!(detected.gateway_installed, "{client_id} missed the gateway");
+
+            uninstall_gateway(client_id).unwrap();
+            let disconnected = read_client(definition);
+            assert!(
+                disconnected.error.is_none(),
+                "{client_id}: {:?}",
+                disconnected.error
+            );
+            assert!(
+                !disconnected.gateway_installed,
+                "{client_id} retained the gateway after disconnect"
+            );
+            let contents = std::fs::read_to_string(&path).unwrap();
+            match definition.format {
+                Format::TomlMcpServers => {
+                    let parsed: toml::Value = toml::from_str(&contents).unwrap();
+                    assert_eq!(
+                        parsed.get("sentinel").and_then(|v| v.as_str()),
+                        Some("keep")
+                    );
+                }
+                _ => {
+                    let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+                    assert_eq!(
+                        parsed.get("sentinel").and_then(|v| v.as_str()),
+                        Some("keep")
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn claude_code_config_follows_a_relocated_config_dir() {
         // Claude Code moves `.claude.json` when CLAUDE_CONFIG_DIR is set. Resolving

@@ -401,8 +401,8 @@ Replace the default Linux shell only when:
 - the functional parity inventory is complete;
 - the package has a tested rollback path;
 - Windows and macOS release jobs are still green; and
-- the native shell has completed a real-world soak across at least two
-  Toolport releases.
+- the native shell has completed a sustained real-world daily-driver soak on
+  the current release candidate.
 
 After replacement, prepare the source package and concise inclusion proposal
 for the Omarchy package repository. Core-image inclusion is an upstream product
@@ -419,6 +419,15 @@ decision, not a technical completion criterion.
 - Existing frontend type-check, lint, and Vitest suite.
 - Headless gateway build and smoke test.
 - Windows and macOS headless Rust tests.
+
+### Omarchy release candidate
+
+- Stable and edge `omarchy-agent` launch contracts pass against the actual
+  upstream launchers with `scripts/test-omarchy-agent-launcher.sh`.
+- All Omarchy client adapters pass isolated connect, registry-failure rollback,
+  and disconnect checks with `scripts/test-omarchy-client-roundtrip.sh`.
+- `scripts/collect-omarchy-release-evidence.sh` records the installed Omarchy
+  package, channel, selector capabilities, session, and agent versions.
 
 ### Linux desktop behavior
 
