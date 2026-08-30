@@ -488,7 +488,7 @@ describe("Omarchy native source package", () => {
     expect(omarchyRecipe).toContain("archive/refs/tags/v$pkgver.tar.gz");
     expect(checksum).toMatch(
       new RegExp(
-        `^(?:[0-9a-f]{64}|REPLACE_WITH_V${pkgver!.replaceAll(".", "_")}_SOURCE_SHA256)$`,
+        `^(?:[0-9a-f]{64}|REPLACE_WITH_V${pkgver!.replace(/\./g, "_")}_SOURCE_SHA256)$`,
       ),
     );
     expect(omarchyRecipe).toContain(
