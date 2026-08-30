@@ -3,6 +3,7 @@
 mod catalog;
 mod hooks;
 mod http_bridge;
+mod omarchy;
 mod onboarding;
 mod permissions;
 mod playground;
@@ -1097,6 +1098,7 @@ struct ClientPage {
     connected_count: gtk::Label,
     configured_count: gtk::Label,
     import_button: gtk::Button,
+    omarchy_button: gtk::Button,
     refresh_button: gtk::Button,
     scanning: std::rc::Rc<std::cell::Cell<bool>>,
     profiles: std::rc::Rc<std::cell::RefCell<Vec<state::ProfileView>>>,
@@ -1124,6 +1126,11 @@ impl ClientPage {
         import_button.set_tooltip_text(Some("Review servers found in client configurations"));
         import_button.add_css_class("toolport-secondary-action");
         header.pack_end(&import_button);
+        let omarchy_button = gtk::Button::with_label("Connect Omarchy");
+        omarchy_button.set_tooltip_text(Some("Review installed Omarchy agents"));
+        omarchy_button.add_css_class("toolport-secondary-action");
+        omarchy_button.set_visible(omarchy::environment_detected());
+        header.pack_end(&omarchy_button);
         root.append(&header);
 
         let scroller = gtk::ScrolledWindow::builder()
@@ -1199,6 +1206,7 @@ impl ClientPage {
             connected_count: values.remove(0),
             configured_count: values.remove(0),
             import_button,
+            omarchy_button,
             refresh_button,
             scanning: std::rc::Rc::new(std::cell::Cell::new(false)),
             profiles: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
@@ -1211,6 +1219,26 @@ impl ClientPage {
         client_page
             .import_button
             .connect_clicked(move |_| page_for_import.preview_imports());
+        let page_for_omarchy = client_page.clone();
+        client_page.omarchy_button.connect_clicked(move |_| {
+            let Some(parent) = page_for_omarchy.root.root().and_downcast::<gtk::Window>() else {
+                return;
+            };
+            let page = page_for_omarchy.clone();
+            omarchy::show_agent_review(
+                &parent,
+                std::rc::Rc::new(move |result| {
+                    page.feedback.set_label(&result.message);
+                    page.feedback
+                        .remove_css_class(if result.error { "success" } else { "error" });
+                    page.feedback
+                        .add_css_class(if result.error { "error" } else { "success" });
+                    if result.changed {
+                        page.refresh();
+                    }
+                }),
+            );
+        });
         client_page
     }
 
