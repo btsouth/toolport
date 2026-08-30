@@ -1084,6 +1084,7 @@ mod tests {
                 scope_id: None,
                 scope_name: None,
                 discovery_mode: None,
+                reachable_server_names: Vec::new(),
                 config_error: false,
             }],
             profiles: Vec::new(),

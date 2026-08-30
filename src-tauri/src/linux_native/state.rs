@@ -256,6 +256,7 @@ pub(super) struct ClientView {
     pub(super) scope_id: Option<String>,
     pub(super) scope_name: Option<String>,
     pub(super) discovery_mode: Option<String>,
+    pub(super) reachable_server_names: Vec<String>,
     pub(super) config_error: bool,
 }
 
@@ -282,6 +283,7 @@ impl ClientView {
             scope_id: None,
             scope_name: None,
             discovery_mode: None,
+            reachable_server_names: Vec::new(),
             config_error: client.error.is_some(),
         }
     }
@@ -326,6 +328,10 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
                 .map(|profile| profile.name.clone())
         });
         client.discovery_mode = registry.client_discovery.get(&client.id).cloned();
+        if client.gateway_state == ClientGatewayState::Connected {
+            client.reachable_server_names =
+                reachable_server_names(&registry, client.scope_id.as_deref().unwrap_or(""));
+        }
     }
     clients.sort_by(|left, right| {
         right
@@ -344,6 +350,15 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
             })
             .collect(),
     })
+}
+
+fn reachable_server_names(registry: &Registry, scope: &str) -> Vec<String> {
+    registry
+        .enabled_servers_for(scope)
+        .into_iter()
+        .filter(|server| !crate::clients::is_gateway_server(server))
+        .map(|server| server.name.clone())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -700,6 +715,26 @@ mod tests {
         assert!(!rendered.contains("/private"));
         assert!(!rendered.contains("secret-command"));
         assert!(!rendered.contains("SECRET_TOKEN"));
+    }
+
+    #[test]
+    fn reachable_client_servers_follow_scope_and_hide_the_gateway() {
+        let mut registry = Registry::default();
+        registry.servers.extend([
+            server("files", "Files", "stdio"),
+            server("github", "GitHub", "http"),
+            server("toolport", "Toolport", "stdio"),
+        ]);
+        registry.profiles[0].enabled_server_ids = vec!["files".into(), "toolport".into()];
+        registry.profiles.push(crate::registry::Profile {
+            id: "work".into(),
+            name: "Work".into(),
+            enabled_server_ids: vec!["github".into(), "toolport".into()],
+            tool_scope: std::collections::HashMap::new(),
+        });
+
+        assert_eq!(reachable_server_names(&registry, ""), ["Files"]);
+        assert_eq!(reachable_server_names(&registry, "Work"), ["GitHub"]);
     }
 
     #[test]

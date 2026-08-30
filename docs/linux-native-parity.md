@@ -7,8 +7,8 @@ and has direct test or runtime evidence.
 
 > **2026-08-29 deep audit:** a UI-affordance and runtime-behavior sweep (as
 > opposed to the command-surface sweep the table rows were graded against)
-> found 26 gaps; all were closed the same day. The "Remaining gaps" section
-> below records what was built and the two deliberate leftovers.
+> found 26 gaps; all were closed the same day. The follow-up section below
+> records the final replacement items and their verification status.
 
 | Requirement                                                                             | Native implementation                                                                                                                                                                    | Evidence                                                                                                | Status               |
 | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | -------------------- |
@@ -33,7 +33,7 @@ and has direct test or runtime evidence.
 | Import, export, sharing, deep links, and native file dialogs                            | GTK handles setup files and both URL schemes using shared preview and import policy                                                                                                      | Isolated invalid-link launch test and shared controller tests                                           | Complete             |
 | Diagnostics and data-folder integration                                                 | Native Settings uses the shared redacted diagnostics controller                                                                                                                          | Diagnostics tests and explicit clipboard or file-manager actions                                        | Complete             |
 | Package-managed updates                                                                 | Native Settings directs users to Omarchy or pacman and contains no self-updater                                                                                                          | Source inspection and native feature build                                                              | Complete             |
-| Arch payload and metadata                                                               | Staging and `PKGBUILD` include both binaries, desktop entry, URL handlers, AppStream, icons, license, and Agent Plugins archive                                                          | Desktop and AppStream validation plus isolated pacman lifecycle test                                    | Complete for preview |
+| Arch payload and metadata                                                               | Production staging and `PKGBUILD` include both binaries, desktop entry, URL handlers, AppStream, icons, license, and Agent Plugins archive                                               | Desktop and AppStream validation plus isolated pacman replacement lifecycle test                        | Complete             |
 | Data-preserving install, upgrade, rollback, and uninstall                               | Isolated fakeroot pacman transactions hash registry and client fixtures after every transaction                                                                                          | `scripts/test-linux-native-package-lifecycle.sh`                                                        | Complete             |
 
 ## Remaining gaps to full 1:1 (2026-08-29 audit)
@@ -91,12 +91,7 @@ Tauri or preview autostart entries to `/usr/bin/toolport`, while customized
 entries fail closed; (26) the package owns the `toolport://` and legacy
 `conduit://` handlers, so startup no longer writes handler state automatically.
 
-Still open, deliberately: the approval card for routine writes still shows
-pretty-printed JSON rather than the structured
-name/risk/calls/dependencies breakdown (item 22, second half); and the
-per-client "servers it can reach" chips and gateway-flow diagram (item 17,
-second half) are not yet drawn - the same facts are visible on the card's
-scope line and in the tooltips.
+Final replacement follow-up: routine approval cards now show the structured name, risk, call count, and dependencies before the raw JSON expander. Connected client cards show the server names their live profile resolves to, excluding Toolport's own gateway entry, and the Clients page includes the agent → gateway → MCP server flow. The parsers and scope resolution have focused tests. These three additions still require visual signoff in the concurrent native-app pass before the release gate can be marked complete.
 
 ## Intentional Linux differences
 

@@ -1,5 +1,6 @@
 //! Native GTK4 desktop shell for Linux.
 
+mod approval_view;
 mod catalog;
 mod hooks;
 mod http_bridge;
@@ -1184,6 +1185,7 @@ impl ClientPage {
             summary.insert(&item, -1);
         }
         page.append(&summary);
+        page.append(&gateway_flow_diagram());
         page.append(
             &gtk::Label::builder()
                 .label("Detected clients")
@@ -1543,6 +1545,29 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             .css_classes(["toolport-muted"])
             .build(),
     );
+    if client.gateway_state == state::ClientGatewayState::Connected && !client.uses_connectors {
+        let reachable = gtk::FlowBox::new();
+        reachable.set_halign(gtk::Align::Start);
+        reachable.set_column_spacing(6);
+        reachable.set_row_spacing(6);
+        reachable.set_min_children_per_line(1);
+        reachable.set_max_children_per_line(8);
+        reachable.set_selection_mode(gtk::SelectionMode::None);
+        if client.reachable_server_names.is_empty() {
+            let chip = gtk::Label::new(Some("No servers reachable"));
+            chip.add_css_class("toolport-badge");
+            chip.add_css_class("disabled");
+            reachable.insert(&chip, -1);
+        } else {
+            for server in &client.reachable_server_names {
+                let chip = gtk::Label::new(Some(server));
+                chip.add_css_class("toolport-badge");
+                chip.set_tooltip_text(Some("Reachable through this client's current profile"));
+                reachable.insert(&chip, -1);
+            }
+        }
+        copy.append(&reachable);
+    }
     card.append(&copy);
     let (status, class) = match client.gateway_state {
         state::ClientGatewayState::Connected => ("Connected", "success"),
@@ -1626,6 +1651,33 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
         }
     }
     card
+}
+
+fn gateway_flow_diagram() -> gtk::Box {
+    let flow = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    flow.add_css_class("toolport-card");
+    flow.set_tooltip_text(Some(
+        "Each connected agent starts the headless gateway. Toolport keeps server configuration and policy in one place.",
+    ));
+    for (index, label) in ["AI agents", "Toolport gateway", "MCP servers"]
+        .into_iter()
+        .enumerate()
+    {
+        if index > 0 {
+            let arrow = gtk::Label::new(Some("→"));
+            arrow.add_css_class("toolport-muted");
+            flow.append(&arrow);
+        }
+        let node = gtk::Label::builder()
+            .label(label)
+            .hexpand(true)
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["toolport-badge"])
+            .build();
+        flow.append(&node);
+    }
+    flow
 }
 
 /// The feedback line after a one-shot migration. States what moved, what was
@@ -5517,6 +5569,52 @@ fn approval_card(
                 .css_classes(["toolport-sensitive-review"])
                 .build(),
         );
+    }
+
+    if view.reason == crate::approval::ApprovalReason::PersistentCodeWrite {
+        if let Some(summary) = approval_view::routine_approval_summary(&view.arguments) {
+            let details = if summary.dependencies.is_empty() {
+                format!("{} calls · {} risk", summary.calls, summary.risk)
+            } else {
+                format!(
+                    "{} calls · {} risk\nDependencies: {}",
+                    summary.calls,
+                    summary.risk,
+                    summary.dependencies.join(", ")
+                )
+            };
+            let routine = gtk::Box::new(gtk::Orientation::Vertical, 3);
+            routine.add_css_class("toolport-sensitive-review");
+            routine.append(
+                &gtk::Label::builder()
+                    .label(format!("Routine: {}", summary.name))
+                    .halign(gtk::Align::Start)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .css_classes(["heading"])
+                    .build(),
+            );
+            if let Some(description) = summary.description {
+                routine.append(
+                    &gtk::Label::builder()
+                        .label(description)
+                        .halign(gtk::Align::Start)
+                        .xalign(0.0)
+                        .wrap(true)
+                        .build(),
+                );
+            }
+            routine.append(
+                &gtk::Label::builder()
+                    .label(details)
+                    .halign(gtk::Align::Start)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .css_classes(["toolport-muted"])
+                    .build(),
+            );
+            card.append(&routine);
+        }
     }
 
     let arguments = serde_json::to_string_pretty(&view.arguments)
