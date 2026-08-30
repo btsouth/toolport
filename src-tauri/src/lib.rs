@@ -28,6 +28,7 @@ pub mod metrics;
 pub mod oauth;
 mod oauth_controller;
 pub mod observability_controller;
+pub mod omarchy;
 pub mod pii;
 pub mod playground;
 pub mod rate_limits;

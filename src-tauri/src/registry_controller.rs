@@ -19,6 +19,15 @@ pub struct ClientImportCandidate {
     pub url: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OmarchyAgentConnectResult {
+    pub selector: String,
+    pub name: String,
+    pub client_id: String,
+    pub connected: bool,
+    pub error: Option<String>,
+}
+
 const AUTH_LOCK_LEASE_SECS: u64 = 180;
 const AUTH_LOCK_WAIT_SECS: u64 = 30;
 const AUTH_LOCK_POLL_MS: u64 = 250;
@@ -454,6 +463,93 @@ pub fn preview_client_imports() -> Result<Vec<ClientImportCandidate>, String> {
             url: server.url,
         })
         .collect())
+}
+
+/// Read the Omarchy agent state for a single confirmation dialog. Ordinary
+/// Linux returns `None`; no client configuration is changed by this preview.
+pub fn preview_omarchy_agent_connections(
+) -> Result<Option<Vec<crate::omarchy::AgentReview>>, String> {
+    let capabilities = crate::omarchy::detect();
+    if !capabilities.environment_detected() {
+        return Ok(None);
+    }
+    let registry = read_registry_exact_or_default()?;
+    let mut detected = clients::detect_clients();
+    clients::apply_entry_states(&mut detected, &registry.client_managed_entries);
+    Ok(Some(crate::omarchy::review_installed_agents(
+        &capabilities,
+        &detected,
+    )))
+}
+
+/// Connect only agents that were classified as available by a fresh Omarchy
+/// preview. The caller presents that preview and collects confirmation first.
+/// Each existing client mutation remains independently rollback-safe, and a
+/// failure for one agent does not prevent the remaining confirmed agents from
+/// being attempted or reported.
+pub fn connect_omarchy_agents(
+    selectors: Vec<String>,
+) -> Result<Vec<OmarchyAgentConnectResult>, String> {
+    let review = preview_omarchy_agent_connections()?
+        .ok_or_else(|| "Omarchy was not detected on this machine".to_string())?;
+    let candidates = validate_omarchy_agent_selection(&review, selectors)?;
+    Ok(candidates
+        .into_iter()
+        .map(
+            |(agent, client_id)| match connect_client_stdio(&client_id, None, false) {
+                Ok(_) => OmarchyAgentConnectResult {
+                    selector: agent.selector,
+                    name: agent.name,
+                    client_id,
+                    connected: true,
+                    error: None,
+                },
+                Err(error) => OmarchyAgentConnectResult {
+                    selector: agent.selector,
+                    name: agent.name,
+                    client_id,
+                    connected: false,
+                    error: Some(error),
+                },
+            },
+        )
+        .collect())
+}
+
+fn validate_omarchy_agent_selection(
+    review: &[crate::omarchy::AgentReview],
+    selectors: Vec<String>,
+) -> Result<Vec<(crate::omarchy::AgentReview, String)>, String> {
+    if selectors.is_empty() {
+        return Err("Select at least one available Omarchy agent".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut selected = Vec::with_capacity(selectors.len());
+    for selector in selectors {
+        if !seen.insert(selector.clone()) {
+            return Err(format!(
+                "Omarchy agent '{selector}' was selected more than once"
+            ));
+        }
+        let agent = review
+            .iter()
+            .find(|agent| agent.selector == selector)
+            .ok_or_else(|| format!("Omarchy agent '{selector}' is not installed"))?;
+        if agent.state != crate::omarchy::AgentConnectionState::Available {
+            return Err(format!(
+                "Omarchy agent '{}' is not available to connect: {}",
+                agent.name, agent.detail
+            ));
+        }
+        let client_id = agent.client_id.clone().ok_or_else(|| {
+            format!(
+                "Omarchy agent '{}' has no Toolport client adapter",
+                agent.name
+            )
+        })?;
+        selected.push((agent.clone(), client_id));
+    }
+    Ok(selected)
 }
 
 pub fn import_client_servers(selected: Vec<String>) -> Result<(Registry, usize), String> {
@@ -2324,6 +2420,37 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Alpha/search", "Beta/read", "Beta/write"]
         );
+    }
+
+    #[test]
+    fn omarchy_batch_validation_accepts_only_available_unique_agents() {
+        let review = vec![
+            crate::omarchy::AgentReview {
+                selector: "codex".into(),
+                name: "Codex".into(),
+                client_id: Some("codex".into()),
+                selected: true,
+                state: crate::omarchy::AgentConnectionState::Available,
+                detail: "Ready to connect after confirmation.".into(),
+            },
+            crate::omarchy::AgentReview {
+                selector: "ori".into(),
+                name: "Ori".into(),
+                client_id: None,
+                selected: false,
+                state: crate::omarchy::AgentConnectionState::Unsupported,
+                detail: "No global MCP configuration.".into(),
+            },
+        ];
+
+        let selected = validate_omarchy_agent_selection(&review, vec!["codex".into()]).unwrap();
+        assert_eq!(selected[0].1, "codex");
+        assert!(validate_omarchy_agent_selection(&review, vec!["ori".into()]).is_err());
+        assert!(
+            validate_omarchy_agent_selection(&review, vec!["codex".into(), "codex".into()])
+                .is_err()
+        );
+        assert!(validate_omarchy_agent_selection(&review, Vec::new()).is_err());
     }
 
     #[test]
