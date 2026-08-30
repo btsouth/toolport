@@ -1,3 +1,4 @@
 {
-  "source": "local"
+  "source": "local",
+  "release_ring": "fast"
 }

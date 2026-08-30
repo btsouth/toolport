@@ -408,6 +408,10 @@ After replacement, prepare the source package and concise inclusion proposal
 for the Omarchy package repository. Core-image inclusion is an upstream product
 decision, not a technical completion criterion.
 
+The Omarchy package uses the fast release ring. It is compiled separately
+against edge, RC, and stable instead of promoting an edge-linked GTK binary into
+channels whose Arch library snapshots may be older.
+
 ## Verification matrix
 
 ### Automated on every change

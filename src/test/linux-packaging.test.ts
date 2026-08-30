@@ -437,3 +437,44 @@ describe("install.sh installs the AppImage on Arch", () => {
     expect(harness).toContain("no AUR helper was invoked");
   });
 });
+
+describe("Omarchy native source package", () => {
+  const nativeRecipe = read("packaging", "linux", "native", "PKGBUILD");
+  const omarchyRecipe = read("packaging", "omarchy-pkgs", "toolport", "PKGBUILD");
+  const metadata = JSON.parse(
+    read("packaging", "omarchy-pkgs", "toolport", ".omarchy", "package.json"),
+  ) as Record<string, unknown>;
+
+  it("builds natively in every Omarchy channel", () => {
+    // Toolport links against channel-owned GTK and libadwaita libraries. An
+    // edge binary must not be copied into RC or stable, whose snapshots can be
+    // older; Omarchy's fast ring rebuilds it against each channel instead.
+    expect(metadata).toEqual({ source: "local", release_ring: "fast" });
+  });
+
+  it("keeps the submitted and in-repo recipes byte-identical", () => {
+    expect(omarchyRecipe).toBe(nativeRecipe);
+  });
+
+  it("is deliberately x86_64-only for the first release", () => {
+    expect(omarchyRecipe).toContain("arch=('x86_64')");
+    expect(omarchyRecipe).not.toContain("'aarch64'");
+  });
+
+  it("builds both production binaries from the immutable release tag", () => {
+    const pkgver = omarchyRecipe.match(/^pkgver=([^\n]+)$/m)?.[1];
+    const checksum = omarchyRecipe.match(/^sha256sums=\('([^']+)'\)$/m)?.[1];
+    expect(pkgver).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(omarchyRecipe).toContain("archive/refs/tags/v$pkgver.tar.gz");
+    expect(checksum).toMatch(
+      new RegExp(
+        `^(?:[0-9a-f]{64}|REPLACE_WITH_V${pkgver!.replaceAll(".", "_")}_SOURCE_SHA256)$`,
+      ),
+    );
+    expect(omarchyRecipe).toContain(
+      "--features gtk-desktop --bin toolport --bin toolport-gateway",
+    );
+    expect(omarchyRecipe).toContain("src-tauri/target/release/toolport");
+    expect(omarchyRecipe).toContain("src-tauri/target/release/toolport-gateway");
+  });
+});

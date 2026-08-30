@@ -65,6 +65,12 @@ expectVersion(
 
 const nativeRecipe = "packaging/linux/native/PKGBUILD";
 const omarchyRecipe = "packaging/omarchy-pkgs/toolport/PKGBUILD";
+const omarchyMetadata = json("packaging/omarchy-pkgs/toolport/.omarchy/package.json");
+if (omarchyMetadata.source !== "local" || omarchyMetadata.release_ring !== "fast") {
+  errors.push(
+    "packaging/omarchy-pkgs/toolport/.omarchy/package.json: expected a local fast-ring package",
+  );
+}
 for (const path of [nativeRecipe, omarchyRecipe]) {
   expectVersion(path, capture(path, /^pkgver=([^\s'"]+)/m, "pkgver"));
   const checksum = capture(path, /^sha256sums=\('([^']+)'\)$/m, "source checksum");
