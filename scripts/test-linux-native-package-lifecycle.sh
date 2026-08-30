@@ -43,7 +43,7 @@ build_package() {
   cp -a "$stage_root"/. "$package_root"/
   printf 'pkgname = toolport\npkgbase = toolport\npkgver = %s-1\npkgdesc = Native MCP gateway manager for AI coding agents\nurl = https://github.com/tsouth89/toolport\nbuilddate = 0\npackager = Toolport lifecycle smoke\nsize = 1\narch = x86_64\nlicense = MIT\nprovides = toolport\nconflict = toolport-bin\nconflict = toolport-native-preview\nreplaces = toolport-bin\nreplaces = toolport-native-preview\n' \
     "$version" > "$package_root/.PKGINFO"
-  if [[ "$version" == "1.17.1" ]]; then
+  if [[ "$version" == "1.18.1" ]]; then
     printf 'X-Toolport-Lifecycle=upgrade\n' \
       >> "$package_root/usr/share/applications/app.toolport.Toolport.desktop"
   fi
@@ -51,8 +51,8 @@ build_package() {
   printf '%s\n' "$package_path"
 }
 
-package_v1="$(build_package 1.17.0)"
-package_v2="$(build_package 1.17.1)"
+package_v1="$(build_package 1.18.0)"
+package_v2="$(build_package 1.18.1)"
 
 build_legacy_package() {
   local name="$1"

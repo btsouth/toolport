@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   linux-native:
-    name: Linux-native GTK preview
+    name: Linux-native GTK
     timeout-minutes: 30
     runs-on: ubuntu-24.04
     steps:
@@ -41,7 +41,7 @@ jobs:
           key: ${{ runner.os }}-gtk-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-gtk-cargo-
 
-      - name: Build the opt-in native preview
+      - name: Build the native app
         run: cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --features gtk-desktop --bin toolport
 
       - name: Test the native shell module

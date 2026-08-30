@@ -39,6 +39,7 @@ pub mod router;
 pub mod routine_advisor;
 pub mod routine_candidates;
 pub mod routine_catalog;
+#[cfg(any(feature = "desktop", feature = "gtk-desktop"))]
 pub mod routine_controller;
 pub mod routines;
 pub mod rules;
