@@ -18,6 +18,10 @@ Releases are built by CI on a version tag (`.github/workflows/release.yml`).
      (`src/test/homebrew-cask.test.ts`) fails CI if the version drifts from
      `package.json`. This file is a snapshot; `brew install` reads the live
      tap, not this copy (see Homebrew tap below)
+   - `packaging/linux/native/PKGBUILD` and
+     `packaging/omarchy-pkgs/toolport/PKGBUILD` (`pkgver`; keep the recipes
+     identical). Leave their explicit source checksum placeholder until the tag
+     archive exists, then finalize it as described below
    - `CHANGELOG.md` — move `[Unreleased]` entries into a dated section
    - `server.json` only when publishing a matching standalone gateway package
    - `scripts/install.ps1` / `scripts/install.sh` only if you changed them, in which
@@ -29,7 +33,14 @@ Releases are built by CI on a version tag (`.github/workflows/release.yml`).
    missing or empty. Write it there rather than anywhere else. (`docs/release-notes/`
    holds hand-written notes from before this was automated; nothing reads it.)
 3. Commit the bump (e.g. `chore(release): 1.6.0`).
-4. Merge to `main`, then tag and push:
+4. Verify the exact tag metadata before merging. This is also a required release
+   workflow gate:
+
+   ```bash
+   node scripts/verify-release-tag.mjs vX.Y.Z
+   ```
+
+5. Merge to `main`, then tag and push:
 
    ```bash
    git checkout main && git pull
@@ -41,6 +52,19 @@ CI builds installers for **Windows** (NSIS), **macOS** (dmg), and **Linux**
 (deb + AppImage), each with the gateway bundled, plus `toolport-agent-plugin.zip`,
 and attaches them to a **draft** release titled `Toolport vX.Y.Z` whose body is the
 changelog section. Review the draft, then click **Publish**.
+
+After the tag exists, pin the real GitHub source archive checksum in both native
+Arch recipes:
+
+```bash
+scripts/finalize-omarchy-package.sh vX.Y.Z
+git diff --check
+```
+
+Commit that result after verifying the package build. The Omarchy package proposal
+must come from this finalized post-tag recipe, never from the placeholder stored in
+the release tag. The updater in `packaging/omarchy-pkgs/toolport/.omarchy/upstream.sh`
+handles later published versions for Omarchy's package repository.
 
 Publishing is also what triggers **winget** (`winget.yml`): it submits a manifest
 update to `microsoft/winget-pkgs` for the new version. It runs on publish rather
