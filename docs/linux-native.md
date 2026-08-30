@@ -378,8 +378,8 @@ Deliverables:
 
 - one Arch package containing `toolport` and `toolport-gateway`;
 - desktop entry, icons, AppStream metadata, URL handlers, and license;
-- direct runtime dependencies on GTK4, libadwaita, libsecret, and required
-  desktop integration libraries;
+- direct runtime dependencies on GTK4, libadwaita, Pango, a Secret Service
+  provider, and required desktop integration libraries;
 - clean-chroot source build;
 - Linux updater behavior replaced with package-manager guidance;
 - migration of durable WebKit preferences that still matter; and

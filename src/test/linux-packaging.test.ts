@@ -461,6 +461,13 @@ describe("Omarchy native source package", () => {
     expect(omarchyRecipe).not.toContain("'aarch64'");
   });
 
+  it("declares direct UI libraries and a working secret-store provider", () => {
+    const depends = omarchyRecipe.match(/^depends=\(([^\n]+)\)$/m)?.[1] ?? "";
+    expect(depends).toContain("'pango'");
+    expect(depends).toContain("'org.freedesktop.secrets'");
+    expect(depends).not.toContain("'libsecret'");
+  });
+
   it("builds both production binaries from the immutable release tag", () => {
     const pkgver = omarchyRecipe.match(/^pkgver=([^\n]+)$/m)?.[1];
     const checksum = omarchyRecipe.match(/^sha256sums=\('([^']+)'\)$/m)?.[1];
