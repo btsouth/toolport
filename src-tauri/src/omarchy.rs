@@ -205,7 +205,7 @@ pub fn review_installed_agents(
     SELECTORS
         .iter()
         .filter_map(|selector| {
-            let selector_available = capabilities.selector_capabilities.is_empty()
+            let selector_available = !capabilities.default_agent_reader_available
                 || capabilities
                     .selector_capabilities
                     .iter()
@@ -640,6 +640,36 @@ mod tests {
         assert_eq!(review[0].state, AgentConnectionState::Blocked);
         assert_eq!(review[1].selector, "codex");
         assert_eq!(review[1].state, AgentConnectionState::Blocked);
+    }
+
+    #[test]
+    fn review_fails_closed_when_the_installed_selector_exposes_no_known_agents() {
+        let root = temp_dir("missing-selector-capabilities");
+        let mut capabilities = detect_with(fixture(&root));
+        capabilities.default_agent_reader_available = true;
+        capabilities.installed_agents = vec![InstalledAgent {
+            selector: "codex".into(),
+            client_id: Some("codex".into()),
+        }];
+        let clients = vec![detected_client(
+            "codex",
+            crate::clients::GatewayEntryState::Absent,
+        )];
+
+        let review = review_installed_agents(&capabilities, &clients);
+        assert!(review.is_empty());
+
+        capabilities.selected_agent = Some(AgentSelection {
+            selector: "codex".into(),
+            client_id: Some("codex".into()),
+        });
+        let selected_review = review_installed_agents(&capabilities, &clients);
+        assert_eq!(selected_review.len(), 1);
+        assert_eq!(selected_review[0].state, AgentConnectionState::Blocked);
+        assert_eq!(
+            selected_review[0].detail,
+            "The installed Omarchy selector does not expose this agent."
+        );
     }
 
     #[test]
