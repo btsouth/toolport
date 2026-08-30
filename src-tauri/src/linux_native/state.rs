@@ -482,14 +482,14 @@ fn load_read_only(path: Option<&Path>) -> RegistryState {
             return RegistryState::FirstRun;
         }
         Err(error) => {
-            eprintln!("toolport-gtk: could not read registry: {error}");
+            eprintln!("toolport: could not read registry: {error}");
             return RegistryState::Unavailable;
         }
     };
     match serde_json::from_str::<Registry>(&contents) {
         Ok(registry) => RegistryState::Ready(RegistrySnapshot::from_registry(registry)),
         Err(error) => {
-            eprintln!("toolport-gtk: could not parse registry: {error}");
+            eprintln!("toolport: could not parse registry: {error}");
             RegistryState::Unavailable
         }
     }

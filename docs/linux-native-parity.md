@@ -12,7 +12,7 @@ and has direct test or runtime evidence.
 
 | Requirement                                                                             | Native implementation                                                                                                                                                                    | Evidence                                                                                                | Status               |
 | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | -------------------- |
-| Additive GTK shell without changing Windows or macOS packaging                          | `toolport-gtk` is behind the `gtk-desktop` feature; the Tauri entry point remains the default                                                                                            | Both Cargo feature sets compile; existing frontend build and tests pass                                 | Complete             |
+| Native GTK shell without changing Windows or macOS packaging                            | Linux builds `toolport` behind the `gtk-desktop` feature; the Tauri entry point remains the cross-platform default                                                                        | Both Cargo feature sets compile; existing frontend build and tests pass                                 | Complete             |
 | Omarchy theme and translucent surfaces                                                  | GTK CSS is generated from the active Omarchy palette and monitored for changes                                                                                                           | Theme parser and generated CSS tests; live Hyprland screenshots                                         | Complete             |
 | Compositor-owned tiling and geometry                                                    | The window uses default size hints only and no center, maximize, or movement workaround                                                                                                  | Live Hyprland client state reports tiled, nonfloating windows at multiple sizes                         | Complete             |
 | Safe registry startup and external refresh                                              | Startup runs the operational recovery path once; later views use read-only refresh and a file monitor                                                                                    | Recovery and read-only state tests; isolated corrupt-primary recovery test                              | Complete             |
@@ -86,14 +86,13 @@ restart panel, and the keychain-backed secret-stored/couldn't-check indicator
 with retry; (22) Teams has the create/how-it-works/pricing/self-host links
 and cancel-pending-join; (23) the one-off star prompt exists; (24) hidden
 launch now requires a live StatusNotifierWatcher, not the blind-assumed tray;
-(25) the native preview autostarts under its own `ToolportNativePreview`
-entry so it cannot repoint the shipping shell's login launch (identities
-merge at cutover); (26) an unpackaged build registers the `toolport://` and
-`conduit://` handlers at runtime, like the shipping shell does.
+(25) production uses `app.toolport.Toolport` and migrates exact Toolport-owned
+Tauri or preview autostart entries to `/usr/bin/toolport`, while customized
+entries fail closed; (26) the package owns the `toolport://` and legacy
+`conduit://` handlers, so startup no longer writes handler state automatically.
 
-Still open, deliberately: the full app-ID unification (item 25's cutover
-half) happens at the replacement release; the approval card for routine
-writes still shows pretty-printed JSON rather than the structured
+Still open, deliberately: the approval card for routine writes still shows
+pretty-printed JSON rather than the structured
 name/risk/calls/dependencies breakdown (item 22, second half); and the
 per-client "servers it can reach" chips and gateway-flow diagram (item 17,
 second half) are not yet drawn - the same facts are visible on the card's
@@ -105,9 +104,8 @@ scope line and in the tooltips.
   WebKit light, dark, and system selector. This is the native theme contract.
 - Updates are owned by pacman or the Omarchy update flow. The Tauri downloader
   remains available only in the shipping cross-platform shell.
-- The GTK binary and package retain preview identity while both Linux shells are
-  installable side by side. Production identity changes only at the replacement
-  release so desktop IDs and package files cannot collide early.
+- The Arch package owns the production `toolport` identity and replaces the old
+  `toolport-bin` and `toolport-native-preview` packages.
 - Updater-only process recovery commands are not exposed as native UI. The
   package lifecycle and stale-gateway action replace that workflow.
 - Clearing retained activity is one explicit action covering the call audit,

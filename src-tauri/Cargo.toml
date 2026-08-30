@@ -12,7 +12,7 @@ path = "src/main.rs"
 required-features = ["desktop"]
 
 [[bin]]
-name = "toolport-gtk"
+name = "toolport"
 path = "src/bin/toolport-gtk.rs"
 required-features = ["gtk-desktop"]
 
@@ -37,9 +37,8 @@ desktop = [
 # needs it because the library is compiled without `cfg(test)` when linked
 # into the binary; docker-publish rebuilds without this feature before upload.
 test-support = []
-# Additive Linux-native shell. This is deliberately not a default feature: the
-# current Tauri app remains the shipping desktop while the GTK shell reaches
-# behavioral parity.
+# Linux-native shell. This stays opt-in so Windows and macOS continue to build
+# the Tauri desktop without GTK dependencies.
 gtk-desktop = ["dep:gtk", "dep:adw", "dep:image", "dep:ksni"]
 
 [lib]

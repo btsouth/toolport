@@ -12,8 +12,7 @@ Ship a first-class Linux Toolport desktop shell that:
   keyboard navigation;
 - preserves the existing registry, secrets, gateway, client configuration, and
   approval behavior; and
-- does not change the current Windows, macOS, or Tauri Linux builds until the
-  native shell passes the replacement gates below.
+- does not change the Windows or macOS desktop shells.
 
 GTK4 and libadwaita are implementation choices. The product requirement is the
 experience above, not resemblance to a stock GNOME application.
@@ -30,7 +29,7 @@ experience above, not resemblance to a stock GNOME application.
 
 ## Safety model
 
-Development is additive:
+Development began additively:
 
 1. The existing `desktop` Cargo feature remains the default.
 2. The GTK shell is behind a separate opt-in `gtk-desktop` feature and binary.
@@ -38,8 +37,8 @@ Development is additive:
 4. Each extraction lands with behavioral tests before either adapter changes.
 5. Existing frontend, Rust, headless gateway, installer, and cross-platform
    tests remain required throughout the project.
-6. Linux packages keep shipping the Tauri application until the native shell
-   passes the beta and replacement gates.
+6. The production Arch package replaces the Tauri and native-preview packages
+   only after the replacement gates pass.
 
 The GTK and Tauri shells use the same registry and keychain identifiers. Any
 new shell preference uses a small file in Toolport's existing data directory;
@@ -53,7 +52,7 @@ audit modules.
 
 Add:
 
-- `toolport-gtk`, a Linux-only binary behind `gtk-desktop`;
+- `toolport`, a Linux-only binary behind `gtk-desktop`;
 - a Linux-native shell module containing application lifecycle, views, and
   Omarchy integration;
 - a small shell-neutral event sink for approval, registry, team, and routine
@@ -111,7 +110,7 @@ libadwaita defaults when the runtime palette is absent.
 
 Deliverables:
 
-- opt-in `toolport-gtk` binary with no impact on existing build paths;
+- opt-in native `toolport` binary with no impact on Windows or macOS build paths;
 - responsive application window with no forced geometry;
 - read-only Omarchy palette parser, GTK CSS generator, and live reload;
 - fallback theme for non-Omarchy Linux sessions;

@@ -95,7 +95,7 @@ impl OmarchyPalette {
             .map_err(|error| format!("could not read {}: {error}", path.display()))
             .and_then(|contents| Self::parse(&contents))
             .unwrap_or_else(|error| {
-                eprintln!("toolport-gtk: {error}; using the fallback palette");
+                eprintln!("toolport: {error}; using the fallback palette");
                 Self::default()
             })
     }

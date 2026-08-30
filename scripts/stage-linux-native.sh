@@ -17,20 +17,20 @@ cargo build \
   --locked \
   --no-default-features \
   --features gtk-desktop \
-  --bin toolport-gtk \
+  --bin toolport \
   --bin toolport-gateway
 
 install -d "$stage_root/usr/bin"
-install -Dm755 "$repo_root/src-tauri/target/release/toolport-gtk" \
-  "$stage_root/usr/bin/toolport-gtk"
+install -Dm755 "$repo_root/src-tauri/target/release/toolport" \
+  "$stage_root/usr/bin/toolport"
 install -Dm755 "$repo_root/src-tauri/target/release/toolport-gateway" \
   "$stage_root/usr/bin/toolport-gateway"
 install -Dm644 \
-  "$repo_root/packaging/linux/native/com.tsout.Toolport.NativePreview.desktop" \
-  "$stage_root/usr/share/applications/com.tsout.Toolport.NativePreview.desktop"
+  "$repo_root/packaging/linux/native/app.toolport.Toolport.desktop" \
+  "$stage_root/usr/share/applications/app.toolport.Toolport.desktop"
 install -Dm644 \
-  "$repo_root/packaging/linux/native/com.tsout.Toolport.NativePreview.metainfo.xml" \
-  "$stage_root/usr/share/metainfo/com.tsout.Toolport.NativePreview.metainfo.xml"
+  "$repo_root/packaging/linux/native/app.toolport.Toolport.metainfo.xml" \
+  "$stage_root/usr/share/metainfo/app.toolport.Toolport.metainfo.xml"
 install -Dm644 "$repo_root/src-tauri/icons/32x32.png" \
   "$stage_root/usr/share/icons/hicolor/32x32/apps/toolport.png"
 install -Dm644 "$repo_root/src-tauri/icons/128x128.png" \
@@ -43,11 +43,11 @@ install -d "$stage_root/usr/share/toolport/agent-plugin"
   zip -qr "$stage_root/usr/share/toolport/agent-plugin/toolport-agent-plugin.zip" toolport
 )
 install -Dm644 "$repo_root/LICENSE" \
-  "$stage_root/usr/share/licenses/toolport-native-preview/LICENSE"
+  "$stage_root/usr/share/licenses/toolport/LICENSE"
 
 desktop-file-validate \
-  "$stage_root/usr/share/applications/com.tsout.Toolport.NativePreview.desktop"
+  "$stage_root/usr/share/applications/app.toolport.Toolport.desktop"
 appstreamcli validate --no-net \
-  "$stage_root/usr/share/metainfo/com.tsout.Toolport.NativePreview.metainfo.xml"
+  "$stage_root/usr/share/metainfo/app.toolport.Toolport.metainfo.xml"
 
-echo "staged the Linux-native preview at $stage_root"
+echo "staged the Linux-native package at $stage_root"

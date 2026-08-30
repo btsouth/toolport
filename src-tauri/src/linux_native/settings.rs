@@ -3,11 +3,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-/// Autostart entry name for the native preview. Deliberately NOT "Toolport":
-/// while both Linux shells are installable side by side, sharing the shipping
-/// shell's autostart file would silently repoint the user's login launch at
-/// whichever shell toggled last. The name merges back at the cutover release.
-const NATIVE_AUTOSTART_NAME: &str = "ToolportNativePreview";
+const NATIVE_AUTOSTART_NAME: &str = "Toolport";
 
 #[derive(Clone)]
 pub(super) struct SettingsPage {

@@ -224,6 +224,90 @@ pub fn repair_linux(app_name: &str) {
     let _ = repair_linux_autostart_file(&dest, &app_path, AUTOSTART_ARGS, appimage_set);
 }
 
+const LEGACY_NATIVE_AUTOSTART_NAME: &str = "ToolportNativePreview";
+const PRODUCTION_AUTOSTART_NAME: &str = "Toolport";
+
+/// Move an enabled preview/Tauri launch-at-login entry to the native binary.
+/// Only the exact file shape written by Toolport is eligible. A customized
+/// desktop entry is left untouched and reported instead of being overwritten.
+pub fn migrate_linux_native_autostart() -> Result<bool, String> {
+    let dir = linux_autostart_dir().ok_or("Could not resolve the autostart directory")?;
+    let app_path = resolve_autostart_app_path_from_env().map_err(|error| error.to_string())?;
+    migrate_linux_native_autostart_at(&dir, &app_path)
+}
+
+fn migrate_linux_native_autostart_at(dir: &Path, app_path: &Path) -> Result<bool, String> {
+    let production = dir.join(format!("{PRODUCTION_AUTOSTART_NAME}.desktop"));
+    let preview = dir.join(format!("{LEGACY_NATIVE_AUTOSTART_NAME}.desktop"));
+    let mut changed = false;
+
+    if production.is_file() {
+        changed = rewrite_owned_autostart(&production, PRODUCTION_AUTOSTART_NAME, app_path)?;
+    } else if preview.is_file() {
+        let contents = std::fs::read_to_string(&preview).map_err(|error| error.to_string())?;
+        if !is_owned_linux_autostart(&contents, LEGACY_NATIVE_AUTOSTART_NAME) {
+            return Err(
+                "the native preview autostart entry was customized; left it untouched".into(),
+            );
+        }
+        write_linux_autostart(
+            &production,
+            PRODUCTION_AUTOSTART_NAME,
+            app_path,
+            AUTOSTART_ARGS,
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::remove_file(&preview).map_err(|error| error.to_string())?;
+        changed = true;
+    }
+
+    if preview.is_file() {
+        let contents = std::fs::read_to_string(&preview).map_err(|error| error.to_string())?;
+        if !is_owned_linux_autostart(&contents, LEGACY_NATIVE_AUTOSTART_NAME) {
+            return Err(
+                "the native preview autostart entry was customized; left it untouched".into(),
+            );
+        }
+        std::fs::remove_file(&preview).map_err(|error| error.to_string())?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn rewrite_owned_autostart(path: &Path, app_name: &str, app_path: &Path) -> Result<bool, String> {
+    let contents = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    if !is_owned_linux_autostart(&contents, app_name) {
+        return Err(format!(
+            "the {app_name} autostart entry was customized; left it untouched"
+        ));
+    }
+    let desired = linux_desktop_entry(app_name, app_path, AUTOSTART_ARGS);
+    if contents == desired {
+        return Ok(false);
+    }
+    std::fs::write(path, desired).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+fn is_owned_linux_autostart(contents: &str, app_name: &str) -> bool {
+    let expected = [
+        "[Desktop Entry]".to_string(),
+        "Type=Application".to_string(),
+        "Version=1.0".to_string(),
+        format!("Name={app_name}"),
+        format!("Comment={app_name}startup script"),
+        "StartupNotify=false".to_string(),
+        "Terminal=false".to_string(),
+    ];
+    expected
+        .iter()
+        .all(|line| contents.lines().any(|candidate| candidate == line))
+        && contents.lines().any(|line| {
+            line.strip_prefix("Exec=")
+                .is_some_and(|exec| exec.trim_end().ends_with(" --hidden"))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +343,64 @@ mod tests {
             !exec.contains(".mount_"),
             "Exec must not mention the FUSE mount, got {exec}"
         );
+    }
+
+    #[test]
+    fn native_cutover_moves_owned_preview_autostart() {
+        let dir = unique_dir("native-cutover-preview");
+        let preview = dir.join("ToolportNativePreview.desktop");
+        let production = dir.join("Toolport.desktop");
+        write_linux_autostart(
+            &preview,
+            "ToolportNativePreview",
+            Path::new("/usr/bin/toolport-gtk"),
+            AUTOSTART_ARGS,
+        )
+        .unwrap();
+
+        assert!(migrate_linux_native_autostart_at(&dir, Path::new("/usr/bin/toolport")).unwrap());
+        assert!(!preview.exists());
+        assert_eq!(
+            std::fs::read_to_string(&production).unwrap(),
+            linux_desktop_entry("Toolport", Path::new("/usr/bin/toolport"), AUTOSTART_ARGS)
+        );
+        assert!(!migrate_linux_native_autostart_at(&dir, Path::new("/usr/bin/toolport")).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn native_cutover_repoints_owned_tauri_autostart() {
+        let dir = unique_dir("native-cutover-tauri");
+        let production = dir.join("Toolport.desktop");
+        write_linux_autostart(
+            &production,
+            "Toolport",
+            Path::new("/usr/bin/conduit"),
+            AUTOSTART_ARGS,
+        )
+        .unwrap();
+
+        assert!(migrate_linux_native_autostart_at(&dir, Path::new("/usr/bin/toolport")).unwrap());
+        assert_eq!(
+            desktop_exec_command(&std::fs::read_to_string(&production).unwrap()).as_deref(),
+            Some("/usr/bin/toolport")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn native_cutover_leaves_custom_autostart_untouched() {
+        let dir = unique_dir("native-cutover-custom");
+        let preview = dir.join("ToolportNativePreview.desktop");
+        let custom = "[Desktop Entry]\nName=My Toolport wrapper\nExec=/opt/custom/toolport\n";
+        std::fs::write(&preview, custom).unwrap();
+
+        let error = migrate_linux_native_autostart_at(&dir, Path::new("/usr/bin/toolport"))
+            .expect_err("customized entries must fail closed");
+        assert!(error.contains("customized"));
+        assert_eq!(std::fs::read_to_string(&preview).unwrap(), custom);
+        assert!(!dir.join("Toolport.desktop").exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

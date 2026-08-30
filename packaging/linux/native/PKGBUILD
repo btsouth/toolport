@@ -1,23 +1,25 @@
-# Maintainer preview package. The release archive is expected to unpack to
-# toolport-$pkgver and is replaced with a tagged source URL at release time.
-pkgname=toolport-native-preview
-pkgver=1.17.0
+# Production Arch package. Set the release checksum before publishing.
+pkgname=toolport
+pkgver=1.18.0
 pkgrel=1
-pkgdesc='Native GTK Toolport shell and local MCP gateway'
+pkgdesc='Native MCP gateway manager for AI coding agents'
 arch=('x86_64')
 url='https://github.com/tsouth89/toolport'
 license=('MIT')
 depends=('gtk4' 'libadwaita' 'libsecret' 'glib2' 'dbus' 'hicolor-icon-theme')
 makedepends=('cargo' 'desktop-file-utils' 'appstream' 'zip')
-provides=('toolport-native-preview')
+provides=('toolport')
+conflicts=('toolport-bin' 'toolport-native-preview')
+replaces=('toolport-bin' 'toolport-native-preview')
 options=('!lto')
 source=("toolport-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+# Replace from the immutable v1.18.0 source archive after the release tag exists.
+sha256sums=('REPLACE_WITH_V1_18_0_SOURCE_SHA256')
 
 build() {
   cd "toolport-$pkgver/src-tauri"
   cargo build --release --locked --no-default-features \
-    --features gtk-desktop --bin toolport-gtk --bin toolport-gateway
+    --features gtk-desktop --bin toolport --bin toolport-gateway
 }
 
 check() {
@@ -28,14 +30,14 @@ check() {
 
 package() {
   cd "toolport-$pkgver"
-  install -Dm755 src-tauri/target/release/toolport-gtk \
-    "$pkgdir/usr/bin/toolport-gtk"
+  install -Dm755 src-tauri/target/release/toolport \
+    "$pkgdir/usr/bin/toolport"
   install -Dm755 src-tauri/target/release/toolport-gateway \
     "$pkgdir/usr/bin/toolport-gateway"
-  install -Dm644 packaging/linux/native/com.tsout.Toolport.NativePreview.desktop \
-    "$pkgdir/usr/share/applications/com.tsout.Toolport.NativePreview.desktop"
-  install -Dm644 packaging/linux/native/com.tsout.Toolport.NativePreview.metainfo.xml \
-    "$pkgdir/usr/share/metainfo/com.tsout.Toolport.NativePreview.metainfo.xml"
+  install -Dm644 packaging/linux/native/app.toolport.Toolport.desktop \
+    "$pkgdir/usr/share/applications/app.toolport.Toolport.desktop"
+  install -Dm644 packaging/linux/native/app.toolport.Toolport.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/app.toolport.Toolport.metainfo.xml"
   install -Dm644 src-tauri/icons/32x32.png \
     "$pkgdir/usr/share/icons/hicolor/32x32/apps/toolport.png"
   install -Dm644 src-tauri/icons/128x128.png \

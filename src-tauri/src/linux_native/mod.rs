@@ -1,7 +1,4 @@
-//! Additive GTK4 desktop shell for Linux.
-//!
-//! This module is feature-gated so the existing Tauri application and every
-//! non-Linux build remain unchanged while the native shell is developed.
+//! Native GTK4 desktop shell for Linux.
 
 mod catalog;
 mod hooks;
@@ -24,7 +21,7 @@ use playground::PlaygroundPage;
 use settings::SettingsPage;
 use teams::TeamsPage;
 
-const PREVIEW_APP_ID: &str = "com.tsout.Toolport.NativePreview";
+const APP_ID: &str = "app.toolport.Toolport";
 
 pub fn run() {
     let registry = match crate::registry::load() {
@@ -48,7 +45,7 @@ pub fn run() {
         .filter(|arg| arg != "--hidden")
         .collect::<Vec<_>>();
     let app = adw::Application::builder()
-        .application_id(PREVIEW_APP_ID)
+        .application_id(APP_ID)
         .flags(gtk::gio::ApplicationFlags::HANDLES_OPEN)
         .build();
     let _hold = app.hold();
@@ -65,8 +62,6 @@ pub fn run() {
     quit.connect_activate(move |_, _| app_for_quit.quit());
     app.add_action(&quit);
     app.set_accels_for_action("app.quit", &["<Primary>q"]);
-    ensure_url_scheme_handlers();
-
     let tray = tray::start(&app);
     // Hidden launch requires a REAL tray host, not just a spawned SNI item: the
     // item is registered optimistically so the icon appears when a host shows
@@ -115,53 +110,6 @@ pub fn run() {
     }
     bridge.shutdown();
     broker.clear_endpoint();
-}
-
-/// Make `toolport://` and `conduit://` links reach this binary even on an
-/// unpackaged build (the packaged desktop file already claims them). The
-/// shipping shell registers its schemes at runtime on Linux for the same
-/// reason; without this a locally built `toolport-gtk` cannot receive share
-/// links at all. Best-effort: a failure only means links stay unopenable, as
-/// before.
-fn ensure_url_scheme_handlers() {
-    let unhandled: Vec<&str> = ["toolport", "conduit"]
-        .into_iter()
-        .filter(|scheme| gtk::gio::AppInfo::default_for_uri_scheme(scheme).is_none())
-        .collect();
-    if unhandled.is_empty() {
-        return;
-    }
-    std::thread::spawn(move || {
-        let Ok(exe) = std::env::current_exe() else {
-            return;
-        };
-        let applications = gtk::glib::user_data_dir().join("applications");
-        if std::fs::create_dir_all(&applications).is_err() {
-            return;
-        }
-        let desktop_path = applications.join("com.tsout.Toolport.NativePreview.desktop");
-        let contents = format!(
-            "[Desktop Entry]\nType=Application\nName=Toolport (native preview)\nExec={} %u\nNoDisplay=true\nMimeType=x-scheme-handler/toolport;x-scheme-handler/conduit;\n",
-            exe.display()
-        );
-        if std::fs::write(&desktop_path, contents).is_err() {
-            return;
-        }
-        let _ = std::process::Command::new("update-desktop-database")
-            .arg(&applications)
-            .status();
-        for scheme in unhandled {
-            let _ = std::process::Command::new("xdg-mime")
-                .arg("default")
-                .arg("com.tsout.Toolport.NativePreview.desktop")
-                .arg(format!("x-scheme-handler/{scheme}"))
-                .status();
-        }
-        eprintln!(
-            "toolport: registered {} as the handler for toolport:// links",
-            desktop_path.display()
-        );
-    });
 }
 
 fn build_window(
@@ -383,6 +331,9 @@ fn restart_advice_line(clients: &[crate::gateway_publish::ClientNeedingRestart])
 }
 
 fn run_startup_maintenance() {
+    if let Err(error) = crate::autostart::migrate_linux_native_autostart() {
+        eprintln!("toolport: could not migrate launch-at-login: {error}");
+    }
     if let Some(migrated) = crate::registry::migrate_legacy_data_dir() {
         eprintln!(
             "toolport: migrated data directory to {}",
@@ -415,7 +366,7 @@ fn run_startup_maintenance() {
 
 fn run_registry_startup_failure(error: String) {
     let app = adw::Application::builder()
-        .application_id("com.tsout.Toolport.NativePreview.Recovery")
+        .application_id("app.toolport.Toolport.Recovery")
         .build();
     app.connect_activate(move |app| {
         let path = crate::registry::resolved_path()
@@ -5430,7 +5381,7 @@ impl ApprovalPage {
 
     fn decide(&self, id: &str, approved: bool) {
         if let Err(error) = self.broker.decide(id, approved) {
-            eprintln!("toolport-gtk: could not resolve approval: {error}");
+            eprintln!("toolport: could not resolve approval: {error}");
         }
         self.refresh();
     }
@@ -5451,13 +5402,13 @@ impl ApprovalPage {
                             Ok(())
                         }) {
                             eprintln!(
-                                "toolport-gtk: approved the call but could not save its allow rule: {error}"
+                                "toolport: approved the call but could not save its allow rule: {error}"
                             );
                         }
                     }
                 }
             }
-            Err(error) => eprintln!("toolport-gtk: could not resolve approval: {error}"),
+            Err(error) => eprintln!("toolport: could not resolve approval: {error}"),
         }
         self.refresh();
     }
