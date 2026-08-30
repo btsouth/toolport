@@ -441,6 +441,7 @@ describe("install.sh installs the AppImage on Arch", () => {
 describe("Omarchy native source package", () => {
   const nativeRecipe = read("packaging", "linux", "native", "PKGBUILD");
   const omarchyRecipe = read("packaging", "omarchy-pkgs", "toolport", "PKGBUILD");
+  const nativeShell = read("src-tauri", "src", "linux_native", "mod.rs");
   const metadata = JSON.parse(
     read("packaging", "omarchy-pkgs", "toolport", ".omarchy", "package.json"),
   ) as Record<string, unknown>;
@@ -466,6 +467,18 @@ describe("Omarchy native source package", () => {
     expect(depends).toContain("'pango'");
     expect(depends).toContain("'org.freedesktop.secrets'");
     expect(depends).not.toContain("'libsecret'");
+  });
+
+  it("keeps the production shell contract through visual convergence", () => {
+    expect(nativeShell).toContain("mod approval_view;");
+    expect(nativeShell).toContain("mod omarchy;");
+    expect(nativeShell).toContain('const APP_ID: &str = "app.toolport.Toolport";');
+    expect(nativeShell).toContain('.application_id("app.toolport.Toolport.Recovery")');
+    expect(nativeShell).toContain("crate::autostart::migrate_linux_native_autostart()");
+    expect(nativeShell).toContain("omarchy::show_agent_review(");
+    expect(nativeShell).toContain("approval_view::routine_approval_summary(");
+    expect(nativeShell).not.toContain("com.tsout.Toolport.NativePreview");
+    expect(nativeShell).not.toContain("PREVIEW_APP_ID");
   });
 
   it("builds both production binaries from the immutable release tag", () => {
