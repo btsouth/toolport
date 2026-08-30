@@ -1,0 +1,15 @@
+# Strip AI attribution trailers from commit messages.
+# The global hook at ~/.config/git/hooks does not run here, because husky sets
+# core.hooksPath to .husky/_ for this repo.
+msg=$1
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+sed -E \
+	-e '/^[[:space:]]*Claude-Session:/d' \
+	-e '/^[[:space:]]*Co-[Aa]uthored-[Bb]y:[[:space:]]*Claude/d' \
+	-e '/^[[:space:]]*(🤖[[:space:]]*)?Generated with \[?Claude Code/d' \
+	-e '/^[[:space:]]*https:\/\/claude\.ai\/code\//d' \
+	"$msg" >"$tmp"
+# Drop blank lines left dangling at the end.
+awk '{l[NR]=$0} END{e=NR; while(e>0 && l[e]~/^[[:space:]]*$/) e--; for(i=1;i<=e;i++) print l[i]}' \
+	"$tmp" >"$msg"
