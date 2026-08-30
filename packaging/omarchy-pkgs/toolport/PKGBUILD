@@ -50,4 +50,6 @@ package() {
     "$pkgdir/usr/share/toolport/agent-plugin/toolport-agent-plugin.zip" toolport)
   install -Dm644 LICENSE \
     "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 THIRD_PARTY_NOTICES.md \
+    "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES.md"
 }

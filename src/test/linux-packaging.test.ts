@@ -457,6 +457,12 @@ describe("Omarchy native source package", () => {
     expect(omarchyRecipe).toBe(nativeRecipe);
   });
 
+  it("installs the bundled icon notices with the package licenses", () => {
+    expect(omarchyRecipe).toContain(
+      '"$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES.md"',
+    );
+  });
+
   it("is deliberately x86_64-only for the first release", () => {
     expect(omarchyRecipe).toContain("arch=('x86_64')");
     expect(omarchyRecipe).not.toContain("'aarch64'");

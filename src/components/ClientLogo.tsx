@@ -4,9 +4,7 @@ import { cn } from "@/lib/utils";
  * Official client brand logos.
  *
  * SVGs are vendored under src/assets/client-logos (no runtime dependency), sourced from
- * @lobehub/icons-static-svg (MIT), simple-icons (CC0), and devicon (MIT), plus a handful
- * taken from the vendor's own published mark where no icon set carries it (Factory Droid,
- * BoltAI, AnythingLLM, Continue, Oh My Pi). Full-color marks keep their own
+ * @lobehub/icons-static-svg (MIT), simple-icons (CC0), and devicon (MIT). Full-color marks keep their own
  * fills; monochrome marks are authored with `fill="currentColor"`, so they inherit the
  * surrounding text color and stay legible on both the light and dark (navy) themes.
  *
@@ -29,9 +27,8 @@ const LOGOS: Record<string, string> = Object.fromEntries(
 
 /**
  * Client id -> logo file basename. Most ids match their filename; the two Claude clients
- * share the Anthropic mark family but use distinct files. Ids absent here render a monogram
- * (Crush, Jan, and Witsy publish only a raster mark or a trademarked wordmark, so there is
- * nothing clean to vendor yet).
+ * share the Anthropic mark family but use distinct files. Ids absent here use the neutral
+ * monogram fallback, including clients without a mark from a redistributable icon set.
  */
 const CLIENT_LOGO: Record<string, string> = {
   "claude-desktop": "claude",
@@ -61,11 +58,6 @@ const CLIENT_LOGO: Record<string, string> = {
   "github-copilot-cli": "github-copilot-cli",
   amp: "amp",
   pi: "pi",
-  omp: "omp",
-  droid: "droid",
-  boltai: "boltai",
-  anythingllm: "anythingllm",
-  continue: "continue",
 };
 
 /** Initials for the monogram fallback: two letters for multi-word names, else two chars. */
