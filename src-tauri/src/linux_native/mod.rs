@@ -874,7 +874,7 @@ impl ServerPage {
                 self.list.append(&state_card(
                     "dialog-warning-symbolic",
                     "Configuration could not be displayed",
-                    "The native preview left the registry untouched. Open the current Toolport app to inspect or recover it.",
+                    "Toolport left the registry untouched. Open the app to inspect or recover it.",
                     true,
                 ));
             }
@@ -5754,11 +5754,6 @@ fn build_content(
             .css_classes(["title"])
             .build(),
     ));
-    let mode = gtk::Label::builder()
-        .label("Native preview")
-        .css_classes(["toolport-mode-badge"])
-        .build();
-    header.pack_end(&mode);
     let add_server = gtk::Button::builder()
         .icon_name("list-add-symbolic")
         .tooltip_text("Add server")
@@ -5800,7 +5795,7 @@ fn build_content(
     page.append(&intro);
 
     let description = gtk::Label::builder()
-        .label("Your MCP servers, available everywhere. This native preview follows the active Omarchy palette and behaves like a regular Hyprland window.")
+        .label("Configure MCP servers once, then connect them to every supported AI agent. On Omarchy, Toolport follows the active palette and behaves like a regular Hyprland window.")
         .halign(gtk::Align::Start)
         .wrap(true)
         .xalign(0.0)

@@ -331,7 +331,7 @@ impl SettingsPage {
         );
         diagnostics_copy.append(
             &gtk::Label::builder()
-                .label("Diagnostics redact secrets. The data folder contains your registry, audit, and gateway logs.")
+                .label("Copied diagnostics omit environment names and redact secrets and home paths. The data folder contains your registry, audit, and gateway logs.")
                 .halign(gtk::Align::Start)
                 .xalign(0.0)
                 .wrap(true)

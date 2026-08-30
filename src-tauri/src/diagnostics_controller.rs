@@ -18,11 +18,12 @@ pub fn gather() -> String {
     match registry::load() {
         Ok(registry) => output.push_str(&registry_summary(&registry)),
         Err(error) => {
+            let error = redact_diagnostic_text(&error);
             let _ = writeln!(output, "\nregistry: failed to load: {error}");
         }
     }
     let _ = writeln!(output, "\ngateway log (last {DIAG_LOG_LINES} lines):");
-    output.push_str(&gateway_log_tail(DIAG_LOG_LINES));
+    output.push_str(&redact_diagnostic_text(&gateway_log_tail(DIAG_LOG_LINES)));
     output
 }
 
@@ -77,7 +78,7 @@ pub(crate) fn registry_summary(registry: &Registry) -> String {
         };
         let target = match (&server.command, &server.url) {
             (Some(command), _) => safe_command_target(command, &server.args),
-            (None, Some(url)) => registry::redact_url_userinfo(url),
+            (None, Some(url)) => redact_diagnostic_text(&registry::redact_url_userinfo(url)),
             _ => String::new(),
         };
         let _ = writeln!(
@@ -86,18 +87,11 @@ pub(crate) fn registry_summary(registry: &Registry) -> String {
             server.id, server.transport
         );
         if !server.env.is_empty() {
-            let keys = server
-                .env
-                .iter()
-                .map(|entry| {
-                    if entry.secret {
-                        format!("{} (secret)", entry.key)
-                    } else {
-                        entry.key.clone()
-                    }
-                })
-                .collect::<Vec<_>>();
-            let _ = writeln!(output, "        env: {}", keys.join(", "));
+            let _ = writeln!(
+                output,
+                "        environment variables: {} (names and values omitted)",
+                server.env.len()
+            );
         }
     }
     let _ = writeln!(output, "\nprofiles ({}):", registry.profiles.len());
@@ -123,7 +117,21 @@ pub(crate) fn safe_command_target(command: &str, args: &[String]) -> String {
             registry::redact_url_userinfo(argument)
         });
     }
-    parts.join(" ").trim().to_string()
+    redact_diagnostic_text(parts.join(" ").trim())
+}
+
+pub(crate) fn redact_diagnostic_text(text: &str) -> String {
+    let mut redacted = registry::redact_secret_text(text);
+    for key in ["HOME", "USERPROFILE"] {
+        let Some(home) = std::env::var_os(key) else {
+            continue;
+        };
+        let home = home.to_string_lossy();
+        if !home.is_empty() {
+            redacted = redacted.replace(home.as_ref(), "$HOME");
+        }
+    }
+    redacted
 }
 
 fn redact_argument(argument: &str) -> String {

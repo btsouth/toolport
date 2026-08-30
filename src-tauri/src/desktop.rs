@@ -5774,16 +5774,36 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_lists_env_keys_but_never_values() {
+    fn diagnostics_counts_env_without_disclosing_names_or_values() {
         let mut reg = Registry::default();
         reg.add_server(github_with_secret());
         let s = registry_summary(&reg);
-        // The key is shown (with a secret marker) so a report says what's set...
-        assert!(s.contains("TOKEN (secret)"), "got: {s}");
-        // ...but the secret value itself must never appear in a pasted report.
+        assert!(
+            s.contains("environment variables: 1 (names and values omitted)"),
+            "got: {s}"
+        );
+        assert!(!s.contains("TOKEN"), "credential metadata leaked: {s}");
         assert!(!s.contains("sk-live-xyz"), "secret value leaked: {s}");
-        // The launch command is present for debugging.
         assert!(s.contains("(stdio) npx"), "missing launch line: {s}");
+    }
+
+    #[test]
+    fn diagnostics_redacts_home_paths_and_secret_shaped_text() {
+        let home = ["HOME", "USERPROFILE"]
+            .into_iter()
+            .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
+            .expect("test host has a home directory");
+        let text = format!("failed at {home}/private/project with ghp_abcdefghijklmnop");
+        let redacted = crate::diagnostics_controller::redact_diagnostic_text(&text);
+        assert!(
+            redacted.contains("$HOME/private/project"),
+            "got: {redacted}"
+        );
+        assert!(!redacted.contains(&home), "home path leaked: {redacted}");
+        assert!(
+            !redacted.contains("ghp_abcdefghijklmnop"),
+            "secret leaked: {redacted}"
+        );
     }
 
     #[test]
