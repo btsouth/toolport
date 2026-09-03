@@ -13214,22 +13214,46 @@ fn result_text(resp: &Value) -> String {
 /// such flag: its whole contract is the status code, and the spec above promises
 /// 400 for a failed call and 404 for an unknown tool. Returning 200 with the
 /// error text as a string let a timeout, a denied destructive call and a
-/// misspelt tool name all run the caller's success path (SBS-937).
-fn openapi_status(resp: &Value, name: &str) -> u16 {
+/// misspelt tool name all run the caller's success path (SBS-937). `known` is
+/// whether the requested name resolves at all (a gateway meta-tool, a grouped
+/// browse tool, a live route, or a catalog entry); the result text is never
+/// consulted for that, since a real tool's error may echo any wording.
+fn openapi_status(resp: &Value, known: bool) -> u16 {
     let is_error = resp
         .pointer("/result/isError")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if !is_error {
-        return 200;
+    match (is_error, known) {
+        (false, _) => 200,
+        (true, true) => 400,
+        (true, false) => 404,
     }
-    // The router's own wording for a name nothing routes; the only signal an
-    // unknown tool leaves, since MCP has no dedicated code for it.
-    if result_text(resp).contains(&format!("no route for tool '{name}'")) {
-        404
-    } else {
-        400
+}
+
+/// Whether an OpenAPI tool path names something the gateway can dispatch. Checked
+/// after the call so a lazily connected server's route, if the call connected it,
+/// counts; the catalog covers a known tool whose server failed to connect.
+fn openapi_tool_is_known(state: &GatewayState, name: &str) -> bool {
+    let canonical = canonical_meta(name).unwrap_or(name);
+    if is_fixed_meta_tool(canonical) || grouped_help_target(name).is_some() {
+        return true;
     }
+    let routed = state
+        .router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .route_of(name)
+        .is_some();
+    if routed {
+        return true;
+    }
+    state
+        .cached_tools
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .tools
+        .iter()
+        .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
 }
 
 /// HTTP handler result: status, content-type, body, plus optional extra headers
@@ -13943,7 +13967,7 @@ fn handle_http_with_headers(
                         return HttpOut::json_err(400, msg);
                     }
                     let text = result_text(&resp);
-                    let status = openapi_status(&resp, name);
+                    let status = openapi_status(&resp, openapi_tool_is_known(state, name));
                     if status != 200 {
                         return HttpOut::json_err(status, &text);
                     }
@@ -22376,29 +22400,24 @@ mod tests {
     #[test]
     fn openapi_status_follows_the_result_error_flag() {
         let ok = json!({ "result": { "content": [{ "type": "text", "text": "done" }] } });
-        assert_eq!(openapi_status(&ok, "s__work"), 200);
+        assert_eq!(openapi_status(&ok, true), 200);
         let explicit_ok = json!({ "result": { "content": [], "isError": false } });
-        assert_eq!(openapi_status(&explicit_ok, "s__work"), 200);
+        assert_eq!(openapi_status(&explicit_ok, true), 200);
 
         let timed_out = json!({ "result": {
             "content": [{ "type": "text", "text": "Toolport: timed out waiting for 'tools/call' response" }],
             "isError": true
         } });
-        assert_eq!(openapi_status(&timed_out, "s__work"), 400);
-        let denied = json!({ "result": {
-            "content": [{ "type": "text", "text": "Toolport: the call to s__work was denied, so it did not run." }],
-            "isError": true
-        } });
-        assert_eq!(openapi_status(&denied, "s__work"), 400);
+        assert_eq!(openapi_status(&timed_out, true), 400);
+        assert_eq!(openapi_status(&timed_out, false), 404);
 
-        let unknown = json!({ "result": {
-            "content": [{ "type": "text", "text": "Toolport: no route for tool 'nope'" }],
+        // A known tool whose error happens to echo the router's wording is still a
+        // failed call on a tool that exists, never a missing route.
+        let echoing = json!({ "result": {
+            "content": [{ "type": "text", "text": "Toolport: no route for tool 's__work'" }],
             "isError": true
         } });
-        assert_eq!(openapi_status(&unknown, "nope"), 404);
-        // A downstream tool echoing the phrase about some other name is still a
-        // failed call on a tool that exists, not a missing route.
-        assert_eq!(openapi_status(&unknown, "s__work"), 400);
+        assert_eq!(openapi_status(&echoing, true), 400);
     }
 
     #[test]
