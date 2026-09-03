@@ -23,6 +23,7 @@ const GATED_JOB_IDS = [
   "build-test",
   "cross-platform-rust",
   "installer-script",
+  "installer-script-bash",
   "pinned-install-urls",
 ];
 
@@ -211,6 +212,18 @@ describe("CI required merge gate (SBS-874)", () => {
     expect(runScripts(job).join("\n")).toContain("scripts/install.Tests.ps1");
   });
 
+  // SBS-902: the bash suite existed for months without CI ever running it,
+  // so install.sh's download verification had no coverage on the one
+  // installer piped into bash. Being in the gate proves the job ran; this
+  // proves it runs the suite.
+  it("still runs install.sh's bash suite as Installer script tests (bash)", () => {
+    const job = jobs["installer-script-bash"];
+    expect(job).toBeDefined();
+    expect(job.name).toBe("Installer script tests (bash)");
+    expect(runsOnLabels(job)).toEqual(["ubuntu-22.04"]);
+    expect(runScripts(job).join("\n")).toContain("bash scripts/install.Tests.bash");
+  });
+
   // SBS-894: being in the gate's `needs` only proves the job ran. A job that
   // greps for nothing is green forever, so the gate would keep passing while
   // the control it names does nothing.
@@ -245,7 +258,7 @@ jobs:
   merge-gate:
     name: Build + test
     if: always()
-    needs: [build-test, cross-platform-rust, installer-script, pinned-install-urls]
+    needs: [build-test, cross-platform-rust, installer-script, installer-script-bash, pinned-install-urls]
     runs-on: ubuntu-22.04
     steps:
       - name: Require everything
@@ -253,6 +266,7 @@ jobs:
           echo "build-test=\${{ needs.build-test.result }}"
           echo "cross-platform-rust=\${{ needs.cross-platform-rust.result }}"
           echo "installer-script=\${{ needs.installer-script.result }}"
+          echo "installer-script-bash=\${{ needs.installer-script-bash.result }}"
           echo "pinned-install-urls=\${{ needs.pinned-install-urls.result }}"
 `);
     const gate = jobsWithCheckName(fixture.jobs, REQUIRED_CHECK_NAME)[0][1];
@@ -309,6 +323,7 @@ jobs:
           test "\${{ needs.build-test.result }}" = "success"
           test "\${{ needs.cross-platform-rust.result }}" = "success"
           test "\${{ needs.installer-script.result }}" = "success"
+          test "\${{ needs.installer-script-bash.result }}" = "success"
           test "\${{ needs.pinned-install-urls.result }}" = "success"`;
     const gateWith = (extra: string, runsOn = "ubuntu-22.04") =>
       parseWorkflow(`
@@ -316,7 +331,7 @@ jobs:
   merge-gate:
     name: Build + test
     if: always()
-    needs: [build-test, cross-platform-rust, installer-script, pinned-install-urls]
+    needs: [build-test, cross-platform-rust, installer-script, installer-script-bash, pinned-install-urls]
     runs-on: ${runsOn}
     steps:
       - name: Require everything${extra}${script}

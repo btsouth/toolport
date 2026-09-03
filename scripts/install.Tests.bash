@@ -98,8 +98,9 @@ EOF
   # Without this, running these tests on an Arch or Manjaro box finds the REAL
   # pacman and the REAL paru/yay/pamac on PATH, and the Arch branch then builds
   # and sudo-installs toolport-bin from the actual AUR in the middle of a unit
-  # test. Ubuntu CI never runs this file, so that hole only ever opens on the
-  # maintainer's own machine, which is the worst place for it.
+  # test. CI runs this file on Ubuntu, where there is no pacman to find, so
+  # that hole only ever opens on the maintainer's own machine, which is the
+  # worst place for it.
   #
   # Since 1.18.0 the Arch branch installs the native package and returns instead
   # of falling through to the AppImage, so these tests must be able to say which

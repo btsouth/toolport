@@ -241,6 +241,24 @@ jobs:
           $result = Invoke-Pester -Path scripts/install.Tests.ps1 -Output Detailed -PassThru
           if ($result.FailedCount -gt 0) { exit 1 }
 
+  # scripts/install.sh is the same shape: piped into `bash` from a pinned
+  # commit on macOS and Linux, and its download verification (https-only,
+  # per-asset digest, size/truncation, empty-file rejection) had no CI
+  # coverage while the bash suite sat unrun (SBS-902). The harness shims curl,
+  # uname and pacman-key on PATH and runs inside a temp HOME, so it needs no
+  # root and touches nothing outside its scratch dirs.
+  installer-script-bash:
+    name: Installer script tests (bash)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Bash tests for scripts/install.sh
+        run: bash scripts/install.Tests.bash
+
   # SBS-894: toolport.app/install.sh and /install.ps1 redirect to a PINNED
   # COMMIT of those scripts, because they are piped into a shell and a movable
   # URL there means anything that lands on main runs on users' machines. Both
@@ -294,17 +312,20 @@ jobs:
       - build-test
       - cross-platform-rust
       - installer-script
+      - installer-script-bash
       - pinned-install-urls
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
-      - name: Require Linux, Windows/macOS headless, install.ps1 and pinned URLs
+      - name: Require Linux, Windows/macOS headless, both installers and pinned URLs
         run: |
           echo "build-test=${{ needs.build-test.result }}"
           echo "cross-platform-rust=${{ needs.cross-platform-rust.result }}"
           echo "installer-script=${{ needs.installer-script.result }}"
+          echo "installer-script-bash=${{ needs.installer-script-bash.result }}"
           echo "pinned-install-urls=${{ needs.pinned-install-urls.result }}"
           test "${{ needs.build-test.result }}" = "success"
           test "${{ needs.cross-platform-rust.result }}" = "success"
           test "${{ needs.installer-script.result }}" = "success"
+          test "${{ needs.installer-script-bash.result }}" = "success"
           test "${{ needs.pinned-install-urls.result }}" = "success"
