@@ -1625,15 +1625,31 @@ pub fn migrate_profile_stores(registry: &Registry) -> Result<(), String> {
     Ok(())
 }
 
+/// Two ids the gateway would treat as one principal (SBS-880).
+///
+/// `sanitize_segment` rewrites an id to the tool-name charset and is deliberately
+/// lossy: `gh-api` and `gh_api` both become `gh_api`. The client scope set, the PII
+/// origin, injection block exemptions and result budgets all key on that form, so
+/// two registry ids that meet there share scope, exemptions and pseudonym origins.
+/// Every id factory goes through [`unique_id`], which refuses a candidate that
+/// lands on an existing id under this map, so ids stay injective at creation
+/// whatever charset the existing id came from (a `team_` prefix, a hand-edited
+/// `registry.json`). Case-insensitive because the gateway's prefix-owner tables
+/// lowercase the sanitized form.
+pub(crate) fn ids_collide(a: &str, b: &str) -> bool {
+    sanitize_segment(a).eq_ignore_ascii_case(&sanitize_segment(b))
+}
+
 pub(crate) fn unique_id(base: &str, existing: &[String]) -> String {
     let base = if base.is_empty() { "item" } else { base };
-    if !existing.iter().any(|e| e == base) {
+    let taken = |candidate: &str| existing.iter().any(|e| ids_collide(e, candidate));
+    if !taken(base) {
         return base.to_string();
     }
     let mut n = 2;
     loop {
         let candidate = format!("{base}-{n}");
-        if !existing.iter().any(|e| e == &candidate) {
+        if !taken(&candidate) {
             return candidate;
         }
         n += 1;
@@ -4689,6 +4705,36 @@ mod tests {
         assert_eq!(loaded.servers, r.servers);
         assert_eq!(loaded.profiles, r.profiles);
         assert_eq!(loaded.active_profile_id, r.active_profile_id);
+    }
+
+    /// SBS-880: the gateway keys scope, PII origin, block exemptions and budgets
+    /// on `sanitize_segment(id)`, which is lossy. A new id must never land on an
+    /// existing id's sanitized form, whatever charset that id came from.
+    #[test]
+    fn new_ids_never_collide_with_existing_ids_under_sanitize() {
+        assert!(ids_collide("gh-api", "gh_api"));
+        assert!(ids_collide("team-acme-crm", "team_acme-crm"));
+        assert!(ids_collide("GH_API", "gh-api"));
+        assert!(!ids_collide("gh-api", "gh-api-2"));
+
+        let mut r = Registry::default();
+        // A legacy or hand-edited id carrying an underscore.
+        let mut legacy = sample_server("GH API");
+        legacy.id = "gh_api".into();
+        r.servers.push(legacy);
+        assert_eq!(r.add_server(sample_server("GH API")), "gh-api-2");
+
+        // The team prefix against a local name that slugifies to `team-...`.
+        let mut team = sample_server("Acme CRM");
+        team.id = "team_acme-crm".into();
+        r.servers.push(team);
+        assert_eq!(
+            r.add_server(sample_server("Team Acme CRM")),
+            "team-acme-crm-2"
+        );
+
+        // Exact reuse still renames the same way it always did.
+        assert_eq!(r.add_server(sample_server("GH API")), "gh-api-3");
     }
 
     #[test]
