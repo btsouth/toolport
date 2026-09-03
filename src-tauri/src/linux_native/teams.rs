@@ -360,6 +360,7 @@ impl TeamsPage {
         ));
         let server_url = gtk::Entry::builder()
             .placeholder_text("https://teams.example.com")
+            .text(crate::teams::HOSTED_TEAMS_URL)
             .build();
         let invite = gtk::PasswordEntry::builder()
             .placeholder_text("Invite or join-link code")

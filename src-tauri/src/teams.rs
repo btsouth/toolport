@@ -19,6 +19,7 @@ use crate::usage_report;
 /// Reserved keychain slot for the member bearer token (one team connection at a time).
 pub const TEAM_TOKEN_SERVER: &str = "__conduit_team__";
 pub const TEAM_TOKEN_KEY: &str = "member_token";
+pub const HOSTED_TEAMS_URL: &str = "https://teams.toolport.app";
 
 pub fn save_token(token: &str) -> Result<(), String> {
     crate::secrets::set_secret(TEAM_TOKEN_SERVER, TEAM_TOKEN_KEY, token)
@@ -2180,6 +2181,15 @@ pub fn remove_team(reg: &mut Registry, team_id: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn hosted_url_matches_the_react_shell() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/lib/teamUrl.ts");
+        let source = std::fs::read_to_string(path).expect("teamUrl.ts is readable");
+        assert!(source.contains(&format!(
+            "export const HOSTED_TEAMS_URL = \"{HOSTED_TEAMS_URL}\""
+        )));
+    }
 
     #[test]
     fn desired_instructions_reads_enabled_nonempty_content() {
