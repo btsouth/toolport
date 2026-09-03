@@ -13124,7 +13124,7 @@ fn openapi_spec(
                                 "description": "The tool's text output."
                             } } }
                         },
-                        "400": err_resp("Invalid JSON body, or the tool itself returned an error."),
+                        "400": err_resp("Invalid JSON body, or the call failed: the tool returned an error, timed out, or was denied."),
                         "401": err_resp("Missing or invalid bearer token."),
                         "404": err_resp("Unknown tool name."),
                         "500": err_resp("Internal gateway error.")
@@ -13205,6 +13205,31 @@ fn result_text(resp: &Value) -> String {
         }
     }
     serde_json::to_string(result).unwrap_or_default()
+}
+
+/// The HTTP status an OpenAPI consumer should see for a tools/call result.
+///
+/// MCP reports a failed call as a successful JSON-RPC envelope whose result
+/// carries `isError`, which is right for MCP clients. An OpenAPI client has no
+/// such flag: its whole contract is the status code, and the spec above promises
+/// 400 for a failed call and 404 for an unknown tool. Returning 200 with the
+/// error text as a string let a timeout, a denied destructive call and a
+/// misspelt tool name all run the caller's success path (SBS-937).
+fn openapi_status(resp: &Value, name: &str) -> u16 {
+    let is_error = resp
+        .pointer("/result/isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !is_error {
+        return 200;
+    }
+    // The router's own wording for a name nothing routes; the only signal an
+    // unknown tool leaves, since MCP has no dedicated code for it.
+    if result_text(resp).contains(&format!("no route for tool '{name}'")) {
+        404
+    } else {
+        400
+    }
 }
 
 /// HTTP handler result: status, content-type, body, plus optional extra headers
@@ -13917,11 +13942,15 @@ fn handle_http_with_headers(
                             .unwrap_or("error");
                         return HttpOut::json_err(400, msg);
                     }
+                    let text = result_text(&resp);
+                    let status = openapi_status(&resp, name);
+                    if status != 200 {
+                        return HttpOut::json_err(status, &text);
+                    }
                     HttpOut::new(
                         200,
                         "application/json",
-                        serde_json::to_string(&result_text(&resp))
-                            .unwrap_or_else(|_| "\"\"".into()),
+                        serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into()),
                     )
                 }
                 None => HttpOut::json_err(500, "no response"),
@@ -22342,6 +22371,65 @@ mod tests {
         );
         assert_eq!(out.status, 204);
         assert!(out.body.is_empty());
+    }
+
+    #[test]
+    fn openapi_status_follows_the_result_error_flag() {
+        let ok = json!({ "result": { "content": [{ "type": "text", "text": "done" }] } });
+        assert_eq!(openapi_status(&ok, "s__work"), 200);
+        let explicit_ok = json!({ "result": { "content": [], "isError": false } });
+        assert_eq!(openapi_status(&explicit_ok, "s__work"), 200);
+
+        let timed_out = json!({ "result": {
+            "content": [{ "type": "text", "text": "Toolport: timed out waiting for 'tools/call' response" }],
+            "isError": true
+        } });
+        assert_eq!(openapi_status(&timed_out, "s__work"), 400);
+        let denied = json!({ "result": {
+            "content": [{ "type": "text", "text": "Toolport: the call to s__work was denied, so it did not run." }],
+            "isError": true
+        } });
+        assert_eq!(openapi_status(&denied, "s__work"), 400);
+
+        let unknown = json!({ "result": {
+            "content": [{ "type": "text", "text": "Toolport: no route for tool 'nope'" }],
+            "isError": true
+        } });
+        assert_eq!(openapi_status(&unknown, "nope"), 404);
+        // A downstream tool echoing the phrase about some other name is still a
+        // failed call on a tool that exists, not a missing route.
+        assert_eq!(openapi_status(&unknown, "s__work"), 400);
+    }
+
+    #[test]
+    fn openapi_post_reports_failed_and_unknown_tools_by_status() {
+        // SBS-937: Open WebUI, n8n and generated OpenAPI clients branch on the
+        // status code. A 200 carrying error text runs their success path.
+        let (router, calls, _catalog) = counting_router(false);
+        let mut state = http_state(true);
+        state.router = Arc::new(Mutex::new(router));
+        let search = SearchGuard::default();
+        let confirm = ConfirmGuard::new();
+        let post = |path: &str| {
+            handle_http(
+                &state, &search, &confirm, "POST", path, "{}", None, None, None, None,
+            )
+        };
+
+        let ok = post("/s__work");
+        assert_eq!(ok.status, 200, "body={}", ok.body);
+        assert_eq!(ok.body, "\"called\"");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let missing = post("/no_such_tool");
+        assert_eq!(missing.status, 404, "body={}", missing.body);
+        let body: Value = serde_json::from_str(&missing.body).expect("json error body");
+        let error = body["error"].as_str().expect("error string");
+        assert!(
+            error.contains("no route for tool 'no_such_tool'"),
+            "error={error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "nothing was dispatched");
     }
 
     fn mcp_session_of(out: &HttpOut) -> String {
