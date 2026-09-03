@@ -252,7 +252,13 @@ install_linux() {
 
   # Prefer the .deb on Debian/Ubuntu: it links the system WebKitGTK and is the most
   # reliable package (see README). Fall back to the no-root AppImage everywhere else.
-  if command -v dpkg >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+  # Detected from os-release like the Arch branch below, not from `command -v dpkg`
+  # alone: dpkg and apt-get exist on hosts that are not Debian (an Ubuntu CI runner
+  # simulating another distribution, a box with them installed for other reasons),
+  # and the tests need to simulate either host regardless of what they run on.
+  os_release="${TOOLPORT_OS_RELEASE:-/etc/os-release}"
+  if grep -qE '^(ID|ID_LIKE)=.*\b(debian|ubuntu)\b' "$os_release" 2>/dev/null &&
+    command -v dpkg >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
     url="$(asset_url '_amd64[.]deb')"
     [ -n "$url" ] || err "No .deb found in $tag_name."
     digest="$(asset_field '_amd64[.]deb' digest)"
@@ -281,7 +287,6 @@ install_linux() {
   # pacman installed without being Arch, and the tests need to simulate either
   # host regardless of what they are running on. Omarchy reports ID=omarchy with
   # ID_LIKE=arch, so both fields are checked.
-  os_release="${TOOLPORT_OS_RELEASE:-/etc/os-release}"
   if command -v pacman >/dev/null 2>&1 &&
     grep -qE '^(ID|ID_LIKE)=.*\barch\b' "$os_release" 2>/dev/null; then
     install_arch_repo

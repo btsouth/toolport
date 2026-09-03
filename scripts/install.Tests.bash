@@ -28,6 +28,14 @@ fake_bytes=""
 for i in $(seq 1 64); do fake_bytes="${fake_bytes}\\x$(printf '%02x' "$i")"; done
 fake_sha256="$(printf '%b' "$fake_bytes" | shasum -a 256 | awk '{print $1}')"
 
+# The Debian release: same bytes, advertised as the .deb the apt path selects.
+fake_release_deb() {
+  local digest="$1" size="$2"
+  fake_release "$digest" "$size" \
+    "https://github.com/tsouth89/toolport/releases/download/v1.13.0/Toolport_1.13.0_amd64.deb" |
+    sed 's/Toolport_1\.13\.0_amd64\.AppImage/Toolport_1.13.0_amd64.deb/'
+}
+
 # Pretty-printed shape the script's grep/sed/awk parsers expect.
 fake_release() {
   local digest="$1" size="$2"
@@ -102,13 +110,16 @@ EOF
   # that hole only ever opens on the maintainer's own machine, which is the
   # worst place for it.
   #
-  # Since 1.18.0 the Arch branch installs the native package and returns instead
-  # of falling through to the AppImage, so these tests must be able to say which
-  # kind of host they are simulating. install.sh reads TOOLPORT_OS_RELEASE, and
-  # every test gets a non-Arch one by default; the Arch tests below point at an
-  # Arch one. Without this the file cannot pass on a maintainer's own Arch box,
-  # where the real pacman is on PATH and cannot be shadowed away.
-  printf 'ID=ubuntu\nID_LIKE=debian\n' > "$shim_dir/os-release-generic"
+  # The Debian branch installs the .deb and the Arch branch installs the native
+  # package; both return instead of falling through to the AppImage, so these
+  # tests must be able to say which kind of host they are simulating. install.sh
+  # reads TOOLPORT_OS_RELEASE, and every test gets a distribution with neither
+  # dpkg nor pacman semantics by default; the Debian and Arch tests below point
+  # at their own. Without this the file cannot pass on a maintainer's own Arch
+  # box, where the real pacman is on PATH and cannot be shadowed away, nor on
+  # the Ubuntu CI runner, where dpkg and apt-get are.
+  printf 'ID=fedora\n' > "$shim_dir/os-release-generic"
+  printf 'ID=ubuntu\nID_LIKE=debian\n' > "$shim_dir/os-release-debian"
   printf 'ID=omarchy\nID_LIKE=arch\n' > "$shim_dir/os-release-arch"
 
   # Shadowing the AUR helpers still matters on an Arch box: without it a stray
@@ -328,6 +339,52 @@ else
   echo "  FAIL: pacman.conf gained a duplicate [toolport] section"; fail=$((fail + 1))
 fi
 rm -rf "$arch_workdir"
+
+echo "Debian: verifies the .deb and installs it with apt"
+# The apt path is the one most Linux users hit. It must select the .deb, verify
+# it like any other download, hand it to apt-get and never place an AppImage.
+# dpkg only has to exist; apt-get is recorded, not run; sudo passes through.
+deb_workdir="$(mktemp -d)"
+deb_shim="$deb_workdir/shim"; deb_home="$deb_workdir/home"; deb_bin="$deb_workdir/bin"
+mkdir -p "$deb_home" "$deb_bin"
+make_shim "$deb_shim" "$(fake_release_deb "sha256:$fake_sha256" 64)"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$deb_shim/dpkg"
+cat > "$deb_shim/apt-get" <<EOF
+#!/usr/bin/env bash
+printf 'apt-get %s\n' "\$*" >> "$deb_shim/apt-get.log"
+EOF
+cat > "$deb_shim/sudo" <<'EOF'
+#!/usr/bin/env bash
+exec "$@"
+EOF
+chmod +x "$deb_shim/dpkg" "$deb_shim/apt-get" "$deb_shim/sudo"
+
+set +e
+deb_output="$(cd "$deb_workdir" && PATH="$deb_shim:$PATH" HOME="$deb_home" \
+  XDG_BIN_HOME="$deb_bin" TOOLPORT_OS_RELEASE="$deb_shim/os-release-debian" \
+  bash "$INSTALL_SH" </dev/null 2>&1)"
+deb_rc=$?
+set -e
+
+if [ "$deb_rc" = "0" ]; then
+  echo "  ok: exit code 0"; pass=$((pass + 1))
+else
+  echo "  FAIL: exit code $deb_rc (wanted 0)"; fail=$((fail + 1))
+  echo "    output: $deb_output"
+fi
+check "verifies the .deb digest" "sha256 verified: $fake_sha256" "$deb_output"
+check "installs with apt" "Installing with apt" "$deb_output"
+if grep -q -- "install -y .*toolport\.deb" "$deb_shim/apt-get.log" 2>/dev/null; then
+  echo "  ok: apt-get was asked to install the .deb"; pass=$((pass + 1))
+else
+  echo "  FAIL: apt-get was not asked to install the .deb"; fail=$((fail + 1))
+fi
+if [ ! -e "$deb_bin/toolport" ]; then
+  echo "  ok: no AppImage on Debian"; pass=$((pass + 1))
+else
+  echo "  FAIL: an AppImage was installed on Debian"; fail=$((fail + 1))
+fi
+rm -rf "$deb_workdir"
 
 echo
 echo "$pass passed, $fail failed"
