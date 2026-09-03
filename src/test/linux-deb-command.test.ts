@@ -22,8 +22,10 @@ const tauriConfPath = join(repoRoot, "src-tauri", "tauri.conf.json");
 const cargoTomlPath = join(repoRoot, "src-tauri", "Cargo.toml");
 
 function linuxAptBranch(script: string): string {
+  // The branch opens on the os-release check and continues onto this line; the
+  // tool check is the stable half to anchor on (SBS-902 moved detection).
   const marker =
-    "if command -v dpkg >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then";
+    "command -v dpkg >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then";
   const start = script.indexOf(marker);
   expect(start, "install.sh is missing the apt/dpkg .deb branch").toBeGreaterThan(-1);
   const after = script.slice(start + marker.length);
