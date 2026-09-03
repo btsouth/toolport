@@ -4855,6 +4855,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -4889,6 +4890,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -5428,6 +5430,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
 
@@ -5534,6 +5537,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         let doc = build_export(&reg, None, None, None);
@@ -5602,6 +5606,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         let doc = build_export(&reg, None, None, None);
@@ -5652,6 +5657,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         let serialized = serde_json::to_string(&build_export(&reg, None, None, None)).unwrap();
@@ -5692,6 +5698,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         let json = serde_json::to_string(&build_export(&reg, None, None, None)).unwrap();
@@ -5806,6 +5813,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         reg.add_server(ServerEntry {
@@ -5820,6 +5828,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
 

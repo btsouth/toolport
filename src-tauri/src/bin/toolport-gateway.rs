@@ -22094,6 +22094,7 @@ mod tests {
                 disabled_tools: vec![],
                 cwd: None,
                 client_credentials: None,
+                request_timeout_ms: None,
                 unknown_fields: serde_json::Map::new(),
             });
         }
@@ -22131,6 +22132,7 @@ mod tests {
                 disabled_tools: vec![],
                 cwd: None,
                 client_credentials: None,
+                request_timeout_ms: None,
                 unknown_fields: serde_json::Map::new(),
             });
             reg.set_server_enabled("default", id, true).unwrap();
@@ -22203,6 +22205,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         reg.set_server_enabled("default", "github", true).unwrap();
@@ -23478,6 +23481,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -26229,6 +26233,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         reg.set_server_enabled("default", &id, true).unwrap();

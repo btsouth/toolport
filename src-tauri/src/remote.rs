@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::downstream::{
     DownstreamServer, HttpTransport, ProgressSink, RefreshFn, ResourceUpdatedSink,
@@ -26,6 +26,16 @@ const PROACTIVE_REFRESH_SKEW_SECS: u64 = 60;
 /// Avoid hammering a temporarily unavailable OAuth endpoint on every tool call
 /// while still retrying within the pre-expiry safety window.
 const PROACTIVE_REFRESH_RETRY_SECS: u64 = 15;
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn request_timeout(server: &ServerEntry) -> Result<Duration, String> {
+    match server.request_timeout_ms {
+        Some(milliseconds) => {
+            crate::registry::validate_request_timeout_ms(milliseconds).map(Duration::from_millis)
+        }
+        None => Ok(DEFAULT_REQUEST_TIMEOUT),
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct OAuthState {
@@ -772,6 +782,7 @@ fn authed_transport(
     token: Option<String>,
     server_id: &str,
     block_private: bool,
+    request_timeout: Duration,
 ) -> Result<HttpTransport, String> {
     if token.is_some() {
         require_secure_for_auth(url)?;
@@ -865,7 +876,8 @@ fn authed_transport(
     // The resolver enforces the SSRF policy at connect time (DNS-rebind safe); it
     // mirrors `guard_connect_target`: link-local/metadata blocked for all, private
     // blocked only for untrusted-provenance servers.
-    let mut transport = HttpTransport::guarded(url, token, refresh, block_private);
+    let mut transport =
+        HttpTransport::guarded_with_timeout(url, token, refresh, block_private, request_timeout);
     transport.set_scope_reauthorize(scope_reauthorize);
     // Declared per request only while the flow is actually in use, which is what
     // the extension requires. Keyed off vaulted state rather than registry config
@@ -1002,6 +1014,7 @@ pub fn connect_remote_with_handler(
     // Untrusted-provenance servers also get private/loopback refused at the resolver,
     // matching `guard_connect_target`'s pre-check but closing the DNS-rebind TOCTOU.
     let block_private = is_untrusted_source(server.source.as_deref());
+    let request_timeout = request_timeout(server)?;
     // First connect for a headless server: mint a token now. Only this path has the
     // registry config (client id, method, scopes); every later reacquisition runs
     // from the state vaulted here, which is why it can go through the shared seam
@@ -1050,7 +1063,7 @@ pub fn connect_remote_with_handler(
     // differs from this afterwards, an exchange already happened during this
     // connect (SOU-474).
     let sent_auth = auth.clone();
-    let mut transport = authed_transport(url, auth, server_id, block_private)?;
+    let mut transport = authed_transport(url, auth, server_id, block_private, request_timeout)?;
     if let Some(ref handler) = server_handler {
         transport.set_server_request_handler(handler.clone());
     }
@@ -1096,8 +1109,13 @@ pub fn connect_remote_with_handler(
             }
             match refresh_token(server_id) {
                 Ok(fresh) => {
-                    let mut transport =
-                        authed_transport(url, Some(fresh), server_id, block_private)?;
+                    let mut transport = authed_transport(
+                        url,
+                        Some(fresh),
+                        server_id,
+                        block_private,
+                        request_timeout,
+                    )?;
                     if let Some(handler) = server_handler.clone() {
                         transport.set_server_request_handler(handler);
                     }
@@ -1438,8 +1456,42 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn request_timeout_uses_the_legacy_default_or_the_server_override() {
+        let mut server = remote_server("https://mcp.example.com/mcp", None);
+        assert_eq!(request_timeout(&server).unwrap(), Duration::from_secs(30));
+
+        server.request_timeout_ms = Some(65_000);
+        assert_eq!(
+            request_timeout(&server).unwrap(),
+            Duration::from_millis(65_000)
+        );
+
+        server.request_timeout_ms = Some(0);
+        assert_eq!(
+            request_timeout(&server).unwrap_err(),
+            "requestTimeoutMs must be greater than zero"
+        );
+
+        server.request_timeout_ms = Some(crate::registry::MAX_REQUEST_TIMEOUT_MS);
+        assert_eq!(
+            request_timeout(&server).unwrap(),
+            Duration::from_millis(crate::registry::MAX_REQUEST_TIMEOUT_MS)
+        );
+
+        server.request_timeout_ms = Some(crate::registry::MAX_REQUEST_TIMEOUT_MS + 1);
+        assert_eq!(
+            request_timeout(&server).unwrap_err(),
+            format!(
+                "requestTimeoutMs must not exceed {} (24 hours)",
+                crate::registry::MAX_REQUEST_TIMEOUT_MS
+            )
+        );
     }
 
     #[test]

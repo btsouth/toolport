@@ -1102,6 +1102,7 @@ mod tests {
             source: None,
             disabled_tools: Vec::new(),
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         assert!(!should_offer(&registry, &empty));

@@ -1,7 +1,7 @@
 import { beforeEach, describe, it, expect, vi } from "vitest";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { ProbeResult, Registry } from "@/lib/types";
+import type { ProbeResult, Registry, ServerEntry } from "@/lib/types";
 
 const api = vi.hoisted(() => ({
   addServer: vi.fn(),
@@ -102,6 +102,37 @@ describe("ServerDialog", () => {
 
     await userEvent.type(screen.getByLabelText("Command"), "npx");
     expect(screen.getByRole("button", { name: "Add" })).toBeEnabled();
+  });
+
+  it("does not reactivate a local-only timeout when switching to HTTP", async () => {
+    const initial: ServerEntry = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+      requestTimeoutMs: 90_000,
+    };
+    api.updateServer.mockResolvedValueOnce(savedRegistry("local"));
+    const user = userEvent.setup();
+
+    render(<ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />);
+    await user.click(screen.getByLabelText("Transport"));
+    await user.click(screen.getByRole("option", { name: "http (remote)" }));
+    await user.type(screen.getByLabelText("URL"), "https://mcp.example.com/mcp");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
+    expect(api.updateServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "local",
+        transport: "http",
+        requestTimeoutMs: null,
+      }),
+    );
   });
 
   it("closes on Cancel when it owns its open state (header add flow)", async () => {

@@ -101,6 +101,7 @@ export function ServerDialog({
   );
   const currentEditId = editId ?? partialEdit?.id;
   const isStdio = form.transport === "stdio";
+  const initialUsesLocalCommand = initial?.transport === "stdio" || !!initial?.command;
   const editing = currentEditId !== undefined;
 
   // Paste-from-config state.
@@ -225,6 +226,8 @@ export function ServerDialog({
       url: isStdio ? null : form.url.trim() || null,
       source: initial?.source ?? "manual",
       cwd: isStdio ? form.cwd.trim() || null : null,
+      requestTimeoutMs:
+        isStdio || initialUsesLocalCommand ? null : initial?.requestTimeoutMs,
     };
   }
 

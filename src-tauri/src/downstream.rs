@@ -934,8 +934,9 @@ pub(crate) const HTTP_RETRY_BASE: Duration = Duration::from_millis(250);
 pub(crate) const HTTP_RETRY_CAP: Duration = Duration::from_secs(10);
 /// Cancellation is observed at this cadence while a blocking HTTP attempt drains on
 /// its bounded worker. The router slot is released within one tick; the wire attempt
-/// remains owned by that single worker until ureq's 30s request timeout closes it.
+/// remains owned by that single worker until ureq's configured request timeout closes it.
 const HTTP_CANCEL_POLL: Duration = Duration::from_millis(25);
+const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// A cancellation notification is best-effort and must never replace one blocked
 /// request with another. Its independent connection has this much total time.
 const HTTP_CANCEL_FORWARD_TIMEOUT: Duration = Duration::from_secs(1);
@@ -3968,12 +3969,6 @@ pub(crate) fn guarded_agent_with_timeout(
         .build()
 }
 
-/// The remote MCP transport allows longer-lived calls than short auxiliary HTTP
-/// requests such as semantic embedding lookups.
-fn guarded_agent(block_private: bool) -> ureq::Agent {
-    guarded_agent_with_timeout(block_private, std::time::Duration::from_secs(30))
-}
-
 /// Talks to a remote MCP server over the Streamable HTTP transport: each request
 /// is a POST, and the response is either a JSON body or an SSE stream carrying
 /// the JSON-RPC message. A session id from `initialize` is echoed on later calls.
@@ -4152,10 +4147,29 @@ impl HttpTransport {
         refresh: Option<RefreshFn>,
         block_private: bool,
     ) -> Self {
+        Self::guarded_with_timeout(
+            url,
+            auth,
+            refresh,
+            block_private,
+            DEFAULT_HTTP_REQUEST_TIMEOUT,
+        )
+    }
+
+    /// Build a transport whose main and inline HTTP agents share the same total
+    /// per-request deadline. This covers initialization, ordinary calls, and SSE
+    /// response reads without changing the independent cancellation budget.
+    pub fn guarded_with_timeout(
+        url: &str,
+        auth: Option<String>,
+        refresh: Option<RefreshFn>,
+        block_private: bool,
+        request_timeout: Duration,
+    ) -> Self {
         HttpTransport {
             url: url.to_string(),
-            agent: guarded_agent(block_private),
-            inline_agent: guarded_agent(block_private),
+            agent: guarded_agent_with_timeout(block_private, request_timeout),
+            inline_agent: guarded_agent_with_timeout(block_private, request_timeout),
             session_id: None,
             next_id: 1,
             auth: Arc::new(Mutex::new(auth)),
@@ -4954,7 +4968,7 @@ impl Transport for HttpTransport {
         // state to exactly one bounded wire worker, leaving this slot with only a
         // receiver and immutable cancellation context. On cancellation the caller
         // returns within HTTP_CANCEL_POLL; the worker owns no Router/ServerSlot borrow
-        // and drains for at most the agent's 30s request timeout.
+        // and drains for at most the agent's configured request timeout.
         let downstream_id = self.downstream_request_id();
         let request_already_live = self.pending_mrtr.is_some();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -9819,6 +9833,47 @@ mod tests {
     }
 
     #[test]
+    fn configured_http_timeout_bounds_the_response_read() {
+        use super::HttpTransport;
+        use std::time::{Duration, Instant};
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let request = server.recv().expect("receive timed request");
+            std::thread::sleep(Duration::from_secs(1));
+            let _ = request.respond(tiny_http::Response::from_string(
+                r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            ));
+        });
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut transport = HttpTransport::guarded_with_timeout(
+            &url,
+            None,
+            None,
+            false,
+            Duration::from_millis(100),
+        );
+        let started = Instant::now();
+        let result = transport.post(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }),
+            true,
+        );
+
+        assert!(
+            result.is_err(),
+            "the delayed response must exceed the configured timeout"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "the custom timeout was not applied: {:?}",
+            started.elapsed()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn notifications_carry_the_connections_protocol_meta() {
         // The request path stamps protocol `_meta`; `notify` has its own copy of
         // that logic and had no coverage, so a modern connection could have sent
@@ -11674,8 +11729,10 @@ mod tests {
             }
         }
         transport.url = format!("http://127.0.0.1:{recovery_port}/");
-        transport.agent = super::guarded_agent(false);
-        transport.inline_agent = super::guarded_agent(false);
+        transport.agent =
+            super::guarded_agent_with_timeout(false, super::DEFAULT_HTTP_REQUEST_TIMEOUT);
+        transport.inline_agent =
+            super::guarded_agent_with_timeout(false, super::DEFAULT_HTTP_REQUEST_TIMEOUT);
         let result = transport
             .request("tools/call", json!({ "name": "after-cancel" }))
             .expect("restored transport accepts a fresh request");

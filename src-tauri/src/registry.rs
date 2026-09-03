@@ -441,6 +441,23 @@ pub struct EnvVar {
     pub secret: bool,
 }
 
+/// Long-running generation calls need room beyond the historical 30-second
+/// default, but a bounded ceiling ensures cancellation cannot leave a server's
+/// single HTTP worker draining for an effectively unlimited period.
+pub(crate) const MAX_REQUEST_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+
+pub(crate) fn validate_request_timeout_ms(milliseconds: u64) -> Result<u64, String> {
+    if milliseconds == 0 {
+        return Err("requestTimeoutMs must be greater than zero".to_string());
+    }
+    if milliseconds > MAX_REQUEST_TIMEOUT_MS {
+        return Err(format!(
+            "requestTimeoutMs must not exceed {MAX_REQUEST_TIMEOUT_MS} (24 hours)"
+        ));
+    }
+    Ok(milliseconds)
+}
+
 // No `Eq`: the `unknown_fields` flatten map (a serde_json::Map) is only `PartialEq`.
 // Dropping `Eq` is what lets an older binary preserve per-server fields it doesn't
 // recognize on re-save, mirroring the same forward-compat protection already on
@@ -484,6 +501,11 @@ pub struct ServerEntry {
     /// interactive OAuth and pasted-token behaviour exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_credentials: Option<ClientCredentials>,
+    /// Total deadline for each HTTP request to this server, in milliseconds.
+    /// Valid values are 1 through 86,400,000 (24 hours). Unset preserves the
+    /// historical 30-second default. Only applies to HTTP/SSE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
     /// Per-server fields written by a newer build that this binary doesn't know
     /// about. Captured on load and re-emitted on save so a mixed-version binary
     /// never strips them (same contract as `Registry::unknown_fields`).
@@ -3904,6 +3926,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -4666,6 +4689,23 @@ mod tests {
         assert_eq!(loaded.servers, r.servers);
         assert_eq!(loaded.profiles, r.profiles);
         assert_eq!(loaded.active_profile_id, r.active_profile_id);
+    }
+
+    #[test]
+    fn server_request_timeout_is_optional_and_round_trips_in_milliseconds() {
+        let server = sample_server("remote");
+        let without_timeout = serde_json::to_value(&server).unwrap();
+        assert!(
+            without_timeout.get("requestTimeoutMs").is_none(),
+            "the historical default must not add a registry field"
+        );
+
+        let mut configured = server;
+        configured.request_timeout_ms = Some(75_000);
+        let json = serde_json::to_value(&configured).unwrap();
+        assert_eq!(json["requestTimeoutMs"], 75_000);
+        let loaded: ServerEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded.request_timeout_ms, Some(75_000));
     }
 
     #[test]
@@ -5707,6 +5747,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         // Inject a per-server field this binary's ServerEntry doesn't define.

@@ -49,6 +49,9 @@ pub(crate) fn build_export(
             if let Some(url) = server.url.as_deref() {
                 server.url = Some(registry::redact_url_userinfo(url));
             }
+            if server.transport == "stdio" || server.command.is_some() {
+                server.request_timeout_ms = None;
+            }
             server
         })
         .collect::<Vec<ServerEntry>>();
@@ -80,7 +83,7 @@ pub(crate) fn apply_import_selected(
     }
     let document: Document = serde_json::from_str(json)
         .map_err(|error| format!("That doesn't look like a Toolport setup: {error}"))?;
-    let mut added = 0usize;
+    let mut to_add = Vec::<ServerEntry>::new();
     for mut server in document.servers {
         if let Some(selected) = selected {
             if !selected
@@ -93,17 +96,28 @@ pub(crate) fn apply_import_selected(
         if registry
             .servers
             .iter()
+            .chain(to_add.iter())
             .any(|entry| entry.name.eq_ignore_ascii_case(&server.name))
         {
             continue;
+        }
+        if server.transport == "stdio" || server.command.is_some() {
+            server.request_timeout_ms = None;
+        } else if let Some(milliseconds) = server.request_timeout_ms {
+            registry::validate_request_timeout_ms(milliseconds).map_err(|error| {
+                format!("Invalid request timeout for '{}': {error}", server.name)
+            })?;
         }
         server.id.clear();
         for entry in &mut server.env {
             entry.value = None;
         }
         server.source = Some("shared".to_string());
+        to_add.push(server);
+    }
+    let added = to_add.len();
+    for server in to_add {
         registry.add_server(server);
-        added += 1;
     }
     Ok(added)
 }
@@ -311,5 +325,74 @@ mod controller_tests {
         assert_eq!(registry.servers.len(), 1);
         assert_eq!(registry.servers[0].name, "GitHub");
         assert_eq!(registry.servers[0].source.as_deref(), Some("shared"));
+    }
+
+    #[test]
+    fn shared_import_enforces_remote_request_timeout_bounds_atomically() {
+        let mut registry = Registry::default();
+        let invalid = serde_json::json!({ "servers": [
+            {
+                "name": "Valid",
+                "transport": "http",
+                "url": "https://example.com/mcp",
+                "requestTimeoutMs": 90_000
+            },
+            {
+                "name": "Invalid",
+                "transport": "http",
+                "url": "https://example.com/slow",
+                "requestTimeoutMs": registry::MAX_REQUEST_TIMEOUT_MS + 1
+            }
+        ]});
+
+        let error = apply_import(&mut registry, &invalid.to_string()).unwrap_err();
+        assert!(error.contains("Invalid request timeout for 'Invalid'"));
+        assert!(
+            registry.servers.is_empty(),
+            "a rejected document must not be partially imported"
+        );
+
+        let valid = serde_json::json!({ "servers": [{
+            "name": "Maximum",
+            "transport": "http",
+            "url": "https://example.com/mcp",
+            "requestTimeoutMs": registry::MAX_REQUEST_TIMEOUT_MS
+        }]});
+        assert_eq!(apply_import(&mut registry, &valid.to_string()).unwrap(), 1);
+        assert_eq!(
+            registry.servers[0].request_timeout_ms,
+            Some(registry::MAX_REQUEST_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn shared_import_and_export_clear_timeouts_for_local_commands() {
+        let mut registry = Registry::default();
+        let json = serde_json::json!({ "servers": [
+            {
+                "name": "Local",
+                "transport": "stdio",
+                "command": "local-server",
+                "requestTimeoutMs": 0
+            },
+            {
+                "name": "Local wrapper",
+                "transport": "http",
+                "command": "local-server",
+                "requestTimeoutMs": registry::MAX_REQUEST_TIMEOUT_MS + 1
+            }
+        ]});
+
+        assert_eq!(apply_import(&mut registry, &json.to_string()).unwrap(), 2);
+        assert!(registry
+            .servers
+            .iter()
+            .all(|server| server.request_timeout_ms.is_none()));
+        let exported = build_export(&registry, None, None, None);
+        assert!(exported["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|server| server["requestTimeoutMs"].is_null()));
     }
 }
