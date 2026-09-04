@@ -35,7 +35,7 @@ omarchy pkg aur add toolport-bin
 > Meanwhile the package builds fine from this repo, no AUR account involved:
 >
 > ```bash
-> git clone https://github.com/tsouth89/toolport && cd toolport
+> git clone https://github.com/btsouth/toolport && cd toolport
 > scripts/render-aur.sh 1.15.0 ./aur     # use the released version
 > cd aur && makepkg -si
 > ```

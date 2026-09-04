@@ -41,7 +41,7 @@ build_package() {
   local package_path="$work_root/toolport-$version.pkg.tar.zst"
   mkdir -p "$package_root"
   cp -a "$stage_root"/. "$package_root"/
-  printf 'pkgname = toolport\npkgbase = toolport\npkgver = %s-1\npkgdesc = One local MCP gateway for every AI client, with a native GTK shell\nurl = https://github.com/tsouth89/toolport\nbuilddate = 0\npackager = Toolport lifecycle smoke\nsize = 1\narch = x86_64\nlicense = MIT\n' \
+  printf 'pkgname = toolport\npkgbase = toolport\npkgver = %s-1\npkgdesc = One local MCP gateway for every AI client, with a native GTK shell\nurl = https://github.com/btsouth/toolport\nbuilddate = 0\npackager = Toolport lifecycle smoke\nsize = 1\narch = x86_64\nlicense = MIT\n' \
     "$version" > "$package_root/.PKGINFO"
   if [[ "$version" == "1.17.1" ]]; then
     printf 'X-Toolport-Lifecycle=upgrade\n' \

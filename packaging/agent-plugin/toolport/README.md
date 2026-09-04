@@ -54,7 +54,7 @@ None required here. Servers, credentials, profiles, discovery mode, and
 security settings are all managed in the Toolport app and apply to every
 connected client. Advanced per-client overrides (`TOOLPORT_PROFILE`,
 `TOOLPORT_DISCOVERY`, …) can be set as `env` on the server entry in
-`mcp.json`; see the [Toolport README](https://github.com/tsouth89/toolport#configuration).
+`mcp.json`; see the [Toolport README](https://github.com/btsouth/toolport#configuration).
 
 To point the plugin at a non-standard gateway location, set the
 `TOOLPORT_GATEWAY` environment variable to the binary's absolute path.

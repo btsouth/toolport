@@ -197,7 +197,7 @@ function VersionFooter({
         action: {
           label: "Open",
           onClick: () =>
-            openExternal("https://github.com/tsouth89/toolport/releases/latest"),
+            openExternal("https://github.com/btsouth/toolport/releases/latest"),
         },
       });
     }

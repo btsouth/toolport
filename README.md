@@ -5,8 +5,8 @@
 **Every tool. One port.** One local gateway for all your MCP servers, shared by
 every AI client, with far fewer tokens.
 
-[![CI](https://github.com/tsouth89/toolport/actions/workflows/ci.yml/badge.svg)](https://github.com/tsouth89/toolport/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/tsouth89/toolport?label=release)](https://github.com/tsouth89/toolport/releases)
+[![CI](https://github.com/btsouth/toolport/actions/workflows/ci.yml/badge.svg)](https://github.com/btsouth/toolport/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/btsouth/toolport?label=release)](https://github.com/btsouth/toolport/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/Xsn27MxdBA)
 [![Glama quality](https://glama.ai/mcp/servers/tsouth89/toolport/badges/score.svg)](https://glama.ai/mcp/servers/tsouth89/toolport)
@@ -42,7 +42,7 @@ eat your context window).
 
 ## Get started in two minutes
 
-1. **[Download the installer](https://github.com/tsouth89/toolport/releases/latest)** for Windows, macOS, or Linux (details in [Install](#install)).
+1. **[Download the installer](https://github.com/btsouth/toolport/releases/latest)** for Windows, macOS, or Linux (details in [Install](#install)).
 2. **Add a server** from the built-in catalog, or paste a config snippet from any
    server's docs, and authenticate once.
 3. Open **Clients** and click **Connect to Toolport** on each AI client you use.
@@ -251,7 +251,7 @@ Point your client's plugin install flow at
 [packaging/agent-plugin/toolport/](packaging/agent-plugin/toolport) from a
 checkout (the folder that contains `plugin.json`). From the first release tagged
 after this lands, the same folder also ships as `toolport-agent-plugin.zip` on
-the [releases page](https://github.com/tsouth89/toolport/releases). The plugin
+the [releases page](https://github.com/btsouth/toolport/releases). The plugin
 bundles the gateway's MCP server entry plus a skill that teaches the agent
 Toolport's search → call workflow, and the same folder also carries the Claude
 Code plugin layout. It launches the gateway already installed by the desktop
@@ -327,7 +327,7 @@ namespaced per server, so the two never collide even in the same profile.
 
 ```sh
 # macOS (Homebrew)
-brew install --cask tsouth89/toolport/toolport
+brew install --cask btsouth/toolport/toolport
 
 # macOS or Linux (script: .deb via apt where available, else AppImage; Mac copies the app)
 curl -fsSL https://toolport.app/install.sh | bash
@@ -352,7 +352,7 @@ a file, it takes the matching `-Version`, `-Interactive`, and `-DownloadOnly`
 parameters.
 
 Prebuilt installers are published on the
-[Releases](https://github.com/tsouth89/toolport/releases) page. Toolport runs on
+[Releases](https://github.com/btsouth/toolport/releases) page. Toolport runs on
 **Windows, macOS, and Linux**. On Linux, take the **`.deb`** on Debian/Ubuntu
 and the **AppImage** everywhere else, including Arch and its derivatives
 (Manjaro, EndeavourOS, Omarchy). The AppImage needs no root and works on both
@@ -385,7 +385,7 @@ yet and the commands above will not find it. Build the identical package from
 this repo in the meantime, no AUR account needed:
 
 ```bash
-git clone https://github.com/tsouth89/toolport && cd toolport
+git clone https://github.com/btsouth/toolport && cd toolport
 scripts/render-aur.sh 1.16.0 ./aur     # use the released version
 cd aur && makepkg -si
 ```

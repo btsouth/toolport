@@ -325,7 +325,7 @@ The catalog tests verify every curated entry has a non-empty name, a valid
 target (URL or command), and a browse-view category — your new entry will be
 checked automatically.
 
-**Reference PR:** [#19](https://github.com/tsouth89/toolport/pull/19) (Firecrawl
+**Reference PR:** [#19](https://github.com/btsouth/toolport/pull/19) (Firecrawl
 catalog entry — a single `cmd()` line + category).
 
 ## Adding a curated stack
@@ -487,12 +487,12 @@ cargo test --manifest-path src-tauri/Cargo.toml clients
 npm run tauri dev   # check the client appears in the sidebar
 ```
 
-**Reference PR:** [#18](https://github.com/tsouth89/toolport/pull/18) (BoltAI
+**Reference PR:** [#18](https://github.com/btsouth/toolport/pull/18) (BoltAI
 client — a path resolver, one `ClientDef`, and a registration test).
 
 ## Reporting issues
 
-Bugs and ideas are welcome in [Issues](https://github.com/tsouth89/toolport/issues).
+Bugs and ideas are welcome in [Issues](https://github.com/btsouth/toolport/issues).
 For security problems, see [SECURITY.md](SECURITY.md) (report privately, please).
 
 ## License

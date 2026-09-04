@@ -24,7 +24,7 @@
     <mediatype>x-scheme-handler/toolport</mediatype>
     <mediatype>x-scheme-handler/conduit</mediatype>
   </provides>
-  <url type="homepage">https://github.com/tsouth89/toolport</url>
-  <url type="bugtracker">https://github.com/tsouth89/toolport/issues</url>
+  <url type="homepage">https://github.com/btsouth/toolport</url>
+  <url type="bugtracker">https://github.com/btsouth/toolport/issues</url>
   <content_rating type="oars-1.1" />
 </component>

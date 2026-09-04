@@ -8,7 +8,7 @@ records locally, and how to report a vulnerability.
 
 Please report security issues **privately**, not as a public issue:
 
-- Preferred: GitHub's [private vulnerability reporting](https://github.com/tsouth89/toolport/security/advisories/new)
+- Preferred: GitHub's [private vulnerability reporting](https://github.com/btsouth/toolport/security/advisories/new)
   (repo **Security** tab to **Report a vulnerability**).
 - Or email the maintainer at **tyler@southforgeai.com**.
 
@@ -19,7 +19,7 @@ credit reporters who want it.
 ## Supported versions
 
 Toolport ships fixes on the latest release only. Always run the newest version
-from the [Releases](https://github.com/tsouth89/toolport/releases) page.
+from the [Releases](https://github.com/btsouth/toolport/releases) page.
 
 ## How Toolport runs, and where the boundaries are
 

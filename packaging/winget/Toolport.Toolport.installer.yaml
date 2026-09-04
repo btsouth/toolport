@@ -19,7 +19,7 @@ AppsAndFeaturesEntries:
     Publisher: tsout
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/tsouth89/toolport/releases/download/v1.13.0/Toolport_1.13.0_x64-setup.exe
+    InstallerUrl: https://github.com/btsouth/toolport/releases/download/v1.13.0/Toolport_1.13.0_x64-setup.exe
     InstallerSha256: 29E98D43D356829A3AFC79912D844264192168C68C2F860E34C4205FAE934EE4
 ManifestType: installer
 ManifestVersion: 1.12.0

@@ -35,7 +35,7 @@ $ErrorActionPreference = "Stop"
 # Everything lives in one function so that piping this script into `iex` doesn't
 # leave a pile of helpers behind in the caller's session.
 function Install-Toolport {
-    $repo = "tsouth89/toolport"
+    $repo = "btsouth/toolport"
     $releasesUrl = "https://github.com/$repo/releases"
 
     function Say($msg) { Write-Host "> $msg" -ForegroundColor Cyan }

@@ -23,7 +23,7 @@
 # scripts/install.ps1's -AllowUnverified).
 set -euo pipefail
 
-REPO="tsouth89/toolport"
+REPO="btsouth/toolport"
 API="https://api.github.com/repos/$REPO/releases/latest"
 
 # The Apple Developer team the macOS builds are signed and notarized under (the
@@ -326,7 +326,7 @@ EOF
 
 install_macos() {
   say "Tip: on macOS the cleanest install is Homebrew:"
-  say "     brew install --cask tsouth89/toolport/toolport"
+  say "     brew install --cask btsouth/toolport/toolport"
   case "$arch" in
     arm64 | aarch64) suffix='aarch64-apple-darwin[.]dmg' ;;
     x86_64) suffix='x86_64-apple-darwin[.]dmg' ;;

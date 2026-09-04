@@ -17,7 +17,7 @@
  */
 
 export const STAR_PROMPT_KEY = "toolport.starPrompt";
-export const STAR_REPO_URL = "https://github.com/tsouth89/toolport";
+export const STAR_REPO_URL = "https://github.com/btsouth/toolport";
 
 /** Written and deleted at read time to find out whether a spent ask could be
  *  recorded at all. Never read back, so a leftover from a crash is harmless. */

@@ -32,20 +32,20 @@ fake_sha256="$(printf '%b' "$fake_bytes" | shasum -a 256 | awk '{print $1}')"
 fake_release_deb() {
   local digest="$1" size="$2"
   fake_release "$digest" "$size" \
-    "https://github.com/tsouth89/toolport/releases/download/v1.13.0/Toolport_1.13.0_amd64.deb" |
+    "https://github.com/btsouth/toolport/releases/download/v1.13.0/Toolport_1.13.0_amd64.deb" |
     sed 's/Toolport_1\.13\.0_amd64\.AppImage/Toolport_1.13.0_amd64.deb/'
 }
 
 # Pretty-printed shape the script's grep/sed/awk parsers expect.
 fake_release() {
   local digest="$1" size="$2"
-  local url="${3:-https://github.com/tsouth89/toolport/releases/download/v1.13.0/Toolport_1.13.0_amd64.AppImage}"
+  local url="${3:-https://github.com/btsouth/toolport/releases/download/v1.13.0/Toolport_1.13.0_amd64.AppImage}"
   cat <<EOF
 {
   "tag_name": "v1.13.0",
   "assets": [
     {
-      "url": "https://api.github.com/repos/tsouth89/toolport/releases/assets/1",
+      "url": "https://api.github.com/repos/btsouth/toolport/releases/assets/1",
       "id": 1,
       "name": "Toolport_1.13.0_amd64.AppImage",
       "state": "uploaded",

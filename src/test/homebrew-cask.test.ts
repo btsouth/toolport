@@ -1,6 +1,6 @@
 // Pins the in-repo Homebrew cask snapshot to package.json so a release
 // bump that forgets packaging/homebrew/toolport.rb fails CI. brew install
-// reads tsouth89/homebrew-toolport, not this file; RELEASING.md is the
+// reads btsouth/homebrew-toolport, not this file; RELEASING.md is the
 // step that updates the live tap. SBS-936.
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
@@ -57,11 +57,11 @@ describe("RELEASING.md Homebrew tap step", () => {
     // The hashing used to be a manual `shasum` step here. It is now the tap's
     // own bump.yml, which computes both digests from the published DMGs; this
     // guards that the doc keeps pointing at the real mechanism.
-    expect(releasing).toContain("tsouth89/homebrew-toolport");
+    expect(releasing).toContain("btsouth/homebrew-toolport");
     expect(releasing).toContain("Casks/toolport.rb");
     expect(releasing).toContain("bump.yml");
     expect(releasing).toContain(
-      "gh workflow run bump.yml --repo tsouth89/homebrew-toolport",
+      "gh workflow run bump.yml --repo btsouth/homebrew-toolport",
     );
   });
 });

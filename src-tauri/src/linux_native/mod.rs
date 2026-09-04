@@ -847,7 +847,7 @@ fn install_star_prompt(container: &gtk::Box) {
     {
         let card = card.clone();
         star.connect_clicked(move |_| {
-            let _ = crate::oauth::open_web_url("https://github.com/tsouth89/toolport");
+            let _ = crate::oauth::open_web_url("https://github.com/btsouth/toolport");
             retire(&card);
         });
     }

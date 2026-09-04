@@ -5,11 +5,11 @@ PackageVersion: 1.13.0
 PackageLocale: en-US
 Publisher: Toolport
 PublisherUrl: https://toolport.app
-PublisherSupportUrl: https://github.com/tsouth89/toolport/issues
+PublisherSupportUrl: https://github.com/btsouth/toolport/issues
 PackageName: Toolport
 PackageUrl: https://toolport.app
 License: MIT
-LicenseUrl: https://github.com/tsouth89/toolport/blob/main/LICENSE
+LicenseUrl: https://github.com/btsouth/toolport/blob/main/LICENSE
 Copyright: Copyright (c) Brandon South
 ShortDescription: Local-first MCP gateway. One port for every tool and every AI client.
 Description: |-
@@ -40,9 +40,9 @@ Tags:
   - local-first
   - mcp
   - model-context-protocol
-ReleaseNotesUrl: https://github.com/tsouth89/toolport/releases/tag/v1.13.0
+ReleaseNotesUrl: https://github.com/btsouth/toolport/releases/tag/v1.13.0
 Documentations:
   - DocumentLabel: README
-    DocumentUrl: https://github.com/tsouth89/toolport#readme
+    DocumentUrl: https://github.com/btsouth/toolport#readme
 ManifestType: defaultLocale
 ManifestVersion: 1.12.0

@@ -498,9 +498,9 @@ makepkg -si` builds the identical package with no AUR account). The AppImage
 
 - **Homebrew cask snapshot was three releases behind.** `packaging/homebrew/toolport.rb`
   still said 1.11.0 after 1.14.0 shipped, and `docs/RELEASING.md` had no tap-bump
-  step, so the next release would leave `brew install --cask tsouth89/toolport/toolport`
+  step, so the next release would leave `brew install --cask btsouth/toolport/toolport`
   stale again. The snapshot now matches 1.14.0 (sha256s from the published dmgs)
-  and the release doc names `tsouth89/homebrew-toolport`. The live tap is a
+  and the release doc names `btsouth/homebrew-toolport`. The live tap is a
   separate repo; bumping it is that step, not this file. (SBS-936)
 
 - **A refused Team Instructions rewrite no longer deletes the last-good org rules.**
@@ -3252,14 +3252,14 @@ driven by the agent on your terms, and supports two more clients.
 - First public release: local MCP gateway and manager with lazy discovery,
   per-agent profiles, the catalog, the tool playground, and the activity log.
 
-[Unreleased]: https://github.com/tsouth89/toolport/compare/v1.18.0...HEAD
-[1.18.0]: https://github.com/tsouth89/toolport/compare/v1.17.0...v1.18.0
-[1.17.0]: https://github.com/tsouth89/toolport/compare/v1.16.0...v1.17.0
-[1.16.0]: https://github.com/tsouth89/toolport/releases/tag/v1.16.0
-[1.6.2]: https://github.com/tsouth89/toolport/compare/v1.6.1...v1.6.2
-[1.6.1]: https://github.com/tsouth89/toolport/compare/v1.6.0...v1.6.1
-[1.6.0]: https://github.com/tsouth89/toolport/releases/tag/v1.6.0
-[1.5.3]: https://github.com/tsouth89/toolport/releases/tag/v1.5.3
+[Unreleased]: https://github.com/btsouth/toolport/compare/v1.18.0...HEAD
+[1.18.0]: https://github.com/btsouth/toolport/compare/v1.17.0...v1.18.0
+[1.17.0]: https://github.com/btsouth/toolport/compare/v1.16.0...v1.17.0
+[1.16.0]: https://github.com/btsouth/toolport/releases/tag/v1.16.0
+[1.6.2]: https://github.com/btsouth/toolport/compare/v1.6.1...v1.6.2
+[1.6.1]: https://github.com/btsouth/toolport/compare/v1.6.0...v1.6.1
+[1.6.0]: https://github.com/btsouth/toolport/releases/tag/v1.6.0
+[1.5.3]: https://github.com/btsouth/toolport/releases/tag/v1.5.3
 [0.3.16]: https://github.com/tsouth89/conduit/releases/tag/v0.3.16
 [0.3.15]: https://github.com/tsouth89/conduit/releases/tag/v0.3.15
 [0.3.14]: https://github.com/tsouth89/conduit/releases/tag/v0.3.14

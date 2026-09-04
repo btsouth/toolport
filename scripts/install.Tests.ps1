@@ -51,7 +51,7 @@ BeforeAll {
             [string]$Url
         )
         if (-not $Url) {
-            $Url = "https://github.com/tsouth89/toolport/releases/download/v1.13.0/$Name"
+            $Url = "https://github.com/btsouth/toolport/releases/download/v1.13.0/$Name"
         }
         [pscustomobject]@{
             name                 = $Name
@@ -146,7 +146,7 @@ Describe "install.ps1" {
             Invoke-Installer @{ Version = "1.13.0" } | Out-Null
 
             Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
-                $Uri -eq "https://api.github.com/repos/tsouth89/toolport/releases/tags/v1.13.0"
+                $Uri -eq "https://api.github.com/repos/btsouth/toolport/releases/tags/v1.13.0"
             }
         }
 
@@ -154,7 +154,7 @@ Describe "install.ps1" {
             Invoke-Installer | Out-Null
 
             Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
-                $Uri -eq "https://api.github.com/repos/tsouth89/toolport/releases/latest"
+                $Uri -eq "https://api.github.com/repos/btsouth/toolport/releases/latest"
             }
         }
 
@@ -164,7 +164,7 @@ Describe "install.ps1" {
             Invoke-Installer | Out-Null
 
             Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter {
-                $Uri -eq "https://api.github.com/repos/tsouth89/toolport/releases/tags/v1.12.0"
+                $Uri -eq "https://api.github.com/repos/btsouth/toolport/releases/tags/v1.12.0"
             }
         }
 

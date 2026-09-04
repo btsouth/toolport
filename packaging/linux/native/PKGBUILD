@@ -5,7 +5,7 @@ pkgver=1.18.0
 pkgrel=1
 pkgdesc='One local MCP gateway for every AI client, with a native GTK shell'
 arch=('x86_64')
-url='https://github.com/tsouth89/toolport'
+url='https://github.com/btsouth/toolport'
 license=('MIT')
 # No libsecret: on Linux the keyring crate uses sync-secret-service, which talks
 # to the Secret Service over D-Bus rather than linking libsecret, and namcap

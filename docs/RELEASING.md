@@ -71,9 +71,9 @@ is deliberately NOT checked in: it pins one release's checksum, so a tracked cop
 would only ever be stale.
 
 Publishing is also when the **Homebrew tap** is bumped, and that is now
-automatic. `brew install --cask tsouth89/toolport/toolport` and
+automatic. `brew install --cask btsouth/toolport/toolport` and
 `brew upgrade --cask toolport` install the version + sha256 pinned in
-[`tsouth89/homebrew-toolport`](https://github.com/tsouth89/homebrew-toolport)
+[`btsouth/homebrew-toolport`](https://github.com/btsouth/homebrew-toolport)
 `Casks/toolport.rb`. The `livecheck` / `github_latest` block in that cask only
 feeds `brew livecheck`; it does not move the pin. The copy at
 `packaging/homebrew/toolport.rb` in this repo is a snapshot `brew install` does
@@ -85,7 +85,7 @@ runs every six hours, so it lands on its own; to have it immediately after a
 release, dispatch it:
 
 ```bash
-gh workflow run bump.yml --repo tsouth89/homebrew-toolport
+gh workflow run bump.yml --repo btsouth/homebrew-toolport
 ```
 
 It is a no-op when the cask already matches, and it only ever tracks
