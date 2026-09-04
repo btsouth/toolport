@@ -3639,6 +3639,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         let cfg = json!({ "servers": [
