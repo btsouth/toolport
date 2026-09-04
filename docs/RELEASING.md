@@ -103,7 +103,7 @@ release time; `src/test/homebrew-cask.test.ts` fails CI if its version drifts
 from `package.json`, so skipping it is loud. Its checksums are cosmetic (nothing
 installs from it), but keep them honest by copying what the tap landed.
 
-The **gateway container image** (`ghcr.io/tsouth89/toolport-gateway`) publishes
+The **gateway container image** (`ghcr.io/btsouth/toolport-gateway`) publishes
 separately on every push to `main` via `docker-publish.yml` — no tag required.
 
 ## After users upgrade

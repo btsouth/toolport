@@ -105,7 +105,7 @@ shipped, near-term focus is distribution and growth over new engineering.
 - [~] **Streamable-HTTP upstream transport** — `POST /mcp` and `GET /mcp` listen stream ship
   (session ids, JSON-RPC, selective SSE responses; see `docs/headless.md` +
   `docker-compose.example.yml`). OpenAPI HTTP mode already shipped for Open WebUI.
-  **GHCR:** `ghcr.io/tsouth89/toolport-gateway` published from `main` (host-built
+  **GHCR:** `ghcr.io/btsouth/toolport-gateway` published from `main` (host-built
   binary + slim runtime image; see `Dockerfile` + `docker-publish.yml`). Optional
   follow-up: long-lived `GET /mcp` listen on HTTP downstream for servers that push
   RPC outside SSE POST responses. (S)

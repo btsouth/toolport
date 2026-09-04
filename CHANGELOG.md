@@ -2088,7 +2088,7 @@ support, Teams usage rollups, and registry safety fixes.
   `roots`, `sampling`, or `elicitation` at `initialize`, downstream servers can call
   `roots/list`, `sampling/createMessage`, and `elicitation/create`; the gateway forwards
   over stdio or HTTP MCP (inline during SSE `POST` responses). (#217, #218, #219)
-- **Prebuilt gateway image on GHCR** — `ghcr.io/tsouth89/toolport-gateway:latest`
+- **Prebuilt gateway image on GHCR** — `ghcr.io/btsouth/toolport-gateway:latest`
   (CI-built binary + slim runtime; ~3 min builds vs ~8 min). (#222, #223, #225)
 - **AnythingLLM client** — connect from the Clients view. (#213)
 - **Teams per-server usage rollups** — members report tool-call counts to the team

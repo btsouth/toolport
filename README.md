@@ -271,7 +271,7 @@ sessionless MCP `2026-07-28` requests and legacy initialize/session clients on t
 endpoint. Sandboxed coding agents and remote clients can use a URL instead of stdio. For
 Docker, env-file secrets, and a compose example, see
 [docs/headless.md](docs/headless.md). Prebuilt image:
-`docker pull ghcr.io/tsouth89/toolport-gateway:latest` (published from `main`).
+`docker pull ghcr.io/btsouth/toolport-gateway:latest` (published from `main`).
 
 ## Configuration
 

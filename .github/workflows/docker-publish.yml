@@ -22,7 +22,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE: ghcr.io/tsouth89/toolport-gateway
+  IMAGE: ghcr.io/btsouth/toolport-gateway
 
 jobs:
   build-gateway:

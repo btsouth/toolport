@@ -110,7 +110,7 @@ After the first CI publish, make the package public (GitHub → Packages →
 `toolport-gateway` → Package settings → Change visibility). Then:
 
 ```bash
-docker pull ghcr.io/tsouth89/toolport-gateway:latest
+docker pull ghcr.io/btsouth/toolport-gateway:latest
 mkdir -p data
 cp data/registry.json.example data/registry.json
 cp docker-compose.example.yml docker-compose.yml
