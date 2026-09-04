@@ -6,6 +6,16 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Fixed
+
+- **Two server ids that differ only by `-` and `_` could become one server.** The
+  gateway rewrites ids to the tool-name charset for exposed names, and that rewrite
+  also keyed client scope, PII pseudonym origins, injection block exemptions and result
+  budgets, so a local server named "Team Acme CRM" and a synced team server
+  `team_acme-crm`, or a hand-edited `gh_api` beside a new `gh-api`, shared scope and
+  exemptions. New ids, local or team-synced, are now kept distinct under that rewrite
+  the same way an exact duplicate is renamed.
+
 ## [1.18.0] - 2026-08-30
 
 Toolport 1.18.0 adds a native GTK shell for Arch and other current-GTK Linux

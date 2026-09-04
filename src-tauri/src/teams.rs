@@ -3621,6 +3621,44 @@ mod tests {
         }
     }
 
+    /// SBS-880: a team id is `team_<slug>`, and a member's own server named
+    /// "Team Acme CRM" is `team-acme-crm`. The gateway would treat those as one
+    /// server, so the team entry must be renamed the way an exact collision is.
+    #[test]
+    fn team_id_never_collides_with_a_local_id_under_sanitize() {
+        let mut r = base_registry();
+        r.servers.push(ServerEntry {
+            id: "team-acme-crm".into(),
+            name: "Team Acme CRM".into(),
+            transport: "http".into(),
+            command: None,
+            args: vec![],
+            env: vec![],
+            url: Some("https://crm.example.com/mcp".into()),
+            source: Some("manual".into()),
+            disabled_tools: vec![],
+            cwd: None,
+            client_credentials: None,
+            request_timeout_ms: None,
+            unknown_fields: serde_json::Map::new(),
+        });
+        let cfg = json!({ "servers": [
+            { "id": "acme-crm", "name": "Acme CRM", "transport": "http", "url": "https://1.2.3.4/mcp" }
+        ]});
+        assert_eq!(apply_team_config(&mut r, "t1", &cfg).applied, 1);
+        let team = r
+            .servers
+            .iter()
+            .find(|s| s.source.as_deref() == Some("team:t1"))
+            .expect("team server applied");
+        assert_eq!(team.id, "team_acme-crm-2");
+        assert!(
+            !crate::registry::ids_collide(&team.id, "team-acme-crm"),
+            "the renamed team id must not share the local server's sanitized form"
+        );
+        assert!(r.servers.iter().any(|s| s.id == "team-acme-crm"));
+    }
+
     #[test]
     fn request_timeout_round_trips_through_team_import_and_export() {
         let mut reg = base_registry();

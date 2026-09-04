@@ -145,6 +145,11 @@ fn retry_wait(retry_after: Option<std::time::Duration>, attempt: u32) -> std::ti
 
 /// Rewrite a name segment to the function-name charset clients accept
 /// (`[A-Za-z0-9_]`); every other character becomes `_`.
+///
+/// A charset rewrite, not an identity: `gh-api` and `gh_api` meet here. The
+/// gateway still keys client scope, PII origin, block exemptions and result
+/// budgets on this form, so `registry::unique_id` keeps new ids injective under
+/// it (SBS-880). Compare raw ids wherever a raw id is available.
 pub fn sanitize_segment(s: &str) -> String {
     s.chars()
         .map(|c| {
