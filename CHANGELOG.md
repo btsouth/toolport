@@ -16,6 +16,14 @@ Entries before the rename below shipped under the project's former name, Conduit
   exemptions. New ids, local or team-synced, are now kept distinct under that rewrite
   the same way an exact duplicate is renamed.
 
+- **The OpenAPI endpoint answered failed tool calls with HTTP 200.** The gateway's
+  `POST /{tool}` surface for Open WebUI, n8n and generated OpenAPI clients never looked
+  at the MCP result's `isError` flag, so a timeout, a denied destructive call, a
+  downstream crash or a misspelt tool name all came back as a 200 carrying the error
+  text as a string. Clients that branch on the status code, which is what the spec
+  documents, ran their success path. A failed call is now a 400 and an unknown tool
+  name a 404, both with `{"error": ...}` bodies; MCP clients are unaffected.
+
 ## [1.18.0] - 2026-08-30
 
 Toolport 1.18.0 adds a native GTK shell for Arch and other current-GTK Linux

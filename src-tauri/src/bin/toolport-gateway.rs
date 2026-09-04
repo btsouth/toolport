@@ -13124,7 +13124,7 @@ fn openapi_spec(
                                 "description": "The tool's text output."
                             } } }
                         },
-                        "400": err_resp("Invalid JSON body, or the tool itself returned an error."),
+                        "400": err_resp("Invalid JSON body, or the call failed: the tool returned an error, timed out, or was denied."),
                         "401": err_resp("Missing or invalid bearer token."),
                         "404": err_resp("Unknown tool name."),
                         "500": err_resp("Internal gateway error.")
@@ -13205,6 +13205,73 @@ fn result_text(resp: &Value) -> String {
         }
     }
     serde_json::to_string(result).unwrap_or_default()
+}
+
+/// The HTTP status an OpenAPI consumer should see for a tools/call result.
+///
+/// MCP reports a failed call as a successful JSON-RPC envelope whose result
+/// carries `isError`, which is right for MCP clients. An OpenAPI client has no
+/// such flag: its whole contract is the status code, and the spec above promises
+/// 400 for a failed call and 404 for an unknown tool. Returning 200 with the
+/// error text as a string let a timeout, a denied destructive call and a
+/// misspelt tool name all run the caller's success path (SBS-937). `known` is
+/// whether the requested name resolves at all (a gateway meta-tool, a grouped
+/// browse tool, a live route, or a catalog entry); the result text is never
+/// consulted for that, since a real tool's error may echo any wording.
+fn openapi_status(resp: &Value, known: bool) -> u16 {
+    let is_error = resp
+        .pointer("/result/isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match (is_error, known) {
+        (false, _) => 200,
+        (true, true) => 400,
+        (true, false) => 404,
+    }
+}
+
+/// Whether an OpenAPI tool path names something this caller can dispatch. Checked
+/// after the call so a lazily connected server's route, if the call connected it,
+/// counts; the catalog covers a known tool whose server failed to connect.
+///
+/// Scope is part of "known": a registered HTTP client only sees its servers'
+/// tools in `/openapi.json` and `tools/list`, and 404 versus 400 would otherwise
+/// tell it which names exist on servers it cannot list (the inventory boundary
+/// SBS-866 keeps fail-closed). For a scoped client only a meta-tool or a live
+/// route on an allowed server counts; anything it cannot see is 404.
+fn openapi_tool_is_known(
+    state: &GatewayState,
+    name: &str,
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    let canonical = canonical_meta(name).unwrap_or(name);
+    if is_fixed_meta_tool(canonical) {
+        return true;
+    }
+    let routed_in_scope = state
+        .router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .route_of(name)
+        .map(|(server_id, _)| match allowed {
+            Some(set) => server_in_allowed_scope(server_id, set),
+            None => true,
+        })
+        .unwrap_or(false);
+    if routed_in_scope {
+        return true;
+    }
+    if allowed.is_some() {
+        return false;
+    }
+    grouped_help_target(name).is_some()
+        || state
+            .cached_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
 }
 
 /// HTTP handler result: status, content-type, body, plus optional extra headers
@@ -13917,11 +13984,21 @@ fn handle_http_with_headers(
                             .unwrap_or("error");
                         return HttpOut::json_err(400, msg);
                     }
+                    let text = result_text(&resp);
+                    let status = openapi_status(&resp, openapi_tool_is_known(state, name, allowed));
+                    // A 404 body is fixed text: the result text for a hidden tool names
+                    // its owning server, which is exactly what a scoped client must not
+                    // learn from probing names.
+                    if status == 404 {
+                        return HttpOut::json_err(404, &format!("unknown tool '{name}'"));
+                    }
+                    if status != 200 {
+                        return HttpOut::json_err(status, &text);
+                    }
                     HttpOut::new(
                         200,
                         "application/json",
-                        serde_json::to_string(&result_text(&resp))
-                            .unwrap_or_else(|_| "\"\"".into()),
+                        serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into()),
                     )
                 }
                 None => HttpOut::json_err(500, "no response"),
@@ -22342,6 +22419,88 @@ mod tests {
         );
         assert_eq!(out.status, 204);
         assert!(out.body.is_empty());
+    }
+
+    #[test]
+    fn openapi_status_follows_the_result_error_flag() {
+        let ok = json!({ "result": { "content": [{ "type": "text", "text": "done" }] } });
+        assert_eq!(openapi_status(&ok, true), 200);
+        let explicit_ok = json!({ "result": { "content": [], "isError": false } });
+        assert_eq!(openapi_status(&explicit_ok, true), 200);
+
+        let timed_out = json!({ "result": {
+            "content": [{ "type": "text", "text": "Toolport: timed out waiting for 'tools/call' response" }],
+            "isError": true
+        } });
+        assert_eq!(openapi_status(&timed_out, true), 400);
+        assert_eq!(openapi_status(&timed_out, false), 404);
+
+        // A known tool whose error happens to echo the router's wording is still a
+        // failed call on a tool that exists, never a missing route.
+        let echoing = json!({ "result": {
+            "content": [{ "type": "text", "text": "Toolport: no route for tool 's__work'" }],
+            "isError": true
+        } });
+        assert_eq!(openapi_status(&echoing, true), 400);
+    }
+
+    #[test]
+    fn openapi_post_reports_failed_and_unknown_tools_by_status() {
+        // SBS-937: Open WebUI, n8n and generated OpenAPI clients branch on the
+        // status code. A 200 carrying error text runs their success path.
+        let (router, calls, _catalog) = counting_router(false);
+        let mut state = http_state(true);
+        state.router = Arc::new(Mutex::new(router));
+        let search = SearchGuard::default();
+        let confirm = ConfirmGuard::new();
+        let post = |path: &str| {
+            handle_http(
+                &state, &search, &confirm, "POST", path, "{}", None, None, None, None,
+            )
+        };
+
+        let ok = post("/s__work");
+        assert_eq!(ok.status, 200, "body={}", ok.body);
+        assert_eq!(ok.body, "\"called\"");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let missing = post("/no_such_tool");
+        assert_eq!(missing.status, 404, "body={}", missing.body);
+        assert_eq!(missing.body, r#"{"error":"unknown tool 'no_such_tool'"}"#);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "nothing was dispatched");
+
+        // A client scoped to another server must not learn that s__work exists:
+        // out of scope reads the same as nonexistent.
+        let scoped: std::collections::HashSet<String> = ["other".to_string()].into();
+        let hidden = handle_http(
+            &state,
+            &search,
+            &confirm,
+            "POST",
+            "/s__work",
+            "{}",
+            None,
+            None,
+            Some(&scoped),
+            None,
+        );
+        assert_eq!(hidden.status, 404, "body={}", hidden.body);
+        // Same body as a nonexistent name: the owning server must not leak either.
+        assert_eq!(hidden.body, r#"{"error":"unknown tool 's__work'"}"#);
+        let missing = handle_http(
+            &state,
+            &search,
+            &confirm,
+            "POST",
+            "/no_such_tool",
+            "{}",
+            None,
+            None,
+            Some(&scoped),
+            None,
+        );
+        assert_eq!(missing.status, 404, "body={}", missing.body);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "nothing was dispatched");
     }
 
     fn mcp_session_of(out: &HttpOut) -> String {
