@@ -571,7 +571,7 @@ Run it whichever way you prefer:
 
 - **Hosted:** sign in at [toolport.app/teams](https://toolport.app/teams) and invite your
   team, no infrastructure to run.
-- **Self-hosted:** one Docker command (`docker pull ghcr.io/tsouth89/conduit-teams`).
+- **Self-hosted:** one Docker command (`docker pull ghcr.io/btsouth/conduit-teams`).
 
 Same pricing hosted or self-hosted:
 
