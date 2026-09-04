@@ -1818,7 +1818,11 @@ fn gateway_log_tail(n: usize) -> String {
     };
     match std::fs::read_to_string(&path) {
         Ok(text) if !text.trim().is_empty() => last_lines(&text, n),
-        _ => "(no gateway log yet, connect a client to populate it)\n".to_string(),
+        Ok(_) => "(no gateway log yet, connect a client to populate it)\n".to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            "(no gateway log yet, connect a client to populate it)\n".to_string()
+        }
+        Err(e) => format!("(failed to read gateway log: {e})\n"),
     }
 }
 
@@ -5553,6 +5557,46 @@ mod tests {
             result.is_err(),
             "a failed activity-log read must reject, not resolve to null: {result:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read error must be reported as a read error, not as "no gateway log yet"
+    /// (#733) — the same class of bug as SBS-873's audit-log dashboard, and the
+    /// same fixture trick: point the log path at a directory, which fails on
+    /// every OS with no permission bits to fight in CI.
+    #[test]
+    fn gateway_log_tail_reports_read_error_not_absence() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = unique_update_test_dir("gateway-log-unreadable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let path = registry::gateway_log_path().expect("gateway log path under override");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let result = gateway_log_tail(5);
+        assert!(
+            result.starts_with("(failed to read gateway log:"),
+            "expected read-error wording, got: {result}"
+        );
+        assert!(!result.contains("no gateway log yet"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the contract: a genuinely missing log keeps its
+    /// existing, reassuring wording.
+    #[test]
+    fn gateway_log_tail_reports_absence_for_missing_log() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = unique_update_test_dir("gateway-log-missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let path = registry::gateway_log_path().expect("gateway log path under override");
+        assert!(!path.exists(), "fixture must not create the log");
+
+        let result = gateway_log_tail(5);
+        assert!(result.contains("no gateway log yet"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
