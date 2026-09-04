@@ -102,6 +102,38 @@ pub fn trim_log_if_large(path: &Path) {
     let _ = crate::registry::atomic_write(path, &kept);
 }
 
+
+/// The last `n` lines of the gateway log, formatted for the diagnostics bundle
+/// and the debug dashboard.
+///
+/// A read error is reported as a read error, including its cause, never
+/// conflated with a genuinely absent log (#733).
+pub fn tail(n: usize) -> String {
+    let Some(path) = crate::registry::gateway_log_path() else {
+        return "(log path unavailable)\n".to_string();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => last_lines(&text, n),
+        Ok(_) => "(no gateway log yet, connect a client to populate it)\n".to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            "(no gateway log yet, connect a client to populate it)\n".to_string()
+        }
+        Err(e) => format!("(failed to read gateway log: {e})\n"),
+    }
+}
+
+/// The last `n` lines of `text`, newline-terminated. Returns everything when
+/// the text has fewer than `n` lines.
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    let mut tail = lines[start..].join("\n");
+    if !tail.is_empty() {
+        tail.push('\n');
+    }
+    tail
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +152,64 @@ mod tests {
             "toolport-sbs869-gatewaylog-{}-{nanos}-{n}.log",
             std::process::id()
         ))
+    }
+
+    fn unique_data_dir(label: &str) -> PathBuf {
+        let n = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "toolport-{label}-{}-{nanos}-{n}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn last_lines_returns_the_tail() {
+        let text = "a\nb\nc\nd\ne";
+        assert_eq!(last_lines(text, 2), "d\ne\n");
+        assert_eq!(last_lines(text, 99), "a\nb\nc\nd\ne\n");
+        assert_eq!(last_lines("", 10), "");
+    }
+
+    /// A read error must be reported as a read error, not as "no gateway log
+    /// yet" (#733).
+    #[test]
+    fn tail_reports_read_error_not_absence() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = unique_data_dir("gateway-log-unreadable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let path = crate::registry::gateway_log_path().expect("gateway log path under override");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let result = tail(5);
+        assert!(
+            result.starts_with("(failed to read gateway log:"),
+            "expected read-error wording, got: {result}"
+        );
+        assert!(!result.contains("no gateway log yet"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the contract: a genuinely missing log keeps its
+    /// existing, reassuring wording.
+    #[test]
+    fn tail_reports_absence_for_missing_log() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = unique_data_dir("gateway-log-missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let path = crate::registry::gateway_log_path().expect("gateway log path under override");
+        assert!(!path.exists(), "fixture must not create the log");
+
+        let result = tail(5);
+        assert!(result.contains("no gateway log yet"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn lock_sibling(path: &Path) -> PathBuf {

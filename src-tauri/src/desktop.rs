@@ -1813,29 +1813,7 @@ fn redact_arg_for_sharing(arg: &str) -> String {
 /// The last `n` lines of the always-on gateway log, or a friendly note when it
 /// hasn't been written yet (no client has connected through the gateway).
 fn gateway_log_tail(n: usize) -> String {
-    let Some(path) = registry::gateway_log_path() else {
-        return "(log path unavailable)\n".to_string();
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(text) if !text.trim().is_empty() => last_lines(&text, n),
-        Ok(_) => "(no gateway log yet, connect a client to populate it)\n".to_string(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            "(no gateway log yet, connect a client to populate it)\n".to_string()
-        }
-        Err(e) => format!("(failed to read gateway log: {e})\n"),
-    }
-}
-
-/// The last `n` lines of `text`, newline-terminated. Returns everything when the
-/// text has fewer than `n` lines.
-fn last_lines(text: &str, n: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    let mut tail = lines[start..].join("\n");
-    if !tail.is_empty() {
-        tail.push('\n');
-    }
-    tail
+    crate::gatewaylog::tail(n)
 }
 
 /// How long to wait for one server's probe before giving up on it. Generous
@@ -5561,45 +5539,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A read error must be reported as a read error, not as "no gateway log yet"
-    /// (#733) — the same class of bug as SBS-873's audit-log dashboard, and the
-    /// same fixture trick: point the log path at a directory, which fails on
-    /// every OS with no permission bits to fight in CI.
-    #[test]
-    fn gateway_log_tail_reports_read_error_not_absence() {
-        let _lock = crate::registry::data_dir_test_lock();
-        let dir = unique_update_test_dir("gateway-log-unreadable");
-        std::fs::create_dir_all(&dir).unwrap();
-        let _override = crate::registry::DataDirOverride::set(&dir);
-        let path = registry::gateway_log_path().expect("gateway log path under override");
-        std::fs::create_dir_all(&path).unwrap();
-
-        let result = gateway_log_tail(5);
-        assert!(
-            result.starts_with("(failed to read gateway log:"),
-            "expected read-error wording, got: {result}"
-        );
-        assert!(!result.contains("no gateway log yet"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The other half of the contract: a genuinely missing log keeps its
-    /// existing, reassuring wording.
-    #[test]
-    fn gateway_log_tail_reports_absence_for_missing_log() {
-        let _lock = crate::registry::data_dir_test_lock();
-        let dir = unique_update_test_dir("gateway-log-missing");
-        std::fs::create_dir_all(&dir).unwrap();
-        let _override = crate::registry::DataDirOverride::set(&dir);
-        let path = registry::gateway_log_path().expect("gateway log path under override");
-        assert!(!path.exists(), "fixture must not create the log");
-
-        let result = gateway_log_tail(5);
-        assert!(result.contains("no gateway log yet"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     /// The other half of the contract: a missing log is an honest empty
     /// dashboard, so a first run still resolves.
@@ -6559,17 +6498,6 @@ mod tests {
         assert_eq!(parse_share_url("toolport://import?x=1"), None);
         assert_eq!(parse_share_url("conduit://import?s=../etc"), None);
         assert_eq!(parse_share_url("https://example.com?s=abc"), None);
-    }
-
-    #[test]
-    fn last_lines_returns_the_tail() {
-        let text = "a\nb\nc\nd\ne";
-        // Fewer requested than available: just the tail, newline-terminated.
-        assert_eq!(last_lines(text, 2), "d\ne\n");
-        // More requested than available: everything.
-        assert_eq!(last_lines(text, 99), "a\nb\nc\nd\ne\n");
-        // Empty input stays empty (no stray newline).
-        assert_eq!(last_lines("", 10), "");
     }
 
     #[test]
