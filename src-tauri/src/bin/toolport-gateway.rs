@@ -13986,6 +13986,12 @@ fn handle_http_with_headers(
                     }
                     let text = result_text(&resp);
                     let status = openapi_status(&resp, openapi_tool_is_known(state, name, allowed));
+                    // A 404 body is fixed text: the result text for a hidden tool names
+                    // its owning server, which is exactly what a scoped client must not
+                    // learn from probing names.
+                    if status == 404 {
+                        return HttpOut::json_err(404, &format!("unknown tool '{name}'"));
+                    }
                     if status != 200 {
                         return HttpOut::json_err(status, &text);
                     }
@@ -22460,12 +22466,7 @@ mod tests {
 
         let missing = post("/no_such_tool");
         assert_eq!(missing.status, 404, "body={}", missing.body);
-        let body: Value = serde_json::from_str(&missing.body).expect("json error body");
-        let error = body["error"].as_str().expect("error string");
-        assert!(
-            error.contains("no route for tool 'no_such_tool'"),
-            "error={error}"
-        );
+        assert_eq!(missing.body, r#"{"error":"unknown tool 'no_such_tool'"}"#);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "nothing was dispatched");
 
         // A client scoped to another server must not learn that s__work exists:
@@ -22484,6 +22485,8 @@ mod tests {
             None,
         );
         assert_eq!(hidden.status, 404, "body={}", hidden.body);
+        // Same body as a nonexistent name: the owning server must not leak either.
+        assert_eq!(hidden.body, r#"{"error":"unknown tool 's__work'"}"#);
         let missing = handle_http(
             &state,
             &search,
