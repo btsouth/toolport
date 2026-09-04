@@ -24,6 +24,16 @@ Entries before the rename below shipped under the project's former name, Conduit
   documents, ran their success path. A failed call is now a 400 and an unknown tool
   name a 404, both with `{"error": ...}` bodies; MCP clients are unaffected.
 
+- **A code-mode script's final result skipped content defense.** Every intermediate
+  `toolport.call` result was scanned, wrapped and, in block mode, withheld, but the
+  value the script composed from them went to the model with only the size pass. A
+  payload split across two results that each passed on their own, or a script that
+  trimmed an intermediate's provenance wrapper, arrived unscanned; the structured copy
+  of the aggregate did too. The aggregate, and the failure text on a script error, now
+  get the same PII, brand-spoof and injection passes as a direct result. They are
+  attributed to the script rather than to a server, so a per-server block exemption
+  cannot cover a multi-server result. Routines share the same path.
+
 ## [1.18.0] - 2026-08-30
 
 Toolport 1.18.0 adds a native GTK shell for Arch and other current-GTK Linux
