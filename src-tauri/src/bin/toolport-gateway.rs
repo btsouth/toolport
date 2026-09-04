@@ -13230,30 +13230,48 @@ fn openapi_status(resp: &Value, known: bool) -> u16 {
     }
 }
 
-/// Whether an OpenAPI tool path names something the gateway can dispatch. Checked
+/// Whether an OpenAPI tool path names something this caller can dispatch. Checked
 /// after the call so a lazily connected server's route, if the call connected it,
 /// counts; the catalog covers a known tool whose server failed to connect.
-fn openapi_tool_is_known(state: &GatewayState, name: &str) -> bool {
+///
+/// Scope is part of "known": a registered HTTP client only sees its servers'
+/// tools in `/openapi.json` and `tools/list`, and 404 versus 400 would otherwise
+/// tell it which names exist on servers it cannot list (the inventory boundary
+/// SBS-866 keeps fail-closed). For a scoped client only a meta-tool or a live
+/// route on an allowed server counts; anything it cannot see is 404.
+fn openapi_tool_is_known(
+    state: &GatewayState,
+    name: &str,
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> bool {
     let canonical = canonical_meta(name).unwrap_or(name);
-    if is_fixed_meta_tool(canonical) || grouped_help_target(name).is_some() {
+    if is_fixed_meta_tool(canonical) {
         return true;
     }
-    let routed = state
+    let routed_in_scope = state
         .router
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .route_of(name)
-        .is_some();
-    if routed {
+        .map(|(server_id, _)| match allowed {
+            Some(set) => server_in_allowed_scope(server_id, set),
+            None => true,
+        })
+        .unwrap_or(false);
+    if routed_in_scope {
         return true;
     }
-    state
-        .cached_tools
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .tools
-        .iter()
-        .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+    if allowed.is_some() {
+        return false;
+    }
+    grouped_help_target(name).is_some()
+        || state
+            .cached_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
 }
 
 /// HTTP handler result: status, content-type, body, plus optional extra headers
@@ -13967,7 +13985,7 @@ fn handle_http_with_headers(
                         return HttpOut::json_err(400, msg);
                     }
                     let text = result_text(&resp);
-                    let status = openapi_status(&resp, openapi_tool_is_known(state, name));
+                    let status = openapi_status(&resp, openapi_tool_is_known(state, name, allowed));
                     if status != 200 {
                         return HttpOut::json_err(status, &text);
                     }
@@ -22448,6 +22466,37 @@ mod tests {
             error.contains("no route for tool 'no_such_tool'"),
             "error={error}"
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "nothing was dispatched");
+
+        // A client scoped to another server must not learn that s__work exists:
+        // out of scope reads the same as nonexistent.
+        let scoped: std::collections::HashSet<String> = ["other".to_string()].into();
+        let hidden = handle_http(
+            &state,
+            &search,
+            &confirm,
+            "POST",
+            "/s__work",
+            "{}",
+            None,
+            None,
+            Some(&scoped),
+            None,
+        );
+        assert_eq!(hidden.status, 404, "body={}", hidden.body);
+        let missing = handle_http(
+            &state,
+            &search,
+            &confirm,
+            "POST",
+            "/no_such_tool",
+            "{}",
+            None,
+            None,
+            Some(&scoped),
+            None,
+        );
+        assert_eq!(missing.status, 404, "body={}", missing.body);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "nothing was dispatched");
     }
 
