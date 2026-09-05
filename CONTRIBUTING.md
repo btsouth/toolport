@@ -25,7 +25,7 @@ use a separate data dir — `%APPDATA%\\Roaming\\Toolport-dev` on Windows,
 installed release data. Override with `TOOLPORT_DATA_DIR` (legacy: `CONDUIT_DATA_DIR`)
 for headless tests.
 
-On macOS/Linux, see the platform notes in the [README troubleshooting](README.md#troubleshooting).
+On macOS/Linux, see the platform notes in the [troubleshooting guide](docs/troubleshooting.md).
 
 ## Development workflow
 
@@ -241,7 +241,7 @@ server in the UI takes effect without restarting the client.
   GNOME Keyring or KWallet unlocked.
 
 For end-user troubleshooting (OAuth, AppImage, VS Code), see the
-[README troubleshooting section](README.md#troubleshooting).
+[troubleshooting guide](docs/troubleshooting.md).
 
 ## Layout
 
