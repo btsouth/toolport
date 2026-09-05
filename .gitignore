@@ -121,3 +121,6 @@ src-tauri/rate_limit_counters.test.json
 /packaging/linux/aur/PKGBUILD
 /packaging/linux/aur/.SRCINFO
 /aur/
+
+# Local verification logs and screenshots
+/.verify/

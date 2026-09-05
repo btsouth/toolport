@@ -141,3 +141,7 @@ debug = "line-tables-only"
 # Same for the profile `cargo test` builds under.
 [profile.test]
 debug = "line-tables-only"
+
+[[example]]
+name = "audit-performance"
+required-features = ["test-support"]

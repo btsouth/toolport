@@ -139,6 +139,24 @@ jobs:
       - name: Frontend tests
         run: npm run test
 
+      - name: Startup bundle budget
+        run: npm run bench:bundle
+
+      - name: Install browser for offline UI smoke
+        run: npx playwright install --with-deps chromium
+
+      - name: Offline browser fixture smoke
+        run: npm run smoke:browser
+
+      - name: Keep browser failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: browser-smoke-diagnostics
+          path: .verify/browser-*/
+          include-hidden-files: true
+          if-no-files-found: ignore
+
       # Run the library, standalone binary, and integration targets explicitly.
       # Keeping all three flags prevents any test class from silently dropping
       # out of CI when the command is updated.

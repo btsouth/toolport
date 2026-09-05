@@ -1,31 +1,43 @@
+import amazonQ from "@/assets/client-logos/amazon-q.svg?raw";
 import { cn } from "@/lib/utils";
 
-/**
- * Official client brand logos.
- *
- * SVGs are vendored under src/assets/client-logos (no runtime dependency), sourced from
- * @lobehub/icons-static-svg (MIT), simple-icons (CC0), and devicon (MIT), plus a handful
- * taken from the vendor's own published mark where no icon set carries it (Factory Droid,
- * BoltAI, AnythingLLM, Continue, Oh My Pi). Full-color marks keep their own
- * fills; monochrome marks are authored with `fill="currentColor"`, so they inherit the
- * surrounding text color and stay legible on both the light and dark (navy) themes.
- *
- * Each file is a 24x24 viewBox sized in `1em`, so the wrapper's font-size sets the render
- * size. Clients without a vendored logo fall back to a neutral monogram badge.
- */
-const RAW = import.meta.glob("../assets/client-logos/*.svg", {
-  query: "?raw",
+// Vendored official marks from @lobehub/icons-static-svg (MIT), simple-icons
+// (CC0), devicon (MIT), and vendor-published marks for Factory Droid, BoltAI,
+// AnythingLLM, Continue, and Oh My Pi.
+// External local assets load only for clients actually on screen and can be
+// cached by the webview. Keep the mixed-color Amazon mark inline because its
+// orange accent and inherited foreground cannot both be expressed by a mask.
+const URLS = import.meta.glob("../assets/client-logos/*.svg", {
+  query: "?url&no-inline",
   import: "default",
   eager: true,
 }) as Record<string, string>;
-
-// basename (without .svg) -> raw SVG markup
-const LOGOS: Record<string, string> = Object.fromEntries(
-  Object.entries(RAW).map(([path, svg]) => [
+const LOGOS = Object.fromEntries(
+  Object.entries(URLS).map(([path, url]) => [
     path.split("/").pop()!.replace(".svg", ""),
-    svg,
+    url,
   ]),
 );
+const MONOCHROME = new Set([
+  "amp",
+  "anythingllm",
+  "boltai",
+  "cline",
+  "continue",
+  "cursor",
+  "devin",
+  "droid",
+  "github-copilot-cli",
+  "goose",
+  "grok",
+  "hermes",
+  "kilo-code",
+  "kimi-code",
+  "lm-studio",
+  "opencode",
+  "pi",
+  "roo-code",
+]);
 
 /**
  * Client id -> logo file basename. Most ids match their filename; the two Claude clients
@@ -90,16 +102,30 @@ export function ClientLogo({
   size?: number;
   className?: string;
 }) {
-  const svg = LOGOS[CLIENT_LOGO[id] ?? ""];
+  const key = CLIENT_LOGO[id] ?? "";
+  const url = LOGOS[key];
 
-  if (svg) {
+  if (url) {
     return (
       <span
         aria-hidden
         className={cn("inline-flex shrink-0 items-center justify-center", className)}
         style={{ fontSize: size, lineHeight: 0, width: size, height: size }}
-        dangerouslySetInnerHTML={{ __html: svg }}
-      />
+      >
+        {key === "amazon-q" ? (
+          <span dangerouslySetInnerHTML={{ __html: amazonQ }} />
+        ) : MONOCHROME.has(key) ? (
+          <span
+            className="size-full bg-current"
+            style={{
+              mask: `url("${url}") center / contain no-repeat`,
+              WebkitMask: `url("${url}") center / contain no-repeat`,
+            }}
+          />
+        ) : (
+          <img src={url} alt="" className="size-full object-contain" />
+        )}
+      </span>
     );
   }
 

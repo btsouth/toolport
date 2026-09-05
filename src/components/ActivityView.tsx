@@ -1,3 +1,4 @@
+import { useWindowVisible } from "@/lib/windowVisible";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
@@ -1528,20 +1529,16 @@ export function ActivityView({
     }
   }
 
-  // Live update (SOU-142): tool calls never touch the registry, so the parent's refreshKey
-  // never bumps for them and the feed would sit frozen while an agent works. While Activity
-  // is mounted, tick every few seconds so the call list + Live Inspector refetch the local
-  // logs in place (silent, no spinner). Mirrors how PendingApprovals polls. The visibility
-  // check skips a tick when the webview reports the page hidden; it's best-effort (a desktop
-  // webview doesn't reliably flip visibilityState on minimize), but each tick is only a few
-  // cheap local-file reads, so continuing while minimized costs next to nothing.
+  // Native visibility also covers a window hidden to the tray, where the
+  // webview may keep reporting "visible". Pause file reads and rerenders while
+  // the user is elsewhere; resume within one tick when they return.
+  const windowVisible = useWindowVisible();
   const [liveTick, setLiveTick] = useState(0);
   useEffect(() => {
-    const id = setInterval(() => {
-      if (document.visibilityState === "visible") setLiveTick((t) => t + 1);
-    }, 3000);
+    if (!windowVisible) return;
+    const id = setInterval(() => setLiveTick((t) => t + 1), 3000);
     return () => clearInterval(id);
-  }, []);
+  }, [windowVisible]);
   // Combined so panels refetch on either a registry change or a live tick. Both counters
   // only increase, so the sum always changes when either does (no collisions).
   const liveKey = refreshKey + liveTick;

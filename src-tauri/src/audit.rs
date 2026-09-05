@@ -682,7 +682,58 @@ pub fn tool_call_ok(entry: &Value) -> Option<bool> {
 /// retained (the byte cap bounds it), not a fixed window, so the error rate stays consistent
 /// with the call count instead of being taken over an arbitrary slice.
 pub fn stats() -> std::io::Result<Value> {
-    Ok(aggregate(&read_all()?))
+    // Read on every request: metadata alone can miss equal-length replacements,
+    // coarse timestamps, and changes from another gateway process.
+    let content = match audit_path().map(std::fs::read_to_string) {
+        None => String::new(),
+        Some(Ok(content)) => content,
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Some(Err(e)) => return Err(e),
+    };
+    static CACHE: std::sync::Mutex<StatsCache> = std::sync::Mutex::new(StatsCache {
+        content: None,
+        stats: Value::Null,
+    });
+    Ok(CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(content))
+}
+
+/// Cache one exact snapshot, bounded by the normal log cap. Idle Activity polls
+/// still read the file but avoid reparsing every retained row and sorting all
+/// duration samples. Errors are returned before consulting this cache.
+struct StatsCache {
+    content: Option<String>,
+    stats: Value,
+}
+
+impl StatsCache {
+    fn get(&mut self, content: String) -> Value {
+        if self.content.as_ref() == Some(&content) {
+            return self.stats.clone();
+        }
+        // Release the previous snapshot before parsing its replacement. Feed
+        // rows directly to the accumulator instead of retaining a JSON tree
+        // for every row (including error text that stats never uses).
+        self.content = None;
+        self.stats = Value::Null;
+        let stats = aggregate_rows(
+            content
+                .lines()
+                .rev()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok()),
+        );
+        if content.len() as u64 <= MAX_AUDIT_BYTES {
+            self.content = Some(content);
+            self.stats = stats.clone();
+        } else {
+            // Oversized imports still aggregate correctly without being retained.
+            self.content = None;
+            self.stats = Value::Null;
+        }
+        stats
+    }
 }
 
 /// [`stats`] over entries the caller already read, so a view that needs both the
@@ -694,6 +745,10 @@ pub fn stats_for_entries(entries: &[Value]) -> Value {
 /// Pure aggregation of audit entries into per-server + global stats. Split from
 /// `stats` so the dashboard math is testable without touching the on-disk log.
 fn aggregate(entries: &[Value]) -> Value {
+    aggregate_rows(entries)
+}
+
+fn aggregate_rows<T: std::borrow::Borrow<Value>>(entries: impl IntoIterator<Item = T>) -> Value {
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -717,7 +772,8 @@ fn aggregate(entries: &[Value]) -> Value {
     let mut total = 0u64;
     let mut errors = 0u64;
 
-    for e in entries {
+    for row in entries {
+        let e = row.borrow();
         let Some(ok) = tool_call_ok(e) else {
             continue;
         };
@@ -930,6 +986,27 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn stats_cache_tracks_exact_contents_and_bounds_retention() {
+        let mut cache = StatsCache {
+            content: None,
+            stats: Value::Null,
+        };
+        let first = "{\"server\":\"old\",\"ok\":true,\"durationMs\":10}\n";
+        let expected = aggregate(&[serde_json::from_str(first).unwrap()]);
+        assert_eq!(cache.get(first.into()), expected);
+        assert_eq!(cache.get(first.into()), expected);
+        let replaced = first.replace("old", "new");
+        assert_eq!(replaced.len(), first.len());
+        assert_eq!(cache.get(replaced.clone())["servers"][0]["server"], "new");
+        assert_eq!(cache.get(format!("{replaced}{first}broken\n"))["total"], 2);
+        assert_eq!(cache.get(String::new())["total"], 0);
+        let oversized = format!("{}{first}", " ".repeat(MAX_AUDIT_BYTES as usize + 1));
+        assert_eq!(cache.get(oversized)["total"], 1);
+        assert!(cache.content.is_none());
+        assert_eq!(cache.get(first.into()), expected);
     }
 
     #[test]
@@ -1587,6 +1664,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("scratch data dir");
         (crate::registry::DataDirOverride::set(&path), path)
+    }
+
+    #[test]
+    fn stats_cache_never_hides_read_errors_or_cleared_history() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("stats-cache");
+        let _cleanup = AuditProcessFixture::new(root);
+        let path = audit_path().unwrap();
+        std::fs::write(&path, "{\"server\":\"s\",\"ok\":true}\n").unwrap();
+        assert_eq!(stats().unwrap()["total"], 1);
+        assert_eq!(stats().unwrap()["total"], 1);
+        std::fs::write(&path, [0xff]).unwrap();
+        assert_eq!(stats().unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(stats().is_err());
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(stats().unwrap()["total"], 0);
+        std::fs::write(&path, "{\"server\":\"s\",\"ok\":false}\n").unwrap();
+        assert_eq!(stats().unwrap()["errors"], 1);
+        try_clear().unwrap();
+        assert_eq!(stats().unwrap()["total"], 0);
     }
 
     /// A missing audit.jsonl is an empty log, not a load failure.
