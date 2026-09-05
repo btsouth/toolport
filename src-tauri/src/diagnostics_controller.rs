@@ -140,7 +140,13 @@ fn gateway_log_tail(lines: usize) -> String {
     };
     match std::fs::read_to_string(path) {
         Ok(text) if !text.trim().is_empty() => last_lines(&text, lines),
-        _ => "(no gateway log yet, connect a client to populate it)\n".to_string(),
+        Ok(_) => "(no gateway log yet, connect a client to populate it)\n".to_string(),
+        // A log that could not be read is exactly what a bug report needs to
+        // carry, which is why `registry::load`'s error is written out above
+        // rather than defaulted away. Reporting a permission error or a locked
+        // file as an absent log sends the reader looking for a client that
+        // never connected.
+        Err(error) => format!("(gateway log unreadable: {error})\n"),
     }
 }
 
