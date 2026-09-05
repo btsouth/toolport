@@ -140,7 +140,18 @@ fn gateway_log_tail(lines: usize) -> String {
     };
     match std::fs::read_to_string(path) {
         Ok(text) if !text.trim().is_empty() => last_lines(&text, lines),
-        _ => "(no gateway log yet, connect a client to populate it)\n".to_string(),
+        Ok(_) => "(no gateway log yet, connect a client to populate it)\n".to_string(),
+        // gatewaylog::append creates the file on the first line written, so
+        // before any client has connected there is genuinely no log yet. That
+        // is the absent case, not a failure, and it stays worded as one.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            "(no gateway log yet, connect a client to populate it)\n".to_string()
+        }
+        // Every other error is what a bug report needs to carry, which is why
+        // `registry::load`'s failure is written out above rather than defaulted
+        // away. Reporting a permission error or a locked file as an absent log
+        // sends the reader looking for a client that never connected.
+        Err(error) => format!("(gateway log unreadable: {error})\n"),
     }
 }
 
