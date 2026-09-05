@@ -27,7 +27,16 @@
     "bench:compare": "node benchmark/compare-local.mjs",
     "bench:mcp-native": "node benchmark/mcp-native.mjs",
     "audit:prod": "npm audit --omit=dev",
-    "prepare": "husky"
+    "prepare": "husky",
+    "doctor": "node scripts/doctor.mjs",
+    "verify": "node scripts/verify.mjs",
+    "verify:frontend": "node scripts/verify.mjs --frontend",
+    "verify:headless": "node scripts/verify.mjs --headless",
+    "typecheck": "tsc --noEmit",
+    "smoke:browser": "node scripts/browser-smoke.mjs",
+    "dev:fixture": "vite --host 127.0.0.1 --open /fixtures/",
+    "bench:bundle": "node benchmark/bundle.mjs",
+    "bench:audit": "cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support --example audit-performance"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.2.9",
@@ -50,6 +59,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.63.0",
     "@tauri-apps/cli": "^2",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",

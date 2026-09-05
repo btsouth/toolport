@@ -8,20 +8,12 @@ const host = process.env.TAURI_DEV_HOST;
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [react(), tailwindcss()],
+  build: { manifest: true },
 
   resolve: {
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
     },
-  },
-
-  // Vitest config: reuses the alias above so tests can import via "@/lib/...".
-  // jsdom + Testing Library so component (*.test.tsx) flows run alongside the
-  // pure-logic src/lib tests; setup registers jest-dom matchers and RTL cleanup.
-  test: {
-    environment: "jsdom",
-    include: ["src/**/*.test.{ts,tsx}"],
-    setupFiles: ["./src/test/setup.ts"],
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

@@ -14,21 +14,14 @@ import { createHmac } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const defaultBinary = path.join(
+const targetDir = path.resolve(
   repoRoot,
-  "src-tauri",
-  "target",
-  "debug",
-  process.platform === "win32" ? "toolport-gateway.exe" : "toolport-gateway",
+  process.env.CARGO_TARGET_DIR || "src-tauri/target",
 );
-const gatewayBinary = process.env.TOOLPORT_GATEWAY_BIN || defaultBinary;
-const mockBinary = path.join(
-  repoRoot,
-  "src-tauri",
-  "target",
-  "debug",
-  process.platform === "win32" ? "mock-mcp-server.exe" : "mock-mcp-server",
-);
+const binaryPath = (name) =>
+  path.join(targetDir, "debug", process.platform === "win32" ? `${name}.exe` : name);
+const gatewayBinary = process.env.TOOLPORT_GATEWAY_BIN || binaryPath("toolport-gateway");
+const mockBinary = process.env.TOOLPORT_MOCK_BIN || binaryPath("mock-mcp-server");
 const token = "smoke-test-token-32chars-minimum!!";
 const children = new Set();
 let smokeDir;

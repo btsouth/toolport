@@ -12,19 +12,22 @@
 //   node benchmark/latency.mjs 200 --check               (enforce latency-budget.json)
 //
 // Needs a debug build first:
-//   cargo build --manifest-path src-tauri/Cargo.toml --bins
+//   npm run build:gateway
 
 import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DEBUG = join(__dirname, "..", "src-tauri", "target", "debug");
+const DEBUG = join(
+  resolve(__dirname, "..", process.env.CARGO_TARGET_DIR || "src-tauri/target"),
+  "debug",
+);
 const exe = (n) => join(DEBUG, process.platform === "win32" ? `${n}.exe` : n);
-const GATEWAY = exe("toolport-gateway");
-const MOCK = exe("mock-mcp-server");
+const GATEWAY = process.env.TOOLPORT_GATEWAY_BIN || exe("toolport-gateway");
+const MOCK = process.env.TOOLPORT_MOCK_BIN || exe("mock-mcp-server");
 const args = process.argv.slice(2);
 const N = Math.max(20, Number(args.find((arg) => /^\d+$/.test(arg)) || 200));
 const JSON_OUTPUT = args.includes("--json");
@@ -36,9 +39,7 @@ for (const [label, p] of [
   ["mock server", MOCK],
 ]) {
   if (!existsSync(p)) {
-    console.error(
-      `Missing ${label} at ${p}\nBuild it first:\n  cargo build --manifest-path src-tauri/Cargo.toml --bins`,
-    );
+    console.error(`Missing ${label} at ${p}\nBuild it first:\n  npm run build:gateway`);
     process.exit(1);
   }
 }
@@ -55,6 +56,21 @@ const stats = (xs) => {
 function client(proc) {
   const pending = new Map();
   let buf = "";
+  let stopped;
+  const failPending = (error) => {
+    stopped = error;
+    for (const request of pending.values()) {
+      clearTimeout(request.timer);
+      request.reject(error);
+    }
+    pending.clear();
+  };
+  proc.once("error", failPending);
+  proc.stdin.on("error", failPending);
+  proc.stdout.on("error", failPending);
+  proc.once("close", (code, signal) =>
+    failPending(new Error(`RPC process closed (${code ?? signal})`)),
+  );
   proc.stdout.on("data", (d) => {
     buf += d.toString();
     let i;
@@ -69,17 +85,26 @@ function client(proc) {
         continue;
       }
       if (m.id != null && pending.has(m.id)) {
-        pending.get(m.id)(m);
+        const request = pending.get(m.id);
+        clearTimeout(request.timer);
         pending.delete(m.id);
+        if (m.error || m.result?.isError)
+          request.reject(new Error(`RPC failed: ${JSON.stringify(m.error || m.result)}`));
+        else request.resolve(m);
       }
     }
   });
   let id = 0;
   return {
     call: (method, params) =>
-      new Promise((res) => {
+      new Promise((resolve, reject) => {
+        if (stopped) return reject(stopped);
         const myId = ++id;
-        pending.set(myId, res);
+        const timer = setTimeout(() => {
+          pending.delete(myId);
+          reject(new Error(`${method} timed out after 10 seconds`));
+        }, 10_000);
+        pending.set(myId, { resolve, reject, timer });
         proc.stdin.write(
           JSON.stringify({ jsonrpc: "2.0", id: myId, method, params }) + "\n",
         );
@@ -115,9 +140,58 @@ const INIT = {
   clientInfo: { name: "bench", version: "0" },
 };
 
+const children = new Set();
+let scratch;
+let cleanupPromise;
+function start(binary, options) {
+  const proc = spawn(binary, [], options);
+  children.add(proc);
+  proc.once("close", () => children.delete(proc));
+  return proc;
+}
+function cleanup() {
+  return (cleanupPromise ??= (async () => {
+    await Promise.all(
+      [...children].map(
+        (proc) =>
+          new Promise((resolve) => {
+            const timer = setTimeout(() => proc.kill("SIGKILL"), 2000);
+            proc.once("close", () => {
+              clearTimeout(timer);
+              resolve();
+            });
+            proc.kill();
+          }),
+      ),
+    );
+    if (scratch)
+      rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  })());
+}
+for (const [signal, code] of [
+  ["SIGINT", 130],
+  ["SIGTERM", 143],
+]) {
+  process.once(signal, () => {
+    void cleanup().finally(() => process.exit(code));
+  });
+}
+
 async function main() {
   const dir = mkdtempSync(join(tmpdir(), "conduit-lat-"));
+  scratch = dir;
   const regPath = join(dir, "registry.json");
+  // Benchmarks must not inherit the user's data/profile overrides or write logs
+  // and caches into an installed Toolport instance.
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => !/^(TOOLPORT|CONDUIT)_/.test(key)),
+  );
+  Object.assign(env, {
+    TOOLPORT_DATA_DIR: dir,
+    TOOLPORT_REGISTRY: regPath,
+    TOOLPORT_PROFILE: "bench",
+    TOOLPORT_DISCOVERY: "lazy",
+  });
   writeFileSync(
     regPath,
     JSON.stringify({
@@ -139,15 +213,14 @@ async function main() {
   );
 
   // 1) The mock directly: discover a tool name and measure the bare call latency.
-  const mk = spawn(MOCK, [], { stdio: ["pipe", "pipe", "ignore"] });
+  const mk = start(MOCK, { env, stdio: ["pipe", "pipe", "ignore"] });
   const m = client(mk);
   await m.call("initialize", INIT);
   m.notify("notifications/initialized");
   await sleep(200);
   const tools = (await m.call("tools/list", {})).result?.tools || [];
   if (!tools.length) {
-    console.error("mock advertised no tools; cannot benchmark the call path");
-    process.exit(1);
+    throw new Error("mock advertised no tools; cannot benchmark the call path");
   }
   const bare = tools[0].name;
   for (let k = 0; k < 15; k++) await m.call("tools/call", { name: bare, arguments: {} });
@@ -155,13 +228,8 @@ async function main() {
 
   // 2) Through the gateway.
   const gatewayStarted = now();
-  const gw = spawn(GATEWAY, [], {
-    env: {
-      ...process.env,
-      CONDUIT_REGISTRY: regPath,
-      CONDUIT_PROFILE: "bench",
-      CONDUIT_DISCOVERY: "lazy",
-    },
+  const gw = start(GATEWAY, {
+    env,
     stdio: ["pipe", "pipe", "ignore"],
   });
   const g = client(gw);
@@ -194,12 +262,6 @@ async function main() {
       }),
     N,
   );
-
-  mk.stdin.end();
-  mk.kill();
-  gw.stdin.end();
-  gw.kill();
-  rmSync(dir, { recursive: true, force: true });
 
   const overhead = {
     median: gwCall.median - direct.median,
@@ -280,7 +342,9 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+main()
+  .catch((e) => {
+    console.error(`Latency benchmark failed: ${e.message}`);
+    process.exitCode = 1;
+  })
+  .finally(cleanup);

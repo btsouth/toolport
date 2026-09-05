@@ -4,6 +4,9 @@ import userEvent from "@testing-library/user-event";
 import { ActivityView } from "./ActivityView";
 import type { AuditEntry, SearchTrace } from "@/lib/types";
 
+let windowVisible = true;
+vi.mock("@/lib/windowVisible", () => ({ useWindowVisible: () => windowVisible }));
+
 const getAuditLog = vi.fn();
 const getSearchTraces = vi.fn();
 const getSecurityEvents = vi.fn();
@@ -52,6 +55,7 @@ const initialLog = [failed, entry()];
 const refreshedLog = [entry({ ts: 1700000002000, tool: "list_issues" }), ...initialLog];
 
 beforeEach(() => {
+  windowVisible = true;
   vi.useFakeTimers({ shouldAdvanceTime: true });
   getAuditLog.mockResolvedValue(initialLog);
   getSearchTraces.mockResolvedValue([]);
@@ -61,6 +65,22 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
+});
+
+it("pauses Activity polling while hidden and resumes when visible", async () => {
+  const view = render(<ActivityView refreshKey={0} registry={null} />);
+  await act(async () => {});
+  const loaded = getAuditLog.mock.calls.length;
+  await act(() => vi.advanceTimersByTimeAsync(3000));
+  expect(getAuditLog).toHaveBeenCalledTimes(loaded + 1);
+  windowVisible = false;
+  view.rerender(<ActivityView refreshKey={0} registry={null} />);
+  await act(() => vi.advanceTimersByTimeAsync(60_000));
+  expect(getAuditLog).toHaveBeenCalledTimes(loaded + 1);
+  windowVisible = true;
+  view.rerender(<ActivityView refreshKey={0} registry={null} />);
+  await act(() => vi.advanceTimersByTimeAsync(3000));
+  expect(getAuditLog).toHaveBeenCalledTimes(loaded + 2);
 });
 
 describe("ActivityView trust-state loading", () => {

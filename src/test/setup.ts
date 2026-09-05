@@ -1,12 +1,18 @@
 // Vitest setup for React component tests. The existing src/lib tests use explicit
 // vitest imports (globals off), so we register jest-dom matchers and Testing Library
 // cleanup here rather than relying on auto-injected globals.
-import { afterEach } from "vitest";
+import { afterEach, vi } from "vitest";
+import { setTimeout as nextTimerTurn } from "node:timers/promises";
 import { cleanup } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  // Radix restores focus on a zero-delay timer when a dialog unmounts. Let it
+  // run before jsdom tears down its Event realm; otherwise the timer can create
+  // a Node Event and dispatch it on an old jsdom element after the file passed.
+  if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(0);
+  await nextTimerTurn(0);
   // Reset the in-memory storage so localStorage state never leaks across tests.
   storageData.clear();
 });
