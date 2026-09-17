@@ -128,7 +128,7 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
         ),
         "You.com" => (
             "https://you.com/platform/api-keys",
-            "Create an API key and paste it here. For basic web search only, you can instead add the server with the URL https://api.you.com/mcp?profile=free and skip the key.",
+            "Create an API key, then after adding the server open its Secrets dialog and paste it into the Access token field (it is sent as the Authorization bearer). For basic web search only, you can instead add the server with the URL https://api.you.com/mcp?profile=free and skip the key.",
         ),
         "DataForSEO" => (
             "https://app.dataforseo.com/api-access",
