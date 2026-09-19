@@ -549,6 +549,66 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
 - P4.3 desktop Shared HTTP adopts a daemon service lease; app exit releases the lease
   instead of killing the process.
 
+## Conformance harness
+
+Every row of the design's verification matrix is a named case in
+`src-tauri/tests/one_gateway_conformance.rs`, so each daemon phase lands against an
+executable checklist instead of a prose table. The cases drive real processes — the real
+gateway binary in `--daemon` and `--stdio-adapter` roles, the real rendezvous files, and
+the real `mock-mcp-server` fixture as the downstream — and every wait is bounded, so a
+row that hangs fails its own deadline rather than the CI job. Cases count downstream
+launches two ways: as live processes and as `initialize` lines in the child's transcript.
+
+The fixture registry writes full discovery (`lazy_discovery: false`), because the matrix
+rows are full-catalog rows and `Registry::default()` runs lazy discovery, where
+`tools/list` serves only the gateway's meta-tools. Cases that assert a downstream tool
+is exposed poll `tools/list` bounded: the daemon serves immediately while its router
+builds on a background thread, and a real client learns the finished catalog from
+`notifications/tools/list_changed`.
+
+| Matrix row                                                            | Case                                                                                                                                                        | Phase     | Status on main        |
+| --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- | --------------------- |
+| 20 simultaneous adapters cold-start exactly one daemon                | `matrix_cold_start_twenty_simultaneous_adapters_elect_exactly_one_daemon`                                                                                   | P2.1      | passing               |
+| Version/data-dir mismatch creates separate daemons without cross-talk | `matrix_partitioning_separate_data_dirs_run_separate_daemons_without_cross_talk`, `matrix_partitioning_a_foreign_compat_descriptor_is_rejected_not_adopted` | P2.1      | passing               |
+| Startup never waits indefinitely when rendezvous fails                | `matrix_lifecycle_a_stale_descriptor_does_not_stall_startup`                                                                                                | P2.1      | passing               |
+| Crashes/EOF clean up session-owned resources after close or TTL       | `matrix_lifecycle_adapter_eof_releases_the_session_and_lets_the_daemon_exit`                                                                                | P2.3      | passing               |
+| N clients on one ordinary stdio server create one downstream child    | `matrix_pooling_sessions_share_one_downstream_child`                                                                                                        | P3.2      | passing               |
+| Two `${ROOT}` values create two children, equal roots share one       | `matrix_pooling_root_sharding_two_roots_two_children`                                                                                                       | P3.2      | pending (`#[ignore]`) |
+| Profiles cannot list/call/subscribe outside their scope               | `matrix_routing_profiles_cannot_reach_servers_outside_their_scope`                                                                                          | P3.1      | pending (`#[ignore]`) |
+| Identical JSON-RPC ids from different sessions never collide          | `matrix_routing_identical_request_ids_stay_per_session`                                                                                                     | P3.3      | passing               |
+| Session-scoped surfaces reach only the originating session            | `matrix_routing_session_scoped_notifications_reach_only_the_subscriber`                                                                                     | P3.1/P3.3 | pending (`#[ignore]`) |
+
+Pending rows are `#[ignore]`d acceptance criteria, not absent ones: they fail loudly with
+`--ignored` today (root sharding falls back to the daemon's cwd; a shared daemon serves
+the first session's profile to every session; `tools/list_changed` broadcasts to all
+sessions), and the attribute comes off in the same PR that lands the phase — the pattern
+`tests/spec_conformance.rs` used while the dual-era work was in flight.
+
+Commands (the in-file `CASE_LOCK` already serializes cases; `--test-threads=1` keeps the
+output readable):
+
+```sh
+# every row that main must satisfy (default CI-green set)
+cargo test --manifest-path src-tauri/Cargo.toml --no-default-features \
+  --test one_gateway_conformance -- --test-threads=1
+
+# the pending rows, to watch a phase close (they fail until it lands)
+cargo test --manifest-path src-tauri/Cargo.toml --no-default-features \
+  --test one_gateway_conformance -- --ignored --test-threads=1
+
+# one case by name
+cargo test --manifest-path src-tauri/Cargo.toml --no-default-features \
+  --test one_gateway_conformance matrix_pooling_sessions_share_one_downstream_child \
+  -- --exact --test-threads=1
+```
+
+Rows the harness deliberately does not duplicate: crash recovery and no-auto-replay are
+pinned in `tests/stdio_adapter.rs`, daemon idle exit in `tests/daemon_idle_exit.rs`, and
+version-keyed descriptor isolation in the `daemon.rs` unit tests (the compile-time
+version makes a real-process version mismatch impossible to stage; the data-dir cases
+cover real-process partitioning, and the foreign-compat case covers the wrong-domain
+descriptor a version bump produces).
+
 ## Acceptance mapping
 
 The design's verification matrix maps to: P2.1 (cold start election, mismatch isolation,
