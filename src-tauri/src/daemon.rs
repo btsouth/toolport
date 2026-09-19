@@ -30,10 +30,17 @@ pub const IDENTITY_PATH: &str = "/host/identity";
 /// Bounded wait for a spawned daemon to publish a reachable descriptor.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the winner may hold the election lock while waiting for readiness.
-/// Must exceed [`READY_TIMEOUT`] so a blocked contender never gives up first.
-const ELECTION_TIMEOUT: Duration = Duration::from_secs(15);
+/// Must exceed everything a lock holder can spend probing: the under-lock
+/// recheck (at most two [`PROBE_TIMEOUT`] attempts), [`READY_TIMEOUT`], and
+/// one in-flight poll past its deadline, so a blocked contender never gives up
+/// first.
+const ELECTION_TIMEOUT: Duration = Duration::from_secs(20);
 /// Per-probe network budget for the authenticated handshake.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the fast path keeps re-probing a silent endpoint before giving up
+/// on it. A loaded machine can outrun [`PROBE_TIMEOUT`] while its daemon is
+/// perfectly live, so silence alone is never evidence against the pointer.
+const SILENT_RETRY_TIMEOUT: Duration = Duration::from_secs(6);
 const READY_POLL: Duration = Duration::from_millis(50);
 /// Operational idle grace: the daemon exits after this long with no requests.
 /// A default, not a user setting, in the first release.
@@ -157,19 +164,87 @@ pub fn new_token() -> Result<String, String> {
 /// itself; the caller compares the returned identity against its own
 /// [`CompatKey`]. Any transport error is a failed probe, not a hard error.
 pub fn probe_identity(descriptor: &DaemonDescriptor) -> Result<DaemonIdentity, String> {
+    attempt_identity_probe(descriptor).map_err(|failure| match failure {
+        ProbeFailure::Answered(detail) => detail,
+        ProbeFailure::Unreachable => "the daemon endpoint is not reachable".to_string(),
+        ProbeFailure::Silent => "the daemon did not answer within the probe budget".to_string(),
+    })
+}
+
+/// Why an identity probe failed, in the terms the rendezvous decides on: what
+/// may be cleared, and what may spawn.
+#[derive(Debug)]
+enum ProbeFailure {
+    /// The endpoint answered, but not as a compatible daemon would: a refused
+    /// status or a body that is not an identity. A stale pointer.
+    Answered(String),
+    /// Nothing usable is at the endpoint: the connection is refused or reset,
+    /// or the endpoint itself is malformed or unresolvable. Deterministic
+    /// failures, every one of them. A stale pointer.
+    Unreachable,
+    /// The endpoint stayed silent for the whole `PROBE_TIMEOUT`. A daemon may
+    /// be alive but wedged, so this is never evidence against its pointer.
+    Silent,
+}
+
+/// Read the outcome out of a ureq error. A refused or reset connection, or an
+/// endpoint that cannot be parsed or resolved, says the pointer is unusable
+/// garbage; an answered status or a mangled response says someone else owns
+/// the port; silence alone says nothing either way.
+fn classify_probe_error(error: ureq::Error) -> ProbeFailure {
+    use std::error::Error as _;
+    match &error {
+        ureq::Error::Status(..) => ProbeFailure::Answered(error.to_string()),
+        ureq::Error::Transport(transport) => match transport.kind() {
+            ureq::ErrorKind::ConnectionFailed
+            | ureq::ErrorKind::InvalidUrl
+            | ureq::ErrorKind::UnknownScheme
+            | ureq::ErrorKind::Dns => ProbeFailure::Unreachable,
+            ureq::ErrorKind::BadStatus | ureq::ErrorKind::BadHeader => {
+                ProbeFailure::Answered(error.to_string())
+            }
+            ureq::ErrorKind::Io => {
+                let io_kind = transport
+                    .source()
+                    .and_then(|source| source.downcast_ref::<std::io::Error>())
+                    .map(|io| io.kind());
+                match io_kind {
+                    Some(std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+                        ProbeFailure::Silent
+                    }
+                    Some(
+                        std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe,
+                    ) => ProbeFailure::Unreachable,
+                    _ => ProbeFailure::Silent,
+                }
+            }
+            _ => ProbeFailure::Silent,
+        },
+    }
+}
+
+/// One authenticated attempt against `GET /host/identity`, keeping the
+/// failure kind so the rendezvous can decide on it.
+fn attempt_identity_probe(descriptor: &DaemonDescriptor) -> Result<DaemonIdentity, ProbeFailure> {
     let url = format!("http://{}{}", descriptor.endpoint, IDENTITY_PATH);
     let response = ureq::get(&url)
         .set("Authorization", &format!("Bearer {}", descriptor.token))
         .timeout(PROBE_TIMEOUT)
         .call()
-        .map_err(|e| e.to_string())?;
+        .map_err(classify_probe_error)?;
     response
         .into_json::<DaemonIdentity>()
-        .map_err(|e| format!("Daemon identity was not valid JSON: {e}"))
+        .map_err(|e| ProbeFailure::Answered(format!("Daemon identity was not valid JSON: {e}")))
 }
 
 /// One compatibility domain's rendezvous: the data directory and the build it may
 /// share a runtime with.
+///
+/// The correctness rule lives here: only a proven-live daemon is reused, only
+/// a proven-stale pointer is cleared, and an endpoint that stays silent is
+/// neither — it may be a live daemon too wedged to answer.
 pub struct Rendezvous {
     data_dir: PathBuf,
     compat: CompatKey,
@@ -196,8 +271,14 @@ impl Rendezvous {
         mut spawn: impl FnMut() -> Result<(), String>,
     ) -> Result<DaemonDescriptor, String> {
         let path = self.descriptor_path();
-        if let Some(descriptor) = self.live_descriptor(&path) {
-            return Ok(descriptor);
+        match self.probe_for_reuse(&path) {
+            Probe::Live(descriptor) => return Ok(descriptor),
+            // A silent daemon may still be alive: reuse is unproven, and
+            // clearing or spawning beside it is the double-election defect.
+            // Name it and fail; if it really is gone, its idle watchdog
+            // clears the pointer on the way out.
+            Probe::Silent(descriptor) => return Err(unresponsive_daemon_error(&descriptor)),
+            Probe::Gone => {}
         }
 
         // Elect: `lock_at` appends `.lock` and creates parent directories.
@@ -206,8 +287,10 @@ impl Rendezvous {
 
         // Recheck under the lock: another contender may have started the daemon
         // while we waited.
-        if let Some(descriptor) = self.live_descriptor(&path) {
-            return Ok(descriptor);
+        match self.probe(&path) {
+            Probe::Live(descriptor) => return Ok(descriptor),
+            Probe::Silent(descriptor) => return Err(unresponsive_daemon_error(&descriptor)),
+            Probe::Gone => {}
         }
 
         // We are the winner. Drop any stale pointer first so readiness polling
@@ -216,10 +299,12 @@ impl Rendezvous {
         spawn()?;
 
         // Wait for readiness while still holding the lock, so no second
-        // contender spawns a daemon of its own.
+        // contender spawns a daemon of its own. Until the daemon is ready,
+        // silence and refusals both just mean "not answering yet", so every
+        // non-live outcome keeps polling inside the budget.
         let deadline = Instant::now() + READY_TIMEOUT;
         while Instant::now() < deadline {
-            if let Some(descriptor) = self.live_descriptor(&path) {
+            if let Probe::Live(descriptor) = self.probe(&path) {
                 return Ok(descriptor);
             }
             std::thread::sleep(READY_POLL);
@@ -227,18 +312,66 @@ impl Rendezvous {
         Err("the daemon did not become ready before the deadline".to_string())
     }
 
-    /// Read, claim-check, then prove with the authenticated handshake. A missing,
-    /// mismatched, or unreachable descriptor is "no live daemon".
-    fn live_descriptor(&self, path: &Path) -> Option<DaemonDescriptor> {
-        let descriptor = read_descriptor(path)?;
+    /// Read, claim-check, then prove with the authenticated handshake. A
+    /// missing, mismatched, answered-wrong, or unreachable descriptor is "no
+    /// live daemon"; a silent endpoint is not ([`Probe::Silent`]). One refusal
+    /// is thin evidence for destroying a pointer, so the unreachable case
+    /// rechecks once before declaring it stale.
+    fn probe(&self, path: &Path) -> Probe {
+        let Some(descriptor) = read_descriptor(path) else {
+            return Probe::Gone;
+        };
         if !descriptor.claims_compat(&self.compat) {
-            return None;
+            return Probe::Gone;
         }
-        match probe_identity(&descriptor) {
-            Ok(identity) if identity.is_compatible_with(&self.compat) => Some(descriptor),
-            _ => None,
+        match attempt_identity_probe(&descriptor) {
+            Ok(identity) if identity.is_compatible_with(&self.compat) => Probe::Live(descriptor),
+            Ok(_) | Err(ProbeFailure::Answered(_)) => Probe::Gone,
+            Err(ProbeFailure::Unreachable) => match attempt_identity_probe(&descriptor) {
+                Ok(identity) if identity.is_compatible_with(&self.compat) => Probe::Live(descriptor),
+                Err(ProbeFailure::Silent) => Probe::Silent(descriptor),
+                _ => Probe::Gone,
+            },
+            Err(ProbeFailure::Silent) => Probe::Silent(descriptor),
         }
     }
+
+    /// The fast-path probe with bounded patience: give a live-but-slow daemon
+    /// the whole [`SILENT_RETRY_TIMEOUT`] to answer before concluding
+    /// anything about its pointer.
+    fn probe_for_reuse(&self, path: &Path) -> Probe {
+        let deadline = Instant::now() + SILENT_RETRY_TIMEOUT;
+        loop {
+            match self.probe(path) {
+                Probe::Silent(_) if Instant::now() < deadline => {}
+                outcome => return outcome,
+            }
+            std::thread::sleep(READY_POLL);
+        }
+    }
+}
+
+/// What one look at the descriptor file concluded. The distinction carries the
+/// correctness rule above: only `Gone` justifies clearing the pointer, and
+/// only `Live` justifies reusing it.
+enum Probe {
+    /// A compatible daemon answered the authenticated handshake.
+    Live(DaemonDescriptor),
+    /// The pointer is stale: nothing answers, or something else does. The
+    /// rendezvous may clear it and elect a new daemon.
+    Gone,
+    /// The endpoint stayed silent for the whole probe budget. A daemon may be
+    /// alive but wedged; never clear or spawn beside it on this evidence.
+    Silent(DaemonDescriptor),
+}
+
+/// The error a persistent silence becomes: never a clearing, never a second
+/// daemon, and a name the operator can act on.
+fn unresponsive_daemon_error(descriptor: &DaemonDescriptor) -> String {
+    format!(
+        "the daemon at {} (pid {}) did not answer its identity probe; its descriptor was left in place",
+        descriptor.endpoint, descriptor.pid
+    )
 }
 
 /// The daemon side of the handshake. Binds an ephemeral loopback port, publishes
@@ -267,7 +400,7 @@ pub fn serve_identity(
     let descriptor = DaemonDescriptor::new(format!("127.0.0.1:{port}"), token.clone(), compat);
     write_descriptor(descriptor_path, &descriptor)?;
     if let Some(sender) = ready {
-        let _ = sender.send(descriptor);
+        let _ = sender.send(descriptor.clone());
     }
 
     // Poll so an idle daemon can exit without a request to wake it; a real
@@ -302,8 +435,15 @@ pub fn serve_identity(
             break;
         }
     }
-    // Leave no stale pointer behind for the next rendezvous to trip over.
-    clear_descriptor(descriptor_path);
+    // Leave no stale pointer behind for the next rendezvous to trip over —
+    // but only ours. If another daemon has already published over this path,
+    // the file is the survivor's, and deleting it would strand every later
+    // rendezvous with the wrong daemon.
+    if let Some(current) = read_descriptor(descriptor_path) {
+        if current.token == token && current.endpoint == descriptor.endpoint {
+            clear_descriptor(descriptor_path);
+        }
+    }
     Ok(())
 }
 
@@ -347,6 +487,40 @@ mod tests {
             let _ = serve_identity(&path, &compat, new_token().unwrap(), Some(ready_tx), None);
         });
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+    }
+
+    /// A TCP listener that accepts connections and then stalls, holding each
+    /// socket open without ever answering: a daemon alive enough to own its
+    /// port, but wedged past the probe budget.
+    fn start_stalled_listener() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        endpoint
+    }
+
+    /// A TCP listener that answers every request with a 200 and a body that is
+    /// not an identity: a port squatter the handshake must reject, then route
+    /// around. The response closes the connection so probes never pool.
+    fn start_garbage_responder() -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut scratch = [0u8; 1024];
+                let _ = stream.read(&mut scratch);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\noops!",
+                );
+            }
+        });
+        endpoint
     }
 
     #[test]
@@ -488,6 +662,187 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("an idle daemon should exit after its grace period");
         assert!(!path.exists(), "idle exit must clear the descriptor");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unresponsive_daemon_is_never_cleared_or_duplicated() {
+        let dir = temp_dir("silent");
+        let compat = compat("1.0.0", &dir);
+        let path = descriptor_path(&dir, &compat);
+        let wedged = DaemonDescriptor::new(start_stalled_listener(), "wedged", &compat);
+        write_descriptor(&path, &wedged).unwrap();
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&spawns);
+        let closure_dir = dir.clone();
+        let closure_compat = compat.clone();
+        let rendezvous = Rendezvous::new(&dir, compat.clone());
+        let started = Instant::now();
+        let error = rendezvous
+            .ensure(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = start_listener(&closure_dir, &closure_compat);
+                Ok(())
+            })
+            .expect_err("a silent daemon must not be silently replaced");
+        assert!(
+            error.contains(&wedged.endpoint),
+            "the error must name the unresponsive daemon: {error}"
+        );
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            0,
+            "a silent daemon must not be duplicated"
+        );
+        assert_eq!(
+            read_descriptor(&path),
+            Some(wedged),
+            "a silent daemon's descriptor must survive untouched"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the bounded retry must stay bounded: {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn garbage_answer_is_replaced() {
+        let dir = temp_dir("garbage");
+        let compat = compat("1.0.0", &dir);
+        let squatter = DaemonDescriptor::new(start_garbage_responder(), "squatter", &compat);
+        write_descriptor(&descriptor_path(&dir, &compat), &squatter).unwrap();
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&spawns);
+        let closure_dir = dir.clone();
+        let closure_compat = compat.clone();
+        let rendezvous = Rendezvous::new(&dir, compat.clone());
+        let descriptor = rendezvous
+            .ensure(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = start_listener(&closure_dir, &closure_compat);
+                Ok(())
+            })
+            .expect("a squatter's pointer is stale and gets replaced");
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        assert_ne!(descriptor.endpoint, squatter.endpoint);
+        assert!(probe_identity(&descriptor).unwrap().is_compatible_with(&compat));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_endpoint_is_replaced() {
+        let dir = temp_dir("malformed");
+        let compat = compat("1.0.0", &dir);
+        let broken = DaemonDescriptor::new("not a valid endpoint", "broken", &compat);
+        write_descriptor(&descriptor_path(&dir, &compat), &broken).unwrap();
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&spawns);
+        let closure_dir = dir.clone();
+        let closure_compat = compat.clone();
+        let rendezvous = Rendezvous::new(&dir, compat.clone());
+        let descriptor = rendezvous
+            .ensure(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = start_listener(&closure_dir, &closure_compat);
+                Ok(())
+            })
+            .expect("an endpoint that cannot parse is garbage, not a live daemon");
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        assert_ne!(descriptor.endpoint, broken.endpoint);
+        assert!(probe_identity(&descriptor).unwrap().is_compatible_with(&compat));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unresolvable_host_is_replaced() {
+        let dir = temp_dir("unresolvable");
+        let compat = compat("1.0.0", &dir);
+        let broken =
+            DaemonDescriptor::new("no-such-host.toolport.invalid:9123", "broken", &compat);
+        write_descriptor(&descriptor_path(&dir, &compat), &broken).unwrap();
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&spawns);
+        let closure_dir = dir.clone();
+        let closure_compat = compat.clone();
+        let rendezvous = Rendezvous::new(&dir, compat.clone());
+        let descriptor = rendezvous
+            .ensure(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = start_listener(&closure_dir, &closure_compat);
+                Ok(())
+            })
+            .expect("a host that cannot resolve is garbage, not a live daemon");
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        assert_ne!(descriptor.endpoint, broken.endpoint);
+        assert!(probe_identity(&descriptor).unwrap().is_compatible_with(&compat));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exiting_daemon_does_not_clear_a_successors_descriptor() {
+        let dir = temp_dir("successor");
+        let compat = compat("1.0.0", &dir);
+        let path = descriptor_path(&dir, &compat);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread_path = path.clone();
+        let thread_compat = compat.clone();
+        std::thread::spawn(move || {
+            let _ = serve_identity(
+                &thread_path,
+                &thread_compat,
+                new_token().unwrap(),
+                Some(ready_tx),
+                Some(Duration::from_millis(150)),
+            );
+            let _ = done_tx.send(());
+        });
+        let _ = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Another daemon takes over the pointer while this one is serving.
+        let successor = DaemonDescriptor::new("127.0.0.1:9", "successor", &compat);
+        write_descriptor(&path, &successor).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the serving daemon exits after its grace");
+        assert_eq!(
+            read_descriptor(&path),
+            Some(successor),
+            "an exiting daemon must not clear a successor's pointer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn separate_compat_domains_elect_separate_daemons() {
+        let dir = temp_dir("partition");
+        let a = compat("1.0.0", &dir);
+        let b = compat("2.0.0", &dir);
+        let spawns = Arc::new(AtomicUsize::new(0));
+
+        let mut endpoints = Vec::new();
+        for key in [&a, &b] {
+            let counter = Arc::clone(&spawns);
+            let closure_dir = dir.clone();
+            let closure_key = key.clone();
+            let rendezvous = Rendezvous::new(&dir, key.clone());
+            let descriptor = rendezvous
+                .ensure(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = start_listener(&closure_dir, &closure_key);
+                    Ok(())
+                })
+                .expect("each domain elects its own daemon");
+            assert!(descriptor.claims_compat(key));
+            endpoints.push(descriptor.endpoint);
+        }
+        assert_eq!(spawns.load(Ordering::SeqCst), 2);
+        assert_ne!(endpoints[0], endpoints[1]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
