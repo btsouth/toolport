@@ -1245,6 +1245,34 @@ impl TransportError {
         }
     }
 
+    /// True when the server explicitly rejected the credential or requires the
+    /// caller to authenticate. Preserve these errors during era detection: a
+    /// later `server/discover` probe cannot make the credential valid, and its
+    /// protocol error would hide the action the user actually needs to take.
+    fn is_auth_failure(&self) -> bool {
+        fn message_is_auth_failure(message: &str) -> bool {
+            let lower = message.to_ascii_lowercase();
+            lower.contains("unauthorized")
+                || lower.contains("unauthenticated")
+                || lower.contains("needs authentication")
+                || lower.contains("authentication required")
+                || lower.starts_with("http 401")
+                || lower.starts_with("http 403")
+        }
+
+        match self {
+            TransportError::Rpc(error) => {
+                matches!(error.get("code").and_then(Value::as_i64), Some(401 | 403))
+                    || error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .is_some_and(message_is_auth_failure)
+            }
+            TransportError::Fatal(message) => message_is_auth_failure(message),
+            _ => false,
+        }
+    }
+
     /// True when the server answered with an error only a *modern* (2026-07-28 or
     /// later) implementation produces.
     ///
@@ -5502,6 +5530,10 @@ impl DownstreamServer {
             // A dead or unresponsive server is not a modern server. Probing it
             // again would just double the wait before reporting the same failure.
             Err(err) if err.is_health_failure() => return Err(err.to_string()),
+            // Authentication is independent of the protocol era. Probing after
+            // an explicit rejection can only replace the actionable error with a
+            // secondary protocol failure (#914).
+            Err(err) if err.is_auth_failure() => return Err(err.to_string()),
             Err(init_err) => {
                 // The server answered, but refused `initialize`. A modern server
                 // has no such method. Confirm with `server/discover`, which every
@@ -10749,6 +10781,68 @@ mod tests {
                 .iter()
                 .any(|e| *e == expected),
             "the retry must re-stamp between the two sends, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn initialize_auth_failure_is_not_replaced_by_the_era_probe() {
+        // LaunchDarkly rejects an unauthenticated legacy initialize with -32001,
+        // then rejects the modern probe with UnsupportedProtocolVersion. The
+        // second error used to replace the first and send the user toward a
+        // protocol upgrade instead of sign-in (#914).
+        use super::{DownstreamServer, Transport, TransportError};
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        struct Probe {
+            responses: VecDeque<Result<Value, TransportError>>,
+            methods: Arc<Mutex<Vec<String>>>,
+        }
+        impl Transport for Probe {
+            fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+                self.methods.lock().unwrap().push(method.to_string());
+                self.responses.pop_front().expect("a response per request")
+            }
+            fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let transport = Probe {
+            methods: Arc::clone(&methods),
+            responses: VecDeque::from(vec![
+                Err(TransportError::Rpc(json!({
+                    "code": -32001,
+                    "message": "unauthorized access"
+                }))),
+                Err(TransportError::Rpc(json!({
+                    "code": super::UNSUPPORTED_PROTOCOL_VERSION,
+                    "message": "Unsupported protocol version",
+                    "data": {
+                        "requested": super::MODERN_PROTOCOL_VERSION,
+                        "supported": [super::PROTOCOL_VERSION]
+                    }
+                }))),
+            ]),
+        };
+
+        let err = match DownstreamServer::connect("launchdarkly".to_string(), Box::new(transport)) {
+            Err(err) => err,
+            Ok(_) => panic!("an unauthenticated server cannot connect"),
+        };
+        assert!(
+            err.contains("unauthorized access"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("cannot negotiate"),
+            "the auth error must not be replaced by a version error: {err}"
+        );
+        assert_eq!(
+            *methods.lock().unwrap(),
+            vec!["initialize"],
+            "an explicit auth rejection must skip the era probe"
         );
     }
 
