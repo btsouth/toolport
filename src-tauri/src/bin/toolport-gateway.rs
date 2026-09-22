@@ -3729,10 +3729,10 @@ struct HttpCaller {
     audit_label: Option<String>,
     session_owner: McpSessionOwner,
     /// Per-client discovery override, when `clientDiscovery[<client id>]` sets one
-    /// (#868). `None` means the request falls back to the listener's boot `lazy` flag plus
-    /// the host's live grouped bit (see `handle_http_with_headers`), so one HTTP bridge
-    /// can still serve a native-search client the full catalog and a local model
-    /// the meta-tools at the same time.
+    /// (#868). `None` means the request falls back to the host's live discovery mode
+    /// (see `handle_http_with_headers`), so one HTTP bridge can still serve a
+    /// native-search client the full catalog and a local model the meta-tools at the
+    /// same time, and a mode switch after boot reaches both without a restart.
     discovery: Option<DiscoveryMode>,
 }
 
@@ -16110,10 +16110,9 @@ fn main() {
     // Discovery mode resolves from an explicit env override first (per-client), then
     // the registry (its `discovery_mode` override, else the `lazy_discovery` bool), so
     // it applies to EVERY client, including ones that don't forward env vars to the
-    // gateway (e.g. Antigravity). Resolved once and cached; `lazy` is derived so its
-    // behavior is unchanged, and grouped mode reads the same cached value.
+    // gateway (e.g. Antigravity). Resolved once and cached; grouped mode reads the
+    // same cached value.
     let mode = resolve_discovery_mode();
-    let lazy = matches!(mode, DiscoveryMode::Lazy);
     // The host's discovery mode starts from this bootstrap value; the watcher refreshes it.
     let discovery_seed = mode.as_u8();
     // Per-client scoping: this gateway exposes only the named profile's servers.
@@ -16144,11 +16143,12 @@ fn main() {
     let http_mode = http_port_opt.is_some() || daemon_mode;
     glog("=== gateway start ===");
     glog(&format!(
-        "cwd={:?} TOOLPORT_REGISTRY={:?} registry_path={:?} dir_resolution={:?} lazy={lazy} profile={env_profile:?} client_id={client_id:?}",
+        "cwd={:?} TOOLPORT_REGISTRY={:?} registry_path={:?} dir_resolution={:?} mode={} profile={env_profile:?} client_id={client_id:?}",
         std::env::current_dir().ok(),
         conduit_lib::brand::env_var("TOOLPORT_REGISTRY", "CONDUIT_REGISTRY"),
         registry::resolved_path(),
         registry::conduit_dir_resolution(),
+        mode.as_str(),
     ));
     if registry::conduit_dir_resolution() == registry::DirResolution::VirtualizedFallback {
         // Loud, not fatal: inside an MSIX container with no UNC escape, the data
@@ -22015,7 +22015,9 @@ mod tests {
                 quarantine_read_failed: AtomicBool::new(false),
                 code_mode: AtomicBool::new(false),
                 // The bridge resolves discovery from this live field, so seed it from the
-                // flag the test passes: true = a lazy bridge, false = full.
+                // flag the test passes: true = a lazy bridge, false = full. (A host from
+                // `host_from_parts` keeps main's Lazy default instead, because the tests
+                // there assert host-mode-derived output; set it explicitly when needed.)
                 discovery: AtomicU8::new(
                     if lazy {
                         DiscoveryMode::Lazy
@@ -23961,7 +23963,7 @@ mod tests {
     #[test]
     fn http_bridge_follows_a_live_discovery_switch() {
         let state = http_state(false);
-        let spec = |state: &GatewayState| -> Value {
+        let spec = |state: &GatewayState, caller: Option<&HttpCaller>| -> Value {
             let out = handle_http_with_headers(
                 state,
                 &SearchGuard::default(),
@@ -23971,7 +23973,7 @@ mod tests {
                 "",
                 McpHttpRequestHeaders::default(),
                 None,
-                None,
+                caller,
             );
             assert_eq!(out.status, 200, "body={}", out.body);
             serde_json::from_str(&out.body).expect("the spec is JSON")
@@ -23986,7 +23988,7 @@ mod tests {
         };
 
         // Booted full: the bridge advertises the catalog bridge, not the lazy meta-tools.
-        let full = paths(&spec(&state));
+        let full = paths(&spec(&state, None));
         assert!(
             full.contains("/toolport_status") && !full.contains("/toolport_search_tools"),
             "a full-mode bridge must advertise the catalog bridge, not the meta-tools: {full:?}"
@@ -23994,18 +23996,70 @@ mod tests {
 
         // A live switch reaches the bridge without a restart.
         state.host.set_discovery_mode(DiscoveryMode::Lazy);
-        let lazy = paths(&spec(&state));
+        let lazy = paths(&spec(&state, None));
         assert!(
             lazy.contains("/toolport_search_tools"),
             "a live switch to lazy must reach the bridge: {lazy:?}"
         );
 
-        // And so does a switch back out of it.
+        // A per-client override still wins (#868), whichever way the host is set: a
+        // client pinned to full keeps the catalog bridge on a lazy host.
+        let pinned_full = HttpCaller {
+            audit_label: Some("client:pinned-full".to_string()),
+            session_owner: McpSessionOwner {
+                identity: "client:pinned-full".to_string(),
+                scope: None,
+            },
+            discovery: Some(DiscoveryMode::Full),
+        };
+        let overridden = paths(&spec(&state, Some(&pinned_full)));
+        assert!(
+            overridden.contains("/toolport_status")
+                && !overridden.contains("/toolport_search_tools"),
+            "a client pinned to full must keep the catalog bridge on a lazy host: {overridden:?}"
+        );
+
+        // And a switch back out of lazy does not override a client pinned to lazy.
         state.host.set_discovery_mode(DiscoveryMode::Full);
-        let back = paths(&spec(&state));
+        let pinned_lazy = HttpCaller {
+            audit_label: Some("client:pinned-lazy".to_string()),
+            session_owner: McpSessionOwner {
+                identity: "client:pinned-lazy".to_string(),
+                scope: None,
+            },
+            discovery: Some(DiscoveryMode::Lazy),
+        };
+        let pinned = paths(&spec(&state, Some(&pinned_lazy)));
+        assert!(
+            pinned.contains("/toolport_search_tools"),
+            "a client pinned to lazy must get the meta-tools on a full host: {pinned:?}"
+        );
+
+        let back = paths(&spec(&state, None));
         assert!(
             back.contains("/toolport_status") && !back.contains("/toolport_search_tools"),
             "a switch back out of lazy must reach the bridge too: {back:?}"
+        );
+    }
+
+    /// `gateway_capabilities` advertises the mode it is handed rather than a mode it
+    /// re-derives from the host: the caller has already resolved per-client overrides
+    /// (#868), so a client pinned to `full` on a grouped host must be told `full`.
+    #[test]
+    fn gateway_capabilities_advertises_the_resolved_mode() {
+        let host = dispatch_host(false);
+        host.set_discovery_mode(DiscoveryMode::Grouped);
+        assert!(host.grouped_discovery(), "the fixture host must be grouped");
+        let advertised = gateway_capabilities(
+            &host,
+            &Router::new(),
+            None,
+            &Registry::default(),
+            DiscoveryMode::Full,
+        );
+        assert_eq!(
+            advertised["extensions"][TOOLPORT_GATEWAY_EXTENSION]["discoveryMode"], "full",
+            "the resolved mode must win over the host's grouped bit: {advertised}"
         );
     }
 
