@@ -108,6 +108,11 @@ struct AdapterClient {
     /// Whether `initialize` will declare the roots capability. Kept beside the
     /// reader thread that answers `roots/list`, so the two cannot disagree.
     declares_roots: bool,
+    /// This client's data directory, for the gateway log a failure has to quote.
+    dir: PathBuf,
+    /// The adapter's stderr, captured rather than discarded: an adapter that exits
+    /// answers nothing on stdout, and its own lines are the only place that says why.
+    stderr: Arc<Mutex<String>>,
 }
 
 struct AdapterOptions<'a> {
@@ -139,7 +144,7 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
         .env("TOOLPORT_CLIENT_ID", format!("matrix-{index}"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     if let Some(profile) = options.profile {
         command.env("TOOLPORT_PROFILE", profile);
     }
@@ -149,6 +154,29 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
     let mut child = command.spawn().expect("spawn the stdio adapter");
     let stdin = child.stdin.take().expect("adapter stdin");
     let stdout = child.stdout.take().expect("adapter stdout");
+    let stderr = child.stderr.take().expect("adapter stderr");
+    let stderr_text = Arc::new(Mutex::new(String::new()));
+    {
+        let stderr_text = Arc::clone(&stderr_text);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let Ok(mut text) = stderr_text.lock() else {
+                    return;
+                };
+                text.push_str(&line);
+                text.push('\n');
+                // Keep the last 4 KiB, including when one line is longer than the
+                // limit. Move to a UTF-8 boundary before trimming.
+                if text.len() > 4 * 1024 {
+                    let mut from = text.len() - 4 * 1024;
+                    while !text.is_char_boundary(from) {
+                        from += 1;
+                    }
+                    text.drain(..from);
+                }
+            }
+        });
+    }
 
     let roots = options.roots.clone();
     let declares_roots = !roots.is_empty();
@@ -203,7 +231,25 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
         lines,
         next_id: 0,
         declares_roots,
+        dir: dir.to_path_buf(),
+        stderr: stderr_text,
     }
+}
+
+/// The tail of the gateway log this suite's data directory collects. Both the
+/// adapters and the daemon they rendezvous with append to it.
+fn gateway_log_tail(dir: &Path) -> String {
+    let log = std::fs::read_to_string(dir.join("gateway.log")).unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+    format!(
+        "gateway.log (last 20 lines):\n{}",
+        if tail.trim().is_empty() {
+            "<empty>"
+        } else {
+            &tail
+        }
+    )
 }
 
 /// The `file://` root URI form the gateway decodes back into a path.
@@ -225,11 +271,34 @@ impl AdapterClient {
     }
 
     fn next_message(&self) -> Value {
-        let line = self
-            .lines
-            .recv_timeout(RESPONSE_TIMEOUT)
-            .expect("a message before the deadline");
+        let line = match self.lines.recv_timeout(RESPONSE_TIMEOUT) {
+            Ok(line) => line,
+            Err(error) => panic!(
+                "no message before the deadline ({error})\n{}",
+                self.diagnostics()
+            ),
+        };
         serde_json::from_str(&line).unwrap_or_else(|e| panic!("invalid JSON ({e}): {line}"))
+    }
+
+    /// Everything a failure needs to explain itself: this adapter's stderr plus the
+    /// gateway log the data directory collects. An adapter that exits mid-run
+    /// answers nothing, so a bare \"no message\" panic says nothing about why.
+    fn diagnostics(&self) -> String {
+        let stderr = self
+            .stderr
+            .lock()
+            .map(|text| text.trim().to_string())
+            .unwrap_or_default();
+        format!(
+            "adapter stderr:\n{}\n{}",
+            if stderr.is_empty() {
+                "<empty>"
+            } else {
+                &stderr
+            },
+            gateway_log_tail(&self.dir)
+        )
     }
 
     /// The response to `id`, skipping whatever notifications arrive first.
@@ -241,7 +310,8 @@ impl AdapterClient {
             }
             assert!(
                 message.get("method").is_some() && message.get("id").is_none(),
-                "unexpected message before the answer to {id}: {message}"
+                "unexpected message before the answer to {id}: {message}\n{}",
+                self.diagnostics()
             );
         }
     }
@@ -717,7 +787,8 @@ fn matrix_cold_start_twenty_simultaneous_adapters_elect_exactly_one_daemon() {
                 let reply = client.request("tools/list", json!({}));
                 assert!(
                     reply["result"]["tools"].is_array(),
-                    "session did not serve tools/list: {reply}"
+                    "session did not serve tools/list: {reply}\n{}",
+                    client.diagnostics()
                 );
             });
         }

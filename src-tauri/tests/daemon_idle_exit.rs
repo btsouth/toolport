@@ -46,6 +46,20 @@ fn read_descriptor(dir: &Path) -> Option<serde_json::Value> {
     None
 }
 
+/// What a failure needs to explain itself: the tail of the gateway log the daemon
+/// appends to inside this scratch directory. The daemon's stdout and stderr are
+/// null, so this is the only record a failing CI run can leave behind.
+fn diagnostics(dir: &Path) -> String {
+    let log = std::fs::read_to_string(dir.join("gateway.log")).unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+    if tail.trim().is_empty() {
+        "<empty gateway.log>".to_string()
+    } else {
+        format!("gateway.log (last 20 lines):\n{tail}")
+    }
+}
+
 fn spawn_daemon(dir: &Path, grace_ms: u64) -> ChildGuard {
     let child = Command::new(env!("CARGO_BIN_EXE_toolport-gateway"))
         .arg("--daemon")
@@ -68,17 +82,19 @@ fn wait_for_descriptor(child: &mut ChildGuard, dir: &Path) -> serde_json::Value 
         }
         assert!(
             child.0.try_wait().expect("daemon status").is_none(),
-            "daemon exited before publishing a descriptor"
+            "daemon exited before publishing a descriptor\n{}",
+            diagnostics(dir)
         );
         assert!(
             Instant::now() < deadline,
-            "no descriptor within the deadline"
+            "no descriptor within the deadline\n{}",
+            diagnostics(dir)
         );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-fn wait_for_exit(child: &mut ChildGuard, within: Duration) -> ExitStatus {
+fn wait_for_exit(child: &mut ChildGuard, dir: &Path, within: Duration) -> ExitStatus {
     let deadline = Instant::now() + within;
     loop {
         if let Some(status) = child.0.try_wait().expect("daemon status") {
@@ -86,7 +102,8 @@ fn wait_for_exit(child: &mut ChildGuard, within: Duration) -> ExitStatus {
         }
         assert!(
             Instant::now() < deadline,
-            "the daemon did not exit within the deadline"
+            "the daemon did not exit within the deadline\n{}",
+            diagnostics(dir)
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -117,11 +134,16 @@ fn an_idle_daemon_exits_and_clears_its_descriptor() {
     let mut child = spawn_daemon(&dir, 300);
 
     wait_for_descriptor(&mut child, &dir);
-    let status = wait_for_exit(&mut child, Duration::from_secs(30));
-    assert!(status.success(), "unexpected daemon exit: {status:?}");
+    let status = wait_for_exit(&mut child, &dir, Duration::from_secs(30));
+    assert!(
+        status.success(),
+        "unexpected daemon exit: {status:?}\n{}",
+        diagnostics(&dir)
+    );
     assert!(
         read_descriptor(&dir).is_none(),
-        "the descriptor outlived the daemon"
+        "the descriptor outlived the daemon\n{}",
+        diagnostics(&dir)
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -187,6 +209,7 @@ fn an_open_listen_stream_prevents_idle_exit() {
     std::thread::sleep(Duration::from_millis(1500));
     assert!(
         child.0.try_wait().expect("daemon status").is_none(),
-        "the daemon exited while a listen stream was open"
+        "the daemon exited while a listen stream was open\n{}",
+        diagnostics(&dir)
     );
 }
