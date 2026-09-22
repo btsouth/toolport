@@ -1150,16 +1150,18 @@ fn newly_observed_security_events(
 /// A damaged quarantine store makes duplicate suppression uncertain, but it
 /// must not stop the independent security-event feed. The quarantine badge
 /// reports its own read failure as unknown.
-fn read_security_watch_snapshot() -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), String>
-{
+fn read_security_watch_snapshot() -> Result<
+    (
+        Vec<serde_json::Value>,
+        Result<Vec<serde_json::Value>, String>,
+    ),
+    String,
+> {
     let events = crate::integrity::read_recent(25)
         .map_err(|error| format!("could not read security events: {error}"))?;
-    let quarantined = match crate::integrity::all_quarantined() {
-        Ok(records) => records,
-        // Unknown quarantine state must not stop new security findings. The
-        // badge already displays the separate read failure as unknown.
-        Err(_) => Vec::new(),
-    };
+    // Keep the error distinct from a known-empty quarantine. The badge displays
+    // unknown, while this watcher still announces new security findings.
+    let quarantined = crate::integrity::all_quarantined();
     Ok((events, quarantined))
 }
 
@@ -1214,8 +1216,11 @@ fn start_security_event_watch(app: &adw::Application, alert: SecurityEventAlert)
                 return;
             };
             let mut guard = seen.borrow_mut();
-            let (current, newcomers) =
-                newly_observed_security_events(guard.as_ref(), &events, &quarantined);
+            let (current, newcomers) = newly_observed_security_events(
+                guard.as_ref(),
+                &events,
+                quarantined.as_deref().unwrap_or_default(),
+            );
             *guard = Some(current);
             if newcomers.is_empty() {
                 return;
@@ -11058,11 +11063,11 @@ mod tests {
         let (events, quarantined) =
             read_security_watch_snapshot().expect("the security feed remains readable");
         assert_eq!(events, vec![event]);
-        assert!(quarantined.is_empty(), "deduplication is unavailable");
+        assert!(quarantined.is_err(), "quarantine state remains unknown");
         let (_, newcomers) = newly_observed_security_events(
             Some(&std::collections::HashSet::new()),
             &events,
-            &quarantined,
+            quarantined.as_deref().unwrap_or_default(),
         );
         assert_eq!(newcomers.len(), 1, "a new finding must still alert");
 
