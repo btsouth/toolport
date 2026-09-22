@@ -266,6 +266,64 @@ describe("agent plugin gateway launcher", () => {
     expect(candidates.indexOf(newer)).toBeLessThan(candidates.indexOf(pinned));
   });
 
+  it("prefers a newer content-addressed gateway over a readable stale manifest", () => {
+    const binDir = win32.join("R:\\Roaming", "Toolport", "bin");
+    const manifestFile = win32.join(binDir, "gateway-manifest.json");
+    const stale = win32.join(binDir, "toolport-gateway-1.18.0.exe");
+    const current = win32.join(binDir, "toolport-gateway-1.19.0-a1b2c3d4e5f6.exe");
+    const candidates = gatewayCandidates({
+      platform: "win32",
+      home: "C:\\Users\\me",
+      env: { APPDATA: "R:\\Roaming", LOCALAPPDATA: "L:\\Local" },
+      fsOps: {
+        readFileSync: (path: string) => {
+          if (path === manifestFile) {
+            return JSON.stringify({ version: "1.18.0", path: stale, size: 1 });
+          }
+          throw new Error("unexpected manifest read");
+        },
+        readdirSync: (path: string) =>
+          path === binDir
+            ? ["toolport-gateway-1.18.0.exe", "toolport-gateway-1.19.0-a1b2c3d4e5f6.exe"]
+            : [],
+        statSync: (path: string) => ({ mtimeMs: path === current ? 2 : 1 }),
+      },
+      version: "1.18.0",
+    });
+
+    expect(candidates).toContain(stale);
+    expect(candidates).toContain(current);
+    expect(candidates.indexOf(current)).toBeLessThan(candidates.indexOf(stale));
+  });
+
+  it("keeps the manifest as the fallback when MSIX hides published files", () => {
+    const binDir = win32.join("R:\\Roaming", "Toolport", "bin");
+    const manifestFile = win32.join(binDir, "gateway-manifest.json");
+    const recorded = win32.join(binDir, "toolport-gateway-1.19.0.exe");
+    const candidates = gatewayCandidates({
+      platform: "win32",
+      home: "C:\\Users\\me",
+      env: { APPDATA: "R:\\Roaming", LOCALAPPDATA: "L:\\Local" },
+      fsOps: {
+        readFileSync: (path: string) => {
+          if (path === manifestFile) {
+            return JSON.stringify({ version: "1.19.0", path: recorded, size: 1 });
+          }
+          throw new Error("hidden");
+        },
+        readdirSync: () => {
+          throw new Error("hidden");
+        },
+        statSync: () => {
+          throw new Error("hidden");
+        },
+      },
+      version: "1.19.0",
+    });
+
+    expect(candidates[0]).toBe(recorded);
+  });
+
   it("only scans versioned gateway images, not lookalike neighbours", () => {
     // Explorer's duplicate names and hand-made backups sit in the same directory
     // and usually have the newest mtime. Only one scanned path is returned, so

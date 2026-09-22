@@ -15,6 +15,33 @@ Entries before the rename below shipped under the project's former name, Conduit
   no answer in time, or Toolport not running all refuse the call, each saying which. The
   Linux-native settings gained the per-agent switch for it.
 
+- **Servers that need a slow cold start can set their own startup timeout.** The server
+  editor's new **Startup timeout** field applies to `initialize` for stdio, HTTP, and SSE
+  servers, with a maximum of 24 hours, while the normal request timeout resumes afterward.
+  Server rows also say "Initializing…" after a few seconds, so a slow first start no longer
+  looks like a missing route. (#918)
+
+### Fixed
+
+- **A Windows agent-plugin launch can no longer trust an older gateway manifest over a
+  newer published binary.** The launcher scans the published bin directory for the newest
+  versioned or content-addressed gateway first, then uses `gateway-manifest.json` as the
+  fallback for MSIX installs. A readable manifest left over from a previous install can no
+  longer pin new sessions to older gateway code when the current binary is already there.
+  (#916)
+
+- **A downstream server that rejects `initialize` for an authentication reason now says
+  so.** Toolport previously probed for the modern protocol after that failure and could
+  replace the actionable auth error with a misleading version mismatch. Explicit auth
+  failures now stop the probe and reach the user unchanged. (#914)
+
+- **The opt-in host daemon no longer risks clearing or duplicating a live rendezvous
+  entry.** A daemon that is slow or silent is treated as possibly live rather than stale, so
+  a concurrent start does not replace its descriptor or elect a second daemon; a daemon
+  exiting clears only the descriptor that still identifies itself. The stdio adapter also
+  re-runs rendezvous before the next request if its daemon dies. This work remains behind
+  `--stdio-adapter`; the default gateway topology is unchanged. (#893, #915)
+
 ## [1.19.0] - 2026-09-15
 
 Toolport 1.19.0 lets one shared gateway serve clients with different discovery
