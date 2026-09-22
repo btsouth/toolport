@@ -42,6 +42,8 @@ pub(super) struct ActivitySnapshot {
     pub(super) savings_since_ts: u64,
     /// Every pinned tool's provenance, newest-changed first.
     pub(super) tool_identities: Vec<crate::integrity::ToolIdentity>,
+    /// A damaged identity store affects this panel, not the rest of Activity.
+    pub(super) tool_identities_error: Option<String>,
     /// Per-server aggregation of the full retained log (`audit::stats` rows),
     /// busiest first; each row carries its per-tool breakdown.
     pub(super) server_stats: Vec<serde_json::Value>,
@@ -119,6 +121,7 @@ impl ActivitySnapshot {
             savings_peak_catalog: 0,
             savings_since_ts: 0,
             tool_identities: Vec::new(),
+            tool_identities_error: None,
             server_stats: Vec::new(),
         }
     }
@@ -250,13 +253,17 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
     snapshot.savings_list_loads = savings_number("listLoads");
     snapshot.savings_peak_catalog = savings_number("peakCatalog");
     snapshot.savings_since_ts = savings_number("sinceTs");
-    let registry = crate::registry::load()
-        .map_err(|error| format!("could not read the registry for tool identities: {error}"))?;
-    // This read covers the pin stores and the quarantine stores together, so the
-    // message must not promise it was the pins that failed.
-    let tool_identities = crate::integrity::tool_identities(&registry.servers, &registry.profiles)
-        .map_err(|error| format!("could not read the tool identity stores: {error}"))?;
-    snapshot.tool_identities = tool_identities;
+    // Identity provenance has its own panel. A damaged pin or quarantine store
+    // must show as unknown there without hiding retained calls and audit stats.
+    match crate::registry::load()
+        .map_err(|error| format!("could not read the registry for tool identities: {error}"))
+        .and_then(|registry| {
+            crate::integrity::tool_identities(&registry.servers, &registry.profiles)
+                .map_err(|error| format!("could not read the tool identity stores: {error}"))
+        }) {
+        Ok(identities) => snapshot.tool_identities = identities,
+        Err(error) => snapshot.tool_identities_error = Some(error),
+    }
     Ok(snapshot)
 }
 

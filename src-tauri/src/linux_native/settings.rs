@@ -1488,7 +1488,7 @@ impl SettingsPage {
                 Ok::<_, String>((
                     crate::registry_controller::essential_settings()?,
                     crate::autostart::is_enabled_linux(NATIVE_AUTOSTART_NAME)?,
-                    read_quarantined_tools()?,
+                    read_quarantined_tools(),
                     read_allowed_tools(&broker)?,
                     broker.list_suggestions(),
                     crate::registry_controller::folder_routing_settings()?,
@@ -1608,10 +1608,29 @@ impl SettingsPage {
         self.feedback.add_css_class("error");
     }
 
-    fn render_quarantine(&self, entries: Vec<QuarantinedTool>) {
+    fn render_quarantine(&self, entries: Result<Vec<QuarantinedTool>, String>) {
         while let Some(child) = self.quarantine_list.first_child() {
             self.quarantine_list.remove(&child);
         }
+        let entries = match entries {
+            Ok(entries) => entries,
+            Err(error) => {
+                let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                row.add_css_class("toolport-setting-row");
+                row.append(
+                    &gtk::Label::builder()
+                        .label(format!("Blocked-tool state is unknown: {error}"))
+                        .halign(gtk::Align::Fill)
+                        .xalign(0.0)
+                        .wrap(true)
+                        .hexpand(true)
+                        .css_classes(["error"])
+                        .build(),
+                );
+                self.quarantine_list.append(&row);
+                return;
+            }
+        };
         if entries.is_empty() {
             self.quarantine_list
                 .append(&empty_state("No tools are quarantined."));
