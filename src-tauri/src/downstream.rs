@@ -2124,8 +2124,8 @@ pub trait Transport: Send {
     }
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError>;
     /// Bound how long a single `request` waits for its response. Used to fail the
-    /// connect handshake fast. Default no-op: transports with their own fixed
-    /// request timeout (e.g. HTTP) ignore it.
+    /// connect handshake fast. Default no-op: transports with their own request
+    /// timeout (for example HTTP) manage phase changes through dedicated hooks.
     fn set_read_timeout(&mut self, _timeout: Duration) {}
     /// Budget for the connect handshake's `initialize`. Stdio invocations that
     /// download their package before running (npx and friends) report the long
@@ -2134,6 +2134,9 @@ pub trait Transport: Send {
     fn connect_timeout(&self) -> Duration {
         STDIO_CONNECT_TIMEOUT
     }
+    /// The first `initialize` request has completed. Transports that temporarily
+    /// replaced their ordinary request timeout restore it here.
+    fn initialize_complete(&mut self) {}
     /// Start reacting to the server's own `notifications/tools/list_changed`.
     /// Called once the connect handshake is done, so a server that announces its
     /// tools during startup doesn't trigger a needless rebuild. Default no-op:
@@ -3007,6 +3010,9 @@ pub struct StdioTransport {
     /// How long a single request waits for its response. Lowered during the
     /// connect handshake, then restored for (potentially slow) live tool calls.
     read_timeout: Duration,
+    /// Per-server override for the first `initialize` request. Defaults to the
+    /// launcher-aware policy derived from the configured command.
+    connect_timeout: Duration,
     /// Gate shared with the stdout drain: the drain only flags a `dirty` signal
     /// once this is set, so tool-list changes announced during startup are
     /// ignored. Flipped on by `arm_tools_watch` after the handshake.
@@ -3512,6 +3518,7 @@ impl StdioTransport {
             stderr: stderr_buf,
             next_id: 1,
             read_timeout: STDIO_READ_TIMEOUT,
+            connect_timeout: stdio_connect_timeout(command, args),
             armed,
             launcher,
             server_handler: None,
@@ -3530,6 +3537,10 @@ impl StdioTransport {
             .progress
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = sink;
+    }
+
+    pub fn set_connect_timeout(&mut self, timeout: Duration) {
+        self.connect_timeout = timeout;
     }
 
     /// Build a useful error for when the child's stdout closed (it exited or
@@ -3774,11 +3785,7 @@ impl Transport for StdioTransport {
     }
 
     fn connect_timeout(&self) -> Duration {
-        if self.launcher {
-            LAUNCHER_CONNECT_TIMEOUT
-        } else {
-            STDIO_CONNECT_TIMEOUT
-        }
+        self.connect_timeout
     }
 
     fn arm_tools_watch(&mut self) {
@@ -4020,6 +4027,11 @@ pub struct HttpTransport {
     agent: ureq::Agent,
     /// Separate pool so inline replies can POST while an SSE body is still open.
     inline_agent: ureq::Agent,
+    /// Deadline selected for the first `initialize` request. The transport
+    /// restores the ordinary request timeout as soon as that request completes.
+    connect_timeout: Duration,
+    /// Ordinary HTTP request deadline restored immediately after `initialize`.
+    request_timeout: Duration,
     session_id: Option<String>,
     next_id: i64,
     /// Raw bearer token (without the "Bearer " prefix), if the server needs auth.
@@ -4213,6 +4225,8 @@ impl HttpTransport {
             url: url.to_string(),
             agent: guarded_agent_with_timeout(block_private, request_timeout),
             inline_agent: guarded_agent_with_timeout(block_private, request_timeout),
+            connect_timeout: request_timeout,
+            request_timeout,
             session_id: None,
             next_id: 1,
             auth: Arc::new(Mutex::new(auth)),
@@ -4237,6 +4251,17 @@ impl HttpTransport {
 
     pub fn set_scope_reauthorize(&mut self, callback: Option<ScopeReauthorizeFn>) {
         self.scope_reauthorize = callback.map(|callback| Arc::new(Mutex::new(callback)));
+    }
+
+    pub fn set_connect_timeout(&mut self, timeout: Duration) {
+        self.connect_timeout = timeout;
+        self.agent = guarded_agent_with_timeout(self.block_private, timeout);
+        self.inline_agent = guarded_agent_with_timeout(self.block_private, timeout);
+    }
+
+    fn restore_request_timeout(&mut self) {
+        self.agent = guarded_agent_with_timeout(self.block_private, self.request_timeout);
+        self.inline_agent = guarded_agent_with_timeout(self.block_private, self.request_timeout);
     }
 
     /// Declare an extension Toolport supports on this connection.
@@ -4299,6 +4324,8 @@ impl HttpTransport {
             url: self.url.clone(),
             agent: self.agent.clone(),
             inline_agent: self.inline_agent.clone(),
+            connect_timeout: self.connect_timeout,
+            request_timeout: self.request_timeout,
             session_id: self.session_id.clone(),
             next_id: self.next_id,
             auth: Arc::clone(&self.auth),
@@ -5016,6 +5043,14 @@ impl Transport for HttpTransport {
         self.request_inner(method, params, &[])
     }
 
+    fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    fn initialize_complete(&mut self) {
+        self.restore_request_timeout();
+    }
+
     fn request_with_cancel(
         &mut self,
         method: &str,
@@ -5464,9 +5499,8 @@ pub struct DownstreamServer {
     /// Legacy servers keep using resources/subscribe and resources/unsubscribe.
     modern_resource_subscriptions: HashSet<String>,
     /// Live-call read deadline. Starts at STDIO_READ_TIMEOUT; a per-server
-    /// `requestTimeoutMs` widens it through `set_call_timeout`. Connect,
-    /// handshake, and probe budgets are never widened, so a hung server still
-    /// fails fast.
+    /// `requestTimeoutMs` widens it through `set_call_timeout`. The separate
+    /// `initializeTimeoutMs` setting can widen only the first initialize request.
     call_timeout: Duration,
     /// Existing legacy server-to-client request bridge. Modern downstream
     /// `input_required` results use it as a compatibility shim when the upstream
@@ -5507,14 +5541,16 @@ impl DownstreamServer {
         // Going legacy-first costs the existing install base exactly nothing and
         // costs a modern server one cheap rejected request. Worth revisiting once
         // modern servers are common.
-        let (era, caps) = match transport.request(
+        let initialize_result = transport.request(
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") }
             }),
-        ) {
+        );
+        transport.initialize_complete();
+        let (era, caps) = match initialize_result {
             Ok(init) => {
                 let version = init
                     .get("protocolVersion")
@@ -5729,9 +5765,9 @@ impl DownstreamServer {
     }
 
     /// Widen the live-call read deadline for this server (per-server
-    /// `requestTimeoutMs`). Post-handshake requests only: connect, handshake,
-    /// and probe budgets keep their tighter bounds so a hung server still fails
-    /// fast, and a zero/near-zero configured value is clamped by the caller.
+    /// `requestTimeoutMs`). Post-handshake requests only: initialize and probe
+    /// budgets keep their own bounds, and a zero configured value is rejected by
+    /// the caller.
     pub fn set_call_timeout(&mut self, timeout: Duration) {
         self.call_timeout = timeout;
         self.transport.set_read_timeout(timeout);
@@ -7624,7 +7660,7 @@ mod tests {
         std::env::set_var("npm_config_cache", &root);
         let transport = super::StdioTransport::spawn_inner("npx", &args, &[], None, None, None);
         std::env::remove_var("npm_config_cache");
-        let transport = transport.expect("the stub server must spawn");
+        let mut transport = transport.expect("the stub server must spawn");
 
         assert!(
             transport.launcher,
@@ -7635,6 +7671,12 @@ mod tests {
             transport.connect_timeout(),
             super::LAUNCHER_CONNECT_TIMEOUT,
             "and it must reach connect_timeout as the long budget"
+        );
+        transport.set_connect_timeout(std::time::Duration::from_secs(300));
+        assert_eq!(
+            transport.connect_timeout(),
+            std::time::Duration::from_secs(300),
+            "a per-server override must replace the launcher default"
         );
 
         drop(transport);
@@ -8847,6 +8889,7 @@ mod tests {
             stderr: Arc::new(Mutex::new(String::new())),
             next_id: 1,
             read_timeout: std::time::Duration::from_secs(30),
+            connect_timeout: super::STDIO_CONNECT_TIMEOUT,
             armed: Arc::new(AtomicBool::new(false)),
             launcher: false,
             server_handler: None,
@@ -10918,6 +10961,33 @@ mod tests {
             MODERN_PROTOCOL_VERSION,
             "the header must follow the negotiated version, not a constant"
         );
+    }
+
+    #[test]
+    fn http_initialize_timeout_is_distinct_from_the_request_timeout() {
+        use super::{HttpTransport, Transport};
+        use std::time::Duration;
+
+        let mut transport = HttpTransport::guarded_with_timeout(
+            "https://example.invalid/mcp",
+            None,
+            None,
+            true,
+            Duration::from_secs(30),
+        );
+        assert_eq!(transport.connect_timeout(), Duration::from_secs(30));
+
+        transport.set_connect_timeout(Duration::from_secs(240));
+        assert_eq!(transport.connect_timeout(), Duration::from_secs(240));
+        assert_eq!(transport.request_timeout, Duration::from_secs(30));
+
+        transport.initialize_complete();
+        assert_eq!(
+            transport.connect_timeout(),
+            Duration::from_secs(240),
+            "restoring HTTP requests must not overwrite the initialize setting"
+        );
+        assert_eq!(transport.request_timeout, Duration::from_secs(30));
     }
 
     #[test]

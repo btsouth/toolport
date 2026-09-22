@@ -74,20 +74,19 @@ export function RegistryServerRow({
       : (server.url ?? "");
   const secretCount = server.env.filter((e) => e.secret).length;
   const status = statusOf(enabled, health);
-  // For npx/uvx-style servers, a first probe that sits in "checking" past a few
-  // seconds is almost certainly the launcher downloading the package (a warm start
-  // answers in ~1s). Name that wait "Installing…" so a slow first connect reads as
-  // progress, not a stall. Resets whenever the row leaves "checking".
+  // A probe that sits in "checking" past a few seconds is still starting. Name
+  // that wait so a slow initialize reads as progress rather than a missing route.
+  // Download launchers keep the more specific "Installing…" label.
   const launcher = isDownloadLauncher(server.command, server.args);
-  const [installing, setInstalling] = useState(false);
+  const [initializing, setInitializing] = useState(false);
   // Reset during render (not in the effect) so a later re-check starts back at
   // "Checking…" instead of flashing a stale "Installing…".
-  if (installing && (status !== "checking" || !launcher)) setInstalling(false);
+  if (initializing && status !== "checking") setInitializing(false);
   useEffect(() => {
-    if (status !== "checking" || !launcher) return;
-    const t = setTimeout(() => setInstalling(true), 4000);
+    if (status !== "checking") return;
+    const t = setTimeout(() => setInitializing(true), 4000);
     return () => clearTimeout(t);
-  }, [status, launcher]);
+  }, [status]);
   // Team-synced servers are tagged `team:<id>`. An admin manages them centrally, so a
   // member sees a Team badge and can't edit/remove them locally (a local change would
   // just re-sync away), but still authenticates them (keys stay on their own machine).
@@ -99,8 +98,10 @@ export function RegistryServerRow({
       : status === "error"
         ? "Error"
         : status === "checking"
-          ? installing
-            ? "Installing…"
+          ? initializing
+            ? launcher
+              ? "Installing…"
+              : "Initializing…"
             : "Checking…"
           : "Disabled";
 
@@ -155,8 +156,10 @@ export function RegistryServerRow({
           <span
             role="status"
             aria-label={
-              installing
-                ? "Installing the server package"
+              initializing
+                ? launcher
+                  ? "Installing the server package"
+                  : "Server initializing"
                 : status === "connected"
                   ? label.replace(" · ", ", ")
                   : STATUS_ARIA_LABEL[status]

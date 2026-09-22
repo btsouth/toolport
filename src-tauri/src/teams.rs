@@ -1676,6 +1676,7 @@ fn team_server_export(reg: &Registry) -> Value {
                 "env": s.env.iter().map(|e| serde_json::json!({ "key": e.key, "secret": e.secret })).collect::<Vec<_>>(),
                 "disabledTools": s.disabled_tools,
                 "requestTimeoutMs": s.request_timeout_ms,
+                "initializeTimeoutMs": s.initialize_timeout_ms,
                 // Non-secret by construction: client id, method and scopes only.
                 // The client SECRET is vaulted per member and is never in this
                 // payload, so a teammate importing this gets a server that tells
@@ -2100,6 +2101,7 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         // what this flow exists to avoid; the secret is still theirs to add.
         client_credentials,
         request_timeout_ms: None,
+        initialize_timeout_ms: None,
         unknown_fields: serde_json::Map::new(),
     };
 
@@ -2114,6 +2116,18 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         entry.request_timeout_ms = match s.get("requestTimeoutMs").filter(|value| !value.is_null()) {
             Some(value) => match value.as_u64().and_then(|milliseconds| {
                 crate::registry::validate_request_timeout_ms(milliseconds).ok()
+            }) {
+                Some(milliseconds) => Some(milliseconds),
+                None => return TeamClass::Blocked,
+            },
+            None => None,
+        };
+        entry.initialize_timeout_ms = match s
+            .get("initializeTimeoutMs")
+            .filter(|value| !value.is_null())
+        {
+            Some(value) => match value.as_u64().and_then(|milliseconds| {
+                crate::registry::validate_initialize_timeout_ms(milliseconds).ok()
             }) {
                 Some(milliseconds) => Some(milliseconds),
                 None => return TeamClass::Blocked,
@@ -2141,6 +2155,19 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         Some(value) => match value.as_u64().and_then(|milliseconds| {
             crate::registry::validate_request_timeout_ms(milliseconds).ok()
         }) {
+            Some(milliseconds) => Some(milliseconds),
+            None => return TeamClass::Blocked,
+        },
+        None => None,
+    };
+    entry.initialize_timeout_ms = match s
+        .get("initializeTimeoutMs")
+        .filter(|value| !value.is_null())
+    {
+        Some(value) => match value
+            .as_u64()
+            .and_then(|milliseconds| crate::registry::validate_initialize_timeout_ms(milliseconds).ok())
+        {
             Some(milliseconds) => Some(milliseconds),
             None => return TeamClass::Blocked,
         },
@@ -2852,6 +2879,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         let active = r.active_profile_id.clone().unwrap();
@@ -3033,6 +3061,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         let cfg = json!({ "servers": [
@@ -3171,6 +3200,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         apply_team_config(
@@ -3641,6 +3671,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         let cfg = json!({ "servers": [
@@ -3689,6 +3720,70 @@ mod tests {
                 assert_eq!(imported.request_timeout_ms, Some(90_000));
             }
             _ => panic!("expected the http server to import"),
+        }
+    }
+
+    #[test]
+    fn initialize_timeout_round_trips_through_team_import_and_export() {
+        let mut reg = base_registry();
+        let server = reg
+            .servers
+            .iter_mut()
+            .find(|s| s.id == "mine")
+            .expect("fixture server");
+        server.initialize_timeout_ms = Some(240_000);
+
+        let exported = team_server_export(&reg);
+        let entry = exported
+            .as_array()
+            .and_then(|servers| {
+                servers
+                    .iter()
+                    .find(|server| server.get("id").and_then(Value::as_str) == Some("mine"))
+            })
+            .expect("the server must be exported");
+        assert_eq!(entry.get("initializeTimeoutMs"), Some(&Value::from(240_000)));
+
+        match classify_team_server(entry, "team:t1") {
+            TeamClass::Review(imported) => {
+                assert_eq!(imported.initialize_timeout_ms, Some(240_000));
+            }
+            _ => panic!("expected the local server to require review"),
+        }
+    }
+
+    #[test]
+    fn team_import_enforces_initialize_timeout_bounds() {
+        let server = |initialize_timeout_ms| {
+            serde_json::json!({
+                "id": "s",
+                "name": "S",
+                "transport": "http",
+                "url": "https://mcp.example.com/mcp",
+                "initializeTimeoutMs": initialize_timeout_ms,
+            })
+        };
+
+        assert!(matches!(
+            classify_team_server(&server(0), "team:t1"),
+            TeamClass::Blocked
+        ));
+        assert!(matches!(
+            classify_team_server(
+                &server(crate::registry::MAX_INITIALIZE_TIMEOUT_MS + 1),
+                "team:t1"
+            ),
+            TeamClass::Blocked
+        ));
+        match classify_team_server(
+            &server(crate::registry::MAX_INITIALIZE_TIMEOUT_MS),
+            "team:t1",
+        ) {
+            TeamClass::Review(imported) | TeamClass::Ready(imported) => assert_eq!(
+                imported.initialize_timeout_ms,
+                Some(crate::registry::MAX_INITIALIZE_TIMEOUT_MS)
+            ),
+            _ => panic!("the maximum initialize timeout must be accepted"),
         }
     }
 
@@ -3964,6 +4059,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         // A team-sourced server: excluded too (don't echo the team's own set back).
@@ -3980,6 +4076,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         let servers = team_server_export(&r);
@@ -4330,6 +4427,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         };
         let fp = consent_fingerprint(&base);

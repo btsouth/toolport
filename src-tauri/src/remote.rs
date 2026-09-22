@@ -1015,6 +1015,7 @@ pub fn connect_remote_with_handler(
     // matching `guard_connect_target`'s pre-check but closing the DNS-rebind TOCTOU.
     let block_private = is_untrusted_source(server.source.as_deref());
     let request_timeout = request_timeout(server)?;
+    let initialize_timeout = server.initialize_timeout()?.unwrap_or(request_timeout);
     // First connect for a headless server: mint a token now. Only this path has the
     // registry config (client id, method, scopes); every later reacquisition runs
     // from the state vaulted here, which is why it can go through the shared seam
@@ -1064,6 +1065,7 @@ pub fn connect_remote_with_handler(
     // connect (SOU-474).
     let sent_auth = auth.clone();
     let mut transport = authed_transport(url, auth, server_id, block_private, request_timeout)?;
+    transport.set_connect_timeout(initialize_timeout);
     if let Some(ref handler) = server_handler {
         transport.set_server_request_handler(handler.clone());
     }
@@ -1071,7 +1073,10 @@ pub fn connect_remote_with_handler(
     transport.set_progress_sink(progress.clone());
     transport.set_change_sink(change_dirty.clone());
     match DownstreamServer::connect(server_id.to_string(), Box::new(transport)) {
-        Ok(ds) => Ok(ds),
+        Ok(mut ds) => {
+            ds.set_call_timeout(request_timeout);
+            Ok(ds)
+        }
         Err(e) if is_auth_error(&e) => {
             // The transport already gets one forced refresh per token on a 401/403.
             // If it spent one during this connect, the vault now holds a token that
@@ -1116,13 +1121,19 @@ pub fn connect_remote_with_handler(
                         block_private,
                         request_timeout,
                     )?;
+                    transport.set_connect_timeout(initialize_timeout);
                     if let Some(handler) = server_handler.clone() {
                         transport.set_server_request_handler(handler);
                     }
                     transport.set_resource_updated_sink(resource_updated);
                     transport.set_progress_sink(progress);
                     transport.set_change_sink(change_dirty);
-                    DownstreamServer::connect(server_id.to_string(), Box::new(transport))
+                    DownstreamServer::connect(server_id.to_string(), Box::new(transport)).map(
+                        |mut ds| {
+                            ds.set_call_timeout(request_timeout);
+                            ds
+                        },
+                    )
                 }
                 Err(_) => Err(e),
             }
@@ -1457,6 +1468,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     }

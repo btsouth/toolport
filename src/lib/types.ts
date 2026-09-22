@@ -348,6 +348,9 @@ export interface ServerEntry {
   /** Total deadline for each HTTP request, in milliseconds.
    * Valid values are 1 ms through 24 hours; unset preserves the 30-second default. */
   requestTimeoutMs?: number | null;
+  /** Deadline for the initial MCP initialize request, in milliseconds.
+   * Unset keeps the launcher-aware transport default. */
+  initializeTimeoutMs?: number | null;
 }
 
 /** Non-secret client-credentials config. The client SECRET is never here: it

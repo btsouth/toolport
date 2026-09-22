@@ -360,6 +360,7 @@ pub fn apply_add_server(registry: &mut Registry, fields: ServerFields) -> Result
             disabled_tools: Vec::new(),
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         },
     ))
@@ -391,6 +392,7 @@ pub(crate) fn server_from_detected(server: &clients::McpServer, client_id: &str)
         cwd: None,
         client_credentials: None,
         request_timeout_ms: None,
+        initialize_timeout_ms: None,
         unknown_fields: serde_json::Map::new(),
     }
 }
@@ -579,6 +581,7 @@ fn catalog_server(entry: crate::catalog::CatalogEntry) -> ServerEntry {
         disabled_tools: Vec::new(),
         client_credentials: None,
         request_timeout_ms: None,
+        initialize_timeout_ms: None,
         unknown_fields: serde_json::Map::new(),
     }
 }
@@ -654,6 +657,7 @@ pub fn server_entry_for_probe(
                 disabled_tools: Vec::new(),
                 client_credentials: None,
                 request_timeout_ms: None,
+                initialize_timeout_ms: None,
                 unknown_fields: serde_json::Map::new(),
             })
         }
@@ -1843,6 +1847,7 @@ mod tests {
             disabled_tools: Vec::new(),
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     }

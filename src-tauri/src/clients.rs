@@ -5370,6 +5370,7 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
         cwd: None,
         client_credentials: None,
         request_timeout_ms: None,
+        initialize_timeout_ms: None,
         unknown_fields: serde_json::Map::new(),
     })
 }
@@ -5460,6 +5461,7 @@ pub fn gateway_entry_shared_http(
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     } else {
@@ -5494,6 +5496,7 @@ pub fn gateway_entry_shared_http(
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -6894,6 +6897,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -6993,6 +6997,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -7015,6 +7020,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     }

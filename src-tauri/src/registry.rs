@@ -445,6 +445,7 @@ pub struct EnvVar {
 /// default, but a bounded ceiling ensures cancellation cannot leave a server's
 /// single HTTP worker draining for an effectively unlimited period.
 pub(crate) const MAX_REQUEST_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+pub(crate) const MAX_INITIALIZE_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 
 pub(crate) fn validate_request_timeout_ms(milliseconds: u64) -> Result<u64, String> {
     if milliseconds == 0 {
@@ -453,6 +454,18 @@ pub(crate) fn validate_request_timeout_ms(milliseconds: u64) -> Result<u64, Stri
     if milliseconds > MAX_REQUEST_TIMEOUT_MS {
         return Err(format!(
             "requestTimeoutMs must not exceed {MAX_REQUEST_TIMEOUT_MS} (24 hours)"
+        ));
+    }
+    Ok(milliseconds)
+}
+
+pub(crate) fn validate_initialize_timeout_ms(milliseconds: u64) -> Result<u64, String> {
+    if milliseconds == 0 {
+        return Err("initializeTimeoutMs must be greater than zero".to_string());
+    }
+    if milliseconds > MAX_INITIALIZE_TIMEOUT_MS {
+        return Err(format!(
+            "initializeTimeoutMs must not exceed {MAX_INITIALIZE_TIMEOUT_MS} (24 hours)"
         ));
     }
     Ok(milliseconds)
@@ -507,6 +520,12 @@ pub struct ServerEntry {
     /// transports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_ms: Option<u64>,
+    /// Deadline for the initial MCP `initialize` request, in milliseconds.
+    /// Unset preserves the transport default: 120 seconds for download launchers,
+    /// 10 seconds for other stdio commands, and the HTTP request timeout for
+    /// remote servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialize_timeout_ms: Option<u64>,
     /// Per-server fields written by a newer build that this binary doesn't know
     /// about. Captured on load and re-emitted on save so a mixed-version binary
     /// never strips them (same contract as `Registry::unknown_fields`).
@@ -515,6 +534,13 @@ pub struct ServerEntry {
 }
 
 impl ServerEntry {
+    pub fn initialize_timeout(&self) -> Result<Option<std::time::Duration>, String> {
+        self.initialize_timeout_ms
+            .map(validate_initialize_timeout_ms)
+            .transpose()
+            .map(|value| value.map(std::time::Duration::from_millis))
+    }
+
     /// Team-synced local commands and LAN URLs stay off until the member enables
     /// them after review. Enable-all and the playground must not skip that gate.
     pub fn needs_team_enable_review(&self) -> bool {
@@ -3957,6 +3983,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -4752,20 +4779,46 @@ mod tests {
     }
 
     #[test]
-    fn server_request_timeout_is_optional_and_round_trips_in_milliseconds() {
+    fn server_timeouts_are_optional_and_round_trip_in_milliseconds() {
         let server = sample_server("remote");
         let without_timeout = serde_json::to_value(&server).unwrap();
         assert!(
             without_timeout.get("requestTimeoutMs").is_none(),
             "the historical default must not add a registry field"
         );
+        assert!(without_timeout.get("initializeTimeoutMs").is_none());
 
         let mut configured = server;
         configured.request_timeout_ms = Some(75_000);
+        configured.initialize_timeout_ms = Some(240_000);
         let json = serde_json::to_value(&configured).unwrap();
         assert_eq!(json["requestTimeoutMs"], 75_000);
+        assert_eq!(json["initializeTimeoutMs"], 240_000);
         let loaded: ServerEntry = serde_json::from_value(json).unwrap();
         assert_eq!(loaded.request_timeout_ms, Some(75_000));
+        assert_eq!(loaded.initialize_timeout_ms, Some(240_000));
+        assert_eq!(
+            loaded.initialize_timeout().unwrap(),
+            Some(std::time::Duration::from_secs(240))
+        );
+    }
+
+    #[test]
+    fn initialize_timeout_rejects_zero_and_values_over_24_hours() {
+        assert_eq!(validate_initialize_timeout_ms(1), Ok(1));
+        assert_eq!(
+            validate_initialize_timeout_ms(MAX_INITIALIZE_TIMEOUT_MS),
+            Ok(MAX_INITIALIZE_TIMEOUT_MS)
+        );
+        assert_eq!(
+            validate_initialize_timeout_ms(0).unwrap_err(),
+            "initializeTimeoutMs must be greater than zero"
+        );
+        assert!(
+            validate_initialize_timeout_ms(MAX_INITIALIZE_TIMEOUT_MS + 1)
+                .unwrap_err()
+                .contains("must not exceed")
+        );
     }
 
     #[test]
@@ -5808,6 +5861,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         // Inject a per-server field this binary's ServerEntry doesn't define.

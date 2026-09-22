@@ -72,4 +72,17 @@ describe("RegistryServerRow status accessibility", () => {
     view.unmount();
     vi.useRealTimers();
   });
+
+  it("announces when a non-launcher server is still initializing", () => {
+    vi.useFakeTimers();
+    const view = renderRow(true);
+
+    act(() => vi.advanceTimersByTime(4000));
+
+    expect(
+      screen.getByRole("status", { name: "Server initializing" }),
+    ).toBeInTheDocument();
+    view.unmount();
+    vi.useRealTimers();
+  });
 });
