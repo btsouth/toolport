@@ -73,17 +73,17 @@ impl Harness {
                     let Ok(mut text) = stderr_text.lock() else {
                         return;
                     };
-                    // Bounded: only the tail of a failure is worth quoting.
-                    if text.len() > 8 * 1024 {
-                        let from = text.len() - 4 * 1024;
-                        let boundary = text[from..]
-                            .find('\n')
-                            .map(|i| from + i + 1)
-                            .unwrap_or(from);
-                        text.drain(..boundary);
-                    }
                     text.push_str(&line);
                     text.push('\n');
+                    // Keep the last 4 KiB, including when one line is longer than the
+                    // limit. Move to a UTF-8 boundary before trimming.
+                    if text.len() > 4 * 1024 {
+                        let mut from = text.len() - 4 * 1024;
+                        while !text.is_char_boundary(from) {
+                            from += 1;
+                        }
+                        text.drain(..from);
+                    }
                 }
             });
         }
