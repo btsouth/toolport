@@ -281,4 +281,24 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The quarantine gauge carries the same contract as the audit log: an
+    /// existing store that cannot be read is a FAILED scrape, not zero.
+    #[test]
+    fn unreadable_quarantine_store_fails_the_scrape() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = scratch_data_dir("unreadable-quarantine");
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let path = crate::registry::conduit_dir()
+            .expect("data dir under override")
+            .join("quarantine.json");
+        // IsADirectory: the store path exists but cannot be read as a file.
+        std::fs::create_dir_all(&path).expect("unreadable store fixture");
+        let error = render().expect_err("an unreadable quarantine store must fail the scrape");
+        assert!(
+            error.contains("quarantine"),
+            "the scrape error must name what failed: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
