@@ -122,6 +122,10 @@ describe("ServerDialog", () => {
     render(<ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />);
     await user.click(screen.getByLabelText("Transport"));
     await user.click(screen.getByRole("option", { name: "http (remote)" }));
+    expect(screen.getByLabelText("Startup timeout (optional)")).toHaveAttribute(
+      "placeholder",
+      "30",
+    );
     await user.type(screen.getByLabelText("URL"), "https://mcp.example.com/mcp");
     await user.click(screen.getByRole("button", { name: "Save" }));
 
@@ -137,22 +141,24 @@ describe("ServerDialog", () => {
 
   it("saves the startup timeout in milliseconds", async () => {
     const initial: ServerEntry = {
-      id: "local",
-      name: "Local",
-      transport: "stdio",
-      command: "local-server",
+      id: "remote",
+      name: "Remote",
+      transport: "http",
+      command: null,
       args: [],
       env: [],
-      url: null,
+      url: "https://mcp.example.com/mcp",
       source: "manual",
+      requestTimeoutMs: 90_000,
       initializeTimeoutMs: 240_000,
     };
-    api.updateServer.mockResolvedValueOnce(savedRegistry("local"));
+    api.updateServer.mockResolvedValueOnce(savedRegistry("remote"));
     const user = userEvent.setup();
 
-    render(<ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />);
+    render(<ServerDialog autoOpen editId="remote" initial={initial} onSaved={vi.fn()} />);
     const input = screen.getByLabelText("Startup timeout (optional)");
     expect(input).toHaveValue(240);
+    expect(input).toHaveAttribute("placeholder", "90");
     await user.clear(input);
     await user.type(input, "300.5");
     await user.click(screen.getByRole("button", { name: "Save" }));
@@ -160,7 +166,7 @@ describe("ServerDialog", () => {
     await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
     expect(api.updateServer).toHaveBeenCalledWith(
       expect.objectContaining({
-        id: "local",
+        id: "remote",
         initializeTimeoutMs: 300_500,
       }),
     );

@@ -494,9 +494,15 @@ export function ServerDialog({
               max="86400"
               step="0.001"
               placeholder={
-                isStdio && isDownloadLauncher(form.command, parseArgs(form.args))
-                  ? "120"
-                  : "10"
+                isStdio
+                  ? isDownloadLauncher(form.command, parseArgs(form.args))
+                    ? "120"
+                    : "10"
+                  : String(
+                      (initialUsesLocalCommand
+                        ? 30_000
+                        : (initial?.requestTimeoutMs ?? 30_000)) / 1000,
+                    )
               }
               value={form.initializeTimeoutSeconds}
               onChange={(e) => set("initializeTimeoutSeconds", e.target.value)}
