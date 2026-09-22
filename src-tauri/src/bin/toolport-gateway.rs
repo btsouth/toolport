@@ -11191,6 +11191,10 @@ impl HostState {
     }
 
     /// True when this host runs in grouped discovery mode (see [`grouped_tool_defs`]).
+    ///
+    /// Test-only: the `handle_request` wrapper is its only caller and takes the mode
+    /// as a bool, while the bridge resolves the mode itself.
+    #[cfg(test)]
     fn grouped_discovery(&self) -> bool {
         self.discovery_mode() == DiscoveryMode::Grouped
     }
