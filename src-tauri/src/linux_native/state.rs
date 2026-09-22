@@ -252,9 +252,11 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
     snapshot.savings_since_ts = savings_number("sinceTs");
     let registry = crate::registry::load()
         .map_err(|error| format!("could not read the registry for tool identities: {error}"))?;
-    snapshot.tool_identities =
-        crate::integrity::tool_identities(&registry.servers, &registry.profiles)
-            .map_err(|error| format!("could not read tool identity pins: {error}"))?;
+    // This read covers the pin stores and the quarantine stores together, so the
+    // message must not promise it was the pins that failed.
+    let tool_identities = crate::integrity::tool_identities(&registry.servers, &registry.profiles)
+        .map_err(|error| format!("could not read the tool identity stores: {error}"))?;
+    snapshot.tool_identities = tool_identities;
     Ok(snapshot)
 }
 

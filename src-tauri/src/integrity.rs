@@ -1017,27 +1017,80 @@ pub fn tool_identities(
     Ok(ids)
 }
 
+/// Human label for a quarantine store in cross-profile scan errors, so a failure
+/// names which profile's store it was instead of only a hashed file name.
+fn quarantine_store_label(profile: &str) -> String {
+    if profile.is_empty() {
+        "the default profile".to_string()
+    } else {
+        format!("profile {profile:?}")
+    }
+}
+
+/// Read one quarantine store for the cross-profile scans (dashboards, sidebar
+/// badge, `/metrics`).
+///
+/// Same classification as the enforcement read, missing store included: a missing
+/// file contributes nothing only when the pin store says this is a real first run
+/// (or the legacy migrator has not reached the profile yet), while a store that
+/// vanished under real pins, cannot be read, is empty, or is corrupt is an error.
+/// Unknown must never render as nothing blocked (SBS-873, SOU-320, and SBS-871 for
+/// the missing case). The read is retried exactly like the enforcement path, so
+/// another process's `atomic_write` rename window cannot turn into a spurious
+/// failure on its own.
+fn read_quarantine_for_scan(profile: &str, path: &Path) -> Result<Option<Quarantine>, String> {
+    let label = quarantine_store_label(profile);
+    match read_quarantine_file(path) {
+        // A store that vanished under real pins is the same damage as a corrupt one,
+        // and the enforcement read already fails closed on it (SBS-871), so the union
+        // must not answer "nothing blocked" for that profile either.
+        QuarantineFileRead::Missing => {
+            let profile = if profile.is_empty() {
+                None
+            } else {
+                Some(profile)
+            };
+            // The reason already carries the path and the SBS-871 shape; add the label
+            // rather than repeating any of it.
+            missing_quarantine_store(profile, path)
+                .map(|_| None)
+                .map_err(|reason| format!("{reason} (while scanning {label})"))
+        }
+        // The union walks every profile's store, so a parse failure has to name the
+        // profile too, exactly like the unreadable arm below.
+        QuarantineFileRead::Raw(raw) => match parse_quarantine_raw(&raw, path) {
+            Ok(store) => Ok(Some(store)),
+            Err(reason) => Err(format!("{reason} (while scanning {label})")),
+        },
+        // An io error need not name the file, so this arm keeps the path in the prefix.
+        QuarantineFileRead::Unreadable(error) => Err(format!(
+            "quarantine store for {label} at {path:?} is unreadable: {error}"
+        )),
+    }
+}
+
+/// Namespaced names of every quarantined tool across all profiles, for the views
+/// that present the union.
+///
+/// Fails closed on a damaged store: an unreadable, empty, corrupt, or unexpectedly
+/// missing file is an `Err`, so a caller cannot render damage as "nothing blocked".
 pub fn all_quarantined_names() -> Result<BTreeSet<String>, String> {
     let mut out = BTreeSet::new();
     let Some(dir) = crate::registry::conduit_dir() else {
         return Ok(out);
     };
     let registry = crate::registry::load_resolved()?;
-    let mut paths = vec![dir.join("quarantine.json")];
-    paths.extend(
-        registry
-            .profiles
-            .iter()
-            .filter_map(|profile| quarantine_path(Some(&profile.id))),
-    );
-    for path in paths {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            if let Ok(q) = serde_json::from_str::<Quarantine>(&s) {
-                for (name, rec) in q {
-                    if !is_legacy_added(&rec) {
-                        out.insert(name);
-                    }
-                }
+    let mut stores = vec![(String::new(), dir.join("quarantine.json"))];
+    stores.extend(registry.profiles.iter().filter_map(|profile| {
+        quarantine_path(Some(&profile.id)).map(|path| (profile.id.clone(), path))
+    }));
+    for (profile, path) in stores {
+        let Some(store) = read_quarantine_for_scan(&profile, &path)? else {
+            continue;
+        };
+        for (name, record) in store {
+            if !is_legacy_added(&record) {
+                out.insert(name);
             }
         }
     }
@@ -1556,6 +1609,11 @@ pub fn quarantine_notification(newcomers: &[&Value]) -> (String, String) {
     (title, body)
 }
 
+/// Every quarantined tool across all profiles, as the records the dashboards and
+/// `/metrics` present.
+///
+/// Same contract as [`all_quarantined_names`]: only a fresh profile's missing
+/// store contributes nothing; a damaged one is an `Err` rather than a shorter list.
 pub fn all_quarantined() -> Result<Vec<Value>, String> {
     let Some(dir) = crate::registry::conduit_dir() else {
         return Ok(Vec::new());
@@ -1567,16 +1625,15 @@ pub fn all_quarantined() -> Result<Vec<Value>, String> {
         quarantine_path(Some(&profile.id)).map(|path| (profile.id.clone(), path))
     }));
     for (profile, path) in stores {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            if let Ok(q) = serde_json::from_str::<Quarantine>(&s) {
-                for mut rec in q.into_values() {
-                    if is_legacy_added(&rec) {
-                        continue;
-                    }
-                    rec["profile"] = json!(profile);
-                    out.push(rec);
-                }
+        let Some(store) = read_quarantine_for_scan(&profile, &path)? else {
+            continue;
+        };
+        for mut record in store.into_values() {
+            if is_legacy_added(&record) {
+                continue;
             }
+            record["profile"] = json!(profile);
+            out.push(record);
         }
     }
     Ok(out)
@@ -4088,7 +4145,7 @@ mod tests {
             quarantined(profile).expect("store readable").is_empty(),
             "legacy added entry is dropped on the per-profile load"
         );
-        // The app's cross-profile views read the files raw, so they must apply the same
+        // The app's cross-profile views scan every store, so they must apply the same
         // filter or the UI keeps showing tools the gateway no longer blocks (the bug the
         // user hit: dozens of first-sight destructive tools still listed as quarantined).
         assert!(
@@ -4595,6 +4652,223 @@ mod tests {
         assert!(
             all_quarantined().is_err(),
             "a corrupt registry must not become an authoritative empty cross-profile view"
+        );
+    }
+
+    /// A store that exists but cannot be read must fail the cross-profile view
+    /// instead of reading as "nothing blocked". The GTK badge and `/metrics`
+    /// already treat `Err` as unknown for exactly this reason (SBS-873).
+    #[test]
+    fn cross_profile_quarantine_view_surfaces_an_unreadable_store() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data_dir = TestDataDir::new("aggregate-unreadable");
+        // Two profiles, one with a readable store and one damaged, so the union is
+        // the thing under test rather than a single store.
+        let mut registry = crate::registry::load_resolved().expect("a fresh registry loads");
+        for id in ["billing", "support"] {
+            registry.profiles.push(crate::registry::Profile {
+                id: id.to_string(),
+                name: id.to_string(),
+                enabled_server_ids: Vec::new(),
+                tool_scope: std::collections::HashMap::new(),
+            });
+        }
+        crate::registry::save(&registry).expect("save the two-profile registry");
+
+        let mut store = Quarantine::new();
+        store.insert(
+            "srv__wipe".to_string(),
+            json!({ "tool": "srv__wipe", "server": "srv", "change": "changed" }),
+        );
+        save_quarantine(Some("support"), &store).unwrap();
+        // IsADirectory: the store path exists but cannot be read as a file. The
+        // legacy migration leaves an existing target alone, so this reaches the scan.
+        let damaged = quarantine_path(Some("billing")).expect("profile store path");
+        std::fs::create_dir_all(&damaged).unwrap();
+
+        let error = all_quarantined().expect_err("a damaged profile store must fail the union");
+        assert!(
+            error.contains("unreadable") && error.contains("billing"),
+            "the error must name the store's profile: {error}"
+        );
+        assert!(
+            all_quarantined_names().is_err(),
+            "the enforcement set must refuse the damaged store too"
+        );
+        assert!(
+            !data_dir.path.join("quarantine.json").exists(),
+            "the damage must not have been papered over by a new default store"
+        );
+
+        // Damage removed: the other profile's block is back, exactly one record.
+        std::fs::remove_dir_all(&damaged).unwrap();
+        let list = all_quarantined().expect("a readable union");
+        assert_eq!(list.len(), 1, "unexpected records: {list:?}");
+        assert_eq!(
+            list[0].get("profile").and_then(Value::as_str),
+            Some("support")
+        );
+    }
+
+    /// A corrupt or truncated store is a lost store. Both shapes must fail the
+    /// view, exactly like the enforcement read (SOU-320), and the messages must
+    /// stay distinguishable for the operator.
+    #[test]
+    fn cross_profile_quarantine_view_surfaces_a_corrupt_store() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data_dir = TestDataDir::new("aggregate-corrupt-store");
+        let path = data_dir.path.join("quarantine.json");
+
+        std::fs::write(&path, "{ not json").unwrap();
+        let corrupt = all_quarantined().expect_err("corrupt JSON must not read as empty");
+        assert!(
+            corrupt.contains("is corrupt:") && corrupt.contains("the default profile"),
+            "unexpected error: {corrupt}"
+        );
+        assert!(
+            corrupt.contains(&format!("{path:?}")),
+            "the error must name the store path: {corrupt}"
+        );
+
+        std::fs::write(&path, "").unwrap();
+        let empty = all_quarantined_names().expect_err("an empty store must not read as empty");
+        assert!(
+            empty.contains("is empty") && empty.contains("the default profile"),
+            "unexpected error: {empty}"
+        );
+    }
+
+    /// The same two shapes in a named profile's store: the union walks several
+    /// stores, so an error has to name the profile that failed, not only its path.
+    /// Its own data directory keeps the legacy migration (which copies the default
+    /// store into a profile's store when that store is missing) out of the way.
+    #[test]
+    fn cross_profile_quarantine_view_names_a_corrupt_profile_store() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("aggregate-corrupt-profile-store");
+        let mut registry = crate::registry::load_resolved().expect("a fresh registry loads");
+        registry.profiles.push(crate::registry::Profile {
+            id: "billing".to_string(),
+            name: "billing".to_string(),
+            enabled_server_ids: Vec::new(),
+            tool_scope: std::collections::HashMap::new(),
+        });
+        crate::registry::save(&registry).expect("save the registry");
+        let profile_path = quarantine_path(Some("billing")).expect("profile store path");
+
+        std::fs::write(&profile_path, "{ not json").unwrap();
+        let corrupt = all_quarantined().expect_err("corrupt profile JSON must fail the union");
+        assert!(
+            corrupt.contains("is corrupt:") && corrupt.contains("billing"),
+            "the error must name the profile store: {corrupt}"
+        );
+        assert!(
+            corrupt.contains(&format!("{profile_path:?}")),
+            "the error must name the profile store path: {corrupt}"
+        );
+
+        std::fs::write(&profile_path, "").unwrap();
+        let empty = all_quarantined_names().expect_err("an empty profile store must fail too");
+        assert!(
+            empty.contains("is empty") && empty.contains("billing"),
+            "the error must name the truncated profile store: {empty}"
+        );
+    }
+
+    /// A profile store that vanished while its pins are Loaded is the rename-window
+    /// damage SBS-871 fails closed on for enforcement, so the union must refuse it
+    /// too instead of rendering that profile as "nothing blocked". A profile with no
+    /// pins stays silent, which the sibling test covers.
+    #[test]
+    fn cross_profile_quarantine_view_fails_closed_when_a_store_vanishes_under_pins() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("aggregate-vanished-store");
+        let mut registry = crate::registry::load_resolved().expect("a fresh registry loads");
+        registry.profiles.push(crate::registry::Profile {
+            id: "billing".to_string(),
+            name: "billing".to_string(),
+            enabled_server_ids: Vec::new(),
+            tool_scope: std::collections::HashMap::new(),
+        });
+        crate::registry::save(&registry).expect("save the registry");
+        write_loaded_pin_store(Some("billing"));
+        let profile_path = quarantine_path(Some("billing")).expect("profile store path");
+        assert!(
+            !profile_path.exists(),
+            "the fixture needs a missing store, not an unreadable one"
+        );
+
+        let error = all_quarantined().expect_err("a vanished store under pins must fail the union");
+        assert!(
+            is_absent_quarantine_not_fresh(&error) && error.contains("billing"),
+            "the error must be the missing-not-fresh case and name the profile: {error}"
+        );
+        assert!(
+            all_quarantined_names().is_err(),
+            "the enforcement set must refuse it too"
+        );
+    }
+
+    /// Absence stays honest: a missing store contributes nothing, and readable
+    /// stores still report. Only damage fails the view.
+    #[test]
+    fn cross_profile_quarantine_view_keeps_missing_stores_silent() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data_dir = TestDataDir::new("aggregate-missing");
+        assert!(
+            all_quarantined().unwrap().is_empty(),
+            "no store anywhere is an empty view, not a failure"
+        );
+
+        let mut registry = crate::registry::load_resolved().expect("a fresh registry loads");
+        registry.profiles.push(crate::registry::Profile {
+            id: "billing".to_string(),
+            name: "Billing".to_string(),
+            enabled_server_ids: Vec::new(),
+            tool_scope: std::collections::HashMap::new(),
+        });
+        crate::registry::save(&registry).expect("save the registry");
+
+        let mut store = Quarantine::new();
+        store.insert(
+            "srv__wipe".to_string(),
+            json!({ "tool": "srv__wipe", "server": "srv", "change": "changed" }),
+        );
+        save_quarantine(Some("billing"), &store).unwrap();
+
+        let list = all_quarantined().unwrap();
+        assert_eq!(list.len(), 1, "unexpected records: {list:?}");
+        assert_eq!(
+            list[0].get("profile").and_then(Value::as_str),
+            Some("billing")
+        );
+        assert!(all_quarantined_names().unwrap().contains("srv__wipe"));
+        assert!(
+            !data_dir.path.join("quarantine.json").exists(),
+            "a profile store must not be migrated back into the default file"
+        );
+    }
+
+    /// The scan helper labels a per-profile store, so the error names which
+    /// profile failed rather than only a hashed file name.
+    #[test]
+    fn quarantine_scan_helper_labels_a_profile_store() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("aggregate-label");
+        let path = quarantine_path(Some("billing")).expect("profile store path");
+
+        assert!(
+            read_quarantine_for_scan("billing", &path)
+                .unwrap()
+                .is_none(),
+            "a missing profile store contributes nothing"
+        );
+        std::fs::create_dir_all(&path).unwrap();
+        let error = read_quarantine_for_scan("billing", &path)
+            .expect_err("an unreadable profile store must be an error");
+        assert!(
+            error.contains("billing") && error.contains("unreadable"),
+            "the error must name the profile: {error}"
         );
     }
 
