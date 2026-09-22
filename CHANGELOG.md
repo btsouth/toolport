@@ -6,6 +6,13 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.20.0] - 2026-09-22
+
+Toolport 1.20.0 brings slow-start controls and Cursor ask-first approvals into the
+app, and makes damaged integrity stores visible without taking down unrelated
+Linux panels. The shared host daemon remains opt-in; this release does not change
+the default gateway topology.
+
 ### Added
 
 - **A Cursor "ask first" rule now prompts in Toolport instead of Cursor.** When the guard
@@ -21,7 +28,30 @@ Entries before the rename below shipped under the project's former name, Conduit
   Server rows also say "Initializing…" after a few seconds, so a slow first start no longer
   looks like a missing route. (#918)
 
+- **Arch and Omarchy installs can follow the signed pacman repository.** The install
+  and update steps are now documented alongside the other download paths.
+
 ### Fixed
+
+- **Damaged integrity stores no longer look like missing identities or an empty
+  quarantine.** Cross-profile pin and quarantine views report unreadable, empty, or
+  corrupt stores as unknown, naming the affected profile. A vanished pin store with
+  a valid backup recovers from that backup instead of starting a fresh baseline.
+  Unrecoverable stores still fail closed during enforcement. (#922, #931)
+
+- **A damaged quarantine store no longer blanks unrelated Linux pages.** Settings
+  shows the failure in the blocked-tools panel, Activity shows it in the identity
+  panel, and the security watcher continues to announce new findings even when
+  quarantine-based duplicate suppression is unavailable. (#930)
+
+- **Pending approvals no longer reappear from an older refresh.** When a poll or
+  gateway event starts a newer list request, a late older response cannot replace
+  it. (#923)
+
+- **The HTTP bridge follows a live discovery-mode change.** Its OpenAPI and MCP
+  requests now read the host's current mode, while a client's own discovery
+  override still wins. Switching into or out of lazy mode no longer requires a
+  gateway restart. (#924)
 
 - **A Windows agent-plugin launch can no longer trust an older gateway manifest over a
   newer published binary.** The launcher scans the published bin directory for the newest

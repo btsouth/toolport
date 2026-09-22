@@ -18,6 +18,9 @@ Releases are built by CI on a version tag (`.github/workflows/release.yml`).
      (`src/test/homebrew-cask.test.ts`) fails CI if the version drifts from
      `package.json`. This file is a snapshot; `brew install` reads the live
      tap, not this copy (see Homebrew tap below)
+   - `packaging/linux/native/PKGBUILD` (`pkgver`; set its source `sha256sums`
+     to `SKIP` until the tag archive exists, then pin the real digest before
+     dispatching the Arch repository workflow below)
    - `CHANGELOG.md` — move `[Unreleased]` entries into a dated section
    - `server.json` only when publishing a matching standalone gateway package
    - `scripts/install.ps1` / `scripts/install.sh` only if you changed them, in which
@@ -41,6 +44,31 @@ CI builds installers for **Windows** (NSIS), **macOS** (dmg), and **Linux**
 (deb + AppImage), each with the gateway bundled, plus `toolport-agent-plugin.zip`,
 and attaches them to a **draft** release titled `Toolport vX.Y.Z` whose body is the
 changelog section. Review the draft, then click **Publish**.
+
+The **Arch pacman repository** is a separate manual dispatch. The tag archive's
+checksum cannot be pinned in the commit that creates the tag, because changing
+that commit changes the archive. Once the tag exists, download its archive,
+compute its SHA-256, replace `SKIP` in `packaging/linux/native/PKGBUILD`, and
+commit that checksum to `main`. For example, for `vX.Y.Z`:
+
+```bash
+curl -fL -o /tmp/toolport-vX.Y.Z.tar.gz \
+  https://github.com/btsouth/toolport/archive/refs/tags/vX.Y.Z.tar.gz
+sha256sum /tmp/toolport-vX.Y.Z.tar.gz
+```
+
+Run a build-only check against the tag while the GitHub release is still a
+draft, then publish the reviewed release and dispatch the real package update:
+
+```bash
+gh workflow run arch-repo.yml -f tag=vX.Y.Z -f dry_run=true
+# After the release is published:
+gh workflow run arch-repo.yml -f tag=vX.Y.Z -f dry_run=false
+```
+
+The workflow checks that `pkgver` matches the tag and refuses `SKIP`; it builds
+from the tagged source before signing and uploading the package. Watch the run
+through completion so a release does not leave pacman users on the old version.
 
 Publishing is also what triggers **winget** (`winget.yml`): it submits a manifest
 update to `microsoft/winget-pkgs` for the new version. It runs on publish rather
