@@ -4726,7 +4726,7 @@ mod tests {
             "unexpected error: {corrupt}"
         );
         assert!(
-            corrupt.contains(&path.display().to_string()),
+            corrupt.contains(&format!("{path:?}")),
             "the error must name the store path: {corrupt}"
         );
 
@@ -4763,7 +4763,7 @@ mod tests {
             "the error must name the profile store: {corrupt}"
         );
         assert!(
-            corrupt.contains(&profile_path.display().to_string()),
+            corrupt.contains(&format!("{profile_path:?}")),
             "the error must name the profile store path: {corrupt}"
         );
 
