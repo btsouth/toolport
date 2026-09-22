@@ -8,8 +8,8 @@
 // gateway_publish.rs), newest-first:
 //
 //   any OS   $TOOLPORT_GATEWAY (explicit override, absolute path)
-//   Windows  %APPDATA%\Toolport\bin\gateway-manifest.json -> recorded path,
-//            else the newest toolport-gateway-*.exe in that bin dir,
+//   Windows  newest toolport-gateway-*.exe in %APPDATA%\Toolport\bin,
+//            else that bin dir's gateway-manifest.json -> recorded path,
 //            else the NSIS install dir %LOCALAPPDATA%\Toolport
 //   macOS    Toolport.app helper bundle (Contents/Helpers/ToolportGateway.app),
 //            else the Contents/MacOS symlink, in /Applications then ~/Applications
@@ -111,19 +111,21 @@ export function gatewayCandidates({
     const local = env.LOCALAPPDATA || pathImpl.join(home, "AppData", "Local");
     for (const leaf of ["Toolport", "Conduit"]) {
       const binDir = pathImpl.join(roaming, leaf, "bin");
-      const fromManifest = manifestPath(binDir, fsOps, pathImpl);
-      if (fromManifest) found.push(fromManifest);
-      // Scan before guessing. This plugin is installed from a release zip and is
-      // never auto-updated, so its version pins to whatever shipped, while the
-      // desktop app updates underneath it. The app's prune keeps recent and
-      // still-referenced old images (gateway_publish.rs::decide_prune), so
-      // guessing first would spawn a stale gateway with the newer one sitting in
-      // the same directory.
+      // Scan before trusting the manifest. The manifest is only rewritten when
+      // the desktop app launches, so an upgraded install can leave it pointing at
+      // an older valid image while a newer one is already published beside it.
+      // The app's prune keeps recent and still-referenced old images
+      // (gateway_publish.rs::decide_prune), so a stale manifest must not pin the
+      // launcher to one of those.
       const published = newestPublished(binDir, fsOps, pathImpl, exe);
       if (published) found.push(published);
-      // Tried only after the scanned path fails to spawn: the normal published
-      // filename can still be constructed from this plugin's lockstep version
-      // when MSIX hides the directory and the manifest from readdir/read.
+      // The manifest remains the fallback for MSIX, where a host-created path can
+      // be launchable through CreateProcess even when stat/readdir are hidden.
+      const fromManifest = manifestPath(binDir, fsOps, pathImpl);
+      if (fromManifest) found.push(fromManifest);
+      // Tried only after both published paths fail to spawn: construct the normal
+      // filename from this plugin's lockstep version when MSIX hides the directory
+      // and the manifest from readdir/read too.
       const candidateVersion = version ?? pluginVersion(fsOps);
       if (candidateVersion) {
         found.push(
