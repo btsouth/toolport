@@ -518,7 +518,7 @@ fn gateway_capabilities(
     router: &Router,
     allowed: Option<&std::collections::HashSet<String>>,
     reg: &Registry,
-    lazy: bool,
+    mode: DiscoveryMode,
 ) -> Value {
     let resources = if serving_modern_client() {
         json!({ "listChanged": true })
@@ -554,20 +554,16 @@ fn gateway_capabilities(
         } else {
             extensions.remove(MCP_APPS_EXTENSION);
         }
-        let discovery_mode = if lazy {
-            DiscoveryMode::Lazy
-        } else if host.grouped_discovery() {
-            DiscoveryMode::Grouped
-        } else {
-            DiscoveryMode::Full
-        };
+        // The caller resolved this request's mode (a per-client override, else the host's
+        // live mode), so advertise exactly that instead of re-deriving it from a bool,
+        // which could only see the boot value.
         // This is Toolport's capability on the upstream hop, so it wins over a
         // downstream server attempting to claim the same vendor namespace.
         extensions.insert(
             TOOLPORT_GATEWAY_EXTENSION.to_string(),
             json!({
                 "version": "1.0.0",
-                "discoveryMode": discovery_mode.as_str(),
+                "discoveryMode": mode.as_str(),
                 "codeMode": host.code_mode_enabled(),
                 "agentControl": reg.allow_agent_control,
                 "destructiveConfirmation": reg.confirm_destructive
@@ -7644,7 +7640,7 @@ fn handle_request_with_cancel(
             id,
             json!({
                 "supportedVersions": SUPPORTED_UPSTREAM_VERSIONS,
-                "capabilities": gateway_capabilities(host, router, allowed, reg, mode == DiscoveryMode::Lazy),
+                "capabilities": gateway_capabilities(host, router, allowed, reg, mode),
                 "instructions": format!("Toolport aggregates every configured MCP server behind one endpoint. In lazy discovery mode the catalog is reached through toolport_search_tools / toolport_call_tool rather than a full tools/list. {ROUTINE_AGENT_INSTRUCTIONS}"),
                 // server/discover is a cacheable operation. The list results grow
                 // these fields in SOU-454.
@@ -7675,7 +7671,7 @@ fn handle_request_with_cancel(
                 id,
                 json!({
                     "protocolVersion": proto,
-                    "capabilities": gateway_capabilities(host, router, allowed, reg, mode == DiscoveryMode::Lazy),
+                    "capabilities": gateway_capabilities(host, router, allowed, reg, mode),
                     "serverInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": ROUTINE_AGENT_INSTRUCTIONS
                 }),
@@ -11076,7 +11072,6 @@ struct HostState {
     /// the loser's Drop kills mid-flight work. In-place tools/list_changed refresh
     /// does not take it (no spawn).
     rebuild_lock: Arc<Mutex<()>>,
-    lazy: bool,
     /// True when this process is the HTTP/OpenAPI bridge (vs a stdio client's
     /// gateway). The bridge connects the union of all registered clients' servers.
     http: bool,
@@ -14342,21 +14337,11 @@ fn handle_http_with_headers(
     let client_name = caller.and_then(|value| value.audit_label.as_deref());
     let session_owner = caller.map(|value| &value.session_owner);
     // Per-client discovery (#868): a caller whose client set clientDiscovery gets that mode;
-    // every other request keeps the listener's boot-frozen `lazy` flag and reads the host's
-    // live grouped bit, so a switch into or out of grouped reaches this bridge at once while a
-    // switch involving `lazy` waits for a restart (the plan doc records that gap; stdio and the
-    // daemon read the host's live mode instead).
+    // every other request reads the host's live mode, exactly like stdio and the daemon, so a
+    // switch after boot reaches this bridge at once instead of waiting for a restart.
     let discovery = caller
         .and_then(|value| value.discovery)
-        .unwrap_or_else(|| {
-            if state.lazy {
-                DiscoveryMode::Lazy
-            } else if state.grouped_discovery() {
-                DiscoveryMode::Grouped
-            } else {
-                DiscoveryMode::Full
-            }
-        });
+        .unwrap_or_else(|| state.discovery_mode());
     if method == "OPTIONS" {
         return HttpOut::new(204, "text/plain", String::new());
     }
@@ -16297,7 +16282,6 @@ fn main() {
         ready: Arc::clone(&ready),
         downstream_dirty: Arc::clone(&downstream_dirty),
         rebuild_lock,
-        lazy,
         http: http_mode,
         http_bind_host: if http_mode {
             conduit_lib::brand::env_var("TOOLPORT_HTTP_HOST", "CONDUIT_HTTP_HOST")
@@ -21969,7 +21953,6 @@ mod tests {
             ready: Arc::new(AtomicBool::new(true)),
             downstream_dirty,
             rebuild_lock,
-            lazy: false,
             http: true,
             http_bind_host: "127.0.0.1".to_string(),
             http_allowed_origins: Vec::new(),
@@ -22015,7 +21998,6 @@ mod tests {
                 ready: Arc::new(AtomicBool::new(true)),
                 downstream_dirty: Arc::new(AtomicU8::new(0)),
                 rebuild_lock: Arc::new(Mutex::new(())),
-                lazy,
                 http: true,
                 http_bind_host: "127.0.0.1".to_string(),
                 http_allowed_origins: Vec::new(),
@@ -22028,7 +22010,16 @@ mod tests {
                 rebuild_shrink_streaks: Mutex::new(HashMap::new()),
                 quarantine_read_failed: AtomicBool::new(false),
                 code_mode: AtomicBool::new(false),
-                discovery: AtomicU8::new(0),
+                // The bridge resolves discovery from this live field, so seed it from the
+                // flag the test passes: true = a lazy bridge, false = full.
+                discovery: AtomicU8::new(
+                    if lazy {
+                        DiscoveryMode::Lazy
+                    } else {
+                        DiscoveryMode::Full
+                    }
+                    .as_u8(),
+                ),
             }),
             profile: Arc::new(Mutex::new(None)),
             stdio_upstream,
@@ -23956,6 +23947,61 @@ mod tests {
         assert!(
             state.mcp_sessions.lock().unwrap().is_empty(),
             "an ordinary modern request must not create protocol session state"
+        );
+    }
+
+    /// The HTTP bridge resolves its own requests from the host's live discovery mode
+    /// (a per-client override still wins), so a switch after boot reaches it at once
+    /// instead of waiting for a restart, exactly like stdio and the daemon. The plan doc
+    /// recorded the old boot-frozen read as a hazard; this pins the fix.
+    #[test]
+    fn http_bridge_follows_a_live_discovery_switch() {
+        let state = http_state(false);
+        let spec = |state: &GatewayState| -> Value {
+            let out = handle_http_with_headers(
+                state,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                "GET",
+                "/openapi.json",
+                "",
+                McpHttpRequestHeaders::default(),
+                None,
+                None,
+            );
+            assert_eq!(out.status, 200, "body={}", out.body);
+            serde_json::from_str(&out.body).expect("the spec is JSON")
+        };
+        let paths = |spec: &Value| -> std::collections::BTreeSet<String> {
+            spec["paths"]
+                .as_object()
+                .unwrap_or_else(|| panic!("a spec without paths: {spec}"))
+                .keys()
+                .cloned()
+                .collect()
+        };
+
+        // Booted full: the bridge advertises the catalog bridge, not the lazy meta-tools.
+        let full = paths(&spec(&state));
+        assert!(
+            full.contains("/toolport_status") && !full.contains("/toolport_search_tools"),
+            "a full-mode bridge must advertise the catalog bridge, not the meta-tools: {full:?}"
+        );
+
+        // A live switch reaches the bridge without a restart.
+        state.host.set_discovery_mode(DiscoveryMode::Lazy);
+        let lazy = paths(&spec(&state));
+        assert!(
+            lazy.contains("/toolport_search_tools"),
+            "a live switch to lazy must reach the bridge: {lazy:?}"
+        );
+
+        // And so does a switch back out of it.
+        state.host.set_discovery_mode(DiscoveryMode::Full);
+        let back = paths(&spec(&state));
+        assert!(
+            back.contains("/toolport_status") && !back.contains("/toolport_search_tools"),
+            "a switch back out of lazy must reach the bridge too: {back:?}"
         );
     }
 

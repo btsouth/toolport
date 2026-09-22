@@ -332,13 +332,13 @@ ownership did not rewrite several hundred lines.
   host field is not observable from a unit test (nothing calls `main`), the
   `process_request` mode arguments are not driven with a non-default host mode, and the watcher
   test derives its expected mode from its own fixture so an ambient `TOOLPORT_DISCOVERY`
-  override cannot fail it. One hazard this increment uncovered and did not fix, because fixing
-  it changes behavior: the HTTP/OpenAPI fallback keeps the boot-frozen `HostState.lazy` bit
-  while the live value is `HostState::discovery`, so a mode switch after boot reaches stdio
-  and the daemon immediately, a switch into or out of grouped reaches the bridge immediately
-  through the live field, and only a switch involving `lazy` waits for a restart. That is
-  main's behavior too, and the comment there now says so; collapsing the two fields is its
-  own slice.
+  override cannot fail it. The hazard this increment uncovered is closed: the HTTP/OpenAPI
+  fallback read a boot-frozen `lazy` bit and only followed grouped switches live, so a switch
+  involving `lazy` waited for a restart, unlike stdio and the daemon. The two fields are
+  collapsed (the bridge resolves its own requests from `HostState::discovery`, and
+  `gateway_capabilities` takes the resolved mode instead of a bool), and
+  `http_bridge_follows_a_live_discovery_switch` flips the mode on one host and asserts the
+  bridge's OpenAPI spec follows it both ways; freezing the read back to a constant fails it.
 - Remaining: the principal-keyed session store and the
   `PROGRESS_*` dispatch and routes. The session store
   is read deep inside the dispatch core (`execute_call`,
