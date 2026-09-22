@@ -135,6 +135,37 @@ describe("ServerDialog", () => {
     );
   });
 
+  it("saves the startup timeout in milliseconds", async () => {
+    const initial: ServerEntry = {
+      id: "local",
+      name: "Local",
+      transport: "stdio",
+      command: "local-server",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+      initializeTimeoutMs: 240_000,
+    };
+    api.updateServer.mockResolvedValueOnce(savedRegistry("local"));
+    const user = userEvent.setup();
+
+    render(<ServerDialog autoOpen editId="local" initial={initial} onSaved={vi.fn()} />);
+    const input = screen.getByLabelText("Startup timeout (optional)");
+    expect(input).toHaveValue(240);
+    await user.clear(input);
+    await user.type(input, "300.5");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
+    expect(api.updateServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "local",
+        initializeTimeoutMs: 300_500,
+      }),
+    );
+  });
+
   it("closes on Cancel when it owns its open state (header add flow)", async () => {
     render(<ServerDialog trigger={<button>Add server</button>} onSaved={vi.fn()} />);
     await userEvent.click(screen.getByRole("button", { name: "Add server" }));

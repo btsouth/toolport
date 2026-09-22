@@ -19,6 +19,7 @@ import {
   updateServer,
 } from "@/lib/api";
 import { formatArgs, parseArgs } from "@/lib/args";
+import { isDownloadLauncher } from "@/lib/launcher";
 import type { Registry, ServerEntry, Transport } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import {
@@ -87,6 +88,10 @@ export function ServerDialog({
     args: formatArgs(initial?.args ?? []),
     url: initial?.url ?? "",
     cwd: initial?.cwd ?? "",
+    initializeTimeoutSeconds:
+      initial?.initializeTimeoutMs == null
+        ? ""
+        : String(initial.initializeTimeoutMs / 1000),
   });
   // Env vars (API keys etc.). Values are vaulted in the OS keychain, never stored
   // in the registry, so existing secrets show as declared keys with empty values.
@@ -139,6 +144,10 @@ export function ServerDialog({
         args: formatArgs(initial?.args ?? []),
         url: initial?.url ?? "",
         cwd: initial?.cwd ?? "",
+        initializeTimeoutSeconds:
+          initial?.initializeTimeoutMs == null
+            ? ""
+            : String(initial.initializeTimeoutMs / 1000),
       });
       setEnvRows(initial?.env.map((e) => ({ key: e.key, value: "" })) ?? []);
       setTest(IDLE_TEST);
@@ -183,6 +192,7 @@ export function ServerDialog({
         args: formatArgs(s.args),
         url: s.url ?? "",
         cwd: "",
+        initializeTimeoutSeconds: "",
       });
       setEnvRows(
         s.env.map((e) => ({
@@ -228,6 +238,9 @@ export function ServerDialog({
       cwd: isStdio ? form.cwd.trim() || null : null,
       requestTimeoutMs:
         isStdio || initialUsesLocalCommand ? null : initial?.requestTimeoutMs,
+      initializeTimeoutMs: form.initializeTimeoutSeconds.trim()
+        ? Math.round(Number(form.initializeTimeoutSeconds) * 1000)
+        : null,
     };
   }
 
@@ -244,6 +257,13 @@ export function ServerDialog({
     errors.push("Enter the server URL.");
   } else if (!/^https?:\/\//i.test(urlTrim)) {
     errors.push("The URL must start with http:// or https://.");
+  }
+  if (form.initializeTimeoutSeconds.trim()) {
+    const seconds = Number(form.initializeTimeoutSeconds);
+    const milliseconds = Math.round(seconds * 1000);
+    if (!Number.isFinite(seconds) || milliseconds < 1 || milliseconds > 86_400_000) {
+      errors.push("Startup timeout must be greater than 0 and at most 86,400 seconds.");
+    }
   }
   const ownName = editing
     ? (initial?.name ?? partialEdit?.name)?.trim().toLowerCase()
@@ -464,6 +484,28 @@ export function ServerDialog({
               )}
             </div>
           )}
+
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="srv-initialize-timeout">Startup timeout (optional)</Label>
+            <Input
+              id="srv-initialize-timeout"
+              type="number"
+              min="0.001"
+              max="86400"
+              step="0.001"
+              placeholder={
+                isStdio && isDownloadLauncher(form.command, parseArgs(form.args))
+                  ? "120"
+                  : "10"
+              }
+              value={form.initializeTimeoutSeconds}
+              onChange={(e) => set("initializeTimeoutSeconds", e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              Seconds to wait for this server to initialize. Raise this for a slow first
+              start, such as a model download or index build.
+            </p>
+          </div>
 
           <div className="flex flex-col gap-2">
             <Label>Environment variables</Label>

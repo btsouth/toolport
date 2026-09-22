@@ -103,6 +103,11 @@ pub(crate) fn apply_import_selected(
                 format!("Invalid request timeout for '{}': {error}", server.name)
             })?;
         }
+        if let Some(milliseconds) = server.initialize_timeout_ms {
+            registry::validate_initialize_timeout_ms(milliseconds).map_err(|error| {
+                format!("Invalid initialize timeout for '{}': {error}", server.name)
+            })?;
+        }
         server.id.clear();
         for entry in &mut server.env {
             entry.value = None;

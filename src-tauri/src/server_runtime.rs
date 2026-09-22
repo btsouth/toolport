@@ -56,6 +56,10 @@ pub fn connect_server(server: &ServerEntry) -> Result<DownstreamServer, String> 
             .as_deref()
             .and_then(|cwd| resolve_root_token(cwd, None));
         let transport = StdioTransport::spawn(command, &server.args, &env, cwd.as_deref())?;
+        let mut transport = transport;
+        if let Some(timeout) = server.initialize_timeout()? {
+            transport.set_connect_timeout(timeout);
+        }
         DownstreamServer::connect(server.id.clone(), Box::new(transport))
     } else if server.url.is_some() {
         remote::connect_remote(server)
@@ -84,6 +88,21 @@ pub fn probe_one(server: &ServerEntry) -> ProbeResult {
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(90);
+const PROBE_FOLLOWUP_BUDGET: Duration = Duration::from_secs(15);
+
+fn probe_timeout(server: &ServerEntry) -> Duration {
+    let initialize = server
+        .initialize_timeout()
+        .ok()
+        .flatten()
+        .or_else(|| {
+            server.command.as_deref().map(|command| {
+                crate::downstream::stdio_connect_timeout(command, &server.args)
+            })
+        })
+        .unwrap_or(Duration::from_secs(30));
+    PROBE_TIMEOUT.max(initialize.saturating_add(PROBE_FOLLOWUP_BUDGET))
+}
 
 pub fn probe_one_bounded(server: &ServerEntry) -> ProbeResult {
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -91,13 +110,14 @@ pub fn probe_one_bounded(server: &ServerEntry) -> ProbeResult {
     std::thread::spawn(move || {
         let _ = sender.send(probe_one(&server_for_probe));
     });
+    let timeout = probe_timeout(server);
     receiver
-        .recv_timeout(PROBE_TIMEOUT)
+        .recv_timeout(timeout)
         .unwrap_or_else(|_| ProbeResult {
             server_id: server.id.clone(),
             ok: false,
             tool_count: 0,
-            error: Some(format!("timed out after {}s", PROBE_TIMEOUT.as_secs())),
+            error: Some(format!("timed out after {}s", timeout.as_secs())),
             auth_required: false,
         })
 }
@@ -153,6 +173,7 @@ mod tests {
             disabled_tools: Vec::new(),
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -165,6 +186,23 @@ mod tests {
         assert!(!result.auth_required);
         assert_eq!(result.tool_count, 0);
         assert_eq!(result.error.as_deref(), Some("no command or url"));
+    }
+
+    #[test]
+    fn probe_budget_covers_the_configured_initialize_timeout() {
+        let mut configured = server();
+        configured.initialize_timeout_ms = Some(300_000);
+
+        assert_eq!(probe_timeout(&configured), Duration::from_secs(315));
+    }
+
+    #[test]
+    fn launcher_probe_budget_covers_the_default_cold_start_timeout() {
+        let mut launcher = server();
+        launcher.command = Some("npx".into());
+        launcher.args = vec!["-y".into(), "example-server".into()];
+
+        assert_eq!(probe_timeout(&launcher), Duration::from_secs(135));
     }
 
     #[test]

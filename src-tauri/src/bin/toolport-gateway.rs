@@ -9181,7 +9181,10 @@ fn connect_one(
     // connect, and `DownstreamServer::set_server_request_handler` wraps again afterwards
     // (idempotent) (SBS-891).
     let server_handler = downstream::stamping_server_request_handler(&server.id, server_handler);
-    let result = if let Some(command) = &server.command {
+    let initialize_timeout = server.initialize_timeout();
+    let result = if let Err(error) = &initialize_timeout {
+        Err(error.clone())
+    } else if let Some(command) = &server.command {
         let mut env: Vec<(String, String)> = Vec::new();
         // A failed vault read is NOT "no secret stored" (SBS-789): a locked
         // Credential Manager or torn chunk read must fail the connect, not spawn
@@ -9233,6 +9236,9 @@ fn connect_one(
             resource_updated,
         ) {
             Ok(mut t) => {
+                if let Some(timeout) = initialize_timeout.expect("validated above") {
+                    t.set_connect_timeout(timeout);
+                }
                 t.set_server_request_handler(Arc::clone(&server_handler));
                 t.set_progress_sink(progress);
                 DownstreamServer::connect(server.id.clone(), Box::new(t))
@@ -23318,6 +23324,7 @@ mod tests {
                 cwd: None,
                 client_credentials: None,
                 request_timeout_ms: None,
+                initialize_timeout_ms: None,
                 unknown_fields: serde_json::Map::new(),
             });
         }
@@ -23361,6 +23368,7 @@ mod tests {
                 cwd: None,
                 client_credentials: None,
                 request_timeout_ms: None,
+                initialize_timeout_ms: None,
                 unknown_fields: serde_json::Map::new(),
             });
             reg.set_server_enabled("default", id, true).unwrap();
@@ -23442,6 +23450,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         reg.set_server_enabled("default", "github", true).unwrap();
@@ -24805,6 +24814,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -27642,6 +27652,7 @@ mod tests {
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
+            initialize_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         reg.set_server_enabled("default", &id, true).unwrap();
