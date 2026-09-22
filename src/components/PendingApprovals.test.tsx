@@ -186,3 +186,39 @@ describe("PendingApprovals persistent routine writes", () => {
     ).toBeInTheDocument();
   });
 });
+
+describe("PendingApprovals refresh ordering", () => {
+  it("discards a stale list that lands after a newer one", async () => {
+    // The mount refresh is still in flight when the 2s poll starts a newer one, so the
+    // older response can land last. Writing it would resurrect a row the newer list had
+    // already dropped (or hide one that just arrived).
+    vi.useFakeTimers();
+    try {
+      let settleStale!: (value: PendingApproval[]) => void;
+      let settleFresh!: (value: PendingApproval[]) => void;
+      const stale = new Promise<PendingApproval[]>((resolve) => (settleStale = resolve));
+      const fresh = new Promise<PendingApproval[]>((resolve) => (settleFresh = resolve));
+      listPendingApprovals.mockReturnValueOnce(stale).mockReturnValueOnce(fresh);
+
+      render(<PendingApprovals />);
+      await act(async () => {});
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+
+      settleFresh([approval({ id: "fresh", tool: "mailer__send" })]);
+      await act(async () => {});
+      expect(screen.getByText("mailer__send")).toBeInTheDocument();
+
+      settleStale([
+        approval({ id: "fresh", tool: "mailer__send" }),
+        approval({ id: "gone", tool: "mailer__wipe" }),
+      ]);
+      await act(async () => {});
+      expect(screen.queryByText("mailer__wipe")).not.toBeInTheDocument();
+      expect(screen.getByText("mailer__send")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

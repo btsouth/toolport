@@ -96,10 +96,18 @@ export function PendingApprovals() {
   const [now, setNow] = useState(() => Date.now());
   const dialogRef = useRef<HTMLDivElement>(null);
   const prevCount = useRef(0);
+  // Monotonic request id: the interval poll, both event listeners, and a decision's error
+  // path can all start a refresh, so an older response can land last and momentarily
+  // resurrect a resolved row (or hide a new one). Only the newest request may write,
+  // the same guard the sidebar badge and the quarantine card already carry.
+  const reqId = useRef(0);
 
   const refresh = useCallback(async () => {
+    const id = ++reqId.current;
     try {
       const list = await listPendingApprovals();
+      // A stale response must not write: the newer list is the authority.
+      if (id !== reqId.current) return;
       setPending(list);
       // Prune resolving ids the backend has confirmed gone (authoritative removal).
       setResolving((s) => {
