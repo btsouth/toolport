@@ -13,6 +13,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 struct Harness {
@@ -20,6 +21,8 @@ struct Harness {
     stdin: ChildStdin,
     lines: mpsc::Receiver<String>,
     dir: std::path::PathBuf,
+    /// The adapter's stderr, so a failure says why instead of only that it happened.
+    stderr: Arc<Mutex<String>>,
 }
 
 impl Harness {
@@ -41,11 +44,15 @@ impl Harness {
             .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Piped rather than null: the adapter's own lines are the only place a
+            // broken exchange explains itself, and macOS CI has failed here before
+            // with nothing recorded.
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn the adapter");
         let stdin = child.stdin.take().expect("adapter stdin");
         let stdout = child.stdout.take().expect("adapter stdout");
+        let stderr = child.stderr.take().expect("adapter stderr");
 
         let (sender, lines) = mpsc::channel();
         std::thread::spawn(move || {
@@ -57,12 +64,64 @@ impl Harness {
             }
         });
 
+        let stderr_text = Arc::new(Mutex::new(String::new()));
+        {
+            let stderr_text = Arc::clone(&stderr_text);
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    let Ok(mut text) = stderr_text.lock() else {
+                        return;
+                    };
+                    // Bounded: only the tail of a failure is worth quoting.
+                    if text.len() > 8 * 1024 {
+                        let from = text.len() - 4 * 1024;
+                        let boundary = text[from..]
+                            .find('\n')
+                            .map(|i| from + i + 1)
+                            .unwrap_or(from);
+                        text.drain(..boundary);
+                    }
+                    text.push_str(&line);
+                    text.push('\n');
+                }
+            });
+        }
+
         Self {
             child,
             stdin,
             lines,
             dir,
+            stderr: stderr_text,
         }
+    }
+
+    /// What a failure needs to explain itself: the adapter's stderr, plus the tail of
+    /// the gateway log the adapter and its daemon both append to. That log lives in
+    /// this harness's scratch data directory, so no other process can be writing it.
+    fn diagnostics(&self) -> String {
+        let stderr = self
+            .stderr
+            .lock()
+            .map(|text| text.trim().to_string())
+            .unwrap_or_default();
+        let log = std::fs::read_to_string(self.dir.join("gateway.log")).unwrap_or_default();
+        let lines: Vec<&str> = log.lines().collect();
+        let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+        format!(
+            "adapter stderr:\n{}\ngateway.log (last 20 lines):\n{}",
+            if stderr.is_empty() {
+                "<empty>"
+            } else {
+                &stderr
+            },
+            if tail.trim().is_empty() {
+                "<empty>"
+            } else {
+                &tail
+            }
+        )
     }
 
     fn send(&mut self, message: serde_json::Value) {
@@ -76,10 +135,13 @@ impl Harness {
     }
 
     fn next_response(&self) -> serde_json::Value {
-        let line = self
-            .lines
-            .recv_timeout(Duration::from_secs(60))
-            .expect("a response before the deadline");
+        let line = match self.lines.recv_timeout(Duration::from_secs(60)) {
+            Ok(line) => line,
+            Err(error) => panic!(
+                "no response before the deadline ({error})\n{}",
+                self.diagnostics()
+            ),
+        };
         serde_json::from_str(&line).unwrap_or_else(|e| panic!("invalid JSON ({e}): {line}"))
     }
 
@@ -93,7 +155,8 @@ impl Harness {
             }
             assert!(
                 message.get("method").is_some() && message.get("id").is_none(),
-                "unexpected non-notification before the answer to {id}: {message}"
+                "unexpected non-notification before the answer to {id}: {message}\n{}",
+                self.diagnostics()
             );
         }
     }
@@ -196,7 +259,13 @@ fn the_adapter_recovers_after_the_daemon_dies() {
             "clientInfo": { "name": "stdio-adapter-recovery", "version": "1" }
         }
     }));
-    let _ = harness.response_to(1);
+    let initialize = harness.response_to(1);
+    assert_eq!(
+        initialize["result"]["serverInfo"]["name"],
+        "toolport-gateway",
+        "the cold start did not complete: {initialize}\n{}",
+        harness.diagnostics()
+    );
     harness.send(serde_json::json!({
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
@@ -208,7 +277,8 @@ fn the_adapter_recovers_after_the_daemon_dies() {
     }));
     assert!(
         harness.response_to(2)["result"]["tools"].is_array(),
-        "the session did not start"
+        "the session did not start\n{}",
+        harness.diagnostics()
     );
 
     // Kill the daemon out from under the adapter.
@@ -228,7 +298,8 @@ fn the_adapter_recovers_after_the_daemon_dies() {
     };
     assert!(
         failed.get("error").is_some(),
-        "the call against a dead daemon should have failed: {failed}"
+        "the call against a dead daemon should have failed: {failed}\n{}",
+        harness.diagnostics()
     );
 
     // The next request re-rendezvouses, replays the handshake, and succeeds. The
@@ -245,11 +316,13 @@ fn the_adapter_recovers_after_the_daemon_dies() {
         }
         assert!(
             message.get("method").is_some() && message.get("id").is_none(),
-            "unexpected message while recovering: {message}"
+            "unexpected message while recovering: {message}\n{}",
+            harness.diagnostics()
         );
     };
     assert!(
         recovered["result"]["tools"].is_array(),
-        "the adapter did not recover: {recovered}"
+        "the adapter did not recover: {recovered}\n{}",
+        harness.diagnostics()
     );
 }
