@@ -96,6 +96,13 @@ function manifestPath(binDir, fsOps, pathImpl) {
   return null;
 }
 
+/** Return gateway paths in launch order for the current platform.
+ *
+ * Windows checks the newest published versioned or content-addressed binary
+ * first, then the manifest fallback for MSIX, then a filename derived from this
+ * plugin's lockstep version. Other platforms check their native install locations
+ * before falling back to PATH.
+ */
 export function gatewayCandidates({
   platform = process.platform,
   env = process.env,
