@@ -24047,6 +24047,10 @@ mod tests {
     /// (#868), so a client pinned to `full` on a grouped host must be told `full`.
     #[test]
     fn gateway_capabilities_advertises_the_resolved_mode() {
+        // The vendor extension is only advertised to a modern client, and that is
+        // per-request thread-local state. Enter the era here instead of inheriting it
+        // from whatever test ran on this worker thread before.
+        let _era = UpstreamEraGuard::enter(Some(MODERN_PROTOCOL_VERSION.to_string()));
         let host = dispatch_host(false);
         host.set_discovery_mode(DiscoveryMode::Grouped);
         assert!(host.grouped_discovery(), "the fixture host must be grouped");
