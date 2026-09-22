@@ -1072,8 +1072,8 @@ fn read_quarantine_for_scan(profile: &str, path: &Path) -> Result<Option<Quarant
 /// Namespaced names of every quarantined tool across all profiles, for the views
 /// that present the union.
 ///
-/// Fails closed on a damaged store: an unreadable, empty, or corrupt file is an
-/// `Err`, so a caller can never render a damaged profile as "nothing blocked".
+/// Fails closed on a damaged store: an unreadable, empty, corrupt, or unexpectedly
+/// missing file is an `Err`, so a caller cannot render damage as "nothing blocked".
 pub fn all_quarantined_names() -> Result<BTreeSet<String>, String> {
     let mut out = BTreeSet::new();
     let Some(dir) = crate::registry::conduit_dir() else {
@@ -1612,8 +1612,8 @@ pub fn quarantine_notification(newcomers: &[&Value]) -> (String, String) {
 /// Every quarantined tool across all profiles, as the records the dashboards and
 /// `/metrics` present.
 ///
-/// Same contract as [`all_quarantined_names`]: a missing store contributes
-/// nothing, a damaged one is an `Err` rather than a quietly shorter list.
+/// Same contract as [`all_quarantined_names`]: only a fresh profile's missing
+/// store contributes nothing; a damaged one is an `Err` rather than a shorter list.
 pub fn all_quarantined() -> Result<Vec<Value>, String> {
     let Some(dir) = crate::registry::conduit_dir() else {
         return Ok(Vec::new());
