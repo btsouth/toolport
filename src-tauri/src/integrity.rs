@@ -1038,7 +1038,16 @@ fn quarantine_store_label(profile: &str) -> String {
 /// `atomic_write` rename window cannot turn into a spurious failure.
 fn read_quarantine_for_scan(profile: &str, path: &Path) -> Result<Option<Quarantine>, String> {
     match read_quarantine_file(path) {
-        QuarantineFileRead::Raw(raw) => Ok(Some(parse_quarantine_raw(&raw, path)?)),
+        // The union walks every profile's store, so a parse failure has to name the
+        // profile too, exactly like the unreadable arm below.
+        QuarantineFileRead::Raw(raw) => {
+            parse_quarantine_raw(&raw, path).map(Some).map_err(|error| {
+                format!(
+                    "quarantine store for {} at {path:?} is invalid: {error}",
+                    quarantine_store_label(profile)
+                )
+            })
+        }
         QuarantineFileRead::Missing => Ok(None),
         QuarantineFileRead::Unreadable(error) => Err(format!(
             "quarantine store for {} at {path:?} is unreadable: {error}",
@@ -4704,6 +4713,39 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let empty = all_quarantined_names().expect_err("an empty store must not read as empty");
         assert!(empty.contains("empty"), "unexpected error: {empty}");
+    }
+
+    /// The same two shapes in a named profile's store: the union walks several
+    /// stores, so an error has to name the profile that failed, not only its path.
+    /// Its own data directory keeps the legacy migration (which copies the default
+    /// store into a profile's store when that store is missing) out of the way.
+    #[test]
+    fn cross_profile_quarantine_view_names_a_corrupt_profile_store() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("aggregate-corrupt-profile-store");
+        let mut registry = crate::registry::load_resolved().expect("a fresh registry loads");
+        registry.profiles.push(crate::registry::Profile {
+            id: "billing".to_string(),
+            name: "billing".to_string(),
+            enabled_server_ids: Vec::new(),
+            tool_scope: std::collections::HashMap::new(),
+        });
+        crate::registry::save(&registry).expect("save the registry");
+        let profile_path = quarantine_path(Some("billing")).expect("profile store path");
+
+        std::fs::write(&profile_path, "{ not json").unwrap();
+        let corrupt = all_quarantined().expect_err("corrupt profile JSON must fail the union");
+        assert!(
+            corrupt.contains("corrupt") && corrupt.contains("billing"),
+            "the error must name the profile store: {corrupt}"
+        );
+
+        std::fs::write(&profile_path, "").unwrap();
+        let empty = all_quarantined_names().expect_err("an empty profile store must fail too");
+        assert!(
+            empty.contains("empty") && empty.contains("billing"),
+            "the error must name the truncated profile store: {empty}"
+        );
     }
 
     /// Absence stays honest: a missing store contributes nothing, and readable
