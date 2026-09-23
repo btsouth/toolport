@@ -1389,6 +1389,7 @@ pub fn pid_is_running(pid: u32) -> bool {
 
 /// The daemon flag is a standalone argv token. For platforms that only expose
 /// the joined command line, require whitespace boundaries around it.
+#[cfg(any(target_os = "macos", windows, test))]
 fn joined_command_is_daemon(command: &str) -> bool {
     command
         .split_whitespace()
@@ -1434,12 +1435,31 @@ fn windows_gateway_daemon_roles(pids: &[u32]) -> std::collections::HashMap<u32, 
         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); @(Get-CimInstance Win32_Process -Filter '{filter}' -ErrorAction Stop | Select-Object ProcessId,CommandLine) | ConvertTo-Json -Compress"
     );
     let mut command = std::process::Command::new("powershell.exe");
-    let Some(output) = command
+    let Some(mut child) = command
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()
     else {
+        return std::collections::HashMap::new();
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break child.wait_with_output().ok(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return std::collections::HashMap::new();
+            }
+        }
+    };
+    let Some(output) = output else {
         return std::collections::HashMap::new();
     };
     if !output.status.success() || output.stdout.is_empty() {
@@ -2078,6 +2098,18 @@ mod tests {
         assert_eq!(roles.get(&42), Some(&Some(true)));
         assert_eq!(roles.get(&43), Some(&Some(false)));
         assert_eq!(roles.get(&44), Some(&None));
+    }
+
+    #[test]
+    fn role_probe_can_inspect_the_current_process() {
+        let pid = std::process::id();
+        #[cfg(windows)]
+        assert_eq!(
+            windows_gateway_daemon_roles(&[pid]).get(&pid),
+            Some(&Some(false))
+        );
+        #[cfg(not(windows))]
+        assert_eq!(gateway_daemon_role(pid), Some(false));
     }
 
     #[test]
