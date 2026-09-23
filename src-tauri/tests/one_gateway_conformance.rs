@@ -26,7 +26,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1562,9 +1562,13 @@ fn matrix_routing_approved_call_rebinds_to_its_profile_view() {
         serde_json::to_vec(&descriptor).unwrap(),
     )
     .expect("approval descriptor");
+    let broker_stop = Arc::new(AtomicBool::new(false));
+    let broker_requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let stop = Arc::clone(&broker_stop);
+    let requests = Arc::clone(&broker_requests);
     let broker = std::thread::spawn(move || {
         let deadline = Instant::now() + RESPONSE_TIMEOUT;
-        loop {
+        while !stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     // BSD may inherit nonblocking mode from the listener. The
@@ -1593,12 +1597,14 @@ fn matrix_routing_approved_call_rebinds_to_its_profile_view() {
                     let request: approval::ApprovalRequest =
                         serde_json::from_str(&line).expect("valid approval request");
                     assert_eq!(request.server, "shared");
-                    assert_eq!(request.tool, "echo");
+                    requests.lock().unwrap().push(request.tool);
                     writeln!(stream, "\"approved\"").expect("approval decision");
-                    return;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "no approval request");
+                    assert!(
+                        Instant::now() < deadline || !requests.lock().unwrap().is_empty(),
+                        "no approval request"
+                    );
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) => panic!("approval accept failed: {error}"),
@@ -1629,9 +1635,14 @@ fn matrix_routing_approved_call_rebinds_to_its_profile_view() {
         text_of(&echo.call_tool(&echo_tool, json!({ "text": "approved" }))),
         "approved"
     );
+    let before = transcript_method_count(&transcript, "tools/call");
+    let rejected = echo.call_tool(&add_tool, json!({ "a": 2, "b": 3 }));
+    broker_stop.store(true, Ordering::Release);
     broker.join().expect("approval broker");
+    assert_eq!(*broker_requests.lock().unwrap(), ["echo"]);
+    assert_eq!(transcript_method_count(&transcript, "tools/call"), before);
     assert!(
-        echo.call_tool(&add_tool, json!({ "a": 2, "b": 3 }))["isError"] == true,
+        rejected["isError"] == true,
         "approval did not preserve the caller's tool scope"
     );
 }
