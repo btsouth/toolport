@@ -1868,12 +1868,17 @@ fn matrix_pooling_secret_generation_retires_the_old_root_launch() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    assert!(
+        client.call_tool(&pwd, json!({}))["isError"] != true,
+        "replacement child must remain callable"
+    );
     let settled = Instant::now() + Duration::from_secs(10);
     while mock_child_process_count().saturating_sub(before) != 1 {
         assert!(
             Instant::now() < settled,
-            "root launch did not settle to one live child: {}",
-            process_report("mock-mcp-server").join("\n")
+            "root launch did not settle to one live child: {}\n{}",
+            process_report("mock-mcp-server").join("\n"),
+            client.diagnostics()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
