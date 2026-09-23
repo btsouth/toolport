@@ -575,9 +575,12 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
 
 ## Phase 4: dogfood, default, convergence
 
-- P4.1 registry feature flag with a pre-session fallback and a legacy override,
-  telemetry/diagnostics, and the real-machine acceptance run
+- P4.1 registry feature flag with a pre-session fallback only when OS process
+  creation definitively fails, a legacy override, telemetry/diagnostics, and
+  the real-machine acceptance run
   (heavy gateways, adapters, descendants, memory, cold-start and first-call latency).
+  A blocked election, silent daemon, or readiness timeout has an ambiguous
+  outcome and fails closed to avoid starting a second heavy gateway.
 - P4.2 default flip only after parity suites pass on Windows, macOS, and Linux, keeping a
   documented legacy kill switch for at least one release.
 - P4.3 desktop Shared HTTP adopts a daemon service lease; app exit releases the lease

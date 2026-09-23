@@ -1315,7 +1315,7 @@ fn matrix_rollout_legacy_override_keeps_the_standalone_role() {
 }
 
 #[test]
-fn matrix_rollout_daemon_startup_failure_falls_back_before_session_open() {
+fn matrix_rollout_ambiguous_daemon_startup_refuses_standalone_fallback() {
     let _guard = CASE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1338,28 +1338,23 @@ fn matrix_rollout_daemon_startup_failure_falls_back_before_session_open() {
             ..AdapterOptions::default()
         },
     );
-    client.initialize("matrix-startup-fallback");
-    let tool = client.wait_for_tool("__echo", Duration::from_secs(30));
-    assert_eq!(
-        text_of(&client.call_tool(&tool, json!({ "text": "fallback" }))),
-        "fallback"
-    );
+    assert!(!client.wait_exit(Duration::from_secs(25)).success());
     assert!(
         descriptor_files(&dir).is_empty(),
-        "fallback elected a daemon"
+        "blocked election started a daemon"
     );
-    assert_eq!(transcript_initialize_count(&transcript), 1);
+    assert_eq!(transcript_initialize_count(&transcript), 0);
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         if client
             .stderr
             .lock()
             .unwrap()
-            .contains("using the in-process gateway")
+            .contains("refusing an in-process fallback")
         {
             break;
         }
-        assert!(Instant::now() < deadline, "fallback was not reported");
+        assert!(Instant::now() < deadline, "refusal was not reported");
         std::thread::sleep(Duration::from_millis(10));
     }
 }

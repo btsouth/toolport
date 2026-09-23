@@ -68,14 +68,31 @@ pub fn adapter_requested(args: &[String]) -> bool {
     args.iter().any(|arg| arg == STDIO_ADAPTER_FLAG)
 }
 
-/// Run the adapter: rendezvous with (or start) the host daemon, then proxy stdio
-/// to it until the client closes stdin. Diverges: the process exit code is the
-/// adapter's result.
-fn prepare_stdio_adapter() -> Result<(Rendezvous, DaemonDescriptor), String> {
-    let dir = registry::conduit_dir().ok_or("no data directory could be resolved")?;
+/// Why daemon preparation failed and whether a standalone gateway is safe.
+struct PreparationFailure {
+    detail: String,
+    /// Only a failed OS spawn proves no daemon was launched by this attempt.
+    safe_to_fallback: bool,
+}
+
+fn prepare_stdio_adapter() -> Result<(Rendezvous, DaemonDescriptor), PreparationFailure> {
+    let dir = registry::conduit_dir().ok_or_else(|| PreparationFailure {
+        detail: "no data directory could be resolved".to_string(),
+        safe_to_fallback: false,
+    })?;
     let compat = CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string());
     let rendezvous = Rendezvous::new(&dir, compat);
-    let descriptor = rendezvous.ensure(spawn_daemon)?;
+    let mut spawn_failed = false;
+    let descriptor = rendezvous
+        .ensure(|| {
+            let result = spawn_daemon();
+            spawn_failed = result.is_err();
+            result
+        })
+        .map_err(|detail| PreparationFailure {
+            detail,
+            safe_to_fallback: spawn_failed,
+        })?;
     Ok((rendezvous, descriptor))
 }
 
@@ -89,11 +106,12 @@ fn finish_stdio_adapter(rendezvous: Rendezvous, descriptor: DaemonDescriptor) ->
     }
 }
 
+/// Run an explicit stdio adapter; an unavailable daemon ends this process.
 pub fn run_stdio_adapter() -> ! {
     match prepare_stdio_adapter() {
         Ok((rendezvous, descriptor)) => finish_stdio_adapter(rendezvous, descriptor),
         Err(error) => {
-            eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: {error}");
+            eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: {}", error.detail);
             std::process::exit(1);
         }
     }
@@ -108,12 +126,23 @@ pub fn run_opt_in_stdio_adapter() {
             crate::gatewaylog::append("topology: role=stdio-adapter source=registry-opt-in");
             finish_stdio_adapter(rendezvous, descriptor)
         }
-        Err(error) => {
+        Err(PreparationFailure {
+            detail,
+            safe_to_fallback: true,
+        }) => {
             crate::gatewaylog::append("topology: role=standalone reason=daemon-startup-fallback");
             eprintln!(
-                "toolport-gateway: host daemon unavailable before session open ({error}); \
+                "toolport-gateway: host daemon could not be launched ({detail}); \
                  using the in-process gateway"
             );
+        }
+        Err(error) => {
+            eprintln!(
+                "toolport-gateway: host daemon startup was inconclusive ({}); \
+                 refusing an in-process fallback",
+                error.detail
+            );
+            std::process::exit(1);
         }
     }
 }
