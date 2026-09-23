@@ -25787,7 +25787,8 @@ mod tests {
         *b.client_root.lock().unwrap() = Some("/adapter-b".to_string());
         a.client_upstream.lock().unwrap().roots.supported = true;
 
-        let answer = |root: Option<&str>| {
+        let project = std::env::temp_dir().join("toolport-http-roots-project-a");
+        let answer = |root: Option<&std::path::Path>| {
             {
                 let _active = McpSessionGuard::enter(Some(sid_a.clone()));
                 refresh_http_session_root(&state);
@@ -25804,7 +25805,12 @@ mod tests {
             let request: Value = serde_json::from_str(&request.json).unwrap();
             assert_eq!(request["method"], "roots/list");
             let roots = root
-                .map(|path| vec![json!({"uri": format!("file://{path}"), "name": "project"})])
+                .map(|path| {
+                    vec![json!({
+                        "uri": url::Url::from_file_path(path).expect("file URI").to_string(),
+                        "name": "project"
+                    })]
+                })
                 .unwrap_or_default();
             assert!(a.try_deliver(&json!({
                 "jsonrpc": "2.0", "id": request["id"],
@@ -25818,13 +25824,16 @@ mod tests {
             }
             panic!("roots refresh did not finish");
         };
-        answer(Some("/project-a"));
-        assert_eq!(a.client_root.lock().unwrap().as_deref(), Some("/project-a"));
+        answer(Some(&project));
+        assert_eq!(
+            a.client_root.lock().unwrap().as_deref(),
+            project.to_str()
+        );
         assert_eq!(b.client_root.lock().unwrap().as_deref(), Some("/adapter-b"));
         answer(None);
         assert_eq!(a.client_root.lock().unwrap().as_deref(), Some("/adapter-a"));
         *a.client_root_override.lock().unwrap() = Some("/operator-root".to_string());
-        answer(Some("/project-a"));
+        answer(Some(&project));
         assert_eq!(
             a.client_root.lock().unwrap().as_deref(),
             Some("/operator-root")
