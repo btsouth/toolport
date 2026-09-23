@@ -1185,7 +1185,6 @@ fn matrix_adapter_root_is_queried_on_its_own_session() {
     assert_eq!(without_roots.roots_queries.load(Ordering::Relaxed), 0);
 }
 
-#[ignore = "P3.2 root-aware downstream slot selection is pending (see #910 and docs/design/one-gateway-per-host-plan.md). Run with --ignored once it lands, and remove this attribute in the PR that lands it."]
 #[test]
 fn matrix_pooling_root_sharding_two_roots_two_children() {
     let _guard = CASE_LOCK
@@ -1242,6 +1241,379 @@ fn matrix_pooling_root_sharding_two_roots_two_children() {
          matching processes:\n{}",
         process_report("mock-mcp-server").join("\n")
     );
+}
+
+#[test]
+fn matrix_pooling_rooted_servers_launch_only_for_authorized_profiles() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("root-profile-launches");
+    let root = fixture.add("root");
+    let first_transcript = dir.join("first.jsonl");
+    let second_transcript = dir.join("second.jsonl");
+    write_registry(
+        &dir,
+        vec![
+            mock_server_entry("first", &first_transcript, Some("${ROOT}")),
+            mock_server_entry("second", &second_transcript, Some("${ROOT}")),
+        ],
+        vec![
+            profile("first-profile", &["first"]),
+            profile("second-profile", &["second"]),
+        ],
+    );
+    let options = |profile: &'static str| AdapterOptions {
+        profile: Some(profile),
+        roots: vec![root.clone()],
+        ..AdapterOptions::default()
+    };
+    let mut first = spawn_adapter(&dir, &options("first-profile"));
+    first.initialize("matrix-root-first-profile");
+    first.wait_for_tool("__echo", Duration::from_secs(30));
+    assert_eq!(transcript_initialize_count(&first_transcript), 1);
+    assert_eq!(
+        transcript_initialize_count(&second_transcript),
+        0,
+        "the first profile must not launch the other profile's rooted server"
+    );
+
+    let mut second = spawn_adapter(&dir, &options("second-profile"));
+    second.initialize("matrix-root-second-profile");
+    second.wait_for_tool("__echo", Duration::from_secs(30));
+    assert_eq!(transcript_initialize_count(&first_transcript), 1);
+    assert_eq!(transcript_initialize_count(&second_transcript), 1);
+}
+
+#[test]
+fn matrix_pooling_rooted_catalog_change_reaches_only_its_root() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("root-catalog-change");
+    let root_a = fixture.add("root-a");
+    let root_b = fixture.add("root-b");
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, Some("${ROOT}"))],
+        vec![],
+    );
+    let mut a = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            roots: vec![root_a],
+            ..AdapterOptions::default()
+        },
+    );
+    let mut b = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            roots: vec![root_b],
+            ..AdapterOptions::default()
+        },
+    );
+    a.initialize("matrix-root-catalog-a");
+    b.initialize("matrix-root-catalog-b");
+    let grow = a.wait_for_tool("__grow", Duration::from_secs(30));
+    b.wait_for_tool("__grow", Duration::from_secs(30));
+    for client in [&a, &b] {
+        while client.lines.try_recv().is_ok() {}
+    }
+
+    a.call_tool(&grow, json!({}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let line = a
+            .lines
+            .recv_timeout(remaining.max(Duration::from_millis(1)))
+            .expect("root A did not receive tools/list_changed");
+        let message: Value = serde_json::from_str(&line).expect("valid notification");
+        if message["method"] == "notifications/tools/list_changed" {
+            break;
+        }
+    }
+    a.wait_for_tool("__greet", Duration::from_secs(30));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(line) = b.lines.recv_timeout(remaining) else {
+            break;
+        };
+        let message: Value = serde_json::from_str(&line).expect("valid notification");
+        assert_ne!(
+            message["method"], "notifications/tools/list_changed",
+            "root B received root A's tool catalog change"
+        );
+    }
+    assert!(!b.tool_names().iter().any(|name| name.ends_with("__greet")));
+    assert_eq!(transcript_initialize_count(&transcript), 2);
+}
+
+#[test]
+fn matrix_pooling_equal_resource_uris_keep_rooted_subscriptions_separate() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("root-resource-subscriptions");
+    let root_a = fixture.add("root-a");
+    let root_b = fixture.add("root-b");
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, Some("${ROOT}"))],
+        vec![],
+    );
+    let options = |root| AdapterOptions {
+        roots: vec![root],
+        ..AdapterOptions::default()
+    };
+    let mut a = spawn_adapter(&dir, &options(root_a));
+    let mut b = spawn_adapter(&dir, &options(root_b));
+    a.initialize("matrix-root-sub-a");
+    b.initialize("matrix-root-sub-b");
+    let grow = a.wait_for_tool("__grow", Duration::from_secs(30));
+    b.wait_for_tool("__grow", Duration::from_secs(30));
+    for client in [&mut a, &mut b] {
+        let reply = client.request("resources/subscribe", json!({ "uri": "mock://base" }));
+        assert_eq!(reply["result"], json!({}), "subscribe failed: {reply}");
+        while client.lines.try_recv().is_ok() {}
+    }
+
+    a.next_id += 1;
+    let grow_id = a.next_id;
+    a.send(json!({
+        "jsonrpc": "2.0",
+        "id": grow_id,
+        "method": "tools/call",
+        "params": { "name": grow, "arguments": {} }
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut got_reply = false;
+    let mut got_update = false;
+    loop {
+        if got_reply && got_update {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let line = a
+            .lines
+            .recv_timeout(remaining.max(Duration::from_millis(1)))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "root A did not receive its resource update ({error})\ntranscript:\n{}\n{}",
+                    std::fs::read_to_string(&transcript).unwrap_or_default(),
+                    a.diagnostics()
+                )
+            });
+        let message: Value = serde_json::from_str(&line).expect("valid notification");
+        if message["id"] == grow_id {
+            assert!(message.get("result").is_some(), "grow failed: {message}");
+            got_reply = true;
+        }
+        if message["method"] == "notifications/resources/updated" {
+            assert_eq!(message["params"]["uri"], "mock://base");
+            got_update = true;
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(line) = b.lines.recv_timeout(remaining) else {
+            break;
+        };
+        let message: Value = serde_json::from_str(&line).expect("valid notification");
+        assert_ne!(
+            message["method"], "notifications/resources/updated",
+            "root B received root A's resource update"
+        );
+    }
+    assert_eq!(transcript_initialize_count(&transcript), 2);
+}
+
+#[test]
+fn matrix_pooling_rooted_server_request_returns_to_the_originating_adapter() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("rooted-server-request");
+    let root_a = fixture.add("root-a");
+    let root_b = fixture.add("root-b");
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, Some("${ROOT}"))],
+        vec![],
+    );
+    let options = |root| AdapterOptions {
+        roots: vec![root],
+        elicitation: true,
+        ..AdapterOptions::default()
+    };
+    let mut origin = spawn_adapter(&dir, &options(root_a));
+    let mut other = spawn_adapter(&dir, &options(root_b));
+    origin.initialize("matrix-rooted-origin");
+    other.initialize("matrix-rooted-other");
+    let tool = origin.wait_for_tool("__legacy_elicitation", Duration::from_secs(30));
+    other.wait_for_tool("__legacy_elicitation", Duration::from_secs(30));
+    let result = origin.call_tool(&tool, json!({}));
+    assert!(
+        text_of(&result).contains("legacy confirmed"),
+        "the rooted server request did not reach its caller: {result}"
+    );
+    assert_eq!(origin.elicitation_queries.load(Ordering::Relaxed), 1);
+    assert_eq!(other.elicitation_queries.load(Ordering::Relaxed), 0);
+    assert_eq!(transcript_initialize_count(&transcript), 2);
+}
+
+#[test]
+fn matrix_pooling_unused_root_launch_exits_while_another_root_stays_live() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("root-launch-retirement");
+    let root_a = fixture.add("root-a");
+    let root_b = fixture.add("root-b");
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, Some("${ROOT}"))],
+        vec![],
+    );
+    let before = mock_child_process_count();
+    let mut a = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            roots: vec![root_a],
+            ..AdapterOptions::default()
+        },
+    );
+    let mut b = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            roots: vec![root_b],
+            ..AdapterOptions::default()
+        },
+    );
+    a.initialize("matrix-retire-a");
+    b.initialize("matrix-retire-b");
+    let a_pwd = a.wait_for_tool("__pwd", Duration::from_secs(30));
+    let b_pwd = b.wait_for_tool("__pwd", Duration::from_secs(30));
+    a.call_tool(&a_pwd, json!({}));
+    b.call_tool(&b_pwd, json!({}));
+    assert_eq!(mock_child_process_count().saturating_sub(before), 2);
+
+    a.close_stdin();
+    assert!(a.wait_exit(Duration::from_secs(10)).success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while mock_child_process_count().saturating_sub(before) > 1 {
+        assert!(
+            Instant::now() < deadline,
+            "unused root child stayed live:\n{}",
+            process_report("mock-mcp-server").join("\n")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!b.call_tool(&b_pwd, json!({}))["isError"]
+        .as_bool()
+        .unwrap_or(false));
+    assert_eq!(transcript_initialize_count(&transcript), 2);
+}
+
+#[test]
+fn matrix_pooling_root_views_keep_one_ordinary_child() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("mixed-root-pool");
+    let root_a = fixture.add("root-a");
+    let root_b = fixture.add("root-b");
+    let ordinary_log = dir.join("ordinary.jsonl");
+    let rooted_log = dir.join("rooted.jsonl");
+    write_registry(
+        &dir,
+        vec![
+            mock_server_entry("ordinary", &ordinary_log, None),
+            mock_server_entry("rooted", &rooted_log, Some("${ROOT}")),
+        ],
+        vec![],
+    );
+    let before = mock_child_process_count();
+    let mut a = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            roots: vec![root_a],
+            ..AdapterOptions::default()
+        },
+    );
+    let mut b = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            roots: vec![root_b],
+            ..AdapterOptions::default()
+        },
+    );
+    a.initialize("matrix-mixed-a");
+    b.initialize("matrix-mixed-b");
+    for client in [&mut a, &mut b] {
+        let ordinary = client.wait_for_tool("ordinary__echo", Duration::from_secs(30));
+        let rooted = client.wait_for_tool("rooted__pwd", Duration::from_secs(30));
+        assert_eq!(
+            text_of(&client.call_tool(&ordinary, json!({ "text": "shared" }))),
+            "shared"
+        );
+        client.call_tool(&rooted, json!({}));
+    }
+    assert_eq!(transcript_initialize_count(&ordinary_log), 1);
+    assert_eq!(transcript_initialize_count(&rooted_log), 2);
+    assert_eq!(mock_child_process_count().saturating_sub(before), 3);
+}
+
+#[test]
+fn matrix_pooling_secret_generation_retires_the_old_root_launch() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("root-secret-generation");
+    let root = fixture.add("project");
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, Some("${ROOT}"))],
+        vec![],
+    );
+    let before = mock_child_process_count();
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            roots: vec![root],
+            ..AdapterOptions::default()
+        },
+    );
+    client.initialize("matrix-root-secret-generation");
+    let pwd = client.wait_for_tool("__pwd", Duration::from_secs(30));
+    client.call_tool(&pwd, json!({}));
+    assert_eq!(transcript_initialize_count(&transcript), 1);
+
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).expect("load fixture registry");
+    reg.secrets_generation += 1;
+    registry::save_to(&path, &reg).expect("rotate secret generation");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while transcript_initialize_count(&transcript) < 2 {
+        client.call_tool(&pwd, json!({}));
+        assert!(
+            Instant::now() < deadline,
+            "the old rooted launch survived a secret generation change"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    while mock_child_process_count().saturating_sub(before) > 1 {
+        assert!(Instant::now() < deadline, "old root child stayed live");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(mock_child_process_count().saturating_sub(before), 1);
 }
 
 // ---------------------------------------------------------------------------

@@ -519,6 +519,17 @@ struct ServerSlot {
     reconnect: Option<Reconnect>,
 }
 
+/// An opaque reference to one live downstream launch. The gateway's launch
+/// pool can hold this without retaining an obsolete router or its other slots.
+#[derive(Clone)]
+pub struct SharedServerSlot(Arc<ServerSlot>);
+
+impl SharedServerSlot {
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// Factory that rebuilds a downstream connection on demand. Supplied by the gateway
 /// (which owns the registry + secret injection) so `router` stays free of spawn logic;
 /// returns `None` if the server still can't be reached.
@@ -883,6 +894,40 @@ impl Router {
         } else {
             view.add_with_reconnect(server, reconnect);
         }
+        view
+    }
+
+    /// Compose a launch already owned by another view into this one. The source
+    /// and result share the exact slot, so selecting the same LaunchKey never
+    /// starts a second child or splits its reconnect state.
+    pub fn with_server_slot_from(&self, source: &Router, server_id: &str) -> Option<Self> {
+        Some(self.with_shared_server_slot(&source.server_slot(server_id)?))
+    }
+
+    pub fn server_slot(&self, server_id: &str) -> Option<SharedServerSlot> {
+        let index = *self.by_id.get(server_id)?;
+        Some(SharedServerSlot(Arc::clone(self.servers.get(index)?)))
+    }
+
+    pub fn with_shared_server_slot(&self, slot: &SharedServerSlot) -> Self {
+        let server_id = &slot.0.id;
+        let mut view = self.clone();
+        if let Some(&index) = view.by_id.get(server_id) {
+            view.servers[index] = Arc::clone(&slot.0);
+        } else {
+            let index = view.servers.len();
+            view.servers.push(Arc::clone(&slot.0));
+            view.by_id.insert(server_id.to_string(), index);
+        }
+        view.rebuild_aggregation();
+        view
+    }
+
+    /// Re-index a view after one of its shared downstream slots refreshed its
+    /// catalog. The view keeps its own policy and routes while sharing launches.
+    pub fn reindexed(&self) -> Self {
+        let mut view = self.clone();
+        view.rebuild_aggregation();
         view
     }
 
@@ -2994,6 +3039,10 @@ mod tests {
         assert!(Arc::ptr_eq(&ordinary_only.servers[0], &inserted.servers[0]));
         assert!(inserted.route_of("rooted__add").is_some());
         assert!(ordinary_only.route_of("rooted__add").is_none());
+        let reused = ordinary_only
+            .with_server_slot_from(&inserted, "rooted")
+            .expect("inserted slot can be shared");
+        assert!(Arc::ptr_eq(&inserted.servers[1], &reused.servers[1]));
     }
 
     #[test]

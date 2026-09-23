@@ -18,7 +18,7 @@
 //!   model searches and calls on demand, keeping context flat.
 //! - Records every tool call to a local audit log.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -44,7 +44,9 @@ use conduit_lib::integrity;
 use conduit_lib::pii;
 use conduit_lib::registry::{self, Registry, ServerEntry};
 use conduit_lib::remote;
-use conduit_lib::router::{is_destructive, sanitize_segment, Reconnect, Router, ToolPolicy};
+use conduit_lib::router::{
+    is_destructive, sanitize_segment, Reconnect, Router, SharedServerSlot, ToolPolicy,
+};
 use conduit_lib::routine_advisor::{self, AdvisorLedger, HintSlot};
 use conduit_lib::routine_candidates::{
     CandidateRegistry, CodeRunEvidence, Recommendation, ToolReceipt,
@@ -58,6 +60,7 @@ use conduit_lib::secrets;
 use conduit_lib::semantic;
 use conduit_lib::session_store::SessionStore;
 use conduit_lib::shaping;
+use conduit_lib::topology::LaunchKey;
 
 #[cfg(any(unix, windows))]
 #[global_allocator]
@@ -768,27 +771,26 @@ impl OpenGate {
 
 /// If the leader panics (or otherwise unwinds) between claiming leadership and
 /// calling `finish_open_*`, clear the opening gate and fail waiters (WS1-4).
-struct LeadOpenGuard<'a> {
-    state: &'a GatewayState,
+struct LeadOpenGuard {
+    subscriptions: Arc<Mutex<ResourceSubscriptionTable>>,
     uri: String,
     gate: Arc<OpenGate>,
     armed: bool,
 }
 
-impl LeadOpenGuard<'_> {
+impl LeadOpenGuard {
     fn disarm(&mut self) {
         self.armed = false;
     }
 }
 
-impl Drop for LeadOpenGuard<'_> {
+impl Drop for LeadOpenGuard {
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
         let mut table = self
-            .state
-            .resource_subs
+            .subscriptions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Only finish if this gate is still the in-flight open for the URI.
@@ -8997,6 +8999,62 @@ fn prior_quarantine_from_router(router: &Router) -> Option<PriorQuarantine> {
 /// Spawn and connect every enabled server into a router. With `profile` set, only
 /// that profile's servers are connected (per-client scoping); otherwise the
 /// active profile is used.
+fn server_uses_project_root(server: &ServerEntry) -> bool {
+    server.command.is_some()
+        && server
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| cwd.contains("${ROOT}"))
+}
+
+fn daemon_root_servers(reg: &Registry) -> Vec<ServerEntry> {
+    reg.servers
+        .iter()
+        .filter(|server| {
+            !clients::is_gateway_server(server)
+                && server_uses_project_root(server)
+                && reg
+                    .profiles
+                    .iter()
+                    .any(|profile| reg.is_enabled(&profile.id, &server.id))
+        })
+        .cloned()
+        .collect()
+}
+
+fn root_servers_in_scope(
+    specs: &[ServerEntry],
+    allowed: Option<&HashSet<String>>,
+) -> Vec<ServerEntry> {
+    specs
+        .iter()
+        .filter(|server| allowed.is_none_or(|scope| server_in_allowed_scope(&server.id, scope)))
+        .cloned()
+        .collect()
+}
+
+fn root_launch_keys(specs: &[ServerEntry], root: &str, secrets_generation: u64) -> Vec<LaunchKey> {
+    specs
+        .iter()
+        .map(|server| {
+            let env_names: BTreeSet<String> =
+                server.env.iter().map(|entry| entry.key.clone()).collect();
+            let cwd = server
+                .cwd
+                .as_deref()
+                .and_then(|cwd| downstream::resolve_root_token(cwd, Some(root)));
+            LaunchKey::stdio(
+                &server.id,
+                server.command.as_deref().unwrap_or(""),
+                &server.args,
+                cwd.as_deref(),
+                &env_names,
+                secrets_generation,
+            )
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)] // SBS-871 adds the pre-rebuild quarantine set.
 fn build_router(
     reg: &Registry,
@@ -9040,7 +9098,7 @@ fn build_router(
             None => reg.enabled_servers(),
         }
     };
-    let servers: Vec<ServerEntry> = enabled
+    let all_servers: Vec<ServerEntry> = enabled
         .into_iter()
         .filter(|s| !clients::is_gateway_server(s)) // never proxy ourselves
         .cloned()
@@ -9049,11 +9107,18 @@ fn build_router(
     // Build the policy from the same server set: per-tool disables + the global
     // destructive switch. The router enforces it as servers are added.
     let mut disabled = std::collections::HashMap::new();
-    for s in &servers {
+    for s in &all_servers {
         if !s.disabled_tools.is_empty() {
             disabled.insert(s.id.clone(), s.disabled_tools.iter().cloned().collect());
         }
     }
+    // A daemon learns each adapter's project root only after that adapter's
+    // handshake. Delay these launches until a session has a resolved root;
+    // starting them here would create an extra child in the daemon's own cwd.
+    let servers: Vec<ServerEntry> = all_servers
+        .into_iter()
+        .filter(|server| !daemon_mode || !server_uses_project_root(server))
+        .collect();
     // Tool-granular profile scope (SOU-189 / SOU-167): per-server ORIGINAL tool allow-lists.
     // Stdio: bake the single active (or requested) profile's tool_scope.
     // HTTP: one shared router serves every registered client/profile. Bake a fail-closed
@@ -10088,6 +10153,7 @@ fn handle_resource_subscription(
             ));
         }
     }
+    let subscriptions = state.subscriptions_for_route(router, &owner);
     let session = active_resource_session_id();
     match method {
         "resources/subscribe" => {
@@ -10102,8 +10168,7 @@ fn handle_resource_subscription(
             // clippy's deny-by-default never_loop was the one hard error blocking a
             // -D warnings gate in CI.
             let begin = {
-                let mut table = state
-                    .resource_subs
+                let mut table = subscriptions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match table.begin_subscribe(&session, uri, &owner) {
@@ -10121,15 +10186,14 @@ fn handle_resource_subscription(
                     // If subscribe_resource panics, Drop clears `opening` and
                     // fails waiters instead of parking them forever (WS1-4).
                     let mut lead_guard = LeadOpenGuard {
-                        state,
+                        subscriptions: Arc::clone(&subscriptions),
                         uri: uri.to_string(),
                         gate: Arc::clone(&gate),
                         armed: true,
                     };
                     match router.subscribe_resource(uri) {
                         Ok(_) => {
-                            let mut table = state
-                                .resource_subs
+                            let mut table = subscriptions
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             table.finish_open_ok(uri, &gate);
@@ -10141,8 +10205,7 @@ fn handle_resource_subscription(
                                 &integrity::sanitize_wrapper_label(&owner),
                                 &e,
                             );
-                            let mut table = state
-                                .resource_subs
+                            let mut table = subscriptions
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             table.finish_open_err(uri, &gate, msg.clone());
@@ -10153,8 +10216,7 @@ fn handle_resource_subscription(
                 }
                 BeginSubscribe::Wait(gate) => match gate.wait(cancel) {
                     Ok(()) => {
-                        let mut table = state
-                            .resource_subs
+                        let mut table = subscriptions
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         match table.join_open(&session, uri, &owner) {
@@ -10172,8 +10234,7 @@ fn handle_resource_subscription(
         }
         "resources/unsubscribe" => {
             let last_owner = {
-                let mut table = state
-                    .resource_subs
+                let mut table = subscriptions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 table.remove(&session, uri)
@@ -10282,19 +10343,47 @@ fn cleanup_resource_subs_for_session(state: &GatewayState, session: &str) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         table.drop_session(session)
     };
-    if need_unsub.is_empty() {
-        return;
+    if !need_unsub.is_empty() {
+        let router = state
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for (uri, owner) in need_unsub {
+            if let Err(e) = router.unsubscribe_resource_on_server(&owner, &uri) {
+                eprintln!(
+                    "toolport: cleanup resources/unsubscribe failed for '{uri}' on '{owner}': {e}"
+                );
+            }
+        }
     }
-    let router = state
-        .router
+    cleanup_root_resource_subs_for_session(state, session);
+}
+
+fn cleanup_root_resource_subs_for_session(state: &GatewayState, session: &str) {
+    let launches: Vec<_> = state
+        .root_launch_pool
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    for (uri, owner) in need_unsub {
-        if let Err(e) = router.unsubscribe_resource_on_server(&owner, &uri) {
-            eprintln!(
-                "toolport: cleanup resources/unsubscribe failed for '{uri}' on '{owner}': {e}"
-            );
+        .launches
+        .values()
+        .map(|launch| (launch.slot.clone(), Arc::clone(&launch.subscriptions)))
+        .collect();
+    for (slot, subscriptions) in launches {
+        let need_unsub = subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drop_session(session);
+        if need_unsub.is_empty() {
+            continue;
+        }
+        let router = Router::new().with_shared_server_slot(&slot);
+        for (uri, owner) in need_unsub {
+            if let Err(error) = router.unsubscribe_resource_on_server(&owner, &uri) {
+                eprintln!(
+                    "toolport: cleanup rooted resources/unsubscribe failed for '{uri}' on '{owner}': {error}"
+                );
+            }
         }
     }
 }
@@ -10708,6 +10797,7 @@ impl HostState {
         scope_diff_only: bool,
         previous_adapter_tools: Option<&HashMap<McpSessionOwner, Vec<Value>>>,
     ) {
+        self.invalidate_root_views();
         self.invalidate_tool_scope_views();
         let previous_catalog = scope_diff_only.then(|| {
             cached_tools
@@ -11011,6 +11101,7 @@ fn watch_tick(
     state: &mut WatchLoopState,
     host: &HostState,
 ) -> TickOutcome {
+    host.reap_root_launches();
     // Everything host-scoped in this tick comes off the host, so a caller cannot pair
     // one host with another host's router, cache, session table, or rebuild lock.
     let registry = &host.registry;
@@ -11051,6 +11142,7 @@ fn watch_tick(
         )
     };
     if quarantine_changed {
+        host.invalidate_root_views();
         host.invalidate_tool_scope_views();
     }
     // A live downstream server that changed its own tool set (sent
@@ -11062,7 +11154,7 @@ fn watch_tick(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        live.expired_cache_kinds()
+        live.expired_cache_kinds() | host.rooted_cache_expired_kinds()
     };
     let downstream_changed = downstream_notified | cache_expired;
     let current_routines_mtime = routines::routines_path().and_then(|path| mtime(&path));
@@ -11257,6 +11349,7 @@ fn watch_tick(
             tools.len(),
         );
     } else {
+        host.refresh_rooted_catalogs(downstream_changed);
         let resolved = profile
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -11328,6 +11421,7 @@ fn watch_tick(
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&current);
+            host.invalidate_root_views();
             host.invalidate_tool_scope_views();
             notify_list_changed_for_router_diff(
                 stdio,
@@ -11355,6 +11449,7 @@ fn watch_tick(
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&current);
+            host.invalidate_root_views();
             host.invalidate_tool_scope_views();
             notify_list_changed_for_router_diff(
                 stdio,
@@ -11398,6 +11493,52 @@ struct ProfileToolView {
     catalog: Arc<CatalogSnapshot>,
 }
 
+#[derive(Default)]
+struct RootLaunchPool {
+    base: Option<Arc<Router>>,
+    specs: Vec<ServerEntry>,
+    secrets_generation: u64,
+    launches: BTreeMap<LaunchKey, RootLaunch>,
+    views: BTreeMap<Vec<LaunchKey>, Arc<Router>>,
+}
+
+struct RootLaunch {
+    slot: SharedServerSlot,
+    subscriptions: Arc<Mutex<ResourceSubscriptionTable>>,
+}
+
+fn visible_root_list(
+    router: &Router,
+    owner: &McpSessionOwner,
+    reg: &Registry,
+    kind: u8,
+) -> Vec<Value> {
+    let allowed: Option<HashSet<String>> = owner
+        .scope
+        .as_ref()
+        .map(|scope| scope.iter().cloned().collect());
+    if kind == downstream::change::TOOLS {
+        let scoped = owner.tool_scope.as_ref().map(|scope| {
+            let allow = scope
+                .iter()
+                .map(|(server, tools)| (server.clone(), tools.iter().cloned().collect()))
+                .collect();
+            router.with_tool_allow(allow)
+        });
+        let view = scoped.as_ref().unwrap_or(router);
+        let owners = unique_prefix_owners(reg);
+        return scope_tools(&view.aggregated_tools(), allowed.as_ref(), |name| {
+            owner_of_exposed_tool(Some(view), &owners, name)
+        });
+    }
+    let kind = if kind == downstream::change::RESOURCES {
+        ChangedListKind::Resources
+    } else {
+        ChangedListKind::Prompts
+    };
+    visible_changed_list(router, allowed.as_ref(), kind)
+}
+
 struct HostState {
     registry: Arc<Mutex<Registry>>,
     /// Whether `registry` above is a faithful copy of what is on disk, i.e.
@@ -11417,6 +11558,10 @@ struct HostState {
     /// adapter's original-tool allowlist. Invalidated when the live router or
     /// that profile's allowlist changes.
     tool_scope_views: Mutex<ToolScopeViews>,
+    /// Root-dependent downstreams are keyed by their resolved launch parameters.
+    /// Every view shares the host router's ordinary slots and any rooted slot
+    /// whose LaunchKey is equal, even when another root view is composed later.
+    root_launch_pool: Mutex<RootLaunchPool>,
     cached_tools: SharedCatalog,
     routine_candidates: CandidateRegistry,
     routine_advisor: AdvisorLedger,
@@ -11440,6 +11585,9 @@ struct HostState {
     server_handler: ServerRequestHandler,
     /// Upstream resource subscriptions (session → URI) for SOU-394 fanout.
     resource_subs: Arc<Mutex<ResourceSubscriptionTable>>,
+    /// The daemon's stdio face is inert, but the per-launch notification sinks
+    /// use the same delivery path as ordinary downstreams.
+    resource_stdio: Arc<SessionState>,
     /// Shared dispatch `(producer, uri)` that delivers `notifications/resources/updated`
     /// to subscribed clients after ownership check (SOU-394 / SOU-398). Bound per
     /// server at connect/reconnect.
@@ -11487,6 +11635,382 @@ struct HostState {
 }
 
 impl HostState {
+    fn subscriptions_for_route(
+        &self,
+        router: &Router,
+        owner: &str,
+    ) -> Arc<Mutex<ResourceSubscriptionTable>> {
+        let Some(slot) = router.server_slot(owner) else {
+            return Arc::clone(&self.resource_subs);
+        };
+        self.root_launch_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .launches
+            .values()
+            .find(|launch| launch.slot.ptr_eq(&slot))
+            .map(|launch| Arc::clone(&launch.subscriptions))
+            .unwrap_or_else(|| Arc::clone(&self.resource_subs))
+    }
+
+    fn refresh_rooted_catalogs(&self, changed: u8) {
+        let kinds: Vec<u8> = [
+            downstream::change::TOOLS,
+            downstream::change::RESOURCES,
+            downstream::change::PROMPTS,
+        ]
+        .into_iter()
+        .filter(|kind| changed & kind != 0)
+        .collect();
+        if kinds.is_empty() {
+            return;
+        }
+        let reg = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let specs = daemon_root_servers(&reg);
+        let sessions: Vec<Arc<SessionState>> = self
+            .mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        let mut pool = self
+            .root_launch_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pool.launches.is_empty() {
+            return;
+        }
+        let mut before = Vec::new();
+        for session in &sessions {
+            let (Some(owner), Some(root)) =
+                (session.owner.as_ref(), Self::resolved_adapter_root(session))
+            else {
+                continue;
+            };
+            let allowed: Option<HashSet<String>> = owner
+                .scope
+                .as_ref()
+                .map(|scope| scope.iter().cloned().collect());
+            let scoped = root_servers_in_scope(&specs, allowed.as_ref());
+            let keys = root_launch_keys(&scoped, &root, reg.secrets_generation);
+            let Some(view) = pool.views.get(&keys) else {
+                continue;
+            };
+            for &kind in &kinds {
+                before.push((
+                    Arc::clone(session),
+                    keys.clone(),
+                    kind,
+                    visible_root_list(view, owner, &reg, kind),
+                ));
+            }
+        }
+        // Each launch is refreshed once. The ordinary host router does not own
+        // these slots, so its refresh loop cannot see their catalog changes.
+        for launch in pool.launches.values() {
+            let mut view = Router::new().with_shared_server_slot(&launch.slot);
+            for &kind in &kinds {
+                if kind == downstream::change::TOOLS {
+                    view.refresh_tools();
+                } else if kind == downstream::change::RESOURCES {
+                    view.refresh_resources();
+                } else {
+                    view.refresh_prompts();
+                }
+            }
+        }
+        let updated: BTreeMap<Vec<LaunchKey>, Arc<Router>> = pool
+            .views
+            .iter()
+            .map(|(keys, view)| (keys.clone(), Arc::new(view.reindexed())))
+            .collect();
+        pool.views = updated.clone();
+        drop(pool);
+        self.invalidate_tool_scope_views();
+
+        for (session, keys, kind, prior) in before {
+            if session.is_expired() || session.closed.load(Ordering::SeqCst) {
+                continue;
+            }
+            let (Some(owner), Some(view)) = (session.owner.as_ref(), updated.get(&keys)) else {
+                continue;
+            };
+            if prior == visible_root_list(view, owner, &reg, kind) {
+                continue;
+            }
+            let method = if kind == downstream::change::TOOLS {
+                "notifications/tools/list_changed"
+            } else if kind == downstream::change::RESOURCES {
+                "notifications/resources/list_changed"
+            } else {
+                "notifications/prompts/list_changed"
+            };
+            let msg = json!({ "jsonrpc": "2.0", "method": method });
+            if let Some(json) = session.notification_json(&msg) {
+                if !session.push_message(json, None) {
+                    eprintln!("toolport: MCP session could not take a root catalog notification");
+                }
+            }
+        }
+    }
+
+    fn rooted_cache_expired_kinds(&self) -> u8 {
+        self.root_launch_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .views
+            .values()
+            .fold(0, |changed, view| changed | view.expired_cache_kinds())
+    }
+
+    fn invalidate_root_views(&self) {
+        if !self.daemon_mode.load(Ordering::SeqCst) {
+            return;
+        }
+        let reg = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let specs = daemon_root_servers(&reg);
+        let mut pool = self
+            .root_launch_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pool.specs != specs || pool.secrets_generation != reg.secrets_generation {
+            pool.launches.clear();
+            pool.specs = specs;
+            pool.secrets_generation = reg.secrets_generation;
+        }
+        pool.base = None;
+        pool.views.clear();
+    }
+
+    fn reap_root_launches(&self) {
+        if !self.daemon_mode.load(Ordering::SeqCst) {
+            return;
+        }
+        let reg = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let specs = daemon_root_servers(&reg);
+        let sessions: Vec<Arc<SessionState>> = self
+            .mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        let active_views: BTreeSet<Vec<LaunchKey>> = sessions
+            .iter()
+            .filter(|session| !session.closed.load(Ordering::SeqCst) && !session.is_expired())
+            .filter_map(|session| {
+                let owner = session.owner.as_ref()?;
+                // A roots/list refresh temporarily pauses dispatch, but the
+                // existing launch remains leased until the answer selects a
+                // replacement. Reaping it now would drop live subscriptions.
+                let root = Self::last_adapter_root(session)?;
+                let allowed: Option<HashSet<String>> = owner
+                    .scope
+                    .as_ref()
+                    .map(|scope| scope.iter().cloned().collect());
+                let scoped = root_servers_in_scope(&specs, allowed.as_ref());
+                Some(root_launch_keys(&scoped, &root, reg.secrets_generation))
+            })
+            .collect();
+        let active_keys: BTreeSet<LaunchKey> = active_views.iter().flatten().cloned().collect();
+        let mut pool = self
+            .root_launch_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = (pool.views.len(), pool.launches.len());
+        pool.views.retain(|keys, _| active_views.contains(keys));
+        pool.launches.retain(|key, _| active_keys.contains(key));
+        if pool.views.is_empty() && pool.launches.is_empty() {
+            pool.base = None;
+        }
+        let changed = before != (pool.views.len(), pool.launches.len());
+        drop(pool);
+        if changed {
+            self.invalidate_tool_scope_views();
+        }
+    }
+
+    fn resolved_adapter_root(session: &SessionState) -> Option<String> {
+        if !session
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.identity.starts_with("adapter:"))
+        {
+            return None;
+        }
+        let override_root = session
+            .client_root_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if override_root.is_some() {
+            return override_root;
+        }
+        let capable = session
+            .client_upstream
+            .lock()
+            .map(|caps| caps.roots.supported)
+            .unwrap_or(false);
+        if capable
+            && (!session.root_refreshed.load(Ordering::SeqCst)
+                || session.root_refreshing.load(Ordering::SeqCst))
+        {
+            return None;
+        }
+        let root = session
+            .client_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        root
+    }
+
+    fn last_adapter_root(session: &SessionState) -> Option<String> {
+        if !session
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.identity.starts_with("adapter:"))
+        {
+            return None;
+        }
+        session
+            .client_root_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .or_else(|| {
+                session
+                    .client_root
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            })
+    }
+
+    fn active_adapter_root(&self) -> Option<String> {
+        let sid = active_mcp_session()?;
+        let session = self
+            .mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&sid)
+            .cloned()?;
+        Self::resolved_adapter_root(&session)
+    }
+
+    fn router_for_root(
+        &self,
+        base: Arc<Router>,
+        reg: &Registry,
+        root: Option<&str>,
+        allowed: Option<&HashSet<String>>,
+    ) -> Arc<Router> {
+        let all_specs = daemon_root_servers(reg);
+        let specs = root_servers_in_scope(&all_specs, allowed);
+        let Some(root) = root else {
+            return base;
+        };
+        if specs.is_empty() {
+            return base;
+        }
+        let keys = root_launch_keys(&specs, root, reg.secrets_generation);
+        let mut pool = self
+            .root_launch_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live = self
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if !Arc::ptr_eq(&live, &base) {
+            // A concurrent rebuild won. Its next request creates the new pool.
+            return base;
+        }
+        if pool.specs != all_specs || pool.secrets_generation != reg.secrets_generation {
+            pool.launches.clear();
+            pool.views.clear();
+            pool.specs = all_specs;
+            pool.secrets_generation = reg.secrets_generation;
+        }
+        if !pool
+            .base
+            .as_ref()
+            .is_some_and(|previous| Arc::ptr_eq(previous, &base))
+        {
+            pool.base = Some(Arc::clone(&base));
+            pool.views.clear();
+        }
+        if let Some(view) = pool.views.get(&keys) {
+            return Arc::clone(view);
+        }
+
+        let mut view = (*base).clone();
+        let mut complete = true;
+        for (server, key) in specs.iter().zip(&keys) {
+            if let Some(launch) = pool.launches.get(key) {
+                view = view.with_shared_server_slot(&launch.slot);
+                continue;
+            }
+            let dirty = Arc::clone(&self.downstream_dirty);
+            let handler = Arc::clone(&self.server_handler);
+            let subscriptions = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
+            let sink = Some(make_resource_updated_sink(
+                Arc::clone(&self.resource_stdio),
+                Arc::clone(&self.mcp_sessions),
+                Arc::clone(&subscriptions),
+            ));
+            let Some(ds) = connect_one(server, &dirty, handler, Some(root), sink.clone()) else {
+                complete = false;
+                continue;
+            };
+            let spec = server.clone();
+            let root = root.to_string();
+            let subs = Arc::clone(&subscriptions);
+            let handler = Arc::clone(&self.server_handler);
+            let server_id = server.id.clone();
+            let reconnect: Reconnect = Box::new(move || {
+                let mut ds = connect_one(
+                    &spec,
+                    &dirty,
+                    Arc::clone(&handler),
+                    Some(&root),
+                    sink.clone(),
+                )?;
+                resubscribe_server_resources(&mut ds, &server_id, &subs);
+                Some(ds)
+            });
+            view = view.with_server_launch(ds, Some(reconnect));
+            if let Some(slot) = view.server_slot(&server.id) {
+                pool.launches.insert(
+                    key.clone(),
+                    RootLaunch {
+                        slot,
+                        subscriptions,
+                    },
+                );
+            }
+        }
+        let view = Arc::new(view);
+        if complete {
+            pool.views.insert(keys, Arc::clone(&view));
+        }
+        view
+    }
+
     fn invalidate_tool_scope_views(&self) {
         let mut views = self
             .tool_scope_views
@@ -11520,7 +12044,14 @@ impl HostState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if !Arc::ptr_eq(&live, &base) {
+        let rooted_live = self
+            .root_launch_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .views
+            .values()
+            .any(|view| Arc::ptr_eq(view, &base));
+        if !Arc::ptr_eq(&live, &base) && !rooted_live {
             // A rebuild won after this request took its snapshot. Keep serving
             // that snapshot, but never pin its old downstream slots in the host.
             let view = Arc::new(base.with_tool_allow(allow));
@@ -12107,6 +12638,7 @@ struct SessionState {
     client_cwd: Mutex<Option<String>>,
     client_root_override: Mutex<Option<String>>,
     root_refreshing: AtomicBool,
+    root_refreshed: AtomicBool,
     /// The stdio client's progress hand-off, created on first use: one writer
     /// thread owns the blocking write to this session's stdout, fed by a bounded
     /// queue. Delivery runs on the downstream drain thread, which must never block.
@@ -12186,6 +12718,7 @@ impl SessionState {
             client_cwd: Mutex::new(None),
             client_root_override: Mutex::new(None),
             root_refreshing: AtomicBool::new(false),
+            root_refreshed: AtomicBool::new(false),
             stdio_progress: OnceLock::new(),
             stdio_client_ready: AtomicBool::new(false),
             stdio_responded: AtomicBool::new(false),
@@ -13412,6 +13945,7 @@ fn refresh_http_session_root(state: &GatewayState) {
     if !supported || session.root_refreshing.swap(true, Ordering::SeqCst) {
         return;
     }
+    let root_state = state.clone();
     std::thread::spawn(move || {
         let result = session.call("roots/list", json!({}));
         match result {
@@ -13439,14 +13973,23 @@ fn refresh_http_session_root(state: &GatewayState) {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
-                *session
-                    .client_root
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    override_root.or(declared).or(fallback);
+                let next_root = override_root.or(declared).or(fallback);
+                let changed = {
+                    let mut current = session
+                        .client_root
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let changed = *current != next_root;
+                    *current = next_root;
+                    changed
+                };
+                if changed {
+                    cleanup_root_resource_subs_for_session(&root_state, &sid);
+                }
             }
             Err(error) => glog(&format!("toolport: HTTP roots/list failed: {error}")),
         }
+        session.root_refreshed.store(true, Ordering::SeqCst);
         session.root_refreshing.store(false, Ordering::SeqCst);
     });
 }
@@ -13462,9 +14005,25 @@ fn handle_client_notification(
             false
         }
         Some("notifications/roots/list_changed") => {
-            // Refresh this client's root off-thread. Standalone stdio also
-            // re-places its ${ROOT} servers; the daemon will use the session
-            // root for launch sharding once P3.2 wires the slot pool.
+            // Forward against the session's current root before refreshing it.
+            // The notification belongs to that root's downstream slot; the
+            // subsequent roots/list result selects any replacement launch.
+            let base = state
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let router = if state.daemon_mode.load(Ordering::SeqCst) {
+                let reg = state
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let root = state.active_adapter_root();
+                state.router_for_root(base, &reg, root.as_deref(), allowed)
+            } else {
+                base
+            };
             if state.http {
                 refresh_http_session_root(state);
             } else {
@@ -13472,11 +14031,6 @@ fn handle_client_notification(
                 std::thread::spawn(move || refresh_client_root(&st));
             }
             // Still tell downstream servers, for ones that consume roots themselves.
-            let router = state
-                .router
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
             router.notify_downstreams_in_scope(
                 "notifications/roots/list_changed",
                 json!({}),
@@ -13580,6 +14134,14 @@ fn process_request(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .server_count()
             == 0
+        && !(state.daemon_mode.load(Ordering::SeqCst)
+            && !daemon_root_servers(
+                &state
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .is_empty())
     {
         // Single-flight: serialize the rebuild so a startup burst of concurrent
         // tools/call workers doesn't have each one spawn the full server set (and
@@ -13649,6 +14211,7 @@ fn process_request(
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     Arc::make_mut(&mut guard).adopt_restored_routes(&previous_router, &tools);
                 }
+                state.invalidate_root_views();
                 state.invalidate_tool_scope_views();
                 // A fail-closed rebuild hides everything, so the cache must not keep
                 // serving the last-good catalog past it (SBS-871).
@@ -13695,13 +14258,22 @@ fn process_request(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    let daemon_adapter = state.daemon_mode.load(Ordering::SeqCst) && adapter_profile.is_some();
+    let adapter_root = daemon_adapter
+        .then(|| state.active_adapter_root())
+        .flatten();
+    let rooted_router = if daemon_adapter {
+        state.router_for_root(base_router, &reg, adapter_root.as_deref(), allowed)
+    } else {
+        base_router
+    };
     let (router, adapter_catalog) = if state.daemon_mode.load(Ordering::SeqCst) {
         adapter_profile
-            .map(|profile| state.router_for_adapter_profile(base_router.clone(), &reg, profile))
+            .map(|profile| state.router_for_adapter_profile(rooted_router.clone(), &reg, profile))
             .map(|(router, catalog)| (router, Some(catalog)))
-            .unwrap_or_else(|| (Arc::clone(&base_router), None))
+            .unwrap_or_else(|| (Arc::clone(&rooted_router), None))
     } else {
-        (base_router, None)
+        (rooted_router, None)
     };
     // The shared HTTP cache reflects the fail-closed intersection across all
     // profiles. An adapter needs the catalog indexed under its own tool scope,
@@ -14826,6 +15398,7 @@ fn handle_mcp_http(
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             headers.adapter_resolved_root.map(str::to_string);
+                        session.root_refreshed.store(false, Ordering::SeqCst);
                     }
                 }
             }
@@ -16991,8 +17564,13 @@ fn main() {
     let stdio_upstream = Arc::new(SessionState::new_stdio(Arc::clone(&stdout)));
     // Resource subscription tracking + drain-thread sink (SOU-394).
     let resource_subs = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
+    let resource_stdio = if daemon_mode {
+        Arc::new(SessionState::new_http(None))
+    } else {
+        Arc::clone(&stdio_upstream)
+    };
     let resource_updated_sink = Some(make_resource_updated_sink(
-        Arc::clone(&stdio_upstream),
+        Arc::clone(&resource_stdio),
         Arc::clone(&mcp_sessions),
         Arc::clone(&resource_subs),
     ));
@@ -17021,6 +17599,7 @@ fn main() {
         registry_trusted: Arc::clone(&registry_trusted),
         router: Arc::clone(&router),
         tool_scope_views: Mutex::new(ToolScopeViews::default()),
+        root_launch_pool: Mutex::new(RootLaunchPool::default()),
         cached_tools: Arc::clone(&cached_tools),
         routine_candidates: CandidateRegistry::default(),
         routine_advisor: AdvisorLedger::default(),
@@ -17038,6 +17617,7 @@ fn main() {
         http_allowed_origins: configured_allowed_origins(),
         server_handler,
         resource_subs,
+        resource_stdio,
         resource_updated_sink,
         mcp_sessions: Arc::clone(&mcp_sessions),
         daemon_mode: AtomicBool::new(daemon_mode),
@@ -17125,6 +17705,7 @@ fn main() {
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(built);
+            host_for_build.invalidate_root_views();
             host_for_build.invalidate_tool_scope_views();
             // Don't let a transient empty build (registry caught mid-write, or
             // every downstream momentarily unreachable) clobber a good catalog -
@@ -22706,6 +23287,7 @@ mod tests {
             registry_trusted,
             router,
             tool_scope_views: Mutex::new(ToolScopeViews::default()),
+            root_launch_pool: Mutex::new(RootLaunchPool::default()),
             cached_tools,
             routine_candidates: CandidateRegistry::default(),
             routine_advisor: AdvisorLedger::default(),
@@ -22717,6 +23299,7 @@ mod tests {
             http_allowed_origins: Vec::new(),
             server_handler,
             resource_subs: Arc::new(Mutex::new(ResourceSubscriptionTable::default())),
+            resource_stdio: Arc::new(SessionState::new_http(None)),
             // Host state now, not a parameter: the watcher reads both off the host, so
             // these are the test's own handles when it supplies them and empty otherwise.
             resource_updated_sink,
@@ -22752,6 +23335,7 @@ mod tests {
                 registry_trusted: Arc::new(AtomicBool::new(true)),
                 router: Arc::new(Mutex::new(Arc::new(Router::new()))),
                 tool_scope_views: Mutex::new(ToolScopeViews::default()),
+                root_launch_pool: Mutex::new(RootLaunchPool::default()),
                 cached_tools: Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
                 routine_candidates: CandidateRegistry::default(),
                 routine_advisor: AdvisorLedger::default(),
@@ -22763,6 +23347,7 @@ mod tests {
                 http_allowed_origins: Vec::new(),
                 server_handler,
                 resource_subs,
+                resource_stdio: Arc::clone(&stdio_upstream),
                 resource_updated_sink,
                 mcp_sessions: Arc::clone(&mcp_sessions),
                 daemon_mode: AtomicBool::new(false),
