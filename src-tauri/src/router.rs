@@ -863,6 +863,29 @@ impl Router {
         self.by_id.insert(id, idx);
     }
 
+    /// Build a view with one root-specific launch added or replaced. All other
+    /// slots stay shared with the source router. Re-index from the selected
+    /// slots so catalogs cannot leak across roots.
+    pub fn with_server_launch(
+        &self,
+        server: DownstreamServer,
+        reconnect: Option<Reconnect>,
+    ) -> Self {
+        let mut view = self.clone();
+        if let Some(&index) = view.by_id.get(&server.id) {
+            view.servers[index] = Arc::new(ServerSlot {
+                id: server.id.clone(),
+                inner: Mutex::new(server),
+                breaker: Mutex::new(Breaker::default()),
+                reconnect,
+            });
+            view.rebuild_aggregation();
+        } else {
+            view.add_with_reconnect(server, reconnect);
+        }
+        view
+    }
+
     pub fn server_count(&self) -> usize {
         self.servers.len()
     }
@@ -2928,6 +2951,49 @@ mod tests {
         assert!(echo.route_of("shared__add").is_none());
         assert!(add.route_of("shared__echo").is_none());
         assert!(add.route_of("shared__add").is_some());
+    }
+
+    #[test]
+    fn replacing_a_root_slot_shares_unrelated_connections_and_rebuilds_its_catalog() {
+        let mut base = Router::new();
+        base.add(mock_server("ordinary"));
+        base.add(mock_server("rooted"));
+        let mut replacement = DownstreamServer::connect(
+            "rooted".to_string(),
+            Box::new(MockTransport {
+                label: "another-root".to_string(),
+            }),
+        )
+        .expect("replacement downstream");
+        replacement.tools.push(json!({
+            "name": "only_at_this_root",
+            "inputSchema": { "type": "object" }
+        }));
+        let view = base.with_server_launch(replacement, None);
+
+        assert!(Arc::ptr_eq(&base.servers[0], &view.servers[0]));
+        assert!(!Arc::ptr_eq(&base.servers[1], &view.servers[1]));
+        assert!(view.route_of("rooted__only_at_this_root").is_some());
+        assert!(base.route_of("rooted__only_at_this_root").is_none());
+        assert_eq!(
+            view.route_call("ordinary__add", json!({})).unwrap()["content"][0]["text"],
+            "ordinary:add"
+        );
+        assert_eq!(
+            base.route_call("rooted__add", json!({})).unwrap()["content"][0]["text"],
+            "rooted:add"
+        );
+        assert_eq!(
+            view.route_call("rooted__add", json!({})).unwrap()["content"][0]["text"],
+            "another-root:add"
+        );
+
+        let mut ordinary_only = Router::new();
+        ordinary_only.add(mock_server("ordinary"));
+        let inserted = ordinary_only.with_server_launch(mock_server("rooted"), None);
+        assert!(Arc::ptr_eq(&ordinary_only.servers[0], &inserted.servers[0]));
+        assert!(inserted.route_of("rooted__add").is_some());
+        assert!(ordinary_only.route_of("rooted__add").is_none());
     }
 
     #[test]
