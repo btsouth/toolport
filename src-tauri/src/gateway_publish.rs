@@ -2122,7 +2122,7 @@ mod tests {
             assert!(in_explicit_reap_scope(&own, Some(&symlink)));
         }
 
-        #[cfg(not(windows))]
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             let distinct_bin = dir.root.join("toolport/bin");
             std::fs::create_dir_all(&distinct_bin).unwrap();
