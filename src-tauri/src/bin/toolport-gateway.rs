@@ -10184,7 +10184,16 @@ fn handle_resource_subscription(
             ));
         }
     }
-    let subscriptions = state.subscriptions_for_route(router, &owner);
+    let (subscriptions, rooted_active) = match state.subscriptions_for_route(router, &owner) {
+        Some(route) => route,
+        None => {
+            return Some(error(
+                id,
+                -32602,
+                "Toolport: this resource route was replaced; retry the request",
+            ));
+        }
+    };
     let session = active_resource_session_id();
     match method {
         "resources/subscribe" => {
@@ -10230,6 +10239,17 @@ fn handle_resource_subscription(
                 }
             };
             match begin {
+                BeginSubscribe::AlreadyLocal | BeginSubscribe::Joined
+                    if rooted_active
+                        .as_ref()
+                        .is_some_and(|active| !active.load(Ordering::SeqCst)) =>
+                {
+                    subscriptions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&session, uri);
+                    return Some(error(id, -32602, "Toolport: resource route changed; retry"));
+                }
                 BeginSubscribe::AlreadyLocal | BeginSubscribe::Joined => {
                     return Some(success(id, json!({})));
                 }
@@ -10243,6 +10263,26 @@ fn handle_resource_subscription(
                         armed: true,
                     };
                     match router.subscribe_resource(uri) {
+                        Ok(_)
+                            if rooted_active
+                                .as_ref()
+                                .is_some_and(|active| !active.load(Ordering::SeqCst)) =>
+                        {
+                            let mut table = subscriptions
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            table.finish_open_err(
+                                uri,
+                                &gate,
+                                "resource route changed during subscribe".to_string(),
+                            );
+                            lead_guard.disarm();
+                            return Some(error(
+                                id,
+                                -32602,
+                                "Toolport: resource route changed; retry",
+                            ));
+                        }
                         Ok(_) => {
                             let mut table = subscriptions
                                 .lock()
@@ -10266,6 +10306,13 @@ fn handle_resource_subscription(
                     }
                 }
                 BeginSubscribe::Wait(gate) => match gate.wait(cancel) {
+                    Ok(())
+                        if rooted_active
+                            .as_ref()
+                            .is_some_and(|active| !active.load(Ordering::SeqCst)) =>
+                    {
+                        return Some(error(id, -32602, "Toolport: resource route changed; retry"));
+                    }
                     Ok(()) => {
                         let _capacity = state
                             .resource_sub_capacity
@@ -11775,18 +11822,39 @@ impl HostState {
         &self,
         router: &Router,
         owner: &str,
-    ) -> Arc<Mutex<ResourceSubscriptionTable>> {
+    ) -> Option<(
+        Arc<Mutex<ResourceSubscriptionTable>>,
+        Option<Arc<AtomicBool>>,
+    )> {
+        if !self.daemon_mode.load(Ordering::SeqCst) {
+            return Some((Arc::clone(&self.resource_subs), None));
+        }
         let Some(slot) = router.server_slot(owner) else {
-            return Arc::clone(&self.resource_subs);
+            return None;
         };
-        self.root_launch_pool
+        let rooted = self
+            .root_launch_pool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .launches
             .values()
             .find(|launch| launch.slot.ptr_eq(&slot))
-            .map(|launch| Arc::clone(&launch.subscriptions))
-            .unwrap_or_else(|| Arc::clone(&self.resource_subs))
+            .map(|launch| {
+                (
+                    Arc::clone(&launch.subscriptions),
+                    Some(Arc::clone(&launch.active)),
+                )
+            });
+        if rooted.is_some() {
+            return rooted;
+        }
+        let ordinary = self
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .server_slot(owner)
+            .is_some_and(|current| current.ptr_eq(&slot));
+        ordinary.then(|| (Arc::clone(&self.resource_subs), None))
     }
 
     fn refresh_rooted_catalogs(&self, changed: u8) {
@@ -23710,6 +23778,7 @@ mod tests {
                     json!({ "contents": [{ "uri": params["uri"], "text": "cached" }] }),
                     20_000,
                 )),
+                "resources/subscribe" | "resources/unsubscribe" => Ok(json!({})),
                 "prompts/list" => Ok(cached(json!({ "prompts": [{ "name": "cached" }] }), 10_000)),
                 other => Err(conduit_lib::downstream::TransportError::Fatal(format!(
                     "unexpected {other}"
@@ -27928,6 +27997,61 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.contains("global subscription limit")),
             "rooted subscriptions did not count toward the cap: {reply}"
+        );
+    }
+
+    #[test]
+    fn retired_root_route_cannot_report_a_new_subscription_as_open() {
+        let state = http_state(false);
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        let router = cache_router();
+        let slot = router.server_slot("cache").expect("cache slot");
+        let table = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
+        let active = Arc::new(AtomicBool::new(false));
+        let key = LaunchKey {
+            server: "cache".into(),
+            kind: "stdio",
+            digest: "fixture-root-launch".into(),
+        };
+        {
+            let mut pool = state.root_launch_pool.lock().unwrap();
+            pool.subscriptions
+                .insert(("cache".into(), "/project".into()), Arc::clone(&table));
+            pool.launches.insert(
+                key,
+                RootLaunch {
+                    slot,
+                    subscriptions: Arc::clone(&table),
+                    subscription_key: ("cache".into(), "/project".into()),
+                    active,
+                },
+            );
+        }
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "resources/subscribe",
+            "params": { "uri": "fixture://cached" }
+        });
+        let reply = handle_resource_subscription(
+            &state,
+            &router,
+            &request,
+            None,
+            None,
+            "resources/subscribe",
+        )
+        .expect("stale route answers with an error");
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("retry")),
+            "unexpected subscribe reply: {reply}"
+        );
+        assert_eq!(table.lock().unwrap().total_count(), 0);
+
+        state.root_launch_pool.lock().unwrap().retire_launches();
+        assert!(
+            state.subscriptions_for_route(&router, "cache").is_none(),
+            "a retired rooted slot must never fall back to the ordinary table"
         );
     }
 
