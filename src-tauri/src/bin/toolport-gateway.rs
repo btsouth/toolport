@@ -14337,6 +14337,7 @@ fn process_request(
             let profile = profile.to_string();
             let expected_scope = allowed.cloned();
             let expected_tool_scope = adapter_tool_scope(&reg, &profile);
+            let expected_root = adapter_root.clone();
             Arc::new(move || {
                 let current = host
                     .registry
@@ -14350,6 +14351,7 @@ fn process_request(
                     .collect();
                 if expected_scope.as_ref() != Some(&current_scope)
                     || expected_tool_scope != adapter_tool_scope(&current, &profile)
+                    || host.active_adapter_root() != expected_root
                 {
                     return Arc::new(Router::new());
                 }
@@ -14358,7 +14360,13 @@ fn process_request(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
-                host.router_for_adapter_profile(base, &current, &profile).0
+                let rooted = host.router_for_root(
+                    base,
+                    &current,
+                    expected_root.as_deref(),
+                    expected_scope.as_ref(),
+                );
+                host.router_for_adapter_profile(rooted, &current, &profile).0
             }) as LiveRouterResolver
         })
     } else {

@@ -584,6 +584,72 @@ fn write_registry(dir: &Path, servers: Vec<ServerEntry>, profiles: Vec<Profile>)
     registry::save_to(&dir.join("registry.json"), &registry_value).expect("write registry");
 }
 
+fn approval_broker(
+    dir: &Path,
+    expected_server: &str,
+    expected_tool: &str,
+) -> std::thread::JoinHandle<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("approval listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let token = "matrix-approval-token".to_string();
+    let descriptor = EndpointDescriptor {
+        endpoint: listener.local_addr().unwrap().to_string(),
+        unix_endpoint: None,
+        token: token.clone(),
+    };
+    std::fs::write(
+        dir.join(approval::ENDPOINT_FILE),
+        serde_json::to_vec(&descriptor).unwrap(),
+    )
+    .expect("approval descriptor");
+    let expected_server = expected_server.to_string();
+    let expected_tool = expected_tool.to_string();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // BSD may inherit nonblocking mode from the listener.
+                    stream
+                        .set_nonblocking(false)
+                        .expect("blocking approval socket");
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("approval challenge");
+                    let challenge: BrokerChallenge =
+                        serde_json::from_str(&line).expect("valid challenge");
+                    let proof = BrokerProof {
+                        toolport_approval_proof: approval::challenge_proof(
+                            &token,
+                            &challenge.toolport_approval_challenge,
+                        ),
+                    };
+                    writeln!(stream, "{}", serde_json::to_string(&proof).unwrap())
+                        .expect("approval proof");
+                    line.clear();
+                    reader.read_line(&mut line).expect("approval request");
+                    let request: approval::ApprovalRequest =
+                        serde_json::from_str(&line).expect("valid approval request");
+                    assert_eq!(request.server, expected_server);
+                    assert_eq!(request.tool, expected_tool);
+                    writeln!(stream, "\"approved\"").expect("approval decision");
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "no approval request");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("approval accept failed: {error}"),
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Daemon observation
 // ---------------------------------------------------------------------------
@@ -1983,7 +2049,6 @@ fn matrix_routing_approved_call_rebinds_to_its_profile_view() {
             }
         }
     });
-
     let mut echo = spawn_adapter(
         &dir,
         &AdapterOptions {
@@ -2016,6 +2081,42 @@ fn matrix_routing_approved_call_rebinds_to_its_profile_view() {
     assert!(
         rejected["isError"] == true,
         "approval did not preserve the caller's tool scope"
+    );
+}
+
+#[test]
+fn matrix_pooling_approved_rooted_call_rebinds_to_its_root_view() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("root-hitl");
+    let root = std::fs::canonicalize(fixture.add("project")).expect("project root");
+    let transcript = dir.join("rooted.jsonl");
+    let mut server = mock_server_entry("rooted", &transcript, Some("${ROOT}"));
+    server.source = Some("shared".to_string());
+    write_registry(&dir, vec![server], vec![profile("rooted-only", &["rooted"])]);
+    let registry_path = dir.join("registry.json");
+    let mut reg = registry::load_from(&registry_path).expect("load registry");
+    reg.set_human_approval(true);
+    registry::save_to(&registry_path, &reg).expect("enable approval");
+    let broker = approval_broker(&dir, "rooted", "pwd");
+
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("rooted-only"),
+            roots: vec![root.clone()],
+            ..AdapterOptions::default()
+        },
+    );
+    client.initialize("matrix-root-hitl");
+    let tool = client.wait_for_tool("__pwd", Duration::from_secs(30));
+    let result = client.call_tool(&tool, json!({}));
+    broker.join().expect("approval broker");
+    assert_eq!(
+        std::fs::canonicalize(text_of(&result)).ok().as_ref(),
+        Some(&root),
+        "approved rooted call lost its route: {result}"
     );
 }
 
