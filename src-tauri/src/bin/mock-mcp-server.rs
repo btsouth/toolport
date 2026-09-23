@@ -123,6 +123,7 @@ struct State {
     /// Original legacy tools/call waiting for the client to answer a
     /// server-initiated elicitation request.
     pending_legacy_elicitation: Option<Value>,
+    subscribed_resources: std::collections::HashSet<String>,
 }
 
 fn success(id: Value, result: Value) -> Value {
@@ -205,6 +206,14 @@ fn tool_list(cfg: &Config, grown: bool) -> Value {
         json!({ "name": "legacy_elicitation", "description": "Issue a legacy server-to-client elicitation request.",
                 "inputSchema": { "type": "object", "properties": {} } }),
     ];
+    // A fixture marker lets rooted launches advertise different schemas for
+    // the same tool name, as real project-scoped servers can.
+    if let Ok(marker) = std::fs::read_to_string("toolport-mock-schema.txt") {
+        if let Some(pwd) = tools.iter_mut().find(|tool| tool["name"] == "pwd") {
+            pwd["inputSchema"]["properties"]["project"] =
+                json!({ "type": "string", "const": marker.trim() });
+        }
+    }
     if grown {
         tools.push(json!({ "name": "greet", "description": "Greet someone by name.",
                 "inputSchema": { "type": "object", "properties": { "name": { "type": "string" } } } }));
@@ -243,7 +252,7 @@ fn prompt_list(grown: bool) -> Value {
 fn capabilities() -> Value {
     json!({
         "tools": { "listChanged": true },
-        "resources": { "listChanged": true },
+        "resources": { "listChanged": true, "subscribe": true },
         "prompts": { "listChanged": true }
     })
 }
@@ -374,6 +383,18 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
         }),
         "tools/list" => tool_list(cfg, state.grown),
         "resources/list" => resource_list(state.grown),
+        "resources/subscribe" => {
+            if let Some(uri) = req["params"]["uri"].as_str() {
+                state.subscribed_resources.insert(uri.to_string());
+            }
+            json!({})
+        }
+        "resources/unsubscribe" => {
+            if let Some(uri) = req["params"]["uri"].as_str() {
+                state.subscribed_resources.remove(uri);
+            }
+            json!({})
+        }
         "resources/templates/list" => json!({ "resourceTemplates": [] }),
         "prompts/list" => prompt_list(state.grown),
         "tools/call" => {
@@ -621,6 +642,7 @@ fn serve_http(cfg: &Config) {
         grown: false,
         initialized: false,
         pending_legacy_elicitation: None,
+        subscribed_resources: std::collections::HashSet::new(),
     };
     for mut request in server.incoming_requests() {
         let header_version = request
@@ -692,6 +714,7 @@ fn main() {
         grown: false,
         initialized: false,
         pending_legacy_elicitation: None,
+        subscribed_resources: std::collections::HashSet::new(),
     };
     for line in stdin.lock().lines() {
         let line = match line {
@@ -729,6 +752,16 @@ fn main() {
         // A `grow` call just changed all three lists: announce each (after the call
         // response) so a watching gateway re-fetches and surfaces the new entries.
         if state.grown && !was_grown {
+            if state.subscribed_resources.contains("mock://base") {
+                let update = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/resources/updated",
+                    "params": { "uri": "mock://base" }
+                });
+                if writeln!(out, "{update}").is_err() {
+                    return;
+                }
+            }
             for method in [
                 "notifications/tools/list_changed",
                 "notifications/resources/list_changed",

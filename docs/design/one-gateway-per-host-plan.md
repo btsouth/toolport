@@ -550,23 +550,26 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
   secret generations retire the old key after in-flight calls finish.
 - This is the measurable win: adding an ordinary client session must not add a router or a
   root-independent downstream copy.
-- The current `Router` indexes one `ServerSlot` by server id and the daemon starts its
-  router before an adapter supplies roots. The adapter now sends its own cwd and
-  explicit root override over the private bearer connection, and the daemon asks
-  each capable session for `roots/list` after its handshake. That root stays on
-  the session, including a fallback to that adapter's cwd when roots vanish.
-  The pending root case still runs the mock child in the daemon's cwd because
-  dispatch does not select a root-specific slot yet. Implementing this requires
-  a launch-keyed slot pool and a session-root selection at dispatch, with
-  root-independent slots shared across those selections. Rebuilding a whole
-  router per root would respawn the independent servers and erase the intended
-  saving.
+- The daemon now starts ordinary servers once and defers `${ROOT}` launches until
+  a capable adapter's `roots/list` answer resolves its root. Its launch-keyed pool
+  composes each root view from shared ordinary slots and only the rooted slots
+  authorized for that adapter's profile. Equal keys share a child; different roots
+  get separate children. Unused
+  rooted launches exit after their last adapter session closes. Registry, policy,
+  and secret changes invalidate the affected views. Rooted catalog changes are
+  compared against each session's visible catalog before notification, and rooted
+  resource subscriptions use a separate table for each child so equal URIs cannot
+  cross from one root to another.
 
 ### P3.3 Concurrency and isolation tests
 
 - Concurrent clients with different identities, profiles, protocol eras, capabilities,
   roots, and overlapping request ids. Assertions must prove both sharing and isolation
   from the design's verification matrix.
+- Rehydrate rooted resource subscriptions when a registry or secret edit retires
+  their launch key, and exercise a live root change while subscribed. The P3.2
+  table separates equal URIs across live children; retirement continuity still
+  needs its own lifecycle case before the default flip.
 
 ## Phase 4: dogfood, default, convergence
 
@@ -594,30 +597,32 @@ is exposed poll `tools/list` bounded: the daemon serves immediately while its ro
 builds on a background thread, and a real client learns the finished catalog from
 `notifications/tools/list_changed`.
 
-| Matrix row                                                            | Case                                                                                                                                                        | Phase     | Status                |
-| --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- | --------------------- |
-| 20 simultaneous adapters cold-start exactly one daemon                | `matrix_cold_start_twenty_simultaneous_adapters_elect_exactly_one_daemon`                                                                                   | P2.1      | passing               |
-| Version/data-dir mismatch creates separate daemons without cross-talk | `matrix_partitioning_separate_data_dirs_run_separate_daemons_without_cross_talk`, `matrix_partitioning_a_foreign_compat_descriptor_is_rejected_not_adopted` | P2.1      | passing               |
-| Startup never waits indefinitely when rendezvous fails                | `matrix_lifecycle_a_stale_descriptor_does_not_stall_startup`                                                                                                | P2.1      | passing               |
-| Crashes/EOF clean up session-owned resources after close or TTL       | `matrix_lifecycle_adapter_eof_releases_the_session_and_lets_the_daemon_exit`                                                                                | P2.3      | passing               |
-| N clients on one ordinary stdio server create one downstream child    | `matrix_pooling_sessions_share_one_downstream_child`                                                                                                        | P3.2      | passing               |
-| A capable adapter is asked for roots on its own session               | `matrix_adapter_root_is_queried_on_its_own_session`                                                                                                         | P3.2      | passing               |
-| Two `${ROOT}` values create two children, equal roots share one       | `matrix_pooling_root_sharding_two_roots_two_children`                                                                                                       | P3.2      | pending (`#[ignore]`) |
-| Profiles cannot list or call outside their scope                      | `matrix_routing_profiles_cannot_reach_servers_outside_their_scope`                                                                                          | P3.1      | passing               |
-| Profiles with different tool scopes share one server safely           | `matrix_routing_profile_tool_scopes_are_independent_on_one_shared_server`                                                                                   | P3.1      | passing               |
-| A live tool-scope edit reopens the adapter under its new policy       | `matrix_routing_live_tool_scope_change_reopens_the_adapter_session`                                                                                         | P3.1      | passing               |
-| Tool changes notify only profiles that can see the new catalog        | `matrix_routing_tool_change_notifies_only_profiles_that_can_see_it`                                                                                         | P3.1      | passing               |
-| An adapter's declared root selects its folder profile                 | `matrix_routing_declared_root_selects_folder_profile`                                                                                                       | P3.1      | passing               |
-| Live profile changes reopen the adapter under the new scope           | `matrix_routing_live_profile_change_reopens_the_adapter_session`                                                                                            | P3.1      | passing               |
-| Identical JSON-RPC ids from different sessions never collide          | `matrix_routing_identical_request_ids_stay_per_session`                                                                                                     | P3.3      | passing               |
-| A downstream catalog change reaches authorized sessions only          | `matrix_routing_server_change_notifies_only_authorized_sessions`                                                                                            | P3.1/P3.3 | passing               |
-| A root change reaches authorized downstream servers only              | `matrix_routing_root_change_notifies_only_authorized_downstreams`                                                                                           | P3.1/P3.3 | passing               |
-| A server request reaches only the originating adapter                 | `matrix_routing_server_request_reaches_only_the_originating_adapter`                                                                                        | P3.1/P3.3 | passing               |
+| Matrix row                                                            | Case                                                                                                                                                        | Phase     | Status  |
+| --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- | ------- |
+| 20 simultaneous adapters cold-start exactly one daemon                | `matrix_cold_start_twenty_simultaneous_adapters_elect_exactly_one_daemon`                                                                                   | P2.1      | passing |
+| Version/data-dir mismatch creates separate daemons without cross-talk | `matrix_partitioning_separate_data_dirs_run_separate_daemons_without_cross_talk`, `matrix_partitioning_a_foreign_compat_descriptor_is_rejected_not_adopted` | P2.1      | passing |
+| Startup never waits indefinitely when rendezvous fails                | `matrix_lifecycle_a_stale_descriptor_does_not_stall_startup`                                                                                                | P2.1      | passing |
+| Crashes/EOF clean up session-owned resources after close or TTL       | `matrix_lifecycle_adapter_eof_releases_the_session_and_lets_the_daemon_exit`                                                                                | P2.3      | passing |
+| N clients on one ordinary stdio server create one downstream child    | `matrix_pooling_sessions_share_one_downstream_child`                                                                                                        | P3.2      | passing |
+| A capable adapter is asked for roots on its own session               | `matrix_adapter_root_is_queried_on_its_own_session`                                                                                                         | P3.2      | passing |
+| Two `${ROOT}` values create two children, equal roots share one       | `matrix_pooling_root_sharding_two_roots_two_children`                                                                                                       | P3.2      | passing |
+| A root session launches only servers allowed by its profile           | `matrix_pooling_rooted_servers_launch_only_for_authorized_profiles`                                                                                         | P3.2      | passing |
+| Approved rooted calls retain the caller's root and profile            | `matrix_pooling_approved_rooted_call_rebinds_to_its_root_view`                                                                                              | P3.2      | passing |
+| Equal resource URIs in different roots do not share subscriptions     | `matrix_pooling_equal_resource_uris_keep_rooted_subscriptions_separate`                                                                                     | P3.2      | passing |
+| A rooted server request returns only to its originating adapter       | `matrix_pooling_rooted_server_request_returns_to_the_originating_adapter`                                                                                   | P3.2/P3.3 | passing |
+| Profiles cannot list or call outside their scope                      | `matrix_routing_profiles_cannot_reach_servers_outside_their_scope`                                                                                          | P3.1      | passing |
+| Profiles with different tool scopes share one server safely           | `matrix_routing_profile_tool_scopes_are_independent_on_one_shared_server`                                                                                   | P3.1      | passing |
+| A live tool-scope edit reopens the adapter under its new policy       | `matrix_routing_live_tool_scope_change_reopens_the_adapter_session`                                                                                         | P3.1      | passing |
+| Tool changes notify only profiles that can see the new catalog        | `matrix_routing_tool_change_notifies_only_profiles_that_can_see_it`                                                                                         | P3.1      | passing |
+| An adapter's declared root selects its folder profile                 | `matrix_routing_declared_root_selects_folder_profile`                                                                                                       | P3.1      | passing |
+| Live profile changes reopen the adapter under the new scope           | `matrix_routing_live_profile_change_reopens_the_adapter_session`                                                                                            | P3.1      | passing |
+| Identical JSON-RPC ids from different sessions never collide          | `matrix_routing_identical_request_ids_stay_per_session`                                                                                                     | P3.3      | passing |
+| A downstream catalog change reaches authorized sessions only          | `matrix_routing_server_change_notifies_only_authorized_sessions`                                                                                            | P3.1/P3.3 | passing |
+| A root change reaches authorized downstream servers only              | `matrix_routing_root_change_notifies_only_authorized_downstreams`                                                                                           | P3.1/P3.3 | passing |
+| A server request reaches only the originating adapter                 | `matrix_routing_server_request_reaches_only_the_originating_adapter`                                                                                        | P3.1/P3.3 | passing |
 
-Pending rows are `#[ignore]`d acceptance criteria, not absent ones: they fail loudly with
-`--ignored` today (root sharding still launches from the daemon's cwd), and the attribute comes off
-in the same PR that lands the phase — the pattern
-`tests/spec_conformance.rs` used while the dual-era work was in flight.
+The P3.2 root-sharding case is no longer ignored; the matrix runs it with the
+other real-process cases.
 
 Commands (the in-file `CASE_LOCK` already serializes cases; `--test-threads=1` keeps the
 output readable):

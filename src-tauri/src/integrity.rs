@@ -1257,6 +1257,26 @@ pub fn ensure_quarantine_store_for_existing_pins(profile: Option<&str>) {
     });
 }
 
+/// Materialize an empty quarantine store before the first integrity check writes
+/// pins. A daemon with only rooted servers has no tools in its base build, so
+/// the first pin may be created by a later rooted launch.
+pub fn ensure_quarantine_store_for_fresh_pins(profile: Option<&str>) -> Result<(), String> {
+    let Some(path) = quarantine_path(profile) else {
+        return Ok(());
+    };
+    with_store_lock(&path, || {
+        match std::fs::metadata(&path) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("could not inspect quarantine store: {error}")),
+        }
+        if !matches!(load_pins(profile), PinsLoad::Fresh) {
+            return Ok(());
+        }
+        crate::registry::atomic_write(&path, "{}")
+    })
+}
+
 /// Parse quarantine JSON. Shared by disk load and the mtime-cached read path.
 fn parse_quarantine_raw(raw: &str, path: &Path) -> Result<Quarantine, String> {
     if raw.trim().is_empty() {
@@ -4534,6 +4554,26 @@ mod tests {
         assert!(
             !quarantine_path(profile).expect("path").exists(),
             "a first run stays a first run"
+        );
+    }
+
+    #[test]
+    fn first_rooted_pin_gets_a_quarantine_store_without_healing_a_lost_store() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("rooted-first-pin-store");
+        let fresh = Some("rooted-fresh");
+        let lost = Some("rooted-lost");
+        ensure_quarantine_store_for_fresh_pins(fresh).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(quarantine_path(fresh).unwrap()).unwrap(),
+            "{}"
+        );
+
+        write_loaded_pin_store(lost);
+        ensure_quarantine_store_for_fresh_pins(lost).unwrap();
+        assert!(
+            !quarantine_path(lost).unwrap().exists(),
+            "a missing store beside existing pins stays fail closed"
         );
     }
 
