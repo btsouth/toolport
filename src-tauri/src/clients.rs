@@ -162,14 +162,7 @@ fn gateway_identity_matches(id: &str, name: &str, command: Option<&str>) -> bool
             || value.eq_ignore_ascii_case(LEGACY_GATEWAY_ENTRY_NAME)
     };
 
-    has_gateway_name(id)
-        || has_gateway_name(name)
-        || command
-            .map(|command| {
-                let command = command.to_lowercase();
-                command.contains("toolport-gateway") || command.contains("conduit-gateway")
-            })
-            .unwrap_or(false)
+    has_gateway_name(id) || has_gateway_name(name) || command.is_some_and(command_is_gateway_binary)
 }
 
 /// Whether a registry entry refers to Toolport's own gateway. The gateway must
@@ -8519,6 +8512,25 @@ bad = "not-a-table"
         ));
         assert!(!command_is_gateway_binary(
             "/usr/local/bin/my-toolport-gateway-shim"
+        ));
+    }
+
+    #[test]
+    fn gateway_identity_ignores_a_gateway_named_parent_directory() {
+        assert!(!gateway_identity_matches(
+            "fixture",
+            "Fixture",
+            Some("/tmp/toolport-gateway-reaper/mock-mcp-server")
+        ));
+        assert!(!gateway_identity_matches(
+            "fixture",
+            "Fixture",
+            Some(r"C:\tools\conduit-gateway\mock-mcp-server.exe")
+        ));
+        assert!(gateway_identity_matches(
+            "fixture",
+            "Fixture",
+            Some("/opt/toolport/toolport-gateway")
         ));
     }
 
