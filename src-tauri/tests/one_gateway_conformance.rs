@@ -1323,6 +1323,66 @@ fn matrix_rollout_default_selects_the_shared_daemon() {
     assert_eq!(topology["ordinaryLaunches"], 1);
     assert_eq!(topology["rootedLaunches"], 0);
     assert_eq!(topology["launches"], 1);
+
+    let lease_url = format!(
+        "http://{endpoint}{}",
+        conduit_lib::daemon::HTTP_SERVICE_LEASE_PATH
+    );
+    let bridge_token = "leased-public-bridge-token";
+    let lease_body = json!({
+        "tokenSha256": registry::sha256_hex(bridge_token),
+        "bindHost": "bridge.example"
+    });
+    assert!(matches!(
+        ureq::post(&lease_url)
+            .set("Authorization", "Bearer registered-probe-token")
+            .send_json(lease_body.clone()),
+        Err(ureq::Error::Status(401, _))
+    ));
+    ureq::post(&lease_url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .send_json(lease_body.clone())
+        .expect("private bearer acquires public bridge lease");
+    ureq::get(&format!("http://{endpoint}/openapi.json"))
+        .set("Authorization", "Bearer registered-probe-token")
+        .set("Origin", "http://127.0.0.1")
+        .call()
+        .expect("service lease keeps registered clients' Origin policy");
+    ureq::get(&format!("http://{endpoint}/openapi.json"))
+        .set("Authorization", &format!("Bearer {bridge_token}"))
+        .set("Origin", "http://bridge.example")
+        .call()
+        .expect("leased bridge token reaches its public origin");
+    assert!(matches!(
+        ureq::get(&format!("http://{endpoint}/openapi.json"))
+            .set("Authorization", &format!("Bearer {bridge_token}"))
+            .set("Origin", "http://attacker.example")
+            .call(),
+        Err(ureq::Error::Status(403, _))
+    ));
+    for path in [
+        conduit_lib::daemon::IDENTITY_PATH,
+        conduit_lib::daemon::TOPOLOGY_PATH,
+        conduit_lib::daemon::HTTP_SERVICE_LEASE_PATH,
+    ] {
+        let response = ureq::get(&format!("http://{endpoint}{path}"))
+            .set("Authorization", &format!("Bearer {bridge_token}"))
+            .call();
+        assert!(
+            matches!(response, Err(ureq::Error::Status(401, _))),
+            "leased public bearer reached private {path}"
+        );
+    }
+    ureq::delete(&lease_url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .send_json(lease_body)
+        .expect("private bearer releases public bridge lease");
+    assert!(matches!(
+        ureq::get(&format!("http://{endpoint}/openapi.json"))
+            .set("Authorization", &format!("Bearer {bridge_token}"))
+            .call(),
+        Err(ureq::Error::Status(401, _))
+    ));
 }
 
 #[test]

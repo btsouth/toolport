@@ -11717,6 +11717,36 @@ fn visible_root_list(
     visible_changed_list(router, allowed.as_ref(), kind)
 }
 
+const HTTP_SERVICE_LEASE_TTL: Duration = Duration::from_secs(120);
+
+struct HttpServiceLease {
+    token_sha256: String,
+    bind_host: String,
+    expires_at: Instant,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HttpServiceLeaseRequest {
+    token_sha256: String,
+    bind_host: String,
+}
+
+fn valid_http_service_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_http_service_bind_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 255
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".:-[]".contains(&byte))
+}
+
 struct HostState {
     registry: Arc<Mutex<Registry>>,
     /// Whether `registry` above is a faithful copy of what is on disk, i.e.
@@ -11810,12 +11840,45 @@ struct HostState {
     /// True once this process is serving as the host daemon (`--daemon`). Set
     /// before the first request, read by the daemon identity route.
     daemon_mode: AtomicBool,
+    /// The desktop's public bridge may use its existing bearer on this daemon
+    /// while it holds a short private lease. A bridge crash leaves no permanent
+    /// authorization behind.
+    http_service_lease: Mutex<Option<HttpServiceLease>>,
     /// Millis of the last request a listener accepted. The daemon's idle watchdog
     /// compares it against its grace period to decide the host is unused.
     last_activity_ms: AtomicU64,
 }
 
 impl HostState {
+    fn http_service_lease_active(&self) -> bool {
+        self.http_service_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|lease| Instant::now() < lease.expires_at)
+    }
+
+    fn http_service_token_active(&self, token: &str) -> bool {
+        let hash = registry::sha256_hex(token);
+        self.http_service_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|lease| {
+                Instant::now() < lease.expires_at
+                    && ct_eq(hash.as_bytes(), lease.token_sha256.as_bytes())
+            })
+    }
+
+    fn http_service_bind_host(&self) -> Option<String> {
+        self.http_service_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|lease| Instant::now() < lease.expires_at)
+            .map(|lease| lease.bind_host.clone())
+    }
+
     fn total_resource_subscriptions(&self) -> usize {
         let ordinary = self
             .resource_subs
@@ -16187,6 +16250,57 @@ fn handle_http_with_headers(
             HttpOut::json_err(405, "method not allowed on /host/topology")
         };
     }
+    if state.daemon_mode.load(Ordering::SeqCst)
+        && path == conduit_lib::daemon::HTTP_SERVICE_LEASE_PATH
+    {
+        if !headers.private_daemon_bearer {
+            return HttpOut::json_err(401, "unauthorized");
+        }
+        if !matches!(method, "POST" | "DELETE") {
+            return HttpOut::json_err(405, "method not allowed on /host/http-service-lease");
+        }
+        if body.len() > 256 {
+            return HttpOut::json_err(413, "service lease request is too large");
+        }
+        let Ok(request) = serde_json::from_str::<HttpServiceLeaseRequest>(body) else {
+            return HttpOut::json_err(400, "invalid service lease request");
+        };
+        if !valid_http_service_hash(&request.token_sha256)
+            || !valid_http_service_bind_host(&request.bind_host)
+        {
+            return HttpOut::json_err(400, "invalid HTTP service lease");
+        }
+        let mut lease = state
+            .http_service_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if method == "POST" {
+            *lease = Some(HttpServiceLease {
+                token_sha256: request.token_sha256,
+                bind_host: request.bind_host,
+                expires_at: Instant::now() + HTTP_SERVICE_LEASE_TTL,
+            });
+            return HttpOut::new(
+                200,
+                "application/json",
+                json!({ "leaseMs": HTTP_SERVICE_LEASE_TTL.as_millis() }).to_string(),
+            );
+        }
+        if lease.as_ref().is_some_and(|current| {
+            !ct_eq(
+                current.token_sha256.as_bytes(),
+                request.token_sha256.as_bytes(),
+            )
+        }) {
+            return HttpOut::json_err(409, "a different HTTP service holds the lease");
+        }
+        *lease = None;
+        return HttpOut::new(
+            200,
+            "application/json",
+            json!({ "released": true }).to_string(),
+        );
+    }
 
     // Streamable-HTTP MCP endpoint (same port as OpenAPI).
     if path == "/mcp" || path.starts_with("/mcp?") {
@@ -17057,6 +17171,9 @@ fn spawn_daemon_idle_watchdog(
         if inflight.load(Ordering::Relaxed) > 0 {
             continue;
         }
+        if host.http_service_lease_active() {
+            continue;
+        }
         if host.idle_for() < grace {
             continue;
         }
@@ -17064,7 +17181,7 @@ fn spawn_daemon_idle_watchdog(
         // window between the check and here.
         conduit_lib::daemon::clear_descriptor(&descriptor_path);
         std::thread::sleep(poll);
-        if inflight.load(Ordering::Relaxed) > 0 {
+        if inflight.load(Ordering::Relaxed) > 0 || host.http_service_lease_active() {
             // A client found us first. Advertise again and keep serving.
             let _ = conduit_lib::daemon::write_descriptor(&descriptor_path, &descriptor);
             continue;
@@ -17581,11 +17698,25 @@ fn handle_connection(
         .iter()
         .find(|h| h.field.equiv("Origin"))
         .map(|h| h.value.as_str().to_string());
+    let provided = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Authorization"))
+        .map(|h| h.value.as_str().to_string());
+    let provided_tok = provided.as_deref().and_then(parse_bearer);
+    let service_bearer = provided_tok.filter(|actual| {
+        state.daemon_mode.load(Ordering::SeqCst) && state.http_service_token_active(actual)
+    });
+    // A service lease changes the permitted origin only for its own bearer.
+    // Registered HTTP clients retain the daemon's ordinary Origin policy.
+    let service_bind_host = service_bearer.and_then(|_| state.http_service_bind_host());
     let forbidden = cross_origin_forbidden(
         &method,
         sec_fetch_site.as_deref(),
         origin_hdr.as_deref(),
-        &state.http_bind_host,
+        service_bind_host
+            .as_deref()
+            .unwrap_or(&state.http_bind_host),
         &state.http_allowed_origins,
     );
 
@@ -17595,12 +17726,6 @@ fn handle_connection(
     // HTTP client (its profile's servers), or open only when startup explicitly
     // accepted `--insecure-loopback`.
     // A bad/missing token is rejected before we read the body or route.
-    let provided = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Authorization"))
-        .map(|h| h.value.as_str().to_string());
-    let provided_tok = provided.as_deref().and_then(parse_bearer);
     let adapter_client_header = request.headers().iter().find(|h| {
         h.field
             .equiv(conduit_lib::stdio_adapter::ADAPTER_CLIENT_ID_HEADER)
@@ -17731,7 +17856,7 @@ fn handle_connection(
         } else {
             resolve_http_caller(
                 &reg,
-                token.as_deref(),
+                service_bearer.or(token.as_deref()),
                 provided_tok,
                 allow_insecure_open,
                 registry_loaded,
@@ -18374,6 +18499,7 @@ fn main() {
         resource_updated_sink,
         mcp_sessions: Arc::clone(&mcp_sessions),
         daemon_mode: AtomicBool::new(daemon_mode),
+        http_service_lease: Mutex::new(None),
         last_activity_ms: AtomicU64::new(0),
         rebuild_shrink_streaks: Mutex::new(HashMap::new()),
         quarantine_read_failed: AtomicBool::new(false),
@@ -24112,6 +24238,7 @@ mod tests {
             discovery: AtomicU8::new(0),
             mcp_sessions: mcp_sessions.unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new()))),
             daemon_mode: AtomicBool::new(false),
+            http_service_lease: Mutex::new(None),
             last_activity_ms: AtomicU64::new(0),
         }
     }
@@ -24155,6 +24282,7 @@ mod tests {
                 resource_updated_sink,
                 mcp_sessions: Arc::clone(&mcp_sessions),
                 daemon_mode: AtomicBool::new(false),
+                http_service_lease: Mutex::new(None),
                 last_activity_ms: AtomicU64::new(0),
                 rebuild_shrink_streaks: Mutex::new(HashMap::new()),
                 quarantine_read_failed: AtomicBool::new(false),
@@ -34622,6 +34750,23 @@ mod tests {
             "body={}",
             authenticated.body
         );
+    }
+
+    #[test]
+    fn expired_http_service_lease_stops_authorizing_its_bearer() {
+        let state = http_state(true);
+        let token = "expired-public-token";
+        *state
+            .http_service_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HttpServiceLease {
+            token_sha256: registry::sha256_hex(token),
+            bind_host: "127.0.0.1".to_string(),
+            expires_at: Instant::now() - Duration::from_secs(1),
+        });
+        assert!(!state.http_service_lease_active());
+        assert!(!state.http_service_token_active(token));
+        assert!(state.http_service_bind_host().is_none());
     }
 
     /// P1.3: the rebuild streak map and the quarantine read flag belong to the host.
