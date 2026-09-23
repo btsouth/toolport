@@ -280,12 +280,9 @@ fn gateway_log_tail(dir: &Path) -> String {
 
 /// The `file://` root URI form the gateway decodes back into a path.
 fn file_uri(path: &Path) -> String {
-    let text = path.display().to_string().replace('\\', "/");
-    if cfg!(windows) {
-        format!("file:///{text}")
-    } else {
-        format!("file://{text}")
-    }
+    url::Url::from_file_path(path)
+        .expect("absolute project root has a file URI")
+        .to_string()
 }
 
 impl AdapterClient {
@@ -1440,8 +1437,8 @@ fn matrix_routing_declared_root_selects_folder_profile() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (mut fixture, dir) = Fixture::new("folder-scope");
-    let cwd = std::fs::canonicalize(fixture.add("launch-cwd")).expect("adapter cwd");
-    let root = std::fs::canonicalize(fixture.add("mapped-project")).expect("project root");
+    let cwd = fixture.add("launch-cwd");
+    let root = fixture.add("mapped-project");
     let transcript_one = dir.join("one.jsonl");
     write_registry(
         &dir,
@@ -1462,6 +1459,9 @@ fn matrix_routing_declared_root_selects_folder_profile() {
         path: root.display().to_string(),
         profile: "scope-two".to_string(),
     });
+    let reported_root = conduit_lib::downstream::file_uri_to_path(&file_uri(&root))
+        .expect("declared root URI must decode on this platform");
+    assert_eq!(reg.profile_for_root(&reported_root), Some("scope-two".to_string()));
     registry::save_to(&path, &reg).expect("set folder profile");
 
     let mut client = spawn_adapter(
