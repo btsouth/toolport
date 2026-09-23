@@ -1,10 +1,11 @@
 # Design: One heavy gateway per host
 
-Status: Phases 0 through 3 and the P4.1 acceptance run were delivered in increments.
+Status: Phase 0, P1.2, Phases 2 and 3, and P4.1 through P4.3 were delivered in increments.
 Client-spawned stdio gateways now select the host daemon by default when their
-registry is authoritative. An explicit registry or launch `legacy` choice keeps
-the separate in-process topology available for rollback. P1.3 host-state ownership
-and P4.3 desktop Shared HTTP convergence remain separate work. See
+registry is authoritative. Desktop Shared HTTP uses a lightweight proxy and a
+private daemon service lease. An explicit registry or launch `legacy` choice keeps
+the separate in-process topology available for rollback. P1.3 host-state field
+moves remain structural cleanup. See
 [the plan](one-gateway-per-host-plan.md) for the slice-by-slice status.
 
 SBS-551 delivered this design plus a slice of Phase 1 (`ActiveRequestContext` and the
@@ -223,11 +224,10 @@ running as the same OS user.
 
 Do not combine daemon rollout with changing the public Shared HTTP contract.
 
-Initially, the internal daemon endpoint is private rendezvous infrastructure and the
-existing opt-in desktop HTTP bridge remains unchanged. After stdio sharing is stable, the
-desktop app can acquire a service lease and publish the configured port/token through the
-same host runtime. At that point `start_http_bridge_at` discovers/adopts the daemon and app
-exit releases its lease instead of killing the process.
+The internal daemon endpoint remains private rendezvous infrastructure. The
+desktop app now holds a service lease and publishes its configured port/token
+through a lightweight proxy into the same host runtime. `start_http_bridge_at`
+discovers the daemon, and app exit releases the lease instead of killing the host.
 
 This sequencing keeps fixed-port behavior, registered client tokens, LAN exposure options,
 and user expectations out of the first migration. It also avoids accidentally exposing the
