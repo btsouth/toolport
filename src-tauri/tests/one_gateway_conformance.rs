@@ -1408,7 +1408,9 @@ fn matrix_pooling_integrity_pins_are_independent_per_root() {
     assert_eq!(b.wait_for_tool("__pwd", Duration::from_secs(30)), tool);
     assert_eq!(transcript_initialize_count(&transcript), 2);
 
-    let scope = format!("root:{}", registry::sha256_hex(root_a.to_str().unwrap()));
+    let resolved_root = conduit_lib::downstream::file_uri_to_path(&file_uri(&root_a))
+        .expect("declared root URI decodes on this host");
+    let scope = format!("root:{}", registry::sha256_hex(&resolved_root));
     let quarantine = dir.join(format!(
         "quarantine-v2-{}.json",
         registry::profile_store_key(&scope)
