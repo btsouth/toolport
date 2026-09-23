@@ -10,7 +10,10 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+static NEXT_SCRATCH_DIR_ID: AtomicU64 = AtomicU64::new(0);
 
 struct ChildGuard(Child);
 
@@ -23,12 +26,13 @@ impl Drop for ChildGuard {
 
 fn scratch_dir() -> PathBuf {
     std::env::temp_dir().join(format!(
-        "toolport-daemon-idle-{}-{}",
+        "toolport-daemon-idle-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        NEXT_SCRATCH_DIR_ID.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
