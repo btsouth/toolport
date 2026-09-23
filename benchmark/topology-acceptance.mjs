@@ -271,7 +271,7 @@ async function runArm(topology) {
           });
           return { coldStartMs, catalogReadyMs, firstCallMs: now() - callStarted };
         } catch (error) {
-          throw new Error(error.message + "\n" + stderr());
+          throw new Error(error.message + "\n" + stderr(), { cause: error });
         }
       }),
     );
