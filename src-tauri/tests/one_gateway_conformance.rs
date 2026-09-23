@@ -118,6 +118,7 @@ struct AdapterClient {
     /// Whether `initialize` will declare the roots capability. Kept beside the
     /// reader thread that answers `roots/list`, so the two cannot disagree.
     declares_roots: bool,
+    roots: Arc<Mutex<Vec<PathBuf>>>,
     roots_queries: Arc<AtomicUsize>,
     declares_elicitation: bool,
     elicitation_queries: Arc<AtomicUsize>,
@@ -208,8 +209,9 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
         });
     }
 
-    let roots = options.roots.clone();
-    let declares_roots = !roots.is_empty();
+    let roots = Arc::new(Mutex::new(options.roots.clone()));
+    let roots_reader = Arc::clone(&roots);
+    let declares_roots = !options.roots.is_empty();
     let roots_queries = Arc::new(AtomicUsize::new(0));
     let roots_queries_reader = Arc::clone(&roots_queries);
     let elicitation_queries = Arc::new(AtomicUsize::new(0));
@@ -231,7 +233,9 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
                             "jsonrpc": "2.0",
                             "id": id,
                             "result": {
-                                "roots": roots
+                                "roots": roots_reader
+                                    .lock()
+                                    .unwrap()
                                     .iter()
                                     .map(|root| json!({
                                         "uri": file_uri(root),
@@ -280,6 +284,7 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
         pending_notifications: Mutex::new(VecDeque::new()),
         next_id: 0,
         declares_roots,
+        roots,
         roots_queries,
         declares_elicitation: options.elicitation,
         elicitation_queries,
@@ -312,6 +317,14 @@ fn file_uri(path: &Path) -> String {
 }
 
 impl AdapterClient {
+    fn set_roots(&mut self, roots: Vec<PathBuf>) {
+        *self.roots.lock().unwrap() = roots;
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/roots/list_changed"
+        }));
+    }
+
     fn send(&mut self, message: Value) {
         let mut guard = self.stdin.lock().unwrap();
         let stdin = guard.as_mut().expect("adapter stdin still open");
@@ -1868,6 +1881,183 @@ fn matrix_pooling_secret_generation_retires_the_old_root_launch() {
         client.call_tool(&pwd, json!({}))["isError"] != true,
         "replacement child must remain callable"
     );
+}
+
+#[test]
+fn matrix_pooling_rooted_subscription_survives_secret_generation_rollover() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("root-subscription-rollover");
+    let root = fixture.add("project");
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, Some("${ROOT}"))],
+        vec![],
+    );
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            roots: vec![root],
+            ..AdapterOptions::default()
+        },
+    );
+    client.initialize("matrix-root-subscription-rollover");
+    let pwd = client.wait_for_tool("__pwd", Duration::from_secs(30));
+    let grow = client.wait_for_tool("__grow", Duration::from_secs(30));
+    let subscribe = client.request("resources/subscribe", json!({ "uri": "mock://base" }));
+    assert_eq!(
+        subscribe["result"],
+        json!({}),
+        "subscribe failed: {subscribe}"
+    );
+    assert_eq!(
+        transcript_method_count(&transcript, "resources/subscribe"),
+        1
+    );
+
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).expect("load fixture registry");
+    reg.secrets_generation += 1;
+    registry::save_to(&path, &reg).expect("rotate secret generation");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while transcript_initialize_count(&transcript) < 2 {
+        client.call_tool(&pwd, json!({}));
+        assert!(
+            Instant::now() < deadline,
+            "replacement rooted child was not launched"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        transcript_method_count(&transcript, "resources/subscribe"),
+        2,
+        "the replacement child did not resume the subscription"
+    );
+    while client.lines.try_recv().is_ok() {}
+
+    client.next_id += 1;
+    let grow_id = client.next_id;
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": grow_id,
+        "method": "tools/call",
+        "params": { "name": grow, "arguments": {} }
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut got_reply = false;
+    let mut got_update = false;
+    while !got_reply || !got_update {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let line = client
+            .lines
+            .recv_timeout(remaining.max(Duration::from_millis(1)))
+            .expect("replacement child did not deliver its resource update");
+        let message: Value = serde_json::from_str(&line).expect("valid gateway frame");
+        if message["id"] == grow_id {
+            assert!(message.get("result").is_some(), "grow failed: {message}");
+            got_reply = true;
+        }
+        if message["method"] == "notifications/resources/updated" {
+            assert_eq!(message["params"]["uri"], "mock://base");
+            got_update = true;
+        }
+    }
+}
+
+#[test]
+fn matrix_pooling_live_root_change_drops_the_old_resource_subscription() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("root-subscription-change");
+    let root_a = std::fs::canonicalize(fixture.add("root-a")).expect("root A");
+    let root_b = std::fs::canonicalize(fixture.add("root-b")).expect("root B");
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, Some("${ROOT}"))],
+        vec![],
+    );
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            roots: vec![root_a.clone()],
+            ..AdapterOptions::default()
+        },
+    );
+    client.initialize("matrix-live-root-subscription");
+    let pwd = client.wait_for_tool("__pwd", Duration::from_secs(30));
+    let grow = client.wait_for_tool("__grow", Duration::from_secs(30));
+    let subscribe = client.request("resources/subscribe", json!({ "uri": "mock://base" }));
+    assert_eq!(
+        subscribe["result"],
+        json!({}),
+        "subscribe failed: {subscribe}"
+    );
+    let queries_before = client.roots_queries.load(Ordering::Relaxed);
+
+    client.set_roots(vec![root_b.clone()]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = client.call_tool(&pwd, json!({}));
+        let current = text_of(&reply);
+        if std::fs::canonicalize(&current).ok().as_ref() == Some(&root_b) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "root change never selected B: {reply}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(client.roots_queries.load(Ordering::Relaxed) > queries_before);
+    assert_eq!(transcript_initialize_count(&transcript), 2);
+    assert_eq!(
+        transcript_method_count(&transcript, "resources/subscribe"),
+        1,
+        "a subscription for root A must not silently move to root B"
+    );
+
+    let subscribe = client.request("resources/subscribe", json!({ "uri": "mock://base" }));
+    assert_eq!(
+        subscribe["result"],
+        json!({}),
+        "B subscribe failed: {subscribe}"
+    );
+    assert_eq!(
+        transcript_method_count(&transcript, "resources/subscribe"),
+        2
+    );
+    while client.lines.try_recv().is_ok() {}
+    client.next_id += 1;
+    let grow_id = client.next_id;
+    client.send(json!({
+        "jsonrpc": "2.0",
+        "id": grow_id,
+        "method": "tools/call",
+        "params": { "name": grow, "arguments": {} }
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut got_reply = false;
+    let mut got_update = false;
+    while !got_reply || !got_update {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let line = client
+            .lines
+            .recv_timeout(remaining.max(Duration::from_millis(1)))
+            .expect("new root did not deliver its resource update");
+        let message: Value = serde_json::from_str(&line).expect("valid gateway frame");
+        if message["id"] == grow_id {
+            assert!(message.get("result").is_some(), "grow failed: {message}");
+            got_reply = true;
+        }
+        if message["method"] == "notifications/resources/updated" {
+            assert_eq!(message["params"]["uri"], "mock://base");
+            got_update = true;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -914,6 +914,9 @@ impl ResourceSubscriptionTable {
         uri: &str,
         owner: &str,
     ) -> Result<BeginSubscribe, String> {
+        if let Some(gate) = self.opening.get(uri) {
+            return Ok(BeginSubscribe::Wait(Arc::clone(gate)));
+        }
         if self
             .by_session
             .get(session)
@@ -922,9 +925,6 @@ impl ResourceSubscriptionTable {
             return Ok(BeginSubscribe::AlreadyLocal);
         }
         self.check_limits(session)?;
-        if let Some(gate) = self.opening.get(uri) {
-            return Ok(BeginSubscribe::Wait(Arc::clone(gate)));
-        }
         if self.uri_owner.contains_key(uri) {
             // Downstream already open for other sessions.
             self.insert_local(session, uri, owner);
@@ -9077,6 +9077,15 @@ fn root_launch_keys(specs: &[ServerEntry], root: &str, secrets_generation: u64) 
         .collect()
 }
 
+fn root_subscription_key(server: &ServerEntry, root: &str) -> (String, String) {
+    let resolved_cwd = server
+        .cwd
+        .as_deref()
+        .and_then(|cwd| downstream::resolve_root_token(cwd, Some(root)))
+        .unwrap_or_else(|| root.to_string());
+    (server.id.clone(), resolved_cwd)
+}
+
 #[allow(clippy::too_many_arguments)] // SBS-871 adds the pre-rebuild quarantine set.
 fn build_router(
     reg: &Registry,
@@ -10190,6 +10199,26 @@ fn handle_resource_subscription(
             // clippy's deny-by-default never_loop was the one hard error blocking a
             // -D warnings gate in CI.
             let begin = {
+                let _capacity = state
+                    .resource_sub_capacity
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let already_local = subscriptions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .by_session
+                    .get(&session)
+                    .is_some_and(|uris| uris.contains(uri));
+                if !already_local && state.total_resource_subscriptions() >= MAX_RESOURCE_SUBS_TOTAL
+                {
+                    return Some(error(
+                        id,
+                        -32602,
+                        &format!(
+                            "Toolport: global subscription limit ({MAX_RESOURCE_SUBS_TOTAL}) reached"
+                        ),
+                    ));
+                }
                 let mut table = subscriptions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -10238,6 +10267,27 @@ fn handle_resource_subscription(
                 }
                 BeginSubscribe::Wait(gate) => match gate.wait(cancel) {
                     Ok(()) => {
+                        let _capacity = state
+                            .resource_sub_capacity
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let already_local = subscriptions
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .by_session
+                            .get(&session)
+                            .is_some_and(|uris| uris.contains(uri));
+                        if !already_local
+                            && state.total_resource_subscriptions() >= MAX_RESOURCE_SUBS_TOTAL
+                        {
+                            return Some(error(
+                                id,
+                                -32602,
+                                &format!(
+                                    "Toolport: global subscription limit ({MAX_RESOURCE_SUBS_TOTAL}) reached"
+                                ),
+                            ));
+                        }
                         let mut table = subscriptions
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -10383,15 +10433,24 @@ fn cleanup_resource_subs_for_session(state: &GatewayState, session: &str) {
 }
 
 fn cleanup_root_resource_subs_for_session(state: &GatewayState, session: &str) {
-    let launches: Vec<_> = state
-        .root_launch_pool
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .launches
-        .values()
-        .map(|launch| (launch.slot.clone(), Arc::clone(&launch.subscriptions)))
-        .collect();
-    for (slot, subscriptions) in launches {
+    let subscriptions: Vec<_> = {
+        let pool = state
+            .root_launch_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pool.subscriptions
+            .iter()
+            .map(|(key, table)| {
+                let slot = pool
+                    .launches
+                    .values()
+                    .find(|launch| launch.subscription_key == *key)
+                    .map(|launch| launch.slot.clone());
+                (slot, Arc::clone(table))
+            })
+            .collect()
+    };
+    for (slot, subscriptions) in subscriptions {
         let need_unsub = subscriptions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -10399,6 +10458,9 @@ fn cleanup_root_resource_subs_for_session(state: &GatewayState, session: &str) {
         if need_unsub.is_empty() {
             continue;
         }
+        let Some(slot) = slot else {
+            continue;
+        };
         let router = Router::new().with_shared_server_slot(&slot);
         for (uri, owner) in need_unsub {
             if let Err(error) = router.unsubscribe_resource_on_server(&owner, &uri) {
@@ -11527,6 +11589,9 @@ struct RootLaunchPool {
     specs: Vec<ServerEntry>,
     secrets_generation: u64,
     launches: BTreeMap<LaunchKey, RootLaunch>,
+    /// Subscription identity is stable across secret and command changes that
+    /// replace a child at the same rooted cwd.
+    subscriptions: BTreeMap<(String, String), Arc<Mutex<ResourceSubscriptionTable>>>,
     views: BTreeMap<Vec<LaunchKey>, Arc<Router>>,
     root_scopes: BTreeMap<Vec<LaunchKey>, String>,
     last_used: BTreeMap<Vec<LaunchKey>, Instant>,
@@ -11539,6 +11604,17 @@ const ROOT_VIEW_IDLE_GRACE: Duration = Duration::from_secs(60);
 struct RootLaunch {
     slot: SharedServerSlot,
     subscriptions: Arc<Mutex<ResourceSubscriptionTable>>,
+    subscription_key: (String, String),
+    active: Arc<AtomicBool>,
+}
+
+impl RootLaunchPool {
+    fn retire_launches(&mut self) -> BTreeMap<LaunchKey, RootLaunch> {
+        for launch in self.launches.values() {
+            launch.active.store(false, Ordering::SeqCst);
+        }
+        std::mem::take(&mut self.launches)
+    }
 }
 
 fn visible_root_list(
@@ -11619,6 +11695,9 @@ struct HostState {
     server_handler: ServerRequestHandler,
     /// Upstream resource subscriptions (session → URI) for SOU-394 fanout.
     resource_subs: Arc<Mutex<ResourceSubscriptionTable>>,
+    /// Serializes the process-wide subscription cap across the ordinary table
+    /// and every rooted child table.
+    resource_sub_capacity: Mutex<()>,
     /// The daemon's stdio face is inert, but the per-launch notification sinks
     /// use the same delivery path as ordinary downstreams.
     resource_stdio: Arc<SessionState>,
@@ -11669,6 +11748,29 @@ struct HostState {
 }
 
 impl HostState {
+    fn total_resource_subscriptions(&self) -> usize {
+        let ordinary = self
+            .resource_subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .total_count();
+        let pool = self
+            .root_launch_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ordinary
+            + pool
+                .subscriptions
+                .values()
+                .map(|table| {
+                    table
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .total_count()
+                })
+                .sum::<usize>()
+    }
+
     fn subscriptions_for_route(
         &self,
         router: &Router,
@@ -11852,7 +11954,7 @@ impl HostState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let retired_launches =
             if pool.specs != specs || pool.secrets_generation != reg.secrets_generation {
-                let retired = std::mem::take(&mut pool.launches);
+                let retired = pool.retire_launches();
                 pool.failed_until.clear();
                 pool.incomplete_until.clear();
                 pool.specs = specs;
@@ -11888,7 +11990,7 @@ impl HostState {
             .values()
             .cloned()
             .collect();
-        let mut active_views: BTreeSet<Vec<LaunchKey>> = sessions
+        let active: Vec<_> = sessions
             .iter()
             .filter(|session| !session.closed.load(Ordering::SeqCst) && !session.is_expired())
             .filter_map(|session| {
@@ -11902,8 +12004,19 @@ impl HostState {
                     .as_ref()
                     .map(|scope| scope.iter().cloned().collect());
                 let scoped = root_servers_in_scope(&specs, allowed.as_ref());
-                Some(root_launch_keys(&scoped, &root, reg.secrets_generation))
+                let launch_keys = root_launch_keys(&scoped, &root, reg.secrets_generation);
+                let subscription_keys = scoped
+                    .iter()
+                    .map(|server| root_subscription_key(server, &root))
+                    .collect::<Vec<_>>();
+                Some((launch_keys, subscription_keys))
             })
+            .collect();
+        let mut active_views: BTreeSet<Vec<LaunchKey>> =
+            active.iter().map(|(keys, _)| keys.clone()).collect();
+        let mut active_subscription_keys: BTreeSet<(String, String)> = active
+            .into_iter()
+            .flat_map(|(_, subscriptions)| subscriptions)
             .collect();
         let mut pool = self
             .root_launch_pool
@@ -11914,6 +12027,12 @@ impl HostState {
             .retain(|_, used| now.duration_since(*used) < ROOT_VIEW_IDLE_GRACE);
         active_views.extend(pool.last_used.keys().cloned());
         let active_keys: BTreeSet<LaunchKey> = active_views.iter().flatten().cloned().collect();
+        active_subscription_keys.extend(
+            pool.launches
+                .iter()
+                .filter(|(key, _)| active_keys.contains(*key))
+                .map(|(_, launch)| launch.subscription_key.clone()),
+        );
         let before = (pool.views.len(), pool.launches.len());
         let mut retired_views = Vec::new();
         let mut retained_views = BTreeMap::new();
@@ -11931,6 +12050,7 @@ impl HostState {
             if active_keys.contains(&key) {
                 retained_launches.insert(key, launch);
             } else {
+                launch.active.store(false, Ordering::SeqCst);
                 retired_launches.push(launch);
             }
         }
@@ -11940,6 +12060,16 @@ impl HostState {
             .retain(|keys, _| active_views.contains(keys));
         pool.root_scopes
             .retain(|keys, _| active_views.contains(keys));
+        let mut retired_subscriptions = Vec::new();
+        let mut retained_subscriptions = BTreeMap::new();
+        for (key, table) in std::mem::take(&mut pool.subscriptions) {
+            if active_subscription_keys.contains(&key) {
+                retained_subscriptions.insert(key, table);
+            } else {
+                retired_subscriptions.push(table);
+            }
+        }
+        pool.subscriptions = retained_subscriptions;
         if pool.views.is_empty() && pool.launches.is_empty() {
             pool.base = None;
         }
@@ -11947,6 +12077,7 @@ impl HostState {
         drop(pool);
         drop(retired_views);
         drop(retired_launches);
+        drop(retired_subscriptions);
         if changed {
             self.invalidate_tool_scope_views();
         }
@@ -12134,7 +12265,7 @@ impl HostState {
         let mut retired_launches = Vec::new();
         let mut retired_views = Vec::new();
         if pool.specs != all_specs || pool.secrets_generation != reg.secrets_generation {
-            retired_launches.extend(std::mem::take(&mut pool.launches).into_values());
+            retired_launches.extend(pool.retire_launches().into_values());
             retired_views.extend(std::mem::take(&mut pool.views).into_values());
             pool.failed_until.clear();
             pool.incomplete_until.clear();
@@ -12188,6 +12319,20 @@ impl HostState {
             })
             .map(|(server, key)| (server.clone(), key.clone()))
             .collect();
+        let missing: Vec<_> = missing
+            .into_iter()
+            .map(|(server, key)| {
+                let subscription_key = root_subscription_key(&server, root);
+                let subscriptions = Arc::clone(
+                    pool.subscriptions
+                        .entry(subscription_key.clone())
+                        .or_insert_with(|| {
+                            Arc::new(Mutex::new(ResourceSubscriptionTable::default()))
+                        }),
+                );
+                (server, key, subscription_key, subscriptions)
+            })
+            .collect();
         drop(pool);
         drop(retired_views);
         drop(retired_launches);
@@ -12195,25 +12340,40 @@ impl HostState {
         // Spawning and handshaking can block for the server's initialize timeout.
         // Keep every other root and adapter free to use the pool during that wait.
         let mut connected = Vec::new();
-        for (server, key) in missing {
+        for (server, key, subscription_key, subscriptions) in missing {
             let dirty = Arc::clone(&self.downstream_dirty);
             let handler = Arc::clone(&self.server_handler);
-            let subscriptions = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
-            let sink = Some(make_resource_updated_sink(
+            let active = Arc::new(AtomicBool::new(true));
+            let dispatch = make_resource_updated_sink(
                 Arc::clone(&self.resource_stdio),
                 Arc::clone(&self.mcp_sessions),
                 Arc::clone(&subscriptions),
-            ));
-            let Some(ds) = connect_one(&server, &dirty, handler, Some(root), sink.clone()) else {
+            );
+            let sink_active = Arc::clone(&active);
+            let sink: Option<ResourceUpdatedDispatch> = Some(Arc::new(move |producer, uri| {
+                if sink_active.load(Ordering::SeqCst) {
+                    dispatch(producer, uri);
+                }
+            }));
+            let Some(mut ds) = connect_one(&server, &dirty, handler, Some(root), sink.clone())
+            else {
+                active.store(false, Ordering::SeqCst);
                 connected.push((key, None));
                 continue;
             };
+            // A replacement child at the same rooted cwd inherits active
+            // subscribers before the route becomes visible to new requests.
+            resubscribe_server_resources(&mut ds, &server.id, &subscriptions);
             let spec = server.clone();
             let root = root.to_string();
             let subs = Arc::clone(&subscriptions);
             let handler = Arc::clone(&self.server_handler);
             let server_id = server.id.clone();
+            let reconnect_active = Arc::clone(&active);
             let reconnect: Reconnect = Box::new(move || {
+                if !reconnect_active.load(Ordering::SeqCst) {
+                    return None;
+                }
                 let mut ds = connect_one(
                     &spec,
                     &dirty,
@@ -12221,6 +12381,9 @@ impl HostState {
                     Some(&root),
                     sink.clone(),
                 )?;
+                if !reconnect_active.load(Ordering::SeqCst) {
+                    return None;
+                }
                 resubscribe_server_resources(&mut ds, &server_id, &subs);
                 Some(ds)
             });
@@ -12232,6 +12395,8 @@ impl HostState {
                 slot.map(|slot| RootLaunch {
                     slot,
                     subscriptions,
+                    subscription_key,
+                    active,
                 }),
             ));
         }
@@ -12248,6 +12413,11 @@ impl HostState {
                 .is_some_and(|current| Arc::ptr_eq(current, &base))
         {
             drop(pool);
+            for (_, launch) in &connected {
+                if let Some(launch) = launch {
+                    launch.active.store(false, Ordering::SeqCst);
+                }
+            }
             return base;
         }
         let mut inserted = false;
@@ -12255,6 +12425,7 @@ impl HostState {
         for (key, launch) in connected {
             if pool.launches.contains_key(&key) {
                 if let Some(launch) = launch {
+                    launch.active.store(false, Ordering::SeqCst);
                     discarded.push(launch);
                 }
                 continue;
@@ -17990,6 +18161,7 @@ fn main() {
         http_allowed_origins: configured_allowed_origins(),
         server_handler,
         resource_subs,
+        resource_sub_capacity: Mutex::new(()),
         resource_stdio,
         resource_updated_sink,
         mcp_sessions: Arc::clone(&mcp_sessions),
@@ -23672,6 +23844,7 @@ mod tests {
             http_allowed_origins: Vec::new(),
             server_handler,
             resource_subs: Arc::new(Mutex::new(ResourceSubscriptionTable::default())),
+            resource_sub_capacity: Mutex::new(()),
             resource_stdio: Arc::new(SessionState::new_http(None)),
             // Host state now, not a parameter: the watcher reads both off the host, so
             // these are the test's own handles when it supplies them and empty otherwise.
@@ -23720,6 +23893,7 @@ mod tests {
                 http_allowed_origins: Vec::new(),
                 server_handler,
                 resource_subs,
+                resource_sub_capacity: Mutex::new(()),
                 resource_stdio: Arc::clone(&stdio_upstream),
                 resource_updated_sink,
                 mcp_sessions: Arc::clone(&mcp_sessions),
@@ -27667,6 +27841,15 @@ mod tests {
             BeginSubscribe::Lead(g) => g,
             _ => panic!("expected Lead, got non-lead"),
         };
+        // A duplicate request from the same session must also wait for the
+        // actual downstream result instead of reporting a premature success.
+        match table
+            .begin_subscribe("s1", "file://x", "alpha")
+            .expect("same-session wait")
+        {
+            BeginSubscribe::Wait(g) => assert!(Arc::ptr_eq(&lead, &g)),
+            _ => panic!("expected Wait for the leader's own session"),
+        }
         // Concurrent second session must wait, not join as if already open.
         match table
             .begin_subscribe("s2", "file://x", "alpha")
@@ -27705,6 +27888,46 @@ mod tests {
             wait_gate.waiters.load(Ordering::Acquire),
             0,
             "a completed gate returns immediately without consuming a waiter slot"
+        );
+    }
+
+    #[test]
+    fn rooted_subscriptions_consume_the_process_wide_capacity() {
+        let state = http_state(false);
+        let table = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
+        {
+            let mut held = table.lock().unwrap();
+            for index in 0..MAX_RESOURCE_SUBS_TOTAL {
+                held.insert_local(&format!("root-session-{index}"), "fixture://held", "rooted");
+            }
+        }
+        state
+            .root_launch_pool
+            .lock()
+            .unwrap()
+            .subscriptions
+            .insert(("rooted".into(), "/project".into()), table);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "resources/subscribe",
+            "params": { "uri": "fixture://cached" }
+        });
+        let _session = McpSessionGuard::enter(Some("other-session".to_string()));
+        let reply = handle_resource_subscription(
+            &state,
+            &cache_router(),
+            &request,
+            None,
+            None,
+            "resources/subscribe",
+        )
+        .expect("an error response");
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("global subscription limit")),
+            "rooted subscriptions did not count toward the cap: {reply}"
         );
     }
 

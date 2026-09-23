@@ -566,10 +566,11 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
 - Concurrent clients with different identities, profiles, protocol eras, capabilities,
   roots, and overlapping request ids. Assertions must prove both sharing and isolation
   from the design's verification matrix.
-- Rehydrate rooted resource subscriptions when a registry or secret edit retires
-  their launch key, and exercise a live root change while subscribed. The P3.2
-  table separates equal URIs across live children; retirement continuity still
-  needs its own lifecycle case before the default flip.
+- Rooted resource subscriptions now survive a secret-generation rollover: the
+  replacement child re-subscribes before serving calls, and retired children stop
+  emitting updates to the old subscribers. A live root change drops the prior
+  root's subscription and requires a new subscription at the new root. The
+  process-wide subscription cap spans ordinary and rooted tables.
 
 ## Phase 4: dogfood, default, convergence
 
@@ -609,6 +610,8 @@ builds on a background thread, and a real client learns the finished catalog fro
 | A root session launches only servers allowed by its profile           | `matrix_pooling_rooted_servers_launch_only_for_authorized_profiles`                                                                                         | P3.2      | passing |
 | Approved rooted calls retain the caller's root and profile            | `matrix_pooling_approved_rooted_call_rebinds_to_its_root_view`                                                                                              | P3.2      | passing |
 | Equal resource URIs in different roots do not share subscriptions     | `matrix_pooling_equal_resource_uris_keep_rooted_subscriptions_separate`                                                                                     | P3.2      | passing |
+| Root subscriptions survive a secret-generation rollover               | `matrix_pooling_rooted_subscription_survives_secret_generation_rollover`                                                                                    | P3.3      | passing |
+| A live root change drops the old root's resource subscription         | `matrix_pooling_live_root_change_drops_the_old_resource_subscription`                                                                                       | P3.3      | passing |
 | A rooted server request returns only to its originating adapter       | `matrix_pooling_rooted_server_request_returns_to_the_originating_adapter`                                                                                   | P3.2/P3.3 | passing |
 | Profiles cannot list or call outside their scope                      | `matrix_routing_profiles_cannot_reach_servers_outside_their_scope`                                                                                          | P3.1      | passing |
 | Profiles with different tool scopes share one server safely           | `matrix_routing_profile_tool_scopes_are_independent_on_one_shared_server`                                                                                   | P3.1      | passing |
