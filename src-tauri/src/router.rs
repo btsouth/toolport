@@ -13,6 +13,7 @@
 //! map so `tools/call` still forwards the server's real, hyphenated tool name.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -508,6 +509,7 @@ impl ToolPolicy {
 struct ServerSlot {
     id: String,
     inner: Mutex<DownstreamServer>,
+    tool_revision: AtomicU64,
     /// Fast-fail state for a server that keeps failing (dead/hung), so we don't pay
     /// its full read timeout on every call once it's clearly down.
     breaker: Mutex<Breaker>,
@@ -636,6 +638,7 @@ struct RestoredTool {
     exposed: String,
     server: String,
     original: String,
+    source_revision: u64,
 }
 
 impl Router {
@@ -868,6 +871,7 @@ impl Router {
         self.servers.push(Arc::new(ServerSlot {
             id: id.clone(),
             inner: Mutex::new(server),
+            tool_revision: AtomicU64::new(0),
             breaker: Mutex::new(Breaker::default()),
             reconnect,
         }));
@@ -889,6 +893,7 @@ impl Router {
             view.servers[index] = Arc::new(ServerSlot {
                 id: server.id.clone(),
                 inner: Mutex::new(server),
+                tool_revision: AtomicU64::new(0),
                 breaker: Mutex::new(Breaker::default()),
                 reconnect,
             });
@@ -909,6 +914,13 @@ impl Router {
     pub fn server_slot(&self, server_id: &str) -> Option<SharedServerSlot> {
         let index = *self.by_id.get(server_id)?;
         Some(SharedServerSlot(Arc::clone(self.servers.get(index)?)))
+    }
+
+    fn tool_revision(&self, server_id: &str) -> Option<u64> {
+        self.by_id
+            .get(server_id)
+            .and_then(|index| self.servers.get(*index))
+            .map(|slot| slot.tool_revision.load(Ordering::Acquire))
     }
 
     pub fn with_shared_server_slot(&self, slot: &SharedServerSlot) -> Self {
@@ -1149,20 +1161,28 @@ impl Router {
     pub fn refresh_tools(&mut self) {
         // `&mut self` is exclusive, so locking each slot here can't contend.
         for slot in &self.servers {
-            slot.inner
+            if slot
+                .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .refresh_tools();
+                .refresh_tools()
+            {
+                slot.tool_revision.fetch_add(1, Ordering::AcqRel);
+            }
         }
         self.rebuild_aggregation();
     }
 
     pub fn refresh_stale_tools(&mut self) {
         for slot in &self.servers {
-            slot.inner
+            if slot
+                .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .refresh_tools_if_stale();
+                .refresh_tools_if_stale()
+            {
+                slot.tool_revision.fetch_add(1, Ordering::AcqRel);
+            }
         }
         self.rebuild_aggregation();
     }
@@ -1319,6 +1339,7 @@ impl Router {
                     exposed: exposed.to_string(),
                     server: server_id.to_string(),
                     original: original.to_string(),
+                    source_revision: self.tool_revision(server_id).unwrap_or(0),
                 });
             }
         }
@@ -1365,6 +1386,7 @@ impl Router {
                         exposed: exposed.to_string(),
                         server: server_id.to_string(),
                         original: original.to_string(),
+                        source_revision: self.tool_revision(server_id).unwrap_or(0),
                     });
                 }
             }
@@ -1404,8 +1426,15 @@ impl Router {
     }
 
     fn rebuild_preserving_restored(&mut self) {
-        let restored = self.restored_candidates.clone();
-        self.rebuild_aggregation();
+        let restored: Vec<_> = self
+            .restored_candidates
+            .iter()
+            .filter(|candidate| {
+                self.tool_revision(&candidate.server) == Some(candidate.source_revision)
+            })
+            .cloned()
+            .collect();
+        self.rebuild_aggregation_with_reserved(&restored);
         self.restored_candidates = restored;
         self.apply_restored_candidates();
     }
@@ -1415,10 +1444,34 @@ impl Router {
     /// exposed names and their `_2` collision suffixes stay stable. The server
     /// set itself is unchanged, so `servers` and `by_id` are kept.
     fn rebuild_aggregation(&mut self) {
+        self.rebuild_aggregation_with_reserved(&[]);
+    }
+
+    fn rebuild_aggregation_with_reserved(&mut self, restored: &[RestoredTool]) {
         self.restored_candidates.clear();
         self.tools.clear();
         self.routes.clear();
         self.seen.clear();
+        // A restored route keeps its exposed name until a fresh tool catalog
+        // confirms its removal. Reserve that name before indexing new slots,
+        // otherwise a later colliding tool can silently inherit the old route.
+        for candidate in restored {
+            let still_advertised = self
+                .by_id
+                .get(&candidate.server)
+                .and_then(|index| self.servers.get(*index))
+                .is_some_and(|slot| {
+                    slot.inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .tools
+                        .iter()
+                        .any(|tool| tool["name"] == candidate.original)
+                });
+            if !still_advertised {
+                self.seen.insert(candidate.exposed.clone());
+            }
+        }
         self.blocked.clear();
         self.resources.clear();
         self.resource_routes.clear();
@@ -1599,6 +1652,7 @@ impl Router {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *server = fresh; // swap the live child/connection for the fresh one
+            slot.tool_revision.fetch_add(1, Ordering::AcqRel);
             f(&mut server)
         };
         let mut breaker = slot
@@ -2764,6 +2818,7 @@ mod tests {
             inner: Mutex::new(
                 DownstreamServer::connect("s".into(), Box::new(DeadOnCallTransport)).unwrap(),
             ),
+            tool_revision: AtomicU64::new(0),
             breaker: Mutex::new(Breaker::default()),
             reconnect,
         })
@@ -3464,6 +3519,32 @@ mod tests {
         quarantined.requarantine(BTreeSet::from(["atlassian__t39".to_string()]));
         assert!(quarantined.route_of("atlassian__t39").is_none());
         assert!(quarantined.is_blocked("atlassian__t39"));
+    }
+
+    #[test]
+    fn guarded_route_keeps_its_name_when_a_new_server_collides() {
+        let previous = router_with_catalogs(&[("a-b", 40)]);
+        let mut guarded = router_with_catalogs(&[("a-b", 3)]);
+        guarded.adopt_restored_routes(&previous, &previous.aggregated_tools());
+        let new_server = router_with_catalogs(&[("a_b", 40)]);
+        let slot = new_server.server_slot("a_b").unwrap();
+        let combined = guarded.with_shared_server_slot(&slot);
+        assert_eq!(combined.route_of("a_b__t39"), Some(("a-b", "t39")));
+        assert_eq!(combined.route_of("a_b__t39_2"), Some(("a_b", "t39")));
+    }
+
+    #[test]
+    fn confirmed_tool_refresh_expires_only_its_own_guarded_routes() {
+        let previous = router_with_catalogs(&[("a", 40), ("b", 40)]);
+        let mut guarded = router_with_catalogs(&[("a", 3), ("b", 3)]);
+        guarded.adopt_restored_routes(&previous, &previous.aggregated_tools());
+        assert!(guarded.reindexed().route_of("a__t39").is_some());
+
+        let slot = guarded.server_slot("a").unwrap();
+        slot.0.tool_revision.fetch_add(1, Ordering::AcqRel);
+        let refreshed = guarded.reindexed();
+        assert!(refreshed.route_of("a__t39").is_none());
+        assert_eq!(refreshed.route_of("b__t39"), Some(("b", "t39")));
     }
 
     #[test]

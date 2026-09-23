@@ -476,7 +476,7 @@ fn apply_catalog_refresh(
     new_hint: CacheHint,
     server_id: &str,
     kind: &str,
-) {
+) -> bool {
     if is_implausible_shrink(previous.len(), new_items.len()) {
         *shrink_streak = shrink_streak.saturating_add(1);
         let (before, after) = (previous.len(), new_items.len());
@@ -487,7 +487,7 @@ fn apply_catalog_refresh(
             );
             eprintln!("{msg}");
             crate::gatewaylog::append(&msg);
-            return;
+            return false;
         }
         let msg = format!(
             "toolport: accepting {kind} catalog collapse {before} -> {after} for server '{server_id}' after {EMPTY_CATALOG_CONFIRMATIONS} consecutive confirmations"
@@ -497,11 +497,12 @@ fn apply_catalog_refresh(
         *shrink_streak = 0;
         *cache_hint = new_hint;
         *previous = new_items;
-        return;
+        return true;
     }
     *shrink_streak = 0;
     *cache_hint = new_hint;
     *previous = new_items;
+    true
 }
 
 /// Error codes the 2026-07-28 allocation policy reserves for the specification
@@ -5953,20 +5954,22 @@ impl DownstreamServer {
     /// Re-fetch the server's tool list on the existing connection, after it
     /// announced a `tools/list_changed`. Bounds the wait like the handshake so a
     /// hung server can't stall the refresh; on error the previous list is kept.
-    pub fn refresh_tools(&mut self) {
-        self.refresh_tools_inner();
+    pub fn refresh_tools(&mut self) -> bool {
+        self.refresh_tools_inner()
     }
 
     /// Refresh a positive-TTL catalog only once its downstream freshness window
     /// expires. Notifications keep calling `refresh_tools` and therefore bypass
     /// this check: they invalidate a still-fresh result immediately.
-    pub fn refresh_tools_if_stale(&mut self) {
+    pub fn refresh_tools_if_stale(&mut self) -> bool {
         if self.tool_cache_hint.needs_refresh() {
-            self.refresh_tools_inner();
+            self.refresh_tools_inner()
+        } else {
+            false
         }
     }
 
-    fn refresh_tools_inner(&mut self) {
+    fn refresh_tools_inner(&mut self) -> bool {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         let modern_version = match &self.era {
             Era::Modern { version } => Some(version.clone()),
@@ -5985,7 +5988,7 @@ impl DownstreamServer {
             self.transport
                 .set_protocol_meta(Some(protocol_meta_for(version)));
         }
-        match listed {
+        let refreshed = match listed {
             Ok(listed) if listed.warning.is_none() => {
                 let new_tools = if self.modern_http {
                     filter_modern_http_tools(&self.id, listed.items)
@@ -6000,7 +6003,7 @@ impl DownstreamServer {
                     listed.cache_hint,
                     &self.id,
                     "tool",
-                );
+                )
             }
             Ok(listed) => {
                 self.tool_cache_hint.mark_stale_and_defer();
@@ -6012,6 +6015,7 @@ impl DownstreamServer {
                 );
                 eprintln!("{msg}");
                 crate::gatewaylog::append(&msg);
+                false
             }
             Err(error) => {
                 self.tool_cache_hint.mark_stale_and_defer();
@@ -6019,9 +6023,11 @@ impl DownstreamServer {
                     "toolport: keeping server '{}' previous tool catalog after refresh failed: {error}",
                     self.id
                 );
+                false
             }
-        }
+        };
         self.transport.set_read_timeout(self.call_timeout);
+        refreshed
     }
 
     /// Re-fetch the resource list on the existing connection after the server

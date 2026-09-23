@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use conduit_lib::approval::{self, BrokerChallenge, BrokerProof, EndpointDescriptor};
 use conduit_lib::daemon::descriptor_path;
 use conduit_lib::registry::{self, EnvVar, FolderProfile, Profile, Registry, ServerEntry};
@@ -1311,6 +1312,127 @@ fn matrix_pooling_root_sharding_two_roots_two_children() {
 }
 
 #[test]
+fn matrix_pooling_sessionless_modern_requests_keep_a_warm_root_launch() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("sessionless-root-lease");
+    let root = std::fs::canonicalize(fixture.add("project")).unwrap();
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("rooted", &transcript, Some("${ROOT}"))],
+        vec![],
+    );
+    let mut bootstrap = spawn_adapter(&dir, &AdapterOptions::default());
+    bootstrap.initialize("matrix-sessionless-bootstrap");
+    let descriptor = wait_for_descriptor(&dir, Duration::from_secs(10));
+    let endpoint = descriptor["endpoint"].as_str().unwrap();
+    let token = descriptor["token"].as_str().unwrap();
+    let encoded_root =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(root.to_str().unwrap().as_bytes());
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+        "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}
+    });
+    let request = || {
+        let response = ureq::post(&format!("http://{endpoint}/mcp"))
+            .set("Authorization", &format!("Bearer {token}"))
+            .set(
+                conduit_lib::stdio_adapter::ADAPTER_CLIENT_ID_HEADER,
+                "sessionless-root",
+            )
+            .set(
+                conduit_lib::stdio_adapter::ADAPTER_CWD_HEADER,
+                &encoded_root,
+            )
+            .set("MCP-Protocol-Version", "2026-07-28")
+            .set("Mcp-Method", "tools/list")
+            .set("Accept", "application/json")
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string())
+            .expect("modern rooted tools/list");
+        let value: Value = serde_json::from_reader(response.into_reader()).unwrap();
+        assert!(
+            value["result"]["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "rooted__pwd")),
+            "sessionless root must expose the rooted child: {value}"
+        );
+    };
+    request();
+    let launches = transcript_initialize_count(&transcript);
+    std::thread::sleep(Duration::from_millis(2200));
+    request();
+    assert_eq!(transcript_initialize_count(&transcript), launches);
+}
+
+#[test]
+fn matrix_pooling_integrity_pins_are_independent_per_root() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("root-integrity-scope");
+    let root_a = std::fs::canonicalize(fixture.add("root-a")).unwrap();
+    let root_b = std::fs::canonicalize(fixture.add("root-b")).unwrap();
+    std::fs::write(root_a.join("toolport-mock-schema.txt"), "project-a").unwrap();
+    std::fs::write(root_b.join("toolport-mock-schema.txt"), "project-b").unwrap();
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("rooted", &transcript, Some("${ROOT}"))],
+        vec![],
+    );
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).unwrap();
+    reg.integrity_check = true;
+    reg.quarantine_on_drift = true;
+    registry::save_to(&path, &reg).unwrap();
+    let mut a = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            roots: vec![root_a.clone()],
+            ..AdapterOptions::default()
+        },
+    );
+    let mut b = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            roots: vec![root_b.clone()],
+            ..AdapterOptions::default()
+        },
+    );
+    a.initialize("matrix-root-integrity-a");
+    b.initialize("matrix-root-integrity-b");
+    let tool = a.wait_for_tool("__pwd", Duration::from_secs(30));
+    assert_eq!(b.wait_for_tool("__pwd", Duration::from_secs(30)), tool);
+    assert_eq!(transcript_initialize_count(&transcript), 2);
+
+    let scope = format!("root:{}", registry::sha256_hex(root_a.to_str().unwrap()));
+    let quarantine = dir.join(format!(
+        "quarantine-v2-{}.json",
+        registry::profile_store_key(&scope)
+    ));
+    std::fs::write(
+        quarantine,
+        json!({(tool.clone()): {"change": "changed"}}).to_string(),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while a.tool_names().contains(&tool) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !a.tool_names().contains(&tool),
+        "root A quarantine was ignored"
+    );
+    assert!(
+        b.tool_names().contains(&tool),
+        "root A quarantine leaked to B"
+    );
+}
+
+#[test]
 fn matrix_pooling_quarantine_reaches_every_cached_root_view() {
     let _guard = CASE_LOCK
         .lock()
@@ -1443,6 +1565,7 @@ fn matrix_pooling_rooted_catalog_change_reaches_only_its_root() {
     b.wait_for_tool("__grow", Duration::from_secs(30));
     for client in [&a, &b] {
         while client.lines.try_recv().is_ok() {}
+        client.pending_notifications.lock().unwrap().clear();
     }
 
     a.call_tool(&grow, json!({}));
@@ -1460,10 +1583,9 @@ fn matrix_pooling_rooted_catalog_change_reaches_only_its_root() {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let Ok(line) = b.lines.recv_timeout(remaining) else {
+        let Some(message) = b.observed_message(remaining) else {
             break;
         };
-        let message: Value = serde_json::from_str(&line).expect("valid notification");
         assert_ne!(
             message["method"], "notifications/tools/list_changed",
             "root B received root A's tool catalog change"
@@ -2150,7 +2272,11 @@ fn matrix_pooling_approved_rooted_call_rebinds_to_its_root_view() {
     let transcript = dir.join("rooted.jsonl");
     let mut server = mock_server_entry("rooted", &transcript, Some("${ROOT}"));
     server.source = Some("shared".to_string());
-    write_registry(&dir, vec![server], vec![profile("rooted-only", &["rooted"])]);
+    write_registry(
+        &dir,
+        vec![server],
+        vec![profile("rooted-only", &["rooted"])],
+    );
     let registry_path = dir.join("registry.json");
     let mut reg = registry::load_from(&registry_path).expect("load registry");
     reg.set_human_approval(true);
@@ -2276,6 +2402,7 @@ fn matrix_routing_tool_change_notifies_only_profiles_that_can_see_it() {
             .observed_message(Duration::from_millis(500))
             .is_some()
         {}
+        client.pending_notifications.lock().unwrap().clear();
     }
 
     grow.call_tool(&grow_tool, json!({}));
@@ -2442,6 +2569,7 @@ fn matrix_routing_server_change_notifies_only_authorized_sessions() {
             .observed_message(Duration::from_millis(500))
             .is_some()
         {}
+        client.pending_notifications.lock().unwrap().clear();
     }
 
     // A and B share the same downstream server. Its catalog change belongs to

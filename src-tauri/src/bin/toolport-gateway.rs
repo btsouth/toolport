@@ -11528,9 +11528,13 @@ struct RootLaunchPool {
     secrets_generation: u64,
     launches: BTreeMap<LaunchKey, RootLaunch>,
     views: BTreeMap<Vec<LaunchKey>, Arc<Router>>,
+    root_scopes: BTreeMap<Vec<LaunchKey>, String>,
+    last_used: BTreeMap<Vec<LaunchKey>, Instant>,
     failed_until: BTreeMap<LaunchKey, Instant>,
     incomplete_until: BTreeMap<Vec<LaunchKey>, Instant>,
 }
+
+const ROOT_VIEW_IDLE_GRACE: Duration = Duration::from_secs(60);
 
 struct RootLaunch {
     slot: SharedServerSlot,
@@ -11708,7 +11712,7 @@ impl HostState {
             .values()
             .cloned()
             .collect();
-        let (launches, old_views) = {
+        let (launches, old_views, root_scopes) = {
             let pool = self
                 .root_launch_pool
                 .lock()
@@ -11722,6 +11726,7 @@ impl HostState {
                     .map(|launch| launch.slot.clone())
                     .collect::<Vec<_>>(),
                 pool.views.clone(),
+                pool.root_scopes.clone(),
             )
         };
         let mut before = Vec::new();
@@ -11765,12 +11770,13 @@ impl HostState {
         }
         let updated: BTreeMap<Vec<LaunchKey>, Arc<Router>> = old_views
             .iter()
-            .map(|(keys, view)| {
+            .filter_map(|(keys, view)| {
+                let scope = root_scopes.get(keys)?;
                 let mut refreshed = view.reindexed();
                 if changed & downstream::change::TOOLS != 0 {
-                    self.check_rooted_integrity(&mut refreshed);
+                    self.check_rooted_integrity(&mut refreshed, scope, keys);
                 }
-                (keys.clone(), Arc::new(refreshed))
+                Some((keys.clone(), Arc::new(refreshed)))
             })
             .collect();
         let committed: BTreeMap<_, _> = {
@@ -11857,6 +11863,8 @@ impl HostState {
             };
         pool.base = None;
         let retired_views = std::mem::take(&mut pool.views);
+        pool.root_scopes.clear();
+        pool.last_used.clear();
         pool.incomplete_until.clear();
         drop(pool);
         drop(retired_views);
@@ -11880,7 +11888,7 @@ impl HostState {
             .values()
             .cloned()
             .collect();
-        let active_views: BTreeSet<Vec<LaunchKey>> = sessions
+        let mut active_views: BTreeSet<Vec<LaunchKey>> = sessions
             .iter()
             .filter(|session| !session.closed.load(Ordering::SeqCst) && !session.is_expired())
             .filter_map(|session| {
@@ -11897,11 +11905,15 @@ impl HostState {
                 Some(root_launch_keys(&scoped, &root, reg.secrets_generation))
             })
             .collect();
-        let active_keys: BTreeSet<LaunchKey> = active_views.iter().flatten().cloned().collect();
         let mut pool = self
             .root_launch_pool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        pool.last_used
+            .retain(|_, used| now.duration_since(*used) < ROOT_VIEW_IDLE_GRACE);
+        active_views.extend(pool.last_used.keys().cloned());
+        let active_keys: BTreeSet<LaunchKey> = active_views.iter().flatten().cloned().collect();
         let before = (pool.views.len(), pool.launches.len());
         let mut retired_views = Vec::new();
         let mut retained_views = BTreeMap::new();
@@ -11925,6 +11937,8 @@ impl HostState {
         pool.launches = retained_launches;
         pool.failed_until.retain(|key, _| active_keys.contains(key));
         pool.incomplete_until
+            .retain(|keys, _| active_views.contains(keys));
+        pool.root_scopes
             .retain(|keys, _| active_views.contains(keys));
         if pool.views.is_empty() && pool.launches.is_empty() {
             pool.base = None;
@@ -12009,9 +12023,29 @@ impl HostState {
         }
     }
 
-    fn check_rooted_integrity(&self, view: &mut Router) {
-        let tools = view.aggregated_tools();
-        let pending = match maybe_check_integrity(&self.registry, &tools, None) {
+    fn rooted_quarantine(&self, scope: &str) -> Option<BTreeSet<String>> {
+        let mut global = effective_quarantine(&self.registry, None, &self.quarantine_read_failed)?;
+        global.extend(effective_quarantine(
+            &self.registry,
+            Some(scope),
+            &self.quarantine_read_failed,
+        )?);
+        Some(global)
+    }
+
+    fn check_rooted_integrity(&self, view: &mut Router, scope: &str, keys: &[LaunchKey]) {
+        let rooted_ids: HashSet<&str> = keys.iter().map(|key| key.server.as_str()).collect();
+        let tools: Vec<Value> = view
+            .aggregated_tools()
+            .into_iter()
+            .filter(|tool| {
+                tool["name"]
+                    .as_str()
+                    .and_then(|name| view.route_of(name))
+                    .is_some_and(|(server, _)| rooted_ids.contains(server))
+            })
+            .collect();
+        let pending = match maybe_check_integrity(&self.registry, &tools, Some(scope)) {
             Ok(pending) => pending.unwrap_or_default(),
             Err((error, _)) => {
                 glog(&format!(
@@ -12021,7 +12055,7 @@ impl HostState {
                 return;
             }
         };
-        match effective_quarantine(&self.registry, None, &self.quarantine_read_failed) {
+        match self.rooted_quarantine(scope) {
             Some(mut quarantined) => {
                 quarantined.extend(pending);
                 view.requarantine_from_store(quarantined);
@@ -12031,7 +12065,14 @@ impl HostState {
     }
 
     fn reconcile_rooted_view(&self, keys: &[LaunchKey], cached: Arc<Router>) -> Arc<Router> {
-        let wanted = effective_quarantine(&self.registry, None, &self.quarantine_read_failed);
+        let scope = {
+            let pool = self
+                .root_launch_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pool.root_scopes.get(keys).cloned()
+        };
+        let wanted = scope.and_then(|scope| self.rooted_quarantine(&scope));
         if wanted
             .as_ref()
             .is_some_and(|set| set == cached.quarantined() && !cached.catalog_fail_closed())
@@ -12097,6 +12138,8 @@ impl HostState {
             retired_views.extend(std::mem::take(&mut pool.views).into_values());
             pool.failed_until.clear();
             pool.incomplete_until.clear();
+            pool.root_scopes.clear();
+            pool.last_used.clear();
             pool.specs = all_specs;
             pool.secrets_generation = reg.secrets_generation;
         }
@@ -12108,6 +12151,13 @@ impl HostState {
             pool.base = Some(Arc::clone(&base));
             retired_views.extend(std::mem::take(&mut pool.views).into_values());
             pool.incomplete_until.clear();
+            pool.root_scopes.clear();
+            pool.last_used.clear();
+        }
+        pool.root_scopes
+            .insert(keys.clone(), format!("root:{}", registry::sha256_hex(root)));
+        if active_mcp_session().is_none() {
+            pool.last_used.insert(keys.clone(), Instant::now());
         }
         if pool
             .incomplete_until
@@ -12239,7 +12289,11 @@ impl HostState {
         for slot in slots.iter().flatten() {
             view = view.with_shared_server_slot(slot);
         }
-        self.check_rooted_integrity(&mut view);
+        self.check_rooted_integrity(
+            &mut view,
+            &format!("root:{}", registry::sha256_hex(root)),
+            &keys,
+        );
         let view = Arc::new(view);
         let mut pool = self
             .root_launch_pool

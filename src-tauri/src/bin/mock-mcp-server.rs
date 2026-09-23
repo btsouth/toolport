@@ -206,6 +206,14 @@ fn tool_list(cfg: &Config, grown: bool) -> Value {
         json!({ "name": "legacy_elicitation", "description": "Issue a legacy server-to-client elicitation request.",
                 "inputSchema": { "type": "object", "properties": {} } }),
     ];
+    // A fixture marker lets rooted launches advertise different schemas for
+    // the same tool name, as real project-scoped servers can.
+    if let Ok(marker) = std::fs::read_to_string("toolport-mock-schema.txt") {
+        if let Some(pwd) = tools.iter_mut().find(|tool| tool["name"] == "pwd") {
+            pwd["inputSchema"]["properties"]["project"] =
+                json!({ "type": "string", "const": marker.trim() });
+        }
+    }
     if grown {
         tools.push(json!({ "name": "greet", "description": "Greet someone by name.",
                 "inputSchema": { "type": "object", "properties": { "name": { "type": "string" } } } }));
