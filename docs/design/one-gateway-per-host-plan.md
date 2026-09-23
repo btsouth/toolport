@@ -584,6 +584,31 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
   The daemon's bearer-gated `GET /host/topology` reports its live session count,
   ordinary downstream slots, and rooted launches for that run. It is absent
   from the public HTTP bridge and does not expose launch parameters or secrets.
+  `npm run build:gateway && node benchmark/topology-acceptance.mjs 3` compares
+  the legacy and opt-in roles with three real gateway processes and an isolated
+  mock downstream. `node benchmark/topology-acceptance.mjs 3 --registry
+~/.config/Toolport/registry.json` copies a configured registry into an isolated
+  data directory, forces full discovery, and compares the same three MCP client
+  identities against the configured servers. It writes process counts, private
+  memory, and startup and first-call latency to `.verify/`. The configured-server
+  run uses an MCP harness; its first call is `toolport_status`, not a provider call.
+
+  On 2026-09-23, a Linux debug build with three sessions and the configured six
+  enabled servers (four stdio, two HTTP) measured 18 gateway-tree processes,
+  12 direct stdio children, and 1,446.1 MiB private memory in legacy mode. The
+  daemon arm measured 9 processes, 4 direct stdio children, and 621.1 MiB private
+  memory after a five-second settling period. The daemon reported three sessions
+  and six ordinary launch slots. MCP initialize took 6-45 ms in legacy mode and
+  26-65 ms through the daemon; catalog readiness took 2.7-3.5 seconds in both
+  arms. The first `toolport_status` call took 2-7 ms in legacy mode and 3-27 ms
+  through the daemon. These are local measurements, not provider-call latency.
+
+  An isolated smoke used two Grok Build 1.0.41 MCP doctor processes and one
+  Claude Code 2.1.280 MCP health check at the same time. Both Grok checks passed
+  command discovery, startup, handshake, and tool admission; Claude connected.
+  The private probe reached three concurrent daemon sessions. The smoke used
+  lazy discovery and did not send a model prompt or provider tool call.
+
 - P4.2 default flip only after parity suites pass on Windows, macOS, and Linux, keeping a
   documented legacy kill switch for at least one release.
 - P4.3 desktop Shared HTTP adopts a daemon service lease; app exit releases the lease
