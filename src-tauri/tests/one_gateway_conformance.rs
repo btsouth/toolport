@@ -1248,11 +1248,11 @@ fn matrix_pooling_sessions_share_one_downstream_child() {
 }
 
 #[test]
-fn matrix_rollout_registry_opt_in_selects_the_shared_daemon() {
+fn matrix_rollout_default_selects_the_shared_daemon() {
     let _guard = CASE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (_fixture, dir) = Fixture::new("rollout-opt-in");
+    let (_fixture, dir) = Fixture::new("rollout-default");
     let transcript = dir.join("downstream.jsonl");
     write_registry(
         &dir,
@@ -1261,14 +1261,15 @@ fn matrix_rollout_registry_opt_in_selects_the_shared_daemon() {
     );
     let path = dir.join("registry.json");
     let mut reg = registry::load_from(&path).expect("load registry");
-    reg.gateway_topology = Some(registry::GatewayTopology::Daemon);
+    assert!(reg.gateway_topology.is_none(), "default must be absent on disk");
+    assert_eq!(reg.gateway_topology_effective(), registry::GatewayTopology::Daemon);
     reg.http_clients.push(registry::HttpClient {
         id: "probe-client".into(),
         label: "Probe client".into(),
         token_sha256: registry::sha256_hex("registered-probe-token"),
         profile: String::new(),
     });
-    registry::save_to(&path, &reg).expect("opt in to daemon topology");
+    registry::save_to(&path, &reg).expect("register probe client");
 
     let options = AdapterOptions {
         default_role: true,
@@ -1276,8 +1277,8 @@ fn matrix_rollout_registry_opt_in_selects_the_shared_daemon() {
     };
     let mut a = spawn_adapter(&dir, &options);
     let mut b = spawn_adapter(&dir, &options);
-    a.initialize("matrix-opt-in-a");
-    b.initialize("matrix-opt-in-b");
+    a.initialize("matrix-default-a");
+    b.initialize("matrix-default-b");
     let tool_a = a.wait_for_tool("__echo", Duration::from_secs(30));
     let tool_b = b.wait_for_tool("__echo", Duration::from_secs(30));
     assert_eq!(text_of(&a.call_tool(&tool_a, json!({ "text": "a" }))), "a");
@@ -1337,9 +1338,8 @@ fn matrix_rollout_legacy_override_keeps_the_standalone_role() {
         vec![],
     );
     let path = dir.join("registry.json");
-    let mut reg = registry::load_from(&path).expect("load registry");
-    reg.gateway_topology = Some(registry::GatewayTopology::Daemon);
-    registry::save_to(&path, &reg).expect("opt in to daemon topology");
+    let reg = registry::load_from(&path).expect("load registry");
+    assert!(reg.gateway_topology.is_none(), "legacy override tests the default");
 
     let options = AdapterOptions {
         default_role: true,
@@ -1356,6 +1356,37 @@ fn matrix_rollout_legacy_override_keeps_the_standalone_role() {
     assert_eq!(text_of(&b.call_tool(&tool_b, json!({ "text": "b" }))), "b");
     assert!(descriptor_files(&dir).is_empty(), "legacy started a daemon");
     assert_eq!(transcript_initialize_count(&transcript), 2);
+}
+
+#[test]
+fn matrix_rollout_explicit_legacy_registry_keeps_the_standalone_role() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("rollout-registry-legacy");
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, None)],
+        vec![],
+    );
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).expect("load registry");
+    reg.gateway_topology = Some(registry::GatewayTopology::Legacy);
+    registry::save_to(&path, &reg).expect("save explicit legacy topology");
+
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            default_role: true,
+            ..AdapterOptions::default()
+        },
+    );
+    client.initialize("matrix-registry-legacy");
+    let tool = client.wait_for_tool("__echo", Duration::from_secs(30));
+    assert_eq!(text_of(&client.call_tool(&tool, json!({ "text": "legacy" }))), "legacy");
+    assert!(descriptor_files(&dir).is_empty(), "legacy started a daemon");
+    assert_eq!(transcript_initialize_count(&transcript), 1);
 }
 
 #[test]

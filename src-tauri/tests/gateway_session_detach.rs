@@ -47,6 +47,8 @@ fn process_group_leader_gateway_still_creates_its_own_session() {
     let gateway = env!("CARGO_BIN_EXE_toolport-gateway");
     let child = Command::new(gateway)
         .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
+        .env("TOOLPORT_DATA_DIR", &dir)
+        .env("TOOLPORT_GATEWAY_TOPOLOGY", "legacy")
         .env("TOOLPORT_CLIENT_ID", "session-detach-test")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

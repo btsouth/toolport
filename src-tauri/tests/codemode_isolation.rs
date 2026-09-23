@@ -159,11 +159,12 @@ impl Gateway {
     }
 
     fn run(&mut self, arguments: Value) -> Value {
-        self.request(
+        let response = self.request(
             "tools/call",
             json!({ "name": "toolport_run_script", "arguments": arguments }),
-        )["result"]
-            .clone()
+        );
+        assert!(response["result"].is_object(), "code mode RPC failed: {response}");
+        response["result"].clone()
     }
 
     fn assert_alive(&mut self) {

@@ -149,7 +149,11 @@ fn record(cfg: &Config, req: &Value) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(f, "{req}");
+        // Concurrent fixture children share this transcript. Format first so
+        // each line reaches O_APPEND in one write rather than interleaving
+        // `writeln!` fragments from separate processes.
+        let line = format!("{req}\n");
+        let _ = f.write_all(line.as_bytes());
         let _ = f.flush();
     }
 }
