@@ -72,11 +72,10 @@ Still open:
   which are client-chosen, so shared across a host one client cancelling its id 7 would have
   cancelled another client's id 7, and one client's queue depth would have throttled another's.
   `handle_stdio_request` lost the parameter.
-  One single-stdio assumption remains and is NOT part of these moves: stdio PII/HITL lookups
-  collapse to `PII_LOCAL_SESSION`, so two stdio clients on one host would share one pseudonym
-  map and clearing one would clear the other. That one is a policy decision about identity
-  rather than a field move, because a second stdio client has no asserted identity to key on
-  until the daemon session protocol supplies one.
+  The last single-stdio assumption was stdio PII/HITL lookup by client identity: two adapters
+  on one host could share one pseudonym map or approval scope. The daemon now keys both by its
+  MCP session id and clears them together when that session closes. Sessionless bridge calls
+  retain their client identity key, and standalone stdio keeps its process-local key.
 - P1.3 `HostState` (in progress). The host runtime now lives on `HostState` (registry and
   its trust flag, router, catalog snapshot, routine candidates and advisor, ready/dirty
   flags, rebuild lock, listener config, server handler, resource subscriptions and the
@@ -146,7 +145,7 @@ Still open:
 | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | 1   | P2.1 rendezvous primitives (library module, tested)                                                                                                                             | none (new module only)                      | landed (#880)                                                                                       |
 | 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint                                                                                                                | none (explicit flag only)                   | landed (#881)                                                                                       |
-| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, guards, handshake, broken-stdout latch, cancellation, and in-flight cap per session | none default; HTTP confirm scoping narrowed | landed; one stdio assumption remains (PII)                                                          |
+| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, guards, handshake, broken-stdout latch, cancellation, and in-flight cap per session | none default; HTTP confirm scoping narrowed | landed; PII and HITL follow the daemon MCP session                                                  |
 | 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade                                                                                                                | none                                        | in progress: five landed increments; the session store and progress dispatch remain                 |
 | 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag                                                                                                             | opt-in only                                 | landed (#888, #891, #893)                                                                           |
 | 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                                                                                       | opt-in only                                 | landed (#892, #893)                                                                                 |
@@ -448,14 +447,9 @@ attempt should reuse rather than re-derive.
   build one host from their own handles (a `host_from_parts` test helper), which is what makes
   the collapse assert the same thing it used to. The only parameter kept is `resource_updated_override`, because the watcher tests
   need to drive a rebuild with no sink wired, which a host field cannot express.
-- Sequencing question, for the maintainer rather than for the code: this increment is all
-  Phase 1 has left apart from the one remaining stdio assumption noted above (the PII
-  fallback), and it is not a prerequisite for the pooling work. The remaining P1.3
-  holders are host-scoped by decision rather than isolation gaps (host policy, one table per
-  host, one dispatch per host), and the P1.2
-  remainder is now only the local-session PII fallback. P3.1 and P3.2 are therefore free to start
-  first; the plan keeps the original order by preference, so that pooling is built on state
-  that is already fully host-owned. That is a choice about risk, not a dependency.
+- P1.2's local-session PII and HITL fallback is closed by the daemon MCP session key.
+  P1.3 still has host-scoped session-store and progress-dispatch holders to move onto
+  `HostState`; those are state-ownership changes rather than another stdio isolation gap.
 
 ## Phase 2: rendezvous and the stdio adapter
 
