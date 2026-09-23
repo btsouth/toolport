@@ -23,8 +23,7 @@ conflicts=('toolport-bin' 'toolport-native-preview')
 replaces=('toolport-native-preview')
 options=('!lto')
 source=("toolport-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# Replace after the tag exists; arch-repo.yml refuses SKIP for publishing.
-sha256sums=('SKIP')
+sha256sums=('eccb08f4d71ea3a25a49933a6027afd857512bc075aa7b1be93ed6777ddd4692')
 
 build() {
   cd "toolport-$pkgver/src-tauri"
