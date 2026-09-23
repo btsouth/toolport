@@ -96,6 +96,14 @@ fn prepare_stdio_adapter() -> Result<(Rendezvous, DaemonDescriptor), Preparation
     Ok((rendezvous, descriptor))
 }
 
+/// Find or start the same host daemon for the desktop's lightweight HTTP
+/// bridge. It has no stdio session, but shares the adapter's election path.
+pub fn ensure_host_daemon() -> Result<DaemonDescriptor, String> {
+    prepare_stdio_adapter()
+        .map(|(_, descriptor)| descriptor)
+        .map_err(|failure| failure.detail)
+}
+
 fn finish_stdio_adapter(rendezvous: Rendezvous, descriptor: DaemonDescriptor) -> ! {
     match proxy_stdio(rendezvous, descriptor) {
         Ok(()) => std::process::exit(0),

@@ -87,6 +87,15 @@ impl Drop for Fixture {
     }
 }
 
+struct HttpProxyChild(Child);
+
+impl Drop for HttpProxyChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "toolport-matrix-{tag}-{}-{}-{}",
@@ -1380,6 +1389,140 @@ fn matrix_rollout_default_selects_the_shared_daemon() {
     assert!(matches!(
         ureq::get(&format!("http://{endpoint}/openapi.json"))
             .set("Authorization", &format!("Bearer {bridge_token}"))
+            .call(),
+        Err(ureq::Error::Status(401, _))
+    ));
+}
+
+#[test]
+fn matrix_desktop_http_proxy_shares_daemon_and_releases_lease() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("desktop-http-proxy");
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, None)],
+        vec![],
+    );
+    let registry_path = dir.join("registry.json");
+    let mut reg = registry::load_from(&registry_path).expect("load bridge registry");
+    reg.http_clients.push(registry::HttpClient {
+        id: "proxy-client".into(),
+        label: "Proxy client".into(),
+        token_sha256: registry::sha256_hex("registered-proxy-token"),
+        profile: String::new(),
+    });
+    registry::save_to(&registry_path, &reg).expect("register HTTP proxy client");
+    let mut adapter = spawn_adapter(&dir, &AdapterOptions::default());
+    adapter.initialize("matrix-http-proxy-stdio");
+    let tool = adapter.wait_for_tool("__echo", Duration::from_secs(30));
+    assert_eq!(transcript_initialize_count(&transcript), 1);
+
+    let port_listener = TcpListener::bind("127.0.0.1:0").expect("allocate HTTP proxy port");
+    let port = port_listener.local_addr().unwrap().port();
+    drop(port_listener);
+    let public_token = "matrix-desktop-bridge-token";
+    let child = Command::new(env!("CARGO_BIN_EXE_toolport-gateway"))
+        .arg("--http-proxy")
+        .arg(port.to_string())
+        .env("TOOLPORT_DATA_DIR", &dir)
+        .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
+        .env("TOOLPORT_HTTP_TOKEN", public_token)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("start lightweight desktop HTTP proxy");
+    let mut proxy = HttpProxyChild(child);
+    let public_url = format!("http://127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            proxy.0.try_wait().unwrap().is_none(),
+            "HTTP proxy exited before readiness"
+        );
+        if let Ok(response) = ureq::get(&format!("{public_url}/"))
+            .timeout(Duration::from_millis(300))
+            .set("Authorization", &format!("Bearer {public_token}"))
+            .call()
+        {
+            let banner = response.into_string().expect("read proxy readiness banner");
+            assert!(
+                banner.starts_with("Toolport gateway (HTTP mode)."),
+                "desktop readiness requires the HTTP-mode banner: {banner}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "HTTP proxy did not become ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        ureq::get(&format!("{public_url}/openapi.json"))
+            .set("Authorization", "Bearer registered-proxy-token")
+            .set("Origin", "http://127.0.0.1")
+            .call()
+            .expect("registered client reaches Shared HTTP through the proxy")
+            .status(),
+        200
+    );
+
+    let request = |id: u64, method: &str, mut params: Value| {
+        params["_meta"] = json!({ "io.modelcontextprotocol/protocolVersion": "2026-07-28" });
+        let mut request = ureq::post(&format!("{public_url}/mcp"))
+            .timeout(Duration::from_secs(10))
+            .set("Authorization", &format!("Bearer {public_token}"))
+            .set("MCP-Protocol-Version", "2026-07-28")
+            .set("Mcp-Method", method)
+            .set("Accept", "application/json");
+        if let Some(name) = params.get("name").and_then(Value::as_str) {
+            request = request.set("Mcp-Name", name);
+        }
+        json_body(
+            request
+                .send_json(json!({
+                    "jsonrpc": "2.0", "id": id, "method": method, "params": params
+                }))
+                .expect("public MCP request through proxy"),
+        )
+    };
+    let listed = request(1, "tools/list", json!({}));
+    assert!(
+        listed["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|entry| entry["name"] == tool)),
+        "public MCP catalog missing shared tool: {listed}"
+    );
+    let called = request(
+        2,
+        "tools/call",
+        json!({ "name": tool, "arguments": { "text": "via-http" } }),
+    );
+    assert_eq!(text_of(&called["result"]), "via-http");
+    assert_eq!(
+        transcript_initialize_count(&transcript),
+        1,
+        "the public bridge started a second downstream copy"
+    );
+
+    let descriptor = first_descriptor(&dir).expect("shared daemon descriptor");
+    let endpoint = descriptor["endpoint"].as_str().unwrap();
+    let private_token = descriptor["token"].as_str().unwrap();
+    let identity_url = format!("http://{endpoint}{}", conduit_lib::daemon::IDENTITY_PATH);
+    drop(proxy.0.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while proxy.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "HTTP proxy ignored parent EOF");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    ureq::get(&identity_url)
+        .set("Authorization", &format!("Bearer {private_token}"))
+        .call()
+        .expect("shared daemon survives desktop bridge exit");
+    assert!(matches!(
+        ureq::get(&format!("http://{endpoint}/openapi.json"))
+            .set("Authorization", &format!("Bearer {public_token}"))
             .call(),
         Err(ureq::Error::Status(401, _))
     ));

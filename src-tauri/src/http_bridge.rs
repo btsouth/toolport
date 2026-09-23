@@ -12,6 +12,7 @@ pub struct HttpBridge {
     pub(crate) child: Option<std::process::Child>,
     pub(crate) port: Option<u16>,
     pub(crate) token: Option<String>,
+    pub(crate) proxy_mode: bool,
 }
 
 pub type HttpBridgeState = Mutex<HttpBridge>;
@@ -54,6 +55,7 @@ pub fn alive(bridge: &mut HttpBridge) -> bool {
         bridge.child = None;
         bridge.port = None;
         bridge.token = None;
+        bridge.proxy_mode = false;
     }
     alive
 }
@@ -76,6 +78,42 @@ pub fn identity_ready(port: u16, token: &str) -> bool {
         .read_to_string(&mut body)
         .is_ok()
         && body.starts_with("Toolport gateway (HTTP mode).")
+}
+
+fn proxy_selected(
+    override_value: Option<&str>,
+    topology: Option<crate::registry::GatewayTopology>,
+) -> bool {
+    match override_value.map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("legacy") => false,
+        Some(value) if value.eq_ignore_ascii_case("daemon") => true,
+        _ => topology == Some(crate::registry::GatewayTopology::Daemon),
+    }
+}
+
+fn bridge_uses_daemon() -> bool {
+    let topology = crate::registry::load_resolved_with_source()
+        .ok()
+        .filter(|(_, source)| source.is_authoritative())
+        .map(|(registry, _)| registry.gateway_topology_effective());
+    let override_value =
+        crate::brand::env_var("TOOLPORT_GATEWAY_TOPOLOGY", "CONDUIT_GATEWAY_TOPOLOGY");
+    proxy_selected(override_value.as_deref(), topology)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::proxy_selected;
+    use crate::registry::GatewayTopology::{Daemon, Legacy};
+
+    #[test]
+    fn desktop_proxy_selection_keeps_the_legacy_rollback() {
+        assert!(proxy_selected(None, Some(Daemon)));
+        assert!(!proxy_selected(None, Some(Legacy)));
+        assert!(!proxy_selected(None, None));
+        assert!(!proxy_selected(Some("legacy"), Some(Daemon)));
+        assert!(proxy_selected(Some("daemon"), Some(Legacy)));
+    }
 }
 
 pub fn start_with_token_at(
@@ -106,13 +144,19 @@ pub fn start_with_token_at(
             bytes.iter().map(|byte| format!("{byte:02x}")).collect()
         }
     };
+    let proxy_mode = bridge_uses_daemon();
     let mut command = std::process::Command::new(&bin);
     command
-        .arg("--http")
+        .arg(if proxy_mode { "--http-proxy" } else { "--http" })
         .arg(port.to_string())
         .env("TOOLPORT_HTTP_TOKEN", &token)
         .env("CONDUIT_HTTP_TOKEN", &token)
-        .stdin(std::process::Stdio::null())
+        // The proxy treats stdin EOF as the app's service lease ending.
+        .stdin(if proxy_mode {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     #[cfg(windows)]
@@ -123,7 +167,8 @@ pub fn start_with_token_at(
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start the HTTP bridge: {error}"))?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let startup_timeout = if proxy_mode { 25 } else { 5 };
+    let deadline = std::time::Instant::now() + Duration::from_secs(startup_timeout);
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!(
@@ -137,7 +182,7 @@ pub fn start_with_token_at(
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!(
-                "The HTTP endpoint did not come up on port {port} within 5s."
+                "The HTTP endpoint did not come up on port {port} within {startup_timeout}s."
             ));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -145,6 +190,7 @@ pub fn start_with_token_at(
     bridge.child = Some(child);
     bridge.port = Some(port);
     bridge.token = Some(token.clone());
+    bridge.proxy_mode = proxy_mode;
     Ok(HttpBridgeStatus::new(Some(port), Some(token)))
 }
 
@@ -153,13 +199,34 @@ pub fn stop_with(
     kill_child: impl FnOnce(&mut std::process::Child) -> std::io::Result<()>,
 ) -> Result<HttpBridgeStatus, String> {
     if let Some(mut child) = bridge.child.take() {
-        let stopped = match kill_child(&mut child) {
-            Ok(()) => child.wait().map(|_| ()),
-            Err(kill_error) => match child.try_wait() {
-                Ok(Some(_)) => Ok(()),
-                Ok(None) => Err(kill_error),
-                Err(wait_error) => Err(wait_error),
-            },
+        let gracefully_exited = if bridge.proxy_mode {
+            // Closing the parent-held pipe tells the proxy to release the
+            // daemon lease and stop its public listener.
+            drop(child.stdin.take());
+            let deadline = std::time::Instant::now() + Duration::from_secs(4);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break true,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    _ => break false,
+                }
+            }
+        } else {
+            false
+        };
+        let stopped = if gracefully_exited {
+            Ok(())
+        } else {
+            match kill_child(&mut child) {
+                Ok(()) => child.wait().map(|_| ()),
+                Err(kill_error) => match child.try_wait() {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => Err(kill_error),
+                    Err(wait_error) => Err(wait_error),
+                },
+            }
         };
         if let Err(error) = stopped {
             bridge.child = Some(child);
@@ -171,6 +238,7 @@ pub fn stop_with(
     }
     bridge.port = None;
     bridge.token = None;
+    bridge.proxy_mode = false;
     Ok(HttpBridgeStatus::new(None, None))
 }
 
@@ -192,10 +260,5 @@ pub fn kill_on_exit(state: &HttpBridgeState) {
     let mut bridge = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(mut child) = bridge.child.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    bridge.port = None;
-    bridge.token = None;
+    let _ = stop_with(&mut bridge, std::process::Child::kill);
 }
