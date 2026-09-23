@@ -7,11 +7,11 @@ still runs its own gateway and its own copy of every enabled downstream server u
 P4.2 default flip. P1.2 is landed apart from one stdio assumption (stdio PII/HITL collapsing
 to one local session, which needs an asserted identity to key on); the handshake flags, the
 broken-stdout latch, and the cancel registry and in-flight cap are session state.
-P1.3 is three increments in: the host runtime, the session table and daemon runtime, and the
-rebuild streaks and quarantine read state have moved onto `HostState`. What is left there is
-discovery and code mode, the principal-keyed session store, and the progress dispatch and
-routes, all of which need the dispatch core's signatures changed rather than a field move.
-The P3 downstream pooling has not started. See
+P1.3 is five increments in: the host runtime, session table and daemon runtime,
+rebuild streaks and quarantine read state, code mode, and discovery mode have moved
+onto `HostState`. The session store and progress dispatch and routes remain. P3.1
+profile and folder scoping and P3.2 root propagation are opt-in work in progress;
+root-specific downstream launch pooling has not started. See
 [the plan](one-gateway-per-host-plan.md) for the slice-by-slice status and what is next.
 
 SBS-551 delivered this design plus a slice of Phase 1 (`ActiveRequestContext` and the

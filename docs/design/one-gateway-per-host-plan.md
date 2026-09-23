@@ -7,8 +7,8 @@ one release.
 
 ## Current state
 
-Grounded in the code as of 2026-09-16 (through #894). Anything marked "not started" below
-is the honest next work, not a claim about ordering.
+This section distinguishes landed increments from Phase 3 work still in progress.
+Anything marked "not started" below is the next work, not a claim about ordering.
 
 Landed:
 
@@ -142,19 +142,19 @@ Still open:
 
 ## Delivery shape
 
-| PR  | Slice                                                                                                                                                                           | Behavior change                             | Status                                                                                                  |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| 1   | P2.1 rendezvous primitives (library module, tested)                                                                                                                             | none (new module only)                      | landed (#880)                                                                                           |
-| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint                                                                                                                | none (explicit flag only)                   | landed (#881)                                                                                           |
-| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, guards, handshake, broken-stdout latch, cancellation, and in-flight cap per session | none default; HTTP confirm scoping narrowed | landed; one stdio assumption remains (PII)                                                              |
-| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade                                                                                                                | none                                        | in progress: five increments (the fifth in this PR), the session store and the progress dispatch remain |
-| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag                                                                                                             | opt-in only                                 | landed (#888, #891, #893)                                                                               |
-| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                                                                                       | opt-in only                                 | landed (#892, #893)                                                                                     |
-| 7   | P3.1 union catalog built once, allowed-set enforced per session                                                                                                                 | opt-in only                                 | not started                                                                                             |
-| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                                                                                   | opt-in only, the big win                    | not started                                                                                             |
-| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                                                                                    | opt-in only                                 | not started                                                                                             |
-| 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                                                                               | default flip                                | not started                                                                                             |
-| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                                                                                  | separate, later                             | not started                                                                                             |
+| PR  | Slice                                                                                                                                                                           | Behavior change                             | Status                                                                                              |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| 1   | P2.1 rendezvous primitives (library module, tested)                                                                                                                             | none (new module only)                      | landed (#880)                                                                                       |
+| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint                                                                                                                | none (explicit flag only)                   | landed (#881)                                                                                       |
+| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, guards, handshake, broken-stdout latch, cancellation, and in-flight cap per session | none default; HTTP confirm scoping narrowed | landed; one stdio assumption remains (PII)                                                          |
+| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade                                                                                                                | none                                        | in progress: five landed increments; the session store and progress dispatch remain                 |
+| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag                                                                                                             | opt-in only                                 | landed (#888, #891, #893)                                                                           |
+| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                                                                                       | opt-in only                                 | landed (#892, #893)                                                                                 |
+| 7   | P3.1 union catalog built once, allowed-set enforced per session                                                                                                                 | opt-in only                                 | in progress: adapter identity, profile scope, and scoped catalog-change fanout pass the matrix      |
+| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                                                                                   | opt-in only, the big win                    | in progress: per-adapter cwd and per-session MCP roots reach the daemon; launch slots still pending |
+| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                                                                                    | opt-in only                                 | not started                                                                                         |
+| 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                                                                               | default flip                                | not started                                                                                         |
+| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                                                                                  | separate, later                             | not started                                                                                         |
 
 Each of 1 through 8 must leave the default topology untouched and all existing suites
 green. The only PRs that change what a user gets are 10 and 11.
@@ -252,8 +252,7 @@ routing that P1.3 takes.
 
 ### P1.3 HostState
 
-Status: five increments, the fifth landing in this PR (the slice tracker in #910 still lists
-three increments and is updated separately). `HostState` owns the host runtime the gateway already
+Status: five landed increments. `HostState` owns the host runtime the gateway already
 resolved once per process, and `GatewayState` is now a facade over it: a `Deref` impl keeps
 the host-scoped call sites reading `state.registry`, `state.router`, and friends, so moving
 ownership did not rewrite several hundred lines.
@@ -291,7 +290,7 @@ ownership did not rewrite several hundred lines.
   collapsed catalog through one host and asserts the streak accumulates there, that a
   second host's map stays empty, and that a store failure on one host does not mark
   another's read as failed.
-- Fourth increment, in this PR: the host owns its code-mode switch. `CODE_MODE` is gone, and with
+- Fourth increment, landed: the host owns its code-mode switch. `CODE_MODE` is gone, and with
   it `CODE_MODE_TEST_LOCK`, `CodeModeGuard`, and `set_code_mode_flag`. `code_mode_enabled()` is
   `HostState::code_mode_enabled()`; the watcher publishes the registry's switch through
   `HostState::set_code_mode`. The fail-closed boot rule survives as
@@ -310,7 +309,7 @@ ownership did not rewrite several hundred lines.
   path (`flattened_routine_tools_are_advertised_and_run`,
   `routine_write_opt_in_defaults_off_and_controls_advertisement`, and
   `immutable_code_run_returns_promotion_candidate_without_retaining_input`).
-- Fifth increment, in this PR: the host owns its discovery mode. `DISCOVERY_MODE` is gone,
+- Fifth increment, landed: the host owns its discovery mode. `DISCOVERY_MODE` is gone,
   and with it `DISCOVERY_MODE_TEST_LOCK`, `DiscoveryModeGuard`, and the free
   `discovery_mode()` / `set_discovery_mode()` / `grouped_discovery()`. `HostState` owns a
   `discovery: AtomicU8` read through those same three names as methods, `main` seeds it from
@@ -525,6 +524,18 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
 - Build the catalog once for the union of enabled servers and enforce each session's
   allowed set on every list, call, prompt, resource, subscription, and server-initiated
   path. The HTTP bridge already proves the filtering model; make it the only model.
+- In the opt-in daemon path, adapters now assert their client id and boot profile with
+  private-endpoint headers alongside the rendezvous bearer. The daemon resolves the live
+  profile from that identity and gives the HTTP request path its enabled-server set. It
+  connects the union across configured profiles, so a later adapter in another profile
+  can use the same daemon. A downstream list change now notifies only sessions whose
+  visible tools, resources, templates, or prompts changed. The matrix's profile-scope
+  and cross-profile notification cases pass. A live profile change invalidates the
+  old MCP session; the adapter fails that call once and reopens under the new scope
+  on the next request. The daemon resolves folder-profile mappings from each
+  adapter's own root. The adapter carries a learned MCP root into a reopened
+  session, so a scope switch does not loop back to its launch cwd. Remaining
+  P3.1 work is the full surface audit, especially server-initiated paths.
 
 ### P3.2 Pool by `LaunchKey`
 
@@ -533,6 +544,17 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
   secret generations retire the old key after in-flight calls finish.
 - This is the measurable win: adding an ordinary client session must not add a router or a
   root-independent downstream copy.
+- The current `Router` indexes one `ServerSlot` by server id and the daemon starts its
+  router before an adapter supplies roots. The adapter now sends its own cwd and
+  explicit root override over the private bearer connection, and the daemon asks
+  each capable session for `roots/list` after its handshake. That root stays on
+  the session, including a fallback to that adapter's cwd when roots vanish.
+  The pending root case still runs the mock child in the daemon's cwd because
+  dispatch does not select a root-specific slot yet. Implementing this requires
+  a launch-keyed slot pool and a session-root selection at dispatch, with
+  root-independent slots shared across those selections. Rebuilding a whole
+  router per root would respawn the independent servers and erase the intended
+  saving.
 
 ### P3.3 Concurrency and isolation tests
 
@@ -566,22 +588,24 @@ is exposed poll `tools/list` bounded: the daemon serves immediately while its ro
 builds on a background thread, and a real client learns the finished catalog from
 `notifications/tools/list_changed`.
 
-| Matrix row                                                            | Case                                                                                                                                                        | Phase     | Status on main        |
+| Matrix row                                                            | Case                                                                                                                                                        | Phase     | Status                |
 | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- | --------------------- |
 | 20 simultaneous adapters cold-start exactly one daemon                | `matrix_cold_start_twenty_simultaneous_adapters_elect_exactly_one_daemon`                                                                                   | P2.1      | passing               |
 | Version/data-dir mismatch creates separate daemons without cross-talk | `matrix_partitioning_separate_data_dirs_run_separate_daemons_without_cross_talk`, `matrix_partitioning_a_foreign_compat_descriptor_is_rejected_not_adopted` | P2.1      | passing               |
 | Startup never waits indefinitely when rendezvous fails                | `matrix_lifecycle_a_stale_descriptor_does_not_stall_startup`                                                                                                | P2.1      | passing               |
 | Crashes/EOF clean up session-owned resources after close or TTL       | `matrix_lifecycle_adapter_eof_releases_the_session_and_lets_the_daemon_exit`                                                                                | P2.3      | passing               |
 | N clients on one ordinary stdio server create one downstream child    | `matrix_pooling_sessions_share_one_downstream_child`                                                                                                        | P3.2      | passing               |
+| A capable adapter is asked for roots on its own session               | `matrix_adapter_root_is_queried_on_its_own_session`                                                                                                         | P3.2      | passing               |
 | Two `${ROOT}` values create two children, equal roots share one       | `matrix_pooling_root_sharding_two_roots_two_children`                                                                                                       | P3.2      | pending (`#[ignore]`) |
-| Profiles cannot list or call outside their scope                      | `matrix_routing_profiles_cannot_reach_servers_outside_their_scope`                                                                                          | P3.1      | pending (`#[ignore]`) |
+| Profiles cannot list or call outside their scope                      | `matrix_routing_profiles_cannot_reach_servers_outside_their_scope`                                                                                          | P3.1      | passing               |
+| An adapter's declared root selects its folder profile                 | `matrix_routing_declared_root_selects_folder_profile`                                                                                                       | P3.1      | passing               |
+| Live profile changes reopen the adapter under the new scope           | `matrix_routing_live_profile_change_reopens_the_adapter_session`                                                                                            | P3.1      | passing               |
 | Identical JSON-RPC ids from different sessions never collide          | `matrix_routing_identical_request_ids_stay_per_session`                                                                                                     | P3.3      | passing               |
-| Session-scoped surfaces reach only the originating session            | `matrix_routing_session_scoped_notifications_reach_only_the_subscriber`                                                                                     | P3.1/P3.3 | pending (`#[ignore]`) |
+| A downstream catalog change reaches authorized sessions only          | `matrix_routing_server_change_notifies_only_authorized_sessions`                                                                                            | P3.1/P3.3 | passing               |
 
 Pending rows are `#[ignore]`d acceptance criteria, not absent ones: they fail loudly with
-`--ignored` today (root sharding falls back to the daemon's cwd; a shared daemon serves
-the first session's profile to every session; `tools/list_changed` broadcasts to all
-sessions), and the attribute comes off in the same PR that lands the phase — the pattern
+`--ignored` today (root sharding still launches from the daemon's cwd), and the attribute comes off
+in the same PR that lands the phase — the pattern
 `tests/spec_conformance.rs` used while the dual-era work was in flight.
 
 Commands (the in-file `CASE_LOCK` already serializes cases; `--test-threads=1` keeps the

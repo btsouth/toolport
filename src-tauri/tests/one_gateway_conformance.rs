@@ -28,8 +28,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use conduit_lib::registry::{self, EnvVar, Profile, Registry, ServerEntry};
 use conduit_lib::daemon::descriptor_path;
+use conduit_lib::registry::{self, EnvVar, FolderProfile, Profile, Registry, ServerEntry};
 use conduit_lib::topology::CompatKey;
 use serde_json::{json, Value};
 
@@ -58,7 +58,12 @@ struct Fixture {
 impl Fixture {
     fn new(tag: &str) -> (Self, PathBuf) {
         let dir = scratch_dir(tag);
-        (Self { dirs: vec![dir.clone()] }, dir)
+        (
+            Self {
+                dirs: vec![dir.clone()],
+            },
+            dir,
+        )
     }
 
     /// Add one more scratch directory to the same case (partitioning needs two).
@@ -108,6 +113,7 @@ struct AdapterClient {
     /// Whether `initialize` will declare the roots capability. Kept beside the
     /// reader thread that answers `roots/list`, so the two cannot disagree.
     declares_roots: bool,
+    roots_queries: Arc<AtomicUsize>,
     /// This client's data directory, for the gateway log a failure has to quote.
     dir: PathBuf,
     /// The adapter's stderr, captured rather than discarded: an adapter that exits
@@ -116,8 +122,11 @@ struct AdapterClient {
 }
 
 struct AdapterOptions<'a> {
+    client_id: Option<&'a str>,
     /// Named registry profile this client runs under (the per-principal row).
     profile: Option<&'a str>,
+    /// Process cwd, which may differ from the client's declared MCP root.
+    cwd: Option<&'a Path>,
     /// Idle grace the daemon inherits through the adapter's environment.
     grace_ms: Option<u64>,
     /// Project roots this client declares, for the `${ROOT}` rows.
@@ -127,7 +136,9 @@ struct AdapterOptions<'a> {
 impl Default for AdapterOptions<'_> {
     fn default() -> Self {
         Self {
+            client_id: None,
             profile: None,
+            cwd: None,
             grace_ms: None,
             roots: Vec::new(),
         }
@@ -141,12 +152,21 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
         .arg("--stdio-adapter")
         .env("TOOLPORT_DATA_DIR", dir)
         .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
-        .env("TOOLPORT_CLIENT_ID", format!("matrix-{index}"))
+        .env(
+            "TOOLPORT_CLIENT_ID",
+            options
+                .client_id
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("matrix-{index}")),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(profile) = options.profile {
         command.env("TOOLPORT_PROFILE", profile);
+    }
+    if let Some(cwd) = options.cwd {
+        command.current_dir(cwd);
     }
     if let Some(grace_ms) = options.grace_ms {
         command.env("TOOLPORT_DAEMON_IDLE_GRACE_MS", grace_ms.to_string());
@@ -180,6 +200,8 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
 
     let roots = options.roots.clone();
     let declares_roots = !roots.is_empty();
+    let roots_queries = Arc::new(AtomicUsize::new(0));
+    let roots_queries_reader = Arc::clone(&roots_queries);
     let stdin = Arc::new(Mutex::new(Some(stdin)));
     let responder = Arc::clone(&stdin);
     let (sender, lines) = mpsc::channel();
@@ -191,19 +213,22 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
             if value.get("method").is_some() && value.get("id").is_some() {
                 let id = value["id"].clone();
                 let reply = match value["method"].as_str() {
-                    Some("roots/list") => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "roots": roots
-                                .iter()
-                                .map(|root| json!({
-                                    "uri": file_uri(root),
-                                    "name": "project",
-                                }))
-                                .collect::<Vec<_>>()
-                        }
-                    }),
+                    Some("roots/list") => {
+                        roots_queries_reader.fetch_add(1, Ordering::Relaxed);
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "roots": roots
+                                    .iter()
+                                    .map(|root| json!({
+                                        "uri": file_uri(root),
+                                        "name": "project",
+                                    }))
+                                    .collect::<Vec<_>>()
+                            }
+                        })
+                    }
                     _ => json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -231,6 +256,7 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
         lines,
         next_id: 0,
         declares_roots,
+        roots_queries,
         dir: dir.to_path_buf(),
         stderr: stderr_text,
     }
@@ -342,10 +368,7 @@ impl AdapterClient {
                 "clientInfo": { "name": name, "version": "1" }
             }),
         );
-        assert!(
-            reply.get("result").is_some(),
-            "initialize failed: {reply}"
-        );
+        assert!(reply.get("result").is_some(), "initialize failed: {reply}");
         self.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
         reply
     }
@@ -441,8 +464,8 @@ impl AdapterClient {
                 .lines
                 .recv_timeout(remaining.max(Duration::from_millis(1)))
                 .unwrap_or_else(|_| panic!("no {method} notification before the deadline"));
-            let message: Value =
-                serde_json::from_str(&line).unwrap_or_else(|e| panic!("invalid JSON ({e}): {line}"));
+            let message: Value = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("invalid JSON ({e}): {line}"));
             if message.get("method").is_some() && message.get("id").is_none() {
                 assert_eq!(
                     message["method"], method,
@@ -554,7 +577,9 @@ fn read_descriptor(path: &Path) -> Option<Value> {
 }
 
 fn first_descriptor(dir: &Path) -> Option<Value> {
-    descriptor_files(dir).iter().find_map(|p| read_descriptor(p))
+    descriptor_files(dir)
+        .iter()
+        .find_map(|p| read_descriptor(p))
 }
 
 fn wait_for_descriptor(dir: &Path, within: Duration) -> Value {
@@ -728,21 +753,23 @@ fn pid_alive(pid: u64) -> bool {
     Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}")])
         .output()
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
-        })
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
         .unwrap_or(false)
 }
 
-/// Count `initialize` lines in a downstream transcript: one per spawned child.
-fn transcript_initialize_count(path: &Path) -> usize {
+fn transcript_method_count(path: &Path, method: &str) -> usize {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return 0;
     };
     raw.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|entry| entry.get("method").is_some_and(|m| m == "initialize"))
+        .filter(|entry| entry.get("method").is_some_and(|m| m == method))
         .count()
+}
+
+/// One `initialize` line per spawned downstream child.
+fn transcript_initialize_count(path: &Path) -> usize {
+    transcript_method_count(path, "initialize")
 }
 
 fn wait_until(mut predicate: impl FnMut() -> bool, label: &str, within: Duration) {
@@ -769,7 +796,9 @@ fn text_of(result: &Value) -> String {
 
 #[test]
 fn matrix_cold_start_twenty_simultaneous_adapters_elect_exactly_one_daemon() {
-    let _guard = CASE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (_fixture, dir) = Fixture::new("cold-start");
     let before = daemon_process_count();
 
@@ -799,7 +828,10 @@ fn matrix_cold_start_twenty_simultaneous_adapters_elect_exactly_one_daemon() {
     let paths = descriptor_files(&dir);
     assert_eq!(paths.len(), 1, "expected exactly one descriptor: {paths:?}");
     let descriptor = read_descriptor(&paths[0]).expect("read the descriptor");
-    let endpoint = descriptor["endpoint"].as_str().expect("endpoint").to_string();
+    let endpoint = descriptor["endpoint"]
+        .as_str()
+        .expect("endpoint")
+        .to_string();
     let token = descriptor["token"].as_str().expect("token").to_string();
     let identity = probe_identity(&endpoint, &token).expect("probe the elected daemon");
     assert_eq!(identity["compat"], descriptor["compat"]);
@@ -831,7 +863,9 @@ fn matrix_cold_start_twenty_simultaneous_adapters_elect_exactly_one_daemon() {
 
 #[test]
 fn matrix_partitioning_separate_data_dirs_run_separate_daemons_without_cross_talk() {
-    let _guard = CASE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (mut fixture, dir_a) = Fixture::new("partition-a");
     let dir_b = fixture.add("partition-b");
 
@@ -841,7 +875,10 @@ fn matrix_partitioning_separate_data_dirs_run_separate_daemons_without_cross_tal
     client_b.initialize("matrix-partition-b");
     for (label, client) in [("A", &mut client_a), ("B", &mut client_b)] {
         assert!(
-            !client.tool_names().iter().any(|name| name.ends_with("__echo")),
+            !client
+                .tool_names()
+                .iter()
+                .any(|name| name.ends_with("__echo")),
             "session {label} with an empty registry must not expose downstream tools"
         );
     }
@@ -877,7 +914,9 @@ fn matrix_partitioning_separate_data_dirs_run_separate_daemons_without_cross_tal
 
 #[test]
 fn matrix_partitioning_a_foreign_compat_descriptor_is_rejected_not_adopted() {
-    let _guard = CASE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (mut fixture, dir_a) = Fixture::new("foreign-a");
     let dir_b = fixture.add("foreign-b");
 
@@ -894,7 +933,10 @@ fn matrix_partitioning_a_foreign_compat_descriptor_is_rejected_not_adopted() {
         .expect("spawn the foreign daemon");
     let mut foreign = foreign;
     let descriptor_b = wait_for_descriptor(&dir_b, Duration::from_secs(60));
-    let endpoint_b = descriptor_b["endpoint"].as_str().expect("endpoint B").to_string();
+    let endpoint_b = descriptor_b["endpoint"]
+        .as_str()
+        .expect("endpoint B")
+        .to_string();
     let token_b = descriptor_b["token"].as_str().expect("token B").to_string();
 
     let raw_b = std::fs::read_to_string(
@@ -944,17 +986,25 @@ fn matrix_partitioning_a_foreign_compat_descriptor_is_rejected_not_adopted() {
 
 #[test]
 fn matrix_lifecycle_adapter_eof_releases_the_session_and_lets_the_daemon_exit() {
-    let _guard = CASE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (_fixture, dir) = Fixture::new("eof");
 
     // The grace the daemon inherits through the adapter's environment.
-    let mut client = spawn_adapter(&dir, &AdapterOptions {
-        grace_ms: Some(800),
-        ..AdapterOptions::default()
-    });
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            grace_ms: Some(800),
+            ..AdapterOptions::default()
+        },
+    );
     client.initialize("matrix-eof");
     assert!(
-        !client.tool_names().iter().any(|name| name.ends_with("__echo")),
+        !client
+            .tool_names()
+            .iter()
+            .any(|name| name.ends_with("__echo")),
         "a session with an empty registry must not expose downstream tools"
     );
     let descriptor = first_descriptor(&dir).expect("descriptor before EOF");
@@ -966,9 +1016,7 @@ fn matrix_lifecycle_adapter_eof_releases_the_session_and_lets_the_daemon_exit() 
     client.close_stdin();
     client.wait_exit(Duration::from_secs(20));
     wait_until(
-        || {
-            first_descriptor(&dir).is_none() && !pid_alive(daemon_pid)
-        },
+        || first_descriptor(&dir).is_none() && !pid_alive(daemon_pid),
         "the daemon to idle out after client EOF",
         Duration::from_secs(30),
     );
@@ -980,7 +1028,9 @@ fn matrix_lifecycle_adapter_eof_releases_the_session_and_lets_the_daemon_exit() 
 
 #[test]
 fn matrix_lifecycle_a_stale_descriptor_does_not_stall_startup() {
-    let _guard = CASE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (_fixture, dir) = Fixture::new("stale");
 
     // A descriptor that claims the right domain but points at a dead endpoint:
@@ -1004,13 +1054,19 @@ fn matrix_lifecycle_a_stale_descriptor_does_not_stall_startup() {
     let mut client = spawn_adapter(&dir, &AdapterOptions::default());
     client.initialize("matrix-stale");
     assert!(
-        !client.tool_names().iter().any(|name| name.ends_with("__echo")),
+        !client
+            .tool_names()
+            .iter()
+            .any(|name| name.ends_with("__echo")),
         "a session with an empty registry must not expose downstream tools"
     );
 
     // The stale pointer was replaced by a live daemon's descriptor.
     let live = first_descriptor(&dir).expect("a live descriptor after startup");
-    assert_ne!(live["token"], "stale-token", "the stale descriptor survived");
+    assert_ne!(
+        live["token"], "stale-token",
+        "the stale descriptor survived"
+    );
     let endpoint = live["endpoint"].as_str().expect("endpoint");
     let token = live["token"].as_str().expect("token");
     probe_identity(endpoint, token).expect("probe the replacement daemon");
@@ -1022,7 +1078,9 @@ fn matrix_lifecycle_a_stale_descriptor_does_not_stall_startup() {
 
 #[test]
 fn matrix_pooling_sessions_share_one_downstream_child() {
-    let _guard = CASE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (_fixture, dir) = Fixture::new("pool-share");
     let transcript = dir.join("downstream.jsonl");
     write_registry(
@@ -1061,10 +1119,43 @@ fn matrix_pooling_sessions_share_one_downstream_child() {
     );
 }
 
-#[ignore = "P3.2 pools downstream launches by LaunchKey with ${ROOT} sharding; not started (see #910 and docs/design/one-gateway-per-host-plan.md). Run with --ignored once it lands, and remove this attribute in the PR that lands it."]
+#[test]
+fn matrix_adapter_root_is_queried_on_its_own_session() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("session-roots");
+    let root = std::fs::canonicalize(fixture.add("project")).expect("project root");
+    write_registry(&dir, vec![], vec![]);
+    let mut with_roots = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            roots: vec![root],
+            ..AdapterOptions::default()
+        },
+    );
+    let mut without_roots = spawn_adapter(&dir, &AdapterOptions::default());
+    with_roots.initialize("matrix-with-roots");
+    without_roots.initialize("matrix-without-roots");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while with_roots.roots_queries.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        with_roots.roots_queries.load(Ordering::Relaxed),
+        1,
+        "daemon did not ask the capable adapter for roots\n{}",
+        with_roots.diagnostics()
+    );
+    assert_eq!(without_roots.roots_queries.load(Ordering::Relaxed), 0);
+}
+
+#[ignore = "P3.2 root-aware downstream slot selection is pending (see #910 and docs/design/one-gateway-per-host-plan.md). Run with --ignored once it lands, and remove this attribute in the PR that lands it."]
 #[test]
 fn matrix_pooling_root_sharding_two_roots_two_children() {
-    let _guard = CASE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (mut fixture, dir) = Fixture::new("pool-roots");
     let root_a = std::fs::canonicalize(fixture.add("root-a")).expect("canonical root A");
     let root_b = std::fs::canonicalize(fixture.add("root-b")).expect("canonical root B");
@@ -1124,7 +1215,9 @@ fn matrix_pooling_root_sharding_two_roots_two_children() {
 
 #[test]
 fn matrix_routing_identical_request_ids_stay_per_session() {
-    let _guard = CASE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (_fixture, dir) = Fixture::new("id-collision");
     let transcript = dir.join("downstream.jsonl");
     write_registry(
@@ -1154,10 +1247,11 @@ fn matrix_routing_identical_request_ids_stay_per_session() {
     assert_eq!(text_of(&client_b.response_to(7)["result"]), "from-b");
 }
 
-#[ignore = "P3.1 enforces each session's allowed server set on every path; not started (see #910 and docs/design/one-gateway-per-host-plan.md). Run with --ignored once it lands, and remove this attribute in the PR that lands it."]
 #[test]
 fn matrix_routing_profiles_cannot_reach_servers_outside_their_scope() {
-    let _guard = CASE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (_fixture, dir) = Fixture::new("profile-scope");
     let transcript_one = dir.join("one.jsonl");
     let transcript_two = dir.join("two.jsonl");
@@ -1167,19 +1261,68 @@ fn matrix_routing_profiles_cannot_reach_servers_outside_their_scope() {
             mock_server_entry("one", &transcript_one, None),
             mock_server_entry("two", &transcript_two, None),
         ],
-        vec![profile("scope-one", &["one"]), profile("scope-two", &["two"])],
+        vec![
+            profile("scope-one", &["one"]),
+            profile("scope-two", &["two"]),
+        ],
     );
 
-    let mut scoped_one = spawn_adapter(&dir, &AdapterOptions {
-        profile: Some("scope-one"),
-        ..AdapterOptions::default()
-    });
-    let mut scoped_two = spawn_adapter(&dir, &AdapterOptions {
-        profile: Some("scope-two"),
-        ..AdapterOptions::default()
-    });
+    let mut scoped_one = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("scope-one"),
+            ..AdapterOptions::default()
+        },
+    );
+    let mut scoped_two = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("scope-two"),
+            ..AdapterOptions::default()
+        },
+    );
     scoped_one.initialize("matrix-scope-one");
     scoped_two.initialize("matrix-scope-two");
+
+    // A partial adapter claim must not fall back to the daemon bearer's
+    // unscoped administrative identity.
+    let descriptor = wait_for_descriptor(&dir, Duration::from_secs(10));
+    let endpoint = descriptor["endpoint"].as_str().expect("endpoint");
+    let token = descriptor["token"].as_str().expect("token");
+    let rejected = ureq::post(&format!("http://{endpoint}/mcp"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set(
+            conduit_lib::stdio_adapter::ADAPTER_PROFILE_HEADER,
+            "scope-two",
+        )
+        .set("Content-Type", "application/json")
+        .send_string(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    assert!(
+        matches!(rejected, Err(ureq::Error::Status(401, _))),
+        "a profile claim without a client id must be refused"
+    );
+    let rejected_root = ureq::post(&format!("http://{endpoint}/mcp"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set(conduit_lib::stdio_adapter::ADAPTER_CWD_HEADER, "!!!")
+        .set("Content-Type", "application/json")
+        .send_string(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    assert!(
+        matches!(rejected_root, Err(ureq::Error::Status(401, _))),
+        "a root claim without a client id must be refused"
+    );
+    let malformed_root = ureq::post(&format!("http://{endpoint}/mcp"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set(
+            conduit_lib::stdio_adapter::ADAPTER_CLIENT_ID_HEADER,
+            "matrix-root",
+        )
+        .set(conduit_lib::stdio_adapter::ADAPTER_CWD_HEADER, "!!!")
+        .set("Content-Type", "application/json")
+        .send_string(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    assert!(
+        matches!(malformed_root, Err(ureq::Error::Status(401, _))),
+        "a malformed root claim must be refused"
+    );
 
     scoped_one.wait_for_tool_where(
         "the one__ prefix",
@@ -1210,42 +1353,224 @@ fn matrix_routing_profiles_cannot_reach_servers_outside_their_scope() {
         .find(|name| name.starts_with("two__"))
         .expect("scope-two exposes its downstream tool")
         .clone();
+    let before = transcript_method_count(&transcript_two, "tools/call");
     let reply = scoped_one.request(
         "tools/call",
         json!({ "name": out_of_scope, "arguments": {} }),
     );
     assert!(
-        reply.get("error").is_some(),
-        "an out-of-scope call must not execute: {reply}"
+        reply["result"]["isError"] == true || reply.get("error").is_some(),
+        "an out-of-scope call must be refused: {reply}"
+    );
+    assert_eq!(
+        transcript_method_count(&transcript_two, "tools/call"),
+        before,
+        "the out-of-scope call reached the downstream server"
     );
 }
 
-#[ignore = "P3.1/P3.3 route session-scoped surfaces (subscriptions, list_changed, and the rest of the matrix's routing rows) only to the originating session; not started (see #910). Run with --ignored once it lands, and remove this attribute in the PR that lands it."]
 #[test]
-fn matrix_routing_session_scoped_notifications_reach_only_the_subscriber() {
-    let _guard = CASE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (_fixture, dir) = Fixture::new("route-notifications");
-    let transcript = dir.join("downstream.jsonl");
+fn matrix_routing_live_profile_change_reopens_the_adapter_session() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("live-rescope");
+    let path = dir.join("registry.json");
     write_registry(
         &dir,
-        vec![mock_server_entry("mock", &transcript, None)],
-        vec![],
+        vec![
+            mock_server_entry("one", &dir.join("one.jsonl"), None),
+            mock_server_entry("two", &dir.join("two.jsonl"), None),
+        ],
+        vec![
+            profile("scope-one", &["one"]),
+            profile("scope-two", &["two"]),
+        ],
+    );
+    let mut reg = registry::load_from(&path).expect("load fixture registry");
+    reg.client_scopes
+        .insert("matrix-rescope".to_string(), "scope-one".to_string());
+    registry::save_to(&path, &reg).expect("set initial client scope");
+
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            client_id: Some("matrix-rescope"),
+            ..AdapterOptions::default()
+        },
+    );
+    client.initialize("matrix-rescope");
+    client.wait_for_tool_where(
+        "the one__ prefix",
+        |name| name.starts_with("one__"),
+        Duration::from_secs(30),
     );
 
-    let mut session_a = spawn_adapter(&dir, &AdapterOptions::default());
-    let mut session_b = spawn_adapter(&dir, &AdapterOptions::default());
+    reg.client_scopes
+        .insert("matrix-rescope".to_string(), "scope-two".to_string());
+    registry::save_to(&path, &reg).expect("change client scope");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = client.request("tools/list", json!({}));
+        if reply.get("error").is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the old session was never invalidated"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    client.wait_for_tool_where(
+        "the two__ prefix after recovery",
+        |name| name.starts_with("two__"),
+        Duration::from_secs(30),
+    );
+    let names = client.tool_names();
+    assert!(
+        !names.iter().any(|name| name.starts_with("one__")),
+        "the reopened session still exposes the old profile: {names:?}"
+    );
+}
+
+#[test]
+fn matrix_routing_declared_root_selects_folder_profile() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("folder-scope");
+    let cwd = std::fs::canonicalize(fixture.add("launch-cwd")).expect("adapter cwd");
+    let root = std::fs::canonicalize(fixture.add("mapped-project")).expect("project root");
+    let transcript_one = dir.join("one.jsonl");
+    write_registry(
+        &dir,
+        vec![
+            mock_server_entry("one", &transcript_one, None),
+            mock_server_entry("two", &dir.join("two.jsonl"), None),
+        ],
+        vec![
+            profile("scope-one", &["one"]),
+            profile("scope-two", &["two"]),
+        ],
+    );
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).expect("load fixture registry");
+    reg.client_scopes
+        .insert("matrix-folder".to_string(), "scope-one".to_string());
+    reg.folder_profiles.push(FolderProfile {
+        path: root.display().to_string(),
+        profile: "scope-two".to_string(),
+    });
+    registry::save_to(&path, &reg).expect("set folder profile");
+
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            client_id: Some("matrix-folder"),
+            cwd: Some(&cwd),
+            roots: vec![root],
+            ..AdapterOptions::default()
+        },
+    );
+    client.initialize("matrix-folder");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let names = loop {
+        let reply = client.request("tools/list", json!({}));
+        if let Some(tools) = reply["result"]["tools"].as_array() {
+            let names: Vec<String> = tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect();
+            if names.iter().any(|name| name.starts_with("two__")) {
+                break names;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the declared root never selected its folder profile: {reply}\n{}",
+            client.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        !names.iter().any(|name| name.starts_with("one__")),
+        "the configured profile leaked into the folder scope: {names:?}"
+    );
+    let before = transcript_method_count(&transcript_one, "tools/call");
+    let refused = client.request(
+        "tools/call",
+        json!({"name": "one__echo", "arguments": {"text": "blocked"}}),
+    );
+    assert!(
+        refused["result"]["isError"] == true || refused.get("error").is_some(),
+        "a call outside the folder profile was accepted: {refused}"
+    );
+    assert_eq!(transcript_method_count(&transcript_one, "tools/call"), before);
+}
+
+#[test]
+fn matrix_routing_server_change_notifies_only_authorized_sessions() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("route-notifications");
+    let transcript_one = dir.join("one.jsonl");
+    let transcript_two = dir.join("two.jsonl");
+    write_registry(
+        &dir,
+        vec![
+            mock_server_entry("one", &transcript_one, None),
+            mock_server_entry("two", &transcript_two, None),
+        ],
+        vec![
+            profile("scope-one", &["one"]),
+            profile("scope-two", &["two"]),
+        ],
+    );
+
+    let options = |profile| AdapterOptions {
+        profile: Some(profile),
+        ..AdapterOptions::default()
+    };
+    let mut session_a = spawn_adapter(&dir, &options("scope-one"));
+    let mut session_b = spawn_adapter(&dir, &options("scope-one"));
+    let mut session_c = spawn_adapter(&dir, &options("scope-two"));
     session_a.initialize("matrix-route-a");
     session_b.initialize("matrix-route-b");
+    session_c.initialize("matrix-route-c");
     let grow = session_a.wait_for_tool("__grow", Duration::from_secs(30));
+    session_b.wait_for_tool_where(
+        "the one__ prefix",
+        |name| name.starts_with("one__"),
+        Duration::from_secs(30),
+    );
+    session_c.wait_for_tool_where(
+        "the two__ prefix",
+        |name| name.starts_with("two__"),
+        Duration::from_secs(30),
+    );
+    // Ignore the initial catalog's own change notifications. Only the grow
+    // below is relevant to this assertion.
+    for client in [&session_a, &session_b, &session_c] {
+        while client.lines.try_recv().is_ok() {}
+    }
 
-    // A's grow changes the server's catalog and emits tools/list_changed. That
-    // is A's session's business: B must neither receive the notification nor
-    // see the tool A's session grew.
+    // A and B share the same downstream server. Its catalog change belongs to
+    // both of them; C is scoped to another server and must not learn about it.
     session_a.call_tool(&grow, json!({}));
     session_a.next_notification("notifications/tools/list_changed", Duration::from_secs(10));
-    session_b.assert_no_notification(Duration::from_secs(3), "session B received A's notification");
+    session_b.next_notification("notifications/tools/list_changed", Duration::from_secs(10));
+    session_b.wait_for_tool("__greet", Duration::from_secs(30));
+    session_c.assert_no_notification(
+        Duration::from_secs(3),
+        "out-of-scope session received a notification",
+    );
     assert!(
-        !session_b.tool_names().iter().any(|n| n.ends_with("__greet")),
-        "a tool grown in A's session leaked into B's catalog"
+        !session_c
+            .tool_names()
+            .iter()
+            .any(|n| n.ends_with("__greet")),
+        "an out-of-scope tool leaked into C's catalog"
     );
 }
