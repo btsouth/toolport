@@ -23,7 +23,7 @@ use std::io::{BufRead, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -17392,11 +17392,21 @@ fn serve_http(state: GatewayState, port: u16) {
 struct HttpProxyState {
     token_sha256: String,
     bind_host: String,
+    /// Renewal holds a read lock through its POST; release takes the write lock
+    /// so no worker can reauthorize the bearer after shutdown.
+    lease_open: RwLock<bool>,
     latest_descriptor: Mutex<conduit_lib::daemon::DaemonDescriptor>,
 }
 
 impl HttpProxyState {
     fn renew(&self) -> Result<conduit_lib::daemon::DaemonDescriptor, String> {
+        let open = self
+            .lease_open
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*open {
+            return Err("the desktop HTTP service is stopping".to_string());
+        }
         let descriptor = conduit_lib::stdio_adapter::ensure_host_daemon()?;
         let url = format!(
             "http://{}{}",
@@ -17419,6 +17429,11 @@ impl HttpProxyState {
     }
 
     fn release(&self) {
+        let mut open = self
+            .lease_open
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *open = false;
         let descriptor = self
             .latest_descriptor
             .lock()
@@ -17514,6 +17529,7 @@ fn serve_http_proxy(port: u16) -> Result<(), String> {
     let state = Arc::new(HttpProxyState {
         token_sha256: registry::sha256_hex(&token),
         bind_host,
+        lease_open: RwLock::new(true),
         latest_descriptor: Mutex::new(descriptor),
     });
     state.renew()?;
