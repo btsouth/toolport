@@ -584,6 +584,11 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
   The daemon's bearer-gated `GET /host/topology` reports its live session count,
   ordinary downstream slots, and rooted launches for that run. It is absent
   from the public HTTP bridge and does not expose launch parameters or secrets.
+  `npm run build:gateway && node benchmark/topology-acceptance.mjs 3` compares
+  the legacy and opt-in roles with three real gateway processes and an isolated
+  mock downstream. It writes process counts, private memory, and startup and
+  first-call latency to `.verify/`. This repeatable fixture is a preflight;
+  P4.1 still needs the two-Grok-one-Claude run with the user's real servers.
 - P4.2 default flip only after parity suites pass on Windows, macOS, and Linux, keeping a
   documented legacy kill switch for at least one release.
 - P4.3 desktop Shared HTTP adopts a daemon service lease; app exit releases the lease
