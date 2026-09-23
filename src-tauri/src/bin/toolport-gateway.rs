@@ -26780,18 +26780,23 @@ mod tests {
         );
 
         let pii_client = Some(caller.session_owner.identity.as_str());
-        with_pii_session(pii_client, |map| {
-            *map = pii::SessionMap::new();
-            map.pseudonymize("crm", "ada@example.com");
-        });
         let listen = out.mcp_listen.take().unwrap();
         let (cleanup_state, cleanup_key) = listen.cleanup.unwrap();
+        {
+            let _session = McpSessionGuard::enter(Some(cleanup_key.clone()));
+            with_pii_session(pii_client, |map| {
+                *map = pii::SessionMap::new();
+                map.pseudonymize("crm", "ada@example.com");
+            });
+        }
+        let verify_key = cleanup_key.clone();
         let reader = McpSseReader::with_cleanup(listen.session, cleanup_state, cleanup_key);
         drop(reader);
         assert!(
             state.mcp_sessions.lock().unwrap().is_empty(),
             "closing the POST response removes the listener"
         );
+        let _session = McpSessionGuard::enter(Some(verify_key));
         assert!(
             !with_pii_session(pii_client, |map| !map.is_empty()),
             "closing the SSE conversation must drop its PII map"
@@ -28316,10 +28321,13 @@ mod tests {
             Ok(s) => s,
             Err(_) => panic!("mint s1 failed"),
         };
-        with_pii_session(pii_client, |map| {
-            *map = pii::SessionMap::new();
-            map.pseudonymize("crm", "ada@example.com");
-        });
+        {
+            let _session = McpSessionGuard::enter(Some(s1.clone()));
+            with_pii_session(pii_client, |map| {
+                *map = pii::SessionMap::new();
+                map.pseudonymize("crm", "ada@example.com");
+            });
+        }
         {
             let mut table = state.resource_subs.lock().unwrap();
             table.add(&s1, "file://orphan", "srv").unwrap();
@@ -28348,6 +28356,7 @@ mod tests {
             "reaped session must not leave subscription orphans"
         );
         assert!(table.sessions_for_uri("file://orphan").is_empty());
+        let _session = McpSessionGuard::enter(Some(s1));
         assert!(
             !with_pii_session(pii_client, |map| !map.is_empty()),
             "reaped session must not leave its PII map behind"
