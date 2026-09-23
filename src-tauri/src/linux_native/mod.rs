@@ -1147,6 +1147,24 @@ fn newly_observed_security_events(
     (current, security_attention_incidents(&newcomers))
 }
 
+/// A damaged quarantine store makes duplicate suppression uncertain, but it
+/// must not stop the independent security-event feed. The quarantine badge
+/// reports its own read failure as unknown.
+fn read_security_watch_snapshot() -> Result<
+    (
+        Vec<serde_json::Value>,
+        Result<Vec<serde_json::Value>, String>,
+    ),
+    String,
+> {
+    let events = crate::integrity::read_recent(25)
+        .map_err(|error| format!("could not read security events: {error}"))?;
+    // Keep the error distinct from a known-empty quarantine. The badge displays
+    // unknown, while this watcher still announces new security findings.
+    let quarantined = crate::integrity::all_quarantined();
+    Ok((events, quarantined))
+}
+
 fn security_attention_incidents(events: &[serde_json::Value]) -> Vec<serde_json::Value> {
     events
         .iter()
@@ -1192,21 +1210,17 @@ fn start_security_event_watch(app: &adw::Application, alert: SecurityEventAlert)
         let seen = seen.clone();
         let running = running.clone();
         gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(|| -> Result<_, String> {
-                Ok((
-                    crate::integrity::read_recent(25)
-                        .map_err(|error| format!("could not read security events: {error}"))?,
-                    crate::integrity::all_quarantined()?,
-                ))
-            })
-            .await;
+            let result = gtk::gio::spawn_blocking(read_security_watch_snapshot).await;
             running.set(false);
             let Ok(Ok((events, quarantined))) = result else {
                 return;
             };
             let mut guard = seen.borrow_mut();
-            let (current, newcomers) =
-                newly_observed_security_events(guard.as_ref(), &events, &quarantined);
+            let (current, newcomers) = newly_observed_security_events(
+                guard.as_ref(),
+                &events,
+                quarantined.as_deref().unwrap_or_default(),
+            );
             *guard = Some(current);
             if newcomers.is_empty() {
                 return;
@@ -3394,7 +3408,8 @@ impl ActivityPage {
                 activity_section_changed(
                     previous.map(|snapshot| snapshot.tool_identities.as_slice()),
                     &snapshot.tool_identities,
-                ),
+                ) || previous.and_then(|snapshot| snapshot.tool_identities_error.as_deref())
+                    != snapshot.tool_identities_error.as_deref(),
                 activity_section_changed(
                     previous.map(|snapshot| snapshot.search_traces.as_slice()),
                     &snapshot.search_traces,
@@ -3828,6 +3843,14 @@ impl ActivityPage {
         };
         while let Some(child) = self.identity_list.first_child() {
             self.identity_list.remove(&child);
+        }
+        if let Some(error) = &snapshot.tool_identities_error {
+            let message =
+                empty_activity_label(&format!("Tool identities are unavailable: {error}"));
+            message.remove_css_class("toolport-muted");
+            message.add_css_class("error");
+            self.identity_list.append(&message);
+            return;
         }
         if snapshot.tool_identities.is_empty() {
             self.identity_list.append(&empty_activity_label(
@@ -11004,6 +11027,71 @@ mod tests {
         later["ts"] = serde_json::json!(2000);
         let (_, newcomers) = newly_observed_security_events(Some(&baseline), &[later], &[]);
         assert_eq!(newcomers.len(), 1);
+    }
+
+    #[test]
+    fn damaged_quarantine_store_keeps_security_feed_and_activity_available() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        struct CleanupDir(std::path::PathBuf);
+        impl Drop for CleanupDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-native-damaged-quarantine-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = CleanupDir(dir.clone());
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let event = serde_json::json!({
+            "ts": 1000,
+            "type": "tool_drift",
+            "server": "srv",
+            "tool": "srv__wipe",
+            "change": "changed",
+            "severity": "high"
+        });
+        std::fs::write(dir.join("security.jsonl"), format!("{event}\n")).unwrap();
+        std::fs::write(dir.join("quarantine.json"), "{ not json").unwrap();
+
+        let (events, quarantined) =
+            read_security_watch_snapshot().expect("the security feed remains readable");
+        assert_eq!(events, vec![event]);
+        assert!(quarantined.is_err(), "quarantine state remains unknown");
+        let (_, newcomers) = newly_observed_security_events(
+            Some(&std::collections::HashSet::new()),
+            &events,
+            quarantined.as_deref().unwrap_or_default(),
+        );
+        assert_eq!(newcomers.len(), 1, "a new finding must still alert");
+
+        let activity = state::load_activity_snapshot().expect("Activity remains readable");
+        assert!(
+            activity
+                .tool_identities_error
+                .as_deref()
+                .is_some_and(|error| error.contains("quarantine")),
+            "the identity panel must say why it is unknown: {activity:?}"
+        );
+        assert_eq!(activity.security_events, events);
+
+        std::fs::write(dir.join("quarantine.json"), "{}").unwrap();
+        std::fs::write(dir.join("tool-pins.json"), "{ not json").unwrap();
+        let activity = state::load_activity_snapshot().expect("pin damage stays panel-local");
+        assert!(
+            activity
+                .tool_identities_error
+                .as_deref()
+                .is_some_and(|error| error.contains("pin store")),
+            "a lost pin baseline must not look like an empty identity panel: {activity:?}"
+        );
+        assert_eq!(activity.security_events, events);
     }
 
     #[test]

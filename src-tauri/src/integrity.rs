@@ -396,7 +396,21 @@ fn load_pins(profile: Option<&str>) -> PinsLoad {
     let Some(path) = pins_path(profile) else {
         return PinsLoad::Fresh;
     };
-    if !path.exists() {
+    // A vanished primary with a backup is not a first run. Reuse the last
+    // parseable baseline, just as we do for an unusable primary. A metadata
+    // error other than NotFound is also not evidence of a fresh profile.
+    let missing = match std::fs::metadata(&path) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    };
+    let backup = pins_backup_path(&path);
+    if missing {
+        match std::fs::metadata(&backup) {
+            Ok(_) => return read_pins_at(&backup).map_or(PinsLoad::Corrupt, PinsLoad::Loaded),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return PinsLoad::Corrupt,
+        }
         if profile.is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, true)) {
             return PinsLoad::Corrupt;
         }
@@ -410,7 +424,6 @@ fn load_pins(profile: Option<&str>) -> PinsLoad {
     // app breaking - fall back to the last copy that parsed. The backup is only ever
     // written from a file that already parsed, so it cannot itself be the corrupt one.
     // Deliberately read-only: the next successful save rewrites the primary.
-    let backup = pins_backup_path(&path);
     if backup.exists() {
         if let Some(pins) = read_pins_at(&backup) {
             return PinsLoad::Loaded(pins);
@@ -850,31 +863,39 @@ pub fn baselines(profile: Option<&str>) -> BTreeMap<String, ToolBaseline> {
 /// Aggregate baselines across current stable-id pin files, merged by tool name.
 /// The legacy fallback is also included for the distinct HTTP-union namespace, but retained
 /// pre-v2 name-derived files are migration evidence and must not affect live identity state.
-/// must union every profile's pins rather than guess a single one. For a tool seen in
+/// We must union every profile's pins rather than guess a single one. For a tool seen in
 /// several profiles: earliest first_seen, latest last_changed, and the fingerprint from
-/// the most recent change.
+/// the most recent change. A damaged store fails the whole view rather than silently
+/// dropping that profile's pinned identities.
 pub fn all_baselines() -> Result<BTreeMap<String, ToolBaseline>, String> {
     let mut merged: BTreeMap<String, ToolBaseline> = BTreeMap::new();
     let Some(dir) = crate::registry::conduit_dir() else {
         return Ok(merged);
     };
     let registry = crate::registry::load_resolved()?;
-    let mut paths = vec![dir.join("tool-pins.json")];
-    paths.extend(
-        registry
-            .profiles
-            .iter()
-            .filter_map(|profile| pins_path(Some(&profile.id))),
+    let mut stores = vec![(String::new(), dir.join("tool-pins.json"))];
+    stores.extend(
+        registry.profiles.iter().filter_map(|profile| {
+            pins_path(Some(&profile.id)).map(|path| (profile.id.clone(), path))
+        }),
     );
-    for path in paths {
-        let Ok(s) = std::fs::read_to_string(path) else {
-            continue;
+    for (profile, path) in stores {
+        let profile_id = if profile.is_empty() {
+            None
+        } else {
+            Some(profile.as_str())
         };
-        let Ok(pins) = serde_json::from_str::<BTreeMap<String, PinRepr>>(&s) else {
-            continue;
+        let pins = match load_pins(profile_id) {
+            PinsLoad::Fresh => continue,
+            PinsLoad::Loaded(pins) => pins,
+            PinsLoad::Corrupt => {
+                return Err(format!(
+                    "integrity pin store for {} at {path:?} is unreadable or corrupt; refusing to present an incomplete identity view",
+                    profile_store_label(&profile)
+                ));
+            }
         };
-        for (tool, repr) in pins {
-            let p: Pin = repr.into();
+        for (tool, p) in pins {
             let base = ToolBaseline {
                 fingerprint: p.fp,
                 first_seen: p.first_seen,
@@ -1017,9 +1038,9 @@ pub fn tool_identities(
     Ok(ids)
 }
 
-/// Human label for a quarantine store in cross-profile scan errors, so a failure
-/// names which profile's store it was instead of only a hashed file name.
-fn quarantine_store_label(profile: &str) -> String {
+/// Human label for a profile store in cross-profile scan errors, so a failure
+/// names the profile instead of only a hashed file name.
+fn profile_store_label(profile: &str) -> String {
     if profile.is_empty() {
         "the default profile".to_string()
     } else {
@@ -1039,7 +1060,7 @@ fn quarantine_store_label(profile: &str) -> String {
 /// another process's `atomic_write` rename window cannot turn into a spurious
 /// failure on its own.
 fn read_quarantine_for_scan(profile: &str, path: &Path) -> Result<Option<Quarantine>, String> {
-    let label = quarantine_store_label(profile);
+    let label = profile_store_label(profile);
     match read_quarantine_file(path) {
         // A store that vanished under real pins is the same damage as a corrupt one,
         // and the enforcement read already fails closed on it (SBS-871), so the union
@@ -4653,6 +4674,70 @@ mod tests {
             all_quarantined().is_err(),
             "a corrupt registry must not become an authoritative empty cross-profile view"
         );
+    }
+
+    /// An unreadable, empty, or corrupt pin store must not disappear from the
+    /// cross-profile identity view while another profile remains readable.
+    #[test]
+    fn cross_profile_baselines_fail_on_a_damaged_store() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("aggregate-damaged-pins");
+        let mut registry = crate::registry::load_resolved().expect("fresh registry");
+        for id in ["billing", "support"] {
+            registry.profiles.push(crate::registry::Profile {
+                id: id.to_string(),
+                name: id.to_string(),
+                enabled_server_ids: Vec::new(),
+                tool_scope: std::collections::HashMap::new(),
+            });
+        }
+        crate::registry::save(&registry).expect("save two-profile registry");
+        write_loaded_pin_store(Some("support"));
+        let damaged = pins_path(Some("billing")).expect("billing pin path");
+
+        for contents in ["{ not json", ""] {
+            std::fs::write(&damaged, contents).unwrap();
+            let error = all_baselines().expect_err("damage must fail the union");
+            assert!(
+                error.contains("profile \"billing\"") && error.contains(&format!("{damaged:?}")),
+                "error must name the damaged profile and path: {error}"
+            );
+        }
+        std::fs::remove_file(&damaged).unwrap();
+        std::fs::create_dir(&damaged).unwrap();
+        assert!(
+            all_baselines().is_err(),
+            "an unreadable store must fail too"
+        );
+        std::fs::remove_dir(&damaged).unwrap();
+
+        let baselines = all_baselines().expect("fresh billing and readable support");
+        assert!(baselines.contains_key("srv__a"));
+    }
+
+    /// A vanished primary with a retained backup is evidence of an existing
+    /// baseline, not a first run. Enforcement and the aggregate must both use it.
+    #[test]
+    fn vanished_pin_store_recovers_from_backup_for_enforcement_and_scan() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("aggregate-vanished-pins");
+        let path = pins_path(None).expect("default pin path");
+        let backup = pins_backup_path(&path);
+        std::fs::write(&backup, r#"{"srv__a":"deadbeef"}"#).unwrap();
+
+        assert!(
+            matches!(load_pins(None), PinsLoad::Loaded(_)),
+            "a backup means the profile is not fresh"
+        );
+        assert!(all_baselines().unwrap().contains_key("srv__a"));
+
+        std::fs::write(&backup, "{ not json").unwrap();
+        assert!(matches!(load_pins(None), PinsLoad::Corrupt));
+        assert!(all_baselines().is_err(), "a damaged backup is unknown");
+
+        std::fs::remove_file(&backup).unwrap();
+        assert!(matches!(load_pins(None), PinsLoad::Fresh));
+        assert!(all_baselines().unwrap().is_empty());
     }
 
     /// A store that exists but cannot be read must fail the cross-profile view
