@@ -598,6 +598,32 @@ fn path_looks_like_our_install(path: &Path) -> bool {
         || n.contains("conduit.app")
 }
 
+/// An explicit data directory is an isolated Toolport instance. Only its
+/// published `bin` directory belongs to this startup reaper. Compare the
+/// directories rather than executable paths so a Linux ` (deleted)` image
+/// remains eligible after an in-place replacement.
+fn in_explicit_reap_scope(proc: &GatewayProcess, bin_dir: Option<&Path>) -> bool {
+    let Some(bin_dir) = bin_dir else {
+        return true;
+    };
+    let Some(parent) = proc.path.as_ref().and_then(|path| path.parent()) else {
+        return false;
+    };
+    let actual = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    let expected = std::fs::canonicalize(bin_dir).unwrap_or_else(|_| bin_dir.to_path_buf());
+    if !actual.is_absolute() || !expected.is_absolute() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        normalize_path(&actual) == normalize_path(&expected)
+    }
+    #[cfg(not(windows))]
+    {
+        actual == expected
+    }
+}
+
 /// Pure keep/kill decision. Getting this wrong is expensive both ways: too eager
 /// kills the bridge we just started; too shy leaves users on old gateway code.
 pub fn decide_reap(proc: &GatewayProcess, ctx: &ReapContext) -> ReapDecision {
@@ -1068,7 +1094,18 @@ pub fn reap_stale(extra_keep: &[PathBuf]) -> ReapReport {
             .collect(),
         kill_all: false,
     };
-    let report = reap_with_context(&ctx);
+    // An explicit data directory is commonly used for an isolated dev or
+    // acceptance run. The global process table includes live gateways from
+    // other installations, whose paths are not in this instance's keep set.
+    let scope = crate::brand::env_var_os("TOOLPORT_DATA_DIR", "CONDUIT_DATA_DIR")
+        .map(PathBuf::from)
+        .map(|data_dir| data_dir.join("bin"));
+    let report = reap_listed(&ctx, || {
+        list_gateway_processes()
+            .into_iter()
+            .filter(|proc| in_explicit_reap_scope(proc, scope.as_deref()))
+            .collect()
+    });
     log_reap_report("stale reaper", &report);
     report
 }
@@ -2037,6 +2074,74 @@ mod tests {
                 basename: parent_name.into(),
             }),
             ..proc(pid, basename, path)
+        }
+    }
+
+    #[test]
+    fn explicit_data_dir_limits_stale_reaping_to_its_own_gateways() {
+        let dir = ScratchDir::new("explicit-reap-scope");
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let foreign = proc(
+            41,
+            "toolport-gateway",
+            Some("/home/user/.config/Toolport/bin/toolport-gateway"),
+        );
+        let own_path = bin.join("toolport-gateway");
+        let own = proc(42, "toolport-gateway", own_path.to_str());
+        let sibling_path = dir.root.join("Toolport-other/bin/toolport-gateway");
+        let sibling = proc(43, "toolport-gateway", sibling_path.to_str());
+        let nested_path = dir.join("other/Toolport/bin/toolport-gateway");
+        let nested = proc(44, "toolport-gateway", nested_path.to_str());
+        let unreadable = proc(44, "toolport-gateway-1.0.0", None);
+        let keep_path = bin.join("current");
+        let context = ctx("1.20.0", &[keep_path.to_str().unwrap()], false);
+
+        // The old global decision would kill the installed copy during an
+        // isolated GTK launch. The scoped enumerator must not pass it through.
+        assert_eq!(decide_reap(&foreign, &context), ReapDecision::Kill);
+        assert!(!in_explicit_reap_scope(&foreign, Some(&bin)));
+        assert!(in_explicit_reap_scope(&own, Some(&bin)));
+        assert_eq!(decide_reap(&own, &context), ReapDecision::Kill);
+        assert!(!in_explicit_reap_scope(&sibling, Some(&bin)));
+        assert!(!in_explicit_reap_scope(&nested, Some(&bin)));
+        assert!(!in_explicit_reap_scope(&unreadable, Some(&bin)));
+        assert!(in_explicit_reap_scope(&foreign, None));
+
+        let deleted_path = bin.join("toolport-gateway (deleted)");
+        let deleted = proc(45, "toolport-gateway", deleted_path.to_str());
+        assert!(in_explicit_reap_scope(&deleted, Some(&bin)));
+
+        let alias = dir.join("..").join("Toolport/bin");
+        assert!(in_explicit_reap_scope(&own, Some(&alias)));
+
+        #[cfg(unix)]
+        {
+            let symlink = dir.root.join("linked-bin");
+            std::os::unix::fs::symlink(&bin, &symlink).unwrap();
+            assert!(in_explicit_reap_scope(&own, Some(&symlink)));
+        }
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let distinct_bin = dir.root.join("toolport/bin");
+            std::fs::create_dir_all(&distinct_bin).unwrap();
+            let distinct_path = distinct_bin.join("toolport-gateway");
+            let distinct = proc(46, "toolport-gateway", distinct_path.to_str());
+            assert!(!in_explicit_reap_scope(&distinct, Some(&bin)));
+        }
+
+        #[cfg(windows)]
+        {
+            let windows = proc(
+                47,
+                "toolport-gateway.exe",
+                Some("c:/data/toolport/bin/toolport-gateway.exe"),
+            );
+            assert!(in_explicit_reap_scope(
+                &windows,
+                Some(Path::new("C:\\Data\\Toolport\\bin"))
+            ));
         }
     }
 
