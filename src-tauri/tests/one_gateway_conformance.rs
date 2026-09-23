@@ -21,13 +21,16 @@
 //! `mock-mcp-server` fixture as the downstream. Every wait is bounded, so a
 //! case that hangs fails its own deadline rather than the CI job.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use conduit_lib::approval::{self, BrokerChallenge, BrokerProof, EndpointDescriptor};
 use conduit_lib::daemon::descriptor_path;
 use conduit_lib::registry::{self, EnvVar, FolderProfile, Profile, Registry, ServerEntry};
 use conduit_lib::topology::CompatKey;
@@ -109,6 +112,7 @@ struct AdapterClient {
     /// side closed: dropping the handle is what delivers EOF.
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     lines: mpsc::Receiver<String>,
+    pending_notifications: Mutex<VecDeque<Value>>,
     next_id: i64,
     /// Whether `initialize` will declare the roots capability. Kept beside the
     /// reader thread that answers `roots/list`, so the two cannot disagree.
@@ -272,6 +276,7 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
         child,
         stdin,
         lines,
+        pending_notifications: Mutex::new(VecDeque::new()),
         next_id: 0,
         declares_roots,
         roots_queries,
@@ -356,7 +361,22 @@ impl AdapterClient {
                 "unexpected message before the answer to {id}: {message}\n{}",
                 self.diagnostics()
             );
+            self.pending_notifications
+                .lock()
+                .unwrap()
+                .push_back(message);
         }
+    }
+
+    fn observed_message(&self, within: Duration) -> Option<Value> {
+        if let Some(message) = self.pending_notifications.lock().unwrap().pop_front() {
+            return Some(message);
+        }
+        let line = self.lines.recv_timeout(within).ok()?;
+        Some(
+            serde_json::from_str(&line)
+                .unwrap_or_else(|error| panic!("invalid JSON ({error}): {line}")),
+        )
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
@@ -479,12 +499,9 @@ impl AdapterClient {
         let deadline = Instant::now() + within;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let line = self
-                .lines
-                .recv_timeout(remaining.max(Duration::from_millis(1)))
-                .unwrap_or_else(|_| panic!("no {method} notification before the deadline"));
-            let message: Value = serde_json::from_str(&line)
-                .unwrap_or_else(|e| panic!("invalid JSON ({e}): {line}"));
+            let message = self
+                .observed_message(remaining.max(Duration::from_millis(1)))
+                .unwrap_or_else(|| panic!("no {method} notification before the deadline"));
             if message.get("method").is_some() && message.get("id").is_none() {
                 assert_eq!(
                     message["method"], method,
@@ -496,9 +513,8 @@ impl AdapterClient {
     }
 
     fn assert_no_notification(&self, within: Duration, label: &str) {
-        match self.lines.recv_timeout(within) {
-            Ok(line) => panic!("{label}: unexpected message {line}"),
-            Err(_) => {}
+        if let Some(message) = self.observed_message(within) {
+            panic!("{label}: unexpected message {message}");
         }
     }
 }
@@ -1508,6 +1524,114 @@ fn matrix_routing_profile_tool_scopes_are_independent_on_one_shared_server() {
 }
 
 #[test]
+fn matrix_routing_approved_call_rebinds_to_its_profile_view() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("profile-hitl");
+    let transcript = dir.join("shared.jsonl");
+    let mut echo_only = profile("echo-only", &["shared"]);
+    echo_only
+        .tool_scope
+        .insert("shared".to_string(), vec!["echo".to_string()]);
+    let mut add_only = profile("add-only", &["shared"]);
+    add_only
+        .tool_scope
+        .insert("shared".to_string(), vec!["add".to_string()]);
+    let mut server = mock_server_entry("shared", &transcript, None);
+    // Imported servers require human approval even for a non-destructive tool.
+    server.source = Some("shared".to_string());
+    write_registry(&dir, vec![server], vec![echo_only, add_only]);
+    let registry_path = dir.join("registry.json");
+    let mut reg = registry::load_from(&registry_path).expect("load registry");
+    reg.set_human_approval(true);
+    registry::save_to(&registry_path, &reg).expect("enable approval");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("approval listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let token = "matrix-approval-token".to_string();
+    let descriptor = EndpointDescriptor {
+        endpoint: listener.local_addr().unwrap().to_string(),
+        unix_endpoint: None,
+        token: token.clone(),
+    };
+    std::fs::write(
+        dir.join(approval::ENDPOINT_FILE),
+        serde_json::to_vec(&descriptor).unwrap(),
+    )
+    .expect("approval descriptor");
+    let broker = std::thread::spawn(move || {
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("approval challenge");
+                    let challenge: BrokerChallenge =
+                        serde_json::from_str(&line).expect("valid challenge");
+                    let proof = BrokerProof {
+                        toolport_approval_proof: approval::challenge_proof(
+                            &token,
+                            &challenge.toolport_approval_challenge,
+                        ),
+                    };
+                    writeln!(stream, "{}", serde_json::to_string(&proof).unwrap())
+                        .expect("approval proof");
+                    line.clear();
+                    reader.read_line(&mut line).expect("approval request");
+                    let request: approval::ApprovalRequest =
+                        serde_json::from_str(&line).expect("valid approval request");
+                    assert_eq!(request.server, "shared");
+                    assert_eq!(request.tool, "echo");
+                    writeln!(stream, "\"approved\"").expect("approval decision");
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "no approval request");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("approval accept failed: {error}"),
+            }
+        }
+    });
+
+    let mut echo = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("echo-only"),
+            ..AdapterOptions::default()
+        },
+    );
+    let mut add = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("add-only"),
+            ..AdapterOptions::default()
+        },
+    );
+    echo.initialize("matrix-hitl-echo");
+    add.initialize("matrix-hitl-add");
+    let echo_tool = echo.wait_for_tool("__echo", Duration::from_secs(30));
+    let add_tool = add.wait_for_tool("__add", Duration::from_secs(30));
+    assert!(!add.tool_names().contains(&echo_tool));
+    assert_eq!(
+        text_of(&echo.call_tool(&echo_tool, json!({ "text": "approved" }))),
+        "approved"
+    );
+    broker.join().expect("approval broker");
+    assert!(
+        echo.call_tool(&add_tool, json!({ "a": 2, "b": 3 }))["isError"] == true,
+        "approval did not preserve the caller's tool scope"
+    );
+}
+
+#[test]
 fn matrix_routing_live_tool_scope_change_reopens_the_adapter_session() {
     let _guard = CASE_LOCK
         .lock()
@@ -1604,9 +1728,8 @@ fn matrix_routing_tool_change_notifies_only_profiles_that_can_see_it() {
     // attributing a later notification to the grow call.
     for client in [&grow, &echo] {
         while client
-            .lines
-            .recv_timeout(Duration::from_millis(500))
-            .is_ok()
+            .observed_message(Duration::from_millis(500))
+            .is_some()
         {}
     }
 
@@ -1614,11 +1737,9 @@ fn matrix_routing_tool_change_notifies_only_profiles_that_can_see_it() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let line = grow
-            .lines
-            .recv_timeout(remaining.max(Duration::from_millis(1)))
+        let message = grow
+            .observed_message(remaining.max(Duration::from_millis(1)))
             .expect("grow profile did not receive tools/list_changed");
-        let message: Value = serde_json::from_str(&line).expect("valid notification");
         if message["method"] == "notifications/tools/list_changed" {
             break;
         }
@@ -1627,10 +1748,9 @@ fn matrix_routing_tool_change_notifies_only_profiles_that_can_see_it() {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let Ok(line) = echo.lines.recv_timeout(remaining) else {
+        let Some(message) = echo.observed_message(remaining) else {
             break;
         };
-        let message: Value = serde_json::from_str(&line).expect("valid notification");
         assert_ne!(
             message["method"], "notifications/tools/list_changed",
             "the other tool profile received a tool catalog notification"
@@ -1771,7 +1891,12 @@ fn matrix_routing_server_change_notifies_only_authorized_sessions() {
     // Ignore the initial catalog's own change notifications. Only the grow
     // below is relevant to this assertion.
     for client in [&session_a, &session_b, &session_c] {
-        while client.lines.try_recv().is_ok() {}
+        // The catalog notification can trail the first successful tools/list
+        // on slower runners, so wait for a short quiet period before the call.
+        while client
+            .observed_message(Duration::from_millis(500))
+            .is_some()
+        {}
     }
 
     // A and B share the same downstream server. Its catalog change belongs to

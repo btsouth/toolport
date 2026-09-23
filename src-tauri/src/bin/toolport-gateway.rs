@@ -104,6 +104,33 @@ thread_local! {
         }) };
 }
 
+type LiveRouterResolver = Arc<dyn Fn() -> Arc<Router> + Send + Sync>;
+
+thread_local! {
+    static ACTIVE_LIVE_ROUTER_RESOLVER: std::cell::RefCell<Option<LiveRouterResolver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct LiveRouterResolverGuard(Option<LiveRouterResolver>);
+
+impl LiveRouterResolverGuard {
+    fn enter(resolver: Option<LiveRouterResolver>) -> Self {
+        Self(ACTIVE_LIVE_ROUTER_RESOLVER.with(|cell| cell.replace(resolver)))
+    }
+}
+
+impl Drop for LiveRouterResolverGuard {
+    fn drop(&mut self) {
+        ACTIVE_LIVE_ROUTER_RESOLVER.with(|cell| {
+            cell.replace(self.0.take());
+        });
+    }
+}
+
+fn active_live_router_resolver() -> Option<LiveRouterResolver> {
+    ACTIVE_LIVE_ROUTER_RESOLVER.with(|cell| cell.borrow().clone())
+}
+
 /// Sets the serving era for one request and restores the previous value on drop,
 /// so a nested dispatch (code mode re-entering `execute_call`) cannot leak it.
 struct UpstreamEraGuard(Option<String>);
@@ -4023,6 +4050,9 @@ fn post_hitl_revalidation(
 /// Clone the current live `Arc<Router>` from the swappable slot, releasing the mutex
 /// immediately. Returns `None` only if `live_router` itself is `None` (test harnesses).
 fn clone_live_router(live_router: Option<&Arc<Mutex<Arc<Router>>>>) -> Option<Arc<Router>> {
+    if let Some(resolve) = active_live_router_resolver() {
+        return Some(resolve());
+    }
     live_router.map(|slot| {
         slot.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6356,6 +6386,7 @@ fn execute_script_dispatch_with_candidate(
     // request reach its HTTP client but then misclassifies it as legacy when a
     // downstream asks for sampling/elicitation/roots (SBS-551, extending WS2-3).
     let request_context = active_request_context();
+    let live_view_resolver = active_live_router_resolver();
 
     // Arc + Send + Sync so independent callAsync work can run on a small host thread pool.
     // shape=false: intermediate results stay full-sized in the sandbox (never enter model
@@ -6405,6 +6436,7 @@ fn execute_script_dispatch_with_candidate(
             result
         };
         let _context = ActiveRequestContextGuard::enter(request_context.clone());
+        let _live_view = LiveRouterResolverGuard::enter(live_view_resolver.clone());
         run()
     });
 
@@ -13727,6 +13759,40 @@ fn process_request(
             UpstreamEraGuard::enter(declared.filter(|v| v.as_str() == MODERN_PROTOCOL_VERSION));
         return handle_resource_subscription(state, &router, req, allowed, cancel.as_ref(), method);
     }
+    let live_view: Option<LiveRouterResolver> = if state.daemon_mode.load(Ordering::SeqCst) {
+        adapter_profile.map(|profile| {
+            let host = Arc::clone(&state.host);
+            let profile = profile.to_string();
+            let expected_scope = allowed.cloned();
+            let expected_tool_scope = adapter_tool_scope(&reg, &profile);
+            Arc::new(move || {
+                let current = host
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let current_scope: HashSet<String> = current
+                    .enabled_servers_for(&profile)
+                    .iter()
+                    .map(|server| server.id.clone())
+                    .collect();
+                if expected_scope.as_ref() != Some(&current_scope)
+                    || expected_tool_scope != adapter_tool_scope(&current, &profile)
+                {
+                    return Arc::new(Router::new());
+                }
+                let base = host
+                    .router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                host.router_for_adapter_profile(base, &current, &profile).0
+            }) as LiveRouterResolver
+        })
+    } else {
+        None
+    };
+    let _live_view = LiveRouterResolverGuard::enter(live_view);
     handle_request_with_cancel(
         state,
         req,
