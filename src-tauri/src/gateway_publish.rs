@@ -228,6 +228,55 @@ pub fn client_gateway_path() -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+
+/// Find advertised daemons in this data directory, across compatibility keys.
+/// A positive identity mismatch excludes a descriptor; an inconclusive or
+/// malformed endpoint protects its still-running PID so uncertainty cannot
+/// turn into a daemon kill. Only loopback endpoints are ever probed.
+fn live_host_daemons() -> Vec<crate::daemon::DaemonDescriptor> {
+    let Some(data_dir) = crate::registry::conduit_dir() else {
+        return Vec::new();
+    };
+    live_host_daemons_in(&data_dir)
+}
+
+fn live_host_daemons_in(data_dir: &Path) -> Vec<crate::daemon::DaemonDescriptor> {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            if !name.starts_with("daemon-") || !name.ends_with(".json") {
+                return None;
+            }
+            let descriptor = crate::daemon::read_descriptor(&entry.path())?;
+            if !pid_is_running(descriptor.pid) {
+                return None;
+            }
+            let Ok(address) = descriptor.endpoint.parse::<std::net::SocketAddr>() else {
+                return Some(descriptor);
+            };
+            if !address.ip().is_loopback() {
+                return Some(descriptor);
+            }
+            match crate::daemon::probe_identity(&descriptor) {
+                Ok(identity)
+                    if identity.pid != descriptor.pid
+                        || identity.protocol != descriptor.protocol
+                        || identity.compat != descriptor.compat =>
+                {
+                    None
+                }
+                Ok(_) | Err(_) => Some(descriptor),
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Cross-platform gateway process reaper (SOU-414 / residual of SOU-306)
 //
 // Product rule: same outcome on Windows, macOS, and Linux. Staleness is decided
@@ -248,6 +297,9 @@ pub fn client_gateway_path() -> Option<PathBuf> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayProcess {
     pub pid: u32,
+    /// Whether the process was launched in the shared host role. None means
+    /// its command line could not be inspected, so reaping must fail closed.
+    pub is_host_daemon: Option<bool>,
     /// Best-effort absolute path of the executable. Missing when the OS denied
     /// query access; decision falls back to basename rules only.
     pub path: Option<PathBuf>,
@@ -552,6 +604,9 @@ pub fn decide_reap(proc: &GatewayProcess, ctx: &ReapContext) -> ReapDecision {
     // Before anything else, including kill_all: never kill a protected pid
     // (the calling process itself) (SOU-432).
     if ctx.keep_pids.contains(&proc.pid) {
+        return ReapDecision::Keep;
+    }
+    if proc.is_host_daemon != Some(false) {
         return ReapDecision::Keep;
     }
     if !is_gateway_basename(&proc.basename) {
@@ -910,6 +965,50 @@ fn log_reap_report(kind: &str, report: &ReapReport) {
 /// Returns the complete shutdown report. The updater must refuse installation
 /// while either `failed` or `remaining` is non-empty.
 pub fn stop_spawned_gateways() -> ReapReport {
+    let daemons = live_host_daemons();
+    for descriptor in &daemons {
+        let _ = crate::daemon::request_shutdown_if_idle(descriptor);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while daemons
+        .iter()
+        .any(|descriptor| pid_is_running(descriptor.pid))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // The process table is global, while descriptors above cover only this
+    // data directory. A daemon from another data directory must still veto
+    // installation rather than fall through to kill-all below.
+    let active: Vec<_> = list_gateway_processes()
+        .into_iter()
+        .filter(|process| {
+            process.pid != std::process::id() && process.is_host_daemon != Some(false)
+        })
+        .collect();
+    if !active.is_empty() {
+        let report = ReapReport {
+            failed: active
+                .iter()
+                .map(|process| {
+                    if process.is_host_daemon == Some(true) {
+                        format!(
+                            "shared gateway daemon (pid {}) is still running; close its MCP sessions and retry the update",
+                            process.pid
+                        )
+                    } else {
+                        format!(
+                            "gateway process (pid {}) could not be inspected; close it and retry the update",
+                            process.pid
+                        )
+                    }
+                })
+                .collect(),
+            ..ReapReport::default()
+        };
+        log_reap_report("updater reaper", &report);
+        return report;
+    }
     let ctx = ReapContext {
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         keep_paths: Vec::new(),
@@ -917,7 +1016,17 @@ pub fn stop_spawned_gateways() -> ReapReport {
         keep_pids: vec![std::process::id()],
         kill_all: true,
     };
-    let report = reap_with_context(&ctx);
+    let mut report = reap_with_context(&ctx);
+    // A daemon may start after the first inventory. It is never sent a kill
+    // signal, and a final observation must still block the installer.
+    for process in list_gateway_processes() {
+        if process.pid != std::process::id() && process.is_host_daemon != Some(false) {
+            report.remaining.push(format!(
+                "shared or uninspectable gateway (pid {}) is still running",
+                process.pid
+            ));
+        }
+    }
     log_reap_report("updater reaper", &report);
     report
 }
@@ -950,7 +1059,13 @@ pub fn reap_stale(extra_keep: &[PathBuf]) -> ReapReport {
     let ctx = ReapContext {
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         keep_paths: keep,
-        keep_pids: vec![std::process::id()],
+        keep_pids: std::iter::once(std::process::id())
+            .chain(
+                live_host_daemons()
+                    .into_iter()
+                    .map(|descriptor| descriptor.pid),
+            )
+            .collect(),
         kill_all: false,
     };
     let report = reap_with_context(&ctx);
@@ -1272,6 +1387,110 @@ pub fn pid_is_running(pid: u32) -> bool {
 
 // ----- OS process list / kill ------------------------------------------------
 
+/// The daemon flag is a standalone argv token. For platforms that only expose
+/// the joined command line, require whitespace boundaries around it.
+#[cfg(any(target_os = "macos", windows, test))]
+fn joined_command_is_daemon(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .any(|arg| arg.trim_matches('"') == "--daemon")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn gateway_daemon_role(pid: u32) -> Option<bool> {
+    let args = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    if args.is_empty() {
+        return None;
+    }
+    Some(args.split(|byte| *byte == 0).any(|arg| arg == b"--daemon"))
+}
+
+#[cfg(target_os = "macos")]
+fn gateway_daemon_role(pid: u32) -> Option<bool> {
+    let output = std::process::Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+    Some(joined_command_is_daemon(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+#[cfg(windows)]
+fn windows_gateway_daemon_roles(pids: &[u32]) -> std::collections::HashMap<u32, Option<bool>> {
+    use std::os::windows::process::CommandExt;
+
+    if pids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let filter = pids
+        .iter()
+        .map(|pid| format!("ProcessId = {pid}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let script = format!(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); @(Get-CimInstance Win32_Process -Filter '{filter}' -ErrorAction Stop | Select-Object ProcessId,CommandLine) | ConvertTo-Json -Compress"
+    );
+    let mut command = std::process::Command::new("powershell.exe");
+    let Some(mut child) = command
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+    else {
+        return std::collections::HashMap::new();
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break child.wait_with_output().ok(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return std::collections::HashMap::new();
+            }
+        }
+    };
+    let Some(output) = output else {
+        return std::collections::HashMap::new();
+    };
+    if !output.status.success() || output.stdout.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return std::collections::HashMap::new();
+    };
+    daemon_roles_from_cim_json(&value)
+}
+
+#[cfg(any(windows, test))]
+fn daemon_roles_from_cim_json(
+    value: &serde_json::Value,
+) -> std::collections::HashMap<u32, Option<bool>> {
+    let rows = value
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| std::slice::from_ref(&value));
+    rows.iter()
+        .filter_map(|row| {
+            let pid = row.get("ProcessId")?.as_u64()? as u32;
+            let role = row
+                .get("CommandLine")
+                .and_then(serde_json::Value::as_str)
+                .map(joined_command_is_daemon);
+            Some((pid, role))
+        })
+        .collect()
+}
+
 #[cfg(windows)]
 fn list_gateway_processes() -> Vec<GatewayProcess> {
     windows_list_gateway_processes()
@@ -1326,6 +1545,7 @@ fn windows_list_gateway_processes() -> Vec<GatewayProcess> {
                     out.push((
                         GatewayProcess {
                             pid,
+                            is_host_daemon: None,
                             path,
                             basename,
                             parent: None,
@@ -1339,10 +1559,13 @@ fn windows_list_gateway_processes() -> Vec<GatewayProcess> {
             }
         }
         CloseHandle(snap);
+        let candidate_pids: Vec<u32> = out.iter().map(|(proc, _)| proc.pid).collect();
+        let roles = windows_gateway_daemon_roles(&candidate_pids);
         // Resolve after the walk: a parent can appear later in the snapshot than
         // its child, so this cannot be done inline.
         out.into_iter()
             .map(|(mut proc, ppid)| {
+                proc.is_host_daemon = roles.get(&proc.pid).copied().flatten();
                 proc.parent = names
                     .get(&ppid)
                     .filter(|_| windows_parent_predates_child(ppid, proc.pid))
@@ -1503,6 +1726,7 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
             }
             out.push(GatewayProcess {
                 pid,
+                is_host_daemon: gateway_daemon_role(pid),
                 path: exe,
                 basename: exe_base,
                 parent: linux_parent_of(pid),
@@ -1512,6 +1736,7 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
         let path = std::fs::read_link(ent.path().join("exe")).ok();
         out.push(GatewayProcess {
             pid,
+            is_host_daemon: gateway_daemon_role(pid),
             path,
             basename,
             parent: linux_parent_of(pid),
@@ -1607,6 +1832,7 @@ fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
             });
         procs.push(GatewayProcess {
             pid: *pid,
+            is_host_daemon: gateway_daemon_role(*pid),
             path,
             basename,
             parent,
@@ -1703,6 +1929,81 @@ pub fn is_unversioned_install_gateway_path(stored: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn matching_or_silent_descriptors_protect_a_live_daemon_pid() {
+        use std::io::{Read, Write};
+
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-reaper-daemon-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut chunk = [0u8; 512];
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert!(count > 0 && request.len() < 4096);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                assert!(String::from_utf8_lossy(&request).contains("Bearer private-token"));
+                if index == 2 {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    continue;
+                }
+                let body = serde_json::json!({
+                    "compat": "domain-a",
+                    "protocol": crate::daemon::PROTOCOL_GENERATION,
+                    "pid": std::process::id(),
+                    "gatewayVersion": "test"
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let descriptor = crate::daemon::DaemonDescriptor {
+            endpoint,
+            token: "private-token".into(),
+            pid: std::process::id(),
+            compat: "domain-a".into(),
+            protocol: crate::daemon::PROTOCOL_GENERATION,
+            created_at_ms: 0,
+        };
+        let path = dir.join("daemon-domain-a.json");
+        std::fs::write(&path, serde_json::to_string(&descriptor).unwrap()).unwrap();
+        let protected = live_host_daemons_in(&dir);
+        assert_eq!(protected, vec![descriptor.clone()]);
+
+        let mut forged = descriptor.clone();
+        forged.compat = "domain-b".into();
+        std::fs::write(&path, serde_json::to_string(&forged).unwrap()).unwrap();
+        assert!(live_host_daemons_in(&dir).is_empty());
+        std::fs::write(&path, serde_json::to_string(&descriptor).unwrap()).unwrap();
+        assert_eq!(live_host_daemons_in(&dir), vec![descriptor.clone()]);
+        server.join().unwrap();
+        let mut malformed = descriptor;
+        malformed.endpoint = "unreadable-endpoint".into();
+        std::fs::write(&path, serde_json::to_string(&malformed).unwrap()).unwrap();
+        assert_eq!(live_host_daemons_in(&dir), vec![malformed]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn ctx(version: &str, keep: &[&str], kill_all: bool) -> ReapContext {
         ReapContext {
             current_version: version.into(),
@@ -1715,6 +2016,7 @@ mod tests {
     fn proc(pid: u32, basename: &str, path: Option<&str>) -> GatewayProcess {
         GatewayProcess {
             pid,
+            is_host_daemon: Some(false),
             basename: basename.into(),
             path: path.map(PathBuf::from),
             parent: None,
@@ -1736,6 +2038,78 @@ mod tests {
             }),
             ..proc(pid, basename, path)
         }
+    }
+
+    #[test]
+    fn shared_daemons_survive_global_reaps_without_a_local_descriptor() {
+        let mut daemon = proc(
+            42,
+            "toolport-gateway",
+            Some("/opt/toolport/toolport-gateway"),
+        );
+        daemon.is_host_daemon = Some(true);
+        let mut unknown = proc(
+            43,
+            "toolport-gateway",
+            Some("/opt/toolport/toolport-gateway"),
+        );
+        unknown.is_host_daemon = None;
+        for kill_all in [false, true] {
+            let context = ctx("1.20.0", &["/elsewhere/toolport-gateway"], kill_all);
+            assert_eq!(decide_reap(&daemon, &context), ReapDecision::Keep);
+            assert_eq!(decide_reap(&unknown, &context), ReapDecision::Keep);
+            assert_eq!(
+                decide_reap(
+                    &proc(
+                        44,
+                        "toolport-gateway",
+                        Some("/opt/toolport/toolport-gateway")
+                    ),
+                    &context
+                ),
+                ReapDecision::Kill
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_role_requires_a_standalone_flag() {
+        assert!(joined_command_is_daemon("toolport-gateway --daemon"));
+        assert!(joined_command_is_daemon("toolport-gateway \"--daemon\""));
+        assert!(!joined_command_is_daemon("toolport-gateway --daemonish"));
+        assert!(!joined_command_is_daemon(
+            "toolport-gateway --stdio-adapter"
+        ));
+    }
+
+    #[test]
+    fn windows_role_parser_accepts_one_or_many_processes() {
+        let one = serde_json::json!({
+            "ProcessId": 42,
+            "CommandLine": "toolport-gateway.exe --daemon"
+        });
+        assert_eq!(daemon_roles_from_cim_json(&one).get(&42), Some(&Some(true)));
+        let many = serde_json::json!([
+            one,
+            { "ProcessId": 43, "CommandLine": "toolport-gateway.exe --stdio-adapter" },
+            { "ProcessId": 44, "CommandLine": null }
+        ]);
+        let roles = daemon_roles_from_cim_json(&many);
+        assert_eq!(roles.get(&42), Some(&Some(true)));
+        assert_eq!(roles.get(&43), Some(&Some(false)));
+        assert_eq!(roles.get(&44), Some(&None));
+    }
+
+    #[test]
+    fn role_probe_can_inspect_the_current_process() {
+        let pid = std::process::id();
+        #[cfg(windows)]
+        assert_eq!(
+            windows_gateway_daemon_roles(&[pid]).get(&pid),
+            Some(&Some(false))
+        );
+        #[cfg(not(windows))]
+        assert_eq!(gateway_daemon_role(pid), Some(false));
     }
 
     #[test]
@@ -2197,6 +2571,7 @@ mod tests {
             decide_reap(
                 &GatewayProcess {
                     pid: 1,
+                    is_host_daemon: Some(false),
                     path: Some(keep),
                     basename: "toolport-gateway".into(),
                     parent: None,
@@ -2210,6 +2585,7 @@ mod tests {
             decide_reap(
                 &GatewayProcess {
                     pid: 2,
+                    is_host_daemon: Some(false),
                     path: Some(deleted),
                     basename: "toolport-gateway".into(),
                     parent: None,

@@ -30,6 +30,8 @@ pub const IDENTITY_PATH: &str = "/host/identity";
 pub const TOPOLOGY_PATH: &str = "/host/topology";
 /// Private lease for the desktop's lightweight public HTTP bridge.
 pub const HTTP_SERVICE_LEASE_PATH: &str = "/host/http-service-lease";
+/// Ask an unused daemon to leave before replacing its executable during update.
+pub const SHUTDOWN_IF_IDLE_PATH: &str = "/host/shutdown-if-idle";
 
 /// Bounded wait for a spawned daemon to publish a reachable descriptor.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -185,6 +187,27 @@ pub fn probe_identity(descriptor: &DaemonDescriptor) -> Result<DaemonIdentity, S
         ProbeFailure::Unreachable => "the daemon endpoint is not reachable".to_string(),
         ProbeFailure::Silent => "the daemon did not answer within the probe budget".to_string(),
     })
+}
+
+/// Request a graceful exit. The daemon keeps serving while any session, public
+/// service lease, or request is active and withdraws its descriptor before exit.
+pub fn request_shutdown_if_idle(descriptor: &DaemonDescriptor) -> Result<(), String> {
+    let address = descriptor
+        .endpoint
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| "daemon endpoint must be a loopback address".to_string())?;
+    if !address.ip().is_loopback() {
+        return Err("daemon endpoint must be a loopback address".to_string());
+    }
+    ureq::post(&format!(
+        "http://{}{}",
+        descriptor.endpoint, SHUTDOWN_IF_IDLE_PATH
+    ))
+    .timeout(PROBE_TIMEOUT)
+    .set("Authorization", &format!("Bearer {}", descriptor.token))
+    .call()
+    .map(|_| ())
+    .map_err(|error| format!("could not request idle daemon shutdown: {error}"))
 }
 
 /// Why an identity probe failed, in the terms the rendezvous decides on: what
@@ -517,6 +540,15 @@ mod tests {
 
     fn compat(version: &str, dir: &Path) -> CompatKey {
         CompatKey::new(version, dir.display().to_string())
+    }
+
+    #[test]
+    fn shutdown_request_rejects_non_loopback_descriptors_before_sending_bearer() {
+        let key = CompatKey::new("test", "scratch");
+        for endpoint in ["192.0.2.1:9", "not-a-socket"] {
+            let descriptor = DaemonDescriptor::new(endpoint, "private-token", &key);
+            assert!(request_shutdown_if_idle(&descriptor).is_err());
+        }
     }
 
     /// Start an in-process identity listener and return its descriptor.

@@ -1373,6 +1373,7 @@ fn matrix_rollout_default_selects_the_shared_daemon() {
         conduit_lib::daemon::IDENTITY_PATH,
         conduit_lib::daemon::TOPOLOGY_PATH,
         conduit_lib::daemon::HTTP_SERVICE_LEASE_PATH,
+        conduit_lib::daemon::SHUTDOWN_IF_IDLE_PATH,
     ] {
         let response = ureq::get(&format!("http://{endpoint}{path}"))
             .set("Authorization", &format!("Bearer {bridge_token}"))
@@ -1380,6 +1381,18 @@ fn matrix_rollout_default_selects_the_shared_daemon() {
         assert!(
             matches!(response, Err(ureq::Error::Status(401, _))),
             "leased public bearer reached private {path}"
+        );
+    }
+    for bearer in [bridge_token, "registered-probe-token"] {
+        let response = ureq::post(&format!(
+            "http://{endpoint}{}",
+            conduit_lib::daemon::SHUTDOWN_IF_IDLE_PATH
+        ))
+        .set("Authorization", &format!("Bearer {bearer}"))
+        .call();
+        assert!(
+            matches!(response, Err(ureq::Error::Status(401, _))),
+            "a non-private bearer reached the shutdown endpoint: {response:?}"
         );
     }
     ureq::delete(&lease_url)

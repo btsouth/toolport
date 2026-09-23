@@ -217,3 +217,74 @@ fn an_open_listen_stream_prevents_idle_exit() {
         diagnostics(&dir)
     );
 }
+
+#[test]
+fn updater_shutdown_waits_for_a_client_session_then_exits_without_the_idle_grace() {
+    let dir = scratch_dir();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let mut child = spawn_daemon(&dir, 30_000);
+    let descriptor = wait_for_descriptor(&mut child, &dir);
+    let endpoint = descriptor["endpoint"].as_str().expect("endpoint");
+    let token = descriptor["token"].as_str().expect("token");
+    let shutdown_url = format!(
+        "http://{endpoint}{}",
+        conduit_lib::daemon::SHUTDOWN_IF_IDLE_PATH
+    );
+    assert!(matches!(
+        ureq::post(&shutdown_url).call(),
+        Err(ureq::Error::Status(401, _))
+    ));
+    let initialize = post_mcp(
+        endpoint,
+        token,
+        None,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "updater-idle-test", "version": "1" }
+            }
+        }),
+    );
+    let session = initialize
+        .header("Mcp-Session-Id")
+        .expect("session id")
+        .to_string();
+    let mut listen = TcpStream::connect(endpoint).expect("connect session listen stream");
+    listen
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set listen timeout");
+    write!(
+        listen,
+        "GET /mcp HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {token}\r\nAccept: text/event-stream\r\nMcp-Session-Id: {session}\r\n\r\n"
+    )
+    .expect("write listen request");
+    listen.flush().expect("flush listen request");
+    let mut head = [0u8; 128];
+    let read = listen.read(&mut head).expect("read listen response");
+    assert!(String::from_utf8_lossy(&head[..read]).starts_with("HTTP/1.1 200"));
+    ureq::post(&shutdown_url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+        .expect("authenticated updater request");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.0.try_wait().expect("daemon status").is_none(),
+        "the updater stopped a daemon with a live session"
+    );
+    ureq::delete(&format!("http://{endpoint}/mcp"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Mcp-Session-Id", &session)
+        .call()
+        .expect("close client session");
+    drop(listen);
+    let status = wait_for_exit(&mut child, &dir, Duration::from_secs(5));
+    assert!(status.success(), "unexpected daemon exit: {status:?}");
+    assert!(
+        read_descriptor(&dir).is_none(),
+        "descriptor was left behind"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
