@@ -1599,8 +1599,15 @@ fn matrix_routing_tool_change_notifies_only_profiles_that_can_see_it() {
     echo.initialize("matrix-echo-profile");
     let grow_tool = grow.wait_for_tool("__grow", Duration::from_secs(30));
     echo.wait_for_tool("__echo", Duration::from_secs(30));
+    // The daemon may finish its initial catalog fanout after a tools/list
+    // response, especially on Windows. Establish a quiet baseline before
+    // attributing a later notification to the grow call.
     for client in [&grow, &echo] {
-        while client.lines.try_recv().is_ok() {}
+        while client
+            .lines
+            .recv_timeout(Duration::from_millis(500))
+            .is_ok()
+        {}
     }
 
     grow.call_tool(&grow_tool, json!({}));
