@@ -15492,6 +15492,7 @@ struct HttpOut {
 
 #[derive(Clone, Copy, Default)]
 struct McpHttpRequestHeaders<'a> {
+    private_daemon_bearer: bool,
     session_id: Option<&'a str>,
     adapter_cwd: Option<&'a str>,
     adapter_root_override: Option<&'a str>,
@@ -16171,18 +16172,19 @@ fn handle_http_with_headers(
     // Internal rendezvous identity. Daemon mode only, so the user-facing bridge
     // never exposes the compat fingerprint or build; gated by the same bearer.
     if state.daemon_mode.load(Ordering::SeqCst) && path == conduit_lib::daemon::IDENTITY_PATH {
-        return match caller {
-            Some(_) => HttpOut::new(200, "application/json", daemon_identity_json()),
-            None => HttpOut::json_err(401, "unauthorized"),
+        return if headers.private_daemon_bearer {
+            HttpOut::new(200, "application/json", daemon_identity_json())
+        } else {
+            HttpOut::json_err(401, "unauthorized")
         };
     }
     if state.daemon_mode.load(Ordering::SeqCst) && path == conduit_lib::daemon::TOPOLOGY_PATH {
-        return match caller {
-            Some(_) if method == "GET" => {
-                HttpOut::new(200, "application/json", daemon_topology_json(state))
-            }
-            Some(_) => HttpOut::json_err(405, "method not allowed on /host/topology"),
-            None => HttpOut::json_err(401, "unauthorized"),
+        return if !headers.private_daemon_bearer {
+            HttpOut::json_err(401, "unauthorized")
+        } else if method == "GET" {
+            HttpOut::new(200, "application/json", daemon_topology_json(state))
+        } else {
+            HttpOut::json_err(405, "method not allowed on /host/topology")
         };
     }
 
@@ -17737,6 +17739,7 @@ fn handle_connection(
                         &path,
                         &body,
                         McpHttpRequestHeaders {
+                            private_daemon_bearer,
                             session_id: session_hdr.as_deref(),
                             adapter_cwd: if private_daemon_bearer && valid_adapter_claim {
                                 adapter_cwd.as_deref()
@@ -26003,6 +26006,7 @@ mod tests {
         accept: Option<&'a str>,
     ) -> McpHttpRequestHeaders<'a> {
         McpHttpRequestHeaders {
+            private_daemon_bearer: false,
             session_id,
             adapter_cwd: None,
             adapter_root_override: None,
@@ -34497,7 +34501,7 @@ mod tests {
     fn the_daemon_identity_route_follows_the_hosts_daemon_flag() {
         let state = http_state(true);
         let caller = test_caller("daemon-probe", None);
-        let probe = |state: &GatewayState, caller: Option<&HttpCaller>| {
+        let probe = |state: &GatewayState, caller: Option<&HttpCaller>, private_bearer: bool| {
             handle_http_with_headers(
                 state,
                 &SearchGuard::default(),
@@ -34505,7 +34509,10 @@ mod tests {
                 "GET",
                 conduit_lib::daemon::IDENTITY_PATH,
                 "",
-                McpHttpRequestHeaders::default(),
+                McpHttpRequestHeaders {
+                    private_daemon_bearer: private_bearer,
+                    ..McpHttpRequestHeaders::default()
+                },
                 None,
                 caller,
             )
@@ -34515,7 +34522,7 @@ mod tests {
             !state.daemon_mode.load(Ordering::SeqCst),
             "the fixture is not a daemon"
         );
-        let bridge = probe(&state, Some(&caller));
+        let bridge = probe(&state, Some(&caller), true);
         assert!(
             bridge.status != 200 && bridge.status != 401,
             "a non-daemon host must neither serve nor advertise the identity route: {}",
@@ -34535,9 +34542,23 @@ mod tests {
         assert_ne!(bridge_topology.status, 200);
 
         state.daemon_mode.store(true, Ordering::SeqCst);
-        let anonymous = probe(&state, None);
+        let anonymous = probe(&state, None, false);
         assert_eq!(anonymous.status, 401, "body={}", anonymous.body);
-        let authenticated = probe(&state, Some(&caller));
+        let registered_client = probe(&state, Some(&caller), false);
+        assert_eq!(registered_client.status, 401, "body={}", registered_client.body);
+        let registered_topology = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "GET",
+            conduit_lib::daemon::TOPOLOGY_PATH,
+            "",
+            McpHttpRequestHeaders::default(),
+            None,
+            Some(&caller),
+        );
+        assert_eq!(registered_topology.status, 401);
+        let authenticated = probe(&state, Some(&caller), true);
         assert_eq!(authenticated.status, 200, "body={}", authenticated.body);
         let identity: Value = serde_json::from_str(&authenticated.body).unwrap();
         assert!(
