@@ -1639,11 +1639,7 @@ fn matrix_routing_root_change_notifies_only_authorized_downstreams() {
         |name| name.starts_with("one__"),
         Duration::from_secs(30),
     );
-    two.wait_for_tool_where(
-        "two's catalog",
-        |name| name.starts_with("two__"),
-        Duration::from_secs(30),
-    );
+    let two_echo = two.wait_for_tool("__echo", Duration::from_secs(30));
     one.send(json!({
         "jsonrpc": "2.0",
         "method": "notifications/roots/list_changed"
@@ -1653,6 +1649,16 @@ fn matrix_routing_root_change_notifies_only_authorized_downstreams() {
         assert!(Instant::now() < deadline, "the authorized server saw no root change");
         std::thread::sleep(Duration::from_millis(10));
     }
+    // The next request on adapter one acknowledges that its preceding
+    // notification has finished traversing the daemon. A call on adapter two
+    // then places an acknowledgement after any wrongly forwarded notification
+    // on server two's single stdio stream.
+    let acknowledged = one.request("tools/list", json!({}));
+    assert!(acknowledged.get("result").is_some());
+    assert_eq!(
+        text_of(&two.call_tool(&two_echo, json!({ "text": "barrier" }))),
+        "barrier"
+    );
     assert_eq!(
         transcript_method_count(&transcript_two, "notifications/roots/list_changed"),
         0,
