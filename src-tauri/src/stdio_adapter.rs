@@ -229,6 +229,14 @@ impl Session {
     }
 
     fn remember_roots_response(&self, value: &serde_json::Value) {
+        // Client requests and daemon requests use independent id sequences.
+        // A client request with the same id must not consume the pending roots
+        // response before the client answers it.
+        if value.get("method").is_some()
+            || (value.get("result").is_none() && value.get("error").is_none())
+        {
+            return;
+        }
         let Some(id) = value.get("id") else {
             return;
         };
@@ -802,6 +810,33 @@ mod tests {
         assert_eq!(
             read_bounded_line(&mut reader, 4).unwrap(),
             Some(ClientFrame::Line("ok".to_string()))
+        );
+    }
+
+    #[test]
+    fn client_request_id_does_not_consume_a_pending_roots_response() {
+        let data_dir = std::env::temp_dir();
+        let compat = CompatKey::new("test", data_dir.to_string_lossy());
+        let session = Session::new(
+            Rendezvous::new(&data_dir, compat.clone()),
+            DaemonDescriptor::new("127.0.0.1:1", "test-token", &compat),
+        );
+        let project = data_dir.join("toolport-roots-collision");
+        let uri = url::Url::from_file_path(&project)
+            .expect("native project URI")
+            .to_string();
+        session.remember_roots_request(r#"{"jsonrpc":"2.0","id":1,"method":"roots/list"}"#);
+        session.remember_roots_response(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}
+        }));
+        assert_eq!(session.roots_request_ids.lock().unwrap().len(), 1);
+        session.remember_roots_response(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": { "roots": [{ "uri": uri }] }
+        }));
+        assert!(session.roots_request_ids.lock().unwrap().is_empty());
+        assert_eq!(
+            *session.declared_root.lock().unwrap(),
+            crate::downstream::file_uri_to_path(&uri)
         );
     }
 

@@ -14030,7 +14030,7 @@ struct McpHttpRequestHeaders<'a> {
     session_id: Option<&'a str>,
     adapter_cwd: Option<&'a str>,
     adapter_root_override: Option<&'a str>,
-    adapter_declared_root: Option<&'a str>,
+    adapter_resolved_root: Option<&'a str>,
     protocol_version: Option<&'a str>,
     method: Option<&'a str>,
     name: Option<&'a str>,
@@ -14534,11 +14534,8 @@ fn handle_mcp_http(
                         *session
                             .client_root
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = headers
-                            .adapter_root_override
-                            .or(headers.adapter_declared_root)
-                            .or(headers.adapter_cwd)
-                            .map(str::to_string);
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            headers.adapter_resolved_root.map(str::to_string);
                     }
                 }
             }
@@ -16186,8 +16183,8 @@ fn handle_connection(
                             } else {
                                 None
                             },
-                            adapter_declared_root: if private_daemon_bearer && valid_adapter_claim {
-                                adapter_declared_root.as_deref()
+                            adapter_resolved_root: if private_daemon_bearer && valid_adapter_claim {
+                                adapter_root
                             } else {
                                 None
                             },
@@ -24354,7 +24351,7 @@ mod tests {
             session_id,
             adapter_cwd: None,
             adapter_root_override: None,
-            adapter_declared_root: None,
+            adapter_resolved_root: None,
             protocol_version: Some(MODERN_PROTOCOL_VERSION),
             method: Some(method),
             name,
@@ -25870,6 +25867,7 @@ mod tests {
                 McpHttpRequestHeaders {
                     adapter_cwd: Some(cwd),
                     adapter_root_override: root_override,
+                    adapter_resolved_root: root_override.or(Some(cwd)),
                     ..McpHttpRequestHeaders::default()
                 },
                 None,
@@ -25900,6 +25898,36 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("/operator-b")
+        );
+        drop(sessions);
+
+        // An existing adapter session can have learned a root after initialize.
+        // Its next initialize must keep the root that selected its owner scope,
+        // even when the adapter has cleared its declared-root header meanwhile.
+        let out = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &initialize,
+            McpHttpRequestHeaders {
+                session_id: Some(&sid_a),
+                adapter_cwd: Some("/adapter-a"),
+                adapter_resolved_root: Some("/learned-project"),
+                ..McpHttpRequestHeaders::default()
+            },
+            None,
+            Some(&caller),
+        );
+        assert_eq!(out.status, 200, "body={}", out.body);
+        assert_eq!(
+            state.mcp_sessions.lock().unwrap()[&sid_a]
+                .client_root
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("/learned-project")
         );
     }
 
