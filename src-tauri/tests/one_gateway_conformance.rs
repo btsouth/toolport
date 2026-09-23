@@ -1443,12 +1443,16 @@ fn matrix_desktop_http_proxy_shares_daemon_and_releases_lease() {
             proxy.0.try_wait().unwrap().is_none(),
             "HTTP proxy exited before readiness"
         );
-        if ureq::get(&format!("{public_url}/"))
+        if let Ok(response) = ureq::get(&format!("{public_url}/"))
             .timeout(Duration::from_millis(300))
             .set("Authorization", &format!("Bearer {public_token}"))
             .call()
-            .is_ok()
         {
+            let banner = response.into_string().expect("read proxy readiness banner");
+            assert!(
+                banner.starts_with("Toolport gateway (HTTP mode)."),
+                "desktop readiness requires the HTTP-mode banner: {banner}"
+            );
             break;
         }
         assert!(Instant::now() < deadline, "HTTP proxy did not become ready");

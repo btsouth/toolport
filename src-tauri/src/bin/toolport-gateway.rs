@@ -17532,7 +17532,12 @@ fn serve_http_proxy(port: u16) -> Result<(), String> {
         lease_open: RwLock::new(true),
         latest_descriptor: Mutex::new(descriptor),
     });
-    state.renew()?;
+    if let Err(error) = state.renew() {
+        // A timeout can follow a successful lease POST. Revoke that possible
+        // lease before returning the startup error.
+        state.release();
+        return Err(error);
+    }
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = Arc::clone(&stop);
@@ -17580,7 +17585,11 @@ fn serve_http_proxy(port: u16) -> Result<(), String> {
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(format!("HTTP proxy accept failed: {error}")),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    state.release();
+                    return Err(format!("HTTP proxy accept failed: {error}"));
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(20));
