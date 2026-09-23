@@ -536,6 +536,8 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
   adapter's own root. The adapter carries a learned MCP root into a reopened
   session, so a scope switch does not loop back to its launch cwd. Remaining
   P3.1 work is the full surface audit, especially server-initiated paths.
+  `notifications/roots/list_changed` now reaches only downstream servers in
+  that adapter's allowed set; a different profile's servers do not receive it.
 
 ### P3.2 Pool by `LaunchKey`
 
@@ -602,6 +604,8 @@ builds on a background thread, and a real client learns the finished catalog fro
 | Live profile changes reopen the adapter under the new scope           | `matrix_routing_live_profile_change_reopens_the_adapter_session`                                                                                            | P3.1      | passing               |
 | Identical JSON-RPC ids from different sessions never collide          | `matrix_routing_identical_request_ids_stay_per_session`                                                                                                     | P3.3      | passing               |
 | A downstream catalog change reaches authorized sessions only          | `matrix_routing_server_change_notifies_only_authorized_sessions`                                                                                            | P3.1/P3.3 | passing               |
+| A root change reaches authorized downstream servers only              | `matrix_routing_root_change_notifies_only_authorized_downstreams`                                                                                           | P3.1/P3.3 | passing               |
+| A server request reaches only the originating adapter                 | `matrix_routing_server_request_reaches_only_the_originating_adapter`                                                                                        | P3.1/P3.3 | passing               |
 
 Pending rows are `#[ignore]`d acceptance criteria, not absent ones: they fail loudly with
 `--ignored` today (root sharding still launches from the daemon's cwd), and the attribute comes off
