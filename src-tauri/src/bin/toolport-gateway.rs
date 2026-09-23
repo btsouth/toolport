@@ -17389,6 +17389,194 @@ fn serve_http(state: GatewayState, port: u16) {
     serve_http_loop(server, state, token, search, confirm, allow_insecure_open);
 }
 
+struct HttpProxyState {
+    token_sha256: String,
+    bind_host: String,
+    latest_descriptor: Mutex<conduit_lib::daemon::DaemonDescriptor>,
+}
+
+impl HttpProxyState {
+    fn renew(&self) -> Result<conduit_lib::daemon::DaemonDescriptor, String> {
+        let descriptor = conduit_lib::stdio_adapter::ensure_host_daemon()?;
+        let url = format!(
+            "http://{}{}",
+            descriptor.endpoint,
+            conduit_lib::daemon::HTTP_SERVICE_LEASE_PATH
+        );
+        ureq::post(&url)
+            .timeout(Duration::from_secs(3))
+            .set("Authorization", &format!("Bearer {}", descriptor.token))
+            .send_json(json!({
+                "tokenSha256": self.token_sha256,
+                "bindHost": self.bind_host
+            }))
+            .map_err(|error| format!("could not renew the daemon HTTP service lease: {error}"))?;
+        *self
+            .latest_descriptor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = descriptor.clone();
+        Ok(descriptor)
+    }
+
+    fn release(&self) {
+        let descriptor = self
+            .latest_descriptor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let url = format!(
+            "http://{}{}",
+            descriptor.endpoint,
+            conduit_lib::daemon::HTTP_SERVICE_LEASE_PATH
+        );
+        let _ = ureq::delete(&url)
+            .timeout(Duration::from_secs(2))
+            .set("Authorization", &format!("Bearer {}", descriptor.token))
+            .send_json(json!({
+                "tokenSha256": self.token_sha256,
+                "bindHost": self.bind_host
+            }));
+    }
+}
+
+fn proxy_public_http_connection(
+    mut client: TcpStream,
+    state: &HttpProxyState,
+    pending_read: InflightGuard,
+    active: &Arc<AtomicUsize>,
+) {
+    let request = match read_deadline_http_request(&mut client, HttpReadDeadlines::default()) {
+        Ok(request) => request,
+        Err(error) => {
+            let (status, reason, message) = error.response();
+            write_ingress_response(&mut client, status, reason, message);
+            return;
+        }
+    };
+    drop(pending_read);
+    let Some(_active) = try_acquire_inflight(active, MAX_HTTP_INFLIGHT) else {
+        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway busy; retry later");
+        return;
+    };
+    // Authenticate the cached daemon before every new public request. A failed
+    // connection may be retried here because no request bytes were sent yet;
+    // a failed write after connection is never replayed.
+    let descriptor = match state.renew() {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            glog(&format!("HTTP proxy: {error}"));
+            write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+            return;
+        }
+    };
+    let Ok(endpoint) = descriptor.endpoint.parse::<SocketAddr>() else {
+        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+        return;
+    };
+    let mut upstream = match TcpStream::connect_timeout(&endpoint, Duration::from_secs(2)) {
+        Ok(stream) => stream,
+        Err(_) => {
+            write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+            return;
+        }
+    };
+    if upstream.write_all(&request).is_err() {
+        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+        return;
+    }
+    let _ = upstream.shutdown(Shutdown::Write);
+    let _ = std::io::copy(&mut upstream, &mut client);
+}
+
+/// The desktop keeps this lightweight public listener as its child. The heavy
+/// router and downstream pool stay in the daemon shared with stdio adapters.
+fn serve_http_proxy(port: u16) -> Result<(), String> {
+    let token = conduit_lib::brand::env_var("TOOLPORT_HTTP_TOKEN", "CONDUIT_HTTP_TOKEN")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "the HTTP proxy requires TOOLPORT_HTTP_TOKEN".to_string())?;
+    let bind_host = conduit_lib::brand::env_var("TOOLPORT_HTTP_HOST", "CONDUIT_HTTP_HOST")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let primary = TcpListener::bind((bind_host.as_str(), port))
+        .map_err(|error| format!("could not bind HTTP proxy on {bind_host}:{port}: {error}"))?;
+    let mut listeners = vec![primary];
+    if bind_host == "127.0.0.1" {
+        if let Ok(ipv6) = TcpListener::bind(("::1", port)) {
+            listeners.push(ipv6);
+        }
+    }
+    for listener in &listeners {
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("could not prepare HTTP proxy listener: {error}"))?;
+    }
+    let descriptor = conduit_lib::stdio_adapter::ensure_host_daemon()?;
+    let state = Arc::new(HttpProxyState {
+        token_sha256: registry::sha256_hex(&token),
+        bind_host,
+        latest_descriptor: Mutex::new(descriptor),
+    });
+    state.renew()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut bytes = [0u8; 64];
+            while stdin.read(&mut bytes).unwrap_or(0) > 0 {}
+            stop.store(true, Ordering::Release);
+        });
+    }
+    {
+        let stop = Arc::clone(&stop);
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_secs(60));
+                if !stop.load(Ordering::Acquire) {
+                    if let Err(error) = state.renew() {
+                        glog(&format!("HTTP proxy lease renewal: {error}"));
+                    }
+                }
+            }
+        });
+    }
+    let pending_reads = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    while !stop.load(Ordering::Acquire) {
+        for listener in &listeners {
+            match listener.accept() {
+                Ok((mut client, _)) => {
+                    if client.set_nonblocking(false).is_err() {
+                        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway unavailable");
+                        continue;
+                    }
+                    let Some(pending) =
+                        try_acquire_inflight(&pending_reads, MAX_HTTP_PENDING_READS)
+                    else {
+                        write_ingress_response(&mut client, 503, "Service Unavailable", "gateway busy; retry later");
+                        continue;
+                    };
+                    let state = Arc::clone(&state);
+                    let active = Arc::clone(&active);
+                    std::thread::spawn(move || {
+                        proxy_public_http_connection(client, &state, pending, &active)
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(format!("HTTP proxy accept failed: {error}")),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while active.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    state.release();
+    Ok(())
+}
+
 /// The accept loop for one listener. Each accepted request is handed to its own
 /// worker thread, so a slow downstream call or a (up to two-minute) human-approval
 /// hold never blocks the next request. The gateway state and the two guards are
@@ -17971,6 +18159,7 @@ fn handle_connection(
 /// and `main`'s `--selftest-secrets` check.
 const KNOWN_FLAGS: &[&str] = &[
     "--http",
+    "--http-proxy",
     INSECURE_LOOPBACK_FLAG,
     "--daemon",
     "--selftest-secrets",
@@ -18079,6 +18268,7 @@ fn usage() -> String {
          \n\
          FLAGS:\n\
          \x20   --http [port]         Serve over HTTP instead of stdio (default port 8765)\n\
+         \x20   --http-proxy [port]   Desktop HTTP bridge to the host daemon (internal)\n\
          \x20   {insecure}   Allow unauthenticated HTTP access on a loopback bind\n\
          \x20   --daemon             Run as the host daemon for this host (Phase 2;\n\
          \x20                        internal rendezvous endpoint, not the user HTTP\n\
@@ -18194,6 +18384,23 @@ fn main() {
             std::process::exit(code);
         }
         ArgAction::Run => {}
+    }
+    if let Some(index) = cli_args.iter().position(|arg| arg == "--http-proxy") {
+        let port = match cli_args.get(index + 1) {
+            Some(value) => match value.parse::<u16>() {
+                Ok(port) if port > 0 => port,
+                _ => {
+                    eprintln!("toolport-gateway: invalid HTTP proxy port: {value}");
+                    std::process::exit(1);
+                }
+            },
+            None => 8765,
+        };
+        if let Err(error) = serve_http_proxy(port) {
+            eprintln!("toolport-gateway --http-proxy: {error}");
+            std::process::exit(1);
+        }
+        return;
     }
     // Phase 2 stdio adapter: hand stdio to the host daemon instead of starting an
     // in-process gateway. Diverges, and deliberately runs before the session

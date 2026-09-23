@@ -4664,6 +4664,7 @@ mod tests {
             child: Some(child),
             port: Some(9876),
             token: Some("preserved-secret-token".to_string()),
+            proxy_mode: false,
         };
 
         let error = stop_http_bridge_with(&mut bridge, |_| {
