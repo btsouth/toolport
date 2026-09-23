@@ -24,6 +24,8 @@ gateway entry, written for you when you connect a client:
   loopback listener; it never permits an open non-loopback bind.
 - `TOOLPORT_METRICS=1` - opt-in Prometheus `GET /metrics` on the HTTP surface.
 - `TOOLPORT_DEBUG=1` - per-request gateway trace logging.
+- `TOOLPORT_GATEWAY_TOPOLOGY=daemon|legacy` - override the local stdio topology
+  for one client launch. `legacy` is the immediate rollback setting.
 - `TOOLPORT_CODE_MODE=1` - force-enable code mode (`toolport_run_script`) even if Settings
   has it off. Code mode is **on by default** (Settings kill switch turns it off). Each
   in-script tool call still respects profile scope and human approval; code mode is not a
@@ -31,6 +33,15 @@ gateway entry, written for you when you connect a client:
 
 Every `TOOLPORT_*` name still accepts the pre-rename `CONDUIT_*` alias (for example
 `CONDUIT_HTTP_TOKEN` continues to work). Prefer `TOOLPORT_*` in new configs.
+
+**One gateway per host (opt-in).** Set `"gatewayTopology": "daemon"` in
+`registry.json`, then restart connected AI clients. Their existing Toolport
+entries select a small stdio adapter at startup; one host daemon owns the router
+and shares ordinary downstream connections. The default is still `legacy`.
+`TOOLPORT_GATEWAY_TOPOLOGY=legacy` on a client entry overrides an opt-in without
+editing the registry. If the daemon cannot be reached before the adapter opens
+a session, that launch uses the legacy in-process gateway. A failure after the
+session opens returns an error rather than replaying a call.
 
 **Discovery mode per HTTP client.** The stdio gateway resolves one discovery mode for
 the client that spawned it. The headless HTTP/OpenAPI bridge serves several clients at

@@ -152,12 +152,13 @@ Still open:
 | 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                                                                                       | opt-in only                                 | landed (#892, #893)                                                                                 |
 | 7   | P3.1 union catalog built once, allowed-set enforced per session                                                                                                                 | opt-in only                                 | in progress: adapter identity, profile scope, and scoped catalog-change fanout pass the matrix      |
 | 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                                                                                   | opt-in only, the big win                    | in progress: per-adapter cwd and per-session MCP roots reach the daemon; launch slots still pending |
-| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                                                                                    | opt-in only                                 | not started                                                                                         |
+| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                                                                                    | opt-in only                                 | registry flag and legacy override in progress; diagnostics and real-machine run remain              |
 | 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                                                                               | default flip                                | not started                                                                                         |
 | 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                                                                                  | separate, later                             | not started                                                                                         |
 
-Each of 1 through 8 must leave the default topology untouched and all existing suites
-green. The only PRs that change what a user gets are 10 and 11.
+Each of 1 through 9 leaves the default topology untouched and keeps existing suites
+green. P4.1 changes the role only for clients whose registry or launch environment
+explicitly selects the daemon.
 
 ### Early dogfood signal (synthetic, not the P4.1 acceptance run)
 
@@ -574,7 +575,8 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
 
 ## Phase 4: dogfood, default, convergence
 
-- P4.1 registry feature flag, telemetry/diagnostics, and the real-machine acceptance run
+- P4.1 registry feature flag with a pre-session fallback and a legacy override,
+  telemetry/diagnostics, and the real-machine acceptance run
   (heavy gateways, adapters, descendants, memory, cold-start and first-call latency).
 - P4.2 default flip only after parity suites pass on Windows, macOS, and Linux, keeping a
   documented legacy kill switch for at least one release.

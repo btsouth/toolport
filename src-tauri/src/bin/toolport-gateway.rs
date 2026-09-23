@@ -16858,6 +16858,22 @@ fn daemon_requested(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--daemon")
 }
 
+fn opt_in_adapter_requested(
+    args: &[String],
+    stdio_peer: bool,
+    override_value: Option<&str>,
+    topology: Option<registry::GatewayTopology>,
+) -> bool {
+    if !args.is_empty() || !stdio_peer {
+        return false;
+    }
+    match override_value.map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("legacy") => false,
+        Some(value) if value.eq_ignore_ascii_case("daemon") => true,
+        _ => topology == Some(registry::GatewayTopology::Daemon),
+    }
+}
+
 /// Startup admission policy. The escape hatch is never valid for a non-loopback bind.
 ///
 /// `registry_loaded` is the boot `load_resolved` outcome (Ok=true, Err=false). A
@@ -17957,6 +17973,27 @@ fn main() {
     // daemon does.
     if conduit_lib::stdio_adapter::adapter_requested(&cli_args) {
         conduit_lib::stdio_adapter::run_stdio_adapter();
+    }
+    if cli_args.is_empty() {
+        use std::io::IsTerminal;
+        let stdio_peer = !std::io::stdin().is_terminal();
+        let topology = if stdio_peer {
+            registry::load_resolved_with_source()
+                .ok()
+                .filter(|(_, source)| source.is_authoritative())
+                .map(|(reg, _)| reg.gateway_topology_effective())
+        } else {
+            None
+        };
+        if opt_in_adapter_requested(
+            &cli_args,
+            stdio_peer,
+            conduit_lib::brand::env_var("TOOLPORT_GATEWAY_TOPOLOGY", "CONDUIT_GATEWAY_TOPOLOGY")
+                .as_deref(),
+            topology,
+        ) {
+            conduit_lib::stdio_adapter::run_opt_in_stdio_adapter();
+        }
     }
     let selftest_secrets = cli_args.first().map(String::as_str) == Some("--selftest-secrets");
     if !selftest_secrets {
@@ -33018,6 +33055,39 @@ mod tests {
         assert!(daemon_requested(&["--daemon".to_string()]));
         assert!(!daemon_requested(&["--http".to_string()]));
         assert!(!daemon_requested(&[]));
+    }
+
+    #[test]
+    fn registry_topology_selects_only_ordinary_client_stdio() {
+        use registry::GatewayTopology::{Daemon, Legacy};
+        assert!(!opt_in_adapter_requested(&[], true, None, None));
+        assert!(opt_in_adapter_requested(&[], true, None, Some(Daemon)));
+        assert!(!opt_in_adapter_requested(&[], true, None, Some(Legacy)));
+        assert!(!opt_in_adapter_requested(&[], false, None, Some(Daemon)));
+        assert!(!opt_in_adapter_requested(
+            &["--daemon".into()],
+            true,
+            None,
+            Some(Daemon)
+        ));
+        assert!(!opt_in_adapter_requested(
+            &["--http".into()],
+            true,
+            None,
+            Some(Daemon)
+        ));
+        assert!(!opt_in_adapter_requested(
+            &[],
+            true,
+            Some("legacy"),
+            Some(Daemon)
+        ));
+        assert!(opt_in_adapter_requested(
+            &[],
+            true,
+            Some("daemon"),
+            Some(Legacy)
+        ));
     }
 
     #[test]
