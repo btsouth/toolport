@@ -1262,6 +1262,12 @@ fn matrix_rollout_registry_opt_in_selects_the_shared_daemon() {
     let path = dir.join("registry.json");
     let mut reg = registry::load_from(&path).expect("load registry");
     reg.gateway_topology = Some(registry::GatewayTopology::Daemon);
+    reg.http_clients.push(registry::HttpClient {
+        id: "probe-client".into(),
+        label: "Probe client".into(),
+        token_sha256: registry::sha256_hex("registered-probe-token"),
+        profile: String::new(),
+    });
     registry::save_to(&path, &reg).expect("opt in to daemon topology");
 
     let options = AdapterOptions {
@@ -1285,6 +1291,18 @@ fn matrix_rollout_registry_opt_in_selects_the_shared_daemon() {
         matches!(ureq::get(&url).call(), Err(ureq::Error::Status(401, _))),
         "topology probe must require the private bearer"
     );
+    for path in [
+        conduit_lib::daemon::IDENTITY_PATH,
+        conduit_lib::daemon::TOPOLOGY_PATH,
+    ] {
+        let response = ureq::get(&format!("http://{endpoint}{path}"))
+            .set("Authorization", "Bearer registered-probe-token")
+            .call();
+        assert!(
+            matches!(&response, Err(ureq::Error::Status(401, _))),
+            "a registered HTTP client token reached private {path}: {response:?}"
+        );
+    }
     let topology = json_body(
         ureq::get(&url)
             .set("Authorization", &format!("Bearer {token}"))
