@@ -7,10 +7,18 @@ one release.
 
 ## Current state
 
-This section distinguishes landed increments from Phase 3 work still in progress.
-Anything marked "not started" below is the next work, not a claim about ordering.
+Phases 0, 2, and 3 are landed. P1.2 session isolation, the P4.1 measured run, and
+the P4.2 default flip are landed too. The desktop HTTP lease, proxy, and guarded
+updater complete P4.3. The remaining P1.3 field moves are structural cleanup;
+they do not prevent the shared topology from running. The historical build notes
+below retain the order in which the work landed.
 
-Landed:
+This is implementation and test status, not a published release. The real-client
+smoke checked MCP connections without a model or provider tool call. The desktop
+proxy and updater have automated process tests; no physical desktop update run
+is recorded here.
+
+### Landed foundation
 
 - Phase 0. `src-tauri/src/topology.rs` defines `GatewayRole`, `CompatKey`, `LaunchKey`,
   `TopologySnapshot`, and the topology assertions.
@@ -18,8 +26,8 @@ Landed:
   P2.2a identity and P2.2b the full host runtime on the internal endpoint (#881), with a
   cold-start test (#882).
 - P2.2c the stdio adapter, `--stdio-adapter` (#888), with a bounded worker pool for
-  concurrent requests (#891) and recovery after the daemon dies (#893). Opt-in only; the
-  default stdio role is untouched.
+  concurrent requests (#891) and recovery after the daemon dies (#893). It landed
+  behind an opt-in flag; P4.2 later made it the default for registry-backed clients.
 - P2.3 daemon idle exit (#892) and adapter crash recovery (#893). The lease is the open
   connection: the daemon exits once nothing has been in flight for `DAEMON_IDLE_GRACE`,
   and the adapter re-rendezvouses and replays the client handshake on the next request
@@ -49,7 +57,7 @@ Landed:
   no session record (a modern request, or an OpenAPI call). The `GatewayState.stdout` field
   is gone with them. Progress routes stay host-scoped by decision, see below.
 
-Still open:
+### Session ownership delivered
 
 - P1.2 threading, remainder: the three `STDIO_*` handshake statics landed. `STDIO_CLIENT_READY`,
   `STDIO_RESPONDED`, and `STDIO_DEFERRED_LIST_CHANGED` are gone; the flags and the deferral
@@ -76,6 +84,9 @@ Still open:
   on one host could share one pseudonym map or approval scope. The daemon now keys both by its
   MCP session id and clears them together when that session closes. Sessionless bridge calls
   retain their client identity key, and standalone stdio keeps its process-local key.
+
+### Remaining structural cleanup and implementation notes
+
 - P1.3 `HostState` (in progress). The host runtime now lives on `HostState` (registry and
   its trust flag, router, catalog snapshot, routine candidates and advisor, ready/dirty
   flags, rebuild lock, listener config, server handler, resource subscriptions and the
@@ -104,7 +115,8 @@ Still open:
   `notifications/progress` frame through the hand-off, without the `list_changed` /
   `resources/updated` check on the peer's declared era. Pre-existing, unchanged by the
   threading work, and on the list so it is not read as an oversight.
-- No topology feature flag in the registry.
+- The registry has a `gateway_topology` choice. An absent value selects the daemon;
+  explicit `legacy` keeps the separate in-process role.
 - Two tests resolved the data directory per call on paths `DataDirOverride` was not
   guarding, so the gateway suite wrote into the developer's real data dir: the audit writer
   (`audit::audit_path`) and the search-trace writer (`searchtrace::path`). A full run
@@ -130,34 +142,34 @@ Still open:
   behind. A long local session accumulated about 1,900 of them (`toolport-pii-release-*` was
   the largest group). Worth one small cleanup pass with a Drop guard on those specific
   tests; it does not affect correctness, but it makes the temp dir useless as a signal.
-- The adapter has not been dogfooded against a real client (P4.1). It does have the
-  synthetic per-session-count measurement in the delivery-shape section above, which is a
-  process-count signal on a one-downstream fixture and not a substitute for the real run.
+- P4.1 includes a configured-server process and memory run plus simultaneous Grok
+  and Claude MCP connection checks. Those clients did not send a model prompt or
+  provider tool call; the measured first call used `toolport_status`.
 - Reusable primitives that already exist: the approval broker's `EndpointDescriptor`
   (`approval.rs`), `registry::atomic_write`, and the registry cross-process `FileLock`.
 - Client launch: `clients.rs::gateway_entry` builds the stdio entry and sets
-  `TOOLPORT_CLIENT_ID`. The desktop app spawns `--http <port>` through
-  `http_bridge.rs::start_with_token_at` and kills it on exit.
+  `TOOLPORT_CLIENT_ID`. With authoritative registry state it selects the stdio
+  adapter by default. Desktop Shared HTTP starts a lightweight `--http-proxy`
+  child, which releases its host service lease when the app closes its pipe.
 
 ## Delivery shape
 
-| PR  | Slice                                                                                                                                                                           | Behavior change                             | Status                                                                                              |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| 1   | P2.1 rendezvous primitives (library module, tested)                                                                                                                             | none (new module only)                      | landed (#880)                                                                                       |
-| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint                                                                                                                | none (explicit flag only)                   | landed (#881)                                                                                       |
-| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, guards, handshake, broken-stdout latch, cancellation, and in-flight cap per session | none default; HTTP confirm scoping narrowed | landed; PII and HITL follow the daemon MCP session                                                  |
-| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade                                                                                                                | none                                        | in progress: five landed increments; the session store and progress dispatch remain                 |
-| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag                                                                                                             | opt-in only                                 | landed (#888, #891, #893)                                                                           |
-| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                                                                                       | opt-in only                                 | landed (#892, #893)                                                                                 |
-| 7   | P3.1 union catalog built once, allowed-set enforced per session                                                                                                                 | opt-in only                                 | in progress: adapter identity, profile scope, and scoped catalog-change fanout pass the matrix      |
-| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                                                                                   | opt-in only, the big win                    | in progress: per-adapter cwd and per-session MCP roots reach the daemon; launch slots still pending |
-| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                                                                                    | opt-in only                                 | landed (#940, #941, #942); configured-server and real-client evidence recorded                      |
-| 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                                                                               | default flip                                | daemon default selected; explicit registry and launch rollback retained                             |
-| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                                                                                  | opt-in Shared HTTP                          | implemented: lease, proxy, guarded reaper; acceptance pending                                       |
+| PR  | Slice                                                                                                                                                                           | Behavior change                             | Status                                                                              |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------- |
+| 1   | P2.1 rendezvous primitives (library module, tested)                                                                                                                             | none (new module only)                      | landed (#880)                                                                       |
+| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint                                                                                                                | none (explicit flag only)                   | landed (#881)                                                                       |
+| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, guards, handshake, broken-stdout latch, cancellation, and in-flight cap per session | none default; HTTP confirm scoping narrowed | landed; PII and HITL follow the daemon MCP session                                  |
+| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade                                                                                                                | none                                        | in progress: five landed increments; the session store and progress dispatch remain |
+| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag                                                                                                             | opt-in only                                 | landed (#888, #891, #893)                                                           |
+| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                                                                                       | opt-in only                                 | landed (#892, #893)                                                                 |
+| 7   | P3.1 union catalog built once, allowed-set enforced per session                                                                                                                 | opt-in only                                 | landed; profile, tool, and notification scope pass the matrix                       |
+| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                                                                                   | opt-in only, the big win                    | landed; ordinary slots share and rooted slots shard by launch key                   |
+| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                                                                                    | opt-in only                                 | landed (#940, #941, #942); configured-server and real-client evidence recorded      |
+| 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                                                                               | default flip                                | daemon default selected; explicit registry and launch rollback retained             |
+| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                                                                                  | opt-in Shared HTTP                          | landed; lease, proxy, and guarded updater tests pass                                |
 
-Each of 1 through 9 leaves the default topology untouched and keeps existing suites
-green. P4.1 changes the role only for clients whose registry or launch environment
-explicitly selects the daemon.
+Slices 1 through 9 were initially opt-in. P4.2 changed the default for
+registry-backed stdio launches while retaining explicit `legacy` rollback.
 
 ### Early dogfood signal (synthetic, not the P4.1 acceptance run)
 
@@ -492,8 +504,8 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
   bounded worker pool (notifications stay on the reader, so a cancellation stays ahead of
   what is queued behind it); a request that fails at the transport level is reported and
   never replayed, and the next one re-rendezvouses and replays the client handshake. No
-  Node and no `mcp-remote`. The default role is still the existing in-process stdio
-  gateway.
+  Node and no `mcp-remote`. P4.2 later made the adapter the default for
+  registry-backed stdio launches.
 
 ### P2.3 Lifecycle and failure (landed, #892, #893)
 
@@ -510,7 +522,7 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
   the next request re-runs the rendezvous and replays the client's `initialize` and
   `notifications/initialized`, so the replacement gets an equivalent session. Healthy calls
   share a read gate and run concurrently; recovery takes the write gate.
-- Rollback: `--stdio-adapter` is opt-in; the legacy in-process role stays the default.
+- Rollback: explicit registry or launch `legacy` selects the in-process role.
 
 ## Phase 3: downstream launch pooling
 
@@ -519,7 +531,7 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
 - Build the catalog once for the union of enabled servers and enforce each session's
   allowed set on every list, call, prompt, resource, subscription, and server-initiated
   path. The HTTP bridge already proves the filtering model; make it the only model.
-- In the opt-in daemon path, adapters now assert their client id and boot profile with
+- In the shared daemon path, adapters assert their client id and boot profile with
   private-endpoint headers alongside the rendezvous bearer. The daemon resolves the live
   profile from that identity and gives the HTTP request path its enabled-server set. It
   connects the union across configured profiles, so a later adapter in another profile
@@ -529,8 +541,8 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
   old MCP session; the adapter fails that call once and reopens under the new scope
   on the next request. The daemon resolves folder-profile mappings from each
   adapter's own root. The adapter carries a learned MCP root into a reopened
-  session, so a scope switch does not loop back to its launch cwd. Remaining
-  P3.1 work is the full surface audit, especially server-initiated paths.
+  session, so a scope switch does not loop back to its launch cwd. The later
+  conformance matrix also covers server-initiated routing.
   `notifications/roots/list_changed` now reaches only downstream servers in
   that adapter's allowed set; a different profile's servers do not receive it.
   Adapter requests now re-index the shared downstream slots under the resolved
@@ -606,10 +618,12 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
   The gateway registers rooted integrity scopes for the dashboard quarantine
   union; their `root:<hash>` ids are absent from the registry profile list.
 
-- P4.2 default flip only after parity suites pass on Windows, macOS, and Linux, keeping a
-  documented legacy kill switch for at least one release.
-- P4.3 desktop Shared HTTP adopts a daemon service lease; app exit releases the lease
-  instead of killing the process.
+- P4.2 selected the daemon by default for authoritative registry-backed stdio
+  launches after Windows, macOS, and Linux parity checks. Explicit registry or
+  launch `legacy` remains the rollback choice for at least one release.
+- P4.3 uses a lightweight desktop HTTP proxy and private daemon service lease.
+  App exit releases the lease; the updater requests idle daemon shutdown and
+  refuses to replace files while a shared daemon still runs.
 
 ## Conformance harness
 
@@ -664,10 +678,6 @@ output readable):
 # every row that main must satisfy (default CI-green set)
 cargo test --manifest-path src-tauri/Cargo.toml --no-default-features \
   --test one_gateway_conformance -- --test-threads=1
-
-# the pending rows, to watch a phase close (they fail until it lands)
-cargo test --manifest-path src-tauri/Cargo.toml --no-default-features \
-  --test one_gateway_conformance -- --ignored --test-threads=1
 
 # one case by name
 cargo test --manifest-path src-tauri/Cargo.toml --no-default-features \
