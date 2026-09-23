@@ -34,14 +34,16 @@ gateway entry, written for you when you connect a client:
 Every `TOOLPORT_*` name still accepts the pre-rename `CONDUIT_*` alias (for example
 `CONDUIT_HTTP_TOKEN` continues to work). Prefer `TOOLPORT_*` in new configs.
 
-**One gateway per host (opt-in).** Set `"gatewayTopology": "daemon"` in
-`registry.json`, then restart connected AI clients. Their existing Toolport
-entries select a small stdio adapter at startup; one host daemon owns the router
-and shares ordinary downstream connections. The default is still `legacy`.
-`TOOLPORT_GATEWAY_TOPOLOGY=legacy` on a client entry overrides an opt-in without
-editing the registry. If the daemon cannot be reached before the adapter opens
-a session, that launch uses the legacy in-process gateway. A failure after the
-session opens returns an error rather than replaying a call.
+**One gateway per host.** Client-spawned stdio gateways use a small adapter by
+default; one host daemon owns the router and shares ordinary downstream
+connections. Existing registry files without `gatewayTopology` select this
+topology. Set `"gatewayTopology": "legacy"` in `registry.json` and restart
+connected AI clients to keep separate in-process gateways. For one client,
+`TOOLPORT_GATEWAY_TOPOLOGY=legacy` overrides the registry without editing it.
+The explicit legacy choices remain available for a release cycle. The adapter
+uses an in-process gateway only when the operating system proves daemon launch
+failed. An ambiguous startup failure or a failure after the session opens
+returns an error rather than starting or replaying against a second gateway.
 
 **Discovery mode per HTTP client.** The stdio gateway resolves one discovery mode for
 the client that spawned it. The headless HTTP/OpenAPI bridge serves several clients at

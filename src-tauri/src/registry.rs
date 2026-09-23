@@ -827,7 +827,7 @@ pub enum GatewayTopology {
     Daemon,
 }
 
-pub const DEFAULT_GATEWAY_TOPOLOGY: GatewayTopology = GatewayTopology::Legacy;
+pub const DEFAULT_GATEWAY_TOPOLOGY: GatewayTopology = GatewayTopology::Daemon;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -837,8 +837,8 @@ pub struct Registry {
     pub profiles: Vec<Profile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_profile_id: Option<String>,
-    /// `daemon` opts client-spawned stdio gateways into the host daemon. `legacy`
-    /// is the durable rollback choice when a later release changes the default.
+    /// An absent value selects the release default (`daemon`). `legacy` keeps
+    /// an explicit rollback choice for client-spawned stdio gateways.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_topology: Option<GatewayTopology>,
     /// Global safety switch: when true, the gateway hides and blocks any tool a
@@ -3835,7 +3835,7 @@ mod tests {
     #[test]
     fn gateway_topology_absence_follows_default_and_explicit_choice_round_trips() {
         let mut reg = Registry::default();
-        assert_eq!(reg.gateway_topology_effective(), GatewayTopology::Legacy);
+        assert_eq!(reg.gateway_topology_effective(), GatewayTopology::Daemon);
         let absent = serde_json::to_value(&reg).unwrap();
         assert!(absent.get("gatewayTopology").is_none());
         reg.gateway_topology = Some(GatewayTopology::Daemon);

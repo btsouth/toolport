@@ -249,7 +249,7 @@ async function runArm(topology) {
     profiles: [{ id: "acceptance", name: "Acceptance", enabledServerIds: ["mock"] }],
     activeProfileId: "acceptance",
     lazyDiscovery: false,
-    ...(topology === "daemon" ? { gatewayTopology: "daemon" } : {}),
+    gatewayTopology: topology,
   };
   const registry = realRegistry ? structuredClone(realRegistry) : fixtureRegistry;
   if (realRegistryPath) {

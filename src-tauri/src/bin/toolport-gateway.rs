@@ -16362,13 +16362,16 @@ fn handle_http(
 /// Cap on an inbound HTTP request body. Tool arguments are tiny; this just stops
 /// an unauthenticated caller from forcing the gateway to buffer a huge body.
 const MAX_HTTP_BODY: u64 = 4 * 1024 * 1024;
+/// The authenticated private daemon hop carries the adapter's stdio frames.
+/// Keep its body cap aligned with that frame cap without raising the public
+/// HTTP/OpenAPI limit.
+const MAX_DAEMON_HTTP_BODY: u64 = conduit_lib::stdio_adapter::MAX_FRAME_BYTES as u64;
 
 /// Bound the pre-routing socket work that `tiny_http` otherwise performs before
 /// yielding a request. Headers and bodies each get an absolute deadline, so a
 /// client cannot keep a connection alive forever by dripping one byte at a time.
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_PENDING_READS: usize = 64;
-const MAX_HTTP_CHUNK_WIRE_BYTES: usize = MAX_HTTP_BODY as usize + MAX_HTTP_HEADER_BYTES;
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -16376,6 +16379,7 @@ const HTTP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 struct HttpReadDeadlines {
     header: Duration,
     body: Duration,
+    max_body: u64,
 }
 
 impl Default for HttpReadDeadlines {
@@ -16383,6 +16387,7 @@ impl Default for HttpReadDeadlines {
         Self {
             header: HTTP_HEADER_READ_TIMEOUT,
             body: HTTP_BODY_READ_TIMEOUT,
+            max_body: MAX_HTTP_BODY,
         }
     }
 }
@@ -16431,7 +16436,10 @@ fn find_http_header_end(bytes: &[u8]) -> Option<usize> {
         .map(|offset| offset + 4)
 }
 
-fn parse_http_head(bytes: &[u8]) -> Result<ParsedHttpHead, HttpIngressError> {
+fn parse_http_head_with_limit(
+    bytes: &[u8],
+    max_body: u64,
+) -> Result<ParsedHttpHead, HttpIngressError> {
     let text = std::str::from_utf8(bytes).map_err(|_| HttpIngressError::BadRequest)?;
     let mut lines = text.split("\r\n");
     let request_line = lines
@@ -16488,7 +16496,7 @@ fn parse_http_head(bytes: &[u8]) -> Result<ParsedHttpHead, HttpIngressError> {
         forwarded.extend_from_slice(b"\r\n");
     }
 
-    if content_length.unwrap_or(0) > MAX_HTTP_BODY as usize {
+    if content_length.unwrap_or(0) > max_body as usize {
         return Err(HttpIngressError::BodyTooLarge);
     }
     let framing = match (content_length, transfer_encoding) {
@@ -16570,9 +16578,10 @@ fn chunked_http_trailer_end(body: &[u8], scan: &mut ChunkedHttpBodyScan) -> Opti
     None
 }
 
-fn chunked_http_body_end(
+fn chunked_http_body_end_with_limit(
     body: &[u8],
     scan: &mut ChunkedHttpBodyScan,
+    max_body: u64,
 ) -> Result<Option<usize>, HttpIngressError> {
     if scan.trailer_start.is_some() {
         return Ok(chunked_http_trailer_end(body, scan));
@@ -16599,7 +16608,7 @@ fn chunked_http_body_end(
         decoded = decoded
             .checked_add(size)
             .ok_or(HttpIngressError::BodyTooLarge)?;
-        if decoded > MAX_HTTP_BODY as usize {
+        if decoded > max_body as usize {
             return Err(HttpIngressError::BodyTooLarge);
         }
 
@@ -16627,6 +16636,19 @@ fn chunked_http_body_end(
     }
 }
 
+#[cfg(test)]
+fn parse_http_head(bytes: &[u8]) -> Result<ParsedHttpHead, HttpIngressError> {
+    parse_http_head_with_limit(bytes, MAX_HTTP_BODY)
+}
+
+#[cfg(test)]
+fn chunked_http_body_end(
+    body: &[u8],
+    scan: &mut ChunkedHttpBodyScan,
+) -> Result<Option<usize>, HttpIngressError> {
+    chunked_http_body_end_with_limit(body, scan, MAX_HTTP_BODY)
+}
+
 fn read_deadline_http_request(
     stream: &mut TcpStream,
     deadlines: HttpReadDeadlines,
@@ -16646,7 +16668,7 @@ fn read_deadline_http_request(
         }
     };
 
-    let parsed = parse_http_head(&received[..header_end - 2])?;
+    let parsed = parse_http_head_with_limit(&received[..header_end - 2], deadlines.max_body)?;
     if parsed.send_continue {
         stream
             .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
@@ -16661,7 +16683,7 @@ fn read_deadline_http_request(
         HttpBodyFraming::ContentLength(length) => {
             while body.len() < length {
                 read_before_deadline(stream, &mut body, body_deadline)?;
-                if body.len() > MAX_HTTP_BODY as usize {
+                if body.len() > deadlines.max_body as usize {
                     return Err(HttpIngressError::BodyTooLarge);
                 }
             }
@@ -16672,10 +16694,12 @@ fn read_deadline_http_request(
             loop {
                 // Permit ordinary chunk framing overhead while bounding the total wire
                 // buffer as well as the decoded body size checked by the parser.
-                if body.len() > MAX_HTTP_CHUNK_WIRE_BYTES {
+                if body.len() > deadlines.max_body as usize + MAX_HTTP_HEADER_BYTES {
                     return Err(HttpIngressError::BodyTooLarge);
                 }
-                if let Some(end) = chunked_http_body_end(&body, &mut scan)? {
+                if let Some(end) =
+                    chunked_http_body_end_with_limit(&body, &mut scan, deadlines.max_body)?
+                {
                     request.extend_from_slice(&body[..end]);
                     break;
                 }
@@ -16892,7 +16916,7 @@ fn daemon_requested(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--daemon")
 }
 
-fn opt_in_adapter_requested(
+fn selected_adapter_requested(
     args: &[String],
     stdio_peer: bool,
     override_value: Option<&str>,
@@ -17069,7 +17093,13 @@ fn serve_daemon(state: GatewayState) -> ! {
         }
     };
     let (server, _ingress, _) =
-        match bind_deadline_http_server(("127.0.0.1", 0u16), HttpReadDeadlines::default()) {
+        match bind_deadline_http_server(
+            ("127.0.0.1", 0u16),
+            HttpReadDeadlines {
+                max_body: MAX_DAEMON_HTTP_BODY,
+                ..HttpReadDeadlines::default()
+            },
+        ) {
             Ok(bound) => bound,
             Err(error) => {
                 eprintln!(
@@ -17726,7 +17756,11 @@ fn handle_connection(
                 if method == "POST" || method == "DELETE" {
                     let _ = request
                         .as_reader()
-                        .take(MAX_HTTP_BODY)
+                        .take(if state.daemon_mode.load(Ordering::SeqCst) {
+                            MAX_DAEMON_HTTP_BODY
+                        } else {
+                            MAX_HTTP_BODY
+                        })
                         .read_to_string(&mut body);
                 }
                 // A panic in a handler must return 500, not kill the listener.
@@ -18054,14 +18088,14 @@ fn main() {
         } else {
             None
         };
-        if opt_in_adapter_requested(
+        if selected_adapter_requested(
             &cli_args,
             stdio_peer,
             conduit_lib::brand::env_var("TOOLPORT_GATEWAY_TOPOLOGY", "CONDUIT_GATEWAY_TOPOLOGY")
                 .as_deref(),
             topology,
         ) {
-            conduit_lib::stdio_adapter::run_opt_in_stdio_adapter();
+            conduit_lib::stdio_adapter::run_selected_stdio_adapter();
         }
     }
     let selftest_secrets = cli_args.first().map(String::as_str) == Some("--selftest-secrets");
@@ -24273,6 +24307,7 @@ mod tests {
         let deadlines = HttpReadDeadlines {
             header: Duration::from_millis(180),
             body: Duration::from_millis(120),
+            ..HttpReadDeadlines::default()
         };
         let (_server, _ingress, public_addr) =
             bind_deadline_http_server("127.0.0.1:0", deadlines).unwrap();
@@ -24422,6 +24457,27 @@ mod tests {
         assert!(matches!(
             parse_http_head(b"POST / HTTP/1.1\r\nExpect: something-else\r\n"),
             Err(HttpIngressError::ExpectationFailed)
+        ));
+    }
+
+    #[test]
+    fn private_daemon_body_limit_accepts_stdio_frames_without_raising_public_limit() {
+        let between = format!(
+            "POST /mcp HTTP/1.1\r\nContent-Length: {}\r\n",
+            MAX_HTTP_BODY + 1
+        );
+        assert!(matches!(
+            parse_http_head_with_limit(between.as_bytes(), MAX_HTTP_BODY),
+            Err(HttpIngressError::BodyTooLarge)
+        ));
+        assert!(parse_http_head_with_limit(between.as_bytes(), MAX_DAEMON_HTTP_BODY).is_ok());
+        let over_daemon = format!(
+            "POST /mcp HTTP/1.1\r\nContent-Length: {}\r\n",
+            MAX_DAEMON_HTTP_BODY + 1
+        );
+        assert!(matches!(
+            parse_http_head_with_limit(over_daemon.as_bytes(), MAX_DAEMON_HTTP_BODY),
+            Err(HttpIngressError::BodyTooLarge)
         ));
     }
 
@@ -33187,29 +33243,29 @@ mod tests {
     #[test]
     fn registry_topology_selects_only_ordinary_client_stdio() {
         use registry::GatewayTopology::{Daemon, Legacy};
-        assert!(!opt_in_adapter_requested(&[], true, None, None));
-        assert!(opt_in_adapter_requested(&[], true, None, Some(Daemon)));
-        assert!(!opt_in_adapter_requested(&[], true, None, Some(Legacy)));
-        assert!(!opt_in_adapter_requested(&[], false, None, Some(Daemon)));
-        assert!(!opt_in_adapter_requested(
+        assert!(!selected_adapter_requested(&[], true, None, None));
+        assert!(selected_adapter_requested(&[], true, None, Some(Daemon)));
+        assert!(!selected_adapter_requested(&[], true, None, Some(Legacy)));
+        assert!(!selected_adapter_requested(&[], false, None, Some(Daemon)));
+        assert!(!selected_adapter_requested(
             &["--daemon".into()],
             true,
             None,
             Some(Daemon)
         ));
-        assert!(!opt_in_adapter_requested(
+        assert!(!selected_adapter_requested(
             &["--http".into()],
             true,
             None,
             Some(Daemon)
         ));
-        assert!(!opt_in_adapter_requested(
+        assert!(!selected_adapter_requested(
             &[],
             true,
             Some("legacy"),
             Some(Daemon)
         ));
-        assert!(opt_in_adapter_requested(
+        assert!(selected_adapter_requested(
             &[],
             true,
             Some("daemon"),

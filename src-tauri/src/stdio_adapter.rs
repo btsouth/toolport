@@ -120,10 +120,10 @@ pub fn run_stdio_adapter() -> ! {
 /// Registry opt-in may fall back only before an adapter session reaches the
 /// daemon. Once a descriptor is ready, all later failures stay in adapter mode
 /// so a call cannot be retried against a second, in-process router.
-pub fn run_opt_in_stdio_adapter() {
+pub fn run_selected_stdio_adapter() {
     match prepare_stdio_adapter() {
         Ok((rendezvous, descriptor)) => {
-            crate::gatewaylog::append("topology: role=stdio-adapter source=registry-opt-in");
+            crate::gatewaylog::append("topology: role=stdio-adapter source=stdio-topology");
             finish_stdio_adapter(rendezvous, descriptor)
         }
         Err(PreparationFailure {

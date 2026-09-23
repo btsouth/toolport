@@ -1,18 +1,11 @@
 # Design: One heavy gateway per host
 
-Status: Phase 0 landed (SBS-838), and the daemon groundwork is in: the rendezvous, the
-`--daemon` host runtime, and the opt-in `--stdio-adapter` (P2.1 through P2.3), all behind
-explicit flags. **The current gateway topology is unchanged** — every stdio client session
-still runs its own gateway and its own copy of every enabled downstream server until the
-P4.2 default flip. P1.2 is landed apart from one stdio assumption (stdio PII/HITL collapsing
-to one local session, which needs an asserted identity to key on); the handshake flags, the
-broken-stdout latch, and the cancel registry and in-flight cap are session state.
-P1.3 is five increments in: the host runtime, session table and daemon runtime,
-rebuild streaks and quarantine read state, code mode, and discovery mode have moved
-onto `HostState`. The session store and progress dispatch and routes remain. P3.1
-profile and folder scoping and P3.2 root propagation are opt-in work in progress;
-root-specific downstream launch pooling has not started. See
-[the plan](one-gateway-per-host-plan.md) for the slice-by-slice status and what is next.
+Status: Phases 0 through 3 and the P4.1 acceptance run were delivered in increments.
+Client-spawned stdio gateways now select the host daemon by default when their
+registry is authoritative. An explicit registry or launch `legacy` choice keeps
+the separate in-process topology available for rollback. P1.3 host-state ownership
+and P4.3 desktop Shared HTTP convergence remain separate work. See
+[the plan](one-gateway-per-host-plan.md) for the slice-by-slice status.
 
 SBS-551 delivered this design plus a slice of Phase 1 (`ActiveRequestContext` and the
 per-request guards). It was closed at that point, which read as "one gateway per host is
