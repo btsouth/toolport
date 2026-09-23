@@ -1,6 +1,6 @@
 # Toolport token benchmark
 
-**Routing MCP servers through Toolport's lazy discovery cut total tokens 74-91% at the
+**Routing MCP servers through Toolport's lazy discovery cut provider-reported total tokens 74-91% at the
 SAME task success rate**, measured on a frontier model and graded for _correct answers_,
 not just completion. Every task completed correctly in both modes, and the savings grow
 as you add servers. The reduction comes from not loading every tool's schema into the
@@ -15,8 +15,8 @@ Reproduce it yourself: [`benchmark/`](benchmark/).
   - **lazy**, Toolport advertises 4 meta-tools (`toolport_status`, `toolport_search_tools`,
     `toolport_call_tool`, `toolport_fetch_result`) and the agent searches/calls on demand
     (`TOOLPORT_DISCOVERY=lazy`). (The headline reduction below was originally measured on the
-    earlier 3-meta-tool set; the current 4-tool default measures 886 tokens of always-on
-    overhead, which doesn't change the reduction story.)
+    earlier 3-meta-tool set; 886 was a historical UTF-8 bytes/4 estimate for a
+    four-tool definition set, not a current invariant or provider token count.)
 - **Model:** GPT-5.5 (frontier, via the Vercel AI Gateway), so model capability is not the
   variable, both modes can actually complete every task.
 - **Tasks (5 runs each):** list Stripe products; list Neon projects; list Vercel projects
@@ -27,7 +27,7 @@ Reproduce it yourself: [`benchmark/`](benchmark/).
 
 ## Results
 
-End-to-end tokens to complete the three tasks (median of 5 runs), both modes graded:
+Provider-reported end-to-end tokens to complete the three tasks (median of 5 runs), both modes graded. Search calls and their returned content are included:
 
 | Servers | Tools | Flat tokens | Lazy tokens | Reduction | Correct (flat / lazy) |
 | ------- | ----- | ----------- | ----------- | --------- | --------------------- |
@@ -42,53 +42,53 @@ Two things stand out:
   3 → 6 (it re-sends every tool schema on every call), while lazy's actually _dropped_
   (47K → 40K), it pays a flat ~450-token meta-tool overhead no matter how many servers
   you connect. Per-request tool-definition overhead: flat **19,002 → 51,533**, lazy a
-  constant **451**.
+  constant **451** in those model runs. These historical values depend on that
+  tool set and harness.
 
 ## Why flat is so expensive
 
-Flat mode re-sends every tool schema on **every** LLM call, so a multi-step task pays that
-overhead several times before counting any real work, and it climbs with each server you
-add. Lazy mode pays ~450 tokens of meta-tool overhead and searches for what it needs. The
+In the measured harness, flat mode exposed every tool schema on **every** LLM call, so a multi-step task paid that
+overhead several times before counting any real work, and it climbed with each server.
+Other MCP clients may gate or cache definitions differently. Lazy mode advertised a smaller
+catalog and searched for what it needed. The
 more tools you connect and the more calls a task takes, the wider the gap.
 
 ## Measured on a real 14-server catalog
 
-The 63-tool test above is deliberately small. Point [`benchmark/token-cost.mjs`](benchmark/token-cost.mjs)
-at a real Toolport catalog (no model needed, it just measures the tool definitions)
-and the gap widens fast. On a live 14-server setup of **415 tools**, the definitions
-an agent loads on **every request** measure:
+The 63-tool test above is deliberately small. The historical local estimate below
+used serialized definition bytes divided by four on a 14-server, **415-tool** catalog.
+It describes MCP payload size, not model usage. To reproduce on the current gateway,
+capture `tools/list` for the same client in full and lazy modes and pass both JSON
+responses to [`benchmark/token-cost.mjs`](benchmark/token-cost.mjs).
 
-|                                  | Per request        |
-| -------------------------------- | ------------------ |
-| Without Toolport (all 415 tools) | **164,880 tokens** |
-| With Toolport (meta-tools, flat) | **886 tokens**     |
-| Reduction                        | **99.5%**          |
+|                              | Per request                   |
+| ---------------------------- | ----------------------------- |
+| Full catalog (historical)    | **≈164,880 token-equivalent** |
+| Four meta-tools (historical) | **≈886 token-equivalent**     |
+| Reduction                    | **99.5%**                     |
 
-(660 tokens / 99.6% as originally measured on the 3-meta-tool set; the current
-default set of 4 measures 886.)
+(≈660 token-equivalent / 99.6% for the original three-tool set. Toolport now
+measures the actual arrays for each client; there is no fixed lazy floor.)
 
 The cost is dominated by a few large servers:
 
-| Server                     | Tools | Definition tokens |
-| -------------------------- | ----- | ----------------- |
-| RevenueCat                 | 93    | 42,370            |
-| GitHub                     | 44    | 27,913            |
-| Resend                     | 83    | 26,045            |
-| Cloudflare (observability) | 8     | 5,948             |
-| Stripe                     | 11    | 5,214             |
-| Vercel                     | 20    | 5,029             |
-| Supabase                   | 29    | 4,897             |
-| (5 more)                   | ...   | ...               |
+| Server                     | Tools | Estimated token-equivalent of definitions |
+| -------------------------- | ----- | ----------------------------------------- |
+| RevenueCat                 | 93    | 42,370                                    |
+| GitHub                     | 44    | 27,913                                    |
+| Resend                     | 83    | 26,045                                    |
+| Cloudflare (observability) | 8     | 5,948                                     |
+| Stripe                     | 11    | 5,214                                     |
+| Vercel                     | 20    | 5,029                                     |
+| Supabase                   | 29    | 4,897                                     |
+| (5 more)                   | ...   | ...                                       |
 
-At ~165k tokens of definitions _per request_, that catalog barely fits in most
-models' context alongside real work. On a subscription with usage caps (Claude
-Pro/Max, Cursor, and the like) you feel that directly as runway: cutting ~99% of
-always-on tool tokens is roughly that much more headroom for real work before you
-hit a limit, and prompt caching doesn't stretch a usage cap the way it discounts a
-bill. Toolport's meta-tools stay flat no matter how many servers you add, which is
-why the reduction _grows_ with your setup (74% at 63 tools, 91% at 183, 99.5% at 415).
+At ≈165k token-equivalent of serialized definitions, this catalog is large.
+The actual model context cost depends on the MCP harness, provider serialization,
+tool gating, and caching. Toolport's local telemetry now reports exact full and
+exposed tool-array bytes per load, plus search response bytes separately.
 
-The measured average here is ~397 tokens per tool, consistent with the ~387 the
+The estimated average here is ~397 token-equivalent per tool, consistent with the ~387 the
 public [calculator](https://toolport.app/calculator) uses.
 
 ## Latency: the gateway is not the bottleneck
@@ -114,8 +114,9 @@ run it on yours: `node benchmark/latency.mjs`.)
 
 - **Scope:** one frontier model (GPT-5.5), one machine, three read-only "list" tasks, 5
   runs each. Treat the _direction_ (a large, consistent reduction at equal correctness) as
-  the signal, not the exact percentage. The deterministic overhead numbers above need no
-  such caveat, they're exact.
+  the signal, not the exact percentage. Serialized UTF-8 byte measurements are exact
+  at the MCP boundary; bytes/4 token equivalents are estimates. The end-to-end
+  result table uses provider-reported model usage.
 - **Correctness is graded, not eyeballed.** A run counts only if the answer contains the
   account's real items, so the 30/30 is "right," not just "finished." Token counts come
   from the model's reported `usage`.

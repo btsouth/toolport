@@ -1,32 +1,33 @@
 # Toolport token benchmark
 
-Quantifies Toolport's core claim, that lazy discovery (a handful of meta-tools the agent
-searches) keeps context flat where flat tool exposure (every server's tools loaded
-into every request) does not, by running the **same agent tasks** against your
-local LLM under both modes and measuring tokens, tool calls, and completion.
+Compares lazy discovery with full catalog exposure in the same agent harness.
+It runs the **same tasks** in both modes and records model-reported tokens,
+tool calls, and completion. Client gating and provider caching can differ.
 
 It's framed the same way as the [mcpico benchmark](https://github.com/lxg2it/mcpico/blob/main/BENCHMARK.md),
 so the numbers are directly comparable: lazy mode makes **more tool calls**
-(search round-trips) but should use **far fewer tokens** because it never dumps
-every schema into context.
+(search round-trips) but may use fewer model tokens when the harness sends a
+large full catalog on each request.
 
 ## No-model catalog report (`token-cost.mjs`)
 
-Want the headline numbers without standing up a local LLM? `token-cost.mjs` reads
-the catalog Toolport already built and reports, deterministically: per-server
-definition tokens, the per-tool size distribution, how much of each model's context
-window the definitions eat, the reduction-vs-tool-count scaling curve, and monthly
-dollar cost across request volumes.
+To measure the current MCP catalog without a model, capture `tools/list` JSON
+responses for the same client and configuration in full and lazy/grouped modes.
+`token-cost.mjs` parses each response and measures the canonical reserialized
+UTF-8 `tools` array. JSON escapes or numeric spelling can differ from the
+captured bytes. It reports a clearly labeled bytes/4 token equivalent; the
+gateway's local telemetry measures its own emitted arrays directly.
+
+`compare-local.mjs` also times repeated `tools/list` calls after the catalog is
+ready. Use `--products=toolport --sizes=1700 --iterations=20 --json` for a large
+fixture regression check; the JSON records median and p95 list latency.
 
 ```bash
-node benchmark/token-cost.mjs            # auto-reads the active profile's cache
-node benchmark/token-cost.mjs <path>     # or point at a specific tool-cache JSON
+node benchmark/token-cost.mjs full-tools-list.json lazy-tools-list.json
 ```
 
-With no argument it resolves Toolport's data dir for you (Windows `%APPDATA%\Toolport`,
-macOS `~/Library/Application Support/Toolport`, Linux `~/.config/Toolport`). A
-profile-scoped client writes `tool-cache-<profile>.json`; the unscoped default is
-`tool-cache.json`, which is what the auto-path uses.
+A single cache or tools-list file prints only its own size; it cannot establish
+exposure avoided. Search response bytes and provider model usage are separate.
 
 ## Run the agent-loop benchmark
 

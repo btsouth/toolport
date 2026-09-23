@@ -61,8 +61,10 @@ curl -s -H "Authorization: Bearer $TOOLPORT_HTTP_TOKEN" \
 ```
 
 Emits counters for tool calls (`server`, `tool`, `client`, `ok`), held
-destructive calls, duration sum/count, lazy-discovery tokens saved, and a
-quarantine gauge. Labels are ids only (never arguments). Same auth as OpenAPI.
+destructive calls, duration sum/count, exact catalog bytes avoided, estimated
+token equivalent, tool-list loads, and exact discovery response bytes. The old
+`toolport_tokens_saved_total` remains a compatibility estimate, not provider
+usage. Labels are ids only (never arguments). Same auth as OpenAPI.
 
 An instance that has not run a tool yet scrapes 200 with the gauges at zero. If a
 local stat file exists but cannot be read (permissions, a sharing lock), the

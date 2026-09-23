@@ -133,7 +133,8 @@ machine only through features you explicitly turn on:
 - **Teams usage reporting (opt-in, only when joined to a team).** When connected
   to a Toolport Teams organization, a periodic sync reports **aggregate** usage
   for team-provided servers to the team server URL you joined: per-server row of
-  call count, tokens saved, and estimated cost. It never sends tool names,
+  call count, estimated schema token equivalent (legacy wire field `tokens_saved`),
+  and a list-price equivalent estimate. It never sends tool names,
   arguments, results, or anything about your personal (non-team) servers.
 - **Shared setup links.** Creating a share link POSTs a secret-stripped server
   setup to `https://toolport.app/api/share`, and only when you take that action.
@@ -148,12 +149,12 @@ Windows, the platform config dir elsewhere; override with `TOOLPORT_DATA_DIR`, l
 `CONDUIT_DATA_DIR`) and
 never leaves your device on its own. Each log is capped and trims oldest-first:
 
-| Local record           | File                 | Retained                                | Contains                                                      |
-| ---------------------- | -------------------- | --------------------------------------- | ------------------------------------------------------------- |
-| Audit log              | `audit.jsonl`        | last ~5,000 entries (or 4 MB)           | tool calls and approval/policy decisions                      |
-| Discovery search trace | `search-trace.jsonl` | last ~500                               | lazy-discovery searches the agent ran                         |
-| Live inspector         | `inspect.jsonl`      | last ~50 (opt-in, off by default)       | captured call arguments and results                           |
-| Savings log            | `savings.jsonl`      | last ~2,000, plus a carry-forward total | token-savings tallies (a running aggregate survives trimming) |
+| Local record           | File                                          | Retained                                                                     | Contains                                                    |
+| ---------------------- | --------------------------------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| Audit log              | `audit.jsonl`                                 | last ~5,000 entries (or 4 MB)                                                | tool calls and approval/policy decisions                    |
+| Discovery search trace | `search-trace.jsonl`, `search-trace-v2.jsonl` | legacy and recent v2 traces                                                  | lazy-discovery searches the agent ran                       |
+| Live inspector         | `inspect.jsonl`                               | last ~50 (opt-in, off by default)                                            | captured call arguments and results                         |
+| Catalog telemetry      | `savings.jsonl`, `savings-v2.jsonl`           | legacy estimates and bounded v2 detail with lifetime and daily carry records | local MCP byte measurements and estimated token equivalents |
 
 Registry config, secrets, tool catalogs, and these logs never leave the device
 except through the opt-in hosted features above.

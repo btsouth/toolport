@@ -8,7 +8,7 @@
 //
 // It reports total tokens, tool calls, and completion per task, so the trade-off
 // is honest: lazy makes MORE tool calls (search round-trips) but should use FAR
-// fewer tokens because it never dumps every schema into context. Same framing as
+// fewer provider-reported tokens when the harness repeatedly sends full schemas. Same framing as
 // the mcpico benchmark, so the numbers are directly comparable.
 //
 // Prereqs:

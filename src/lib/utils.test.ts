@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { fmtDollars, fmtMs, fmtPercent, fmtTokens, fmtTs, stableListKeys } from "./utils";
+import {
+  fmtBytes,
+  fmtDollars,
+  fmtMs,
+  fmtPercent,
+  fmtTokens,
+  fmtTs,
+  stableListKeys,
+} from "./utils";
 
 describe("stableListKeys", () => {
   it("uses the bare identity when there are no collisions", () => {
@@ -55,10 +63,23 @@ describe("fmtTokens", () => {
     expect(fmtTokens(1_500_000_000_000)).toBe("1.5T");
   });
 
-  it("handles the boundary at 999999 (rounds up to 1000.0k, not 1.0M)", () => {
-    // 999999 is just below the 1_000_000 threshold, so it takes the "k" branch:
-    // (999999 / 1000).toFixed(1) === "1000.0", giving "1000.0k" rather than "1.0M".
-    expect(fmtTokens(999999)).toBe("1000.0k");
+  it("promotes rounded unit boundaries", () => {
+    for (const [value, expected] of [
+      [999, "999"],
+      [1_000, "1.0k"],
+      [12_340, "12.3k"],
+      [999_949, "999.9k"],
+      [999_999, "1.0M"],
+      [1_000_000, "1.0M"],
+      [999_949_999, "999.9M"],
+      [999_999_999, "1.0B"],
+      [1_000_000_000, "1.0B"],
+      [3_692_944_923, "3.7B"],
+      [999_949_999_999, "999.9B"],
+      [999_999_999_999, "1.0T"],
+      [1_000_000_000_000, "1.0T"],
+    ] as const)
+      expect(fmtTokens(value)).toBe(expected);
   });
 
   it("passes 0 and negative inputs through unformatted", () => {
@@ -66,6 +87,15 @@ describe("fmtTokens", () => {
     expect(fmtTokens(-1)).toBe("-1");
     expect(fmtTokens(-12345)).toBe("-12345");
   });
+});
+
+it("formats exact-byte summaries without a 1000.0 unit boundary", () => {
+  expect(fmtBytes(999_949)).toBe("999.9 KB");
+  expect(fmtBytes(999_999)).toBe("1.0 MB");
+  expect(fmtBytes(999_949_999)).toBe("999.9 MB");
+  expect(fmtBytes(999_999_999)).toBe("1.0 GB");
+  expect(fmtBytes(999_949_999_999)).toBe("999.9 GB");
+  expect(fmtBytes(1_000_000_000_000)).toBe("1.0 TB");
 });
 
 describe("fmtMs", () => {

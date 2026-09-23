@@ -19,7 +19,7 @@ export default defineConfig({
         test: {
           name: "logic",
           environment: "node",
-          include: ["src/**/*.test.ts"],
+          include: ["src/**/*.test.ts", "benchmark/**/*.test.mjs"],
           exclude: domLogicTests,
         },
       },

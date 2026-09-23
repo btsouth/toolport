@@ -270,7 +270,7 @@ function RoutineSuggestions() {
                 </span>
                 <span>
                   ~{Math.max(1, Math.round(suggestion.intermediateBytes / 1024))} KB/run
-                  kept out of context
+                  not returned by Toolport
                 </span>
               </div>
               <details>

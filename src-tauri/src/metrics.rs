@@ -23,16 +23,37 @@ pub fn metrics_enabled() -> bool {
 pub fn render() -> Result<String, String> {
     let entries =
         crate::audit::read_all().map_err(|e| format!("couldn't read the activity log: {e}"))?;
-    let tokens_saved = crate::savings::summary()
+    let savings = crate::savings::try_summary()
+        .map_err(|e| format!("couldn't read the savings logs: {e}"))?;
+    let tokens_saved = savings
         .get("tokensSaved")
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let quarantined = crate::integrity::all_quarantined()?.len() as u64;
-    Ok(render_from_parts(&entries, tokens_saved, quarantined))
+    Ok(render_with_savings(
+        &entries,
+        tokens_saved,
+        quarantined,
+        &savings,
+    ))
 }
 
 /// Pure renderer for tests (no disk).
 pub fn render_from_parts(entries: &[Value], tokens_saved: u64, quarantined_tools: u64) -> String {
+    render_with_savings(
+        entries,
+        tokens_saved,
+        quarantined_tools,
+        &serde_json::json!({}),
+    )
+}
+
+fn render_with_savings(
+    entries: &[Value],
+    tokens_saved: u64,
+    quarantined_tools: u64,
+    savings: &Value,
+) -> String {
     // key: (server, tool, client, ok) -> (calls, error_count_if_not_ok is redundant with ok label)
     let mut calls: BTreeMap<(String, String, String, bool), u64> = BTreeMap::new();
     let mut held: BTreeMap<(String, String, String), u64> = BTreeMap::new();
@@ -127,10 +148,48 @@ pub fn render_from_parts(entries: &[Value], tokens_saved: u64, quarantined_tools
     }
 
     out.push_str(
-        "# HELP toolport_tokens_saved_total Estimated tool-definition tokens saved by lazy discovery\n",
+        "# HELP toolport_tokens_saved_total Deprecated compatibility estimate of catalog exposure avoided (legacy plus UTF-8 bytes / 4); not provider tokens\n",
     );
     out.push_str("# TYPE toolport_tokens_saved_total counter\n");
     out.push_str(&format!("toolport_tokens_saved_total {}\n", tokens_saved));
+
+    for (metric, help, key) in [
+        (
+            "toolport_tool_definition_bytes_avoided_total",
+            "Exact serialized MCP tool-definition array bytes avoided by v2 catalog loads",
+            "avoidedSurfaceBytes",
+        ),
+        (
+            "toolport_tool_definition_extra_exposure_bytes_total",
+            "Exact extra serialized bytes exposed when a discovery list exceeds full mode",
+            "extraExposedSurfaceBytes",
+        ),
+        (
+            "toolport_tool_definition_tokens_estimated_avoided_total",
+            "Estimated token equivalent of v2 avoided bytes (UTF-8 bytes / 4)",
+            "estimatedTokensAvoided",
+        ),
+        (
+            "toolport_tool_list_loads_total",
+            "Non-full tool-list loads, including legacy rows",
+            "listLoads",
+        ),
+        (
+            "toolport_discovery_response_bytes_total",
+            "Exact UTF-8 text bytes returned by v2 search responses",
+            "discoveryResponseBytes",
+        ),
+        (
+            "toolport_discovery_searches_total",
+            "Measured v2 discovery search responses",
+            "discoveryCount",
+        ),
+    ] {
+        out.push_str(&format!(
+            "# HELP {metric} {help}\n# TYPE {metric} counter\n{metric} {}\n",
+            savings.get(key).and_then(Value::as_u64).unwrap_or(0)
+        ));
+    }
 
     out.push_str(
         "# HELP toolport_quarantined_tools Tools currently quarantined after high-risk drift\n",
@@ -196,6 +255,19 @@ mod tests {
         assert!(text.contains("toolport_tokens_saved_total 42"));
         assert!(text.contains("toolport_quarantined_tools 1"));
         assert!(text.contains("# TYPE toolport_tool_calls_total counter"));
+    }
+
+    #[test]
+    fn exact_byte_counters_are_separate_from_legacy_alias() {
+        let summary = json!({"avoidedSurfaceBytes":1200, "estimatedTokensAvoided":300,
+            "listLoads":7, "discoveryResponseBytes":90, "discoveryCount":2});
+        let text = render_with_savings(&[], 400, 0, &summary);
+        assert!(text.contains("toolport_tokens_saved_total 400"));
+        assert!(text.contains("toolport_tool_definition_bytes_avoided_total 1200"));
+        assert!(text.contains("toolport_tool_definition_tokens_estimated_avoided_total 300"));
+        assert!(text.contains("toolport_tool_list_loads_total 7"));
+        assert!(text.contains("toolport_discovery_response_bytes_total 90"));
+        assert!(text.contains("toolport_discovery_searches_total 2"));
     }
 
     /// An approved HITL writes decision + timed (2x). The decision is `ok:true`
@@ -280,6 +352,19 @@ mod tests {
             "the scrape error must name what failed: {error}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_savings_store_fails_the_scrape_for_both_eras() {
+        let _lock = crate::registry::data_dir_test_lock();
+        for name in ["savings.jsonl", "savings-v2.jsonl"] {
+            let dir = scratch_data_dir(name);
+            let _override = crate::registry::DataDirOverride::set(&dir);
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+            let error = render().expect_err("an unreadable savings file must fail the scrape");
+            assert!(error.contains("savings logs"), "{error}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// The quarantine gauge carries the same contract as the audit log: an

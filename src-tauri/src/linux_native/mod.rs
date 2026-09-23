@@ -2862,8 +2862,7 @@ struct ActivityPage {
     updating_filters: std::rc::Rc<std::cell::Cell<bool>>,
     savings_banner: gtk::Box,
     savings_value: gtk::Label,
-    savings_dollars: gtk::Label,
-    savings_model: gtk::DropDown,
+    savings_unit: gtk::Label,
     savings_detail: gtk::Label,
     expanded_stat_servers: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
     server_stat_order: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
@@ -2967,7 +2966,7 @@ impl ActivityPage {
             ("–", "Retained calls"),
             ("–", "Success rate"),
             ("–", "Average latency"),
-            ("–", "Tokens saved"),
+            ("–", "Est. schema token-equivalent"),
         ] {
             let (item, value) = summary_item(value, label);
             values.push(value);
@@ -3012,7 +3011,7 @@ impl ActivityPage {
         let savings_header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         savings_header.append(
             &gtk::Label::builder()
-                .label("Context savings")
+                .label("MCP catalog and discovery")
                 .halign(gtk::Align::Start)
                 .hexpand(true)
                 .css_classes(["heading"])
@@ -3030,45 +3029,16 @@ impl ActivityPage {
             .css_classes(["title-2"])
             .build();
         savings_row.append(&savings_value);
-        savings_row.append(
-            &gtk::Label::builder()
-                .label("tool-definition tokens kept out of agent context")
-                .halign(gtk::Align::Fill)
-                .xalign(0.0)
-                .valign(gtk::Align::End)
-                .wrap(true)
-                .css_classes(["toolport-muted"])
-                .build(),
-        );
-        savings_banner.append(&savings_row);
-        let estimate_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        estimate_row.append(
-            &gtk::Label::builder()
-                .label("Estimated input cost")
-                .halign(gtk::Align::Start)
-                .valign(gtk::Align::Center)
-                .css_classes(["toolport-muted", "caption"])
-                .build(),
-        );
-        let savings_dollars = gtk::Label::builder()
-            .halign(gtk::Align::Start)
-            .valign(gtk::Align::Center)
-            .hexpand(true)
-            .css_classes(["heading"])
+        let savings_unit = gtk::Label::builder()
+            .label("estimated token-equivalent of MCP definitions")
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .valign(gtk::Align::End)
+            .wrap(true)
+            .css_classes(["toolport-muted"])
             .build();
-        estimate_row.append(&savings_dollars);
-        let savings_model = gtk::DropDown::from_strings(
-            &SAVINGS_MODELS
-                .iter()
-                .map(|(label, _)| *label)
-                .collect::<Vec<_>>(),
-        );
-        savings_model.set_selected(1); // Claude Sonnet, the shipping default.
-        savings_model.add_css_class("toolport-input");
-        savings_model.add_css_class("toolport-compact-select");
-        savings_model.set_valign(gtk::Align::Center);
-        estimate_row.append(&savings_model);
-        savings_banner.append(&estimate_row);
+        savings_row.append(&savings_unit);
+        savings_banner.append(&savings_row);
         let savings_detail = gtk::Label::builder()
             .halign(gtk::Align::Fill)
             .xalign(0.0)
@@ -3237,8 +3207,7 @@ impl ActivityPage {
             updating_filters: std::rc::Rc::new(std::cell::Cell::new(false)),
             savings_banner,
             savings_value,
-            savings_dollars,
-            savings_model,
+            savings_unit,
             savings_detail,
             expanded_stat_servers: std::rc::Rc::new(std::cell::RefCell::new(
                 std::collections::HashSet::new(),
@@ -3251,20 +3220,25 @@ impl ActivityPage {
                 std::cell::RefCell::new(load_security_dismissed()),
             ),
         };
-        let page_for_model = activity_page.clone();
-        activity_page
-            .savings_model
-            .connect_selected_notify(move |_| page_for_model.render_savings());
         let page_for_share = activity_page.clone();
         savings_share.connect_clicked(move |_| {
-            let tokens = page_for_share
+            let (tokens, loads, searches, bytes) = page_for_share
                 .last_snapshot
                 .borrow()
                 .as_ref()
-                .map(|snapshot| snapshot.tokens_saved)
-                .unwrap_or(0);
+                .map(|snapshot| {
+                    (
+                        snapshot.tokens_saved,
+                        snapshot.savings_list_loads,
+                        snapshot.savings_discovery_count,
+                        snapshot.savings_discovery_bytes,
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0));
             if let Some(display) = gtk::gdk::Display::default() {
-                display.clipboard().set_text(&savings_share_line(tokens));
+                display
+                    .clipboard()
+                    .set_text(&savings_share_line(tokens, loads, searches, bytes));
                 page_for_share
                     .feedback
                     .set_label("Savings copied, paste them anywhere.");
@@ -3455,7 +3429,7 @@ impl ActivityPage {
             "–".to_string()
         });
         self.tokens_saved.set_tooltip_text(Some(
-            "Tool-definition tokens lazy discovery has kept out of your agent's context",
+            "Estimated token-equivalent of serialized MCP tool definitions avoided at catalog loads. Actual model usage depends on the client and caching.",
         ));
         self.feedback.set_label("");
         self.feedback.remove_css_class("error");
@@ -3463,6 +3437,8 @@ impl ActivityPage {
         self.feedback.set_visible(false);
         self.clear_button.set_sensitive(
             snapshot.call_count > 0
+                || snapshot.savings_list_loads > 0
+                || snapshot.savings_discovery_count > 0
                 || !snapshot.search_traces.is_empty()
                 || !snapshot.inspect_calls.is_empty(),
         );
@@ -3743,24 +3719,84 @@ impl ActivityPage {
         let Some(snapshot) = borrowed.as_ref() else {
             return;
         };
-        if snapshot.tokens_saved == 0 {
+        if !savings_banner_visible(
+            snapshot.savings_list_loads,
+            snapshot.savings_discovery_count,
+        ) {
             self.savings_banner.set_visible(false);
             return;
         }
         self.savings_banner.set_visible(true);
-        self.savings_value.set_label(&format!(
-            "≈ {}",
-            state::format_token_count(snapshot.tokens_saved)
-        ));
-        self.savings_dollars.set_label(&savings_dollar_line(
+        let has_catalog = snapshot.savings_list_loads > 0;
+        let (primary, unit) = savings_primary_display(
             snapshot.tokens_saved,
-            self.savings_model.selected() as usize,
-        ));
-        self.savings_detail.set_label(&savings_detail_line(
             snapshot.savings_list_loads,
-            snapshot.savings_peak_catalog,
-            savings_since_date(snapshot.savings_since_ts),
-        ));
+            snapshot.savings_discovery_bytes,
+        );
+        self.savings_value.set_label(&primary);
+        self.savings_unit.set_label(unit);
+        let mut detail = if has_catalog {
+            savings_detail_line(
+                snapshot.savings_list_loads,
+                snapshot.savings_peak_catalog,
+                savings_since_date(snapshot.savings_since_ts),
+            )
+        } else {
+            String::new()
+        };
+        if snapshot.savings_list_loads > 0 {
+            detail.push_str(&format!(
+                " · ≈{} estimated/load",
+                state::format_token_count(snapshot.tokens_saved / snapshot.savings_list_loads)
+            ));
+        }
+        if snapshot.savings_latest_catalog_ts > 0 {
+            detail.push_str(&format!(
+                "\nLatest load: {} / {} tools full → {} / {} tools exposed.",
+                format_byte_count(snapshot.savings_latest_full_bytes),
+                snapshot.savings_latest_full_tools,
+                format_byte_count(snapshot.savings_latest_exposed_bytes),
+                snapshot.savings_latest_exposed_tools,
+            ));
+        }
+        if snapshot.savings_measured_loads > 0 {
+            detail.push_str(&format!("\n{} full · {} exposed · {} avoided (exact serialized UTF-8 bytes across {} measured loads)",
+                format_byte_count(snapshot.savings_full_bytes),
+                format_byte_count(snapshot.savings_exposed_bytes),
+                format_byte_count(snapshot.savings_avoided_bytes),
+                snapshot.savings_measured_loads));
+            detail.push_str(&format!(
+                " · {} full/load",
+                format_byte_count(snapshot.savings_full_bytes / snapshot.savings_measured_loads)
+            ));
+            if snapshot.savings_extra_bytes > 0 {
+                detail.push_str(&format!(
+                    "\n{} extra exposure on small catalogs.",
+                    format_byte_count(snapshot.savings_extra_bytes)
+                ));
+            }
+        }
+        if snapshot.savings_discovery_count > 0 {
+            detail.push_str(&format!(
+                "\n{} searches returned {} of discovery text.",
+                snapshot.savings_discovery_count,
+                format_byte_count(snapshot.savings_discovery_bytes)
+            ));
+        }
+        if snapshot.savings_legacy_tokens > 0 {
+            detail.push_str(&format!(
+                "\nIncludes ≈{} from older estimated records.",
+                state::format_token_count(snapshot.savings_legacy_tokens)
+            ));
+        }
+        if has_catalog {
+            detail.push_str("\nEstimate: serialized UTF-8 bytes ÷ 4. Actual model usage depends on client, model, and caching.");
+        } else {
+            detail.push_str(
+                "\nExact text bytes at Toolport's MCP boundary; model token usage may differ.",
+            );
+        }
+        self.savings_detail.set_label(&detail);
     }
 
     /// The server the filter dropdown currently points at, or `None` for all.
@@ -3903,6 +3939,7 @@ impl ActivityPage {
         }
         self.feedback.remove_css_class("success");
         self.feedback.add_css_class("error");
+        self.feedback.set_visible(true);
     }
 
     fn confirm_clear(&self) {
@@ -4445,6 +4482,22 @@ fn trace_ranking_lines(trace: &serde_json::Value) -> Vec<String> {
 
 /// The returned-vs-flat token math for one trace.
 fn trace_token_line(trace: &serde_json::Value) -> String {
+    if let Some(bytes) = trace
+        .get("responseContentBytes")
+        .and_then(serde_json::Value::as_u64)
+    {
+        let schemas = trace
+            .get("returned")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let catalog = trace
+            .get("catalogSchemaBytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        return format!("Returned {} of discovery content containing {schemas} matching schemas; full scoped catalog schemas: {}. ≈{} token-equivalent (UTF-8 bytes ÷ 4).",
+            format_byte_count(bytes), format_byte_count(catalog),
+            state::format_token_count(bytes.div_ceil(4)));
+    }
     let number = |key: &str| {
         trace
             .get(key)
@@ -4453,22 +4506,11 @@ fn trace_token_line(trace: &serde_json::Value) -> String {
     };
     let returned = number("returnedTokens");
     let flat = number("flatTokens");
-    let saved = number("savedTokens");
-    let mut line = format!(
-        "Put ≈{} tokens of tool schemas into context, vs ≈{} to load the whole catalog",
+    format!(
+        "Legacy schema-only estimates: ≈{} returned vs ≈{} catalog; search guidance text was not counted.",
         state::format_token_count(returned),
         state::format_token_count(flat)
-    );
-    if flat > 0 {
-        let mut percent = saved.saturating_mul(100) / flat;
-        if percent == 0 && saved > 0 {
-            percent = 1;
-        }
-        line.push_str(&format!(" ({percent}% less this turn)."));
-    } else {
-        line.push('.');
-    }
-    line
+    )
 }
 
 fn search_trace_card(
@@ -4597,29 +4639,6 @@ fn inspect_card(capture: &serde_json::Value, expanded_rows: ActivityExpansionSta
     card
 }
 
-/// Models for the savings dollar estimate: input-token list prices ($/1M),
-/// matching the shipping banner and the public calculator at toolport.app.
-const SAVINGS_MODELS: &[(&str, f64)] = &[
-    ("Claude Opus", 5.0),
-    ("Claude Sonnet", 3.0),
-    ("Claude Haiku", 1.0),
-    ("GPT-5.6 Sol", 5.0),
-    ("GPT-5.6 Terra", 2.5),
-    ("GPT-5.6 Luna", 1.0),
-    ("Gemini 3.1 Pro", 2.0),
-    ("Gemini 3.5 Flash", 1.5),
-    ("Gemini 3.1 Flash-Lite", 0.25),
-];
-
-fn savings_dollar_line(tokens_saved: u64, model_index: usize) -> String {
-    let (_, price) = SAVINGS_MODELS
-        .get(model_index)
-        .copied()
-        .unwrap_or(("Claude Sonnet", 3.0));
-    let dollars = tokens_saved as f64 / 1_000_000.0 * price;
-    format!("≈ ${dollars:.2}")
-}
-
 fn savings_detail_line(list_loads: u64, peak_catalog: u64, since: Option<String>) -> String {
     let mut parts = vec![format!(
         "{list_loads} catalog {}",
@@ -4634,12 +4653,46 @@ fn savings_detail_line(list_loads: u64, peak_catalog: u64, since: Option<String>
     parts.join(" · ")
 }
 
-fn savings_share_line(tokens_saved: u64) -> String {
-    format!(
-        "Toolport keeps ~{} tokens of MCP tool definitions out of my agent's context so far. \
-         One local gateway for all my MCP servers: toolport.app",
-        state::format_token_count(tokens_saved)
+fn savings_banner_visible(loads: u64, searches: u64) -> bool {
+    loads > 0 || searches > 0
+}
+
+fn savings_primary_display(
+    tokens_saved: u64,
+    loads: u64,
+    discovery_bytes: u64,
+) -> (String, &'static str) {
+    if loads == 0 {
+        return (
+            format_byte_count(discovery_bytes),
+            "discovery text returned",
+        );
+    }
+    (
+        format!("≈ {}", state::format_token_count(tokens_saved)),
+        "estimated token-equivalent of MCP definitions",
     )
+}
+
+fn savings_share_line(tokens_saved: u64, loads: u64, searches: u64, bytes: u64) -> String {
+    if loads == 0 {
+        return format!("Toolport recorded {searches} discovery searches returning {} of text at its MCP boundary. toolport.app", format_byte_count(bytes));
+    }
+    format!("Toolport's catalog loads avoided exposing ≈{} token-equivalent of MCP tool definitions across {loads} loads. Estimated from serialized UTF-8 bytes / 4, not model billing. toolport.app", state::format_token_count(tokens_saved))
+}
+
+fn format_byte_count(bytes: u64) -> String {
+    if bytes >= 999_950_000_000 {
+        format!("{:.1} TB", bytes as f64 / 1_000_000_000_000.0)
+    } else if bytes >= 999_950_000 {
+        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+    } else if bytes >= 999_950 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.1} KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// "Mar 4"-style date for the savings detail line, or `None` for epoch 0.
@@ -10829,19 +10882,39 @@ mod tests {
     }
 
     #[test]
-    fn savings_lines_price_detail_and_share_read_like_the_shipping_banner() {
-        assert_eq!(savings_dollar_line(2_000_000, 1), "≈ $6.00");
-        assert_eq!(savings_dollar_line(2_000_000, 999), "≈ $6.00");
+    fn savings_detail_and_share_describe_estimated_catalog_exposure() {
+        assert!(!savings_banner_visible(0, 0));
+        assert!(
+            savings_banner_visible(0, 1),
+            "discovery-only telemetry is visible"
+        );
+        assert!(savings_banner_visible(1, 0));
+        assert_eq!(
+            savings_primary_display(41_100, 12, 0),
+            (
+                "≈ 41.1k".into(),
+                "estimated token-equivalent of MCP definitions"
+            )
+        );
+        assert_eq!(
+            savings_primary_display(0, 0, 12_340),
+            ("12.3 KB".into(), "discovery text returned")
+        );
+        assert_eq!(format_byte_count(999_949), "999.9 KB");
+        assert_eq!(format_byte_count(999_999), "1.0 MB");
+        assert_eq!(format_byte_count(999_999_999), "1.0 GB");
+        assert_eq!(format_byte_count(999_949_999_999), "999.9 GB");
+        assert_eq!(format_byte_count(1_000_000_000_000), "1.0 TB");
         assert_eq!(
             savings_detail_line(12, 80, Some("Mar 4".to_string())),
             "12 catalog loads · peak 80 tools · since Mar 4"
         );
         assert_eq!(savings_detail_line(1, 3, None), "1 catalog load");
         assert_eq!(
-            savings_share_line(41_100),
-            "Toolport keeps ~41.1k tokens of MCP tool definitions out of my agent's context \
-             so far. One local gateway for all my MCP servers: toolport.app"
+            savings_share_line(41_100, 12, 0, 0),
+            "Toolport's catalog loads avoided exposing ≈41.1k token-equivalent of MCP tool definitions across 12 loads. Estimated from serialized UTF-8 bytes / 4, not model billing. toolport.app"
         );
+        assert_eq!(savings_share_line(0, 0, 3, 12_340), "Toolport recorded 3 discovery searches returning 12.3 KB of text at its MCP boundary. toolport.app");
     }
 
     #[test]
@@ -10876,8 +10949,7 @@ mod tests {
         );
         assert_eq!(
             trace_token_line(&trace),
-            "Put ≈900 tokens of tool schemas into context, vs ≈42.0k to load the whole \
-             catalog (97% less this turn)."
+            "Legacy schema-only estimates: ≈900 returned vs ≈42.0k catalog; search guidance text was not counted."
         );
         let miss = serde_json::json!({ "query": "nothing", "returned": 0, "total": 12 });
         assert_eq!(
@@ -10885,6 +10957,10 @@ mod tests {
             "\u{201c}nothing\u{201d} · no match"
         );
         assert!(trace_ranking_lines(&miss).is_empty());
+        let measured = serde_json::json!({"returned":3, "responseContentBytes":24_000,
+            "catalogSchemaBytes":5_400_000});
+        assert_eq!(trace_token_line(&measured),
+            "Returned 24.0 KB of discovery content containing 3 matching schemas; full scoped catalog schemas: 5.4 MB. ≈6.0k token-equivalent (UTF-8 bytes ÷ 4).");
     }
 
     #[test]

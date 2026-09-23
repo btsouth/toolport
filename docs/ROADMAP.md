@@ -1,10 +1,12 @@
 # Toolport roadmap
 
 Toolport is a local MCP gateway for AI coding tools (Claude Desktop, Cursor,
-VS Code, Devin Desktop, Devin CLI, Codex CLI). Every server you connect dumps
-its whole tool list into the agent's context on every request; Toolport routes
-them through one gateway that exposes 4 meta-tools the agent searches on demand,
-so context stays flat: measured ~90% fewer tokens at the same task success. This
+VS Code, Devin Desktop, Devin CLI, Codex CLI). In the historical benchmark harness,
+flat discovery sent every server's tool list on each model request. Toolport's lazy
+gateway exposed a smaller set of meta-tools and searched on demand; the provider
+reported roughly 90% fewer total tokens at equal task success. Local catalog
+telemetry instead measures exact MCP bytes and labels bytes/4 token equivalents as
+estimates. This
 document is the working spec, capturing the architecture decision and the build
 order.
 
@@ -202,8 +204,9 @@ The 2026-07-01 block above supersedes the ordering; these remain the detailed ba
 
 - [x] **Lazy-discovery search trace / observability.** Shipped (#114) as the Activity
       **Discovery** panel: every `toolport_search_tools` call records the query, the
-      matched tool names, which won (top), and the ground-truth per-turn token overhead
-      (returned schemas vs. the full scoped catalog, via `savings::estimate_tokens`).
+      matched tool names, which won (top), and exact serialized MCP response bytes
+      at Toolport's boundary. Token-equivalent figures use UTF-8 bytes / 4 and
+      are not provider prompt or billed tokens.
       Local, bounded, tool-names-only (no args/results). The in-path angle is the
       differentiator vs. post-hoc telemetry (e.g. tokentelemetry.com), which reads
       session logs and doesn't break out MCP tool-schema overhead. Follow-ups still open:
@@ -319,10 +322,10 @@ once (as a local stdio server and/or a custom connector URL). Toolport holds the
 real registry of servers and routes to them. This unlocks the headline win and
 flips every weakness:
 
-- **~90% fewer tokens.** In lazy-discovery mode the gateway advertises 4 meta-tools
-  instead of every server's full tool list, so the agent's context stays flat no
-  matter how many servers you connect. Measured: 99.5% less tool-definition overhead
-  per request on a 415-tool catalog (see [BENCHMARK.md](../BENCHMARK.md)).
+- **Historical model benchmark: ~90% fewer total tokens.** In the tested harness,
+  lazy discovery advertised a small MCP tool set instead of the full catalog.
+  The 415-tool local comparison estimated 99.5% less serialized definition
+  payload; it was not a provider-billing measurement (see [BENCHMARK.md](../BENCHMARK.md)).
 - **Hot toggle, no restart.** Enable/disable a server, the gateway re-emits its
   tool list via the MCP `notifications/tools/list_changed`; supporting clients
   update live. The client's own config never changed, so nothing reloads.

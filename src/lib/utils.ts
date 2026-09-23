@@ -12,11 +12,20 @@ export function cn(...inputs: ClassValue[]) {
  * Sidebar, share text, ...) shows the same rounded figure for the same number.
  */
 export function fmtTokens(n: number): string {
-  if (n >= 1_000_000_000_000) return `${(n / 1_000_000_000_000).toFixed(1)}T`;
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 999_950_000_000) return `${(n / 1_000_000_000_000).toFixed(1)}T`;
+  if (n >= 999_950_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 999_950) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return `${n}`;
+}
+
+/** Decimal byte units for MCP payloads; keep the exact count in tooltips/details. */
+export function fmtBytes(bytes: number): string {
+  if (bytes >= 999_950_000_000) return `${(bytes / 1_000_000_000_000).toFixed(1)} TB`;
+  if (bytes >= 999_950_000) return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
+  if (bytes >= 999_950) return `${(bytes / 1_000_000).toFixed(1)} MB`;
+  if (bytes >= 1_000) return `${(bytes / 1_000).toFixed(1)} KB`;
+  return `${bytes} B`;
 }
 
 /**

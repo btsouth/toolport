@@ -93,7 +93,7 @@ export function getSecurityEvents(limit = 100): Promise<SecurityEvent[]> {
   return invoke<SecurityEvent[]>("get_security_events", { limit });
 }
 
-/** Cumulative tokens lazy discovery has kept out of client context. */
+/** Catalog exposure: exact serialized MCP bytes plus a bytes/4 token-equivalent estimate. */
 export function getSavingsSummary(): Promise<SavingsSummary> {
   return invoke<SavingsSummary>("savings_summary");
 }
@@ -291,9 +291,8 @@ export function clearInspectLog(): Promise<void> {
   return invoke<void>("clear_inspect_log");
 }
 
-/** Recent lazy-discovery search traces (newest first): what the model searched for,
- * which tools matched, and the tool-definition tokens the results cost vs. loading the
- * whole catalog. Empty until something has searched. */
+/** Recent discovery searches, including exact returned UTF-8 content bytes on v2
+ * traces. Older token fields are schema-only estimates. */
 export function getSearchTraces(limit = 100): Promise<SearchTrace[]> {
   return invoke<SearchTrace[]>("get_search_traces", { limit });
 }

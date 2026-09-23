@@ -544,6 +544,11 @@ async function benchmarkProduct(
     const instructions = initialized.result?.instructions ?? "";
     const instructionBytes = Buffer.byteLength(instructions);
     const alwaysOnBytes = toolDefinitionBytes + instructionBytes;
+    for (let i = 0; i < 10; i++) await client.call("tools/list", {});
+    const toolsList = await measure(
+      () => client.call("tools/list", {}),
+      options.iterations,
+    );
 
     // Measure dispatch before the search workload so index construction, trace
     // writes, and CPU/cache churn from repeated searches cannot contaminate it.
@@ -646,6 +651,7 @@ async function benchmarkProduct(
     return {
       handshake,
       catalogReady,
+      toolsList,
       exposedSurface: {
         toolCount: exposedTools.length,
         toolDefinitionBytes,
@@ -905,15 +911,16 @@ function markdown(result) {
     "# Local MCP gateway comparison",
     "",
     `Same generated MCP server, ${result.runtime.iterations} measured iterations per operation.`,
-    "Token counts below estimate the always-exposed MCP tool-definition payload as JSON bytes / 4.",
+    "Token equivalents below are estimates from serialized MCP UTF-8 bytes / 4, not provider-reported usage.",
     "",
-    `| Catalog | Product | Ready ms | Exposed tools | Always-on est. tokens | Search tokens p50 / p95 | Search p50 / p95 ms | Recall@${result.runtime.topK} | Schema-ready@${result.runtime.topK} | Ready tokens / trips p50 | MRR | Call overhead p50 / p95 ms |`,
-    "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    `| Catalog | Product | Ready ms | List p50 / p95 ms | Exposed tools | Always-on est. tokens | Search est. tokens p50 / p95 | Search p50 / p95 ms | Recall@${result.runtime.topK} | Schema-ready@${result.runtime.topK} | Ready est. tokens / trips p50 | MRR | Call overhead p50 / p95 ms |`,
+    "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
   for (const run of result.runs) {
     for (const [product, metrics] of Object.entries(run.products)) {
       lines.push(
         `| ${run.catalogSize} | ${product} | ${metrics.catalogReady.toFixed(2)} | ` +
+          `${metrics.toolsList.median.toFixed(2)} / ${metrics.toolsList.p95.toFixed(2)} | ` +
           `${metrics.exposedSurface.toolCount} | ${metrics.exposedSurface.estimatedTokens} | ` +
           `${metrics.searchPayload.estimatedTokens.median.toFixed(0)} / ${metrics.searchPayload.estimatedTokens.p95.toFixed(0)} | ` +
           `${metrics.search.median.toFixed(2)} / ${metrics.search.p95.toFixed(2)} | ` +
@@ -967,7 +974,8 @@ async function main() {
       sameQueries: true,
       sameIterations: true,
       networkRequiredDuringMeasurement: false,
-      tokenEstimate: "serialized MCP tools/list JSON bytes divided by four",
+      tokenEstimate:
+        "serialized tool-array and initialize-instruction UTF-8 bytes divided by four; search and ready-response estimates use serialized response JSON bytes",
     },
     versions: {
       toolportRevision: gitRevision(),

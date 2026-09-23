@@ -1087,13 +1087,15 @@ async fn get_security_events(limit: usize) -> Result<Vec<serde_json::Value>, Str
     .map_err(|e| format!("security events task join failed: {e}"))?
 }
 
-/// Cumulative tool-definition tokens that lazy discovery has kept out of clients'
-/// context, summed from the local savings log for the in-app counter.
+/// Catalog exposure measurements plus legacy estimated token equivalents from
+/// the local savings log. Byte fields are exact MCP payload measurements.
 #[tauri::command]
-async fn savings_summary() -> serde_json::Value {
-    tauri::async_runtime::spawn_blocking(savings::summary)
-        .await
-        .unwrap_or(serde_json::Value::Null)
+async fn savings_summary() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        savings::try_summary().map_err(|error| format!("Couldn't read catalog telemetry: {error}"))
+    })
+    .await
+    .map_err(|error| format!("catalog telemetry task join failed: {error}"))?
 }
 
 /// A shareable diagnostics blob for bug reports: Toolport version + OS, a
@@ -1547,8 +1549,8 @@ fn clear_inspect_log() -> Result<(), String> {
 }
 
 /// Recent lazy-discovery search traces (newest first): what the model searched for,
-/// which tools matched, and the tool-definition tokens the results cost vs. loading
-/// the whole catalog. The in-path proof that lazy discovery is working. Empty when
+/// which tools matched, and exact UTF-8 response content bytes when measured.
+/// Older token fields are schema-only estimates. Empty when
 /// nothing has searched yet.
 #[tauri::command]
 async fn get_search_traces(limit: usize) -> Result<Vec<serde_json::Value>, String> {
@@ -1559,7 +1561,7 @@ async fn get_search_traces(limit: usize) -> Result<Vec<serde_json::Value>, Strin
     .map_err(|e| format!("search traces task join failed: {e}"))?
 }
 
-/// Clear the search-trace log (delete `search-trace.jsonl`).
+/// Clear legacy and v2 search-trace logs.
 #[tauri::command]
 fn clear_search_traces() -> Result<(), String> {
     searchtrace::try_clear().map_err(|e| format!("Couldn't clear the search traces: {e}"))

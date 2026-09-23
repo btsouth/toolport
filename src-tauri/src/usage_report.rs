@@ -2,7 +2,7 @@
 //!
 //! Builds the rows a member reports to their own team's server for showback
 //! (`POST /teams/{id}/usage`). Everything here is counts and estimates derived
-//! from the same `audit.jsonl` / `savings.jsonl` the in-app dashboards read:
+//! from the same local audit and versioned savings logs the in-app dashboards read:
 //! tool names, arguments, results, and secrets never leave the machine, and only
 //! servers the team itself distributed (`source = "team:<id>"`) are ever counted.
 //! This reports to the member's own team server, not to any vendor endpoint; a
@@ -12,13 +12,14 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde_json::Value;
 
-/// Estimated $ per million tool-definition tokens kept out of context. Matches
-/// the in-app savings banner's default model (Claude Sonnet list input rate);
-/// the Teams dashboards label the figure "estimated, at list input rates".
+/// Reference list-price equivalent per million estimated schema tokens. This
+/// compatibility figure cannot represent actual spend avoided: clients may gate
+/// tools and providers may cache the prompt prefix.
 pub const EST_DOLLARS_PER_MTOK: f64 = 3.0;
 
-/// One per-server rollup row: tool calls routed + tool-def tokens kept out of
-/// agent context. The dollar figure is derived, not stored (see [`est_cost`]).
+/// One per-server rollup row. `tokens_saved` is a compatibility estimate,
+/// derived from v1 attribution or the v2 positive global estimate apportioned
+/// across omitted downstream definitions. Extra exposure receives zero credit.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Row {
     pub calls: u64,
@@ -70,9 +71,9 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// dashboard figure is "tool calls routed through the gateway", and a failed
 /// downstream call was still routed. HITL / routine rows and lines that omit
 /// `ok` are not tool calls (SBS-932). Savings lines carry a `byServer` token
-/// map (new format); lines without one (pre-attribution builds, rotation carry
-/// lines) still count in the in-app total but can't be placed per server, so
-/// they are skipped here.
+/// map. Rotated v2 detail becomes explicit `team_daily` buckets keyed by UTC
+/// day, so a lifetime carry timestamp never impersonates a daily usage row.
+/// Unattributed legacy rows are skipped.
 pub fn rollup(
     day: &str,
     audit_lines: &[Value],
@@ -97,7 +98,12 @@ pub fn rollup(
         }
         rows.entry(server.to_string()).or_default().calls += 1;
     }
-    for e in savings_lines.iter().filter(|e| ts_day(e)) {
+    for e in savings_lines.iter().filter(|e| {
+        if e.get("kind").and_then(Value::as_str) == Some("team_daily") {
+            return e.get("day").and_then(Value::as_str) == Some(day);
+        }
+        ts_day(e)
+    }) {
         let Some(by_server) = e.get("byServer").and_then(Value::as_object) else {
             continue;
         };
@@ -195,6 +201,16 @@ mod tests {
                 tokens_saved: 580
             }
         );
+        assert!(!rows.contains_key("personal"));
+    }
+
+    #[test]
+    fn v2_attribution_keeps_existing_team_wire_estimate_scoped() {
+        let savings = vec![json!({"v":2, "kind":"catalog_exposure", "ts":TS_A,
+            "byServerBytes":{"github":160, "personal":800},
+            "byServer":{"github":40, "personal":200}})];
+        let rows = rollup("2026-07-08", &[], &savings, &team(&["github"]));
+        assert_eq!(rows["github"].tokens_saved, 40);
         assert!(!rows.contains_key("personal"));
     }
 

@@ -2504,7 +2504,7 @@ static DATA_DIR_OVERRIDE_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(any(debug_assertions, test, feature = "test-support"))]
 static DATA_DIR_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
-#[cfg(test)]
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
 static DATA_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Serialize tests that resolve [`conduit_dir`] with tests that override it.
@@ -2512,8 +2512,9 @@ static DATA_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// The override is process-global, so this lock is required even for tests that only
 /// read the normal data directory; otherwise they can observe another test's scratch
 /// directory while that test holds a [`DataDirOverride`].
-#[cfg(test)]
-pub(crate) fn data_dir_test_lock() -> std::sync::MutexGuard<'static, ()> {
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn data_dir_test_lock() -> std::sync::MutexGuard<'static, ()> {
     DATA_DIR_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 
 use conduit_lib::approval;
 use conduit_lib::approval::{new_correlation_id, read_endpoint_descriptor, request_human_decision};
+use conduit_lib::audit;
 use conduit_lib::clients;
 use conduit_lib::codemode;
 use conduit_lib::codemode_worker as worker;
@@ -56,7 +57,6 @@ use conduit_lib::secrets;
 use conduit_lib::semantic;
 use conduit_lib::session_store::SessionStore;
 use conduit_lib::shaping;
-use conduit_lib::{audit, usage_report};
 
 #[cfg(any(unix, windows))]
 #[global_allocator]
@@ -1190,7 +1190,7 @@ fn validate_search_query(query: &str) -> Result<(), String> {
 fn status_tool_def() -> Value {
     json!({
         "name": "toolport_status",
-        "description": "Report Toolport's status: the MCP servers enabled in the active profile, each server's tool count, and how many tokens (and dollars) lazy discovery has saved you so far.",
+        "description": "Report enabled MCP servers, their tool counts, and discovery mode. Unscoped callers may also see a local estimate of catalog exposure avoided.",
         "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
     })
 }
@@ -3021,26 +3021,31 @@ fn enabled_summary(
         "\nDiscovery mode: {}\n",
         host.discovery_mode().as_str()
     ));
-    out.push_str(&savings_line());
+    // Persisted legacy totals and unscoped v2 totals cannot be attributed to a
+    // particular allowed set or profile. Never expose them to a scoped caller.
+    if allowed.is_none() && profile.is_none() {
+        out.push_str(&savings_line());
+    }
     out
 }
 
-/// Compact token count for status text: "1.2M", "541k", or the raw number.
+/// Compact estimated token-equivalent for status text.
 fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000 {
-        let thousands = (n as f64 / 1_000.0).round();
-        if thousands >= 1_000.0 {
-            format!("{:.1}M", n as f64 / 1_000_000.0)
-        } else {
-            format!("{thousands:.0}k")
-        }
+    if n >= 999_950_000_000 {
+        format!("{:.1}T", n as f64 / 1_000_000_000_000.0)
+    } else if n >= 999_950_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 999_950 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         n.to_string()
     }
 }
 
-/// One line summarizing what lazy discovery has saved, for toolport_status, so an
-/// agent can answer "what is Toolport saving me?". Empty until something is saved
+/// One line summarizing local catalog exposure for unscoped toolport_status.
+/// Empty until something is measured or estimated
 /// (a fresh install, or non-lazy mode where nothing is recorded).
 fn savings_line() -> String {
     let s = savings::summary();
@@ -3056,17 +3061,15 @@ fn savings_line() -> String {
     if saved > 0 {
         let loads = s.get("listLoads").and_then(Value::as_u64).unwrap_or(0);
         let peak = s.get("peakCatalog").and_then(Value::as_u64).unwrap_or(0);
-        let dollars = usage_report::est_cost(saved); // Claude Sonnet input $/M
         line.push_str(&format!(
-            "Lazy discovery has kept ~{} tokens of tool definitions out of your agent's \
-             context so far (about ${:.2} at Claude Sonnet input rates) across {loads} \
-             tool-list load(s)",
-            fmt_tokens(saved),
-            dollars
+            "Catalog loads avoided exposing ≈{} token-equivalent of serialized MCP tool \
+             definitions across {loads} load(s). Estimated at UTF-8 bytes / 4; actual \
+             model usage depends on client transformations, gating, and caching",
+            fmt_tokens(saved)
         ));
         if peak > 4 {
             line.push_str(&format!(
-                "; the biggest catalog collapsed {peak} tools down to a handful of meta-tools"
+                "; peak full catalog surface contained {peak} tools"
             ));
         }
         line.push_str(".\n");
@@ -7571,6 +7574,61 @@ fn handle_request(
     )
 }
 
+/// Construct the exact tool array for one discovery mode from a policy-filtered
+/// catalog. Both the response and the hypothetical full baseline use this path.
+fn tool_surface(
+    host: &HostState,
+    reg: &Registry,
+    router: &Router,
+    catalog: &[Value],
+    allowed: Option<&std::collections::HashSet<String>>,
+    mode: DiscoveryMode,
+) -> Vec<Value> {
+    let mut scoped = if mode == DiscoveryMode::Lazy {
+        Vec::new()
+    } else {
+        let owners = unique_prefix_owners(reg);
+        scope_tools(catalog, allowed, |name| {
+            owner_of_exposed_tool(Some(router), &owners, name)
+        })
+    };
+    match mode {
+        DiscoveryMode::Full => {
+            let mut tools = vec![status_tool_def(), fetch_result_tool_def()];
+            if host.code_mode_enabled() {
+                tools.push(run_script_tool_def());
+            }
+            append_routine_tool_defs(host, &mut tools, reg.allow_routine_writes);
+            if reg.confirm_destructive {
+                tools.push(confirm_tool_def());
+            }
+            if !relays_mcp_app_html_to_active_client(router, allowed) {
+                scoped.retain(mcp_app_tool_is_model_visible);
+            }
+            neutralize_listed_tools(&mut scoped);
+            tools.extend(scoped);
+            tools
+        }
+        DiscoveryMode::Lazy | DiscoveryMode::Grouped => {
+            let mut tools = grouped_tool_defs(
+                host,
+                reg.allow_agent_control,
+                reg.allow_routine_writes,
+                reg.confirm_destructive,
+                if mode == DiscoveryMode::Grouped {
+                    &scoped
+                } else {
+                    &[]
+                },
+            );
+            let mut app_tools = mcp_app_tools_for_client(catalog, allowed, router, reg);
+            neutralize_listed_tools(&mut app_tools);
+            tools.extend(app_tools);
+            tools
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_request_with_cancel(
     host: &HostState,
@@ -7678,164 +7736,30 @@ fn handle_request_with_cancel(
             ))
         }
         "tools/list" => {
-            // Lazy mode: advertise only the meta-tools, so the client's context
-            // holds a handful of tool defs instead of the whole catalog. The model
-            // finds real tools via toolport_search_tools and runs toolport_call_tool.
-            if mode == DiscoveryMode::Lazy {
-                let mut tools = vec![
-                    status_tool_def(),
-                    search_tool_def(),
-                    call_tool_def(),
-                    fetch_result_tool_def(),
-                ];
-                // Code mode (on by default, Settings kill switch): one script that
-                // orchestrates many calls in a single round-trip.
-                if host.code_mode_enabled() {
-                    tools.push(run_script_tool_def());
-                }
-                append_routine_tool_defs(host, &mut tools, reg.allow_routine_writes);
-                // Opt-in: surface the agent-control tools only when the user has
-                // allowed it, so an agent can't even see them otherwise.
-                if reg.allow_agent_control {
-                    tools.push(enable_server_tool_def());
-                    tools.push(disable_server_tool_def());
-                }
-                // The confirm tool is advertised only while confirmation is on,
-                // so an agent can't see it (and attempt to call it) otherwise.
-                if reg.confirm_destructive {
-                    tools.push(confirm_tool_def());
-                }
-                // Record what lazy discovery kept out of the client's context: the
-                // full catalog we'd otherwise serve (status + every downstream tool)
-                // minus these 4 meta-tools. Estimating over the cached slice avoids
-                // cloning the whole catalog on a serve.
-                let agg;
-                let unblocked;
-                let catalog: &[Value] = if cached.is_empty() {
-                    agg = router.aggregated_tools();
-                    &agg
-                } else {
-                    unblocked = drop_blocked_from_cache(cached.to_vec(), router, reg);
-                    &unblocked
-                };
-                // MCP Apps hosts discover the UI resource linkage only through
-                // tools/list. Preserve those few tools when the requesting host
-                // explicitly negotiated the UI extension; the rest of the
-                // downstream catalog remains behind lazy discovery.
-                let mut app_tools = mcp_app_tools_for_client(catalog, allowed, router, reg);
-                neutralize_listed_tools(&mut app_tools);
-                tools.extend(app_tools);
-                let status = status_tool_def();
-                let full_tokens = savings::estimate_tokens(catalog)
-                    + savings::estimate_tokens(std::slice::from_ref(&status));
-                savings::record(
-                    full_tokens,
-                    savings::estimate_tokens(&tools),
-                    catalog.len() as u64 + 1,
-                    savings::per_server_tokens(catalog, |name| {
-                        router.route_of(name).map(|(s, _)| s.to_string())
-                    }),
-                );
-                gtrace(&format!(
-                    "tools/list -> {} meta-tools (lazy discovery)",
-                    tools.len()
-                ));
-                return Some(success(
-                    id,
-                    cacheable_for_upstream(
-                        json!({ "tools": tools }),
-                        CacheHint::local(LOCAL_CACHE_TTL_MS),
-                        cache_scoped,
-                    ),
-                ));
-            }
-            // Grouped mode: the lazy meta-tools plus a per-server help_<server> browse
-            // tool, so a weak model can pick a server by name instead of inventing a
-            // search query. Scoped to the client's servers, same as full mode.
-            if mode == DiscoveryMode::Grouped {
-                let agg;
-                let unblocked;
-                let catalog: &[Value] = if cached.is_empty() {
-                    agg = router.aggregated_tools();
-                    &agg
-                } else {
-                    unblocked = drop_blocked_from_cache(cached.to_vec(), router, reg);
-                    &unblocked
-                };
-                let owners = unique_prefix_owners(reg);
-                let scoped = scope_tools(catalog, allowed, |n| {
-                    owner_of_exposed_tool(Some(router), &owners, n)
-                });
-                let mut tools = grouped_tool_defs(
-                    host,
-                    reg.allow_agent_control,
-                    reg.allow_routine_writes,
-                    reg.confirm_destructive,
-                    &scoped,
-                );
-                let mut app_tools = mcp_app_tools_for_client(catalog, allowed, router, reg);
-                neutralize_listed_tools(&mut app_tools);
-                tools.extend(app_tools);
-                // Savings vs. advertising the whole (scoped) catalog + status.
-                let status = status_tool_def();
-                let full_tokens = savings::estimate_tokens(&scoped)
-                    + savings::estimate_tokens(std::slice::from_ref(&status));
-                savings::record(
-                    full_tokens,
-                    savings::estimate_tokens(&tools),
-                    scoped.len() as u64 + 1,
-                    savings::per_server_tokens(&scoped, |name| {
-                        router.route_of(name).map(|(s, _)| s.to_string())
-                    }),
-                );
-                gtrace(&format!(
-                    "tools/list -> {} tools (grouped: {} server browse tools)",
-                    tools.len(),
-                    distinct_server_prefixes(&scoped).len()
-                ));
-                return Some(success(
-                    id,
-                    cacheable_for_upstream(
-                        json!({ "tools": tools }),
-                        router
-                            .tools_cache_hint()
-                            .map(|hint| CacheHint::local(LOCAL_CACHE_TTL_MS).merge(hint))
-                            .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS)),
-                        cache_scoped,
-                    ),
-                ));
-            }
-            let mut tools = vec![status_tool_def(), fetch_result_tool_def()];
-            if host.code_mode_enabled() {
-                tools.push(run_script_tool_def());
-            }
-            append_routine_tool_defs(host, &mut tools, reg.allow_routine_writes);
-            // The confirm tool is advertised only while confirmation is on.
-            if reg.confirm_destructive {
-                tools.push(confirm_tool_def());
-            }
-            // Prefer the cached catalog (instant); fall back to the live router.
-            // Scope to the client's allowed servers (a no-op when unscoped), so a
-            // registered HTTP client only ever sees its own servers' tools.
+            // The same policy-filtered catalog and surface builder serve the real
+            // response and the hypothetical full-mode baseline for this client.
             let catalog = if cached.is_empty() {
                 router.aggregated_tools()
             } else {
                 drop_blocked_from_cache(cached.to_vec(), router, reg)
             };
-            let owners = unique_prefix_owners(reg);
-            let mut scoped = scope_tools(&catalog, allowed, |n| {
-                owner_of_exposed_tool(Some(router), &owners, n)
-            });
-            if !relays_mcp_app_html_to_active_client(router, allowed) {
-                scoped.retain(mcp_app_tool_is_model_visible);
+            let tools = tool_surface(host, reg, router, &catalog, allowed, mode);
+            if mode != DiscoveryMode::Full {
+                let full = tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Full);
+                savings::record_catalog(
+                    if mode == DiscoveryMode::Lazy {
+                        "lazy"
+                    } else {
+                        "grouped"
+                    },
+                    client,
+                    &full,
+                    &tools,
+                    |name| router.route_of(name).map(|(server, _)| server.to_string()),
+                );
             }
-            // `scoped` is an owned clone (scope_tools). Neutralize every listed
-            // string here so a full tools/list cannot deliver a fake Toolport
-            // voice (SBS-896). Lazy-mode meta-tools above are Toolport-authored.
-            neutralize_listed_tools(&mut scoped);
-            tools.extend(scoped);
             gtrace(&format!(
-                "tools/list -> {} tools (cache={})",
+                "tools/list -> {} tools ({mode:?}, cache={})",
                 tools.len(),
                 !cached.is_empty()
             ));
@@ -7843,10 +7767,14 @@ fn handle_request_with_cancel(
                 id,
                 cacheable_for_upstream(
                     json!({ "tools": tools }),
-                    router
-                        .tools_cache_hint()
-                        .map(|hint| CacheHint::local(LOCAL_CACHE_TTL_MS).merge(hint))
-                        .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS)),
+                    if mode == DiscoveryMode::Lazy {
+                        CacheHint::local(LOCAL_CACHE_TTL_MS)
+                    } else {
+                        router
+                            .tools_cache_hint()
+                            .map(|hint| CacheHint::local(LOCAL_CACHE_TTL_MS).merge(hint))
+                            .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS))
+                    },
                     cache_scoped,
                 ),
             ))
@@ -7965,6 +7893,7 @@ fn handle_request_with_cancel(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if let Err(message) = validate_search_query(query) {
+                    savings::record_discovery(message.len() as u64, savings::surface_bytes(&[]));
                     return Some(success(
                         id,
                         json!({
@@ -8210,9 +8139,12 @@ fn handle_request_with_cancel(
                     // spending tokens on indentation and line breaks on every search.
                     serde_json::to_string(&matches).unwrap_or_default()
                 );
-                // Record the trace: the ground-truth cost of what THIS search returned
-                // vs. what advertising the whole (scoped) catalog would cost per turn.
-                // Being in-path, we know both exactly rather than estimating from logs.
+                let response_content_bytes = text.len() as u64;
+                let matched_schema_bytes = savings::surface_bytes(&matches);
+                let catalog_schema_bytes = savings::surface_bytes(source);
+                savings::record_discovery(response_content_bytes, matched_schema_bytes);
+                // Record exact UTF-8 returned text and schema-array bytes. Legacy
+                // token fields remain reference estimates for existing readers.
                 let returned_names: Vec<String> = matches
                     .iter()
                     .filter_map(|m| m.get("name").and_then(|v| v.as_str()).map(str::to_string))
@@ -8242,7 +8174,7 @@ fn handle_request_with_cancel(
                 } else {
                     "lexical"
                 };
-                searchtrace::record(
+                searchtrace::record_measured(
                     client,
                     query,
                     server,
@@ -8251,8 +8183,11 @@ fn handle_request_with_cancel(
                     matches.len(),
                     total,
                     broadened,
-                    savings::estimate_tokens(&matches),
-                    savings::estimate_tokens(source),
+                    savings::estimated_tokens(matched_schema_bytes),
+                    savings::estimated_tokens(catalog_schema_bytes),
+                    response_content_bytes,
+                    matched_schema_bytes,
+                    catalog_schema_bytes,
                     escalate,
                     &ranking,
                     mode,
@@ -16637,10 +16572,16 @@ mod tests {
     #[test]
     fn formats_compact_token_counts() {
         assert_eq!(fmt_tokens(999), "999");
-        assert_eq!(fmt_tokens(1_000), "1k");
+        assert_eq!(fmt_tokens(1_000), "1.0k");
+        assert_eq!(fmt_tokens(999_949), "999.9k");
         assert_eq!(fmt_tokens(999_950), "1.0M");
         assert_eq!(fmt_tokens(1_000_000), "1.0M");
         assert_eq!(fmt_tokens(1_250_000), "1.2M");
+        assert_eq!(fmt_tokens(999_949_999), "999.9M");
+        assert_eq!(fmt_tokens(1_000_000_000), "1.0B");
+        assert_eq!(fmt_tokens(3_692_944_923), "3.7B");
+        assert_eq!(fmt_tokens(999_949_999_999), "999.9B");
+        assert_eq!(fmt_tokens(1_000_000_000_000), "1.0T");
     }
 
     #[test]
@@ -23304,6 +23245,18 @@ mod tests {
 
     #[test]
     fn status_summary_scopes_to_allowed_servers() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _data_lock = registry::data_dir_test_lock();
+        let dir =
+            std::env::temp_dir().join(format!("toolport-status-scope-{}", std::process::id()));
+        let _override = registry::DataDirOverride::set(&dir);
+        savings::record_catalog(
+            "lazy",
+            Some("alpha-client"),
+            &[json!({"name":"alpha__secret","description":"alpha-only-schema"})],
+            &[json!({"name":"toolport_status"})],
+            |name| (name == "alpha__secret").then(|| "alpha".to_string()),
+        );
         let host = dispatch_host(false);
         use std::collections::HashSet;
         let mut reg = Registry::default();
@@ -23334,17 +23287,40 @@ mod tests {
         let full = enabled_summary(&host, &reg, &cached, None, None);
         assert!(full.contains("alpha"));
         assert!(!full.contains("bravo")); // not in the active profile
-                                          // Scoped to bravo: shows bravo (its real scope) even though bravo isn't in
-                                          // the active profile, and never leaks alpha's name/command/tool count.
+        assert!(full.contains("Catalog loads avoided exposing"));
+        // Scoped to bravo: shows bravo (its real scope) even though bravo isn't in
+        // the active profile, and never leaks alpha's name/command/tool count.
         let allowed: HashSet<String> = ["bravo".to_string()].into_iter().collect();
         let scoped = enabled_summary(&host, &reg, &cached, None, Some(&allowed));
         assert!(scoped.contains("bravo"));
         assert!(!scoped.contains("alpha"));
         assert!(!scoped.contains("alpha-cmd"));
+        assert!(!scoped.contains("Catalog loads avoided exposing"));
+        assert!(!scoped.contains("alpha-only-schema"));
+        assert!(!scoped.contains("peak full catalog"));
+        assert!(!scoped.contains("load(s)"));
+        let rpc = handle_request(
+            &host,
+            &json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"toolport_status","arguments":{}}}),
+            &reg,
+            &Router::new(),
+            &cached,
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            Some(&allowed),
+            Some("bravo-client"),
+        ).unwrap();
+        let rpc_text = rpc["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(rpc_text.contains("bravo"));
+        assert!(!rpc_text.contains("Catalog loads avoided exposing"));
         // The status line reports the mode of the host it is asked about.
         host.set_discovery_mode(DiscoveryMode::Grouped);
         let grouped = enabled_summary(&host, &reg, &cached, None, None);
         assert!(grouped.contains("Discovery mode: grouped"), "{grouped}");
+        savings::try_clear().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -26574,6 +26550,13 @@ mod tests {
 
     #[test]
     fn lazy_discovery_keeps_ui_linked_tools_only_for_apps_hosts() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-apps-measure-{}",
+            routines::generate_id().unwrap()
+        ));
+        let _data = registry::DataDirOverride::set(&dir);
         let host = dispatch_host(false);
         let reg = Registry::default();
         let mut router = Router::new();
@@ -26636,6 +26619,30 @@ mod tests {
             "ui://fixture/dashboard"
         );
 
+        let full_apps = handle_request(
+            &host,
+            &modern_apps_req(11, "tools/list", json!({})),
+            &reg,
+            &router,
+            &cached,
+            false,
+            None,
+            &guard,
+            &confirm,
+            None,
+            None,
+        )
+        .unwrap();
+        let measured = savings::entries().into_iter().next().unwrap();
+        assert_eq!(
+            measured["exposedSurfaceBytes"],
+            savings::surface_bytes(apps["result"]["tools"].as_array().unwrap())
+        );
+        assert_eq!(
+            measured["fullSurfaceBytes"],
+            savings::surface_bytes(full_apps["result"]["tools"].as_array().unwrap())
+        );
+
         let ordinary = handle_request(
             &host,
             &modern_req(2, "tools/list", json!({})),
@@ -26685,6 +26692,7 @@ mod tests {
             .all(|tool| !tool["name"]
                 .as_str()
                 .is_some_and(|name| name.starts_with("apps__"))));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -27857,6 +27865,204 @@ mod tests {
         assert!(names.contains(&"toolport_fetch_result"));
         assert!(!names.contains(&"resend__send_email"));
         assert!(!names.contains(&"toolport_run_script"));
+    }
+
+    #[test]
+    fn catalog_measurement_uses_actual_surfaces_for_modes_scope_and_dynamic_defs() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-catalog-measure-{}",
+            routines::generate_id().unwrap()
+        ));
+        let _data = registry::DataDirOverride::set(&dir);
+        let mut router = Router::new();
+        for server in ["alpha", "beta"] {
+            router.add(DownstreamServer::connect(server.into(), Box::new(MockRoute {
+                tools: vec![
+                    json!({"name":"work", "description":format!("{server} work é"), "inputSchema":{"type":"object"}}),
+                    json!({"name":"danger", "description":"Destructive fixture", "inputSchema":{"type":"object"}, "annotations":{"destructiveHint":true}}),
+                ],
+            })).unwrap());
+        }
+        let cached = router.aggregated_tools();
+        let host = dispatch_host(false);
+        let mut reg = Registry::default();
+        let guard = SearchGuard::default();
+        let confirm = ConfirmGuard::new();
+        let req = json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"});
+        let allowed = std::collections::HashSet::from(["alpha".to_string()]);
+        for code in [false, true] {
+            host.set_code_mode(code);
+            for confirm_on in [false, true] {
+                reg.confirm_destructive = confirm_on;
+                reg.allow_agent_control = confirm_on;
+                host.set_discovery_mode(DiscoveryMode::Full);
+                let full = handle_request(
+                    &host,
+                    &req,
+                    &reg,
+                    &router,
+                    &cached,
+                    false,
+                    None,
+                    &guard,
+                    &confirm,
+                    Some(&allowed),
+                    Some("scoped"),
+                )
+                .unwrap();
+                let full_tools = full["result"]["tools"].as_array().unwrap();
+                let has =
+                    |tools: &[Value], name: &str| tools.iter().any(|tool| tool["name"] == name);
+                assert!(full_tools.iter().any(|tool| tool["name"] == "alpha__work"));
+                assert!(!full_tools.iter().any(|tool| tool["name"] == "beta__work"));
+                assert_eq!(has(full_tools, "toolport_run_script"), code);
+                assert_eq!(has(full_tools, "toolport_confirm"), confirm_on);
+                let scoped_rows = || {
+                    savings::entries()
+                        .into_iter()
+                        .filter(|row| {
+                            row["kind"] == "catalog_exposure" && row["client"] == "scoped"
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let before = scoped_rows().len();
+                for mode in [DiscoveryMode::Lazy, DiscoveryMode::Grouped] {
+                    host.set_discovery_mode(mode);
+                    let exposed = handle_request(
+                        &host,
+                        &req,
+                        &reg,
+                        &router,
+                        &cached,
+                        mode == DiscoveryMode::Lazy,
+                        None,
+                        &guard,
+                        &confirm,
+                        Some(&allowed),
+                        Some("scoped"),
+                    )
+                    .unwrap();
+                    let exposed_tools = exposed["result"]["tools"].as_array().unwrap();
+                    assert_eq!(has(exposed_tools, "toolport_run_script"), code);
+                    assert_eq!(has(exposed_tools, "toolport_confirm"), confirm_on);
+                    assert_eq!(has(exposed_tools, "toolport_enable_server"), confirm_on);
+                    assert_eq!(
+                        has(full_tools, "toolport_list_routines"),
+                        has(exposed_tools, "toolport_list_routines")
+                    );
+                    if mode == DiscoveryMode::Grouped {
+                        assert!(has(exposed_tools, "help_alpha"));
+                        assert!(!has(exposed_tools, "help_beta"));
+                    }
+                    let row = scoped_rows().pop().unwrap();
+                    let full_bytes = savings::surface_bytes(full_tools);
+                    let exposed_bytes = savings::surface_bytes(exposed_tools);
+                    assert_eq!(row["fullSurfaceBytes"], full_bytes);
+                    assert_eq!(row["exposedSurfaceBytes"], exposed_bytes);
+                    assert_eq!(
+                        row["avoidedSurfaceBytes"],
+                        full_bytes.saturating_sub(exposed_bytes)
+                    );
+                    assert_eq!(row["fullToolCount"], full_tools.len());
+                    assert_eq!(row["exposedToolCount"], exposed_tools.len());
+                    assert_eq!(row["client"], "scoped");
+                    assert_eq!(row["byServerBytes"].as_object().unwrap().len(), 1);
+                    assert!(row["byServerBytes"].get("alpha").is_some());
+                    assert!(row["byServerBytes"].get("beta").is_none());
+                    assert_eq!(
+                        row["mode"],
+                        if mode == DiscoveryMode::Lazy {
+                            "lazy"
+                        } else {
+                            "grouped"
+                        }
+                    );
+                }
+                assert_eq!(scoped_rows().len(), before + 2);
+            }
+        }
+        reg.deny_destructive = true;
+        host.set_discovery_mode(DiscoveryMode::Full);
+        let filtered = handle_request(
+            &host,
+            &req,
+            &reg,
+            &router,
+            &cached,
+            false,
+            None,
+            &guard,
+            &confirm,
+            Some(&allowed),
+            Some("scoped"),
+        )
+        .unwrap();
+        assert!(!filtered["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "alpha__danger"));
+        host.set_discovery_mode(DiscoveryMode::Lazy);
+        let _ = handle_request(
+            &host,
+            &req,
+            &reg,
+            &router,
+            &cached,
+            true,
+            None,
+            &guard,
+            &confirm,
+            Some(&allowed),
+            Some("scoped"),
+        )
+        .unwrap();
+        let row = savings::entries().pop().unwrap();
+        assert_eq!(
+            row["fullSurfaceBytes"],
+            savings::surface_bytes(filtered["result"]["tools"].as_array().unwrap())
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn search_measurement_includes_lead_and_guidance_text() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-search-measure-{}",
+            routines::generate_id().unwrap()
+        ));
+        let _data = registry::DataDirOverride::set(&dir);
+        let response = handle_request(
+            &dispatch_host(false),
+            &json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"toolport_search_tools", "arguments":{"query":"charges"}}}),
+            &Registry::default(),
+            &router(),
+            &catalog(),
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("Found"));
+        let trace = searchtrace::read_recent(1).unwrap().pop().unwrap();
+        assert_eq!(trace["responseContentBytes"], text.len());
+        assert!(
+            trace["responseContentBytes"].as_u64().unwrap()
+                > trace["matchedSchemaBytes"].as_u64().unwrap()
+        );
+        let discovery = savings::entries().pop().unwrap();
+        assert_eq!(discovery["kind"], "discovery_response");
+        assert_eq!(discovery["responseContentBytes"], text.len());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A tool definition whose forged Toolport voice sits everywhere BUT the

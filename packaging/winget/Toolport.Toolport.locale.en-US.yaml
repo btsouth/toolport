@@ -17,9 +17,9 @@ Description: |-
   shares them with every AI client you use, so a server is configured once rather
   than once per client.
 
-  Instead of loading hundreds of tool definitions into the model's context, clients
-  see a handful of meta-tools and discover the real ones on demand, which cuts tool
-  tokens by roughly 90%. Servers, credentials, and profiles are managed in one app:
+  In lazy mode, Toolport exposes a small MCP tool catalog and discovers full tool
+  definitions on demand. A published task benchmark reported roughly 90% fewer
+  total model tokens in its tested setup. Servers, credentials, and profiles are managed in one app:
   secrets live in the OS keychain, tool definitions are pinned and re-checked so a
   silently changed tool is quarantined rather than called, and destructive calls can
   require human approval.

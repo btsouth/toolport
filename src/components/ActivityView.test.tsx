@@ -12,6 +12,7 @@ const getSearchTraces = vi.fn();
 const getSecurityEvents = vi.fn();
 const getToolIdentities = vi.fn();
 const getInspectLog = vi.fn();
+const getSavingsSummary = vi.fn();
 
 const clearActivityLogs = vi.fn();
 
@@ -21,7 +22,7 @@ vi.mock("@/lib/api", () => ({
   getAuditLog: (...a: unknown[]) => getAuditLog(...a),
   getAuditStats: vi.fn(() => Promise.resolve(null)),
   getInspectLog: (...a: unknown[]) => getInspectLog(...a),
-  getSavingsSummary: vi.fn(() => Promise.resolve(null)),
+  getSavingsSummary: (...a: unknown[]) => getSavingsSummary(...a),
   getSearchTraces: (...a: unknown[]) => getSearchTraces(...a),
   getSecurityEvents: (...a: unknown[]) => getSecurityEvents(...a),
   getToolIdentities: (...a: unknown[]) => getToolIdentities(...a),
@@ -64,6 +65,7 @@ beforeEach(() => {
   getSecurityEvents.mockResolvedValue([]);
   getToolIdentities.mockResolvedValue([]);
   getInspectLog.mockResolvedValue([]);
+  getSavingsSummary.mockResolvedValue(null);
 });
 
 afterEach(() => {
@@ -366,7 +368,7 @@ describe("ActivityView discovery", () => {
     expect(screen.getByText(/Nothing searched yet/)).toBeInTheDocument();
   });
 
-  it("shows a tiny nonzero saving without rounding it down to zero", async () => {
+  it("labels legacy discovery figures as schema-only estimates", async () => {
     const user = userEvent.setup({
       advanceTimers: (ms) => vi.advanceTimersByTime(ms),
     });
@@ -391,9 +393,134 @@ describe("ActivityView discovery", () => {
     const row = screen.getByRole("button", { name: /tiny savings/i });
     await user.click(row);
 
-    expect(row.parentElement).toHaveTextContent(/<0\.1% less this turn\)\./);
-    expect(row.parentElement).not.toHaveTextContent(/\(0% less this turn\)\./);
+    expect(row.parentElement).toHaveTextContent(/Legacy schema-only estimates/);
+    expect(row.parentElement).toHaveTextContent(/Search guidance text was not counted/);
   });
+
+  it("shows measured search content bytes separately from schemas", async () => {
+    const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
+    getSearchTraces.mockResolvedValue([
+      {
+        ts: 1700000000000,
+        query: "charges",
+        top: "stripe__list",
+        names: ["stripe__list"],
+        returned: 1,
+        total: 1,
+        returnedTokens: 50,
+        flatTokens: 500,
+        savedTokens: 450,
+        escalated: false,
+        responseContentBytes: 2450,
+        matchedSchemaBytes: 200,
+        catalogSchemaBytes: 5000,
+        estimatedResponseTokens: 613,
+        estimateMethod: "utf8_bytes_div_4",
+      } satisfies SearchTrace,
+    ]);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    await user.click(screen.getByRole("button", { name: /Discovery/ }));
+    const row = screen.getByRole("button", { name: /charges/i });
+    await user.click(row);
+    expect(row.parentElement).toHaveTextContent(/Returned 2\.5 KB of discovery content/);
+    expect(row.parentElement).toHaveTextContent(/containing 1 matching schema/);
+    expect(row.parentElement).toHaveTextContent(/UTF-8 bytes ÷ 4/);
+  });
+});
+
+it("distinguishes measured bytes from legacy estimates in catalog savings", async () => {
+  getSavingsSummary.mockResolvedValue({
+    tokensSaved: 3_692_944_923,
+    listLoads: 2751,
+    peakCatalog: 1725,
+    sinceTs: 1700000000000,
+    legacyEstimatedTokensAvoided: 3_692_944_000,
+    measuredLoads: 1,
+    latestCatalogTs: 1700000000001,
+    latestFullToolCount: 1725,
+    latestExposedToolCount: 7,
+    latestFullSurfaceBytes: 8_000,
+    latestExposedSurfaceBytes: 1_000,
+    fullSurfaceBytes: 8_000,
+    exposedSurfaceBytes: 1_000,
+    avoidedSurfaceBytes: 7_000,
+    discoveryCount: 2,
+    discoveryResponseBytes: 2_450,
+  });
+  render(<ActivityView refreshKey={0} registry={null} />);
+  await act(async () => {});
+  expect(screen.getAllByText(/3\.7B/).length).toBeGreaterThan(0);
+  expect(screen.getByText(/8\.0 KB full/)).toBeInTheDocument();
+  expect(
+    screen.getByText(/Latest load: 8\.0 KB \/ 1,725 tools full/),
+  ).toBeInTheDocument();
+  expect(screen.getByText(/older estimated records/)).toBeInTheDocument();
+  expect(screen.getByText(/searches returned 2\.5 KB/)).toBeInTheDocument();
+});
+
+it("shares a token-equivalent catalog statement without a billing claim", async () => {
+  const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText },
+  });
+  getSavingsSummary.mockResolvedValue({
+    tokensSaved: 3_692_944_923,
+    listLoads: 2751,
+    peakCatalog: 1725,
+    sinceTs: 1700000000000,
+  });
+  render(<ActivityView refreshKey={0} registry={null} />);
+  await act(async () => {});
+  await user.click(screen.getByRole("button", { name: "Share" }));
+  expect(writeText).toHaveBeenCalledWith(expect.stringContaining("token-equivalent"));
+  expect(writeText.mock.calls[0][0]).toContain("2,751 loads");
+  expect(writeText.mock.calls[0][0]).not.toMatch(/billed tokens|money saved/i);
+});
+
+it("shows discovery bytes without a catalog load or a zero-token savings claim", async () => {
+  getSavingsSummary.mockResolvedValue({
+    tokensSaved: 0,
+    listLoads: 0,
+    peakCatalog: 0,
+    sinceTs: 1700000000000,
+    measuredLoads: 0,
+    discoveryCount: 3,
+    discoveryResponseBytes: 12_340,
+  });
+  render(<ActivityView refreshKey={0} registry={null} />);
+  await act(async () => {});
+  expect(screen.getByText("Discovery payload returned")).toBeInTheDocument();
+  expect(screen.getByText(/3 searches returned 12\.3 KB/)).toBeInTheDocument();
+  expect(screen.queryByText(/0 tool-list loads/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/≈ 0 token-equivalent/)).not.toBeInTheDocument();
+});
+
+it("reports unavailable catalog telemetry without showing an empty measurement", async () => {
+  getSavingsSummary.mockRejectedValue(new Error("corrupt savings store"));
+  render(<ActivityView refreshKey={0} registry={null} />);
+  await act(async () => {});
+  expect(screen.getByRole("alert")).toHaveTextContent("Catalog telemetry unavailable");
+  expect(screen.queryByText("Catalog exposure avoided")).not.toBeInTheDocument();
+});
+
+it("keeps last-loaded catalog telemetry visibly stale after a failed refresh", async () => {
+  getSavingsSummary
+    .mockResolvedValueOnce({
+      tokensSaved: 100,
+      listLoads: 1,
+      peakCatalog: 3,
+      sinceTs: 1700000000000,
+    })
+    .mockRejectedValueOnce(new Error("unreadable"));
+  const view = render(<ActivityView refreshKey={0} registry={null} />);
+  await act(async () => {});
+  view.rerender(<ActivityView refreshKey={1} registry={null} />);
+  await act(async () => {});
+  expect(screen.getByText("Catalog exposure avoided")).toBeInTheDocument();
+  expect(screen.getByRole("alert")).toHaveTextContent("last loaded measurements");
 });
 
 describe("ActivityView tool identities", () => {

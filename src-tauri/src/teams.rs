@@ -872,7 +872,9 @@ fn report_usage(conn: &TeamConnection, token: &str) {
     let Ok(audit_lines) = crate::audit::read_recent(usize::MAX) else {
         return;
     };
-    let savings_lines = crate::savings::entries();
+    let Ok(savings_lines) = crate::savings::try_entries() else {
+        return;
+    };
     let mut new_state: HashMap<String, HashMap<String, [u64; 2]>> = HashMap::new();
     let mut changed = false;
     for back in 0..2u64 {

@@ -109,8 +109,8 @@ export interface InspectEntry {
   durationMs?: number;
 }
 
-/** One lazy-discovery search: what the model searched for and what came back, with
- * the ground-truth token cost of the results vs. loading the whole catalog. */
+/** One lazy-discovery search. Byte fields are exact UTF-8 payload measurements;
+ * token fields are legacy/reference estimates, never provider usage. */
 export interface SearchTrace {
   ts: number;
   client?: string;
@@ -122,12 +122,17 @@ export interface SearchTrace {
   total: number;
   /** Full count of appended recovery candidates. Absent on older traces. */
   fallbacks?: number;
-  /** Tool-definition tokens the returned schemas cost this turn (≈). */
+  /** Legacy compatibility estimate of matched-schema bytes / 4; excludes lead text. */
   returnedTokens: number;
-  /** Tool-definition tokens advertising the whole (scoped) catalog would cost (≈). */
+  /** Legacy compatibility estimate of searchable catalog schema bytes / 4. */
   flatTokens: number;
-  /** flatTokens - returnedTokens: the context kept out of the model this turn. */
+  /** Schema-only estimate difference, not provider tokens saved. */
   savedTokens: number;
+  responseContentBytes?: number;
+  matchedSchemaBytes?: number;
+  catalogSchemaBytes?: number;
+  estimatedResponseTokens?: number;
+  estimateMethod?: "utf8_bytes_div_4";
   /** The loop-breaker fired: repeated searches kept landing on the same top tool. */
   escalated: boolean;
   /** Ranker used: keyword-only (`lexical`) or semantic re-rank. Absent on older traces. */
@@ -257,12 +262,31 @@ export interface AuditStats {
   servers: ServerStat[];
 }
 
-/** Cumulative tool-definition tokens lazy discovery kept out of client context. */
+/** Cumulative catalog exposure measurements plus the legacy estimate. */
 export interface SavingsSummary {
+  /** Compatibility total: v1 legacy estimates plus v2 UTF-8 bytes / 4. */
   tokensSaved: number;
   listLoads: number;
   peakCatalog: number;
   sinceTs: number;
+  legacyEstimatedTokensAvoided?: number;
+  measuredLoads?: number;
+  latestCatalogTs?: number;
+  latestFullToolCount?: number;
+  latestExposedToolCount?: number;
+  latestFullSurfaceBytes?: number;
+  latestExposedSurfaceBytes?: number;
+  fullSurfaceBytes?: number;
+  exposedSurfaceBytes?: number;
+  avoidedSurfaceBytes?: number;
+  extraExposedSurfaceBytes?: number;
+  surfaceDeltaBytes?: number;
+  estimatedTokensAvoided?: number;
+  estimateMethod?: "utf8_bytes_div_4";
+  discoveryCount?: number;
+  discoveryResponseBytes?: number;
+  matchedSchemaBytes?: number;
+  estimatedDiscoveryTokens?: number;
   /** Downstream tool round-trips collapsed into single code-mode run_script calls.
    * Absent in older savings logs written before code mode. */
   roundTripsSaved?: number;

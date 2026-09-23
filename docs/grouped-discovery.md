@@ -8,7 +8,11 @@ Toolport has three tool-discovery modes, selected per client by the
 | ---------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
 | `lazy` (default) | The 4 meta-tools (`toolport_status`, `toolport_search_tools`, `toolport_call_tool`, `toolport_fetch_result`) | Capable models: minimal, constant context regardless of server count                     |
 | `grouped`        | The 4 meta-tools **plus** a per-server `help_<server>` browse tool                                           | Weaker / local models: an _enumerable_ server choice instead of inventing a search query |
-| `full`           | The entire namespaced catalog (`server__tool`, every tool)                                                   | Debugging, or small setups where full schemas are affordable                             |
+| `full`           | `toolport_status`, `toolport_fetch_result`, and the scoped namespaced catalog (`server__tool`)               | Debugging, or small setups where full schemas are affordable                             |
+
+These are the core definitions. Code mode, routine, confirmation, agent-control,
+and negotiated MCP Apps settings can add or change definitions for a particular
+client. The exact measurement uses that client's resulting tool array.
 
 ## Why grouped exists
 
@@ -43,6 +47,29 @@ servers, where the per-server tools approach the full catalog.
 - The `help_<server>` tools are scoped to the client's allowed servers, so a
   registered HTTP client never sees a browse tool for a server outside its
   scope.
+
+## Catalog exposure measurements
+
+For each lazy or grouped `tools/list`, Toolport builds the full and exposed tool
+arrays under the same client scope, profile, policy filters, and MCP Apps
+visibility rules. It records their exact serialized UTF-8 byte sizes, tool
+counts, and the byte difference locally in `savings-v2.jsonl` (legacy estimates
+remain in `savings.jsonl`). The Activity page
+shows these exact bytes alongside an estimated token equivalent (bytes divided
+by four). Existing pre-v2 rows remain as legacy estimates and are never
+presented as exact byte measurements.
+
+The two files coexist during upgrades. Older gateways continue writing and
+rotating only `savings.jsonl`; they cannot touch new exact records in
+`savings-v2.jsonl`. New writers lock append and rotation together. Rotation
+preserves lifetime counters and separate UTC-day/server buckets for Team usage;
+unattributed legacy carries remain unattributed. Clearing Activity removes both.
+
+Each discovery search separately records the UTF-8 size of the complete MCP
+response text, including lead and guidance text. These search bytes are
+not subtracted from the catalog exposure figure. MCP clients may transform or
+gate tools, reuse a cached list, and providers may cache prompts, so neither
+number is an exact model-token or billing measurement.
 
 ## Enabling it
 

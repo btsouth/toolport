@@ -3,17 +3,15 @@
 //!
 //! This is the in-path answer to "how do I know lazy discovery is working, and what
 //! is it costing me?" Because Toolport IS the gateway, it knows the ground truth a
-//! post-hoc log reader can only estimate: the exact query, which tools matched, and
-//! the tool-definition tokens the returned schemas cost THIS turn versus what loading
-//! the whole catalog would have. Each `toolport_search_tools` call appends one line.
+//! post-hoc log reader cannot see: the returned content's exact UTF-8 byte count.
+//! Token fields in older traces are bytes/4 estimates, not model usage.
 //!
 //! Kept lean and non-sensitive: the model-authored query is capped, and only tool
 //! NAMES (never their schemas, arguments, or results) are stored. Like the audit and
-//! savings logs it is append-only (each connected client spawns its own gateway, so
-//! concurrent `O_APPEND` of one small line is safe) and never leaves the machine.
+//! savings logs it stays local. New traces use a versioned file and a
+//! cross-process append/rotation lock; old gateways retain their legacy file.
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
@@ -31,6 +29,10 @@ const MAX_NAMES: usize = 25;
 fn trace_path() -> Option<PathBuf> {
     // Same anchor as the registry/audit/savings logs, so the app and every
     // client-spawned gateway (some under MSIX virtualization) share one file.
+    Some(crate::registry::conduit_dir()?.join("search-trace-v2.jsonl"))
+}
+
+fn legacy_trace_path() -> Option<PathBuf> {
     Some(crate::registry::conduit_dir()?.join("search-trace.jsonl"))
 }
 
@@ -51,9 +53,9 @@ fn cap_chars(s: &str, max: usize) -> String {
     out
 }
 
-/// One recorded search. `flat_tokens` is what advertising the whole (scoped) catalog
-/// would cost per request; `returned_tokens` is what this search's results cost. The
-/// difference is the tool-definition context lazy discovery kept out on this turn.
+/// One recorded search. `response_content_bytes` is exact returned text size;
+/// `matched_schema_bytes` and `catalog_schema_bytes` are separately serialized
+/// arrays. Legacy token fields remain bytes/4 estimates for reader compatibility.
 ///
 /// `ranking` explains why each returned tool surfaced: one entry per result (in result
 /// order) of `{ name, rank, matched, pinned, fallback }`, so the Discovery panel can
@@ -61,7 +63,7 @@ fn cap_chars(s: &str, max: usize) -> String {
 /// recovery-candidate count. `mode` is the ranker the search used (`lexical` or
 /// `semantic`). These fields are additive; older traces may omit them.
 #[allow(clippy::too_many_arguments)]
-pub fn record(
+pub fn record_measured(
     client: Option<&str>,
     query: &str,
     server_filter: Option<&str>,
@@ -72,6 +74,9 @@ pub fn record(
     fallbacks: usize,
     returned_tokens: u64,
     flat_tokens: u64,
+    response_content_bytes: u64,
+    matched_schema_bytes: u64,
+    catalog_schema_bytes: u64,
     escalated: bool,
     ranking: &[Value],
     mode: &str,
@@ -88,6 +93,12 @@ pub fn record(
         "returnedTokens": returned_tokens,
         "flatTokens": flat_tokens,
         "savedTokens": flat_tokens.saturating_sub(returned_tokens),
+        "v": 2,
+        "responseContentBytes": response_content_bytes,
+        "matchedSchemaBytes": matched_schema_bytes,
+        "catalogSchemaBytes": catalog_schema_bytes,
+        "estimatedResponseTokens": crate::savings::estimated_tokens(response_content_bytes),
+        "estimateMethod": crate::savings::ESTIMATE_METHOD,
         "escalated": escalated,
         "mode": mode,
     });
@@ -104,42 +115,55 @@ pub fn record(
     write_line(&entry);
 }
 
-/// Append one entry as a single JSON line, then rotate if the file has grown large.
-/// A single `write_all` (not `writeln!`) keeps the many client-spawned gateways that
-/// share this file from interleaving each other's bytes into corrupt JSON.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn record(
+    client: Option<&str>,
+    query: &str,
+    server_filter: Option<&str>,
+    top: &str,
+    names: &[String],
+    returned: usize,
+    total: usize,
+    fallbacks: usize,
+    returned_tokens: u64,
+    flat_tokens: u64,
+    escalated: bool,
+    ranking: &[Value],
+    mode: &str,
+) {
+    record_measured(
+        client,
+        query,
+        server_filter,
+        top,
+        names,
+        returned,
+        total,
+        fallbacks,
+        returned_tokens,
+        flat_tokens,
+        0,
+        0,
+        0,
+        escalated,
+        ranking,
+        mode,
+    );
+}
+
+/// Append and rotate under the same cross-process lock as other local logs.
 fn write_line(entry: &Value) {
     let Some(path) = trace_path() else {
         return;
     };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // Owner-only from creation (SBS-868): these are the model's queries and the
-    // tool names they matched.
-    if let Ok(mut file) = crate::registry::open_append_private(&path) {
-        let _ = file.write_all(format!("{entry}\n").as_bytes());
-    }
-    rotate_if_large(&path);
-}
-
-/// Keep only the most recent `KEEP_LINES` once the file exceeds the cap. Best-effort:
-/// a failure never affects the search that triggered it.
-fn rotate_if_large(path: &Path) {
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if size <= MAX_TRACE_BYTES {
-        return;
-    }
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.len() <= KEEP_LINES {
-        return;
-    }
-    let start = lines.len() - KEEP_LINES;
-    let mut trimmed = lines[start..].join("\n");
-    trimmed.push('\n');
-    let _ = crate::registry::atomic_write(path, &trimmed);
+    let _ = crate::registry::append_line_locked(
+        &path,
+        &entry.to_string(),
+        MAX_TRACE_BYTES,
+        KEEP_LINES,
+        None,
+    );
 }
 
 /// The most recent `limit` traces, newest first.
@@ -149,33 +173,59 @@ fn rotate_if_large(path: &Path) {
 /// "no traces" (SBS-873). Unparseable lines are skipped — a mid-write or
 /// corrupt line is not an IO failure.
 pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
-    let Some(path) = trace_path() else {
-        return Ok(Vec::new());
-    };
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    Ok(content
-        .lines()
-        .rev()
-        .filter_map(|line| serde_json::from_str(line).ok())
+    let mut rows = Vec::new();
+    for path in [legacy_trace_path(), trace_path()].into_iter().flatten() {
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        rows.extend(
+            content
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok()),
+        );
+    }
+    let mut indexed: Vec<(usize, Value)> = rows.into_iter().enumerate().collect();
+    indexed.sort_by(|(ia, a), (ib, b)| {
+        b.get("ts")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .cmp(&a.get("ts").and_then(Value::as_u64).unwrap_or(0))
+            .then_with(|| ib.cmp(ia))
+    });
+    Ok(indexed
+        .into_iter()
         .take(limit)
+        .map(|(_, row)| row)
         .collect())
 }
 
 /// Delete the trace log. Returns `Err` only on a real removal failure; a missing file
 /// (nothing to clear) is success, so a caller can honestly confirm it is gone.
 pub fn try_clear() -> std::io::Result<()> {
-    let Some(path) = trace_path() else {
-        return Ok(());
-    };
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+    let mut first_error = None;
+    for path in [legacy_trace_path(), trace_path()].into_iter().flatten() {
+        let _lock = match crate::registry::lock_at(&path) {
+            Ok(lock) => lock,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(std::io::Error::other(error));
+                }
+                continue;
+            }
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
     }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Fire-and-forget clear (called when the user clears it from Activity, and from the
@@ -191,6 +241,7 @@ mod tests {
     #[test]
     fn record_then_read_returns_newest_first() {
         let _data_dir = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("record");
         clear();
         record(
             Some("cursor"),
@@ -232,11 +283,13 @@ mod tests {
         assert_eq!(recent[1]["client"], "cursor");
         assert_eq!(recent[1]["total"], 3);
         clear();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn ranking_and_mode_are_recorded_and_capped() {
         let _data_dir = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("ranking");
         clear();
         // Ranking with more than MAX_NAMES entries; only MAX_NAMES are stored.
         let ranking: Vec<Value> = (0..40)
@@ -290,11 +343,13 @@ mod tests {
         assert_eq!(e["mode"], "lexical");
         assert!(e.get("ranking").is_none());
         clear();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn query_is_capped_and_names_are_limited() {
         let _data_dir = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("capped");
         clear();
         let long_q = "x".repeat(500);
         let many: Vec<String> = (0..40).map(|i| format!("srv__t{i}")).collect();
@@ -324,11 +379,13 @@ mod tests {
         );
         assert_eq!(e["names"].as_array().unwrap().len(), MAX_NAMES);
         clear();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn no_match_search_is_still_recorded() {
         let _data_dir = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("no-match");
         clear();
         record(
             None,
@@ -352,6 +409,7 @@ mod tests {
         // A miss still shows what a full catalog would have cost.
         assert_eq!(e["flatTokens"], 5000);
         clear();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn isolated_data_dir(label: &str) -> (crate::registry::DataDirOverride, PathBuf) {
@@ -365,7 +423,7 @@ mod tests {
         (crate::registry::DataDirOverride::set(&path), path)
     }
 
-    /// A missing search-trace.jsonl is an empty trace log, not a load failure.
+    /// Missing legacy and v2 files are an empty trace log, not a load failure.
     #[test]
     fn read_recent_missing_file_is_ok_empty() {
         let _lock = crate::registry::data_dir_test_lock();
@@ -391,6 +449,41 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0]["i"], 2);
         assert_eq!(entries[1]["i"], 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn old_trace_rotation_cannot_replace_new_measured_traces() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (_override, root) = isolated_data_dir("mixed-versions");
+        let legacy = legacy_trace_path().unwrap();
+        std::fs::write(&legacy, "{\"ts\":1,\"query\":\"old\"}\n").unwrap();
+        record_measured(
+            None,
+            "new",
+            None,
+            "",
+            &[],
+            0,
+            0,
+            0,
+            0,
+            0,
+            42,
+            2,
+            2,
+            false,
+            &[],
+            "lexical",
+        );
+        crate::registry::atomic_write(&legacy, "{\"ts\":1,\"query\":\"old\"}\n").unwrap();
+        let rows = read_recent(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["query"], "new");
+        assert_eq!(rows[1]["query"], "old");
+        try_clear().unwrap();
+        assert!(!trace_path().unwrap().exists());
+        assert!(!legacy.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 

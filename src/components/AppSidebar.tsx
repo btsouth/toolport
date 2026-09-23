@@ -365,6 +365,7 @@ export function AppSidebar({
   onReplayOnboarding,
 }: Props) {
   const [savings, setSavings] = useState<SavingsSummary | null>(null);
+  const [savingsStale, setSavingsStale] = useState(false);
   // `null` means "no confirmed count": the first poll hasn't answered yet. It
   // must render distinctly from a confirmed zero so a gateway that never
   // answered never reads as "all clear" (#741).
@@ -375,14 +376,18 @@ export function AppSidebar({
   // the "?" glyph and its "Could not reach the gateway" tooltip must only appear
   // once a poll has actually failed, not on every app start (#742).
   const [quarantineStale, setQuarantineStale] = useState(false);
-  // Surface the running token savings in the sidebar so the headline number isn't
+  // Surface the running catalog estimate in the sidebar so the headline number isn't
   // hidden one click away in Activity. Refresh on a light interval as calls flow.
   useEffect(() => {
     let alive = true;
     const load = () =>
       getSavingsSummary()
-        .then((s) => alive && setSavings(s))
-        .catch(() => {});
+        .then((s) => {
+          if (!alive) return;
+          setSavings(s);
+          setSavingsStale(false);
+        })
+        .catch(() => alive && setSavingsStale(true));
     load();
     const id = setInterval(load, 60_000);
     return () => {
@@ -552,14 +557,14 @@ export function AppSidebar({
           <button
             onClick={() => onSelectView("activity")}
             className="mx-3 mt-2 flex items-center gap-2 rounded-lg border border-success/30 bg-success/5 px-3 py-2 text-left text-xs transition-colors hover:bg-success/10"
-            title="Tool-definition tokens lazy discovery has kept out of your agent's context. Click for the breakdown."
+            title={`${savingsStale ? "Catalog telemetry unavailable; showing the last loaded estimate. " : ""}Estimated token equivalent of MCP tool definitions avoided at catalog loads, from serialized UTF-8 bytes. Actual model usage depends on the client and caching.`}
           >
             <Zap className="size-3.5 shrink-0 text-success" />
             <span className="text-muted-foreground">
               <span className="font-semibold text-foreground">
-                {fmtTokens(savings.tokensSaved)}
+                ≈{fmtTokens(savings.tokensSaved)}
               </span>{" "}
-              tokens saved
+              schema token-equivalent{savingsStale ? " (stale)" : ""}
             </span>
           </button>
         )}
