@@ -27,10 +27,21 @@ const gateway =
   process.env.TOOLPORT_GATEWAY_BIN || join(target, "debug/toolport-gateway");
 const mock = process.env.TOOLPORT_MOCK_BIN || join(target, "debug/mock-mcp-server");
 const clientCount = Number(process.argv[2] || 3);
+const registryOption = process.argv.indexOf("--registry");
+const realRegistryPath = registryOption >= 0 ? process.argv[registryOption + 1] : null;
 if (!Number.isInteger(clientCount) || clientCount < 2 || clientCount > 20) {
   throw new Error("client count must be an integer from 2 to 20");
 }
-for (const path of [gateway, mock]) {
+if (registryOption >= 0 && !realRegistryPath) {
+  throw new Error("--registry requires a path");
+}
+if (realRegistryPath && clientCount !== 3) {
+  throw new Error("configured-server run requires three client sessions");
+}
+const realRegistry = realRegistryPath
+  ? JSON.parse(readFileSync(realRegistryPath, "utf8"))
+  : null;
+for (const path of [gateway, ...(realRegistryPath ? [realRegistryPath] : [mock])]) {
   if (!existsSync(path)) throw new Error("missing binary: " + path);
 }
 
@@ -206,11 +217,23 @@ async function waitForEcho(client) {
   throw new Error("mock echo tool did not appear within 30 seconds");
 }
 
+async function waitForStatus(client) {
+  const deadline = now() + 120000;
+  while (now() < deadline) {
+    const result = await client.call("tools/list", {}, 120000);
+    if (result.tools?.some((entry) => entry.name === "toolport_status")) {
+      return "toolport_status";
+    }
+    await sleep(100);
+  }
+  throw new Error("toolport_status did not appear within two minutes");
+}
+
 async function runArm(topology) {
   const dir = join(scratch, topology);
   mkdirSync(dir);
   const transcript = join(dir, "downstream.jsonl");
-  const registry = {
+  const fixtureRegistry = {
     version: 1,
     servers: [
       {
@@ -228,8 +251,14 @@ async function runArm(topology) {
     lazyDiscovery: false,
     ...(topology === "daemon" ? { gatewayTopology: "daemon" } : {}),
   };
+  const registry = realRegistry ? structuredClone(realRegistry) : fixtureRegistry;
+  if (realRegistryPath) {
+    registry.gatewayTopology = topology;
+    registry.lazyDiscovery = false;
+    registry.clientDiscovery = {};
+  }
   const registryPath = join(dir, "registry.json");
-  writeFileSync(registryPath, JSON.stringify(registry));
+  writeFileSync(registryPath, JSON.stringify(registry), { mode: 0o600 });
   const env = Object.fromEntries(
     Object.entries(process.env).filter(([key]) => !/^(TOOLPORT|CONDUIT)_/.test(key)),
   );
@@ -237,10 +266,18 @@ async function runArm(topology) {
     TOOLPORT_DATA_DIR: dir,
     TOOLPORT_REGISTRY: registryPath,
   });
+  if (realRegistryPath) env.TOOLPORT_DISCOVERY = "full";
   const clients = Array.from({ length: clientCount }, (_, index) => {
     const spawned = now();
     const proc = spawn(gateway, [], {
-      env: { ...env, TOOLPORT_CLIENT_ID: "acceptance-" + index },
+      env: {
+        ...env,
+        TOOLPORT_CLIENT_ID: realRegistryPath
+          ? index === clientCount - 1
+            ? "claude-code"
+            : "grok"
+          : "acceptance-" + index,
+      },
       stdio: ["pipe", "pipe", "pipe"],
     });
     children.add(proc);
@@ -262,20 +299,28 @@ async function runArm(topology) {
           });
           const coldStartMs = now() - spawned;
           client.notify("notifications/initialized");
-          const tool = await waitForEcho(client);
+          const tool = realRegistryPath
+            ? await waitForStatus(client)
+            : await waitForEcho(client);
           const catalogReadyMs = now() - spawned;
           const callStarted = now();
-          await client.call("tools/call", {
-            name: tool,
-            arguments: { text: "acceptance" },
-          });
+          await client.call(
+            "tools/call",
+            {
+              name: tool,
+              arguments: realRegistryPath ? {} : { text: "acceptance" },
+            },
+            realRegistryPath ? 120000 : 30000,
+          );
           return { coldStartMs, catalogReadyMs, firstCallMs: now() - callStarted };
         } catch (error) {
-          throw new Error(error.message + "\n" + stderr(), { cause: error });
+          throw new Error(error.message + (realRegistryPath ? "" : "\n" + stderr()), {
+            cause: error,
+          });
         }
       }),
     );
-    await sleep(500);
+    await sleep(realRegistryPath ? 5000 : 500);
     const elected = descriptor(dir);
     if (topology === "daemon" && !elected) throw new Error("no daemon descriptor");
     if (elected) daemons.add(elected.pid);
@@ -309,7 +354,7 @@ async function runArm(topology) {
       (method) => method === "initialize",
     ).length;
     const expectedLaunches = topology === "daemon" ? 1 : clientCount;
-    if (downstreamInitializes !== expectedLaunches) {
+    if (!realRegistryPath && downstreamInitializes !== expectedLaunches) {
       throw new Error(
         topology +
           " made " +
@@ -333,7 +378,10 @@ async function runArm(topology) {
           expectedDaemons,
       );
     }
-    if (processCounts.directDownstreamChildren !== expectedLaunches) {
+    if (
+      !realRegistryPath &&
+      processCounts.directDownstreamChildren !== expectedLaunches
+    ) {
       throw new Error(
         topology +
           " had " +
@@ -345,13 +393,27 @@ async function runArm(topology) {
     if (processCounts.memorySampledProcesses !== processCounts.processCount) {
       throw new Error("memory snapshot missed a process in the gateway tree");
     }
+    if (
+      realRegistryPath &&
+      topology === "daemon" &&
+      (processCounts.directDownstreamChildren === 0 ||
+        processCounts.directDownstreamChildren > daemonTopology.ordinaryLaunches)
+    ) {
+      throw new Error(
+        "daemon launch count differs from live child count: " +
+          processCounts.directDownstreamChildren +
+          " children, " +
+          daemonTopology.ordinaryLaunches +
+          " launch slots",
+      );
+    }
     return {
       topology,
       clients: clientCount,
       heavyGateways: heavyPids.length,
       adapters: topology === "daemon" ? clientCount : 0,
       gatewayPids,
-      downstreamInitializes,
+      downstreamInitializes: realRegistryPath ? null : downstreamInitializes,
       daemonTopology,
       ...processCounts,
       latencyMs: latency,
@@ -372,14 +434,25 @@ try {
   const daemon = await runArm("daemon");
   const artifact = {
     schemaVersion: 1,
-    kind: "isolated-process-fixture",
+    kind: realRegistryPath ? "isolated-configured-servers" : "isolated-process-fixture",
     measuredAt: new Date().toISOString(),
     platform: process.platform,
     arch: process.arch,
     gatewayBuildProfile: gateway.includes("/release/") ? "release" : "debug",
-    fixture: { downstreamServers: 1, clientSessions: clientCount },
+    fixture: {
+      downstreamServers: realRegistry ? realRegistry.servers?.length : 1,
+      clientSessions: clientCount,
+      ...(realRegistryPath
+        ? {
+            clientIdentities: ["grok", "grok", "claude-code"],
+            clientDriver: "MCP harness",
+            firstCallTool: "toolport_status",
+            steadyDelayMs: 5000,
+          }
+        : {}),
+    },
     gateway,
-    mock,
+    ...(realRegistryPath ? {} : { mock }),
     legacy,
     daemon,
   };
