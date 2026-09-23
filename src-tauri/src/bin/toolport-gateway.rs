@@ -12254,6 +12254,13 @@ impl HostState {
     }
 
     fn check_rooted_integrity(&self, view: &mut Router, scope: &str, keys: &[LaunchKey]) {
+        if let Err(error) = integrity::register_root_scope(scope) {
+            glog(&format!(
+                "SECURITY: rooted integrity scope registration failed: {error}"
+            ));
+            view.fail_closed_catalog();
+            return;
+        }
         let rooted_ids: HashSet<&str> = keys.iter().map(|key| key.server.as_str()).collect();
         let tools: Vec<Value> = view
             .aggregated_tools()

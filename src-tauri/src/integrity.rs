@@ -311,6 +311,74 @@ fn quarantine_path(profile: Option<&str>) -> Option<PathBuf> {
     profile_file(profile, "quarantine-v2-", "quarantine.json")
 }
 
+/// Rooted launch scopes are derived from a path hash and never appear in the
+/// registry's profile list. Keep their scope ids so dashboard unions can find
+/// and release the same quarantine stores the daemon enforces.
+fn root_scope_index_path() -> Result<PathBuf, String> {
+    crate::registry::conduit_dir()
+        .map(|dir| dir.join("root-integrity-scopes.json"))
+        .ok_or_else(|| "Could not resolve the root integrity scope index".to_string())
+}
+
+fn valid_root_scope(scope: &str) -> bool {
+    scope
+        .strip_prefix("root:")
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn load_root_scopes() -> Result<BTreeSet<String>, String> {
+    let path = root_scope_index_path()?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(format!("Could not read {path:?}: {error}")),
+    };
+    let scopes: BTreeSet<String> = serde_json::from_str(&raw)
+        .map_err(|error| format!("Root integrity scope index at {path:?} is corrupt: {error}"))?;
+    if scopes.iter().any(|scope| !valid_root_scope(scope)) {
+        return Err(format!(
+            "Root integrity scope index at {path:?} has an invalid scope"
+        ));
+    }
+    Ok(scopes)
+}
+
+/// Register a rooted scope before its pin/quarantine check. A failed index
+/// write makes the caller fail closed, since an invisible quarantine cannot be
+/// reviewed or released from the app.
+pub fn register_root_scope(scope: &str) -> Result<(), String> {
+    if !valid_root_scope(scope) {
+        return Err("Invalid root integrity scope".to_string());
+    }
+    let path = root_scope_index_path()?;
+    with_store_lock(&path, || {
+        let mut scopes = load_root_scopes()?;
+        if scopes.insert(scope.to_string()) {
+            let raw = serde_json::to_string(&scopes).map_err(|error| error.to_string())?;
+            crate::registry::atomic_write(&path, &raw)?;
+        }
+        Ok(())
+    })
+}
+
+fn quarantine_scan_stores() -> Result<Vec<(String, PathBuf)>, String> {
+    let dir = crate::registry::conduit_dir()
+        .ok_or_else(|| "Could not resolve the quarantine data directory".to_string())?;
+    let registry = crate::registry::load_resolved()?;
+    let mut stores = vec![(String::new(), dir.join("quarantine.json"))];
+    for profile in &registry.profiles {
+        if let Some(path) = quarantine_path(Some(&profile.id)) {
+            stores.push((profile.id.clone(), path));
+        }
+    }
+    for scope in load_root_scopes()? {
+        if let Some(path) = quarantine_path(Some(&scope)) {
+            stores.push((scope, path));
+        }
+    }
+    Ok(stores)
+}
+
 /// Per-profile store file in the conduit dir. Profile references are canonical
 /// stable ids before they reach this module; imported non-canonical ids receive a
 /// collision-resistant key. The no-profile case uses `fallback`.
@@ -1097,15 +1165,10 @@ fn read_quarantine_for_scan(profile: &str, path: &Path) -> Result<Option<Quarant
 /// missing file is an `Err`, so a caller cannot render damage as "nothing blocked".
 pub fn all_quarantined_names() -> Result<BTreeSet<String>, String> {
     let mut out = BTreeSet::new();
-    let Some(dir) = crate::registry::conduit_dir() else {
+    if crate::registry::conduit_dir().is_none() {
         return Ok(out);
-    };
-    let registry = crate::registry::load_resolved()?;
-    let mut stores = vec![(String::new(), dir.join("quarantine.json"))];
-    stores.extend(registry.profiles.iter().filter_map(|profile| {
-        quarantine_path(Some(&profile.id)).map(|path| (profile.id.clone(), path))
-    }));
-    for (profile, path) in stores {
+    }
+    for (profile, path) in quarantine_scan_stores()? {
         let Some(store) = read_quarantine_for_scan(&profile, &path)? else {
             continue;
         };
@@ -1656,16 +1719,11 @@ pub fn quarantine_notification(newcomers: &[&Value]) -> (String, String) {
 /// Same contract as [`all_quarantined_names`]: only a fresh profile's missing
 /// store contributes nothing; a damaged one is an `Err` rather than a shorter list.
 pub fn all_quarantined() -> Result<Vec<Value>, String> {
-    let Some(dir) = crate::registry::conduit_dir() else {
+    if crate::registry::conduit_dir().is_none() {
         return Ok(Vec::new());
-    };
+    }
     let mut out = Vec::new();
-    let registry = crate::registry::load_resolved()?;
-    let mut stores = vec![(String::new(), dir.join("quarantine.json"))];
-    stores.extend(registry.profiles.iter().filter_map(|profile| {
-        quarantine_path(Some(&profile.id)).map(|path| (profile.id.clone(), path))
-    }));
-    for (profile, path) in stores {
+    for (profile, path) in quarantine_scan_stores()? {
         let Some(store) = read_quarantine_for_scan(&profile, &path)? else {
             continue;
         };
@@ -4972,6 +5030,40 @@ mod tests {
             !data_dir.path.join("quarantine.json").exists(),
             "a profile store must not be migrated back into the default file"
         );
+    }
+
+    #[test]
+    fn rooted_quarantine_is_visible_and_releasable_from_the_union() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("rooted-quarantine-union");
+        let scope = format!("root:{}", crate::registry::sha256_hex("/project"));
+        register_root_scope(&scope).expect("register rooted scope");
+        register_root_scope(&scope).expect("registration is idempotent");
+        let mut store = Quarantine::new();
+        store.insert(
+            "srv__wipe".to_string(),
+            json!({ "tool": "srv__wipe", "server": "srv", "change": "changed" }),
+        );
+        save_quarantine(Some(&scope), &store).expect("write rooted quarantine");
+
+        let list = all_quarantined().expect("rooted record in dashboard union");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["profile"], scope);
+        assert!(all_quarantined_names().unwrap().contains("srv__wipe"));
+        assert!(release(Some(&scope), "srv__wipe").expect("release rooted tool"));
+        assert!(all_quarantined().unwrap().is_empty());
+    }
+
+    #[test]
+    fn damaged_root_scope_index_fails_the_quarantine_union_closed() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("rooted-quarantine-damaged-index");
+        let path = root_scope_index_path().unwrap();
+        std::fs::write(&path, "{ invalid").unwrap();
+        assert!(all_quarantined().is_err());
+        assert!(all_quarantined_names().is_err());
+        let scope = format!("root:{}", crate::registry::sha256_hex("/project"));
+        assert!(register_root_scope(&scope).is_err());
     }
 
     /// The scan helper labels a per-profile store, so the error names which

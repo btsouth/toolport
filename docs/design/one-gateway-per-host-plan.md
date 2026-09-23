@@ -603,6 +603,9 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
   The private probe reached three concurrent daemon sessions. The smoke used
   lazy discovery and did not send a model prompt or provider tool call.
 
+  The gateway registers rooted integrity scopes for the dashboard quarantine
+  union; their `root:<hash>` ids are absent from the registry profile list.
+
 - P4.2 default flip only after parity suites pass on Windows, macOS, and Linux, keeping a
   documented legacy kill switch for at least one release.
 - P4.3 desktop Shared HTTP adopts a daemon service lease; app exit releases the lease
