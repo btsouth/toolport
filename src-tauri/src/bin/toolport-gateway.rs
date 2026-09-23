@@ -104,6 +104,33 @@ thread_local! {
         }) };
 }
 
+type LiveRouterResolver = Arc<dyn Fn() -> Arc<Router> + Send + Sync>;
+
+thread_local! {
+    static ACTIVE_LIVE_ROUTER_RESOLVER: std::cell::RefCell<Option<LiveRouterResolver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct LiveRouterResolverGuard(Option<LiveRouterResolver>);
+
+impl LiveRouterResolverGuard {
+    fn enter(resolver: Option<LiveRouterResolver>) -> Self {
+        Self(ACTIVE_LIVE_ROUTER_RESOLVER.with(|cell| cell.replace(resolver)))
+    }
+}
+
+impl Drop for LiveRouterResolverGuard {
+    fn drop(&mut self) {
+        ACTIVE_LIVE_ROUTER_RESOLVER.with(|cell| {
+            cell.replace(self.0.take());
+        });
+    }
+}
+
+fn active_live_router_resolver() -> Option<LiveRouterResolver> {
+    ACTIVE_LIVE_ROUTER_RESOLVER.with(|cell| cell.borrow().clone())
+}
+
 /// Sets the serving era for one request and restores the previous value on drop,
 /// so a nested dispatch (code mode re-entering `execute_call`) cannot leak it.
 struct UpstreamEraGuard(Option<String>);
@@ -3715,9 +3742,15 @@ fn is_fixed_meta_tool(name: &str) -> bool {
 /// Stable authorization context bound to an MCP Streamable-HTTP session. The
 /// identity distinguishes registered and legacy/open callers; the effective
 /// scope makes a live client re-scope invalidate its existing sessions.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct McpSessionOwner {
     identity: String,
+    /// Effective adapter profile. Part of session ownership so changing only a
+    /// tool allowlist profile still forces a fresh session.
+    profile: Option<String>,
+    /// Sorted original-tool allowlists captured when an adapter session was
+    /// minted. A policy edit invalidates that session before its next request.
+    tool_scope: Option<Vec<(String, Vec<String>)>>,
     /// `None` is the full connected set; `Some` is a sorted, deduplicated set of
     /// raw registry server ids, matching [`resolve_http_caller`].
     scope: Option<Vec<String>>,
@@ -3743,19 +3776,33 @@ struct HttpCaller {
 /// An adapter's identity is asserted only on the private daemon endpoint, with
 /// the rendezvous bearer. Resolve its live stdio profile exactly as the legacy
 /// one-client gateway does, then use the HTTP bridge's per-request scope gate.
+fn adapter_tool_scope(reg: &Registry, profile: &str) -> Vec<(String, Vec<String>)> {
+    let resolved = reg.resolve_profile_id(profile);
+    let Some(profile) = reg.profiles.iter().find(|entry| entry.id == resolved) else {
+        return Vec::new();
+    };
+    let mut scope: Vec<(String, Vec<String>)> = profile
+        .tool_scope
+        .iter()
+        .map(|(server, tools)| {
+            let mut tools = tools.clone();
+            tools.sort();
+            tools.dedup();
+            (server.clone(), tools)
+        })
+        .collect();
+    scope.sort_by(|a, b| a.0.cmp(&b.0));
+    scope
+}
+
 fn resolve_adapter_caller(
     reg: &Registry,
     client_id: &str,
     env_profile: Option<&str>,
     root: Option<&str>,
 ) -> (Option<std::collections::HashSet<String>>, HttpCaller) {
-    let profile = effective_profile(
-        reg,
-        Some(client_id),
-        &env_profile.map(str::to_string),
-        root,
-    )
-    .unwrap_or_else(|| reg.active_profile_id());
+    let profile = effective_profile(reg, Some(client_id), &env_profile.map(str::to_string), root)
+        .unwrap_or_else(|| reg.active_profile_id());
     let allowed: std::collections::HashSet<String> = reg
         .enabled_servers_for(&profile)
         .iter()
@@ -3763,12 +3810,15 @@ fn resolve_adapter_caller(
         .collect();
     let mut scope: Vec<String> = allowed.iter().cloned().collect();
     scope.sort();
+    let tool_scope = adapter_tool_scope(reg, &profile);
     (
         Some(allowed),
         HttpCaller {
             audit_label: Some(client_id.to_string()),
             session_owner: McpSessionOwner {
                 identity: format!("adapter:{client_id}"),
+                profile: Some(profile),
+                tool_scope: Some(tool_scope),
                 scope: Some(scope),
             },
             discovery: http_client_discovery_override(reg, client_id),
@@ -3802,6 +3852,8 @@ fn resolve_http_caller(
                     audit_label: None,
                     session_owner: McpSessionOwner {
                         identity: format!("legacy:{}", registry::sha256_hex(actual)),
+                        profile: None,
+                        tool_scope: None,
                         scope: None,
                     },
                     discovery: None,
@@ -3833,6 +3885,8 @@ fn resolve_http_caller(
                 audit_label,
                 session_owner: McpSessionOwner {
                     identity: format!("client:{}", client.id),
+                    profile: None,
+                    tool_scope: None,
                     scope: owner_scope(&allowed),
                 },
                 discovery: http_client_discovery_override(reg, &client.id),
@@ -3861,6 +3915,8 @@ fn resolve_http_caller(
                 audit_label: None,
                 session_owner: McpSessionOwner {
                     identity: "open".to_string(),
+                    profile: None,
+                    tool_scope: None,
                     scope: None,
                 },
                 discovery: None,
@@ -3994,6 +4050,9 @@ fn post_hitl_revalidation(
 /// Clone the current live `Arc<Router>` from the swappable slot, releasing the mutex
 /// immediately. Returns `None` only if `live_router` itself is `None` (test harnesses).
 fn clone_live_router(live_router: Option<&Arc<Mutex<Arc<Router>>>>) -> Option<Arc<Router>> {
+    if let Some(resolve) = active_live_router_resolver() {
+        return Some(resolve());
+    }
     live_router.map(|slot| {
         slot.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6327,6 +6386,7 @@ fn execute_script_dispatch_with_candidate(
     // request reach its HTTP client but then misclassifies it as legacy when a
     // downstream asks for sampling/elicitation/roots (SBS-551, extending WS2-3).
     let request_context = active_request_context();
+    let live_view_resolver = active_live_router_resolver();
 
     // Arc + Send + Sync so independent callAsync work can run on a small host thread pool.
     // shape=false: intermediate results stay full-sized in the sandbox (never enter model
@@ -6376,6 +6436,7 @@ fn execute_script_dispatch_with_candidate(
             result
         };
         let _context = ActiveRequestContextGuard::enter(request_context.clone());
+        let _live_view = LiveRouterResolverGuard::enter(live_view_resolver.clone());
         run()
     });
 
@@ -9288,6 +9349,7 @@ fn notify_tools_changed_for_catalog_diff(
     previous_router: &Router,
     current_router: &Router,
     reg: &Registry,
+    previous_adapter_tools: Option<&HashMap<McpSessionOwner, Vec<Value>>>,
 ) {
     notify_list_changed(stdio, None, "notifications/tools/list_changed");
     let Some(sessions) = mcp_sessions else {
@@ -9301,17 +9363,52 @@ fn notify_tools_changed_for_catalog_diff(
         .cloned()
         .collect();
     let msg = json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" });
-    let mut changed_by_scope: HashMap<Option<Vec<String>>, bool> = HashMap::new();
+    let mut changed_by_scope: HashMap<Option<McpSessionOwner>, bool> = HashMap::new();
     for session in sessions {
         if session.is_expired() || session.closed.load(Ordering::SeqCst) {
             continue;
         }
-        let scope = session.owner.as_ref().and_then(|owner| owner.scope.clone());
-        let changed = *changed_by_scope.entry(scope.clone()).or_insert_with(|| {
-            let Some(scope) = scope else {
+        let owner = session.owner.clone();
+        let changed = *changed_by_scope.entry(owner.clone()).or_insert_with(|| {
+            let Some(owner) = owner else {
+                return previous != current;
+            };
+            let prior_owner = owner.clone();
+            let Some(scope) = owner.scope else {
                 return previous != current;
             };
             let allowed: std::collections::HashSet<String> = scope.into_iter().collect();
+            if let (Some(profile), Some(prior_tool_scope)) =
+                (owner.profile.as_deref(), owner.tool_scope)
+            {
+                let prior_allow = prior_tool_scope
+                    .into_iter()
+                    .map(|(server, tools)| (server, tools.into_iter().collect()))
+                    .collect();
+                let current_allow = adapter_tool_scope(reg, profile)
+                    .into_iter()
+                    .map(|(server, tools)| (server, tools.into_iter().collect()))
+                    .collect();
+                let before_router = previous_router.with_tool_allow(prior_allow);
+                let after_router = current_router.with_tool_allow(current_allow);
+                let before_tools = previous_adapter_tools
+                    .and_then(|by_owner| by_owner.get(&prior_owner))
+                    .cloned()
+                    .unwrap_or_else(|| before_router.aggregated_tools());
+                let before = if previous_adapter_tools
+                    .is_some_and(|by_owner| by_owner.contains_key(&prior_owner))
+                {
+                    before_tools
+                } else {
+                    scope_tools(&before_tools, Some(&allowed), |name| {
+                        owner_of_exposed_tool(Some(&before_router), &owners, name)
+                    })
+                };
+                let after = scope_tools(&after_router.aggregated_tools(), Some(&allowed), |name| {
+                    owner_of_exposed_tool(Some(&after_router), &owners, name)
+                });
+                return before != after;
+            }
             let before = scope_tools(previous, Some(&allowed), |name| {
                 owner_of_exposed_tool(Some(previous_router), &owners, name)
             });
@@ -10557,6 +10654,47 @@ fn cached_tool_is_destructive(tool: &Value, exposed: &str) -> bool {
 }
 
 impl HostState {
+    /// Freeze each adapter's visible catalog before a downstream refresh mutates
+    /// the shared ServerSlot. Cloning Router alone would keep the same slot.
+    fn adapter_tools_before_refresh(
+        &self,
+        router: &Router,
+    ) -> HashMap<McpSessionOwner, Vec<Value>> {
+        let reg = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let owners = unique_prefix_owners(&reg);
+        let sessions: Vec<McpSessionOwner> = self
+            .mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter_map(|session| session.owner.clone())
+            .collect();
+        let mut catalogs = HashMap::new();
+        for owner in sessions {
+            let (Some(scope), Some(tool_scope)) = (&owner.scope, &owner.tool_scope) else {
+                continue;
+            };
+            if catalogs.contains_key(&owner) {
+                continue;
+            }
+            let allow = tool_scope
+                .iter()
+                .map(|(server, tools)| (server.clone(), tools.iter().cloned().collect()))
+                .collect();
+            let view = router.with_tool_allow(allow);
+            let allowed: HashSet<String> = scope.iter().cloned().collect();
+            let tools = scope_tools(&view.aggregated_tools(), Some(&allowed), |name| {
+                owner_of_exposed_tool(Some(&view), &owners, name)
+            });
+            catalogs.insert(owner, tools);
+        }
+        catalogs
+    }
+
     /// Persist a rebuilt catalog and fan out `notifications/tools/list_changed`.
     fn persist_and_emit_with_sessions(
         &self,
@@ -10568,7 +10706,9 @@ impl HostState {
         mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
         profile: Option<&str>,
         scope_diff_only: bool,
+        previous_adapter_tools: Option<&HashMap<McpSessionOwner, Vec<Value>>>,
     ) {
+        self.invalidate_tool_scope_views();
         let previous_catalog = scope_diff_only.then(|| {
             cached_tools
                 .lock()
@@ -10641,6 +10781,7 @@ impl HostState {
                 previous_router,
                 &current_router,
                 &reg,
+                previous_adapter_tools,
             );
         } else {
             notify_tools_changed(stdio, mcp_sessions);
@@ -10909,6 +11050,9 @@ fn watch_tick(
             &host.quarantine_read_failed,
         )
     };
+    if quarantine_changed {
+        host.invalidate_tool_scope_views();
+    }
     // A live downstream server that changed its own tool set (sent
     // tools/list_changed) sets this. Swap before acting so a notification
     // arriving mid-refresh is caught on the next tick rather than lost.
@@ -11096,6 +11240,7 @@ fn watch_tick(
             mcp_sessions,
             resolved.as_deref(),
             false,
+            None,
         );
         let fmt_profile = |p: &Option<String>| match p {
             Some(name) => format!("'{name}'"),
@@ -11140,6 +11285,7 @@ fn watch_tick(
                 (**guard).clone()
             };
             let previous_router = next.clone();
+            let previous_adapter_tools = host.adapter_tools_before_refresh(&previous_router);
             if downstream_notified & downstream::change::TOOLS != 0 {
                 next.refresh_tools();
             } else {
@@ -11159,6 +11305,7 @@ fn watch_tick(
                 mcp_sessions,
                 resolved.as_deref(),
                 true,
+                Some(&previous_adapter_tools),
             );
             eprintln!("toolport: downstream tools/list_changed, refreshed + sent");
         }
@@ -11181,6 +11328,7 @@ fn watch_tick(
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&current);
+            host.invalidate_tool_scope_views();
             notify_list_changed_for_router_diff(
                 stdio,
                 mcp_sessions,
@@ -11207,6 +11355,7 @@ fn watch_tick(
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&current);
+            host.invalidate_tool_scope_views();
             notify_list_changed_for_router_diff(
                 stdio,
                 mcp_sessions,
@@ -11237,6 +11386,18 @@ fn watch_tick(
 /// host runtime owns exactly once and shares with every session it serves. None
 /// of it carries session identity, so two sessions on one host share one
 /// registry, one router, one catalog, and one rebuild lock.
+#[derive(Default)]
+struct ToolScopeViews {
+    base: Option<Arc<Router>>,
+    by_profile: HashMap<String, ProfileToolView>,
+}
+
+struct ProfileToolView {
+    allow: HashMap<String, HashSet<String>>,
+    router: Arc<Router>,
+    catalog: Arc<CatalogSnapshot>,
+}
+
 struct HostState {
     registry: Arc<Mutex<Registry>>,
     /// Whether `registry` above is a faithful copy of what is on disk, i.e.
@@ -11252,6 +11413,10 @@ struct HostState {
     // behind an in-flight request. Rebuilds swap in a new Arc; refresh/requarantine fork
     // via Arc::make_mut.
     router: Arc<Mutex<Arc<Router>>>,
+    /// Profile views re-index the daemon's shared connections under each
+    /// adapter's original-tool allowlist. Invalidated when the live router or
+    /// that profile's allowlist changes.
+    tool_scope_views: Mutex<ToolScopeViews>,
     cached_tools: SharedCatalog,
     routine_candidates: CandidateRegistry,
     routine_advisor: AdvisorLedger,
@@ -11322,6 +11487,72 @@ struct HostState {
 }
 
 impl HostState {
+    fn invalidate_tool_scope_views(&self) {
+        let mut views = self
+            .tool_scope_views
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        views.base = None;
+        views.by_profile.clear();
+    }
+
+    fn router_for_adapter_profile(
+        &self,
+        base: Arc<Router>,
+        reg: &Registry,
+        profile: &str,
+    ) -> (Arc<Router>, Arc<CatalogSnapshot>) {
+        let resolved = reg.resolve_profile_id(profile);
+        if !reg.profiles.iter().any(|entry| entry.id == resolved) {
+            let catalog = Arc::new(CatalogSnapshot::new(base.aggregated_tools()));
+            return (base, catalog);
+        }
+        let allow: HashMap<String, HashSet<String>> = adapter_tool_scope(reg, &resolved)
+            .into_iter()
+            .map(|(server, tools)| (server, tools.into_iter().collect()))
+            .collect();
+        let mut views = self
+            .tool_scope_views
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live = self
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if !Arc::ptr_eq(&live, &base) {
+            // A rebuild won after this request took its snapshot. Keep serving
+            // that snapshot, but never pin its old downstream slots in the host.
+            let view = Arc::new(base.with_tool_allow(allow));
+            let catalog = Arc::new(CatalogSnapshot::new(view.aggregated_tools()));
+            return (view, catalog);
+        }
+        if !views
+            .base
+            .as_ref()
+            .is_some_and(|previous| Arc::ptr_eq(previous, &base))
+        {
+            views.base = Some(Arc::clone(&base));
+            views.by_profile.clear();
+        }
+        if let Some(view) = views.by_profile.get(&resolved) {
+            if view.allow == allow {
+                return (Arc::clone(&view.router), Arc::clone(&view.catalog));
+            }
+        }
+        let router = Arc::new(base.with_tool_allow(allow.clone()));
+        let catalog = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        views.by_profile.insert(
+            resolved,
+            ProfileToolView {
+                allow,
+                router: Arc::clone(&router),
+                catalog: Arc::clone(&catalog),
+            },
+        );
+        (router, catalog)
+    }
+
     /// Record that this host just served something, for the daemon idle lease.
     fn touch_activity(&self) {
         self.last_activity_ms
@@ -13018,6 +13249,7 @@ fn rebuild_router_for_root(state: &GatewayState) {
         Some(&state.mcp_sessions),
         profile.as_deref(),
         false,
+        None,
     );
     glog(&format!(
         "toolport: ${{ROOT}} rebuild (root={root:?}, {} tools)",
@@ -13266,6 +13498,7 @@ fn process_request(
     guard: &SearchGuard,
     confirm: &ConfirmGuard,
     allowed: Option<&std::collections::HashSet<String>>,
+    adapter_profile: Option<&str>,
     cancel: Option<downstream::CancelContext>,
     client: Option<&str>,
     client_name: Option<&str>,
@@ -13416,6 +13649,7 @@ fn process_request(
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     Arc::make_mut(&mut guard).adopt_restored_routes(&previous_router, &tools);
                 }
+                state.invalidate_tool_scope_views();
                 // A fail-closed rebuild hides everything, so the cache must not keep
                 // serving the last-good catalog past it (SBS-871).
                 if router_is_fail_closed(&state.router) {
@@ -13451,21 +13685,34 @@ fn process_request(
     // execute_call re-clones the live Arc (via `live_router`) so mid-hold quarantine
     // / definition drift fail closed (SOU-321 / SOU-322). The client label is
     // threaded in, not stored on the shared router.
-    let cache_snapshot = state
-        .cached_tools
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
     let reg = state
         .registry
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let router = state
+    let base_router = state
         .router
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    let (router, adapter_catalog) = if state.daemon_mode.load(Ordering::SeqCst) {
+        adapter_profile
+            .map(|profile| state.router_for_adapter_profile(base_router.clone(), &reg, profile))
+            .map(|(router, catalog)| (router, Some(catalog)))
+            .unwrap_or_else(|| (Arc::clone(&base_router), None))
+    } else {
+        (base_router, None)
+    };
+    // The shared HTTP cache reflects the fail-closed intersection across all
+    // profiles. An adapter needs the catalog indexed under its own tool scope,
+    // including search and code-mode calls, not that shared intersection.
+    let cache_snapshot = adapter_catalog.unwrap_or_else(|| {
+        state
+            .cached_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    });
     if method == "subscriptions/listen"
         && !state.http
         && upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION)
@@ -13512,6 +13759,40 @@ fn process_request(
             UpstreamEraGuard::enter(declared.filter(|v| v.as_str() == MODERN_PROTOCOL_VERSION));
         return handle_resource_subscription(state, &router, req, allowed, cancel.as_ref(), method);
     }
+    let live_view: Option<LiveRouterResolver> = if state.daemon_mode.load(Ordering::SeqCst) {
+        adapter_profile.map(|profile| {
+            let host = Arc::clone(&state.host);
+            let profile = profile.to_string();
+            let expected_scope = allowed.cloned();
+            let expected_tool_scope = adapter_tool_scope(&reg, &profile);
+            Arc::new(move || {
+                let current = host
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let current_scope: HashSet<String> = current
+                    .enabled_servers_for(&profile)
+                    .iter()
+                    .map(|server| server.id.clone())
+                    .collect();
+                if expected_scope.as_ref() != Some(&current_scope)
+                    || expected_tool_scope != adapter_tool_scope(&current, &profile)
+                {
+                    return Arc::new(Router::new());
+                }
+                let base = host
+                    .router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                host.router_for_adapter_profile(base, &current, &profile).0
+            }) as LiveRouterResolver
+        })
+    } else {
+        None
+    };
+    let _live_view = LiveRouterResolverGuard::enter(live_view);
     handle_request_with_cancel(
         state,
         req,
@@ -13578,6 +13859,7 @@ fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
             &req,
             &guards.search,
             &guards.confirm,
+            None,
             None,
             Some(cancel_context),
             None,
@@ -14591,6 +14873,7 @@ fn handle_mcp_http(
                     guard,
                     confirm,
                     allowed,
+                    session_owner.and_then(|owner| owner.profile.as_deref()),
                     None,
                     client,
                     client_name,
@@ -14610,6 +14893,7 @@ fn handle_mcp_http(
                 guard,
                 confirm,
                 allowed,
+                session_owner.and_then(|owner| owner.profile.as_deref()),
                 None,
                 client,
                 client_name,
@@ -14784,6 +15068,7 @@ fn handle_http_with_headers(
                 guard,
                 confirm,
                 allowed,
+                caller.and_then(|caller| caller.session_owner.profile.as_deref()),
                 None,
                 client,
                 client_name,
@@ -16134,7 +16419,12 @@ fn handle_connection(
         let resolved = if has_adapter_claim {
             if private_daemon_bearer && valid_adapter_claim {
                 adapter_client_id.as_deref().map(|client_id| {
-                    resolve_adapter_caller(&reg, client_id, adapter_profile.as_deref(), adapter_root)
+                    resolve_adapter_caller(
+                        &reg,
+                        client_id,
+                        adapter_profile.as_deref(),
+                        adapter_root,
+                    )
                 })
             } else {
                 None
@@ -16730,6 +17020,7 @@ fn main() {
         registry: Arc::clone(&registry),
         registry_trusted: Arc::clone(&registry_trusted),
         router: Arc::clone(&router),
+        tool_scope_views: Mutex::new(ToolScopeViews::default()),
         cached_tools: Arc::clone(&cached_tools),
         routine_candidates: CandidateRegistry::default(),
         routine_advisor: AdvisorLedger::default(),
@@ -16834,6 +17125,7 @@ fn main() {
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(built);
+            host_for_build.invalidate_tool_scope_views();
             // Don't let a transient empty build (registry caught mid-write, or
             // every downstream momentarily unreachable) clobber a good catalog -
             // that's what leaves a client showing only toolport_status. A
@@ -16981,6 +17273,7 @@ fn main() {
                 &req,
                 &guards.search,
                 &guards.confirm,
+                None,
                 None,
                 None,
                 None,
@@ -22412,6 +22705,7 @@ mod tests {
             registry,
             registry_trusted,
             router,
+            tool_scope_views: Mutex::new(ToolScopeViews::default()),
             cached_tools,
             routine_candidates: CandidateRegistry::default(),
             routine_advisor: AdvisorLedger::default(),
@@ -22457,6 +22751,7 @@ mod tests {
                 // Tests stand in for a clean boot load; the ones that care flip it.
                 registry_trusted: Arc::new(AtomicBool::new(true)),
                 router: Arc::new(Mutex::new(Arc::new(Router::new()))),
+                tool_scope_views: Mutex::new(ToolScopeViews::default()),
                 cached_tools: Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
                 routine_candidates: CandidateRegistry::default(),
                 routine_advisor: AdvisorLedger::default(),
@@ -24372,6 +24667,8 @@ mod tests {
             audit_label: Some(identity.to_string()),
             session_owner: McpSessionOwner {
                 identity: identity.to_string(),
+                profile: None,
+                tool_scope: None,
                 scope: scope.map(|s| s.iter().map(|v| v.to_string()).collect()),
             },
             discovery: None,
@@ -24507,6 +24804,8 @@ mod tests {
             audit_label: Some("client:pinned-full".to_string()),
             session_owner: McpSessionOwner {
                 identity: "client:pinned-full".to_string(),
+                profile: None,
+                tool_scope: None,
                 scope: None,
             },
             discovery: Some(DiscoveryMode::Full),
@@ -24524,6 +24823,8 @@ mod tests {
             audit_label: Some("client:pinned-lazy".to_string()),
             session_owner: McpSessionOwner {
                 identity: "client:pinned-lazy".to_string(),
+                profile: None,
+                tool_scope: None,
                 scope: None,
             },
             discovery: Some(DiscoveryMode::Lazy),
@@ -25773,10 +26074,14 @@ mod tests {
         state.daemon_mode.store(true, Ordering::SeqCst);
         let owner_a = McpSessionOwner {
             identity: "adapter:a".to_string(),
+            profile: None,
+            tool_scope: None,
             scope: None,
         };
         let owner_b = McpSessionOwner {
             identity: "adapter:b".to_string(),
+            profile: None,
+            tool_scope: None,
             scope: None,
         };
         let sid_a =
@@ -25830,10 +26135,7 @@ mod tests {
             panic!("roots refresh did not finish");
         };
         answer(Some(&project));
-        assert_eq!(
-            a.client_root.lock().unwrap().as_deref(),
-            project.to_str()
-        );
+        assert_eq!(a.client_root.lock().unwrap().as_deref(), project.to_str());
         assert_eq!(b.client_root.lock().unwrap().as_deref(), Some("/adapter-b"));
         answer(None);
         assert_eq!(a.client_root.lock().unwrap().as_deref(), Some("/adapter-a"));
@@ -26601,6 +26903,8 @@ mod tests {
         let state = http_state(false);
         let owner = McpSessionOwner {
             identity: "client:reaped-pii".into(),
+            profile: None,
+            tool_scope: None,
             scope: None,
         };
         let pii_client = Some(owner.identity.as_str());
@@ -29503,6 +29807,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         );
 
         assert!(

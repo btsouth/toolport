@@ -22,8 +22,8 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde_json::{json, Value};
 
 use crate::downstream::{
-    backoff_delay, CacheHint, CancelContext, DownstreamServer, MrtrRequest, TransportError,
-    HTTP_MAX_RETRIES, HTTP_RETRY_CAP,
+    backoff_delay, is_implausible_shrink, CacheHint, CancelContext, DownstreamServer, MrtrRequest,
+    TransportError, HTTP_MAX_RETRIES, HTTP_RETRY_CAP,
 };
 use crate::registry::ToolOverride;
 
@@ -583,6 +583,9 @@ pub struct Router {
     tools: Vec<Value>,
     /// Exposed tool name -> (server id, original downstream tool name).
     routes: HashMap<String, (String, String)>,
+    /// Routes kept across a guarded catalog collapse. Profile views recheck
+    /// these under their own allowlist after indexing the shared live slots.
+    restored_candidates: Vec<RestoredTool>,
     /// Exposed names already handed out, for collision disambiguation.
     seen: HashSet<String>,
     /// What may be exposed; applied as each server is added.
@@ -614,6 +617,14 @@ pub struct Router {
     /// so a live router whose connects all failed is still a real prior decision
     /// and not a cold start (SBS-871).
     built: bool,
+}
+
+#[derive(Clone)]
+struct RestoredTool {
+    definition: Value,
+    exposed: String,
+    server: String,
+    original: String,
 }
 
 impl Router {
@@ -651,6 +662,16 @@ impl Router {
         self.routes
             .get(exposed)
             .map(|(s, t)| (s.as_str(), t.as_str()))
+    }
+
+    /// Re-index the same live downstream slots under one adapter profile's
+    /// original-tool allowlists. The shared HTTP router can keep its fail-closed
+    /// intersection while each daemon adapter sees only its own tool scope.
+    pub fn with_tool_allow(&self, allow: HashMap<String, HashSet<String>>) -> Self {
+        let mut view = self.clone();
+        view.policy.allow = allow;
+        view.rebuild_preserving_restored();
+        view
     }
 
     /// Index one server's advertised tools/resources/templates/prompts into the
@@ -1084,7 +1105,7 @@ impl Router {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .refresh_resources();
         }
-        self.rebuild_aggregation();
+        self.rebuild_preserving_restored();
     }
 
     pub fn refresh_stale_resources(&mut self) {
@@ -1094,7 +1115,7 @@ impl Router {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .refresh_resources_if_stale();
         }
-        self.rebuild_aggregation();
+        self.rebuild_preserving_restored();
     }
 
     /// Re-query every live server's prompt list (a downstream announced a
@@ -1107,7 +1128,7 @@ impl Router {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .refresh_prompts();
         }
-        self.rebuild_aggregation();
+        self.rebuild_preserving_restored();
     }
 
     pub fn refresh_stale_prompts(&mut self) {
@@ -1117,7 +1138,7 @@ impl Router {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .refresh_prompts_if_stale();
         }
-        self.rebuild_aggregation();
+        self.rebuild_preserving_restored();
     }
 
     /// Forward one JSON-RPC notification only to downstream servers visible to
@@ -1148,7 +1169,7 @@ impl Router {
     /// set came from a successful read.
     pub fn requarantine(&mut self, quarantined: BTreeSet<String>) {
         self.policy.quarantined = quarantined;
-        self.rebuild_aggregation();
+        self.rebuild_preserving_restored();
     }
 
     /// Install a quarantine set that came from a SUCCESSFUL store read, lifting the
@@ -1201,47 +1222,112 @@ impl Router {
     /// previous build are absent from its `blocked` map and must not slip back
     /// in through the guarded catalog (which still carries them from the cache).
     pub fn adopt_restored_routes(&mut self, previous: &Router, catalog: &[Value]) {
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
         for tool in catalog {
             let Some(exposed) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            if self.routes.contains_key(exposed) || self.blocked.contains_key(exposed) {
-                continue;
-            }
             // The previous router indexed the same exposed name; reuse its
             // (server, original) pair verbatim instead of re-deriving it.
             let Some((server_id, original)) = previous.route_of(exposed) else {
                 continue;
             };
-            // Re-evaluate policy before adopting. The rebuilt router only indexed
-            // the degraded connect, so a tool quarantined / disabled / scoped out
-            // since the previous build has no entry in `self.blocked` yet and the
-            // guarded catalog (from the disk cache) still carries it. Adopting it
-            // now would silently bypass the quarantine and scope guards while the
-            // cache keeps advertising it (review on #717).
-            if let Some(reason) = self
-                .policy
-                .blocked_reason(exposed, server_id, original, tool)
+            if seen.insert(exposed.to_string()) {
+                candidates.push(RestoredTool {
+                    definition: tool.clone(),
+                    exposed: exposed.to_string(),
+                    server: server_id.to_string(),
+                    original: original.to_string(),
+                });
+            }
+        }
+
+        // The host's guarded catalog can omit tools visible only to one profile:
+        // its base allowlist is the intersection. A severe raw slot shrink still
+        // needs those previous definitions for that profile's view. The next
+        // rebuild sees the degraded slot as its previous raw catalog and accepts
+        // a genuine persistent shrink, matching the host's confirm-then-accept
+        // guard rather than pinning stale definitions forever.
+        let mut collapsed = HashSet::new();
+        for slot in &self.servers {
+            let Some(old_index) = previous.by_id.get(&slot.id) else {
+                continue;
+            };
+            let old_count = previous.servers[*old_index]
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tools
+                .len();
+            let new_count = slot
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tools
+                .len();
+            if new_count > 0 && is_implausible_shrink(old_count, new_count) {
+                collapsed.insert(slot.id.clone());
+            }
+        }
+        if !collapsed.is_empty() {
+            let unrestricted = previous.with_tool_allow(HashMap::new());
+            for tool in unrestricted.aggregated_tools() {
+                let Some(exposed) = tool.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some((server_id, original)) = unrestricted.route_of(exposed) else {
+                    continue;
+                };
+                if collapsed.contains(server_id) && seen.insert(exposed.to_string()) {
+                    candidates.push(RestoredTool {
+                        definition: tool.clone(),
+                        exposed: exposed.to_string(),
+                        server: server_id.to_string(),
+                        original: original.to_string(),
+                    });
+                }
+            }
+        }
+        self.restored_candidates = candidates;
+        self.apply_restored_candidates();
+    }
+
+    fn apply_restored_candidates(&mut self) {
+        for candidate in &self.restored_candidates {
+            if self.routes.contains_key(&candidate.exposed)
+                || self.blocked.contains_key(&candidate.exposed)
+                || !self.by_id.contains_key(&candidate.server)
             {
-                self.blocked.insert(exposed.to_string(), reason.to_string());
+                continue;
+            }
+            // Re-evaluate every candidate under this router's current policy.
+            // A profile can allow a tool the host intersection hid, while a new
+            // quarantine must still block it (review on #717).
+            if let Some(reason) = self.policy.blocked_reason(
+                &candidate.exposed,
+                &candidate.server,
+                &candidate.original,
+                &candidate.definition,
+            ) {
+                self.blocked
+                    .insert(candidate.exposed.clone(), reason.to_string());
                 continue;
             }
             self.routes.insert(
-                exposed.to_string(),
-                (server_id.to_string(), original.to_string()),
+                candidate.exposed.clone(),
+                (candidate.server.clone(), candidate.original.clone()),
             );
-            // Re-adopt the exposed tool entry so aggregated_tools() and the
-            // quarantine/fingerprint paths see the restored tool, matching what
-            // the cache advertises.
-            if !self
-                .tools
-                .iter()
-                .any(|t| t.get("name").and_then(Value::as_str) == Some(exposed))
-            {
-                self.tools.push(tool.clone());
-            }
-            self.seen.insert(exposed.to_string());
+            self.tools.push(candidate.definition.clone());
+            self.seen.insert(candidate.exposed.clone());
         }
+    }
+
+    fn rebuild_preserving_restored(&mut self) {
+        let restored = self.restored_candidates.clone();
+        self.rebuild_aggregation();
+        self.restored_candidates = restored;
+        self.apply_restored_candidates();
     }
 
     /// Re-derive the exposed tool/resource/template/prompt aggregation from the
@@ -1249,6 +1335,7 @@ impl Router {
     /// exposed names and their `_2` collision suffixes stay stable. The server
     /// set itself is unchanged, so `servers` and `by_id` are kept.
     fn rebuild_aggregation(&mut self) {
+        self.restored_candidates.clear();
         self.tools.clear();
         self.routes.clear();
         self.seen.clear();
@@ -2819,6 +2906,31 @@ mod tests {
     }
 
     #[test]
+    fn profile_views_share_downstreams_but_reindex_distinct_tool_scopes() {
+        let mut base = Router::with_policy(ToolPolicy {
+            allow: HashMap::from([("shared".to_string(), HashSet::new())]),
+            ..ToolPolicy::default()
+        });
+        base.add(mock_server("shared"));
+        assert!(base.aggregated_tools().is_empty());
+
+        let echo = base.with_tool_allow(HashMap::from([(
+            "shared".to_string(),
+            HashSet::from(["echo".to_string()]),
+        )]));
+        let add = base.with_tool_allow(HashMap::from([(
+            "shared".to_string(),
+            HashSet::from(["add".to_string()]),
+        )]));
+        assert!(Arc::ptr_eq(&base.servers[0], &echo.servers[0]));
+        assert!(Arc::ptr_eq(&echo.servers[0], &add.servers[0]));
+        assert!(echo.route_of("shared__echo").is_some());
+        assert!(echo.route_of("shared__add").is_none());
+        assert!(add.route_of("shared__echo").is_none());
+        assert!(add.route_of("shared__add").is_some());
+    }
+
+    #[test]
     fn tool_overrides_rename_and_redescribe() {
         let mut router = Router::new();
         // Keyed by (server id, ORIGINAL tool name), not the exposed name.
@@ -3182,6 +3294,37 @@ mod tests {
             .collect();
         assert!(names.contains("atlassian__t39"));
         assert_eq!(names.len(), 45, "40 restored + 5 healthy");
+    }
+
+    #[test]
+    fn profile_view_retains_a_tool_hidden_from_the_base_during_a_guarded_shrink() {
+        let mut previous = router_with_catalogs(&[("atlassian", 40)]);
+        previous
+            .policy
+            .allow
+            .insert("atlassian".to_string(), HashSet::from(["t0".to_string()]));
+        previous.rebuild_aggregation();
+        let mut rebuilt = router_with_catalogs(&[("atlassian", 3)]);
+        rebuilt.policy.allow = previous.policy.allow.clone();
+        rebuilt.rebuild_aggregation();
+        rebuilt.adopt_restored_routes(&previous, &previous.aggregated_tools());
+
+        let profile = rebuilt.with_tool_allow(HashMap::from([(
+            "atlassian".to_string(),
+            HashSet::from(["t39".to_string()]),
+        )]));
+        assert_eq!(
+            profile.route_of("atlassian__t39"),
+            Some(("atlassian", "t39"))
+        );
+        assert!(profile
+            .aggregated_tools()
+            .iter()
+            .any(|tool| tool["name"] == "atlassian__t39"));
+        let mut quarantined = profile.clone();
+        quarantined.requarantine(BTreeSet::from(["atlassian__t39".to_string()]));
+        assert!(quarantined.route_of("atlassian__t39").is_none());
+        assert!(quarantined.is_blocked("atlassian__t39"));
     }
 
     #[test]

@@ -538,6 +538,10 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
   P3.1 work is the full surface audit, especially server-initiated paths.
   `notifications/roots/list_changed` now reaches only downstream servers in
   that adapter's allowed set; a different profile's servers do not receive it.
+  Adapter requests now re-index the shared downstream slots under the resolved
+  profile's original-tool allowlist, so profiles with different tool scopes on
+  the same server can each list, search, and call only their own tools. A live
+  tool-scope edit invalidates the old adapter session and is applied on reopen.
 
 ### P3.2 Pool by `LaunchKey`
 
@@ -600,6 +604,9 @@ builds on a background thread, and a real client learns the finished catalog fro
 | A capable adapter is asked for roots on its own session               | `matrix_adapter_root_is_queried_on_its_own_session`                                                                                                         | P3.2      | passing               |
 | Two `${ROOT}` values create two children, equal roots share one       | `matrix_pooling_root_sharding_two_roots_two_children`                                                                                                       | P3.2      | pending (`#[ignore]`) |
 | Profiles cannot list or call outside their scope                      | `matrix_routing_profiles_cannot_reach_servers_outside_their_scope`                                                                                          | P3.1      | passing               |
+| Profiles with different tool scopes share one server safely           | `matrix_routing_profile_tool_scopes_are_independent_on_one_shared_server`                                                                                   | P3.1      | passing               |
+| A live tool-scope edit reopens the adapter under its new policy       | `matrix_routing_live_tool_scope_change_reopens_the_adapter_session`                                                                                         | P3.1      | passing               |
+| Tool changes notify only profiles that can see the new catalog        | `matrix_routing_tool_change_notifies_only_profiles_that_can_see_it`                                                                                         | P3.1      | passing               |
 | An adapter's declared root selects its folder profile                 | `matrix_routing_declared_root_selects_folder_profile`                                                                                                       | P3.1      | passing               |
 | Live profile changes reopen the adapter under the new scope           | `matrix_routing_live_profile_change_reopens_the_adapter_session`                                                                                            | P3.1      | passing               |
 | Identical JSON-RPC ids from different sessions never collide          | `matrix_routing_identical_request_ids_stay_per_session`                                                                                                     | P3.3      | passing               |
