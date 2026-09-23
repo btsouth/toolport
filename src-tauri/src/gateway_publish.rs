@@ -598,6 +598,20 @@ fn path_looks_like_our_install(path: &Path) -> bool {
         || n.contains("conduit.app")
 }
 
+/// An explicit data directory is an isolated Toolport instance. Its startup
+/// reaper may clean up binaries in that directory, but must leave gateways
+/// belonging to the user's other Toolport instances alone.
+fn in_explicit_reap_scope(proc: &GatewayProcess, scope: Option<&Path>) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    let Some(path) = proc.path.as_ref() else {
+        return false;
+    };
+    let root = normalize_path(scope);
+    normalize_path(path).starts_with(&format!("{root}\\"))
+}
+
 /// Pure keep/kill decision. Getting this wrong is expensive both ways: too eager
 /// kills the bridge we just started; too shy leaves users on old gateway code.
 pub fn decide_reap(proc: &GatewayProcess, ctx: &ReapContext) -> ReapDecision {
@@ -1068,7 +1082,17 @@ pub fn reap_stale(extra_keep: &[PathBuf]) -> ReapReport {
             .collect(),
         kill_all: false,
     };
-    let report = reap_with_context(&ctx);
+    // An explicit data directory is commonly used for an isolated dev or
+    // acceptance run. The global process table includes live gateways from
+    // other installations, whose paths are not in this instance's keep set.
+    let scope =
+        crate::brand::env_var_os("TOOLPORT_DATA_DIR", "CONDUIT_DATA_DIR").map(PathBuf::from);
+    let report = reap_listed(&ctx, || {
+        list_gateway_processes()
+            .into_iter()
+            .filter(|proc| in_explicit_reap_scope(proc, scope.as_deref()))
+            .collect()
+    });
     log_reap_report("stale reaper", &report);
     report
 }
@@ -2038,6 +2062,48 @@ mod tests {
             }),
             ..proc(pid, basename, path)
         }
+    }
+
+    #[test]
+    fn explicit_data_dir_limits_stale_reaping_to_its_own_gateways() {
+        let scope = Path::new("/tmp/isolated/Toolport");
+        let foreign = proc(
+            41,
+            "toolport-gateway",
+            Some("/home/user/.config/Toolport/bin/toolport-gateway"),
+        );
+        let own = proc(
+            42,
+            "toolport-gateway",
+            Some("/tmp/isolated/Toolport/bin/toolport-gateway"),
+        );
+        let sibling = proc(
+            43,
+            "toolport-gateway",
+            Some("/tmp/isolated/Toolport-other/bin/toolport-gateway"),
+        );
+        let unreadable = proc(44, "toolport-gateway-1.0.0", None);
+        let context = ctx("1.20.0", &["/tmp/isolated/Toolport/bin/current"], false);
+
+        // The old global decision would kill the installed copy during an
+        // isolated GTK launch. The scoped enumerator must not pass it through.
+        assert_eq!(decide_reap(&foreign, &context), ReapDecision::Kill);
+        assert!(!in_explicit_reap_scope(&foreign, Some(scope)));
+        assert!(in_explicit_reap_scope(&own, Some(scope)));
+        assert_eq!(decide_reap(&own, &context), ReapDecision::Kill);
+        assert!(!in_explicit_reap_scope(&sibling, Some(scope)));
+        assert!(!in_explicit_reap_scope(&unreadable, Some(scope)));
+        assert!(in_explicit_reap_scope(&foreign, None));
+
+        let windows = proc(
+            45,
+            "toolport-gateway.exe",
+            Some("c:/data/toolport/bin/toolport-gateway.exe"),
+        );
+        assert!(in_explicit_reap_scope(
+            &windows,
+            Some(Path::new("C:\\Data\\Toolport"))
+        ));
     }
 
     #[test]
