@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use conduit_lib::approval::{self, BrokerChallenge, BrokerProof, EndpointDescriptor};
-use conduit_lib::daemon::descriptor_path;
+use conduit_lib::daemon::{descriptor_path, election_lock_base};
 use conduit_lib::registry::{self, EnvVar, FolderProfile, Profile, Registry, ServerEntry};
 use conduit_lib::topology::CompatKey;
 use serde_json::{json, Value};
@@ -130,6 +130,9 @@ struct AdapterClient {
 }
 
 struct AdapterOptions<'a> {
+    /// Exercise the registry-selected role with no explicit gateway flag.
+    default_role: bool,
+    topology_override: Option<&'a str>,
     client_id: Option<&'a str>,
     /// Named registry profile this client runs under (the per-principal row).
     profile: Option<&'a str>,
@@ -146,6 +149,8 @@ struct AdapterOptions<'a> {
 impl Default for AdapterOptions<'_> {
     fn default() -> Self {
         Self {
+            default_role: false,
+            topology_override: None,
             client_id: None,
             profile: None,
             cwd: None,
@@ -159,10 +164,14 @@ impl Default for AdapterOptions<'_> {
 fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
     let index = NEXT.fetch_add(1, Ordering::Relaxed);
     let mut command = Command::new(env!("CARGO_BIN_EXE_toolport-gateway"));
+    if !options.default_role {
+        command.arg("--stdio-adapter");
+    }
     command
-        .arg("--stdio-adapter")
         .env("TOOLPORT_DATA_DIR", dir)
         .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
+        .env_remove("TOOLPORT_GATEWAY_TOPOLOGY")
+        .env_remove("CONDUIT_GATEWAY_TOPOLOGY")
         .env(
             "TOOLPORT_CLIENT_ID",
             options
@@ -173,6 +182,9 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(topology) = options.topology_override {
+        command.env("TOOLPORT_GATEWAY_TOPOLOGY", topology);
+    }
     if let Some(profile) = options.profile {
         command.env("TOOLPORT_PROFILE", profile);
     }
@@ -1233,6 +1245,118 @@ fn matrix_pooling_sessions_share_one_downstream_child() {
          matching processes:\n{}",
         process_report("mock-mcp-server").join("\n")
     );
+}
+
+#[test]
+fn matrix_rollout_registry_opt_in_selects_the_shared_daemon() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("rollout-opt-in");
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, None)],
+        vec![],
+    );
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).expect("load registry");
+    reg.gateway_topology = Some(registry::GatewayTopology::Daemon);
+    registry::save_to(&path, &reg).expect("opt in to daemon topology");
+
+    let options = AdapterOptions {
+        default_role: true,
+        ..AdapterOptions::default()
+    };
+    let mut a = spawn_adapter(&dir, &options);
+    let mut b = spawn_adapter(&dir, &options);
+    a.initialize("matrix-opt-in-a");
+    b.initialize("matrix-opt-in-b");
+    let tool_a = a.wait_for_tool("__echo", Duration::from_secs(30));
+    let tool_b = b.wait_for_tool("__echo", Duration::from_secs(30));
+    assert_eq!(text_of(&a.call_tool(&tool_a, json!({ "text": "a" }))), "a");
+    assert_eq!(text_of(&b.call_tool(&tool_b, json!({ "text": "b" }))), "b");
+    assert!(first_descriptor(&dir).is_some(), "no daemon was elected");
+    assert_eq!(transcript_initialize_count(&transcript), 1);
+}
+
+#[test]
+fn matrix_rollout_legacy_override_keeps_the_standalone_role() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("rollout-legacy");
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, None)],
+        vec![],
+    );
+    let path = dir.join("registry.json");
+    let mut reg = registry::load_from(&path).expect("load registry");
+    reg.gateway_topology = Some(registry::GatewayTopology::Daemon);
+    registry::save_to(&path, &reg).expect("opt in to daemon topology");
+
+    let options = AdapterOptions {
+        default_role: true,
+        topology_override: Some("legacy"),
+        ..AdapterOptions::default()
+    };
+    let mut a = spawn_adapter(&dir, &options);
+    let mut b = spawn_adapter(&dir, &options);
+    a.initialize("matrix-legacy-a");
+    b.initialize("matrix-legacy-b");
+    let tool_a = a.wait_for_tool("__echo", Duration::from_secs(30));
+    let tool_b = b.wait_for_tool("__echo", Duration::from_secs(30));
+    assert_eq!(text_of(&a.call_tool(&tool_a, json!({ "text": "a" }))), "a");
+    assert_eq!(text_of(&b.call_tool(&tool_b, json!({ "text": "b" }))), "b");
+    assert!(descriptor_files(&dir).is_empty(), "legacy started a daemon");
+    assert_eq!(transcript_initialize_count(&transcript), 2);
+}
+
+#[test]
+fn matrix_rollout_ambiguous_daemon_startup_refuses_standalone_fallback() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("rollout-startup-fallback");
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, None)],
+        vec![],
+    );
+    let compat = CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string());
+    let blocked_lock = election_lock_base(&dir, &compat).with_extension("lock");
+    std::fs::create_dir(&blocked_lock).expect("block daemon election lock");
+
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            default_role: true,
+            topology_override: Some("daemon"),
+            ..AdapterOptions::default()
+        },
+    );
+    assert!(!client.wait_exit(Duration::from_secs(25)).success());
+    assert!(
+        descriptor_files(&dir).is_empty(),
+        "blocked election started a daemon"
+    );
+    assert_eq!(transcript_initialize_count(&transcript), 0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if client
+            .stderr
+            .lock()
+            .unwrap()
+            .contains("refusing an in-process fallback")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "refusal was not reported");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

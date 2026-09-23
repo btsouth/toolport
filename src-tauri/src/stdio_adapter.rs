@@ -6,10 +6,10 @@
 //! message the daemon sends back (a response body, an SSE frame on the POST reply,
 //! or a frame on the long-lived `GET /mcp` listen stream) is written to stdout.
 //!
-//! It never falls back to an in-process gateway: this role has no gateway to fall
-//! back to. A transport failure becomes a JSON-RPC error to the client, and the
-//! default stdio role stays the existing in-process gateway (the rollback is the
-//! flag, not a code path).
+//! The explicit `--stdio-adapter` role never falls back to an in-process gateway.
+//! A registry-selected adapter can fall back before it opens a daemon session;
+//! transport failures after that point become errors to the client so requests
+//! cannot be replayed against another router.
 //!
 //! Requests run on bounded worker threads, so a client that pipelines a slow call
 //! and a fast one is answered in completion order rather than arrival order. The
@@ -68,27 +68,80 @@ pub fn adapter_requested(args: &[String]) -> bool {
     args.iter().any(|arg| arg == STDIO_ADAPTER_FLAG)
 }
 
-/// Run the adapter: rendezvous with (or start) the host daemon, then proxy stdio
-/// to it until the client closes stdin. Diverges: the process exit code is the
-/// adapter's result.
-pub fn run_stdio_adapter() -> ! {
-    let Some(dir) = registry::conduit_dir() else {
-        eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: no data directory could be resolved");
-        std::process::exit(1);
-    };
+/// Why daemon preparation failed and whether a standalone gateway is safe.
+struct PreparationFailure {
+    detail: String,
+    /// Only a failed OS spawn proves no daemon was launched by this attempt.
+    safe_to_fallback: bool,
+}
+
+fn prepare_stdio_adapter() -> Result<(Rendezvous, DaemonDescriptor), PreparationFailure> {
+    let dir = registry::conduit_dir().ok_or_else(|| PreparationFailure {
+        detail: "no data directory could be resolved".to_string(),
+        safe_to_fallback: false,
+    })?;
     let compat = CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string());
     let rendezvous = Rendezvous::new(&dir, compat);
-    let descriptor = match rendezvous.ensure(spawn_daemon) {
-        Ok(descriptor) => descriptor,
-        Err(error) => {
-            eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: {error}");
-            std::process::exit(1);
-        }
-    };
+    let mut spawn_failed = false;
+    let descriptor = rendezvous
+        .ensure(|| {
+            let result = spawn_daemon();
+            spawn_failed = result.is_err();
+            result
+        })
+        .map_err(|detail| PreparationFailure {
+            detail,
+            safe_to_fallback: spawn_failed,
+        })?;
+    Ok((rendezvous, descriptor))
+}
+
+fn finish_stdio_adapter(rendezvous: Rendezvous, descriptor: DaemonDescriptor) -> ! {
     match proxy_stdio(rendezvous, descriptor) {
         Ok(()) => std::process::exit(0),
         Err(error) => {
             eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Run an explicit stdio adapter; an unavailable daemon ends this process.
+pub fn run_stdio_adapter() -> ! {
+    match prepare_stdio_adapter() {
+        Ok((rendezvous, descriptor)) => finish_stdio_adapter(rendezvous, descriptor),
+        Err(error) => {
+            eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: {}", error.detail);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Registry opt-in may fall back only before an adapter session reaches the
+/// daemon. Once a descriptor is ready, all later failures stay in adapter mode
+/// so a call cannot be retried against a second, in-process router.
+pub fn run_opt_in_stdio_adapter() {
+    match prepare_stdio_adapter() {
+        Ok((rendezvous, descriptor)) => {
+            crate::gatewaylog::append("topology: role=stdio-adapter source=registry-opt-in");
+            finish_stdio_adapter(rendezvous, descriptor)
+        }
+        Err(PreparationFailure {
+            detail,
+            safe_to_fallback: true,
+        }) => {
+            crate::gatewaylog::append("topology: role=standalone reason=daemon-startup-fallback");
+            eprintln!(
+                "toolport-gateway: host daemon could not be launched ({detail}); \
+                 using the in-process gateway"
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "toolport-gateway: host daemon startup was inconclusive ({}); \
+                 refusing an in-process fallback",
+                error.detail
+            );
             std::process::exit(1);
         }
     }

@@ -818,6 +818,17 @@ pub struct ToolOverride {
     pub description: Option<String>,
 }
 
+/// Startup topology for client-spawned stdio gateways. An absent registry value
+/// follows the release default; an explicit value survives future default flips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayTopology {
+    Legacy,
+    Daemon,
+}
+
+pub const DEFAULT_GATEWAY_TOPOLOGY: GatewayTopology = GatewayTopology::Legacy;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Registry {
@@ -826,6 +837,10 @@ pub struct Registry {
     pub profiles: Vec<Profile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_profile_id: Option<String>,
+    /// `daemon` opts client-spawned stdio gateways into the host daemon. `legacy`
+    /// is the durable rollback choice when a later release changes the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_topology: Option<GatewayTopology>,
     /// Global safety switch: when true, the gateway hides and blocks any tool a
     /// server annotates with `destructiveHint: true` (deletes, drops, writes).
     /// One toggle to keep agents read-only across every connected server.
@@ -1313,6 +1328,7 @@ impl Default for Registry {
                 tool_scope: HashMap::new(),
             }],
             active_profile_id: Some(DEFAULT_PROFILE_ID.to_string()),
+            gateway_topology: None,
             deny_destructive: false,
             confirm_destructive: false,
             human_approval: false,
@@ -1697,6 +1713,10 @@ pub(crate) fn unique_id(base: &str, existing: &[String]) -> String {
 }
 
 impl Registry {
+    pub fn gateway_topology_effective(&self) -> GatewayTopology {
+        self.gateway_topology.unwrap_or(DEFAULT_GATEWAY_TOPOLOGY)
+    }
+
     fn profile_id_for_ref(&self, profile_ref: &str) -> Option<String> {
         let profile_ref = profile_ref.trim();
         if profile_ref.is_empty() {
@@ -3811,6 +3831,25 @@ mod tests {
     use crate::approval::fingerprint_allow_key;
 
     static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn gateway_topology_absence_follows_default_and_explicit_choice_round_trips() {
+        let mut reg = Registry::default();
+        assert_eq!(reg.gateway_topology_effective(), GatewayTopology::Legacy);
+        let absent = serde_json::to_value(&reg).unwrap();
+        assert!(absent.get("gatewayTopology").is_none());
+        reg.gateway_topology = Some(GatewayTopology::Daemon);
+        let opted_in = serde_json::to_value(&reg).unwrap();
+        assert_eq!(opted_in["gatewayTopology"], "daemon");
+        let loaded: Registry = serde_json::from_value(opted_in).unwrap();
+        assert_eq!(loaded.gateway_topology_effective(), GatewayTopology::Daemon);
+        reg.gateway_topology = Some(GatewayTopology::Legacy);
+        assert_eq!(
+            serde_json::to_value(&reg).unwrap()["gatewayTopology"],
+            "legacy",
+            "an explicit rollback must survive a future release default change"
+        );
+    }
 
     /// SBS-890: an error body is the downstream server's own words. It has been
     /// through the injection scan and the PII pass, and neither is a credential
