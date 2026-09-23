@@ -228,6 +228,55 @@ pub fn client_gateway_path() -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+
+/// Find advertised daemons in this data directory, across compatibility keys.
+/// A positive identity mismatch excludes a descriptor; an inconclusive or
+/// malformed endpoint protects its still-running PID so uncertainty cannot
+/// turn into a daemon kill. Only loopback endpoints are ever probed.
+fn live_host_daemons() -> Vec<crate::daemon::DaemonDescriptor> {
+    let Some(data_dir) = crate::registry::conduit_dir() else {
+        return Vec::new();
+    };
+    live_host_daemons_in(&data_dir)
+}
+
+fn live_host_daemons_in(data_dir: &Path) -> Vec<crate::daemon::DaemonDescriptor> {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            if !name.starts_with("daemon-") || !name.ends_with(".json") {
+                return None;
+            }
+            let descriptor = crate::daemon::read_descriptor(&entry.path())?;
+            if !pid_is_running(descriptor.pid) {
+                return None;
+            }
+            let Ok(address) = descriptor.endpoint.parse::<std::net::SocketAddr>() else {
+                return Some(descriptor);
+            };
+            if !address.ip().is_loopback() {
+                return Some(descriptor);
+            }
+            match crate::daemon::probe_identity(&descriptor) {
+                Ok(identity)
+                    if identity.pid != descriptor.pid
+                        || identity.protocol != descriptor.protocol
+                        || identity.compat != descriptor.compat =>
+                {
+                    None
+                }
+                Ok(_) | Err(_) => Some(descriptor),
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Cross-platform gateway process reaper (SOU-414 / residual of SOU-306)
 //
 // Product rule: same outcome on Windows, macOS, and Linux. Staleness is decided
@@ -910,6 +959,38 @@ fn log_reap_report(kind: &str, report: &ReapReport) {
 /// Returns the complete shutdown report. The updater must refuse installation
 /// while either `failed` or `remaining` is non-empty.
 pub fn stop_spawned_gateways() -> ReapReport {
+    let daemons = live_host_daemons();
+    for descriptor in &daemons {
+        let _ = crate::daemon::request_shutdown_if_idle(descriptor);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while daemons
+        .iter()
+        .any(|descriptor| pid_is_running(descriptor.pid))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let active: Vec<_> = daemons
+        .iter()
+        .filter(|descriptor| pid_is_running(descriptor.pid))
+        .collect();
+    if !active.is_empty() {
+        let report = ReapReport {
+            failed: active
+                .iter()
+                .map(|descriptor| {
+                    format!(
+                        "shared gateway daemon (pid {}) still serves a client; close its MCP sessions and retry the update",
+                        descriptor.pid
+                    )
+                })
+                .collect(),
+            ..ReapReport::default()
+        };
+        log_reap_report("updater reaper", &report);
+        return report;
+    }
     let ctx = ReapContext {
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         keep_paths: Vec::new(),
@@ -950,7 +1031,13 @@ pub fn reap_stale(extra_keep: &[PathBuf]) -> ReapReport {
     let ctx = ReapContext {
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         keep_paths: keep,
-        keep_pids: vec![std::process::id()],
+        keep_pids: std::iter::once(std::process::id())
+            .chain(
+                live_host_daemons()
+                    .into_iter()
+                    .map(|descriptor| descriptor.pid),
+            )
+            .collect(),
         kill_all: false,
     };
     let report = reap_with_context(&ctx);
@@ -1702,6 +1789,81 @@ pub fn is_unversioned_install_gateway_path(stored: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matching_or_silent_descriptors_protect_a_live_daemon_pid() {
+        use std::io::{Read, Write};
+
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-reaper-daemon-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut chunk = [0u8; 512];
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert!(count > 0 && request.len() < 4096);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                assert!(String::from_utf8_lossy(&request).contains("Bearer private-token"));
+                if index == 2 {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    continue;
+                }
+                let body = serde_json::json!({
+                    "compat": "domain-a",
+                    "protocol": crate::daemon::PROTOCOL_GENERATION,
+                    "pid": std::process::id(),
+                    "gatewayVersion": "test"
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let descriptor = crate::daemon::DaemonDescriptor {
+            endpoint,
+            token: "private-token".into(),
+            pid: std::process::id(),
+            compat: "domain-a".into(),
+            protocol: crate::daemon::PROTOCOL_GENERATION,
+            created_at_ms: 0,
+        };
+        let path = dir.join("daemon-domain-a.json");
+        std::fs::write(&path, serde_json::to_string(&descriptor).unwrap()).unwrap();
+        let protected = live_host_daemons_in(&dir);
+        assert_eq!(protected, vec![descriptor.clone()]);
+
+        let mut forged = descriptor.clone();
+        forged.compat = "domain-b".into();
+        std::fs::write(&path, serde_json::to_string(&forged).unwrap()).unwrap();
+        assert!(live_host_daemons_in(&dir).is_empty());
+        std::fs::write(&path, serde_json::to_string(&descriptor).unwrap()).unwrap();
+        assert_eq!(live_host_daemons_in(&dir), vec![descriptor.clone()]);
+        server.join().unwrap();
+        let mut malformed = descriptor;
+        malformed.endpoint = "unreadable-endpoint".into();
+        std::fs::write(&path, serde_json::to_string(&malformed).unwrap()).unwrap();
+        assert_eq!(live_host_daemons_in(&dir), vec![malformed]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn ctx(version: &str, keep: &[&str], kill_all: bool) -> ReapContext {
         ReapContext {

@@ -1373,6 +1373,7 @@ fn matrix_rollout_default_selects_the_shared_daemon() {
         conduit_lib::daemon::IDENTITY_PATH,
         conduit_lib::daemon::TOPOLOGY_PATH,
         conduit_lib::daemon::HTTP_SERVICE_LEASE_PATH,
+        conduit_lib::daemon::SHUTDOWN_IF_IDLE_PATH,
     ] {
         let response = ureq::get(&format!("http://{endpoint}{path}"))
             .set("Authorization", &format!("Bearer {bridge_token}"))

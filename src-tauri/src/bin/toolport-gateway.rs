@@ -11844,6 +11844,9 @@ struct HostState {
     /// while it holds a short private lease. A bridge crash leaves no permanent
     /// authorization behind.
     http_service_lease: Mutex<Option<HttpServiceLease>>,
+    /// The updater may ask a daemon with no clients to leave before replacing
+    /// its image. The watchdog still checks live work before exiting.
+    shutdown_if_idle: AtomicBool,
     /// Millis of the last request a listener accepted. The daemon's idle watchdog
     /// compares it against its grace period to decide the host is unused.
     last_activity_ms: AtomicU64,
@@ -16301,6 +16304,22 @@ fn handle_http_with_headers(
             json!({ "released": true }).to_string(),
         );
     }
+    if state.daemon_mode.load(Ordering::SeqCst)
+        && path == conduit_lib::daemon::SHUTDOWN_IF_IDLE_PATH
+    {
+        if !headers.private_daemon_bearer {
+            return HttpOut::json_err(401, "unauthorized");
+        }
+        if method != "POST" {
+            return HttpOut::json_err(405, "method not allowed on /host/shutdown-if-idle");
+        }
+        state.shutdown_if_idle.store(true, Ordering::Release);
+        return HttpOut::new(
+            202,
+            "application/json",
+            json!({ "pending": true }).to_string(),
+        );
+    }
 
     // Streamable-HTTP MCP endpoint (same port as OpenAPI).
     if path == "/mcp" || path.starts_with("/mcp?") {
@@ -17174,14 +17193,34 @@ fn spawn_daemon_idle_watchdog(
         if host.http_service_lease_active() {
             continue;
         }
-        if host.idle_for() < grace {
+        let update_requested = host.shutdown_if_idle.load(Ordering::Acquire);
+        if !update_requested && host.idle_for() < grace {
+            continue;
+        }
+        if update_requested
+            && host
+                .mcp_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .any(|session| session.listener_active.load(Ordering::Acquire))
+        {
             continue;
         }
         // Commit: stop advertising this daemon, then confirm nothing connected in the
         // window between the check and here.
         conduit_lib::daemon::clear_descriptor(&descriptor_path);
         std::thread::sleep(poll);
-        if inflight.load(Ordering::Relaxed) > 0 || host.http_service_lease_active() {
+        if inflight.load(Ordering::Relaxed) > 0
+            || host.http_service_lease_active()
+            || (update_requested
+                && host
+                    .mcp_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .values()
+                    .any(|session| session.listener_active.load(Ordering::Acquire)))
+        {
             // A client found us first. Advertise again and keep serving.
             let _ = conduit_lib::daemon::write_descriptor(&descriptor_path, &descriptor);
             continue;
@@ -18732,6 +18771,7 @@ fn main() {
         mcp_sessions: Arc::clone(&mcp_sessions),
         daemon_mode: AtomicBool::new(daemon_mode),
         http_service_lease: Mutex::new(None),
+        shutdown_if_idle: AtomicBool::new(false),
         last_activity_ms: AtomicU64::new(0),
         rebuild_shrink_streaks: Mutex::new(HashMap::new()),
         quarantine_read_failed: AtomicBool::new(false),
@@ -24471,6 +24511,7 @@ mod tests {
             mcp_sessions: mcp_sessions.unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new()))),
             daemon_mode: AtomicBool::new(false),
             http_service_lease: Mutex::new(None),
+            shutdown_if_idle: AtomicBool::new(false),
             last_activity_ms: AtomicU64::new(0),
         }
     }
@@ -24515,6 +24556,7 @@ mod tests {
                 mcp_sessions: Arc::clone(&mcp_sessions),
                 daemon_mode: AtomicBool::new(false),
                 http_service_lease: Mutex::new(None),
+                shutdown_if_idle: AtomicBool::new(false),
                 last_activity_ms: AtomicU64::new(0),
                 rebuild_shrink_streaks: Mutex::new(HashMap::new()),
                 quarantine_read_failed: AtomicBool::new(false),

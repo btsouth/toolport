@@ -3093,30 +3093,18 @@ fn stop_spawned_gateways(bridge: State<HttpBridgeState>) -> UpdateShutdownReport
                     let intent = UpdateHttpBridgeIntent { port, token };
                     match save_update_http_bridge_intent(&intent) {
                         Ok(()) => {
-                            let mut child = bridge.child.take().expect("live bridge has a child");
-                            let stopped = match child.kill() {
-                                Ok(()) => child.wait().map(|_| ()),
-                                Err(kill_error) => match child.try_wait() {
-                                    Ok(Some(_)) => Ok(()),
-                                    Ok(None) => Err(kill_error),
-                                    Err(wait_error) => Err(wait_error),
-                                },
-                            };
+                            let stopped = crate::http_bridge::stop_with(
+                                &mut bridge,
+                                std::process::Child::kill,
+                            );
                             match stopped {
-                                Ok(()) => {
-                                    bridge.port = None;
-                                    bridge.token = None;
-                                    OwnedBridgeStop::Stopped(port)
-                                }
-                                Err(error) => {
-                                    bridge.child = Some(child);
-                                    OwnedBridgeStop::FailedWithIntent {
-                                        port,
-                                        error: format!(
-                                            "Toolport HTTP endpoint on port {port}: {error}"
-                                        ),
-                                    }
-                                }
+                                Ok(_) => OwnedBridgeStop::Stopped(port),
+                                Err(error) => OwnedBridgeStop::FailedWithIntent {
+                                    port,
+                                    error: format!(
+                                        "Toolport HTTP endpoint on port {port}: {error}"
+                                    ),
+                                },
                             }
                         }
                         Err(error) => OwnedBridgeStop::FailedBeforeIntent(error),
