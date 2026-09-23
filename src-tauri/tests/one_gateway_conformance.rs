@@ -1291,6 +1291,11 @@ fn matrix_rollout_registry_opt_in_selects_the_shared_daemon() {
         matches!(ureq::get(&url).call(), Err(ureq::Error::Status(401, _))),
         "topology probe must require the private bearer"
     );
+    let public_route = ureq::get(&format!("http://{endpoint}/openapi.json"))
+        .set("Authorization", "Bearer registered-probe-token")
+        .call()
+        .expect("registered client can reach an ordinary HTTP route");
+    assert_eq!(public_route.status(), 200);
     for path in [
         conduit_lib::daemon::IDENTITY_PATH,
         conduit_lib::daemon::TOPOLOGY_PATH,
