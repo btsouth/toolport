@@ -114,6 +114,8 @@ struct AdapterClient {
     /// reader thread that answers `roots/list`, so the two cannot disagree.
     declares_roots: bool,
     roots_queries: Arc<AtomicUsize>,
+    declares_elicitation: bool,
+    elicitation_queries: Arc<AtomicUsize>,
     /// This client's data directory, for the gateway log a failure has to quote.
     dir: PathBuf,
     /// The adapter's stderr, captured rather than discarded: an adapter that exits
@@ -131,6 +133,8 @@ struct AdapterOptions<'a> {
     grace_ms: Option<u64>,
     /// Project roots this client declares, for the `${ROOT}` rows.
     roots: Vec<PathBuf>,
+    /// Whether this client can answer legacy form elicitation requests.
+    elicitation: bool,
 }
 
 impl Default for AdapterOptions<'_> {
@@ -141,6 +145,7 @@ impl Default for AdapterOptions<'_> {
             cwd: None,
             grace_ms: None,
             roots: Vec::new(),
+            elicitation: false,
         }
     }
 }
@@ -202,6 +207,8 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
     let declares_roots = !roots.is_empty();
     let roots_queries = Arc::new(AtomicUsize::new(0));
     let roots_queries_reader = Arc::clone(&roots_queries);
+    let elicitation_queries = Arc::new(AtomicUsize::new(0));
+    let elicitation_queries_reader = Arc::clone(&elicitation_queries);
     let stdin = Arc::new(Mutex::new(Some(stdin)));
     let responder = Arc::clone(&stdin);
     let (sender, lines) = mpsc::channel();
@@ -229,12 +236,23 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
                             }
                         })
                     }
+                    Some("elicitation/create") => {
+                        elicitation_queries_reader.fetch_add(1, Ordering::Relaxed);
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "action": "accept",
+                                "content": {"approved": true}
+                            }
+                        })
+                    }
                     _ => json!({
                         "jsonrpc": "2.0",
                         "id": id,
                         "error": {
                             "code": -32601,
-                            "message": "harness client answers roots/list only"
+                            "message": "harness client answers roots/list and elicitation/create only"
                         }
                     }),
                 };
@@ -257,6 +275,8 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
         next_id: 0,
         declares_roots,
         roots_queries,
+        declares_elicitation: options.elicitation,
+        elicitation_queries,
         dir: dir.to_path_buf(),
         stderr: stderr_text,
     }
@@ -352,11 +372,13 @@ impl AdapterClient {
     }
 
     fn initialize(&mut self, name: &str) -> Value {
-        let capabilities = if self.declares_roots {
-            json!({ "roots": {} })
-        } else {
-            json!({})
-        };
+        let mut capabilities = serde_json::Map::new();
+        if self.declares_roots {
+            capabilities.insert("roots".to_string(), json!({}));
+        }
+        if self.declares_elicitation {
+            capabilities.insert("elicitation".to_string(), json!({}));
+        }
         let reply = self.request(
             "initialize",
             json!({
@@ -1573,4 +1595,99 @@ fn matrix_routing_server_change_notifies_only_authorized_sessions() {
             .any(|n| n.ends_with("__greet")),
         "an out-of-scope tool leaked into C's catalog"
     );
+}
+
+#[test]
+fn matrix_routing_root_change_notifies_only_authorized_downstreams() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("root-change-scope");
+    let root = fixture.add("project");
+    let transcript_one = dir.join("one.jsonl");
+    let transcript_two = dir.join("two.jsonl");
+    write_registry(
+        &dir,
+        vec![
+            mock_server_entry("one", &transcript_one, None),
+            mock_server_entry("two", &transcript_two, None),
+        ],
+        vec![
+            profile("scope-one", &["one"]),
+            profile("scope-two", &["two"]),
+        ],
+    );
+    let mut one = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("scope-one"),
+            roots: vec![root],
+            ..AdapterOptions::default()
+        },
+    );
+    let mut two = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("scope-two"),
+            ..AdapterOptions::default()
+        },
+    );
+    one.initialize("matrix-root-one");
+    two.initialize("matrix-root-two");
+    one.wait_for_tool_where(
+        "one's catalog",
+        |name| name.starts_with("one__"),
+        Duration::from_secs(30),
+    );
+    two.wait_for_tool_where(
+        "two's catalog",
+        |name| name.starts_with("two__"),
+        Duration::from_secs(30),
+    );
+    one.send(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/roots/list_changed"
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while transcript_method_count(&transcript_one, "notifications/roots/list_changed") == 0 {
+        assert!(Instant::now() < deadline, "the authorized server saw no root change");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        transcript_method_count(&transcript_two, "notifications/roots/list_changed"),
+        0,
+        "an out-of-scope server received the other client's root change"
+    );
+}
+
+#[test]
+fn matrix_routing_server_request_reaches_only_the_originating_adapter() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("originating-server-request");
+    let transcript = dir.join("shared.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("shared", &transcript, None)],
+        vec![],
+    );
+    let options = AdapterOptions {
+        elicitation: true,
+        ..AdapterOptions::default()
+    };
+    let mut origin = spawn_adapter(&dir, &options);
+    let mut other = spawn_adapter(&dir, &options);
+    origin.initialize("matrix-origin");
+    other.initialize("matrix-other");
+    let tool = origin.wait_for_tool("__legacy_elicitation", Duration::from_secs(30));
+    other.wait_for_tool("__legacy_elicitation", Duration::from_secs(30));
+    let result = origin.call_tool(&tool, json!({}));
+    assert!(
+        text_of(&result).contains("legacy confirmed"),
+        "the originating client did not complete elicitation: {result}"
+    );
+    assert_eq!(origin.elicitation_queries.load(Ordering::Relaxed), 1);
+    assert_eq!(other.elicitation_queries.load(Ordering::Relaxed), 0);
+    assert_eq!(transcript_initialize_count(&transcript), 1);
 }

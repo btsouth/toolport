@@ -1120,9 +1120,18 @@ impl Router {
         self.rebuild_aggregation();
     }
 
-    /// Forward one JSON-RPC notification to every connected downstream server.
-    pub fn notify_all_downstreams(&self, method: &str, params: Value) {
+    /// Forward one JSON-RPC notification only to downstream servers visible to
+    /// this upstream session. `None` is the standalone stdio caller's full set.
+    pub fn notify_downstreams_in_scope(
+        &self,
+        method: &str,
+        params: Value,
+        allowed: Option<&HashSet<String>>,
+    ) {
         for slot in &self.servers {
+            if allowed.is_some_and(|scope| !scope.contains(&slot.id)) {
+                continue;
+            }
             if let Ok(mut ds) = slot.inner.lock() {
                 let _ = ds.notify_downstream(method, params.clone());
             }

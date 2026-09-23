@@ -13219,7 +13219,11 @@ fn refresh_http_session_root(state: &GatewayState) {
     });
 }
 
-fn handle_client_notification(state: &GatewayState, req: &Value) -> bool {
+fn handle_client_notification(
+    state: &GatewayState,
+    req: &Value,
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> bool {
     match req.get("method").and_then(|m| m.as_str()) {
         Some("notifications/initialized") if state.http => {
             refresh_http_session_root(state);
@@ -13241,7 +13245,11 @@ fn handle_client_notification(state: &GatewayState, req: &Value) -> bool {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            router.notify_all_downstreams("notifications/roots/list_changed", json!({}));
+            router.notify_downstreams_in_scope(
+                "notifications/roots/list_changed",
+                json!({}),
+                allowed,
+            );
             true
         }
         _ => false,
@@ -13281,7 +13289,7 @@ fn process_request(
     }
     let is_notification = !req.get("id").is_some_and(|id| !id.is_null());
     if is_notification {
-        if handle_client_notification(state, req) {
+        if handle_client_notification(state, req, allowed) {
             return None;
         }
     }
