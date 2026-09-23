@@ -28,6 +28,8 @@ pub const PROTOCOL_GENERATION: u32 = 1;
 pub const IDENTITY_PATH: &str = "/host/identity";
 /// Private, bearer-gated counts for the opt-in topology acceptance run.
 pub const TOPOLOGY_PATH: &str = "/host/topology";
+/// Private lease for the desktop's lightweight public HTTP bridge.
+pub const HTTP_SERVICE_LEASE_PATH: &str = "/host/http-service-lease";
 
 /// Bounded wait for a spawned daemon to publish a reachable descriptor.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
