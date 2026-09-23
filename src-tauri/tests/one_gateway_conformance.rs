@@ -448,7 +448,8 @@ impl AdapterClient {
             }
             assert!(
                 Instant::now() < deadline,
-                "no tool matching {label} was exposed within {within:?}: {names:?}"
+                "no tool matching {label} was exposed within {within:?}: {names:?}\n{}",
+                self.diagnostics()
             );
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -1310,6 +1311,63 @@ fn matrix_pooling_root_sharding_two_roots_two_children() {
 }
 
 #[test]
+fn matrix_pooling_quarantine_reaches_every_cached_root_view() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut fixture, dir) = Fixture::new("root-quarantine");
+    let root_a = fixture.add("root-a");
+    let root_b = fixture.add("root-b");
+    let transcript = dir.join("downstream.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("mock", &transcript, Some("${ROOT}"))],
+        vec![],
+    );
+    let registry_path = dir.join("registry.json");
+    let mut registry_value: Registry =
+        serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+    registry_value.quarantine_on_drift = true;
+    registry::save_to(&registry_path, &registry_value).unwrap();
+
+    let mut a = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            roots: vec![root_a],
+            ..AdapterOptions::default()
+        },
+    );
+    let mut b = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            roots: vec![root_b],
+            ..AdapterOptions::default()
+        },
+    );
+    a.initialize("matrix-root-quarantine-a");
+    b.initialize("matrix-root-quarantine-b");
+    let tool = a.wait_for_tool("__pwd", Duration::from_secs(30));
+    assert_eq!(b.wait_for_tool("__pwd", Duration::from_secs(30)), tool);
+    std::fs::write(
+        dir.join("quarantine.json"),
+        json!({(tool.clone()): {"change": "changed"}}).to_string(),
+    )
+    .unwrap();
+
+    for client in [&mut a, &mut b] {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client.tool_names().contains(&tool) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            !client.tool_names().contains(&tool),
+            "quarantined tool remained in a cached root view: {}",
+            client.diagnostics()
+        );
+    }
+}
+
+#[test]
 fn matrix_pooling_rooted_servers_launch_only_for_authorized_profiles() {
     let _guard = CASE_LOCK
         .lock()
@@ -1391,11 +1449,9 @@ fn matrix_pooling_rooted_catalog_change_reaches_only_its_root() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let line = a
-            .lines
-            .recv_timeout(remaining.max(Duration::from_millis(1)))
+        let message = a
+            .observed_message(remaining.max(Duration::from_millis(1)))
             .expect("root A did not receive tools/list_changed");
-        let message: Value = serde_json::from_str(&line).expect("valid notification");
         if message["method"] == "notifications/tools/list_changed" {
             break;
         }

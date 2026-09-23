@@ -884,13 +884,15 @@ impl Router {
     ) -> Self {
         let mut view = self.clone();
         if let Some(&index) = view.by_id.get(&server.id) {
+            view.restored_candidates
+                .retain(|candidate| candidate.server != server.id);
             view.servers[index] = Arc::new(ServerSlot {
                 id: server.id.clone(),
                 inner: Mutex::new(server),
                 breaker: Mutex::new(Breaker::default()),
                 reconnect,
             });
-            view.rebuild_aggregation();
+            view.rebuild_preserving_restored();
         } else {
             view.add_with_reconnect(server, reconnect);
         }
@@ -913,13 +915,17 @@ impl Router {
         let server_id = &slot.0.id;
         let mut view = self.clone();
         if let Some(&index) = view.by_id.get(server_id) {
+            if !Arc::ptr_eq(&view.servers[index], &slot.0) {
+                view.restored_candidates
+                    .retain(|candidate| candidate.server != server_id.as_str());
+            }
             view.servers[index] = Arc::clone(&slot.0);
         } else {
             let index = view.servers.len();
             view.servers.push(Arc::clone(&slot.0));
             view.by_id.insert(server_id.to_string(), index);
         }
-        view.rebuild_aggregation();
+        view.rebuild_preserving_restored();
         view
     }
 
@@ -927,7 +933,7 @@ impl Router {
     /// catalog. The view keeps its own policy and routes while sharing launches.
     pub fn reindexed(&self) -> Self {
         let mut view = self.clone();
-        view.rebuild_aggregation();
+        view.rebuild_preserving_restored();
         view
     }
 
@@ -1246,6 +1252,12 @@ impl Router {
     pub fn requarantine_from_store(&mut self, quarantined: BTreeSet<String>) {
         self.policy.fail_closed_catalog = false;
         self.requarantine(quarantined);
+    }
+
+    /// Hide a derived catalog when its integrity store cannot be trusted.
+    pub fn fail_closed_catalog(&mut self) {
+        self.policy.fail_closed_catalog = true;
+        self.rebuild_preserving_restored();
     }
 
     /// True when this router is hiding the whole catalog because the quarantine
@@ -3436,6 +3448,18 @@ mod tests {
             .aggregated_tools()
             .iter()
             .any(|tool| tool["name"] == "atlassian__t39"));
+        let refreshed = profile.reindexed();
+        assert_eq!(
+            refreshed.route_of("atlassian__t39"),
+            Some(("atlassian", "t39")),
+            "a rooted catalog refresh must retain guarded routes from unchanged slots"
+        );
+        let slot = profile.server_slot("atlassian").unwrap();
+        let shared = profile.with_shared_server_slot(&slot);
+        assert_eq!(
+            shared.route_of("atlassian__t39"),
+            Some(("atlassian", "t39"))
+        );
         let mut quarantined = profile.clone();
         quarantined.requarantine(BTreeSet::from(["atlassian__t39".to_string()]));
         assert!(quarantined.route_of("atlassian__t39").is_none());

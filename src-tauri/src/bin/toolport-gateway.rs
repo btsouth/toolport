@@ -92,6 +92,8 @@ struct ActiveRequestContext {
     upstream_capabilities: Option<Arc<Value>>,
     /// Legacy HTTP session or modern subscription key used for upstream routing.
     mcp_session: Option<String>,
+    /// Authenticated root on a sessionless modern daemon adapter request.
+    adapter_root: Option<String>,
     /// Transport carrying the originating request. Progress and notifications
     /// must never infer this from process topology in a multi-client daemon.
     upstream_transport: UpstreamTransport,
@@ -103,6 +105,7 @@ thread_local! {
             upstream_version: None,
             upstream_capabilities: None,
             mcp_session: None,
+            adapter_root: None,
             upstream_transport: UpstreamTransport::Unknown,
         }) };
 }
@@ -207,6 +210,25 @@ impl Drop for McpSessionGuard {
 
 fn active_mcp_session() -> Option<String> {
     ACTIVE_REQUEST_CONTEXT.with(|cell| cell.borrow().mcp_session.clone())
+}
+
+struct AdapterRootGuard(Option<String>);
+
+impl AdapterRootGuard {
+    fn enter(root: Option<String>) -> Self {
+        Self(
+            ACTIVE_REQUEST_CONTEXT
+                .with(|cell| std::mem::replace(&mut cell.borrow_mut().adapter_root, root)),
+        )
+    }
+}
+
+impl Drop for AdapterRootGuard {
+    fn drop(&mut self) {
+        ACTIVE_REQUEST_CONTEXT.with(|cell| {
+            cell.borrow_mut().adapter_root = self.0.take();
+        });
+    }
 }
 
 struct UpstreamTransportGuard(UpstreamTransport);
@@ -10417,6 +10439,8 @@ fn maybe_check_integrity(
     if !enabled {
         return Ok(None);
     }
+    integrity::ensure_quarantine_store_for_fresh_pins(profile)
+        .map_err(|error| (error, BTreeSet::new()))?;
     let events = integrity::check_staged(profile, tools).map_err(|e| {
         // Without a trustworthy pin-store update we cannot identify which definitions are
         // safely baselined. Keep the whole live catalog behind the integrity gate until a
@@ -11483,7 +11507,11 @@ fn watch_tick(
 /// registry, one router, one catalog, and one rebuild lock.
 #[derive(Default)]
 struct ToolScopeViews {
-    base: Option<Arc<Router>>,
+    by_base: HashMap<usize, ToolScopeBase>,
+}
+
+struct ToolScopeBase {
+    base: Arc<Router>,
     by_profile: HashMap<String, ProfileToolView>,
 }
 
@@ -11500,6 +11528,8 @@ struct RootLaunchPool {
     secrets_generation: u64,
     launches: BTreeMap<LaunchKey, RootLaunch>,
     views: BTreeMap<Vec<LaunchKey>, Arc<Router>>,
+    failed_until: BTreeMap<LaunchKey, Instant>,
+    incomplete_until: BTreeMap<Vec<LaunchKey>, Instant>,
 }
 
 struct RootLaunch {
@@ -11678,13 +11708,22 @@ impl HostState {
             .values()
             .cloned()
             .collect();
-        let mut pool = self
-            .root_launch_pool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pool.launches.is_empty() {
-            return;
-        }
+        let (launches, old_views) = {
+            let pool = self
+                .root_launch_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pool.launches.is_empty() {
+                return;
+            }
+            (
+                pool.launches
+                    .values()
+                    .map(|launch| launch.slot.clone())
+                    .collect::<Vec<_>>(),
+                pool.views.clone(),
+            )
+        };
         let mut before = Vec::new();
         for session in &sessions {
             let (Some(owner), Some(root)) =
@@ -11698,7 +11737,7 @@ impl HostState {
                 .map(|scope| scope.iter().cloned().collect());
             let scoped = root_servers_in_scope(&specs, allowed.as_ref());
             let keys = root_launch_keys(&scoped, &root, reg.secrets_generation);
-            let Some(view) = pool.views.get(&keys) else {
+            let Some(view) = old_views.get(&keys) else {
                 continue;
             };
             for &kind in &kinds {
@@ -11712,8 +11751,8 @@ impl HostState {
         }
         // Each launch is refreshed once. The ordinary host router does not own
         // these slots, so its refresh loop cannot see their catalog changes.
-        for launch in pool.launches.values() {
-            let mut view = Router::new().with_shared_server_slot(&launch.slot);
+        for slot in &launches {
+            let mut view = Router::new().with_shared_server_slot(slot);
             for &kind in &kinds {
                 if kind == downstream::change::TOOLS {
                     view.refresh_tools();
@@ -11724,20 +11763,43 @@ impl HostState {
                 }
             }
         }
-        let updated: BTreeMap<Vec<LaunchKey>, Arc<Router>> = pool
-            .views
+        let updated: BTreeMap<Vec<LaunchKey>, Arc<Router>> = old_views
             .iter()
-            .map(|(keys, view)| (keys.clone(), Arc::new(view.reindexed())))
+            .map(|(keys, view)| {
+                let mut refreshed = view.reindexed();
+                if changed & downstream::change::TOOLS != 0 {
+                    self.check_rooted_integrity(&mut refreshed);
+                }
+                (keys.clone(), Arc::new(refreshed))
+            })
             .collect();
-        pool.views = updated.clone();
-        drop(pool);
-        self.invalidate_tool_scope_views();
+        let committed: BTreeMap<_, _> = {
+            let mut pool = self
+                .root_launch_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            updated
+                .into_iter()
+                .filter_map(|(keys, view)| {
+                    let old = old_views.get(&keys)?;
+                    let current = pool.views.get_mut(&keys)?;
+                    if !Arc::ptr_eq(old, current) {
+                        return None;
+                    }
+                    *current = Arc::clone(&view);
+                    Some((keys, view))
+                })
+                .collect()
+        };
+        if !committed.is_empty() {
+            self.invalidate_tool_scope_views();
+        }
 
         for (session, keys, kind, prior) in before {
             if session.is_expired() || session.closed.load(Ordering::SeqCst) {
                 continue;
             }
-            let (Some(owner), Some(view)) = (session.owner.as_ref(), updated.get(&keys)) else {
+            let (Some(owner), Some(view)) = (session.owner.as_ref(), committed.get(&keys)) else {
                 continue;
             };
             if prior == visible_root_list(view, owner, &reg, kind) {
@@ -11782,13 +11844,23 @@ impl HostState {
             .root_launch_pool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pool.specs != specs || pool.secrets_generation != reg.secrets_generation {
-            pool.launches.clear();
-            pool.specs = specs;
-            pool.secrets_generation = reg.secrets_generation;
-        }
+        let retired_launches =
+            if pool.specs != specs || pool.secrets_generation != reg.secrets_generation {
+                let retired = std::mem::take(&mut pool.launches);
+                pool.failed_until.clear();
+                pool.incomplete_until.clear();
+                pool.specs = specs;
+                pool.secrets_generation = reg.secrets_generation;
+                retired
+            } else {
+                BTreeMap::new()
+            };
         pool.base = None;
-        pool.views.clear();
+        let retired_views = std::mem::take(&mut pool.views);
+        pool.incomplete_until.clear();
+        drop(pool);
+        drop(retired_views);
+        drop(retired_launches);
     }
 
     fn reap_root_launches(&self) {
@@ -11831,13 +11903,36 @@ impl HostState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = (pool.views.len(), pool.launches.len());
-        pool.views.retain(|keys, _| active_views.contains(keys));
-        pool.launches.retain(|key, _| active_keys.contains(key));
+        let mut retired_views = Vec::new();
+        let mut retained_views = BTreeMap::new();
+        for (keys, view) in std::mem::take(&mut pool.views) {
+            if active_views.contains(&keys) {
+                retained_views.insert(keys, view);
+            } else {
+                retired_views.push(view);
+            }
+        }
+        pool.views = retained_views;
+        let mut retired_launches = Vec::new();
+        let mut retained_launches = BTreeMap::new();
+        for (key, launch) in std::mem::take(&mut pool.launches) {
+            if active_keys.contains(&key) {
+                retained_launches.insert(key, launch);
+            } else {
+                retired_launches.push(launch);
+            }
+        }
+        pool.launches = retained_launches;
+        pool.failed_until.retain(|key, _| active_keys.contains(key));
+        pool.incomplete_until
+            .retain(|keys, _| active_views.contains(keys));
         if pool.views.is_empty() && pool.launches.is_empty() {
             pool.base = None;
         }
         let changed = before != (pool.views.len(), pool.launches.len());
         drop(pool);
+        drop(retired_views);
+        drop(retired_launches);
         if changed {
             self.invalidate_tool_scope_views();
         }
@@ -11901,14 +11996,70 @@ impl HostState {
     }
 
     fn active_adapter_root(&self) -> Option<String> {
-        let sid = active_mcp_session()?;
-        let session = self
-            .mcp_sessions
+        if let Some(sid) = active_mcp_session() {
+            let session = self
+                .mcp_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&sid)
+                .cloned()?;
+            Self::resolved_adapter_root(&session)
+        } else {
+            ACTIVE_REQUEST_CONTEXT.with(|cell| cell.borrow().adapter_root.clone())
+        }
+    }
+
+    fn check_rooted_integrity(&self, view: &mut Router) {
+        let tools = view.aggregated_tools();
+        let pending = match maybe_check_integrity(&self.registry, &tools, None) {
+            Ok(pending) => pending.unwrap_or_default(),
+            Err((error, _)) => {
+                glog(&format!(
+                    "SECURITY: rooted catalog integrity check failed: {error}"
+                ));
+                view.fail_closed_catalog();
+                return;
+            }
+        };
+        match effective_quarantine(&self.registry, None, &self.quarantine_read_failed) {
+            Some(mut quarantined) => {
+                quarantined.extend(pending);
+                view.requarantine_from_store(quarantined);
+            }
+            None => view.fail_closed_catalog(),
+        }
+    }
+
+    fn reconcile_rooted_view(&self, keys: &[LaunchKey], cached: Arc<Router>) -> Arc<Router> {
+        let wanted = effective_quarantine(&self.registry, None, &self.quarantine_read_failed);
+        if wanted
+            .as_ref()
+            .is_some_and(|set| set == cached.quarantined() && !cached.catalog_fail_closed())
+            || wanted.is_none() && cached.catalog_fail_closed()
+        {
+            return cached;
+        }
+        let mut updated = (*cached).clone();
+        if let Some(set) = wanted {
+            updated.requarantine_from_store(set);
+        } else {
+            updated.fail_closed_catalog();
+        }
+        let updated = Arc::new(updated);
+        let mut pool = self
+            .root_launch_pool
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&sid)
-            .cloned()?;
-        Self::resolved_adapter_root(&session)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(current) = pool.views.get_mut(keys) else {
+            return cached;
+        };
+        if !Arc::ptr_eq(current, &cached) {
+            return Arc::clone(current);
+        }
+        *current = Arc::clone(&updated);
+        drop(pool);
+        self.invalidate_tool_scope_views();
+        updated
     }
 
     fn router_for_root(
@@ -11927,22 +12078,25 @@ impl HostState {
             return base;
         }
         let keys = root_launch_keys(&specs, root, reg.secrets_generation);
-        let mut pool = self
-            .root_launch_pool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let live = self
             .router
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if !Arc::ptr_eq(&live, &base) {
-            // A concurrent rebuild won. Its next request creates the new pool.
             return base;
         }
+        let mut pool = self
+            .root_launch_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut retired_launches = Vec::new();
+        let mut retired_views = Vec::new();
         if pool.specs != all_specs || pool.secrets_generation != reg.secrets_generation {
-            pool.launches.clear();
-            pool.views.clear();
+            retired_launches.extend(std::mem::take(&mut pool.launches).into_values());
+            retired_views.extend(std::mem::take(&mut pool.views).into_values());
+            pool.failed_until.clear();
+            pool.incomplete_until.clear();
             pool.specs = all_specs;
             pool.secrets_generation = reg.secrets_generation;
         }
@@ -11952,19 +12106,46 @@ impl HostState {
             .is_some_and(|previous| Arc::ptr_eq(previous, &base))
         {
             pool.base = Some(Arc::clone(&base));
-            pool.views.clear();
+            retired_views.extend(std::mem::take(&mut pool.views).into_values());
+            pool.incomplete_until.clear();
+        }
+        if pool
+            .incomplete_until
+            .get(&keys)
+            .is_some_and(|until| *until <= Instant::now())
+        {
+            if let Some(view) = pool.views.remove(&keys) {
+                retired_views.push(view);
+            }
+            pool.incomplete_until.remove(&keys);
         }
         if let Some(view) = pool.views.get(&keys) {
-            return Arc::clone(view);
+            let view = Arc::clone(view);
+            drop(pool);
+            drop(retired_views);
+            drop(retired_launches);
+            return self.reconcile_rooted_view(&keys, view);
         }
+        let missing: Vec<_> = specs
+            .iter()
+            .zip(&keys)
+            .filter(|(_, key)| {
+                !pool.launches.contains_key(*key)
+                    && !pool
+                        .failed_until
+                        .get(*key)
+                        .is_some_and(|until| *until > Instant::now())
+            })
+            .map(|(server, key)| (server.clone(), key.clone()))
+            .collect();
+        drop(pool);
+        drop(retired_views);
+        drop(retired_launches);
 
-        let mut view = (*base).clone();
-        let mut complete = true;
-        for (server, key) in specs.iter().zip(&keys) {
-            if let Some(launch) = pool.launches.get(key) {
-                view = view.with_shared_server_slot(&launch.slot);
-                continue;
-            }
+        // Spawning and handshaking can block for the server's initialize timeout.
+        // Keep every other root and adapter free to use the pool during that wait.
+        let mut connected = Vec::new();
+        for (server, key) in missing {
             let dirty = Arc::clone(&self.downstream_dirty);
             let handler = Arc::clone(&self.server_handler);
             let subscriptions = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
@@ -11973,8 +12154,8 @@ impl HostState {
                 Arc::clone(&self.mcp_sessions),
                 Arc::clone(&subscriptions),
             ));
-            let Some(ds) = connect_one(server, &dirty, handler, Some(root), sink.clone()) else {
-                complete = false;
+            let Some(ds) = connect_one(&server, &dirty, handler, Some(root), sink.clone()) else {
+                connected.push((key, None));
                 continue;
             };
             let spec = server.clone();
@@ -11993,22 +12174,101 @@ impl HostState {
                 resubscribe_server_resources(&mut ds, &server_id, &subs);
                 Some(ds)
             });
-            view = view.with_server_launch(ds, Some(reconnect));
-            if let Some(slot) = view.server_slot(&server.id) {
-                pool.launches.insert(
-                    key.clone(),
-                    RootLaunch {
-                        slot,
-                        subscriptions,
-                    },
-                );
+            let slot = Router::new()
+                .with_server_launch(ds, Some(reconnect))
+                .server_slot(&server.id);
+            connected.push((
+                key,
+                slot.map(|slot| RootLaunch {
+                    slot,
+                    subscriptions,
+                }),
+            ));
+        }
+
+        let mut pool = self
+            .root_launch_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pool.specs != daemon_root_servers(reg)
+            || pool.secrets_generation != reg.secrets_generation
+            || !pool
+                .base
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &base))
+        {
+            drop(pool);
+            return base;
+        }
+        let mut inserted = false;
+        let mut discarded = Vec::new();
+        for (key, launch) in connected {
+            if pool.launches.contains_key(&key) {
+                if let Some(launch) = launch {
+                    discarded.push(launch);
+                }
+                continue;
+            }
+            if let Some(launch) = launch {
+                pool.failed_until.remove(&key);
+                pool.launches.insert(key, launch);
+                inserted = true;
+            } else {
+                pool.failed_until
+                    .insert(key, Instant::now() + Duration::from_secs(5));
             }
         }
-        let view = Arc::new(view);
-        if complete {
-            pool.views.insert(keys, Arc::clone(&view));
+        if inserted {
+            pool.views.remove(&keys);
+            pool.incomplete_until.remove(&keys);
         }
-        view
+        if let Some(view) = pool.views.get(&keys) {
+            let view = Arc::clone(view);
+            drop(pool);
+            drop(discarded);
+            return self.reconcile_rooted_view(&keys, view);
+        }
+        let slots: Vec<_> = keys
+            .iter()
+            .map(|key| pool.launches.get(key).map(|launch| launch.slot.clone()))
+            .collect();
+        let complete = slots.iter().all(Option::is_some);
+        drop(pool);
+        drop(discarded);
+        let mut view = (*base).clone();
+        for slot in slots.iter().flatten() {
+            view = view.with_shared_server_slot(slot);
+        }
+        self.check_rooted_integrity(&mut view);
+        let view = Arc::new(view);
+        let mut pool = self
+            .root_launch_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pool.specs == daemon_root_servers(reg)
+            && pool.secrets_generation == reg.secrets_generation
+            && pool
+                .base
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &base))
+            && keys
+                .iter()
+                .zip(&slots)
+                .all(|(key, slot)| match (pool.launches.get(key), slot) {
+                    (Some(current), Some(slot)) => current.slot.ptr_eq(slot),
+                    (None, None) => true,
+                    _ => false,
+                })
+        {
+            if !complete {
+                pool.incomplete_until
+                    .insert(keys.clone(), Instant::now() + Duration::from_secs(5));
+            }
+            let selected = Arc::clone(pool.views.entry(keys).or_insert_with(|| Arc::clone(&view)));
+            drop(pool);
+            return selected;
+        }
+        base
     }
 
     fn invalidate_tool_scope_views(&self) {
@@ -12016,8 +12276,9 @@ impl HostState {
             .tool_scope_views
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        views.base = None;
-        views.by_profile.clear();
+        let retired = std::mem::take(&mut views.by_base);
+        drop(views);
+        drop(retired);
     }
 
     fn router_for_adapter_profile(
@@ -12035,10 +12296,6 @@ impl HostState {
             .into_iter()
             .map(|(server, tools)| (server, tools.into_iter().collect()))
             .collect();
-        let mut views = self
-            .tool_scope_views
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let live = self
             .router
             .lock()
@@ -12051,6 +12308,10 @@ impl HostState {
             .views
             .values()
             .any(|view| Arc::ptr_eq(view, &base));
+        let mut views = self
+            .tool_scope_views
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !Arc::ptr_eq(&live, &base) && !rooted_live {
             // A rebuild won after this request took its snapshot. Keep serving
             // that snapshot, but never pin its old downstream slots in the host.
@@ -12058,22 +12319,25 @@ impl HostState {
             let catalog = Arc::new(CatalogSnapshot::new(view.aggregated_tools()));
             return (view, catalog);
         }
-        if !views
-            .base
-            .as_ref()
-            .is_some_and(|previous| Arc::ptr_eq(previous, &base))
-        {
-            views.base = Some(Arc::clone(&base));
-            views.by_profile.clear();
+        let key = Arc::as_ptr(&base) as usize;
+        if !views.by_base.contains_key(&key) && views.by_base.len() >= 32 {
+            if let Some(oldest) = views.by_base.keys().next().copied() {
+                views.by_base.remove(&oldest);
+            }
         }
-        if let Some(view) = views.by_profile.get(&resolved) {
+        let scoped = views.by_base.entry(key).or_insert_with(|| ToolScopeBase {
+            base: Arc::clone(&base),
+            by_profile: HashMap::new(),
+        });
+        debug_assert!(Arc::ptr_eq(&scoped.base, &base));
+        if let Some(view) = scoped.by_profile.get(&resolved) {
             if view.allow == allow {
                 return (Arc::clone(&view.router), Arc::clone(&view.catalog));
             }
         }
         let router = Arc::new(base.with_tool_allow(allow.clone()));
         let catalog = Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
-        views.by_profile.insert(
+        scoped.by_profile.insert(
             resolved,
             ProfileToolView {
                 allow,
@@ -12437,6 +12701,14 @@ fn register_modern_subscription(
             Arc::new(SessionState::new_modern_stdio(id, filter, stdout))
         }
     };
+    if transport == ModernSubscriptionTransport::Http
+        && owner.is_some_and(|owner| owner.identity.starts_with("adapter:"))
+    {
+        *session
+            .client_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state.active_adapter_root();
+    }
     if transport == ModernSubscriptionTransport::Http {
         let _ = session.try_begin_listen();
     }
@@ -14134,14 +14406,20 @@ fn process_request(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .server_count()
             == 0
-        && !(state.daemon_mode.load(Ordering::SeqCst)
-            && !daemon_root_servers(
-                &state
-                    .registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            )
-            .is_empty())
+        && !(state.daemon_mode.load(Ordering::SeqCst) && {
+            let reg = state
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            !reg.servers.iter().any(|server| {
+                !clients::is_gateway_server(server)
+                    && !server_uses_project_root(server)
+                    && reg
+                        .profiles
+                        .iter()
+                        .any(|profile| reg.is_enabled(&profile.id, &server.id))
+            })
+        })
     {
         // Single-flight: serialize the rebuild so a startup burst of concurrent
         // tools/call workers doesn't have each one spawn the full server set (and
@@ -14366,7 +14644,8 @@ fn process_request(
                     expected_root.as_deref(),
                     expected_scope.as_ref(),
                 );
-                host.router_for_adapter_profile(rooted, &current, &profile).0
+                host.router_for_adapter_profile(rooted, &current, &profile)
+                    .0
             }) as LiveRouterResolver
         })
     } else {
@@ -15234,6 +15513,12 @@ fn handle_mcp_http(
     session_owner: Option<&McpSessionOwner>,
 ) -> HttpOut {
     let prefer_sse = mcp_prefers_sse(headers.accept);
+    let _adapter_root = AdapterRootGuard::enter(
+        (state.daemon_mode.load(Ordering::SeqCst)
+            && session_owner.is_some_and(|owner| owner.identity.starts_with("adapter:")))
+        .then(|| headers.adapter_resolved_root.map(str::to_string))
+        .flatten(),
+    );
     match method {
         // GET (listen stream) and DELETE (session teardown) were removed in
         // 2026-07-28. Their transport header is the era boundary because neither
@@ -15317,11 +15602,37 @@ fn handle_mcp_http(
                 if !mcp_accepts_sse(headers.accept) {
                     return HttpOut::json_err(406, "Accept must include text/event-stream");
                 }
-                let router = state
+                let base = state
                     .router
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
+                let reg = state
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let rooted = if state.daemon_mode.load(Ordering::SeqCst)
+                    && session_owner.is_some_and(|owner| owner.identity.starts_with("adapter:"))
+                {
+                    state.router_for_root(
+                        base,
+                        &reg,
+                        state.active_adapter_root().as_deref(),
+                        allowed,
+                    )
+                } else {
+                    base
+                };
+                let router = session_owner
+                    .and_then(|owner| owner.profile.as_deref())
+                    .filter(|_| state.daemon_mode.load(Ordering::SeqCst))
+                    .map(|profile| {
+                        state
+                            .router_for_adapter_profile(rooted.clone(), &reg, profile)
+                            .0
+                    })
+                    .unwrap_or(rooted);
                 return match register_modern_subscription(
                     state,
                     &router,
@@ -26123,6 +26434,41 @@ mod tests {
         assert!(
             !with_pii_session(pii_client, |map| !map.is_empty()),
             "closing the SSE conversation must drop its PII map"
+        );
+    }
+
+    #[test]
+    fn modern_adapter_listener_keeps_its_authenticated_root() {
+        let state = http_state(true);
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        let caller = test_caller("adapter:modern-root", None);
+        let mut headers = modern_http_headers(
+            "subscriptions/listen",
+            None,
+            None,
+            Some("application/json, text/event-stream"),
+        );
+        headers.adapter_resolved_root = Some("/project-modern");
+        let out = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &modern_http_body(
+                1,
+                "subscriptions/listen",
+                json!({"notifications": {"toolsListChanged": true}}),
+            ),
+            headers,
+            None,
+            Some(&caller),
+        );
+        assert_eq!(out.status, 200, "body={}", out.body);
+        let session = &out.mcp_listen.as_ref().unwrap().session;
+        assert_eq!(
+            HostState::resolved_adapter_root(session).as_deref(),
+            Some("/project-modern")
         );
     }
 
