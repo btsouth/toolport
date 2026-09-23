@@ -26,6 +26,8 @@ pub const PROTOCOL_GENERATION: u32 = 1;
 /// The daemon's internal identity endpoint. Authenticated with the descriptor
 /// token; never the user-facing HTTP surface.
 pub const IDENTITY_PATH: &str = "/host/identity";
+/// Private, bearer-gated counts for the opt-in topology acceptance run.
+pub const TOPOLOGY_PATH: &str = "/host/topology";
 
 /// Bounded wait for a spawned daemon to publish a reachable descriptor.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);

@@ -16153,6 +16153,15 @@ fn handle_http_with_headers(
             None => HttpOut::json_err(401, "unauthorized"),
         };
     }
+    if state.daemon_mode.load(Ordering::SeqCst) && path == conduit_lib::daemon::TOPOLOGY_PATH {
+        return match caller {
+            Some(_) if method == "GET" => {
+                HttpOut::new(200, "application/json", daemon_topology_json(state))
+            }
+            Some(_) => HttpOut::json_err(405, "method not allowed on /host/topology"),
+            None => HttpOut::json_err(401, "unauthorized"),
+        };
+    }
 
     // Streamable-HTTP MCP endpoint (same port as OpenAPI).
     if path == "/mcp" || path.starts_with("/mcp?") {
@@ -16907,8 +16916,8 @@ fn http_allows_insecure_open(
 }
 
 /// The daemon's identity payload, matching [`conduit_lib::daemon::DaemonIdentity`].
-fn daemon_identity_json() -> String {
-    let compat = registry::conduit_dir()
+fn daemon_compat_fingerprint() -> String {
+    registry::conduit_dir()
         .map(|dir| {
             conduit_lib::topology::CompatKey::new(
                 env!("CARGO_PKG_VERSION"),
@@ -16916,12 +16925,46 @@ fn daemon_identity_json() -> String {
             )
         })
         .map(|compat| compat.fingerprint())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn daemon_identity_json() -> String {
     json!({
-        "compat": compat,
+        "compat": daemon_compat_fingerprint(),
         "protocol": conduit_lib::daemon::PROTOCOL_GENERATION,
         "pid": std::process::id(),
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
+    })
+    .to_string()
+}
+
+/// Current daemon counts for a private acceptance probe. Locks are released
+/// between fields so diagnostics never hold a session lock over a router lock.
+fn daemon_topology_json(state: &GatewayState) -> String {
+    let sessions = state
+        .mcp_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len();
+    let ordinary_launches = state
+        .router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .server_count();
+    let rooted_launches = state
+        .root_launch_pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .launches
+        .len();
+    json!({
+        "role": "daemon",
+        "compat": daemon_compat_fingerprint(),
+        "pid": std::process::id(),
+        "sessions": sessions,
+        "ordinaryLaunches": ordinary_launches,
+        "rootedLaunches": rooted_launches,
+        "launches": ordinary_launches + rooted_launches,
     })
     .to_string()
 }
@@ -34398,6 +34441,18 @@ mod tests {
             "a non-daemon host must neither serve nor advertise the identity route: {}",
             bridge.body
         );
+        let bridge_topology = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "GET",
+            conduit_lib::daemon::TOPOLOGY_PATH,
+            "",
+            McpHttpRequestHeaders::default(),
+            None,
+            Some(&caller),
+        );
+        assert_ne!(bridge_topology.status, 200);
 
         state.daemon_mode.store(true, Ordering::SeqCst);
         let anonymous = probe(&state, None);

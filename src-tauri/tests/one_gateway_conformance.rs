@@ -1276,8 +1276,29 @@ fn matrix_rollout_registry_opt_in_selects_the_shared_daemon() {
     let tool_b = b.wait_for_tool("__echo", Duration::from_secs(30));
     assert_eq!(text_of(&a.call_tool(&tool_a, json!({ "text": "a" }))), "a");
     assert_eq!(text_of(&b.call_tool(&tool_b, json!({ "text": "b" }))), "b");
-    assert!(first_descriptor(&dir).is_some(), "no daemon was elected");
+    let descriptor = first_descriptor(&dir).expect("daemon descriptor");
     assert_eq!(transcript_initialize_count(&transcript), 1);
+    let endpoint = descriptor["endpoint"].as_str().expect("daemon endpoint");
+    let token = descriptor["token"].as_str().expect("daemon bearer");
+    let url = format!("http://{endpoint}{}", conduit_lib::daemon::TOPOLOGY_PATH);
+    assert!(
+        matches!(ureq::get(&url).call(), Err(ureq::Error::Status(401, _))),
+        "topology probe must require the private bearer"
+    );
+    let topology = json_body(
+        ureq::get(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .timeout(Duration::from_secs(10))
+            .call()
+            .expect("authenticated topology probe"),
+    );
+    assert_eq!(topology["role"], "daemon");
+    assert_eq!(topology["compat"], descriptor["compat"]);
+    assert_eq!(topology["pid"], descriptor["pid"]);
+    assert_eq!(topology["sessions"], 2);
+    assert_eq!(topology["ordinaryLaunches"], 1);
+    assert_eq!(topology["rootedLaunches"], 0);
+    assert_eq!(topology["launches"], 1);
 }
 
 #[test]
