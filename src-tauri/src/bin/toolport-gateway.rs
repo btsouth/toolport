@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize,
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 use conduit_lib::approval;
@@ -3737,6 +3738,42 @@ struct HttpCaller {
     /// native-search client the full catalog and a local model the meta-tools at the
     /// same time, and a mode switch after boot reaches both without a restart.
     discovery: Option<DiscoveryMode>,
+}
+
+/// An adapter's identity is asserted only on the private daemon endpoint, with
+/// the rendezvous bearer. Resolve its live stdio profile exactly as the legacy
+/// one-client gateway does, then use the HTTP bridge's per-request scope gate.
+fn resolve_adapter_caller(
+    reg: &Registry,
+    client_id: &str,
+    env_profile: Option<&str>,
+    root: Option<&str>,
+) -> (Option<std::collections::HashSet<String>>, HttpCaller) {
+    let profile = effective_profile(
+        reg,
+        Some(client_id),
+        &env_profile.map(str::to_string),
+        root,
+    )
+    .unwrap_or_else(|| reg.active_profile_id());
+    let allowed: std::collections::HashSet<String> = reg
+        .enabled_servers_for(&profile)
+        .iter()
+        .map(|server| server.id.clone())
+        .collect();
+    let mut scope: Vec<String> = allowed.iter().cloned().collect();
+    scope.sort();
+    (
+        Some(allowed),
+        HttpCaller {
+            audit_label: Some(client_id.to_string()),
+            session_owner: McpSessionOwner {
+                identity: format!("adapter:{client_id}"),
+                scope: Some(scope),
+            },
+            discovery: http_client_discovery_override(reg, client_id),
+        },
+    )
 }
 
 /// Resolve authorization, routing scope, audit attribution, and MCP session
@@ -8904,6 +8941,7 @@ fn build_router(
     reg: &Registry,
     profile: Option<&str>,
     http_mode: bool,
+    daemon_mode: bool,
     dirty: &Arc<AtomicU8>,
     server_handler: ServerRequestHandler,
     // The upstream client's project root for the ${ROOT} cwd token (issue #239),
@@ -8922,7 +8960,18 @@ fn build_router(
     // union of all their profiles (per-request filtering scopes each one down).
     // In stdio mode the process serves a single client, so connect only its
     // profile - that's what keeps stdio per-client scoping intact.
-    let enabled = if http_mode {
+    let enabled = if daemon_mode {
+        // Adapters may belong to any stdio profile, including one that did
+        // not start the daemon. The per-request allowed set narrows this union.
+        reg.servers
+            .iter()
+            .filter(|server| {
+                reg.profiles
+                    .iter()
+                    .any(|profile| reg.is_enabled(&profile.id, &server.id))
+            })
+            .collect()
+    } else if http_mode {
         reg.bridge_enabled_servers(profile)
     } else {
         match profile {
@@ -9226,6 +9275,159 @@ fn notify_tools_changed(
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
 ) {
     notify_list_changed(stdio, mcp_sessions, "notifications/tools/list_changed");
+}
+
+/// A shared downstream's catalog is visible to every session authorized for
+/// that server. Notify exactly the sessions whose visible catalog changed;
+/// sending this to the whole host leaks activity from other profiles.
+fn notify_tools_changed_for_catalog_diff(
+    stdio: &SessionState,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
+    previous: &[Value],
+    current: &[Value],
+    previous_router: &Router,
+    current_router: &Router,
+    reg: &Registry,
+) {
+    notify_list_changed(stdio, None, "notifications/tools/list_changed");
+    let Some(sessions) = mcp_sessions else {
+        return;
+    };
+    let owners = unique_prefix_owners(reg);
+    let sessions: Vec<Arc<SessionState>> = sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect();
+    let msg = json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" });
+    let mut changed_by_scope: HashMap<Option<Vec<String>>, bool> = HashMap::new();
+    for session in sessions {
+        if session.is_expired() || session.closed.load(Ordering::SeqCst) {
+            continue;
+        }
+        let scope = session.owner.as_ref().and_then(|owner| owner.scope.clone());
+        let changed = *changed_by_scope.entry(scope.clone()).or_insert_with(|| {
+            let Some(scope) = scope else {
+                return previous != current;
+            };
+            let allowed: std::collections::HashSet<String> = scope.into_iter().collect();
+            let before = scope_tools(previous, Some(&allowed), |name| {
+                owner_of_exposed_tool(Some(previous_router), &owners, name)
+            });
+            let after = scope_tools(current, Some(&allowed), |name| {
+                owner_of_exposed_tool(Some(current_router), &owners, name)
+            });
+            before != after
+        });
+        if !changed {
+            continue;
+        }
+        if let Some(json) = session.notification_json(&msg) {
+            if !session.push_message(json, None) {
+                eprintln!("toolport: MCP session could not take a notification; dropped");
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ChangedListKind {
+    Resources,
+    Prompts,
+}
+
+fn visible_changed_list(
+    router: &Router,
+    allowed: Option<&std::collections::HashSet<String>>,
+    kind: ChangedListKind,
+) -> Vec<Value> {
+    let in_scope = |server: Option<&str>| {
+        allowed.map_or(true, |set| {
+            server.is_some_and(|server| server_in_allowed_scope(server, set))
+        })
+    };
+    match kind {
+        ChangedListKind::Resources => {
+            let mut resources = router.aggregated_resources();
+            resources.retain(|resource| {
+                in_scope(
+                    resource["uri"]
+                        .as_str()
+                        .and_then(|uri| router.resource_server(uri)),
+                )
+            });
+            let mut templates = router.aggregated_resource_templates();
+            templates.retain(|template| {
+                in_scope(
+                    template["uriTemplate"]
+                        .as_str()
+                        .and_then(|uri| router.resource_template_server(uri)),
+                )
+            });
+            resources.extend(templates);
+            resources
+        }
+        ChangedListKind::Prompts => {
+            let mut prompts = router.aggregated_prompts();
+            prompts.retain(|prompt| {
+                in_scope(
+                    prompt["name"]
+                        .as_str()
+                        .and_then(|name| router.prompt_server(name)),
+                )
+            });
+            prompts
+        }
+    }
+}
+
+fn notify_list_changed_for_router_diff(
+    stdio: &SessionState,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
+    previous: &Router,
+    current: &Router,
+    kind: ChangedListKind,
+) {
+    let method = match kind {
+        ChangedListKind::Resources => "notifications/resources/list_changed",
+        ChangedListKind::Prompts => "notifications/prompts/list_changed",
+    };
+    notify_list_changed(stdio, None, method);
+    let Some(sessions) = mcp_sessions else {
+        return;
+    };
+    let sessions: Vec<Arc<SessionState>> = sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect();
+    let msg = json!({ "jsonrpc": "2.0", "method": method });
+    let mut changed_by_scope: HashMap<Option<Vec<String>>, bool> = HashMap::new();
+    for session in sessions {
+        if session.is_expired() || session.closed.load(Ordering::SeqCst) {
+            continue;
+        }
+        let scope = session.owner.as_ref().and_then(|owner| owner.scope.clone());
+        let changed = *changed_by_scope.entry(scope.clone()).or_insert_with(|| {
+            let allowed = scope.map(|scope| {
+                scope
+                    .into_iter()
+                    .collect::<std::collections::HashSet<String>>()
+            });
+            visible_changed_list(previous, allowed.as_ref(), kind)
+                != visible_changed_list(current, allowed.as_ref(), kind)
+        });
+        if !changed {
+            continue;
+        }
+        if let Some(json) = session.notification_json(&msg) {
+            if !session.push_message(json, None) {
+                eprintln!("toolport: MCP session could not take a notification; dropped");
+            }
+        }
+    }
 }
 
 /// How long a server->client request waits for the stdio handshake to finish
@@ -10365,7 +10567,15 @@ impl HostState {
         stdio: &SessionState,
         mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
         profile: Option<&str>,
+        scope_diff_only: bool,
     ) {
+        let previous_catalog = scope_diff_only.then(|| {
+            cached_tools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tools
+                .clone()
+        });
         if router_is_fail_closed(router) {
             clear_catalog_for_fail_closed(cached_tools, profile);
             notify_tools_changed(stdio, mcp_sessions);
@@ -10406,7 +10616,35 @@ impl HostState {
             ));
             save_tool_cache(&tools, profile);
         }
-        notify_tools_changed(stdio, mcp_sessions);
+        if let (Some(previous), Some(previous_router)) =
+            (previous_catalog.as_deref(), previous_router)
+        {
+            let current = cached_tools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tools
+                .clone();
+            let current_router = router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let reg = self
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            notify_tools_changed_for_catalog_diff(
+                stdio,
+                mcp_sessions,
+                previous,
+                &current,
+                previous_router,
+                &current_router,
+                &reg,
+            );
+        } else {
+            notify_tools_changed(stdio, mcp_sessions);
+        }
     }
 }
 
@@ -10507,8 +10745,9 @@ fn resolve_live_profile(
 /// when the client's reported project root matches a `folder_profiles` mapping (SOU-188),
 /// otherwise the client's configured profile from [`resolve_live_profile`]. Folder routing
 /// auto-scopes by working directory with no manual profile switch; an unmatched or unknown
-/// root leaves the configured behavior exactly as before. stdio-only for now (the root comes
-/// from the single upstream client's MCP `roots`); the HTTP bridge always passes `root: None`.
+/// root leaves the configured behavior exactly as before. The standalone stdio gateway
+/// uses its one upstream client's MCP roots; daemon adapter requests use that adapter's
+/// session root. The public HTTP bridge passes `root: None`.
 fn effective_profile(
     reg: &Registry,
     client_id: Option<&str>,
@@ -10826,6 +11065,7 @@ fn watch_tick(
             &new_reg,
             resolved.as_deref(),
             http_mode,
+            host.daemon_mode.load(Ordering::SeqCst),
             downstream_dirty,
             Arc::clone(server_handler),
             root.as_deref(),
@@ -10855,6 +11095,7 @@ fn watch_tick(
             stdio,
             mcp_sessions,
             resolved.as_deref(),
+            false,
         );
         let fmt_profile = |p: &Option<String>| match p {
             Some(name) => format!("'{name}'"),
@@ -10898,6 +11139,7 @@ fn watch_tick(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (**guard).clone()
             };
+            let previous_router = next.clone();
             if downstream_notified & downstream::change::TOOLS != 0 {
                 next.refresh_tools();
             } else {
@@ -10912,13 +11154,11 @@ fn watch_tick(
                 &tools,
                 cached_tools,
                 router,
-                // In-place refresh keeps the previous catalog per slot when a
-                // list implausibly shrinks, so the refreshed router routes what
-                // the cache advertises -- nothing to re-adopt.
-                None,
+                Some(&previous_router),
                 stdio,
                 mcp_sessions,
                 resolved.as_deref(),
+                true,
             );
             eprintln!("toolport: downstream tools/list_changed, refreshed + sent");
         }
@@ -10929,6 +11169,7 @@ fn watch_tick(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (**guard).clone()
             };
+            let previous = next.clone();
             // Also refreshes resource templates (MCP has no separate templates
             // list_changed; they ride on resources/list_changed).
             if downstream_notified & downstream::change::RESOURCES != 0 {
@@ -10936,10 +11177,17 @@ fn watch_tick(
             } else {
                 next.refresh_stale_resources();
             }
+            let current = Arc::new(next);
             *router
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-            notify_list_changed(stdio, mcp_sessions, "notifications/resources/list_changed");
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&current);
+            notify_list_changed_for_router_diff(
+                stdio,
+                mcp_sessions,
+                &previous,
+                &current,
+                ChangedListKind::Resources,
+            );
             eprintln!("toolport: downstream resources/list_changed, refreshed + sent");
         }
         if downstream_changed & downstream::change::PROMPTS != 0 {
@@ -10949,15 +11197,23 @@ fn watch_tick(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (**guard).clone()
             };
+            let previous = next.clone();
             if downstream_notified & downstream::change::PROMPTS != 0 {
                 next.refresh_prompts();
             } else {
                 next.refresh_stale_prompts();
             }
+            let current = Arc::new(next);
             *router
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-            notify_list_changed(stdio, mcp_sessions, "notifications/prompts/list_changed");
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&current);
+            notify_list_changed_for_router_diff(
+                stdio,
+                mcp_sessions,
+                &previous,
+                &current,
+                ChangedListKind::Prompts,
+            );
             eprintln!("toolport: downstream prompts/list_changed, refreshed + sent");
         }
     }
@@ -11607,13 +11863,19 @@ struct SessionState {
     upstream_pending: Mutex<HashMap<String, std::sync::mpsc::Sender<Value>>>,
     next_upstream_id: AtomicI64,
     /// The upstream client's project root for the `${ROOT}` cwd token (issue #239),
-    /// decoded from its first declared root. `None` until roots are fetched or if the
-    /// client declares none, in which case `${ROOT}` servers use the gateway cwd.
+    /// decoded from its first declared root. HTTP adapter sessions start with the
+    /// adapter's cwd and update this field after `roots/list`; a standalone stdio
+    /// session starts empty until its own root refresh resolves the fallback.
     ///
     /// An `Arc` inside the session so the registry watcher can hold the root alone
     /// (it predates the session and only needs this field) instead of the whole
-    /// session. stdio-only; always `None` for HTTP sessions.
+    /// session.
     client_root: Arc<Mutex<Option<String>>>,
+    /// The adapter's cwd, retained when a later roots/list reports no roots.
+    /// The daemon's cwd can belong to a different client process.
+    client_cwd: Mutex<Option<String>>,
+    client_root_override: Mutex<Option<String>>,
+    root_refreshing: AtomicBool,
     /// The stdio client's progress hand-off, created on first use: one writer
     /// thread owns the blocking write to this session's stdout, fed by a bounded
     /// queue. Delivery runs on the downstream drain thread, which must never block.
@@ -11690,6 +11952,9 @@ impl SessionState {
             upstream_pending: Mutex::new(HashMap::new()),
             next_upstream_id: AtomicI64::new(1),
             client_root: Arc::new(Mutex::new(None)),
+            client_cwd: Mutex::new(None),
+            client_root_override: Mutex::new(None),
+            root_refreshing: AtomicBool::new(false),
             stdio_progress: OnceLock::new(),
             stdio_client_ready: AtomicBool::new(false),
             stdio_responded: AtomicBool::new(false),
@@ -12729,6 +12994,7 @@ fn rebuild_router_for_root(state: &GatewayState) {
         &reg,
         profile.as_deref(),
         state.http,
+        state.daemon_mode.load(Ordering::SeqCst),
         &state.downstream_dirty,
         Arc::clone(&state.server_handler),
         root.as_deref(),
@@ -12751,6 +13017,7 @@ fn rebuild_router_for_root(state: &GatewayState) {
         &state.stdio_upstream,
         Some(&state.mcp_sessions),
         profile.as_deref(),
+        false,
     );
     glog(&format!(
         "toolport: ${{ROOT}} rebuild (root={root:?}, {} tools)",
@@ -12879,13 +13146,95 @@ fn refresh_client_root(state: &GatewayState) {
     }
 }
 
+/// Ask one HTTP adapter's client for its current roots after the handshake.
+/// The request travels over that session's SSE stream and its answer returns on
+/// the same session, so another adapter cannot supply this client's root.
+fn refresh_http_session_root(state: &GatewayState) {
+    if !state.daemon_mode.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(sid) = active_mcp_session() else {
+        return;
+    };
+    let session = state
+        .mcp_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&sid)
+        .cloned();
+    let Some(session) = session else {
+        return;
+    };
+    if !session
+        .owner
+        .as_ref()
+        .is_some_and(|owner| owner.identity.starts_with("adapter:"))
+    {
+        return;
+    }
+    let supported = session
+        .client_upstream
+        .lock()
+        .map(|caps| caps.roots.supported)
+        .unwrap_or(false);
+    if !supported || session.root_refreshing.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let result = session.call("roots/list", json!({}));
+        match result {
+            Ok(result) => {
+                let roots = result
+                    .get("roots")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let declared = roots
+                    .first()
+                    .and_then(|root| root.get("uri"))
+                    .and_then(Value::as_str)
+                    .and_then(downstream::file_uri_to_path);
+                if let Ok(mut caps) = session.client_upstream.lock() {
+                    caps.roots.roots = roots;
+                }
+                let fallback = session
+                    .client_cwd
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let override_root = session
+                    .client_root_override
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                *session
+                    .client_root
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    override_root.or(declared).or(fallback);
+            }
+            Err(error) => glog(&format!("toolport: HTTP roots/list failed: {error}")),
+        }
+        session.root_refreshing.store(false, Ordering::SeqCst);
+    });
+}
+
 fn handle_client_notification(state: &GatewayState, req: &Value) -> bool {
     match req.get("method").and_then(|m| m.as_str()) {
+        Some("notifications/initialized") if state.http => {
+            refresh_http_session_root(state);
+            false
+        }
         Some("notifications/roots/list_changed") => {
-            // Re-place ${ROOT} servers if the client's project root changed. Off the
-            // request thread so the roots/list round-trip + rebuild don't block it.
-            let st = state.clone();
-            std::thread::spawn(move || refresh_client_root(&st));
+            // Refresh this client's root off-thread. Standalone stdio also
+            // re-places its ${ROOT} servers; the daemon will use the session
+            // root for launch sharding once P3.2 wires the slot pool.
+            if state.http {
+                refresh_http_session_root(state);
+            } else {
+                let st = state.clone();
+                std::thread::spawn(move || refresh_client_root(&st));
+            }
             // Still tell downstream servers, for ones that consume roots themselves.
             let router = state
                 .router
@@ -13025,6 +13374,7 @@ fn process_request(
                 &reg,
                 profile_snapshot.as_deref(),
                 state.http,
+                state.daemon_mode.load(Ordering::SeqCst),
                 &state.downstream_dirty,
                 Arc::clone(&state.server_handler),
                 root.as_deref(),
@@ -13678,6 +14028,9 @@ struct HttpOut {
 #[derive(Clone, Copy, Default)]
 struct McpHttpRequestHeaders<'a> {
     session_id: Option<&'a str>,
+    adapter_cwd: Option<&'a str>,
+    adapter_root_override: Option<&'a str>,
+    adapter_resolved_root: Option<&'a str>,
     protocol_version: Option<&'a str>,
     method: Option<&'a str>,
     name: Option<&'a str>,
@@ -14156,6 +14509,36 @@ fn handle_mcp_http(
                     Err(e) => return e,
                 }
             };
+
+            if is_initialize
+                && state.daemon_mode.load(Ordering::SeqCst)
+                && session_owner.is_some_and(|owner| owner.identity.starts_with("adapter:"))
+            {
+                if let Some(sid) = session_id.as_deref() {
+                    if let Some(session) = state
+                        .mcp_sessions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(sid)
+                    {
+                        *session
+                            .client_cwd
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            headers.adapter_cwd.map(str::to_string);
+                        *session
+                            .client_root_override
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            headers.adapter_root_override.map(str::to_string);
+                        *session
+                            .client_root
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            headers.adapter_resolved_root.map(str::to_string);
+                    }
+                }
+            }
 
             if let Some(session_id) = session_id.as_deref() {
                 if is_initialize {
@@ -15123,16 +15506,16 @@ fn serve_daemon(state: GatewayState) -> ! {
             std::process::exit(1);
         }
     };
-    let (server, _ingress, _) = match bind_deadline_http_server(
-        ("127.0.0.1", 0u16),
-        HttpReadDeadlines::default(),
-    ) {
-        Ok(bound) => bound,
-        Err(error) => {
-            eprintln!("toolport-gateway --daemon: could not bind the internal endpoint: {error}");
-            std::process::exit(1);
-        }
-    };
+    let (server, _ingress, _) =
+        match bind_deadline_http_server(("127.0.0.1", 0u16), HttpReadDeadlines::default()) {
+            Ok(bound) => bound,
+            Err(error) => {
+                eprintln!(
+                    "toolport-gateway --daemon: could not bind the internal endpoint: {error}"
+                );
+                std::process::exit(1);
+            }
+        };
     let Some(addr) = server.server_addr().to_ip() else {
         eprintln!("toolport-gateway --daemon: the internal endpoint was not an IP socket");
         std::process::exit(1);
@@ -15626,6 +16009,104 @@ fn handle_connection(
         .find(|h| h.field.equiv("Authorization"))
         .map(|h| h.value.as_str().to_string());
     let provided_tok = provided.as_deref().and_then(parse_bearer);
+    let adapter_client_header = request.headers().iter().find(|h| {
+        h.field
+            .equiv(conduit_lib::stdio_adapter::ADAPTER_CLIENT_ID_HEADER)
+    });
+    let adapter_profile_header = request.headers().iter().find(|h| {
+        h.field
+            .equiv(conduit_lib::stdio_adapter::ADAPTER_PROFILE_HEADER)
+    });
+    let adapter_cwd_header = request.headers().iter().find(|h| {
+        h.field
+            .equiv(conduit_lib::stdio_adapter::ADAPTER_CWD_HEADER)
+    });
+    let adapter_root_override_header = request.headers().iter().find(|h| {
+        h.field
+            .equiv(conduit_lib::stdio_adapter::ADAPTER_ROOT_OVERRIDE_HEADER)
+    });
+    let adapter_declared_root_header = request.headers().iter().find(|h| {
+        h.field
+            .equiv(conduit_lib::stdio_adapter::ADAPTER_DECLARED_ROOT_HEADER)
+    });
+    let adapter_header_value = |value: &str| {
+        (value.len() <= 512 && !value.trim().is_empty() && !value.chars().any(char::is_control))
+            .then(|| value.to_string())
+    };
+    let adapter_client_id =
+        adapter_client_header.and_then(|h| adapter_header_value(h.value.as_str()));
+    let adapter_profile =
+        adapter_profile_header.and_then(|h| adapter_header_value(h.value.as_str()));
+    let decode_adapter_path = |value: &str| {
+        (value.len() <= 8192)
+            .then(|| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(value)
+                    .ok()
+            })
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .filter(|path| path.len() <= 4096 && !path.trim().is_empty())
+    };
+    let adapter_cwd = adapter_cwd_header
+        .and_then(|h| decode_adapter_path(h.value.as_str()))
+        .filter(|path| std::path::Path::new(path).is_absolute());
+    let adapter_root_override =
+        adapter_root_override_header.and_then(|h| decode_adapter_path(h.value.as_str()));
+    let adapter_declared_root =
+        adapter_declared_root_header.and_then(|h| decode_adapter_path(h.value.as_str()));
+    let has_adapter_claim = adapter_client_header.is_some()
+        || adapter_profile_header.is_some()
+        || adapter_cwd_header.is_some()
+        || adapter_root_override_header.is_some()
+        || adapter_declared_root_header.is_some();
+    let valid_adapter_claim = adapter_client_id.is_some()
+        && (adapter_profile_header.is_none() || adapter_profile.is_some())
+        && (adapter_cwd_header.is_none() || adapter_cwd.is_some())
+        && (adapter_root_override_header.is_none() || adapter_root_override.is_some())
+        && (adapter_declared_root_header.is_none() || adapter_declared_root.is_some());
+    let private_daemon_bearer = state.daemon_mode.load(Ordering::SeqCst)
+        && token
+            .as_deref()
+            .zip(provided_tok)
+            .is_some_and(|(expected, actual)| ct_eq(expected.as_bytes(), actual.as_bytes()));
+    // Resolve an existing adapter session's own root before selecting its scope.
+    // Its declared MCP root can differ from the adapter process cwd. Read only a
+    // session owned by this asserted client id; an unknown or foreign id falls
+    // back to the adapter's launch context and is rejected by the session gate.
+    let adapter_session_root = if private_daemon_bearer && valid_adapter_claim {
+        session_hdr
+            .as_deref()
+            .zip(adapter_client_id.as_deref())
+            .and_then(|(sid, client_id)| {
+                let expected = format!("adapter:{client_id}");
+                state
+                    .mcp_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(sid)
+                    .filter(|session| {
+                        session
+                            .owner
+                            .as_ref()
+                            .is_some_and(|owner| owner.identity == expected)
+                    })
+                    .and_then(|session| {
+                        session
+                            .client_root
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone()
+                    })
+            })
+    } else {
+        None
+    };
+    let adapter_root = adapter_session_root
+        .as_deref()
+        .or(adapter_root_override.as_deref())
+        .or(adapter_declared_root.as_deref())
+        .or(adapter_cwd.as_deref());
     let mut caller: Option<HttpCaller> = None;
     let scope: Option<Option<std::collections::HashSet<String>>> = if method == "OPTIONS" {
         Some(None)
@@ -15642,13 +16123,24 @@ fn handle_connection(
         let registry_loaded = state.registry_trusted.load(Ordering::SeqCst);
         // Resolve authorization, routing scope, audit attribution, and MCP
         // session ownership from one token lookup and one effective allow-set.
-        match resolve_http_caller(
-            &reg,
-            token.as_deref(),
-            provided_tok,
-            allow_insecure_open,
-            registry_loaded,
-        ) {
+        let resolved = if has_adapter_claim {
+            if private_daemon_bearer && valid_adapter_claim {
+                adapter_client_id.as_deref().map(|client_id| {
+                    resolve_adapter_caller(&reg, client_id, adapter_profile.as_deref(), adapter_root)
+                })
+            } else {
+                None
+            }
+        } else {
+            resolve_http_caller(
+                &reg,
+                token.as_deref(),
+                provided_tok,
+                allow_insecure_open,
+                registry_loaded,
+            )
+        };
+        match resolved {
             Some((allowed, resolved_caller)) => {
                 caller = Some(resolved_caller);
                 Some(allowed)
@@ -15681,6 +16173,21 @@ fn handle_connection(
                         &body,
                         McpHttpRequestHeaders {
                             session_id: session_hdr.as_deref(),
+                            adapter_cwd: if private_daemon_bearer && valid_adapter_claim {
+                                adapter_cwd.as_deref()
+                            } else {
+                                None
+                            },
+                            adapter_root_override: if private_daemon_bearer && valid_adapter_claim {
+                                adapter_root_override.as_deref()
+                            } else {
+                                None
+                            },
+                            adapter_resolved_root: if private_daemon_bearer && valid_adapter_claim {
+                                adapter_root
+                            } else {
+                                None
+                            },
                             protocol_version: protocol_version_hdr.as_deref(),
                             method: mcp_method_hdr.as_deref(),
                             name: mcp_name_hdr.as_deref(),
@@ -16288,6 +16795,7 @@ fn main() {
                 &reg,
                 p.as_deref(),
                 http_mode,
+                daemon_mode,
                 &downstream_dirty,
                 server_handler,
                 root.as_deref(),
@@ -20578,10 +21086,11 @@ mod tests {
 
         host.set_discovery_mode(DiscoveryMode::Lazy);
         *state.registry.lock().unwrap() = enabled;
-        let http_names: std::collections::HashSet<String> = http_tool_defs(&state, None, DiscoveryMode::Lazy)
-            .iter()
-            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
-            .collect();
+        let http_names: std::collections::HashSet<String> =
+            http_tool_defs(&state, None, DiscoveryMode::Lazy)
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect();
         assert!(http_names.contains("toolport_save_routine"));
         assert!(http_names.contains("toolport_list_routines"));
         assert!(http_names.contains("toolport_run_routine"));
@@ -20717,9 +21226,12 @@ mod tests {
             flattened.contains(&cjk_alias.as_str()),
             "non-ASCII name must fall back to the id tail: {flattened:?}"
         );
-        assert!(flattened
-            .iter()
-            .all(|name| name.len() <= ROUTINE_TOOL_NAME_MAX_CHARS - ROUTINE_CLIENT_PREFIX_HEADROOM));
+        assert!(
+            flattened
+                .iter()
+                .all(|name| name.len()
+                    <= ROUTINE_TOOL_NAME_MAX_CHARS - ROUTINE_CLIENT_PREFIX_HEADROOM)
+        );
         assert!(flattened.iter().all(|name| !name.contains("__")));
         assert_ne!(
             routine_tool_name(&punctuation),
@@ -23837,6 +24349,9 @@ mod tests {
     ) -> McpHttpRequestHeaders<'a> {
         McpHttpRequestHeaders {
             session_id,
+            adapter_cwd: None,
+            adapter_root_override: None,
+            adapter_resolved_root: None,
             protocol_version: Some(MODERN_PROTOCOL_VERSION),
             method: Some(method),
             name,
@@ -25241,6 +25756,178 @@ mod tests {
         assert_eq!(
             session.outbound.lock().unwrap().len(),
             MCP_SESSION_OUTBOUND_MAX
+        );
+    }
+
+    #[test]
+    fn http_roots_refresh_updates_only_its_session_and_keeps_adapter_cwd_fallback() {
+        let state = http_state(false);
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        let owner_a = McpSessionOwner {
+            identity: "adapter:a".to_string(),
+            scope: None,
+        };
+        let owner_b = McpSessionOwner {
+            identity: "adapter:b".to_string(),
+            scope: None,
+        };
+        let sid_a =
+            mint_mcp_session(&state, Some(&owner_a)).unwrap_or_else(|_| panic!("session A"));
+        let sid_b =
+            mint_mcp_session(&state, Some(&owner_b)).unwrap_or_else(|_| panic!("session B"));
+        let sessions = state.mcp_sessions.lock().unwrap();
+        let a = Arc::clone(sessions.get(&sid_a).unwrap());
+        let b = Arc::clone(sessions.get(&sid_b).unwrap());
+        drop(sessions);
+        *a.client_cwd.lock().unwrap() = Some("/adapter-a".to_string());
+        *a.client_root.lock().unwrap() = Some("/adapter-a".to_string());
+        *b.client_root.lock().unwrap() = Some("/adapter-b".to_string());
+        a.client_upstream.lock().unwrap().roots.supported = true;
+
+        let project = std::env::temp_dir().join("toolport-http-roots-project-a");
+        let answer = |root: Option<&std::path::Path>| {
+            {
+                let _active = McpSessionGuard::enter(Some(sid_a.clone()));
+                refresh_http_session_root(&state);
+            }
+            let request = (0..500)
+                .find_map(|_| {
+                    let frame = a.outbound.lock().unwrap().pop_front();
+                    if frame.is_none() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    frame
+                })
+                .expect("roots/list queued for adapter A");
+            let request: Value = serde_json::from_str(&request.json).unwrap();
+            assert_eq!(request["method"], "roots/list");
+            let roots = root
+                .map(|path| {
+                    vec![json!({
+                        "uri": url::Url::from_file_path(path).expect("file URI").to_string(),
+                        "name": "project"
+                    })]
+                })
+                .unwrap_or_default();
+            assert!(a.try_deliver(&json!({
+                "jsonrpc": "2.0", "id": request["id"],
+                "result": {"roots": roots}
+            })));
+            for _ in 0..500 {
+                if !a.root_refreshing.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("roots refresh did not finish");
+        };
+        answer(Some(&project));
+        assert_eq!(
+            a.client_root.lock().unwrap().as_deref(),
+            project.to_str()
+        );
+        assert_eq!(b.client_root.lock().unwrap().as_deref(), Some("/adapter-b"));
+        answer(None);
+        assert_eq!(a.client_root.lock().unwrap().as_deref(), Some("/adapter-a"));
+        *a.client_root_override.lock().unwrap() = Some("/operator-root".to_string());
+        answer(Some(&project));
+        assert_eq!(
+            a.client_root.lock().unwrap().as_deref(),
+            Some("/operator-root")
+        );
+        state.daemon_mode.store(false, Ordering::SeqCst);
+        {
+            let _active = McpSessionGuard::enter(Some(sid_a));
+            refresh_http_session_root(&state);
+        }
+        assert!(
+            a.outbound.lock().unwrap().is_empty(),
+            "public HTTP mode must not query roots"
+        );
+    }
+
+    #[test]
+    fn adapter_initialize_seeds_its_session_root_without_changing_other_sessions() {
+        let state = http_state(false);
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        let caller = test_caller("adapter:root-test", None);
+        let initialize = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {} }
+        })
+        .to_string();
+        let init = |cwd: &str, root_override: Option<&str>| {
+            let out = handle_http_with_headers(
+                &state,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                "POST",
+                "/mcp",
+                &initialize,
+                McpHttpRequestHeaders {
+                    adapter_cwd: Some(cwd),
+                    adapter_root_override: root_override,
+                    adapter_resolved_root: root_override.or(Some(cwd)),
+                    ..McpHttpRequestHeaders::default()
+                },
+                None,
+                Some(&caller),
+            );
+            assert_eq!(out.status, 200, "body={}", out.body);
+            mcp_session_of(&out)
+        };
+        let sid_a = init("/adapter-a", None);
+        let sid_b = init("/adapter-b", Some("/operator-b"));
+        let sessions = state.mcp_sessions.lock().unwrap();
+        assert_eq!(
+            sessions
+                .get(&sid_a)
+                .unwrap()
+                .client_root
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("/adapter-a")
+        );
+        assert_eq!(
+            sessions
+                .get(&sid_b)
+                .unwrap()
+                .client_root
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("/operator-b")
+        );
+        drop(sessions);
+
+        // An existing adapter session can have learned a root after initialize.
+        // Its next initialize must keep the root that selected its owner scope,
+        // even when the adapter has cleared its declared-root header meanwhile.
+        let out = handle_http_with_headers(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &initialize,
+            McpHttpRequestHeaders {
+                session_id: Some(&sid_a),
+                adapter_cwd: Some("/adapter-a"),
+                adapter_resolved_root: Some("/learned-project"),
+                ..McpHttpRequestHeaders::default()
+            },
+            None,
+            Some(&caller),
+        );
+        assert_eq!(out.status, 200, "body={}", out.body);
+        assert_eq!(
+            state.mcp_sessions.lock().unwrap()[&sid_a]
+                .client_root
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("/learned-project")
         );
     }
 
@@ -28807,6 +29494,7 @@ mod tests {
             &stdio,
             None,
             None,
+            false,
         );
 
         assert!(
@@ -30693,8 +31381,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _data = conduit_lib::registry::DataDirOverride::set(&dir);
 
-        let compat =
-            conduit_lib::topology::CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string());
+        let compat = conduit_lib::topology::CompatKey::new(
+            env!("CARGO_PKG_VERSION"),
+            dir.display().to_string(),
+        );
         let identity: conduit_lib::daemon::DaemonIdentity =
             serde_json::from_str(&daemon_identity_json()).unwrap();
         assert!(identity.is_compatible_with(&compat));

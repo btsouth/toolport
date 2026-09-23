@@ -12,9 +12,12 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+static NEXT_SCRATCH_DIR_ID: AtomicU64 = AtomicU64::new(0);
 
 struct Harness {
     child: Child,
@@ -28,12 +31,13 @@ struct Harness {
 impl Harness {
     fn start() -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "toolport-stdio-adapter-{}-{}",
+            "toolport-stdio-adapter-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            NEXT_SCRATCH_DIR_ID.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create data dir");

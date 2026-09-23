@@ -18,11 +18,14 @@
 //! a cancellation ahead of whatever is queued behind it (MCP cancellation is
 //! best-effort, so one that loses the race simply does not apply).
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+
+use base64::Engine as _;
 
 use crate::daemon::{DaemonDescriptor, Rendezvous};
 use crate::registry;
@@ -30,6 +33,15 @@ use crate::topology::CompatKey;
 
 /// The flag that selects the adapter role instead of the in-process gateway.
 pub const STDIO_ADAPTER_FLAG: &str = "--stdio-adapter";
+/// Internal daemon headers. The daemon accepts these only with its private
+/// rendezvous bearer; the public HTTP bridge never trusts them.
+pub const ADAPTER_CLIENT_ID_HEADER: &str = "Toolport-Adapter-Client-Id";
+pub const ADAPTER_PROFILE_HEADER: &str = "Toolport-Adapter-Profile";
+/// Path values are URL-safe base64 so Unicode and platform separators survive
+/// HTTP header transport. The daemon's cwd belongs to the first adapter only.
+pub const ADAPTER_CWD_HEADER: &str = "Toolport-Adapter-Cwd";
+pub const ADAPTER_ROOT_OVERRIDE_HEADER: &str = "Toolport-Adapter-Root-Override";
+pub const ADAPTER_DECLARED_ROOT_HEADER: &str = "Toolport-Adapter-Declared-Root";
 /// Same per-frame bound the in-process stdio gateway applies to one client frame.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// A single request may legitimately run long (a slow downstream call), so the
@@ -123,10 +135,30 @@ struct Session {
     handshake_initialize: Mutex<Option<String>>,
     handshake_initialized: Mutex<Option<String>>,
     stdout: Mutex<std::io::Stdout>,
+    client_id: String,
+    env_profile: Option<String>,
+    cwd: Option<String>,
+    root_override: Option<String>,
+    /// Roots learned from this client's reply to the daemon's roots/list.
+    declared_root: Mutex<Option<String>>,
+    roots_request_ids: Mutex<HashSet<String>>,
 }
 
 impl Session {
     fn new(rendezvous: Rendezvous, descriptor: DaemonDescriptor) -> Self {
+        let client_id =
+            crate::brand::env_var(crate::brand::CLIENT_ID, crate::brand::CLIENT_ID_LEGACY)
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| format!("adapter-pid-{}", std::process::id()));
+        let env_profile =
+            crate::brand::env_var(crate::brand::PROFILE, crate::brand::PROFILE_LEGACY)
+                .filter(|profile| !profile.trim().is_empty());
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|path| path.to_str().map(str::to_string));
+        let root_override = crate::brand::env_var("TOOLPORT_ROOT", "CONDUIT_ROOT")
+            .map(|root| root.trim().to_string())
+            .filter(|root| !root.is_empty());
         Self {
             rendezvous,
             descriptor: Mutex::new(descriptor),
@@ -136,7 +168,96 @@ impl Session {
             handshake_initialize: Mutex::new(None),
             handshake_initialized: Mutex::new(None),
             stdout: Mutex::new(std::io::stdout()),
+            client_id,
+            env_profile,
+            cwd,
+            root_override,
+            declared_root: Mutex::new(None),
+            roots_request_ids: Mutex::new(HashSet::new()),
         }
+    }
+
+    fn with_identity(&self, request: ureq::Request) -> ureq::Request {
+        let request = request.set(ADAPTER_CLIENT_ID_HEADER, &self.client_id);
+        let request = match &self.env_profile {
+            Some(profile) => request.set(ADAPTER_PROFILE_HEADER, profile),
+            None => request,
+        };
+        let request = match &self.cwd {
+            Some(cwd) => request.set(
+                ADAPTER_CWD_HEADER,
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cwd.as_bytes()),
+            ),
+            None => request,
+        };
+        let request = match &self.root_override {
+            Some(root) => request.set(
+                ADAPTER_ROOT_OVERRIDE_HEADER,
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(root.as_bytes()),
+            ),
+            None => request,
+        };
+        let declared_root = self
+            .declared_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match declared_root {
+            Some(root) => request.set(
+                ADAPTER_DECLARED_ROOT_HEADER,
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(root.as_bytes()),
+            ),
+            None => request,
+        }
+    }
+
+    fn remember_roots_request(&self, body: &str) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return;
+        };
+        if value["method"] == "roots/list" {
+            if let Some(id) = value.get("id") {
+                let mut pending = self
+                    .roots_request_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if pending.len() < 128 {
+                    pending.insert(id.to_string());
+                }
+            }
+        }
+    }
+
+    fn remember_roots_response(&self, value: &serde_json::Value) {
+        // Client requests and daemon requests use independent id sequences.
+        // A client request with the same id must not consume the pending roots
+        // response before the client answers it.
+        if value.get("method").is_some()
+            || (value.get("result").is_none() && value.get("error").is_none())
+        {
+            return;
+        }
+        let Some(id) = value.get("id") else {
+            return;
+        };
+        let mut pending = self
+            .roots_request_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !pending.remove(&id.to_string()) {
+            return;
+        }
+        let Some(roots) = value["result"]["roots"].as_array() else {
+            return;
+        };
+        let root = roots
+            .first()
+            .and_then(|root| root["uri"].as_str())
+            .and_then(crate::downstream::file_uri_to_path);
+        *self
+            .declared_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = root;
     }
 
     /// The daemon this adapter is currently talking to.
@@ -171,6 +292,14 @@ impl Session {
         };
         match value.get("method").and_then(|method| method.as_str()) {
             Some("initialize") => {
+                self.roots_request_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+                *self
+                    .declared_root
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 if let Ok(mut initialize) = self.handshake_initialize.lock() {
                     *initialize = Some(body.to_string());
                 }
@@ -200,11 +329,13 @@ impl Session {
     fn post(&self, body: &str, forward: bool) -> Result<(), String> {
         let descriptor = self.descriptor();
         let url = format!("http://{}/mcp", descriptor.endpoint);
-        let mut request = ureq::post(&url)
-            .set("Authorization", &format!("Bearer {}", descriptor.token))
-            .set("Content-Type", "application/json")
-            .set("Accept", "application/json, text/event-stream")
-            .timeout(REQUEST_TIMEOUT);
+        let mut request = self.with_identity(
+            ureq::post(&url)
+                .set("Authorization", &format!("Bearer {}", descriptor.token))
+                .set("Content-Type", "application/json")
+                .set("Accept", "application/json, text/event-stream")
+                .timeout(REQUEST_TIMEOUT),
+        );
         if let Some(session) = self.session_id() {
             request = request.set("Mcp-Session-Id", &session);
         }
@@ -214,6 +345,13 @@ impl Session {
             // recovery trigger; the body is the error the caller should see.
             Err(ureq::Error::Status(code, response)) => {
                 let body = response.into_string().unwrap_or_default();
+                // A live profile switch changes the session's bound scope. The
+                // daemon then rejects its old id exactly like an expired
+                // session. Fail this call once, and replay the handshake on the
+                // next request; never replay a call that may have executed.
+                if code == 404 && body.contains("unknown or expired Mcp-Session-Id") {
+                    self.stale.store(true, Ordering::SeqCst);
+                }
                 return Err(format!(
                     "the host daemon answered HTTP {code}: {}",
                     body.trim()
@@ -311,10 +449,13 @@ impl Session {
         };
         let descriptor = self.descriptor();
         let url = format!("http://{}/mcp", descriptor.endpoint);
-        let _ = ureq::delete(&url)
-            .set("Authorization", &format!("Bearer {}", descriptor.token))
-            .set("Mcp-Session-Id", &session)
-            .timeout(Duration::from_secs(5))
+        let _ = self
+            .with_identity(
+                ureq::delete(&url)
+                    .set("Authorization", &format!("Bearer {}", descriptor.token))
+                    .set("Mcp-Session-Id", &session)
+                    .timeout(Duration::from_secs(5)),
+            )
             .call();
     }
 }
@@ -493,6 +634,7 @@ fn proxy_stdio(rendezvous: Rendezvous, descriptor: DaemonDescriptor) -> Result<(
                 continue;
             }
         };
+        session.remember_roots_response(&request);
         let is_request = request.get("id").map(|id| !id.is_null()).unwrap_or(false);
         if is_request && session.session_id().is_some() {
             dispatcher.dispatch(trimmed.to_string());
@@ -531,11 +673,14 @@ fn spawn_listen_stream(session: Arc<Session>) {
         };
         let descriptor = session.descriptor();
         let url = format!("http://{}/mcp", descriptor.endpoint);
-        let response = ureq::get(&url)
-            .set("Authorization", &format!("Bearer {}", descriptor.token))
-            .set("Accept", "text/event-stream")
-            .set("Mcp-Session-Id", &session_id)
-            .timeout(Duration::from_secs(3600))
+        let response = session
+            .with_identity(
+                ureq::get(&url)
+                    .set("Authorization", &format!("Bearer {}", descriptor.token))
+                    .set("Accept", "text/event-stream")
+                    .set("Mcp-Session-Id", &session_id)
+                    .timeout(Duration::from_secs(3600)),
+            )
             .call();
         match response {
             Ok(response) => {
@@ -546,6 +691,7 @@ fn spawn_listen_stream(session: Arc<Session>) {
                     if let Some(data) = line.strip_prefix("data:") {
                         let data = data.trim();
                         if !data.is_empty() {
+                            session.remember_roots_request(data);
                             let _ = session.write_message(data);
                         }
                     }
@@ -664,6 +810,33 @@ mod tests {
         assert_eq!(
             read_bounded_line(&mut reader, 4).unwrap(),
             Some(ClientFrame::Line("ok".to_string()))
+        );
+    }
+
+    #[test]
+    fn client_request_id_does_not_consume_a_pending_roots_response() {
+        let data_dir = std::env::temp_dir();
+        let compat = CompatKey::new("test", data_dir.to_string_lossy());
+        let session = Session::new(
+            Rendezvous::new(&data_dir, compat.clone()),
+            DaemonDescriptor::new("127.0.0.1:1", "test-token", &compat),
+        );
+        let project = data_dir.join("toolport-roots-collision");
+        let uri = url::Url::from_file_path(&project)
+            .expect("native project URI")
+            .to_string();
+        session.remember_roots_request(r#"{"jsonrpc":"2.0","id":1,"method":"roots/list"}"#);
+        session.remember_roots_response(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}
+        }));
+        assert_eq!(session.roots_request_ids.lock().unwrap().len(), 1);
+        session.remember_roots_response(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": { "roots": [{ "uri": uri }] }
+        }));
+        assert!(session.roots_request_ids.lock().unwrap().is_empty());
+        assert_eq!(
+            *session.declared_root.lock().unwrap(),
+            crate::downstream::file_uri_to_path(&uri)
         );
     }
 
