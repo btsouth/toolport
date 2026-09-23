@@ -653,6 +653,16 @@ impl Router {
             .map(|(s, t)| (s.as_str(), t.as_str()))
     }
 
+    /// Re-index the same live downstream slots under one adapter profile's
+    /// original-tool allowlists. The shared HTTP router can keep its fail-closed
+    /// intersection while each daemon adapter sees only its own tool scope.
+    pub fn with_tool_allow(&self, allow: HashMap<String, HashSet<String>>) -> Self {
+        let mut view = self.clone();
+        view.policy.allow = allow;
+        view.rebuild_aggregation();
+        view
+    }
+
     /// Index one server's advertised tools/resources/templates/prompts into the
     /// exposed aggregation (names, routes, policy). Shared by `add` (a new
     /// server) and `rebuild_aggregation` (after a refresh). Within a server,
@@ -2816,6 +2826,31 @@ mod tests {
             .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, "postgres:add");
+    }
+
+    #[test]
+    fn profile_views_share_downstreams_but_reindex_distinct_tool_scopes() {
+        let mut base = Router::with_policy(ToolPolicy {
+            allow: HashMap::from([("shared".to_string(), HashSet::new())]),
+            ..ToolPolicy::default()
+        });
+        base.add(mock_server("shared"));
+        assert!(base.aggregated_tools().is_empty());
+
+        let echo = base.with_tool_allow(HashMap::from([(
+            "shared".to_string(),
+            HashSet::from(["echo".to_string()]),
+        )]));
+        let add = base.with_tool_allow(HashMap::from([(
+            "shared".to_string(),
+            HashSet::from(["add".to_string()]),
+        )]));
+        assert!(Arc::ptr_eq(&base.servers[0], &echo.servers[0]));
+        assert!(Arc::ptr_eq(&echo.servers[0], &add.servers[0]));
+        assert!(echo.route_of("shared__echo").is_some());
+        assert!(echo.route_of("shared__add").is_none());
+        assert!(add.route_of("shared__echo").is_none());
+        assert!(add.route_of("shared__add").is_some());
     }
 
     #[test]

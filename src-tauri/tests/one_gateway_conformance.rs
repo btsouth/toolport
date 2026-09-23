@@ -1454,6 +1454,189 @@ fn matrix_routing_live_profile_change_reopens_the_adapter_session() {
 }
 
 #[test]
+fn matrix_routing_profile_tool_scopes_are_independent_on_one_shared_server() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("tool-scope");
+    let transcript = dir.join("shared.jsonl");
+    let mut echo_only = profile("echo-only", &["shared"]);
+    echo_only
+        .tool_scope
+        .insert("shared".to_string(), vec!["echo".to_string()]);
+    let mut add_only = profile("add-only", &["shared"]);
+    add_only
+        .tool_scope
+        .insert("shared".to_string(), vec!["add".to_string()]);
+    write_registry(
+        &dir,
+        vec![mock_server_entry("shared", &transcript, None)],
+        vec![echo_only, add_only],
+    );
+
+    let mut echo = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("echo-only"),
+            ..AdapterOptions::default()
+        },
+    );
+    let mut add = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("add-only"),
+            ..AdapterOptions::default()
+        },
+    );
+    echo.initialize("matrix-tool-scope-echo");
+    add.initialize("matrix-tool-scope-add");
+    let echo_tool = echo.wait_for_tool("__echo", Duration::from_secs(30));
+    let add_tool = add.wait_for_tool("__add", Duration::from_secs(30));
+    assert!(!echo.tool_names().contains(&add_tool));
+    assert!(!add.tool_names().contains(&echo_tool));
+    assert_eq!(
+        text_of(&echo.call_tool(&echo_tool, json!({ "text": "yes" }))),
+        "yes"
+    );
+    assert!(add.call_tool(&add_tool, json!({ "a": 2, "b": 3 }))["isError"] != true);
+    assert_eq!(
+        echo.call_tool(&add_tool, json!({ "a": 2, "b": 3 }))["isError"],
+        true,
+        "a direct call must not bypass the profile's tool allowlist"
+    );
+    assert_eq!(transcript_initialize_count(&transcript), 1);
+}
+
+#[test]
+fn matrix_routing_live_tool_scope_change_reopens_the_adapter_session() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("live-tool-scope");
+    let path = dir.join("registry.json");
+    let transcript = dir.join("shared.jsonl");
+    let mut scoped = profile("scoped", &["shared"]);
+    scoped
+        .tool_scope
+        .insert("shared".to_string(), vec!["echo".to_string()]);
+    write_registry(
+        &dir,
+        vec![mock_server_entry("shared", &transcript, None)],
+        vec![scoped],
+    );
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("scoped"),
+            ..AdapterOptions::default()
+        },
+    );
+    client.initialize("matrix-live-tool-scope");
+    let echo = client.wait_for_tool("__echo", Duration::from_secs(30));
+
+    let mut reg = registry::load_from(&path).expect("load fixture registry");
+    reg.profiles[0]
+        .tool_scope
+        .insert("shared".to_string(), vec!["add".to_string()]);
+    registry::save_to(&path, &reg).expect("change tool scope");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = client.request("tools/list", json!({}));
+        if reply.get("error").is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "old tool scope was never invalidated"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let add = client.wait_for_tool("__add", Duration::from_secs(30));
+    assert!(!client.tool_names().contains(&echo));
+    assert_eq!(
+        client.call_tool(&echo, json!({ "text": "blocked" }))["isError"],
+        true
+    );
+    assert!(client.call_tool(&add, json!({ "a": 2, "b": 3 }))["isError"] != true);
+}
+
+#[test]
+fn matrix_routing_tool_change_notifies_only_profiles_that_can_see_it() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("tool-scope-notifications");
+    let transcript = dir.join("shared.jsonl");
+    let mut grow_profile = profile("grow-profile", &["shared"]);
+    grow_profile.tool_scope.insert(
+        "shared".to_string(),
+        vec!["grow".to_string(), "greet".to_string()],
+    );
+    let mut echo_profile = profile("echo-profile", &["shared"]);
+    echo_profile
+        .tool_scope
+        .insert("shared".to_string(), vec!["echo".to_string()]);
+    write_registry(
+        &dir,
+        vec![mock_server_entry("shared", &transcript, None)],
+        vec![grow_profile, echo_profile],
+    );
+    let mut grow = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("grow-profile"),
+            ..AdapterOptions::default()
+        },
+    );
+    let mut echo = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            profile: Some("echo-profile"),
+            ..AdapterOptions::default()
+        },
+    );
+    grow.initialize("matrix-grow-profile");
+    echo.initialize("matrix-echo-profile");
+    let grow_tool = grow.wait_for_tool("__grow", Duration::from_secs(30));
+    echo.wait_for_tool("__echo", Duration::from_secs(30));
+    for client in [&grow, &echo] {
+        while client.lines.try_recv().is_ok() {}
+    }
+
+    grow.call_tool(&grow_tool, json!({}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let line = grow
+            .lines
+            .recv_timeout(remaining.max(Duration::from_millis(1)))
+            .expect("grow profile did not receive tools/list_changed");
+        let message: Value = serde_json::from_str(&line).expect("valid notification");
+        if message["method"] == "notifications/tools/list_changed" {
+            break;
+        }
+    }
+    grow.wait_for_tool("__greet", Duration::from_secs(30));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(line) = echo.lines.recv_timeout(remaining) else {
+            break;
+        };
+        let message: Value = serde_json::from_str(&line).expect("valid notification");
+        assert_ne!(
+            message["method"], "notifications/tools/list_changed",
+            "the other tool profile received a tool catalog notification"
+        );
+    }
+    assert!(!echo
+        .tool_names()
+        .iter()
+        .any(|name| name.ends_with("__greet")));
+    assert_eq!(transcript_initialize_count(&transcript), 1);
+}
+
+#[test]
 fn matrix_routing_declared_root_selects_folder_profile() {
     let _guard = CASE_LOCK
         .lock()
@@ -1483,7 +1666,10 @@ fn matrix_routing_declared_root_selects_folder_profile() {
     });
     let reported_root = conduit_lib::downstream::file_uri_to_path(&file_uri(&root))
         .expect("declared root URI must decode on this platform");
-    assert_eq!(reg.profile_for_root(&reported_root), Some("scope-two".to_string()));
+    assert_eq!(
+        reg.profile_for_root(&reported_root),
+        Some("scope-two".to_string())
+    );
     registry::save_to(&path, &reg).expect("set folder profile");
 
     let mut client = spawn_adapter(
@@ -1528,7 +1714,10 @@ fn matrix_routing_declared_root_selects_folder_profile() {
         refused["result"]["isError"] == true || refused.get("error").is_some(),
         "a call outside the folder profile was accepted: {refused}"
     );
-    assert_eq!(transcript_method_count(&transcript_one, "tools/call"), before);
+    assert_eq!(
+        transcript_method_count(&transcript_one, "tools/call"),
+        before
+    );
 }
 
 #[test]
@@ -1646,7 +1835,10 @@ fn matrix_routing_root_change_notifies_only_authorized_downstreams() {
     }));
     let deadline = Instant::now() + Duration::from_secs(10);
     while transcript_method_count(&transcript_one, "notifications/roots/list_changed") == 0 {
-        assert!(Instant::now() < deadline, "the authorized server saw no root change");
+        assert!(
+            Instant::now() < deadline,
+            "the authorized server saw no root change"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     // The next request on adapter one acknowledges that its preceding
