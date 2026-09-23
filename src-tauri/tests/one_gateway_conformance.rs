@@ -1567,6 +1567,11 @@ fn matrix_routing_approved_call_rebinds_to_its_profile_view() {
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // BSD may inherit nonblocking mode from the listener. The
+                    // broker waits for the request after answering the challenge.
+                    stream
+                        .set_nonblocking(false)
+                        .expect("blocking approval socket");
                     stream
                         .set_read_timeout(Some(Duration::from_secs(10)))
                         .unwrap();
