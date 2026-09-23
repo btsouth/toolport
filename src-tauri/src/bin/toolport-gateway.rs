@@ -4867,20 +4867,17 @@ struct CallOpts {
 /// (one-gateway-per-host P1.2).
 ///
 /// Two tables used to be process globals with ad-hoc lifetimes: the PII pseudonym
-/// map (SBS-346) and the modern HITL approval table. They are keyed the same way
-/// and released the same way, so they get one owner with one set of rules: a
+/// map (SBS-346) and the modern HITL approval table. They share a conversation
+/// scope and are released together, so they get one owner with one set of rules: a
 /// session's state is dropped when it closes, is bounded by a TTL, and cannot grow
 /// past a cap. The shaped-result stash got the same treatment in
 /// [`conduit_lib::shaping`], which owns it behind a `SessionStore`. This is where
 /// the unification slice will thread the owner as one per-session value.
 ///
-/// The PII table is keyed by client, NOT process-global in effect. One gateway
-/// process serves several clients over the HTTP bridge, each with its own bearer
-/// token, so a single shared map would let a token minted from client A's result
-/// be re-hydrated into client B's outgoing call -- handing A's real PII to B's
-/// downstream server. That is the exact leak this feature exists to prevent, so
-/// isolation is enforced here rather than assumed from "one process per stdio
-/// client".
+/// The PII table is keyed by MCP session when one exists. Two stdio adapters
+/// can use the same configured client identity against one daemon, but their
+/// conversations must not share pseudonyms. Sessionless requests retain their
+/// client-identity key for the HTTP bridge and standalone stdio process.
 ///
 /// `None` (the local stdio client, and Toolport's own internal calls) gets its own
 /// reserved key rather than sharing with the first HTTP client to connect.
@@ -4907,7 +4904,7 @@ impl SessionTables {
         }
     }
 
-    /// Run `f` against one client's PII map, creating it on first use.
+    /// Run `f` against one conversation's PII map, creating it on first use.
     ///
     /// A poisoned lock is recovered rather than propagated: the map is a cache,
     /// and failing every tool call because one thread panicked mid-pass would be a
@@ -4917,15 +4914,28 @@ impl SessionTables {
             .pii
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sessions.get_or_insert_with(client.unwrap_or(PII_LOCAL_SESSION), pii::SessionMap::new, f)
+        sessions.get_or_insert_with(&conversation_scope(client), pii::SessionMap::new, f)
     }
 
-    /// Forget everything mapped for one client.
+    /// Forget everything mapped for the current conversation.
     fn clear_pii(&self, client: Option<&str>) {
+        let scope = conversation_scope(client);
         self.pii
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(client.unwrap_or(PII_LOCAL_SESSION));
+            .remove(&scope);
+        self.hitl()
+            .remove_where(|_, pending| pending.scope == scope);
+    }
+
+    fn clear_mcp_session(&self, session: &str) {
+        let scope = format!("\0mcp:{session}");
+        self.pii
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&scope);
+        self.hitl()
+            .remove_where(|_, pending| pending.scope == scope);
     }
 
     fn hitl(&self) -> std::sync::MutexGuard<'_, SessionStore<ModernHitlApproval>> {
@@ -5052,6 +5062,15 @@ fn configured_allowed_origins() -> Vec<String> {
 /// NUL so it cannot collide with a real client id.
 const PII_LOCAL_SESSION: &str = "\0local";
 
+/// MCP session ids take priority over the configured client identity. Prefixes
+/// keep the two namespaces separate, including the local stdio fallback key.
+fn conversation_scope(client: Option<&str>) -> String {
+    match active_mcp_session() {
+        Some(session) => format!("\0mcp:{session}"),
+        None => format!("\0client:{}", client.unwrap_or(PII_LOCAL_SESSION)),
+    }
+}
+
 /// The spelling of a server id used as a PII origin.
 ///
 /// Origins are compared by string equality, so every mint and rehydrate path has to
@@ -5065,7 +5084,7 @@ fn pii_origin_id(server: &str) -> String {
     sanitize_segment(server)
 }
 
-/// Forget everything mapped for one client.
+/// Forget PII mappings and pending approvals for the current conversation.
 ///
 /// Called on MCP session teardown and on a fresh `initialize`. Without it "session"
 /// meant the whole gateway process: a new conversation against a long-lived HTTP
@@ -5073,12 +5092,14 @@ fn pii_origin_id(server: &str) -> String {
 /// resident for the process lifetime with no eviction at all (SBS-605). Memory was
 /// bounded by `DEFAULT_MAX_VALUES`; PII retention was not.
 ///
-/// Keyed by client, so a client running two concurrent MCP sessions clears both.
-/// That is deliberate — over-clearing costs a refused call, under-clearing leaks
-/// across conversations — and the tokens simply stop resolving rather than
-/// resolving to something wrong.
+/// A daemon session has its own key even when another adapter declares the
+/// same client identity. Sessionless requests retain the client key.
 fn clear_pii_session(client: Option<&str>) {
     session_tables().clear_pii(client);
+}
+
+fn clear_mcp_session_tables(session: &str) {
+    session_tables().clear_mcp_session(session);
 }
 
 /// Run `f` against one client's map.
@@ -13703,12 +13724,7 @@ impl Drop for McpSseReader {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&key);
             cleanup_resource_subs_for_session(&state, &key);
-            clear_pii_session(
-                self.session
-                    .owner
-                    .as_ref()
-                    .map(|owner| owner.identity.as_str()),
-            );
+            clear_mcp_session_tables(&key);
         }
     }
 }
@@ -13734,24 +13750,24 @@ fn new_mcp_session_id() -> String {
 fn reap_stale_mcp_sessions(state: &GatewayState) {
     // Collect first so we do not hold the sessions lock across cleanup that may
     // call the router.
-    let stale: Vec<(String, Arc<SessionState>)> = {
+    let stale: Vec<String> = {
         let mut sessions = state
             .mcp_sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stale: Vec<(String, Arc<SessionState>)> = sessions
+        let stale: Vec<String> = sessions
             .iter()
             .filter(|(_, session)| session.is_expired() || session.closed.load(Ordering::SeqCst))
-            .map(|(id, session)| (id.clone(), Arc::clone(session)))
+            .map(|(id, _)| id.clone())
             .collect();
-        for (id, _) in &stale {
+        for id in &stale {
             sessions.remove(id);
         }
         stale
     };
-    for (id, session) in stale {
+    for id in stale {
         cleanup_resource_subs_for_session(state, &id);
-        clear_pii_session(session.owner.as_ref().map(|owner| owner.identity.as_str()));
+        clear_mcp_session_tables(&id);
     }
 }
 
@@ -13980,7 +13996,7 @@ enum ModernHitlStatus {
 struct ModernHitlApproval {
     name: String,
     args_hash: String,
-    client: Option<String>,
+    scope: String,
     approved_fingerprint: Option<String>,
     reason: approval::ApprovalReason,
     started: Instant,
@@ -14058,7 +14074,7 @@ fn start_modern_hitl(
             ModernHitlApproval {
                 name: name.to_string(),
                 args_hash,
-                client: client.map(str::to_string),
+                scope: conversation_scope(client),
                 approved_fingerprint,
                 reason,
                 started: Instant::now(),
@@ -14102,7 +14118,7 @@ fn poll_modern_hitl(
         .with(token, |pending| {
             if pending.name != name
                 || pending.args_hash != args_hash
-                || pending.client.as_deref() != client
+                || pending.scope != conversation_scope(client)
             {
                 return (ModernHitlPoll::Stale, false);
             }
@@ -15853,7 +15869,7 @@ fn handle_mcp_http(
                     cleanup_resource_subs_for_session(state, &sid);
                     // The conversation is over; its pseudonym map must not outlive it
                     // and resolve tokens for the next one (SBS-605).
-                    clear_pii_session(session_owner.map(|o| o.identity.as_str()));
+                    clear_mcp_session_tables(&sid);
                     HttpOut::new(204, "text/plain", String::new())
                 }
                 Err(e) => e,
@@ -20172,7 +20188,7 @@ mod tests {
             ModernHitlApproval {
                 name: "s__wipe".into(),
                 args_hash: audit::args_hash(&json!({ "target": "x" })),
-                client: Some("cursor".into()),
+                scope: conversation_scope(Some("cursor")),
                 approved_fingerprint: None,
                 reason: approval::ApprovalReason::Destructive,
                 started: Instant::now(),
@@ -20218,7 +20234,7 @@ mod tests {
                     ModernHitlApproval {
                         name: "s__wipe".into(),
                         args_hash: audit::args_hash(&json!({ "target": i })),
-                        client: Some("cursor".into()),
+                        scope: conversation_scope(Some("cursor")),
                         approved_fingerprint: None,
                         reason: approval::ApprovalReason::Destructive,
                         started: Instant::now(),
@@ -20235,6 +20251,54 @@ mod tests {
             );
             assert!(hitl.peek("token-1", |_| ()).is_some());
         }
+    }
+
+    #[test]
+    fn two_daemon_sessions_with_one_client_identity_keep_pii_and_approvals_separate() {
+        let client = Some("shared-adapter-client");
+        let first = format!("first-{}", new_correlation_id());
+        let second = format!("second-{}", new_correlation_id());
+        let args = json!({ "target": "x" });
+        let hash = audit::args_hash(&args);
+        let token = {
+            let _session = McpSessionGuard::enter(Some(first.clone()));
+            with_pii_session(client, |map| {
+                map.pseudonymize("crm", "ada@example.com");
+            });
+            start_modern_hitl(
+                "s__wipe",
+                hash.clone(),
+                None,
+                approval::ApprovalReason::Destructive,
+                client,
+                "s",
+                "wipe",
+                &args,
+                MrtrRequest::default(),
+            )
+            .expect("first approval starts")
+        };
+        {
+            let _session = McpSessionGuard::enter(Some(second.clone()));
+            assert!(with_pii_session(client, |map| map.is_empty()));
+            with_pii_session(client, |map| {
+                map.pseudonymize("crm", "bob@example.com");
+            });
+            assert!(matches!(
+                poll_modern_hitl(&token, "s__wipe", &hash, client, None),
+                ModernHitlPoll::Stale
+            ));
+        }
+        clear_mcp_session_tables(&first);
+        {
+            let _session = McpSessionGuard::enter(Some(second.clone()));
+            assert!(!with_pii_session(client, |map| map.is_empty()));
+            assert!(matches!(
+                poll_modern_hitl(&token, "s__wipe", &hash, client, None),
+                ModernHitlPoll::Missing
+            ));
+        }
+        clear_mcp_session_tables(&second);
     }
 
     #[test]
