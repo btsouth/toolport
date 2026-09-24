@@ -306,6 +306,7 @@ fn build_window(
         app,
         &split,
         &stack,
+        server_page.clone(),
         client_page.clone(),
         activity_page.clone(),
         catalog_page.clone(),
@@ -411,6 +412,7 @@ fn build_window(
 
     window.set_content(Some(&alerts));
     theme.attach(&window);
+    let page_for_focus = server_page.clone();
     let state = state::RegistryController::new(move |snapshot| {
         server_page.render(snapshot);
         if let Some(notice) = startup_notice.borrow_mut().take() {
@@ -426,6 +428,13 @@ fn build_window(
                 ),
                 true,
             );
+        }
+    });
+    let stack_for_focus = stack.clone();
+    window.connect_is_active_notify(move |window| {
+        if window.is_active() && stack_for_focus.visible_child_name().as_deref() == Some("servers")
+        {
+            page_for_focus.reprobe_if_stale();
         }
     });
     state.attach(&window);
@@ -639,6 +648,7 @@ fn build_sidebar(
     app: &adw::Application,
     split: &adw::NavigationSplitView,
     stack: &gtk::Stack,
+    server_page: ServerPage,
     client_page: ClientPage,
     activity_page: ActivityPage,
     catalog_page: CatalogPage,
@@ -726,6 +736,7 @@ fn build_sidebar(
         let stack = stack.clone();
         let buttons = buttons.clone();
         let client_page = client_page.clone();
+        let server_page = server_page.clone();
         let activity_page = activity_page.clone();
         let catalog_page = catalog_page.clone();
         let playground_page = playground_page.clone();
@@ -740,6 +751,7 @@ fn build_sidebar(
                 &stack,
                 &buttons,
                 &target,
+                &server_page,
                 &client_page,
                 &activity_page,
                 &catalog_page,
@@ -760,6 +772,7 @@ fn build_sidebar(
         let buttons = buttons.clone();
         let target = target.clone();
         let client_page = client_page.clone();
+        let server_page = server_page.clone();
         let activity_page = activity_page.clone();
         let catalog_page = catalog_page.clone();
         let playground_page = playground_page.clone();
@@ -774,6 +787,7 @@ fn build_sidebar(
                 &stack,
                 &buttons,
                 &target,
+                &server_page,
                 &client_page,
                 &activity_page,
                 &catalog_page,
@@ -1317,6 +1331,7 @@ fn show_native_page(
     stack: &gtk::Stack,
     buttons: &[(String, gtk::Button)],
     target: &str,
+    server_page: &ServerPage,
     client_page: &ClientPage,
     activity_page: &ActivityPage,
     catalog_page: &CatalogPage,
@@ -1336,7 +1351,9 @@ fn show_native_page(
             candidate.remove_css_class("selected");
         }
     }
-    if target == "clients" {
+    if target == "servers" {
+        server_page.reprobe_if_stale();
+    } else if target == "clients" {
         client_page.refresh();
     } else if target == "activity" {
         activity_page.refresh();
@@ -1385,6 +1402,8 @@ struct ServerPage {
     >,
     /// Invalidates in-flight probes when the list re-renders.
     probe_generation: std::rc::Rc<std::cell::Cell<u64>>,
+    last_probe_started: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>>,
+    pending_probes: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
 #[derive(Clone)]
@@ -1397,7 +1416,38 @@ struct HealthRow {
     copy_error: gtk::Button,
 }
 
+const HEALTH_REPROBE_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
+
+fn health_reprobe_due(
+    last_started: Option<std::time::Instant>,
+    pending: usize,
+    now: std::time::Instant,
+) -> bool {
+    pending == 0
+        && last_started
+            .is_none_or(|last| now.saturating_duration_since(last) >= HEALTH_REPROBE_AFTER)
+}
+
 impl ServerPage {
+    fn reprobe_after_auth_change(&self) {
+        if let Some(snapshot) = self.last_snapshot.borrow().clone() {
+            self.render_server_list(&snapshot);
+        }
+    }
+
+    fn reprobe_if_stale(&self) {
+        if !health_reprobe_due(
+            self.last_probe_started.get(),
+            self.pending_probes.get(),
+            std::time::Instant::now(),
+        ) {
+            return;
+        }
+        if let Some(snapshot) = self.last_snapshot.borrow().clone() {
+            self.start_probes(&snapshot);
+        }
+    }
+
     fn render(&self, state: state::RegistryState) {
         self.hide_feedback();
 
@@ -1547,11 +1597,26 @@ impl ServerPage {
             .collect();
         let total = to_probe.len();
         if total == 0 {
+            self.pending_probes.set(0);
             self.posture.set_visible(false);
             return;
         }
+        self.last_probe_started.set(Some(std::time::Instant::now()));
+        self.pending_probes.set(total);
         self.posture.set_visible(true);
         self.posture.set_label(&posture_line(0, 0, 0, total, total));
+        for server_id in &to_probe {
+            if let Some(row) = self.health_rows.borrow().get(server_id) {
+                row.label
+                    .set_label(&format!("{} · Checking…", row.transport));
+                for class in ["success", "error", "review"] {
+                    row.label.remove_css_class(class);
+                }
+                row.label.set_tooltip_text(None);
+                row.authenticate.set_visible(false);
+                row.copy_error.set_visible(false);
+            }
+        }
         // Per-round tallies: only this round's probes feed the posture line, so
         // a server removed mid-round can never inflate the counts.
         let counts = std::rc::Rc::new((
@@ -1598,6 +1663,7 @@ impl ServerPage {
                     errors.set(errors.get() + 1);
                 }
                 pending.set(pending.get().saturating_sub(1));
+                page.pending_probes.set(pending.get());
                 page.apply_probe(&server_id, probe);
                 page.posture.set_label(&posture_line(
                     ready.get(),
@@ -7510,6 +7576,8 @@ fn build_content(
                 std::collections::HashMap::new(),
             )),
             probe_generation: std::rc::Rc::new(std::cell::Cell::new(0)),
+            last_probe_started: std::rc::Rc::new(std::cell::Cell::new(None)),
+            pending_probes: std::rc::Rc::new(std::cell::Cell::new(0)),
         },
     );
     let page_for_add = server_page.1.clone();
@@ -8610,7 +8678,6 @@ fn server_card(
             }
         });
     }
-    card.append(&authenticate);
     let copy_error = gtk::Button::builder()
         .icon_name("edit-copy-symbolic")
         .tooltip_text("Copy the full probe error")
@@ -8632,7 +8699,13 @@ fn server_card(
             }
         });
     }
-    card.append(&copy_error);
+    // Put recovery actions below the health line. Keeping them in the card's
+    // horizontal row leaves too little room for the status in narrow windows.
+    let health_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    health_actions.set_halign(gtk::Align::Start);
+    health_actions.append(&authenticate);
+    health_actions.append(&copy_error);
+    text.append(&health_actions);
     if server.enabled && !server.requires_review {
         page.health_rows.borrow_mut().insert(
             server.id.clone(),
@@ -9391,6 +9464,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                     feedback.add_css_class("success");
                     remove.set_sensitive(true);
                     page.show_confirmation(&format!("Authenticated {server_name}"));
+                    page.reprobe_after_auth_change();
                 }
                 Ok(Err(error)) => {
                     feedback.set_label(&error);
@@ -9441,6 +9515,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                     feedback.add_css_class("success");
                     remove.set_sensitive(true);
                     page.show_confirmation(&format!("Updated authentication for {server_name}"));
+                    page.reprobe_after_auth_change();
                 }
                 Ok(Err(error)) => {
                     feedback.set_label(&error);
@@ -9481,6 +9556,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                     feedback.remove_css_class("error");
                     feedback.add_css_class("success");
                     page.show_confirmation(&format!("Removed authentication for {server_name}"));
+                    page.reprobe_after_auth_change();
                 }
                 Ok(Err(error)) => {
                     button.set_sensitive(true);
@@ -11316,6 +11392,19 @@ mod tests {
             probe_status_line(&probe(false, 0, false)),
             ("Error".to_string(), "error")
         );
+    }
+
+    #[test]
+    fn health_reprobe_waits_for_the_previous_round_and_refreshes_stale_results() {
+        let now = std::time::Instant::now();
+        assert!(health_reprobe_due(None, 0, now));
+        assert!(!health_reprobe_due(None, 1, now));
+        assert!(!health_reprobe_due(
+            Some(now - HEALTH_REPROBE_AFTER + std::time::Duration::from_millis(1)),
+            0,
+            now,
+        ));
+        assert!(health_reprobe_due(Some(now - HEALTH_REPROBE_AFTER), 0, now,));
     }
 
     #[test]
