@@ -13,10 +13,12 @@ updater complete P4.3. The remaining P1.3 field moves are structural cleanup;
 they do not prevent the shared topology from running. The historical build notes
 below retain the order in which the work landed.
 
-This is implementation and test status, not a published release. The real-client
-smoke checked MCP connections without a model or provider tool call. The desktop
-proxy and updater have automated process tests; no physical desktop update run
-is recorded here.
+This is implementation and test status, not a published release. The original
+Grok and Claude connection smoke did not make a provider tool call. On
+2026-09-24, a Linear `get_issue` read succeeded through a live Codex adapter and
+appeared as a successful Toolport audit entry. An isolated visible GTK run also
+routed an authenticated Shared HTTP `mock__echo` call through one daemon. The
+updater has automated process tests; no signed desktop update run is recorded.
 
 ### Landed foundation
 
@@ -624,6 +626,13 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
 - P4.3 uses a lightweight desktop HTTP proxy and private daemon service lease.
   App exit releases the lease; the updater requests idle daemon shutdown and
   refuses to replace files while a shared daemon still runs.
+  On 2026-09-24, an isolated visible GTK window started one `--http-proxy` and
+  one daemon with a configured mock stdio server. The public endpoint rejected
+  an unauthenticated request, accepted MCP `initialize`, and returned the
+  expected `mock__echo` result. The daemon reported one ordinary launch and no
+  retained MCP session after DELETE. A separate process check confirmed that
+  the proxy lease kept an idle-shutdown request pending and that the daemon
+  exited after the lease was released. This was not a signed updater install.
 
 ## Conformance harness
 
