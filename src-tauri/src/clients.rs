@@ -5833,39 +5833,39 @@ fn command_is_gateway_binary(stored: &str) -> bool {
 /// Presumes the command is already known to be ours; the caller
 /// ([`gateway_entry_needs_rewrite`]) establishes that with
 /// [`command_is_gateway_binary`] first. On Unix an old install may leave its
-/// unversioned gateway binary in place, so existence does not make a different
-/// command path current.
+/// unversioned `toolport-gateway` binary in place, so existence alone does not
+/// make that command path current.
 fn gateway_command_is_stale(stored: &str, current: &str) -> bool {
     if stored.is_empty() || stored == current {
         return false;
     }
     #[cfg(not(windows))]
+    if Path::new(stored)
+        .file_name()
+        .is_some_and(|name| name == "toolport-gateway")
     {
         return true;
     }
-    #[cfg(windows)]
-    {
-        if crate::gateway_publish::is_unversioned_install_gateway_path(stored) {
-            return true;
-        }
-        if stored.to_lowercase().contains("conduit-gateway") || !Path::new(stored).exists() {
-            return true;
-        }
-        // Published bin dir: repoint when the app version bumped the gateway path,
-        // or when the data-dir leaf moved Conduit → Toolport.
-        let current_norm = current.replace('/', "\\").to_ascii_lowercase();
-        let stored_norm = stored.replace('/', "\\").to_ascii_lowercase();
-        if current_norm.contains("\\toolport\\bin\\toolport-gateway-")
-            || current_norm.contains("\\conduit\\bin\\toolport-gateway-")
-        {
-            return true;
-        }
-        // Legacy data-dir path still in the client config after leaf migration.
-        if stored_norm.contains("\\conduit\\bin\\") && current_norm.contains("\\toolport\\bin\\") {
-            return true;
-        }
-        false
+    if crate::gateway_publish::is_unversioned_install_gateway_path(stored) {
+        return true;
     }
+    if stored.to_lowercase().contains("conduit-gateway") || !Path::new(stored).exists() {
+        return true;
+    }
+    // Published bin dir: repoint when the app version bumped the gateway path,
+    // or when the data-dir leaf moved Conduit → Toolport.
+    let current_norm = current.replace('/', "\\").to_ascii_lowercase();
+    let stored_norm = stored.replace('/', "\\").to_ascii_lowercase();
+    if current_norm.contains("\\toolport\\bin\\toolport-gateway-")
+        || current_norm.contains("\\conduit\\bin\\toolport-gateway-")
+    {
+        return true;
+    }
+    // Legacy data-dir path still in the client config after leaf migration.
+    if stored_norm.contains("\\conduit\\bin\\") && current_norm.contains("\\toolport\\bin\\") {
+        return true;
+    }
+    false
 }
 
 /// Whether [`repoint_stale_gateways`] should rewrite a client's existing gateway
@@ -6927,10 +6927,12 @@ mod tests {
             std::process::id()
         ));
         let old = dir.join("Toolport/bin/toolport-gateway");
+        let wrapper = dir.join("Toolport/bin/toolport-gateway-wrapper.sh");
         let current = dir.join("new-install/toolport-gateway");
         std::fs::create_dir_all(old.parent().unwrap()).unwrap();
         std::fs::create_dir_all(current.parent().unwrap()).unwrap();
         std::fs::write(&old, b"old binary").unwrap();
+        std::fs::write(&wrapper, b"user wrapper").unwrap();
         std::fs::write(&current, b"current binary").unwrap();
 
         assert!(gateway_entry_needs_rewrite(
@@ -6942,6 +6944,12 @@ mod tests {
         assert!(!gateway_entry_needs_rewrite(
             GATEWAY_ENTRY_NAME,
             current.to_str().unwrap(),
+            current.to_str().unwrap(),
+            None
+        ));
+        assert!(!gateway_entry_needs_rewrite(
+            GATEWAY_ENTRY_NAME,
+            wrapper.to_str().unwrap(),
             current.to_str().unwrap(),
             None
         ));
