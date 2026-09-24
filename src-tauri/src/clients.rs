@@ -5828,18 +5828,23 @@ fn command_is_gateway_binary(stored: &str) -> bool {
     stem.starts_with("toolport-gateway") || stem.starts_with("conduit-gateway")
 }
 
-/// Whether a client's stored gateway command should be re-pointed: it names the
-/// pre-rename binary (`conduit-gateway`), or its path no longer exists on disk, and
-/// it isn't already the current path.
+/// Whether a client's stored gateway command should be re-pointed.
 ///
 /// Presumes the command is already known to be ours; the caller
 /// ([`gateway_entry_needs_rewrite`]) establishes that with
-/// [`command_is_gateway_binary`] first. These heuristics cannot make that call
-/// themselves - they read "not our current path" as "our binary moved", which is only
-/// true once provenance is settled.
+/// [`command_is_gateway_binary`] first. On Unix an old install may leave its
+/// unversioned `toolport-gateway` binary in place, so existence alone does not
+/// make that command path current.
 fn gateway_command_is_stale(stored: &str, current: &str) -> bool {
     if stored.is_empty() || stored == current {
         return false;
+    }
+    #[cfg(not(windows))]
+    if Path::new(stored)
+        .file_name()
+        .is_some_and(|name| name == "toolport-gateway")
+    {
+        return true;
     }
     if crate::gateway_publish::is_unversioned_install_gateway_path(stored) {
         return true;
@@ -6912,6 +6917,49 @@ mod tests {
         assert!(!gateway_command_is_stale(current, current));
         // Empty -> not stale.
         assert!(!gateway_command_is_stale("", current));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn existing_old_unix_gateway_is_repointed_to_the_current_binary() {
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-existing-gateway-repoint-{}",
+            std::process::id()
+        ));
+        let old = dir.join("Toolport/bin/toolport-gateway");
+        let wrapper = dir.join("Toolport/bin/toolport-gateway-wrapper.sh");
+        let current = dir.join("new-install/toolport-gateway");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&old, b"old binary").unwrap();
+        std::fs::write(&wrapper, b"user wrapper").unwrap();
+        std::fs::write(&current, b"current binary").unwrap();
+
+        assert!(gateway_entry_needs_rewrite(
+            GATEWAY_ENTRY_NAME,
+            old.to_str().unwrap(),
+            current.to_str().unwrap(),
+            None
+        ));
+        assert!(!gateway_entry_needs_rewrite(
+            GATEWAY_ENTRY_NAME,
+            current.to_str().unwrap(),
+            current.to_str().unwrap(),
+            None
+        ));
+        assert!(!gateway_entry_needs_rewrite(
+            GATEWAY_ENTRY_NAME,
+            wrapper.to_str().unwrap(),
+            current.to_str().unwrap(),
+            None
+        ));
+        assert!(!gateway_entry_needs_rewrite(
+            GATEWAY_ENTRY_NAME,
+            "npx",
+            current.to_str().unwrap(),
+            None
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

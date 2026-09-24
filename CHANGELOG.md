@@ -6,6 +6,39 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-09-24
+
+Toolport now uses one shared host gateway for registry-backed MCP clients by
+default. An explicit `legacy` setting remains available if a client needs the
+previous per-session gateway behavior.
+
+### Added
+
+- **MCP sessions share downstream connections.** Lightweight stdio adapters use
+  one host daemon and pool ordinary server launches. Profiles, project roots,
+  subscriptions, approvals, and sensitive-data controls remain scoped to the
+  originating session. (#910, #937, #938, #939, #943, #944, #945)
+- **Shared HTTP uses the same host daemon.** The desktop HTTP endpoint runs as a
+  lightweight proxy with a private service lease instead of starting another
+  full gateway. The endpoint releases its lease when the app closes. (#947, #948)
+- **Gateway savings and topology diagnostics are measurable.** A local Linux
+  acceptance run with three sessions and six configured servers measured 18 to
+  9 gateway-tree processes and 1,446.1 to 621.1 MiB of private memory. These
+  figures describe that test setup, not every installation. (#940, #941, #942)
+
+### Fixed
+
+- **Updates protect active shared gateways.** The updater requests shutdown
+  from idle daemons and refuses installation while a shared daemon is still
+  serving sessions. Startup cleanup also limits an explicit data-directory run
+  to its own gateway processes. (#949, #950, #952)
+- **Managed Unix clients move off an old gateway path even while that file still
+  exists.** A previous installation could leave its binary behind, causing a
+  client to start the old standalone gateway after an update.
+- **The Linux server list refreshes authentication health when focused.** A
+  server that needs a new sign-in now updates in the visible app, and its
+  Authenticate action fits narrow windows. (#953)
+
 ## [1.20.0] - 2026-09-22
 
 Toolport 1.20.0 brings slow-start controls and Cursor ask-first approvals into the
