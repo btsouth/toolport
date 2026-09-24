@@ -140,8 +140,11 @@ On each app launch Toolport **stops obsolete gateway processes** (older versione
 binaries and stale paths), keeping the current published/resolved gateway. Clients
 that auto-respawn MCP pick up the new binary on the **next tool call** without a
 full agent restart. Settings → Integrations → **Stop old gateways** runs the same
-cleanup on demand. The in-app updater still kills **all** gateway processes before
-install so locked files can be replaced.
+cleanup on demand. The Tauri in-app updater asks idle shared daemons to shut
+down, then stops standalone gateway processes before installation. If a shared
+daemon still has active MCP sessions, installation is refused and the app gives
+recovery guidance. Retry after those sessions close; the updater never forces a
+live shared daemon to exit.
 
 ## Manual fallback
 

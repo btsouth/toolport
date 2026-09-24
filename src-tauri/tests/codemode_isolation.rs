@@ -220,6 +220,38 @@ impl Drop for Gateway {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
+        // The default stdio path is an adapter. Killing it does not kill its
+        // detached host daemon, so stop that fixture daemon before removing the
+        // descriptor that identifies it.
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with("daemon-") || !name.ends_with(".json") {
+                    continue;
+                }
+                let Some(descriptor) = conduit_lib::daemon::read_descriptor(&entry.path()) else {
+                    continue;
+                };
+                let _ = conduit_lib::daemon::request_shutdown_if_idle(&descriptor);
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while conduit_lib::gateway_publish::pid_is_running(descriptor.pid)
+                    && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                if conduit_lib::gateway_publish::pid_is_running(descriptor.pid) {
+                    #[cfg(unix)]
+                    let _ = Command::new("kill")
+                        .args(["-TERM", &descriptor.pid.to_string()])
+                        .status();
+                    #[cfg(windows)]
+                    let _ = Command::new("taskkill")
+                        .args(["/PID", &descriptor.pid.to_string(), "/F"])
+                        .status();
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
