@@ -332,45 +332,60 @@ impl Rendezvous {
         mut spawn: impl FnMut() -> Result<(), String>,
     ) -> Result<DaemonDescriptor, String> {
         let path = self.descriptor_path();
-        match self.probe_for_reuse(&path) {
-            Probe::Live(descriptor) => return Ok(descriptor),
-            // A silent daemon may still be alive: reuse is unproven, and
-            // clearing or spawning beside it is the double-election defect.
-            // Name it and fail; if it really is gone, its idle watchdog
-            // clears the pointer on the way out.
-            Probe::Silent(descriptor) => return Err(unresponsive_daemon_error(&descriptor)),
-            Probe::Gone => {}
-        }
-
-        // Elect: `lock_at` appends `.lock` and creates parent directories.
-        let lock_base = election_lock_base(&self.data_dir, &self.compat);
-        let _election = registry::lock_at_for(&lock_base, ELECTION_TIMEOUT)?;
-
-        // Recheck under the lock: another contender may have started the daemon
-        // while we waited.
-        match self.probe(&path) {
-            Probe::Live(descriptor) => return Ok(descriptor),
-            Probe::Silent(descriptor) => return Err(unresponsive_daemon_error(&descriptor)),
-            Probe::Gone => {}
-        }
-
-        // We are the winner. Drop any stale pointer first so readiness polling
-        // cannot mistake it for the daemon we are about to start.
-        clear_descriptor(&path);
-        spawn()?;
-
-        // Wait for readiness while still holding the lock, so no second
-        // contender spawns a daemon of its own. Until the daemon is ready,
-        // silence and refusals both just mean "not answering yet", so every
-        // non-live outcome keeps polling inside the budget.
-        let deadline = Instant::now() + READY_TIMEOUT;
-        while Instant::now() < deadline {
-            if let Probe::Live(descriptor) = self.probe(&path) {
-                return Ok(descriptor);
+        // A descriptor may appear while we wait for the election lock. If it
+        // then stays silent, retry outside the lock so other adapters are not
+        // serialized behind one slow identity endpoint. A disappearing pointer
+        // gets one more election attempt, bounded against repeated churn.
+        for _ in 0..2 {
+            match self.probe_for_reuse(&path) {
+                Probe::Live(descriptor) => return Ok(descriptor),
+                // A silent daemon may still be alive: reuse is unproven, and
+                // clearing or spawning beside it is the double-election defect.
+                Probe::Silent(descriptor) => return Err(unresponsive_daemon_error(&descriptor)),
+                Probe::Gone => {}
             }
-            std::thread::sleep(READY_POLL);
+
+            // Elect: `lock_at` appends `.lock` and creates parent directories.
+            let lock_base = election_lock_base(&self.data_dir, &self.compat);
+            let election = registry::lock_at_for(&lock_base, ELECTION_TIMEOUT)?;
+
+            // Recheck under the lock: another contender may have started the
+            // daemon while we waited. Silence needs the same patience as the
+            // fast path, but must not hold the election lock during that wait.
+            match self.probe(&path) {
+                Probe::Live(descriptor) => return Ok(descriptor),
+                Probe::Silent(_) => {
+                    drop(election);
+                    match self.probe_for_reuse(&path) {
+                        Probe::Live(descriptor) => return Ok(descriptor),
+                        Probe::Silent(descriptor) => {
+                            return Err(unresponsive_daemon_error(&descriptor));
+                        }
+                        Probe::Gone => continue,
+                    }
+                }
+                Probe::Gone => {}
+            }
+
+            // We are the winner. Drop any stale pointer first so readiness
+            // polling cannot mistake it for the daemon we are about to start.
+            clear_descriptor(&path);
+            spawn()?;
+
+            // Wait for readiness while still holding the lock, so no second
+            // contender spawns a daemon of its own. Until the daemon is ready,
+            // silence and refusals both just mean "not answering yet", so every
+            // non-live outcome keeps polling inside the budget.
+            let deadline = Instant::now() + READY_TIMEOUT;
+            while Instant::now() < deadline {
+                if let Probe::Live(descriptor) = self.probe(&path) {
+                    return Ok(descriptor);
+                }
+                std::thread::sleep(READY_POLL);
+            }
+            return Err("the daemon did not become ready before the deadline".to_string());
         }
-        Err("the daemon did not become ready before the deadline".to_string())
+        Err("the daemon descriptor changed repeatedly during startup".to_string())
     }
 
     /// Read, claim-check, then prove with the authenticated handshake. A
@@ -839,6 +854,46 @@ mod tests {
             .expect("a delayed but live daemon should be reused");
         assert_eq!(reused, descriptor);
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(read_descriptor(&path), Some(descriptor));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_published_while_waiting_for_election_gets_silent_retry() {
+        let dir = temp_dir("delayed-election");
+        let key = compat("1.0.0", &dir);
+        let election =
+            registry::lock_at_for(&election_lock_base(&dir, &key), ELECTION_TIMEOUT).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker_dir = dir.clone();
+        let worker_key = key.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            Rendezvous::new(&worker_dir, worker_key).ensure(|| {
+                Err("must not spawn beside a published daemon".to_string())
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // Let the worker observe an absent descriptor and block on our lock.
+        std::thread::sleep(Duration::from_millis(500));
+
+        let identity = DaemonIdentity {
+            compat: key.fingerprint(),
+            protocol: PROTOCOL_GENERATION,
+            pid: std::process::id(),
+            gateway_version: "1.0.0".to_string(),
+        };
+        let endpoint = start_delayed_responder(Duration::from_secs(6), identity);
+        let descriptor = DaemonDescriptor::new(endpoint, "delayed", &key);
+        let path = descriptor_path(&dir, &key);
+        write_descriptor(&path, &descriptor).unwrap();
+        drop(election);
+
+        let reused = worker
+            .join()
+            .unwrap()
+            .expect("a daemon published during election should be reused");
+        assert_eq!(reused, descriptor);
         assert_eq!(read_descriptor(&path), Some(descriptor));
         let _ = std::fs::remove_dir_all(&dir);
     }
