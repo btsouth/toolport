@@ -337,6 +337,8 @@ impl Rendezvous {
         // serialized behind one slow identity endpoint. A disappearing pointer
         // gets one more election attempt, bounded against repeated churn.
         for _ in 0..2 {
+            let observed_before_lock =
+                read_descriptor(&path).filter(|descriptor| descriptor.claims_compat(&self.compat));
             match self.probe_for_reuse(&path) {
                 Probe::Live(descriptor) => return Ok(descriptor),
                 // A silent daemon may still be alive: reuse is unproven, and
@@ -348,6 +350,22 @@ impl Rendezvous {
             // Elect: `lock_at` appends `.lock` and creates parent directories.
             let lock_base = election_lock_base(&self.data_dir, &self.compat);
             let election = registry::lock_at_for(&lock_base, ELECTION_TIMEOUT)?;
+
+            // If another contender published while we waited, leave the lock
+            // before probing it. A slow identity response must not make the
+            // remaining contenders time out on election lock acquisition.
+            let current =
+                read_descriptor(&path).filter(|descriptor| descriptor.claims_compat(&self.compat));
+            if current.is_some() && current != observed_before_lock {
+                drop(election);
+                match self.probe_for_reuse(&path) {
+                    Probe::Live(descriptor) => return Ok(descriptor),
+                    Probe::Silent(descriptor) => {
+                        return Err(unresponsive_daemon_error(&descriptor));
+                    }
+                    Probe::Gone => continue,
+                }
+            }
 
             // Recheck under the lock: another contender may have started the
             // daemon while we waited. Silence needs the same patience as the
