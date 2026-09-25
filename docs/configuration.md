@@ -13,7 +13,9 @@ gateway entry, written for you when you connect a client:
   discovery setting. Rarely needed; the gateway reads the registry default otherwise.
 - `TOOLPORT_REGISTRY=<path>` - override the registry file location. Defaults to a
   stable per-user path so packaged and unpackaged clients agree.
-- `TOOLPORT_DATA_DIR=<path>` - override the full Toolport data directory.
+- `TOOLPORT_DATA_DIR=<path>` - override the full Toolport data directory. A desktop
+  launch with this override keeps its startup migration within that instance:
+  it does not rewrite client configs or agent hooks in the user's normal home.
 - `TOOLPORT_RESULT_BUDGET=<bytes>` - cap oversized tool results at this many bytes
   (0 disables it). Optional; default budget applies when unset.
 - `TOOLPORT_HTTP=<port>` (with optional `TOOLPORT_HTTP_HOST`, default `127.0.0.1`,

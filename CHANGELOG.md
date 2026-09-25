@@ -6,7 +6,7 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
-## [1.21.1] - 2026-09-24
+## [1.21.2] - 2026-09-25
 
 Toolport now uses one shared host gateway for registry-backed MCP clients by
 default. An explicit `legacy` setting remains available if a client needs the
@@ -38,6 +38,9 @@ previous per-session gateway behavior.
 - **Managed Unix clients move off an old gateway path even while that file still
   exists.** A previous installation could leave its binary behind, causing a
   client to start the old standalone gateway after an update.
+- **Isolated desktop launches leave existing AI clients alone.** A launch with an
+  explicit data directory publishes its own gateway without rewriting client
+  configs or agent hooks in the user's normal home. (#958)
 - **The Linux server list refreshes authentication health when focused.** A
   server that needs a new sign-in now updates in the visible app, and its
   Authenticate action fits narrow windows. (#953)

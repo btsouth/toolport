@@ -30853,6 +30853,7 @@ mod tests {
         let confirm = ConfirmGuard::new();
         let req = json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"});
         let allowed = std::collections::HashSet::from(["alpha".to_string()]);
+        let scoped_client = format!("scoped-{}", routines::generate_id().unwrap());
         for code in [false, true] {
             host.set_code_mode(code);
             for confirm_on in [false, true] {
@@ -30870,7 +30871,7 @@ mod tests {
                     &guard,
                     &confirm,
                     Some(&allowed),
-                    Some("scoped"),
+                    Some(&scoped_client),
                 )
                 .unwrap();
                 let full_tools = full["result"]["tools"].as_array().unwrap();
@@ -30884,7 +30885,7 @@ mod tests {
                     savings::entries()
                         .into_iter()
                         .filter(|row| {
-                            row["kind"] == "catalog_exposure" && row["client"] == "scoped"
+                            row["kind"] == "catalog_exposure" && row["client"] == scoped_client
                         })
                         .collect::<Vec<_>>()
                 };
@@ -30902,7 +30903,7 @@ mod tests {
                         &guard,
                         &confirm,
                         Some(&allowed),
-                        Some("scoped"),
+                        Some(&scoped_client),
                     )
                     .unwrap();
                     let exposed_tools = exposed["result"]["tools"].as_array().unwrap();
@@ -30928,7 +30929,7 @@ mod tests {
                     );
                     assert_eq!(row["fullToolCount"], full_tools.len());
                     assert_eq!(row["exposedToolCount"], exposed_tools.len());
-                    assert_eq!(row["client"], "scoped");
+                    assert_eq!(row["client"], scoped_client);
                     assert_eq!(row["byServerBytes"].as_object().unwrap().len(), 1);
                     assert!(row["byServerBytes"].get("alpha").is_some());
                     assert!(row["byServerBytes"].get("beta").is_none());
@@ -30957,7 +30958,7 @@ mod tests {
             &guard,
             &confirm,
             Some(&allowed),
-            Some("scoped"),
+            Some(&scoped_client),
         )
         .unwrap();
         assert!(!filtered["result"]["tools"]
@@ -30977,10 +30978,15 @@ mod tests {
             &guard,
             &confirm,
             Some(&allowed),
-            Some("scoped"),
+            Some(&scoped_client),
         )
         .unwrap();
-        let row = savings::entries().pop().unwrap();
+        // Other tests may append telemetry concurrently; select this client's row.
+        let row = savings::entries()
+            .into_iter()
+            .filter(|row| row["kind"] == "catalog_exposure" && row["client"] == scoped_client)
+            .last()
+            .unwrap();
         assert_eq!(
             row["fullSurfaceBytes"],
             savings::surface_bytes(filtered["result"]["tools"].as_array().unwrap())
