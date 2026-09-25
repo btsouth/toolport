@@ -6,7 +6,7 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
-## [1.21.0] - 2026-09-24
+## [1.21.1] - 2026-09-24
 
 Toolport now uses one shared host gateway for registry-backed MCP clients by
 default. An explicit `legacy` setting remains available if a client needs the
@@ -28,6 +28,9 @@ previous per-session gateway behavior.
 
 ### Fixed
 
+- **Simultaneous clients tolerate a slow daemon startup.** Adapters keep
+  checking a published daemon's authenticated identity during a busy cold
+  start instead of disconnecting after the old six-second probe window.
 - **Updates protect active shared gateways.** The updater requests shutdown
   from idle daemons and refuses installation while a shared daemon is still
   serving sessions. Startup cleanup also limits an explicit data-directory run
