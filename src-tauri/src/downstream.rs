@@ -3561,7 +3561,9 @@ impl StdioTransport {
             msg.push_str(&format!(" (status {code})"));
         }
         if tail.is_empty() {
-            msg.push_str(" without output. Check the command, args, and any required API keys.");
+            msg.push_str(
+                " without stderr output. Check the command, args, and any required setup values.",
+            );
         } else {
             msg.push_str(":\n");
             msg.push_str(&tail);
@@ -12299,8 +12301,7 @@ mod tests {
             // below returns even when the fast-fail works and nothing arrives.
             if let Ok(Some(req)) = server.recv_timeout(Duration::from_secs(2)) {
                 hc.store(true, Ordering::SeqCst);
-                let _ = req
-                    .respond(tiny_http::Response::from_string("late").with_status_code(200));
+                let _ = req.respond(tiny_http::Response::from_string("late").with_status_code(200));
             }
         });
 
@@ -12316,7 +12317,10 @@ mod tests {
             true,
         );
         match &result {
-            Err(TransportError::Retry { retry_after, message }) => {
+            Err(TransportError::Retry {
+                retry_after,
+                message,
+            }) => {
                 assert!(*retry_after <= Some(Duration::from_secs(2)));
                 assert!(message.contains("shared backoff"), "{message}");
             }
@@ -12384,7 +12388,10 @@ mod tests {
             }
             other => panic!("expected Retry from live 429, got {other:?}"),
         }
-        assert!(hit.load(Ordering::SeqCst), "the 429 response came from the wire");
+        assert!(
+            hit.load(Ordering::SeqCst),
+            "the 429 response came from the wire"
+        );
         assert!(
             downstream_backoff::remaining_for_url(&url).is_some(),
             "the inline 429 must be recorded into the shared window"

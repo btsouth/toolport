@@ -7,6 +7,7 @@ const api = vi.hoisted(() => ({
   addServer: vi.fn(),
   parseServerSnippet: vi.fn(),
   setSecret: vi.fn(),
+  setLaunchSecret: vi.fn(),
   testServer: vi.fn(),
   updateServer: vi.fn(),
 }));
@@ -79,6 +80,67 @@ async function fillServer(user: ReturnType<typeof userEvent.setup>, command: str
 describe("ServerDialog", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("vaults composed launch inputs and clears bindings when arguments change", async () => {
+    const initial: ServerEntry = {
+      id: "",
+      name: "Twilio",
+      transport: "stdio",
+      command: "npx",
+      args: ["-y", "@twilio-alpha/mcp", "<launch-input>"],
+      env: [],
+      url: null,
+      source: "catalog:curated",
+      launch: {
+        inputs: [
+          { key: "ACCOUNT", label: "Account SID", secret: false, required: true },
+          { key: "KEY", label: "API Key SID", secret: true, required: true },
+          { key: "SECRET", label: "API Secret", secret: true, required: true },
+        ],
+        bindings: [
+          {
+            index: 2,
+            parts: [
+              { kind: "input", key: "ACCOUNT" },
+              { kind: "literal", value: "/" },
+              { kind: "input", key: "KEY" },
+              { kind: "literal", value: ":" },
+              { kind: "input", key: "SECRET" },
+            ],
+          },
+        ],
+      },
+    };
+    const added = savedRegistry("twilio");
+    api.addServer.mockResolvedValue(added);
+    api.setLaunchSecret.mockResolvedValue(added);
+    const user = userEvent.setup();
+    render(<ServerDialog autoOpen initial={initial} onSaved={vi.fn()} />);
+    await user.type(screen.getByLabelText("Account SID *"), "AC123");
+    await user.type(screen.getByLabelText("API Key SID *"), "SK123");
+    await user.type(screen.getByLabelText("API Secret *"), "private-value");
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    await waitFor(() => expect(api.setLaunchSecret).toHaveBeenCalledTimes(2));
+    expect(api.addServer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        launch: expect.objectContaining({
+          inputs: [
+            expect.objectContaining({ value: "AC123" }),
+            expect.objectContaining({ value: null }),
+            expect.objectContaining({ value: null }),
+          ],
+        }),
+      }),
+    );
+    expect(api.setLaunchSecret).toHaveBeenCalledWith("twilio", "SECRET", "private-value");
+
+    render(<ServerDialog autoOpen initial={initial} onSaved={vi.fn()} />);
+    await user.type(screen.getAllByLabelText("Arguments")[0], " extra");
+    expect(
+      screen.getByText(/Generated argument bindings were removed/),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
   });
 
   it("opens from its trigger and shows the add form", async () => {

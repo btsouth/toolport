@@ -433,6 +433,7 @@ pub(super) struct ServerView {
     pub(super) transport_id: String,
     pub(super) command: Option<String>,
     pub(super) args: Vec<String>,
+    pub(super) launch: Option<crate::registry::LaunchConfig>,
     pub(super) url: Option<String>,
     pub(super) cwd: Option<String>,
     pub(super) secret_keys: Vec<String>,
@@ -499,6 +500,7 @@ impl RegistrySnapshot {
                     transport_id: server.transport.clone(),
                     command: server.command.clone(),
                     args: server.args.clone(),
+                    launch: server.launch.clone(),
                     url: server.url.clone(),
                     cwd: server.cwd.clone(),
                     secret_keys: server
@@ -729,6 +731,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -763,6 +766,7 @@ mod tests {
                     transport_id: "stdio".into(),
                     command: None,
                     args: Vec::new(),
+                    launch: None,
                     url: None,
                     cwd: None,
                     secret_keys: vec!["TOKEN".into()],
@@ -777,6 +781,7 @@ mod tests {
                     transport_id: "http".into(),
                     command: None,
                     args: Vec::new(),
+                    launch: None,
                     url: None,
                     cwd: None,
                     secret_keys: Vec::new(),

@@ -6,6 +6,30 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Fixed
+
+- **Atlassian now uses its documented v2 MCP endpoint.** The catalog requests
+  the gateway-compatible flat tool list. Only untouched saved v1 catalog
+  entries migrate; custom URLs and tool choices stay as they are. Existing
+  OAuth sessions may need a new sign-in. The Atlassian and Parallel Search
+  documentation links were refreshed.
+- **Curated local servers now ask for required launch inputs.** Twilio composes its
+  account SID, API Key SID, and API Secret into the argument its API server
+  requires. PostgreSQL vaults its connection URL; Filesystem asks for an allowed
+  directory so standalone tests work. Browserbase uses its current package and
+  requests Gemini credentials. Brave, Perplexity, Qdrant, and AWS presets were
+  updated from confirmed upstream package and setup changes. Untouched saved
+  catalog entries migrate while edited entries keep their configuration. Team
+  members can fill launch setup values locally without changing the team server.
+- **Startup errors now say when stderr is empty.** The message no longer claims
+  the process had no output when stdout might have been used.
+
+### Added
+
+- **Postman and Redis join the curated catalog.** Postman uses its hosted OAuth
+  server in Minimal mode. Redis uses the publisher's `uvx` server and keeps its
+  required connection URL in Toolport's vault.
+
 ## [1.21.2] - 2026-09-25
 
 Toolport now uses one shared host gateway for registry-backed MCP clients by

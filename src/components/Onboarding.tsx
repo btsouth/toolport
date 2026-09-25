@@ -636,7 +636,12 @@ function AddServers({
         if (existing.has(entry.name.toLowerCase())) continue;
         last = await addCatalogServer(entry);
         added++;
-        if (entry.credentialsUrl || entry.envKeys.length > 0) needCreds++;
+        if (
+          entry.credentialsUrl ||
+          entry.envKeys.length > 0 ||
+          entry.launch?.inputs.length
+        )
+          needCreds++;
       }
       onImport(last);
       setTouched(true);
@@ -647,7 +652,7 @@ function AddServers({
         {
           description:
             needCreds > 0
-              ? `${needCreds} need credentials. Use the "get key" links, then enable them.`
+              ? `${needCreds} need setup values. Complete their Launch setup or credentials under Servers, then enable them.`
               : "Enable them next.",
         },
       );

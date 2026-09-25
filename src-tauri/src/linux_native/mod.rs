@@ -10137,6 +10137,68 @@ fn open_server_editor_prefilled(
     let args_row = editor_field("Arguments, one per line", &args_scroller);
     connection.append(&args_row);
 
+    let original_launch = server.as_ref().and_then(|server| server.launch.clone());
+    let original_command = server.as_ref().and_then(|server| server.command.clone());
+    let original_args = server
+        .as_ref()
+        .map(|server| server.args.clone())
+        .unwrap_or_default();
+    let mut launch_entries: Vec<(crate::registry::LaunchInput, gtk::Entry)> = Vec::new();
+    if let Some(launch) = &original_launch {
+        if !launch.inputs.is_empty() {
+            let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            section.add_css_class("toolport-form-section");
+            section.append(&section_heading(
+                "Launch setup",
+                "Secret values stay in Toolport's vault. Leave a saved secret blank to keep it.",
+            ));
+            for input in &launch.inputs {
+                let field = gtk::Entry::builder()
+                    .text(if input.secret {
+                        ""
+                    } else {
+                        input.value.as_deref().unwrap_or("")
+                    })
+                    .placeholder_text(if input.secret {
+                        "Saved value stays in vault"
+                    } else {
+                        "Required before enabling"
+                    })
+                    .visibility(!input.secret)
+                    .hexpand(true)
+                    .css_classes(["toolport-input"])
+                    .build();
+                section.append(&editor_field(&input.label, &field));
+                launch_entries.push((input.clone(), field));
+            }
+            connection.append(&section);
+            let binding_warning = gtk::Label::builder()
+                .label("Editing the command or arguments removes generated launch bindings. Replace <launch-input> before saving, or restore the catalog preset.")
+                .halign(gtk::Align::Fill).xalign(0.0).wrap(true).visible(false)
+                .css_classes(["toolport-feedback", "error"]).build();
+            connection.append(&binding_warning);
+            let args_for_warning = args.clone();
+            let command_for_warning = command.clone();
+            let old_args = original_args.clone();
+            let old_command = original_command.clone();
+            let update_warning = move || {
+                let buffer = args_for_warning.buffer();
+                let text = buffer
+                    .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                    .to_string();
+                let parsed = text.lines().map(str::to_string).collect::<Vec<_>>();
+                binding_warning.set_visible(
+                    parsed != old_args
+                        || Some(command_for_warning.text().to_string()) != old_command,
+                );
+            };
+            let update_warning = std::rc::Rc::new(update_warning);
+            let on_args = update_warning.clone();
+            args.buffer().connect_changed(move |_| on_args());
+            command.connect_changed(move |_| update_warning());
+        }
+    }
+
     let cwd = gtk::Entry::builder()
         .text(
             server
@@ -10319,6 +10381,10 @@ fn open_server_editor_prefilled(
     let args_for_test = args.clone();
     let url_for_test = url.clone();
     let cwd_for_test = cwd.clone();
+    let launch_for_test = launch_entries.clone();
+    let launch_definition_for_test = original_launch.clone();
+    let original_command_for_test = original_command.clone();
+    let original_args_for_test = original_args.clone();
     test.connect_clicked(move |button| {
         button.set_sensitive(false);
         feedback_for_test.set_label("Testing connection…");
@@ -10333,15 +10399,38 @@ fn open_server_editor_prefilled(
             &url_for_test,
             &cwd_for_test,
         );
+        let binding_changed =
+            fields.command != original_command_for_test || fields.args != original_args_for_test;
+        let launch_values = launch_for_test
+            .iter()
+            .map(|(input, field)| (input.key.clone(), input.secret, field.text().to_string()))
+            .collect::<Vec<_>>();
+        let launch_definition = launch_definition_for_test.clone();
         let server_id = server_id_for_test.clone();
         let feedback = feedback_for_test.clone();
         let button = button.clone();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || {
-                let entry = crate::registry_controller::server_entry_for_probe(
+                let mut entry = crate::registry_controller::server_entry_for_probe(
                     server_id.as_deref(),
                     fields,
                 )?;
+                if !binding_changed {
+                    if entry.launch.is_none() {
+                        entry.launch = launch_definition;
+                    }
+                    if let Some(launch) = &mut entry.launch {
+                        for input in &mut launch.inputs {
+                            if let Some((_, _, value)) =
+                                launch_values.iter().find(|(key, _, _)| *key == input.key)
+                            {
+                                if !value.is_empty() {
+                                    input.value = Some(value.clone());
+                                }
+                            }
+                        }
+                    }
+                }
                 Ok::<_, String>(crate::server_runtime::probe_one_bounded(&entry))
             })
             .await;
@@ -10388,11 +10477,22 @@ fn open_server_editor_prefilled(
     });
 
     let editor_for_save = editor.clone();
+    let launch_for_save = launch_entries.clone();
+    let original_launch_for_save = original_launch.clone();
+    let original_command_for_save = original_command.clone();
+    let original_args_for_save = original_args.clone();
     save.connect_clicked(move |save| {
         save.set_sensitive(false);
         feedback.set_visible(false);
         let server_id = server_id.clone();
         let fields = collect_server_fields(&name, &transport, &command, &args, &url, &cwd);
+        let binding_changed =
+            fields.command != original_command_for_save || fields.args != original_args_for_save;
+        let launch_values = launch_for_save
+            .iter()
+            .map(|(input, field)| (input.clone(), field.text().to_string()))
+            .collect::<Vec<_>>();
+        let launch_definition = original_launch_for_save.clone();
         let display_name = fields.name.trim().to_string();
         let env = snippet_env.borrow().clone();
         let page = page.clone();
@@ -10400,23 +10500,52 @@ fn open_server_editor_prefilled(
         let feedback = feedback.clone();
         let editor = editor_for_save.clone();
         gtk::glib::spawn_future_local(async move {
-            let update = gtk::gio::spawn_blocking(move || match server_id {
-                Some(server_id) => {
-                    let registry =
-                        crate::registry_controller::update_server_fields(&server_id, fields)?;
-                    Ok((registry, Vec::new(), Vec::new()))
+            let update = gtk::gio::spawn_blocking(move || {
+                if binding_changed
+                    && launch_definition.is_some()
+                    && fields.args.iter().any(|arg| arg == "<launch-input>")
+                {
+                    return Err(
+                        "Replace <launch-input> with a literal argument before saving".into(),
+                    );
                 }
-                None if env.is_empty() => {
-                    let registry = crate::registry_controller::add_server(fields)?;
-                    Ok((registry, Vec::new(), Vec::new()))
-                }
-                None => {
-                    let outcome = crate::registry_controller::add_snippet_server(fields, env)?;
-                    Ok::<_, String>((
-                        outcome.registry,
-                        outcome.declared_without_value,
-                        outcome.failed,
-                    ))
+                match server_id {
+                    Some(server_id) => {
+                        let mut registry =
+                            crate::registry_controller::update_server_fields(&server_id, fields)?;
+                        if !binding_changed {
+                            registry = save_launch_entries(&server_id, &launch_values, registry)?;
+                        }
+                        Ok((registry, Vec::new(), Vec::new()))
+                    }
+                    None if env.is_empty() => {
+                        let mut registry = if !binding_changed {
+                            match launch_definition {
+                                Some(launch) => crate::registry_controller::add_server_with_launch(
+                                    fields, launch,
+                                )?,
+                                None => crate::registry_controller::add_server(fields)?,
+                            }
+                        } else {
+                            crate::registry_controller::add_server(fields)?
+                        };
+                        if !binding_changed {
+                            if let Some(id) =
+                                registry.servers.last().map(|server| server.id.clone())
+                            {
+                                registry = save_launch_entries(&id, &launch_values, registry)?;
+                            }
+                        }
+                        Ok((registry, Vec::new(), Vec::new()))
+                    }
+                    None => {
+                        let outcome = crate::registry_controller::add_snippet_server(fields, env)?;
+                        Ok::<_, String>((
+                            outcome.registry,
+                            outcome.declared_without_value,
+                            outcome.failed,
+                        ))
+                    }
                 }
             })
             .await;
@@ -10453,6 +10582,28 @@ fn open_server_editor_prefilled(
     });
     editor.present();
     Some(editor)
+}
+
+fn save_launch_entries(
+    server_id: &str,
+    values: &[(crate::registry::LaunchInput, String)],
+    mut registry: crate::registry::Registry,
+) -> Result<crate::registry::Registry, String> {
+    for (input, value) in values {
+        if input.secret {
+            if !value.is_empty() {
+                registry =
+                    crate::registry_controller::set_launch_secret(server_id, &input.key, value)?;
+            }
+        } else if input.value.as_deref().unwrap_or("") != value {
+            registry = crate::registry_controller::set_launch_input_value(
+                server_id,
+                &input.key,
+                (!value.is_empty()).then_some(value.clone()),
+            )?;
+        }
+    }
+    Ok(registry)
 }
 
 fn editor_field(label: &str, child: &impl IsA<gtk::Widget>) -> gtk::Box {
@@ -11571,6 +11722,7 @@ mod tests {
             transport_id: "stdio".into(),
             command: None,
             args: Vec::new(),
+            launch: None,
             url: None,
             cwd: None,
             secret_keys: Vec::new(),

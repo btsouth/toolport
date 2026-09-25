@@ -32,6 +32,9 @@ them across Claude, Cursor, Codex, VS Code, and other clients.
 
 1. [Download Toolport](https://toolport.app/download) for Windows, macOS, or Linux.
 2. Add a server from the catalog, import an existing setup, or paste a server config.
+   Curated servers that need launch arguments show a Launch setup section; see
+   [catalog launch setup](docs/catalog-launch-setup.md) for inputs and package status,
+   and the [curation review](docs/catalog-curation-review.md) for selection criteria.
 3. Authenticate the server, then open **Clients** and connect your AI apps.
 
 Installers and release notes are also on

@@ -24,6 +24,7 @@ pub mod http_bridge;
 pub mod inspect;
 pub mod instructions;
 pub mod integrity;
+pub mod launch_inputs;
 pub mod launcher;
 #[cfg(all(target_os = "linux", feature = "gtk-desktop"))]
 pub mod linux_native;

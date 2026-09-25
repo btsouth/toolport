@@ -1674,6 +1674,7 @@ fn team_server_export(reg: &Registry) -> Value {
                 "transport": s.transport,
                 "command": s.command,
                 "args": args,
+                "launch": s.launch.as_ref().map(|launch| launch.without_values()),
                 "url": url,
                 "env": s.env.iter().map(|e| serde_json::json!({ "key": e.key, "secret": e.secret })).collect::<Vec<_>>(),
                 "disabledTools": s.disabled_tools,
@@ -1762,6 +1763,33 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
         .filter(|s| is_team_server(s, &tag))
         .map(|s| (s.id.clone(), consent_fingerprint(s)))
         .collect();
+    // Team definitions deliberately omit setup values. Keep the member's own
+    // nonsecret values when an otherwise matching server is replaced on sync.
+    let local_launch_values: HashMap<String, HashMap<String, String>> = reg
+        .servers
+        .iter()
+        .filter(|s| is_team_server(s, &tag))
+        .map(|s| {
+            let values = s
+                .launch
+                .as_ref()
+                .map(|launch| {
+                    launch
+                        .inputs
+                        .iter()
+                        .filter(|input| !input.secret)
+                        .filter_map(|input| {
+                            input
+                                .value
+                                .as_ref()
+                                .map(|value| (input.key.clone(), value.clone()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (s.id.clone(), values)
+        })
+        .collect();
     let prev_enabled_by_profile: std::collections::HashMap<
         String,
         std::collections::HashSet<String>,
@@ -1804,6 +1832,7 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
             match classify_team_server(s, &tag) {
                 TeamClass::Ready(mut entry) => {
                     entry.id = crate::registry::unique_id(&entry.id, &used_ids);
+                    restore_local_launch_values(&mut entry, &local_launch_values);
                     used_ids.push(entry.id.clone());
                     tool_allows.insert(entry.id.clone(), allowed);
                     auto_enable.push(entry.id.clone());
@@ -1812,6 +1841,7 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
                 }
                 TeamClass::Review(mut entry) => {
                     entry.id = crate::registry::unique_id(&entry.id, &used_ids);
+                    restore_local_launch_values(&mut entry, &local_launch_values);
                     used_ids.push(entry.id.clone());
                     tool_allows.insert(entry.id.clone(), allowed);
                     review_ids.push(entry.id.clone());
@@ -1974,6 +2004,22 @@ fn apply_team_tool_scope(
 /// out: changing them does not change what runs on the member's machine, and re-prompting
 /// on a rename would train members to click through. Length-prefixed so no choice of
 /// separator inside a field can make two different definitions hash alike.
+fn restore_local_launch_values(
+    entry: &mut ServerEntry,
+    local_values: &HashMap<String, HashMap<String, String>>,
+) {
+    let Some(values) = local_values.get(&entry.id) else {
+        return;
+    };
+    if let Some(launch) = &mut entry.launch {
+        for input in &mut launch.inputs {
+            if !input.secret {
+                input.value = values.get(&input.key).cloned();
+            }
+        }
+    }
+}
+
 fn consent_fingerprint(entry: &ServerEntry) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -1986,6 +2032,11 @@ fn consent_fingerprint(entry: &ServerEntry) -> String {
     field("command", entry.command.as_deref().unwrap_or(""));
     for arg in &entry.args {
         field("arg", arg);
+    }
+    if let Some(launch) = &entry.launch {
+        if let Ok(encoded) = serde_json::to_string(&launch.without_values()) {
+            field("launch", &encoded);
+        }
     }
     let mut env_keys: Vec<&str> = entry.env.iter().map(|e| e.key.as_str()).collect();
     env_keys.sort_unstable();
@@ -2087,6 +2138,14 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
 
     let transport = str_field("transport").unwrap_or("stdio").to_string();
     let command = str_field("command").map(String::from);
+    let launch = match s.get("launch").filter(|value| !value.is_null()) {
+        Some(value) => match serde_json::from_value::<crate::registry::LaunchConfig>(value.clone())
+        {
+            Ok(launch) => Some(launch.without_values()),
+            Err(_) => return TeamClass::Blocked,
+        },
+        None => None,
+    };
     let mut entry = ServerEntry {
         id,
         name: name.to_string(),
@@ -2104,8 +2163,16 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         client_credentials,
         request_timeout_ms: None,
         initialize_timeout_ms: None,
+        launch,
         unknown_fields: serde_json::Map::new(),
     };
+    if entry
+        .launch
+        .as_ref()
+        .is_some_and(|launch| launch.validate(&entry.args, true).is_err())
+    {
+        return TeamClass::Blocked;
+    }
 
     // A server that runs a local command (stdio, or any command-bearing entry) is the RCE
     // case: carry the command so the member CAN run it, but only after they enable it.
@@ -2115,7 +2182,8 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
             Some(c) => entry.command = Some(c),
             None => return TeamClass::Skip, // stdio with no command is unusable
         }
-        entry.request_timeout_ms = match s.get("requestTimeoutMs").filter(|value| !value.is_null()) {
+        entry.request_timeout_ms = match s.get("requestTimeoutMs").filter(|value| !value.is_null())
+        {
             Some(value) => match value.as_u64().and_then(|milliseconds| {
                 crate::registry::validate_request_timeout_ms(milliseconds).ok()
             }) {
@@ -2882,6 +2950,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         let active = r.active_profile_id.clone().unwrap();
@@ -3064,6 +3133,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         let cfg = json!({ "servers": [
@@ -3203,6 +3273,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         apply_team_config(
@@ -3674,6 +3745,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         let cfg = json!({ "servers": [
@@ -3826,7 +3898,10 @@ mod tests {
         for (request_timeout_ms, should_block) in [
             (Value::from(0), true),
             (Value::from("not-a-number"), true),
-            (Value::from(crate::registry::MAX_REQUEST_TIMEOUT_MS + 1), true),
+            (
+                Value::from(crate::registry::MAX_REQUEST_TIMEOUT_MS + 1),
+                true,
+            ),
             (Value::from(90_000), false),
         ] {
             let server = serde_json::json!({
@@ -4062,6 +4137,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         // A team-sourced server: excluded too (don't echo the team's own set back).
@@ -4079,6 +4155,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         let servers = team_server_export(&r);
@@ -4404,6 +4481,71 @@ mod tests {
     }
 
     #[test]
+    fn team_sync_preserves_local_setup_and_reviews_binding_changes() {
+        let mut registry = base_registry();
+        let config = |prefix: &str| {
+            json!({ "servers": [{
+                "id": "tool", "name": "Tool", "transport": "stdio",
+                "command": "node", "args": ["<launch-input>"],
+                "launch": {
+                    "inputs": [{"key": "ROOT", "label": "Root", "secret": false, "required": true}],
+                    "bindings": [{"index": 0, "parts": [
+                        {"kind": "literal", "value": prefix},
+                        {"kind": "input", "key": "ROOT"}
+                    ]}]
+                }
+            }]})
+        };
+        assert_eq!(
+            apply_team_config(&mut registry, "t1", &config("/")).review,
+            1
+        );
+        let member = registry
+            .servers
+            .iter_mut()
+            .find(|s| s.id == "team_tool")
+            .unwrap();
+        member.launch.as_mut().unwrap().inputs[0].value = Some("/home/member".into());
+        consent_to(&mut registry, "team_tool");
+
+        let unchanged = apply_team_config(&mut registry, "t1", &config("/"));
+        assert_eq!(unchanged.review, 0);
+        assert!(active_enabled(&registry).contains(&"team_tool".to_string()));
+        assert_eq!(
+            registry
+                .servers
+                .iter()
+                .find(|s| s.id == "team_tool")
+                .unwrap()
+                .launch
+                .as_ref()
+                .unwrap()
+                .inputs[0]
+                .value
+                .as_deref(),
+            Some("/home/member")
+        );
+
+        let changed = apply_team_config(&mut registry, "t1", &config(":"));
+        assert_eq!(changed.review, 1);
+        assert!(!active_enabled(&registry).contains(&"team_tool".to_string()));
+        assert_eq!(
+            registry
+                .servers
+                .iter()
+                .find(|s| s.id == "team_tool")
+                .unwrap()
+                .launch
+                .as_ref()
+                .unwrap()
+                .inputs[0]
+                .value
+                .as_deref(),
+            Some("/home/member")
+        );
+    }
+
+    #[test]
     fn consent_fingerprint_tracks_only_what_runs() {
         let base = ServerEntry {
             id: "team_x".into(),
@@ -4430,9 +4572,36 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         };
         let fp = consent_fingerprint(&base);
+
+        let mut bound = base.clone();
+        bound.args.push("<launch-input>".into());
+        bound.launch = Some(crate::registry::LaunchConfig {
+            inputs: vec![crate::registry::LaunchInput {
+                key: "SID".into(),
+                label: "SID".into(),
+                secret: false,
+                required: true,
+                value: None,
+            }],
+            bindings: vec![crate::registry::ArgBinding {
+                index: 2,
+                parts: vec![crate::registry::ArgPart::Input { key: "SID".into() }],
+            }],
+            ..Default::default()
+        });
+        let before_binding_change = consent_fingerprint(&bound);
+        bound.launch.as_mut().unwrap().bindings[0]
+            .parts
+            .insert(0, crate::registry::ArgPart::Literal { value: "/".into() });
+        assert_ne!(
+            consent_fingerprint(&bound),
+            before_binding_change,
+            "changed launch binding needs review"
+        );
 
         let mut renamed = base.clone();
         renamed.name = "Y".into();

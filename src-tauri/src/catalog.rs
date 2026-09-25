@@ -7,6 +7,7 @@
 //! Both produce the same [`CatalogEntry`] shape, which the UI turns into a
 //! registry server with one click - the existing auth flow then handles creds.
 
+use crate::registry::{ArgBinding, ArgPart, LaunchConfig, LaunchInput};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -22,6 +23,8 @@ pub struct CatalogEntry {
     pub transport: String,
     pub command: Option<String>,
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<LaunchConfig>,
     pub url: Option<String>,
     /// Env-var names the server needs (treated as secrets when added).
     pub env_keys: Vec<String>,
@@ -66,13 +69,15 @@ fn category_for(name: &str) -> &'static str {
         | "Vercel (Full API)"
         | "Cloudflare (Full API)"
         | "Clerk (Full API)" => "Code & infrastructure",
-        "Supabase" | "Neon" | "PostgreSQL" | "MongoDB" | "Elasticsearch" | "Qdrant" => "Databases",
+        "Supabase" | "Neon" | "PostgreSQL" | "MongoDB" | "Elasticsearch" | "Qdrant" | "Redis" => {
+            "Databases"
+        }
         "Context7" | "DeepWiki" | "Hugging Face" | "OpenRouter" | "Parallel Search"
         | "Brave Search" | "Exa" | "Tavily" | "Perplexity" | "DataForSEO" => "Search & knowledge",
         "Firecrawl" | "Apify" | "Browserbase" => "Web & automation",
         "Stripe" | "Stripe (Full API)" | "Notion" | "Composio" | "Linear" | "Atlassian"
         | "Asana" | "Airtable" | "Todoist" | "Slack" | "Resend" | "Figma" | "Postiz" | "Twilio"
-        | "n8n" | "Langfuse" => "Apps & productivity",
+        | "n8n" | "Langfuse" | "Postman" => "Apps & productivity",
         "Filesystem"
         | "Fetch"
         | "Git"
@@ -135,6 +140,10 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
             "https://cloud.qdrant.io",
             "Create a free cluster, then copy its URL and an API key (Cluster > API Keys).",
         ),
+        "Redis" => (
+            "",
+            "Enter a redis:// or rediss:// connection URL in Launch setup. It is vaulted and passed as one argument.",
+        ),
         "Hugging Face" => (
             "https://huggingface.co/settings/tokens",
             "Authenticate when prompted, or paste a read token.",
@@ -150,7 +159,7 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
         ),
         "Twilio" => (
             "https://console.twilio.com",
-            "Create an API key (API Key SID + Secret) in the Twilio Console.",
+            "Copy your Account SID, API Key SID, and API Secret from the Twilio Console.",
         ),
         "Postiz" => (
             "https://postiz.pro/settings/developers",
@@ -159,15 +168,15 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
         // Config you supply (no single token page).
         "PostgreSQL" => (
             "",
-            "Add your Postgres connection string (postgres://user:pass@host/db) to the server's arguments.",
+            "Enter your Postgres connection URL in Launch setup. It is vaulted and passed as one argument.",
         ),
         "Kubernetes" => ("", "Uses your local kubeconfig (~/.kube/config); nothing to paste."),
         "Filesystem" => (
             "",
-            "No credential. After adding, point it at the directories the agent may access.",
+            "Enter one allowed directory in Launch setup. Add more directories as literal arguments if needed.",
         ),
         // OAuth: authorize in the browser, no manual token.
-        "GitHub" | "Vercel" | "Sentry" | "Notion" | "Linear" | "Stripe" => (
+        "GitHub" | "Vercel" | "Sentry" | "Notion" | "Linear" | "Stripe" | "Postman" => (
             "",
             "OAuth: click Authenticate when prompted; no manual token needed.",
         ),
@@ -189,6 +198,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         transport: "http".to_string(),
         command: None,
         args: vec![],
+        launch: None,
         url: Some(url.to_string()),
         env_keys: vec![],
         source: "curated".to_string(),
@@ -209,6 +219,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         transport: "http".to_string(),
         command: None,
         args: vec![],
+        launch: None,
         url: None,
         env_keys: vec![],
         source: "curated".to_string(),
@@ -227,6 +238,7 @@ pub fn curated() -> Vec<CatalogEntry> {
             transport: "stdio".to_string(),
             command: Some(command.to_string()),
             args: args.iter().map(|s| s.to_string()).collect(),
+            launch: None,
             url: None,
             env_keys: env.iter().map(|s| s.to_string()).collect(),
             source: "curated".to_string(),
@@ -251,43 +263,45 @@ pub fn curated() -> Vec<CatalogEntry> {
         http("Cloudflare Docs", "Search Cloudflare's documentation.", "https://docs.mcp.cloudflare.com/mcp", "https://developers.cloudflare.com/agents/model-context-protocol/"),
         cmd("Cloudflare (Full API)", "Toolport overlay: 357 Cloudflare control-plane endpoints as named tools (DNS, email routing, zones, WAF, SSL, cache, R2, Access) for per-tool approval.", "npx", &["-y", "toolport-mcp-servers", "cloudflare"], &["CLOUDFLARE_API_TOKEN"], "https://github.com/btsouth/toolport-mcp-servers"),
         cmd("Clerk (Full API)", "Toolport overlay: 224 Clerk Backend API endpoints (users, orgs, sessions, invitations), vs the official 2-tool docs server.", "npx", &["-y", "toolport-mcp-servers", "clerk"], &["CLERK_SECRET_KEY"], "https://github.com/btsouth/toolport-mcp-servers"),
-        cmd("AWS", "AWS APIs, docs, and best practices via AWS Labs MCP.", "uvx", &["awslabs.core-mcp-server@latest"], &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"], "https://github.com/awslabs/mcp"),
+        cmd("AWS", "AWS service APIs through the AWS Labs API MCP server.", "uvx", &["awslabs.aws-api-mcp-server@latest"], &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"], "https://github.com/awslabs/mcp"),
         cmd("Kubernetes", "Inspect and manage Kubernetes clusters via your kubeconfig.", "npx", &["-y", "mcp-server-kubernetes"], &[], "https://github.com/Flux159/mcp-server-kubernetes"),
         cmd("Linode", "Manage Linode (Akamai) cloud: instances, volumes, NodeBalancers, databases, and networking.", "npx", &["-y", "@takashito/linode-mcp-server"], &["LINODE_API_TOKEN"], "https://github.com/takashito/linode-mcp-server"),
         cmd("Chrome DevTools", "Control and inspect a live Chrome browser: traces, screenshots, network, console.", "npx", &["-y", "chrome-devtools-mcp@latest"], &[], "https://github.com/ChromeDevTools/chrome-devtools-mcp"),
         // --- Databases ---
         http("Supabase", "Query and manage your Supabase projects.", "https://mcp.supabase.com/mcp", "https://supabase.com/docs/guides/getting-started/mcp"),
         http("Neon", "Serverless Postgres: branches, queries, projects.", "https://mcp.neon.tech/mcp", "https://neon.tech/docs/ai/neon-mcp-server"),
-        cmd("PostgreSQL", "Query a Postgres database (add your connection string to args).", "npx", &["-y", "@modelcontextprotocol/server-postgres"], &[], "https://github.com/modelcontextprotocol/servers"),
+        cmd("PostgreSQL", "Query a Postgres database (requires a connection URL).", "npx", &["-y", "@modelcontextprotocol/server-postgres", "<launch-input>"], &[], "https://github.com/modelcontextprotocol/servers-archived"),
         cmd("MongoDB", "Query and manage MongoDB databases.", "npx", &["-y", "mongodb-mcp-server"], &["MDB_MCP_CONNECTION_STRING"], "https://github.com/mongodb-js/mongodb-mcp-server"),
         cmd("Elasticsearch", "Search and analytics over your Elasticsearch cluster.", "npx", &["-y", "@elastic/mcp-server-elasticsearch"], &["ES_URL", "ES_API_KEY"], "https://github.com/elastic/mcp-server-elasticsearch"),
-        cmd("Qdrant", "Vector search and memory for RAG: store and query embeddings in Qdrant.", "uvx", &["mcp-server-qdrant"], &["QDRANT_URL", "QDRANT_API_KEY"], "https://github.com/qdrant/mcp-server-qdrant"),
+        cmd("Qdrant", "Vector search and memory for RAG: store and query embeddings in Qdrant.", "uvx", &["mcp-server-qdrant"], &["QDRANT_URL", "QDRANT_API_KEY", "COLLECTION_NAME"], "https://github.com/qdrant/mcp-server-qdrant"),
+        cmd("Redis", "Inspect and manage a Redis database.", "uvx", &["--from", "redis-mcp-server@latest", "redis-mcp-server", "--url", "<launch-input>"], &[], "https://github.com/redis/mcp-redis"),
         // --- Project management & docs ---
         http("Notion", "Search and edit Notion pages and databases.", "https://mcp.notion.com/mcp", "https://developers.notion.com"),
+        http("Postman", "Manage Postman workspaces, collections, and environments.", "https://mcp.postman.com/minimal", "https://github.com/postmanlabs/postman-mcp-server"),
         http("Composio", "Connect AI agents to 1,000+ apps (Gmail, Slack, GitHub, Notion, Linear, and more).", "https://connect.composio.dev/mcp", "https://composio.dev"),
         http("Linear", "Issues, projects, and cycles in Linear.", "https://mcp.linear.app/mcp", "https://linear.app/docs"),
-        http("Atlassian", "Jira issues and Confluence pages.", "https://mcp.atlassian.com/v1/mcp/authv2", "https://support.atlassian.com/atlassian-rovo-mcp-server/"),
+        http("Atlassian", "Jira issues and Confluence pages.", "https://mcp.atlassian.com/v2/mcp?tools=all", "https://support.atlassian.com/atlassian-ai-gateway/docs/get-started-with-the-atlassian-remote-mcp-server/"),
         http("Asana", "Tasks, projects, and portfolios in Asana.", "https://mcp.asana.com/mcp", "https://developers.asana.com/docs/mcp-server"),
         cmd("Airtable", "Read and write records in your Airtable bases.", "npx", &["-y", "airtable-mcp-server"], &["AIRTABLE_API_KEY"], "https://github.com/domdomegg/airtable-mcp-server"),
         cmd("Todoist", "Manage Todoist tasks and projects.", "npx", &["-y", "@abhiz123/todoist-mcp-server"], &["TODOIST_API_TOKEN"], "https://github.com/abhiz123/todoist-mcp-server"),
         // --- Communication ---
         cmd("Slack", "Read and send Slack messages and manage channels.", "npx", &["-y", "@modelcontextprotocol/server-slack"], &["SLACK_BOT_TOKEN", "SLACK_TEAM_ID"], "https://github.com/modelcontextprotocol/servers"),
-        cmd("Twilio", "Send SMS, make calls, and manage Twilio messaging and voice.", "npx", &["-y", "@twilio-alpha/mcp"], &["TWILIO_API_KEY", "TWILIO_API_SECRET"], "https://github.com/twilio-labs/mcp"),
+        cmd("Twilio", "Send SMS, make calls, and manage Twilio messaging and voice.", "npx", &["-y", "@twilio-alpha/mcp", "<launch-input>"], &[], "https://github.com/twilio-labs/mcp"),
         http("Postiz", "Schedule and publish social media posts across platforms.", "https://api.postiz.com/mcp", "https://postiz.pro"),
         // --- Knowledge & search ---
         http("Context7", "Up-to-date docs and code examples for libraries.", "https://mcp.context7.com/mcp", "https://github.com/upstash/context7"),
         http("DeepWiki", "Ask questions about any public GitHub repo. No auth.", "https://mcp.deepwiki.com/mcp", "https://deepwiki.com"),
         http("Hugging Face", "Models, datasets, and Spaces on Hugging Face.", "https://huggingface.co/mcp", "https://huggingface.co/settings/mcp"),
         http("OpenRouter", "Live model intelligence: list and compare models, prices, and your credits.", "https://mcp.openrouter.ai/mcp", "https://openrouter.ai/docs/mcp-server"),
-        http("Parallel Search", "Live web search and clean content from URLs. No account or API key required.", "https://search.parallel.ai/mcp", "https://docs.parallel.ai/search/mcp-server/quickstart"),
-        cmd("Brave Search", "Web search via the Brave Search API.", "npx", &["-y", "@modelcontextprotocol/server-brave-search"], &["BRAVE_API_KEY"], "https://github.com/modelcontextprotocol/servers"),
+        http("Parallel Search", "Live web search and clean content from URLs. No account or API key required.", "https://search.parallel.ai/mcp", "https://docs.parallel.ai/integrations/mcp/search-mcp"),
+        cmd("Brave Search", "Web search via the Brave Search API.", "npx", &["-y", "@brave/brave-search-mcp-server"], &["BRAVE_API_KEY"], "https://github.com/brave/brave-search-mcp-server"),
         cmd("Exa", "AI-native web search built for agents.", "npx", &["-y", "exa-mcp-server"], &["EXA_API_KEY"], "https://github.com/exa-labs/exa-mcp-server"),
         cmd("Tavily", "Web search and content extraction built for LLMs.", "npx", &["-y", "tavily-mcp"], &["TAVILY_API_KEY"], "https://github.com/tavily-ai/tavily-mcp"),
-        cmd("Perplexity", "Ask Perplexity for cited, up-to-date answers.", "npx", &["-y", "server-perplexity-ask"], &["PERPLEXITY_API_KEY"], "https://github.com/ppl-ai/modelcontextprotocol"),
+        cmd("Perplexity", "Ask Perplexity for cited, up-to-date answers.", "npx", &["-y", "@perplexity-ai/mcp-server"], &["PERPLEXITY_API_KEY"], "https://github.com/perplexityai/modelcontextprotocol"),
         cmd("DataForSEO", "SEO data: SERP tracking, keyword research, and competitor analysis.", "npx", &["-y", "dataforseo-mcp-server"], &["DATAFORSEO_USERNAME", "DATAFORSEO_PASSWORD"], "https://dataforseo.com"),
         cmd("Firecrawl", "Web scraping and data extraction from websites.", "npx", &["-y", "firecrawl-mcp"], &["FIRECRAWL_API_KEY"], "https://github.com/firecrawl/firecrawl-mcp-server"),
         cmd("Apify", "Run Apify actors for web scraping and automation.", "npx", &["-y", "@apify/actors-mcp-server"], &["APIFY_TOKEN"], "https://github.com/apify/actors-mcp-server"),
-        cmd("Browserbase", "Cloud headless browsers agents can drive.", "npx", &["-y", "@browserbasehq/mcp-server-browserbase"], &["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"], "https://github.com/browserbase/mcp-server-browserbase"),
+        cmd("Browserbase", "Cloud headless browsers agents can drive.", "npx", &["-y", "@browserbasehq/mcp"], &["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "GEMINI_API_KEY"], "https://github.com/browserbase/mcp-server-browserbase"),
         // --- Email & comms already above; Design ---
         cmd("Figma", "Turn Figma designs into code (Framelink).", "npx", &["-y", "figma-developer-mcp", "--stdio"], &["FIGMA_API_KEY"], "https://github.com/GLips/Figma-Context-MCP"),
         // --- Email ---
@@ -296,7 +310,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         self_hosted("n8n", "Trigger, manage, and edit n8n workflows via MCP.", "https://your-instance.com/mcp-server/http", "https://n8n.io"),
         self_hosted("Langfuse", "Prompt management and observability for LLM apps.", "https://your-langfuse.com/mcp", "https://langfuse.com"),
         // --- Local utilities (no account needed) ---
-        cmd("Filesystem", "Read and write files in directories you allow.", "npx", &["-y", "@modelcontextprotocol/server-filesystem"], &[], "https://github.com/modelcontextprotocol/servers"),
+        cmd("Filesystem", "Read and write files in directories you allow.", "npx", &["-y", "@modelcontextprotocol/server-filesystem", "<launch-input>"], &[], "https://github.com/modelcontextprotocol/servers"),
         cmd("Fetch", "Fetch a URL and return its content as markdown.", "uvx", &["mcp-server-fetch"], &[], "https://github.com/modelcontextprotocol/servers"),
         cmd("Git", "Read, search, and manipulate a local Git repo.", "uvx", &["mcp-server-git"], &[], "https://github.com/modelcontextprotocol/servers"),
         cmd("Playwright", "Drive a real browser for testing and scraping.", "npx", &["-y", "@playwright/mcp@latest"], &[], "https://github.com/microsoft/playwright-mcp"),
@@ -305,6 +319,122 @@ pub fn curated() -> Vec<CatalogEntry> {
         cmd("Time", "Current time and timezone conversions.", "uvx", &["mcp-server-time"], &[], "https://github.com/modelcontextprotocol/servers"),
     ];
     for e in &mut list {
+        let template = e
+            .name
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>();
+        let mut launch = LaunchConfig {
+            template: Some(template),
+            revision: Some(1),
+            ..Default::default()
+        };
+        let mut add_input = |key: &str, label: &str, secret: bool| {
+            launch.inputs.push(LaunchInput {
+                key: key.into(),
+                label: label.into(),
+                secret,
+                required: true,
+                value: None,
+            });
+        };
+        match e.name.as_str() {
+            "Twilio" => {
+                add_input("TWILIO_ACCOUNT_SID", "Account SID", false);
+                add_input("TWILIO_API_KEY", "API Key SID", true);
+                add_input("TWILIO_API_SECRET", "API Secret", true);
+                launch.bindings.push(ArgBinding {
+                    index: 2,
+                    parts: vec![
+                        ArgPart::Input {
+                            key: "TWILIO_ACCOUNT_SID".into(),
+                        },
+                        ArgPart::Literal { value: "/".into() },
+                        ArgPart::Input {
+                            key: "TWILIO_API_KEY".into(),
+                        },
+                        ArgPart::Literal { value: ":".into() },
+                        ArgPart::Input {
+                            key: "TWILIO_API_SECRET".into(),
+                        },
+                    ],
+                });
+                launch.revision = Some(2);
+            }
+            "PostgreSQL" => {
+                add_input("POSTGRES_URL", "Postgres connection URL", true);
+                launch.bindings.push(ArgBinding {
+                    index: 2,
+                    parts: vec![ArgPart::Input {
+                        key: "POSTGRES_URL".into(),
+                    }],
+                });
+                launch.revision = Some(2);
+            }
+            "Redis" => {
+                add_input("REDIS_URL", "Redis connection URL", true);
+                launch.bindings.push(ArgBinding {
+                    index: 4,
+                    parts: vec![ArgPart::Input {
+                        key: "REDIS_URL".into(),
+                    }],
+                });
+            }
+            "Filesystem" => {
+                add_input("ALLOWED_DIRECTORY", "Allowed directory", false);
+                launch.bindings.push(ArgBinding {
+                    index: 2,
+                    parts: vec![ArgPart::Input {
+                        key: "ALLOWED_DIRECTORY".into(),
+                    }],
+                });
+                launch.revision = Some(2);
+            }
+            "Browserbase" => {
+                launch.required_env = vec![
+                    "BROWSERBASE_API_KEY".into(),
+                    "BROWSERBASE_PROJECT_ID".into(),
+                    "GEMINI_API_KEY".into(),
+                ];
+                launch.revision = Some(2);
+            }
+            "Qdrant" => {
+                launch.required_env = vec!["QDRANT_URL".into(), "COLLECTION_NAME".into()];
+                launch.revision = Some(2);
+            }
+            "AWS" => launch.revision = Some(2),
+            "Atlassian" => launch.revision = Some(2),
+            "Perplexity" | "Brave Search" => launch.revision = Some(2),
+            _ => {}
+        }
+        // These stdio packages cannot authenticate or complete setup without
+        // their declared keys. Optional/alternative credentials (AWS's provider
+        // chain, MongoDB's connect-later flow, Qdrant's API key) stay optional.
+        if matches!(
+            e.name.as_str(),
+            "Stripe (Full API)"
+                | "Vercel (Full API)"
+                | "Cloudflare (Full API)"
+                | "Clerk (Full API)"
+                | "Linode"
+                | "Elasticsearch"
+                | "Airtable"
+                | "Todoist"
+                | "Slack"
+                | "Brave Search"
+                | "Exa"
+                | "Tavily"
+                | "Perplexity"
+                | "DataForSEO"
+                | "Firecrawl"
+                | "Apify"
+                | "Figma"
+                | "Resend"
+        ) {
+            launch.required_env = e.env_keys.clone();
+        }
+        e.launch = Some(launch);
         e.category = category_for(&e.name).to_string();
         if let Some((url, hint)) = credentials_for(&e.name) {
             e.credentials_url = (!url.is_empty()).then(|| url.to_string());
@@ -531,6 +661,7 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
                 transport: transport.to_string(),
                 command: None,
                 args: vec![],
+                launch: None,
                 url: Some(url.to_string()),
                 env_keys: vec![],
                 source: "registry".to_string(),
@@ -620,6 +751,7 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
             transport: "stdio".to_string(),
             command: Some(command),
             args,
+            launch: None,
             url: None,
             env_keys,
             source: "registry".to_string(),
@@ -759,14 +891,14 @@ mod tests {
     }
 
     #[test]
-    fn atlassian_uses_the_authv2_endpoint() {
+    fn atlassian_uses_the_current_v2_gateway_endpoint() {
         let atlassian = curated()
             .into_iter()
             .find(|entry| entry.name == "Atlassian")
             .expect("Atlassian must remain in the curated catalog");
         assert_eq!(
             atlassian.url.as_deref(),
-            Some("https://mcp.atlassian.com/v1/mcp/authv2")
+            Some("https://mcp.atlassian.com/v2/mcp?tools=all")
         );
     }
 
@@ -781,6 +913,7 @@ mod tests {
             "Qdrant",
             "MongoDB",
             "PostgreSQL",
+            "Redis",
         ] {
             assert!(
                 databases.iter().any(|e| e.name == name),
@@ -797,6 +930,7 @@ mod tests {
             productivity.iter().any(|e| e.name == "Linear"),
             "searching 'productivity' should include Apps & productivity members"
         );
+        assert!(productivity.iter().any(|e| e.name == "Postman"));
 
         let infrastructure = filter_catalog(c, "infrastructure");
         assert!(
@@ -817,6 +951,7 @@ mod tests {
             transport: "http".into(),
             command: None,
             args: vec![],
+            launch: None,
             url: Some("https://example.com/mcp".into()),
             env_keys: vec![],
             source: "registry".into(),
@@ -1177,5 +1312,78 @@ mod tests {
             entry.url_hint.is_none(),
             "registry entries should not have url_hint"
         );
+    }
+
+    #[test]
+    fn curated_launch_references_are_complete_and_templates_stable() {
+        let entries = curated();
+        let mut templates = std::collections::HashSet::new();
+        for entry in &entries {
+            let launch = entry.launch.as_ref().expect("curated template identity");
+            assert!(templates.insert(launch.template.as_deref().unwrap()));
+            launch.validate(&entry.args, true).unwrap();
+            assert!(launch
+                .required_env
+                .iter()
+                .all(|key| entry.env_keys.contains(key)));
+        }
+        let mut bad = entries.into_iter().find(|e| e.name == "Twilio").unwrap();
+        bad.launch.as_mut().unwrap().bindings[0]
+            .parts
+            .push(ArgPart::Input {
+                key: "MISSING".into(),
+            });
+        assert!(bad.launch.unwrap().validate(&bad.args, true).is_err());
+        let mut unused = curated().into_iter().find(|e| e.name == "Twilio").unwrap();
+        unused.launch.as_mut().unwrap().inputs.push(LaunchInput {
+            key: "UNUSED".into(),
+            label: "Unused".into(),
+            secret: false,
+            required: true,
+            value: None,
+        });
+        assert!(unused.launch.unwrap().validate(&unused.args, true).is_err());
+        let mut missing_binding = curated().into_iter().find(|e| e.name == "Twilio").unwrap();
+        missing_binding.launch.as_mut().unwrap().bindings.clear();
+        assert!(missing_binding
+            .launch
+            .unwrap()
+            .validate(&missing_binding.args, true)
+            .is_err());
+    }
+
+    #[test]
+    fn redis_and_postman_have_documented_launch_shapes() {
+        let entries = curated();
+        let redis = entries.iter().find(|e| e.name == "Redis").unwrap();
+        assert_eq!(redis.category, "Databases");
+        assert_eq!(redis.command.as_deref(), Some("uvx"));
+        assert_eq!(
+            redis.args,
+            [
+                "--from",
+                "redis-mcp-server@latest",
+                "redis-mcp-server",
+                "--url",
+                "<launch-input>",
+            ]
+        );
+        let launch = redis.launch.as_ref().unwrap();
+        assert_eq!(launch.template.as_deref(), Some("redis"));
+        assert_eq!(launch.revision, Some(1));
+        assert_eq!(launch.inputs.len(), 1);
+        assert_eq!(launch.inputs[0].key, "REDIS_URL");
+        assert!(launch.inputs[0].secret && launch.inputs[0].required);
+        assert_eq!(launch.bindings[0].index, 4);
+
+        let postman = entries.iter().find(|e| e.name == "Postman").unwrap();
+        assert_eq!(postman.transport, "http");
+        assert_eq!(
+            postman.url.as_deref(),
+            Some("https://mcp.postman.com/minimal")
+        );
+        assert!(postman.command.is_none());
+        assert_eq!(postman.category, "Apps & productivity");
+        assert!(postman.setup_hint.as_deref().unwrap().contains("OAuth"));
     }
 }

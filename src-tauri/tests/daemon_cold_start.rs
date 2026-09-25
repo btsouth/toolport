@@ -64,7 +64,12 @@ fn json_body(response: ureq::Response) -> serde_json::Value {
     }
 }
 
-fn post_mcp(endpoint: &str, token: &str, session: Option<&str>, body: &serde_json::Value) -> ureq::Response {
+fn post_mcp(
+    endpoint: &str,
+    token: &str,
+    session: Option<&str>,
+    body: &serde_json::Value,
+) -> ureq::Response {
     let mut request = ureq::post(&format!("http://{endpoint}/mcp"))
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json")
@@ -109,7 +114,10 @@ fn daemon_cold_start_serves_identity_and_an_mcp_session() {
         );
         std::thread::sleep(Duration::from_millis(50));
     };
-    let endpoint = descriptor["endpoint"].as_str().expect("endpoint").to_string();
+    let endpoint = descriptor["endpoint"]
+        .as_str()
+        .expect("endpoint")
+        .to_string();
     let token = descriptor["token"].as_str().expect("token").to_string();
     let compat = descriptor["compat"].as_str().expect("compat").to_string();
 

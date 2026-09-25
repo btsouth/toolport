@@ -40,6 +40,9 @@ pub(crate) fn build_export(
             for entry in &mut server.env {
                 entry.value = None;
             }
+            if let Some(launch) = &server.launch {
+                server.launch = Some(launch.without_values());
+            }
             let mask = registry::secret_arg_mask(&server.args);
             for (argument, secret) in server.args.iter_mut().zip(mask) {
                 if secret {
@@ -111,6 +114,9 @@ pub(crate) fn apply_import_selected(
         server.id.clear();
         for entry in &mut server.env {
             entry.value = None;
+        }
+        if let Some(launch) = &server.launch {
+            server.launch = Some(launch.without_values());
         }
         server.source = Some("shared".to_string());
         to_add.push(server);
@@ -384,17 +390,44 @@ mod controller_tests {
         ]});
 
         assert_eq!(apply_import(&mut registry, &json.to_string()).unwrap(), 2);
-        assert_eq!(
-            registry.servers[0].request_timeout_ms,
-            Some(90_000)
-        );
-        assert_eq!(
-            registry.servers[1].request_timeout_ms,
-            Some(120_000)
-        );
+        assert_eq!(registry.servers[0].request_timeout_ms, Some(90_000));
+        assert_eq!(registry.servers[1].request_timeout_ms, Some(120_000));
         let exported = build_export(&registry, None, None, None);
         let servers = exported["servers"].as_array().unwrap();
         assert_eq!(servers[0]["requestTimeoutMs"], 90_000);
         assert_eq!(servers[1]["requestTimeoutMs"], 120_000);
+    }
+
+    #[test]
+    fn share_round_trip_preserves_bindings_but_strips_all_input_values() {
+        let mut registry = Registry::default();
+        let catalog = crate::catalog::curated()
+            .into_iter()
+            .find(|entry| entry.name == "Twilio")
+            .unwrap();
+        let mut server: ServerEntry = serde_json::from_value(serde_json::json!({
+            "id":"twilio", "name":"Twilio", "transport":"stdio", "command":catalog.command,
+            "args":catalog.args, "source":"catalog:curated"
+        }))
+        .unwrap();
+        server.launch = catalog.launch;
+        let launch = server.launch.as_mut().unwrap();
+        launch.inputs[0].value = Some("ACprivate".into());
+        launch.inputs[2].value = Some("secret-private".into());
+        registry.servers.push(server);
+        let exported = build_export(&registry, None, None, None);
+        let serialized = exported.to_string();
+        assert!(!serialized.contains("ACprivate"));
+        assert!(!serialized.contains("secret-private"));
+        assert!(serialized.contains("arg") || serialized.contains("bindings"));
+        let mut imported = Registry::default();
+        assert_eq!(apply_import(&mut imported, &serialized).unwrap(), 1);
+        assert!(imported.servers[0]
+            .launch
+            .as_ref()
+            .unwrap()
+            .inputs
+            .iter()
+            .all(|input| input.value.is_none()));
     }
 }

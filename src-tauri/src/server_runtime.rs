@@ -55,12 +55,14 @@ pub fn connect_server(server: &ServerEntry) -> Result<DownstreamServer, String> 
             .cwd
             .as_deref()
             .and_then(|cwd| resolve_root_token(cwd, None));
-        let transport = StdioTransport::spawn(command, &server.args, &env, cwd.as_deref())?;
-        let mut transport = transport;
+        let resolved = crate::launch_inputs::resolve_args(server)?;
+        let mut transport = StdioTransport::spawn(command, &resolved.args, &env, cwd.as_deref())
+            .map_err(|error| resolved.redact(error))?;
         if let Some(timeout) = server.initialize_timeout()? {
             transport.set_connect_timeout(timeout);
         }
         DownstreamServer::connect(server.id.clone(), Box::new(transport))
+            .map_err(|error| resolved.redact(error))
     } else if server.url.is_some() {
         remote::connect_remote(server)
     } else {
@@ -158,6 +160,7 @@ pub fn probe_many(servers: Vec<ServerEntry>) -> Vec<ProbeResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::{ArgBinding, ArgPart, LaunchConfig, LaunchInput};
 
     fn server() -> ServerEntry {
         ServerEntry {
@@ -174,6 +177,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -243,5 +247,68 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|result| !result.ok));
+    }
+
+    #[test]
+    fn probe_passes_composed_launch_argument_to_real_stdio_child() {
+        let mut server = server();
+        server.command = Some("node".into());
+        server.args = vec![
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../fixtures/arg-server.mjs").into(),
+            "<launch-input>".into(),
+        ];
+        server.launch = Some(LaunchConfig {
+            inputs: vec![
+                LaunchInput {
+                    key: "ACCOUNT".into(),
+                    label: "Account".into(),
+                    secret: false,
+                    required: true,
+                    value: Some("account".into()),
+                },
+                LaunchInput {
+                    key: "KEY".into(),
+                    label: "Key".into(),
+                    secret: false,
+                    required: true,
+                    value: Some("key".into()),
+                },
+                LaunchInput {
+                    key: "SECRET".into(),
+                    label: "Secret".into(),
+                    secret: true,
+                    required: true,
+                    value: Some("secret".into()),
+                },
+            ],
+            bindings: vec![ArgBinding {
+                index: 1,
+                parts: vec![
+                    ArgPart::Input {
+                        key: "ACCOUNT".into(),
+                    },
+                    ArgPart::Literal { value: "/".into() },
+                    ArgPart::Input { key: "KEY".into() },
+                    ArgPart::Literal { value: ":".into() },
+                    ArgPart::Input {
+                        key: "SECRET".into(),
+                    },
+                ],
+            }],
+            ..Default::default()
+        });
+        let ready = probe_one(&server);
+        assert!(ready.ok, "{ready:?}");
+        assert_eq!(ready.tool_count, 1);
+
+        server.launch.as_mut().unwrap().inputs[2].value = Some("wrong-secret".into());
+        let rejected = probe_one(&server);
+        assert!(!rejected.ok);
+        assert!(!rejected.error.unwrap_or_default().contains("wrong-secret"));
+
+        server.launch.as_mut().unwrap().inputs[2].value = None;
+        let missing = probe_one(&server);
+        assert!(!missing.ok);
+        assert!(missing.error.unwrap_or_default().contains("Secret"));
     }
 }
