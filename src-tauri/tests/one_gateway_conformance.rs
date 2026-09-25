@@ -2103,7 +2103,14 @@ fn matrix_pooling_equal_resource_uris_keep_rooted_subscriptions_separate() {
             "root B received root A's resource update"
         );
     }
-    assert_eq!(transcript_initialize_count(&transcript), 2);
+    assert_eq!(
+        transcript_initialize_count(&transcript),
+        2,
+        "unexpected rooted downstream initialization\ntranscript:\n{}\nroot A:\n{}\nroot B:\n{}",
+        std::fs::read_to_string(&transcript).unwrap_or_default(),
+        a.diagnostics(),
+        b.diagnostics()
+    );
 }
 
 #[test]
