@@ -4328,15 +4328,23 @@ pub fn run() {
             // HttpBridgeState so a stopped bridge can be brought back (SOU-418).
             let migrate_handle = app.handle().clone();
             std::thread::spawn(move || {
+                // A data-dir override is a separate Toolport instance. Its bundled
+                // gateway and bridge belong to that instance, but the detected AI
+                // client configs and startup hooks live in the user's normal home.
+                // Do not redirect those clients to this instance on launch.
+                let isolated_data_dir =
+                    crate::brand::env_var_os("TOOLPORT_DATA_DIR", "CONDUIT_DATA_DIR").is_some();
                 // Prefer a quiet data-dir rename before publishing/repointing so the
                 // new bin path is under Toolport and client configs get that path.
                 // Gateways holding files open may block the rename; we then keep the
                 // legacy leaf and still repoint names/env keys.
-                if let Some(migrated) = registry::migrate_legacy_data_dir() {
-                    eprintln!(
-                        "toolport: migrated data directory to {}",
-                        migrated.display()
-                    );
+                if !isolated_data_dir {
+                    if let Some(migrated) = registry::migrate_legacy_data_dir() {
+                        eprintln!(
+                            "toolport: migrated data directory to {}",
+                            migrated.display()
+                        );
+                    }
                 }
                 if let Some(published) = crate::gateway_publish::publish_bundled_gateway() {
                     eprintln!(
@@ -4370,70 +4378,72 @@ pub fn run() {
                     ),
                 }
                 // Ownership map from disk (this launch thread has no RegistryState handle).
-                let managed_snapshot = registry::load()
-                    .map(|r| r.client_managed_entries)
-                    .unwrap_or_default();
-                let repoint = clients::repoint_stale_gateways(&managed_snapshot);
-                if !repoint.repointed.is_empty() {
-                    let ids: Vec<&str> = repoint
-                        .repointed
-                        .iter()
-                        .map(|(id, _)| id.as_str())
-                        .collect();
-                    eprintln!(
-                        "toolport: re-pointed {} client config(s) to the renamed gateway: {}",
-                        repoint.repointed.len(),
-                        ids.join(", ")
-                    );
-                    // Refresh ownership records for everything we rewrote (SOU-406).
-                    let _ = registry::update(|reg| {
-                        for (id, entry) in &repoint.repointed {
-                            reg.set_client_managed_entry(id, entry.clone());
-                        }
-                        Ok(())
-                    });
-                }
-                if !repoint.customized.is_empty() {
-                    eprintln!(
-                        "toolport: left {} client config(s) alone (custom configuration): {}",
-                        repoint.customized.len(),
-                        repoint.customized.join(", ")
-                    );
-                }
-                if !repoint.failed.is_empty() {
-                    // A client that needed migrating and could not be written stays
-                    // on a superseded gateway until someone notices. Keep it
-                    // distinguishable from "nothing to do" at the call site too,
-                    // not just in the gateway log.
-                    eprintln!(
-                        "toolport: FAILED to re-point {} client config(s); they will keep \
-                         launching their previous gateway: {}",
-                        repoint.failed.len(),
-                        repoint
-                            .failed
+                if !isolated_data_dir {
+                    let managed_snapshot = registry::load()
+                        .map(|r| r.client_managed_entries)
+                        .unwrap_or_default();
+                    let repoint = clients::repoint_stale_gateways(&managed_snapshot);
+                    if !repoint.repointed.is_empty() {
+                        let ids: Vec<&str> = repoint
+                            .repointed
                             .iter()
-                            .map(|(id, why)| format!("{id} ({why})"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
+                            .map(|(id, _)| id.as_str())
+                            .collect();
+                        eprintln!(
+                            "toolport: re-pointed {} client config(s) to the renamed gateway: {}",
+                            repoint.repointed.len(),
+                            ids.join(", ")
+                        );
+                        // Refresh ownership records for everything we rewrote (SOU-406).
+                        let _ = registry::update(|reg| {
+                            for (id, entry) in &repoint.repointed {
+                                reg.set_client_managed_entry(id, entry.clone());
+                            }
+                            Ok(())
+                        });
+                    }
+                    if !repoint.customized.is_empty() {
+                        eprintln!(
+                            "toolport: left {} client config(s) alone (custom configuration): {}",
+                            repoint.customized.len(),
+                            repoint.customized.join(", ")
+                        );
+                    }
+                    if !repoint.failed.is_empty() {
+                        // A client that needed migrating and could not be written stays
+                        // on a superseded gateway until someone notices. Keep it
+                        // distinguishable from "nothing to do" at the call site too,
+                        // not just in the gateway log.
+                        eprintln!(
+                            "toolport: FAILED to re-point {} client config(s); they will keep \
+                             launching their previous gateway: {}",
+                            repoint.failed.len(),
+                            repoint
+                                .failed
+                                .iter()
+                                .map(|(id, why)| format!("{id} ({why})"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    // Re-assert the user's personal agent rules (SBS-821), on this same launch
+                    // thread because it is the one already allowed to touch client files on disk.
+                    // Picks up a client installed, reinstalled, or updated since the last apply
+                    // without the user opening the Rules tab. Cheap and quiet: it returns before
+                    // scanning anything when no rule set is configured and nothing was ever
+                    // written, and `write_target` no-ops when a client's block already matches, so
+                    // a steady-state launch touches no files.
+                    rules::apply_on_startup();
+                    // Same launch thread, same reason, for the agent hook sensor (SBS-822).
+                    // This one additionally repairs the binary path after an update: the
+                    // published gateway is versioned and the reaper prunes superseded
+                    // builds, so hooks written before an update would name a binary that
+                    // no longer exists. Returns immediately when the sensor was never
+                    // turned on.
+                    hooks::apply_on_startup();
+                    agent_permissions::apply_on_startup();
+                    agent_guard::apply_on_startup();
                 }
-                // Re-assert the user's personal agent rules (SBS-821), on this same launch
-                // thread because it is the one already allowed to touch client files on disk.
-                // Picks up a client installed, reinstalled, or updated since the last apply
-                // without the user opening the Rules tab. Cheap and quiet: it returns before
-                // scanning anything when no rule set is configured and nothing was ever
-                // written, and `write_target` no-ops when a client's block already matches, so
-                // a steady-state launch touches no files.
-                rules::apply_on_startup();
-                // Same launch thread, same reason, for the agent hook sensor (SBS-822).
-                // This one additionally repairs the binary path after an update: the
-                // published gateway is versioned and the reaper prunes superseded
-                // builds, so hooks written before an update would name a binary that
-                // no longer exists. Returns immediately when the sensor was never
-                // turned on.
-                hooks::apply_on_startup();
-                agent_permissions::apply_on_startup();
-                agent_guard::apply_on_startup();
 
                 // Stop obsolete gateway processes. Path-based identity on all OS
                 // (SOU-414); not gated on repoint (SOU-306).
