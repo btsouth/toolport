@@ -31014,13 +31014,30 @@ mod tests {
         .unwrap();
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("Found"));
-        let trace = searchtrace::read_recent(1).unwrap().pop().unwrap();
+        // Other tests can append telemetry while this one holds the data-dir
+        // override, so the last row need not belong to this search.
+        let trace = searchtrace::read_recent(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .find(|entry| {
+                entry["query"] == "charges"
+                    && entry["responseContentBytes"].as_u64() == Some(text.len() as u64)
+            })
+            .expect("trace for this search");
         assert_eq!(trace["responseContentBytes"], text.len());
         assert!(
             trace["responseContentBytes"].as_u64().unwrap()
                 > trace["matchedSchemaBytes"].as_u64().unwrap()
         );
-        let discovery = savings::entries().pop().unwrap();
+        let discovery = savings::entries()
+            .into_iter()
+            .rev()
+            .find(|entry| {
+                entry["kind"] == "discovery_response"
+                    && entry["responseContentBytes"] == trace["responseContentBytes"]
+                    && entry["matchedSchemaBytes"] == trace["matchedSchemaBytes"]
+            })
+            .expect("savings entry for this search");
         assert_eq!(discovery["kind"], "discovery_response");
         assert_eq!(discovery["responseContentBytes"], text.len());
         let _ = std::fs::remove_dir_all(dir);

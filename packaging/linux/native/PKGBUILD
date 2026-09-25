@@ -1,7 +1,7 @@
 # Maintainer: Tyler South <tsouth2@gmail.com>
 # The archive is expected to unpack to toolport-$pkgver.
 pkgname=toolport
-pkgver=1.21.0
+pkgver=1.21.1
 pkgrel=1
 pkgdesc='One local MCP gateway for every AI client, with a native GTK shell'
 arch=('x86_64')
