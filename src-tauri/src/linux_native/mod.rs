@@ -2927,6 +2927,7 @@ struct ActivityPage {
     identity_search: gtk::SearchEntry,
     updating_filters: std::rc::Rc<std::cell::Cell<bool>>,
     savings_banner: gtk::Box,
+    savings_title: gtk::Label,
     savings_value: gtk::Label,
     savings_unit: gtk::Label,
     savings_detail: gtk::Label,
@@ -3032,7 +3033,7 @@ impl ActivityPage {
             ("–", "Retained calls"),
             ("–", "Success rate"),
             ("–", "Average latency"),
-            ("–", "Est. schema token-equivalent"),
+            ("–", "Tokens saved (est.)"),
         ] {
             let (item, value) = summary_item(value, label);
             values.push(value);
@@ -3075,14 +3076,12 @@ impl ActivityPage {
         savings_banner.add_css_class("toolport-card");
         savings_banner.set_visible(false);
         let savings_header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        savings_header.append(
-            &gtk::Label::builder()
-                .label("MCP catalog and discovery")
-                .halign(gtk::Align::Start)
-                .hexpand(true)
-                .css_classes(["heading"])
-                .build(),
-        );
+        let savings_title = gtk::Label::builder()
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .css_classes(["heading"])
+            .build();
+        savings_header.append(&savings_title);
         let savings_share = gtk::Button::with_label("Share");
         savings_share.add_css_class("toolport-secondary-action");
         savings_share.set_valign(gtk::Align::Center);
@@ -3096,7 +3095,7 @@ impl ActivityPage {
             .build();
         savings_row.append(&savings_value);
         let savings_unit = gtk::Label::builder()
-            .label("estimated token-equivalent of MCP definitions")
+            .label("tokens of tool definitions kept out of agent context")
             .halign(gtk::Align::Fill)
             .xalign(0.0)
             .valign(gtk::Align::End)
@@ -3272,6 +3271,7 @@ impl ActivityPage {
             identity_search,
             updating_filters: std::rc::Rc::new(std::cell::Cell::new(false)),
             savings_banner,
+            savings_title,
             savings_value,
             savings_unit,
             savings_detail,
@@ -3495,7 +3495,7 @@ impl ActivityPage {
             "–".to_string()
         });
         self.tokens_saved.set_tooltip_text(Some(
-            "Estimated token-equivalent of serialized MCP tool definitions avoided at catalog loads. Actual model usage depends on the client and caching.",
+            "Tool-definition tokens Toolport kept out of your agent's context, estimated from their serialized size. Actual model usage depends on the client and caching.",
         ));
         self.feedback.set_label("");
         self.feedback.remove_css_class("error");
@@ -3794,6 +3794,8 @@ impl ActivityPage {
         }
         self.savings_banner.set_visible(true);
         let has_catalog = snapshot.savings_list_loads > 0;
+        self.savings_title
+            .set_label(savings_title(snapshot.savings_list_loads));
         let (primary, unit) = savings_primary_display(
             snapshot.tokens_saved,
             snapshot.savings_list_loads,
@@ -3812,7 +3814,7 @@ impl ActivityPage {
         };
         if snapshot.savings_list_loads > 0 {
             detail.push_str(&format!(
-                " · ≈{} estimated/load",
+                " · ≈{} per load",
                 state::format_token_count(snapshot.tokens_saved / snapshot.savings_list_loads)
             ));
         }
@@ -4560,7 +4562,7 @@ fn trace_token_line(trace: &serde_json::Value) -> String {
             .get("catalogSchemaBytes")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        return format!("Returned {} of discovery content containing {schemas} matching schemas; full scoped catalog schemas: {}. ≈{} token-equivalent (UTF-8 bytes ÷ 4).",
+        return format!("Returned {} of discovery content containing {schemas} matching schemas; full scoped catalog schemas: {}. ≈{} tokens (UTF-8 bytes ÷ 4).",
             format_byte_count(bytes), format_byte_count(catalog),
             state::format_token_count(bytes.div_ceil(4)));
     }
@@ -4723,6 +4725,14 @@ fn savings_banner_visible(loads: u64, searches: u64) -> bool {
     loads > 0 || searches > 0
 }
 
+fn savings_title(loads: u64) -> &'static str {
+    if loads == 0 {
+        "Discovery payload returned"
+    } else {
+        "Tool definitions kept out of your agent's context"
+    }
+}
+
 fn savings_primary_display(
     tokens_saved: u64,
     loads: u64,
@@ -4736,7 +4746,7 @@ fn savings_primary_display(
     }
     (
         format!("≈ {}", state::format_token_count(tokens_saved)),
-        "estimated token-equivalent of MCP definitions",
+        "tokens of tool definitions kept out of agent context",
     )
 }
 
@@ -4744,7 +4754,7 @@ fn savings_share_line(tokens_saved: u64, loads: u64, searches: u64, bytes: u64) 
     if loads == 0 {
         return format!("Toolport recorded {searches} discovery searches returning {} of text at its MCP boundary. toolport.app", format_byte_count(bytes));
     }
-    format!("Toolport's catalog loads avoided exposing ≈{} token-equivalent of MCP tool definitions across {loads} loads. Estimated from serialized UTF-8 bytes / 4, not model billing. toolport.app", state::format_token_count(tokens_saved))
+    format!("Toolport kept ≈{} tokens of MCP tool definitions out of my agent's context across {loads} loads. Estimated from serialized size (UTF-8 bytes / 4), not model billing. toolport.app", state::format_token_count(tokens_saved))
 }
 
 fn format_byte_count(bytes: u64) -> String {
@@ -11145,13 +11155,18 @@ mod tests {
             savings_primary_display(41_100, 12, 0),
             (
                 "≈ 41.1k".into(),
-                "estimated token-equivalent of MCP definitions"
+                "tokens of tool definitions kept out of agent context"
             )
         );
         assert_eq!(
             savings_primary_display(0, 0, 12_340),
             ("12.3 KB".into(), "discovery text returned")
         );
+        assert_eq!(
+            savings_title(12),
+            "Tool definitions kept out of your agent's context"
+        );
+        assert_eq!(savings_title(0), "Discovery payload returned");
         assert_eq!(format_byte_count(999_949), "999.9 KB");
         assert_eq!(format_byte_count(999_999), "1.0 MB");
         assert_eq!(format_byte_count(999_999_999), "1.0 GB");
@@ -11164,7 +11179,7 @@ mod tests {
         assert_eq!(savings_detail_line(1, 3, None), "1 catalog load");
         assert_eq!(
             savings_share_line(41_100, 12, 0, 0),
-            "Toolport's catalog loads avoided exposing ≈41.1k token-equivalent of MCP tool definitions across 12 loads. Estimated from serialized UTF-8 bytes / 4, not model billing. toolport.app"
+            "Toolport kept ≈41.1k tokens of MCP tool definitions out of my agent's context across 12 loads. Estimated from serialized size (UTF-8 bytes / 4), not model billing. toolport.app"
         );
         assert_eq!(savings_share_line(0, 0, 3, 12_340), "Toolport recorded 3 discovery searches returning 12.3 KB of text at its MCP boundary. toolport.app");
     }
@@ -11212,7 +11227,7 @@ mod tests {
         let measured = serde_json::json!({"returned":3, "responseContentBytes":24_000,
             "catalogSchemaBytes":5_400_000});
         assert_eq!(trace_token_line(&measured),
-            "Returned 24.0 KB of discovery content containing 3 matching schemas; full scoped catalog schemas: 5.4 MB. ≈6.0k token-equivalent (UTF-8 bytes ÷ 4).");
+            "Returned 24.0 KB of discovery content containing 3 matching schemas; full scoped catalog schemas: 5.4 MB. ≈6.0k tokens (UTF-8 bytes ÷ 4).");
     }
 
     #[test]

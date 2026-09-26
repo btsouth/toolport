@@ -557,14 +557,14 @@ export function AppSidebar({
           <button
             onClick={() => onSelectView("activity")}
             className="mx-3 mt-2 flex items-center gap-2 rounded-lg border border-success/30 bg-success/5 px-3 py-2 text-left text-xs transition-colors hover:bg-success/10"
-            title={`${savingsStale ? "Catalog telemetry unavailable; showing the last loaded estimate. " : ""}Estimated token equivalent of MCP tool definitions avoided at catalog loads, from serialized UTF-8 bytes. Actual model usage depends on the client and caching.`}
+            title={`${savingsStale ? "Catalog telemetry unavailable; showing the last loaded estimate. " : ""}Tool-definition tokens Toolport kept out of your agent's context, estimated from their serialized size. Actual model usage depends on the client and caching. Click for the breakdown.`}
           >
             <Zap className="size-3.5 shrink-0 text-success" />
             <span className="text-muted-foreground">
               <span className="font-semibold text-foreground">
                 ≈{fmtTokens(savings.tokensSaved)}
               </span>{" "}
-              schema token-equivalent{savingsStale ? " (stale)" : ""}
+              tokens saved{savingsStale ? " (stale)" : ""}
             </span>
           </button>
         )}

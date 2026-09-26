@@ -3,7 +3,7 @@ import { mockIPC } from "@tauri-apps/api/mocks";
 import { createRoot } from "react-dom/client";
 import { ClientLogo } from "@/components/ClientLogo";
 import { ServerLogo } from "@/components/ServerLogo";
-import type { Registry, ServerEntry } from "@/lib/types";
+import type { Registry, SavingsSummary, ServerEntry } from "@/lib/types";
 import "../index.css";
 
 if (!import.meta.env.DEV) throw new Error("Fixtures require the development server");
@@ -33,6 +33,23 @@ const auditRows = Array.from({ length: 200 }, (_, i) => ({
   ok: true,
   durationMs: 12,
 }));
+const savingsSummary: SavingsSummary = {
+  tokensSaved: 41_100,
+  listLoads: 12,
+  peakCatalog: 75,
+  sinceTs: 1_700_000_000_000,
+  measuredLoads: 12,
+  latestCatalogTs: 1_700_000_000_000,
+  latestFullToolCount: 75,
+  latestExposedToolCount: 4,
+  latestFullSurfaceBytes: 15_000,
+  latestExposedSurfaceBytes: 1_300,
+  fullSurfaceBytes: 180_000,
+  exposedSurfaceBytes: 15_600,
+  avoidedSurfaceBytes: 164_400,
+  estimatedTokensAvoided: 41_100,
+  estimateMethod: "utf8_bytes_div_4",
+};
 const calls: Record<string, number> = {};
 const missing: string[] = [];
 Object.assign(window, { toolportFixture: { calls, missing } });
@@ -74,8 +91,9 @@ mockIPC(
       case "take_pending_shared":
       case "take_registry_recovery_notice":
       case "plugin:updater|check":
-      case "savings_summary":
         return null;
+      case "savings_summary":
+        return savingsSummary;
       case "plugin:app|version":
         return "1.18.0-fixture";
       case "get_audit_log":

@@ -52,9 +52,13 @@ try {
   });
   await page.goto(`${baseURL}/fixtures/`);
   await expect(page.getByText("GitHub", { exact: true })).toBeVisible();
+  await expect(page.getByText("≈41.1k tokens saved")).toBeVisible();
   await page.screenshot({ path: path.join(output, "servers.png") });
   await page.getByRole("button", { name: "Activity", exact: true }).click();
   await expect(page.getByText("Protection active.", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Tool definitions kept out of your agent's context"),
+  ).toBeVisible();
   await page.screenshot({ path: path.join(output, "activity.png") });
   const fixture = await page.evaluate(() => window.toolportFixture);
   expect(fixture.missing).toEqual([]);
