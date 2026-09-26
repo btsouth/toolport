@@ -4283,8 +4283,15 @@ fn execute_call(
     // not sanitize_segment(server_id) — that collapses team-slack / team_slack.
     if let Some(set) = allowed {
         if !server_in_allowed_scope(server_id, set) {
+            // A name with no route belongs to no server. Say so, as an unscoped
+            // caller would hear, rather than calling an empty server id out of scope.
+            let text = if server_id.is_empty() {
+                router.no_route_message(name)
+            } else {
+                format!("Toolport: '{srv}' is not available to this client.")
+            };
             return json!({
-                "content": [{ "type": "text", "text": format!("Toolport: '{srv}' is not available to this client.") }],
+                "content": [{ "type": "text", "text": text }],
                 "isError": true
             });
         }
@@ -26076,7 +26083,7 @@ mod tests {
             &host,
             &req,
             &reg,
-            &router(),
+            &routed_router("resend", "send"),
             &catalog(),
             true,
             None,
@@ -26095,7 +26102,10 @@ mod tests {
             .and_then(|b| b.get("text"))
             .and_then(|t| t.as_str())
             .unwrap_or("");
-        assert!(text.contains("not available to this client"));
+        assert!(
+            text.contains("'resend' is not available to this client"),
+            "got {text}"
+        );
         // An in-scope call passes the scope guard (it then fails at routing since
         // no server is connected, but NOT with the scope-refusal message).
         let req_ok = json!({
@@ -27874,6 +27884,40 @@ mod tests {
         assert!(
             !allowed_text.contains("not available to this client"),
             "personal server must not be a scope denial, got {allowed_call}"
+        );
+    }
+
+    #[test]
+    fn execute_call_reports_an_unknown_tool_the_same_with_or_without_scope() {
+        let _data_env = DataDirTestEnv::new("execute_call_reports_an_unknown_tool");
+        let reg = Registry::default();
+        let router = twin_router();
+        let cached = router.aggregated_tools();
+        let personal = personal_scope();
+        let unknown = execute_call(
+            &reg,
+            &router,
+            &cached,
+            Some("open-webui"),
+            None,
+            Some(&personal),
+            None,
+            Some(&ConfirmGuard::new()),
+            "no_such_tool",
+            json!({}),
+            None,
+            None,
+            CallOpts {
+                confirmed: true,
+                shape: false,
+                allow_app_only: true,
+            },
+            None,
+        );
+        assert_eq!(unknown["isError"], true, "got {unknown}");
+        assert_eq!(
+            unknown["content"][0]["text"], "no route for tool 'no_such_tool'",
+            "an unknown tool is not a scope denial for an empty server id"
         );
     }
 

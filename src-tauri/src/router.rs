@@ -678,6 +678,26 @@ impl Router {
             .map(|(s, t)| (s.as_str(), t.as_str()))
     }
 
+    /// Why a call to `exposed_name` cannot be routed.
+    pub fn no_route_message(&self, exposed_name: &str) -> String {
+        // Several client harnesses expose gateway tools to their model as
+        // `mcp__<gateway-alias>__<tool>`; models then reuse that spelling inside
+        // toolport_run_script and land here (observed with Codex, 2026-08-13).
+        // Point at the name that will actually route instead of a dead end.
+        let client_prefixed = exposed_name
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.split_once("__"))
+            .map(|(_, tool)| tool)
+            .filter(|candidate| self.routes.contains_key(*candidate));
+        match client_prefixed {
+            Some(real) => format!(
+                "no route for tool '{exposed_name}'; that looks like a client-side alias - \
+                 inside Toolport the tool is named '{real}', call that instead"
+            ),
+            None => format!("no route for tool '{exposed_name}'"),
+        }
+    }
+
     /// Re-index the same live downstream slots under one adapter profile's
     /// original-tool allowlists. The shared HTTP router can keep its fail-closed
     /// intersection while each daemon adapter sees only its own tool scope.
@@ -1706,24 +1726,10 @@ impl Router {
         if let Some(reason) = self.blocked.get(exposed_name) {
             return Err(format!("tool '{exposed_name}' is {reason}"));
         }
-        let (server_id, tool) = self.routes.get(exposed_name).ok_or_else(|| {
-            // Several client harnesses expose gateway tools to their model as
-            // `mcp__<gateway-alias>__<tool>`; models then reuse that spelling inside
-            // toolport_run_script and land here (observed with Codex, 2026-08-13).
-            // Point at the name that will actually route instead of a dead end.
-            let client_prefixed = exposed_name
-                .strip_prefix("mcp__")
-                .and_then(|rest| rest.split_once("__"))
-                .map(|(_, tool)| tool)
-                .filter(|candidate| self.routes.contains_key(*candidate));
-            match client_prefixed {
-                Some(real) => format!(
-                    "no route for tool '{exposed_name}'; that looks like a client-side alias - \
-                     inside Toolport the tool is named '{real}', call that instead"
-                ),
-                None => format!("no route for tool '{exposed_name}'"),
-            }
-        })?;
+        let (server_id, tool) = self
+            .routes
+            .get(exposed_name)
+            .ok_or_else(|| self.no_route_message(exposed_name))?;
         let slot = self.slot_for(server_id)?;
         let (result, downstream_supports_tasks) = self.call_with_retry(
             &slot,

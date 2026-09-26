@@ -14,6 +14,9 @@ Entries before the rename below shipped under the project's former name, Conduit
   errors such as an unsupported version reach the client unchanged, modern
   requests run concurrently, `subscriptions/listen` delivers notifications as
   they arrive, and an idle modern client keeps its daemon running.
+- **Unknown tool names get the same answer in every topology.** The shared
+  daemon now reports that the tool has no route instead of calling an empty
+  server unavailable to the client.
 
 ## [1.22.0] - 2026-09-25
 
