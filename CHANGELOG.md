@@ -6,6 +6,8 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.22.0] - 2026-09-25
+
 ### Fixed
 
 - **Atlassian now uses its documented v2 MCP endpoint.** The catalog requests
@@ -23,6 +25,21 @@ Entries before the rename below shipped under the project's former name, Conduit
   members can fill launch setup values locally without changing the team server.
 - **Startup errors now say when stderr is empty.** The message no longer claims
   the process had no output when stdout might have been used.
+- **Optional catalog credentials work in Test Connection.** The probe now follows
+  the same optional environment rules as the gateway, including AWS credential
+  chains and Qdrant clusters without an API key. Qdrant no longer requires a
+  default collection. Customizing a preset's command or arguments clears its
+  generated launch requirements, and missing env credentials no longer prevent
+  background package prewarming.
+- **Team sync keeps launch setup with the correct server.** Local IDs now follow
+  the team's original entry identity, so reordering IDs with the same slug
+  cannot swap member setup values, vaulted credentials, or standing consent.
+  Ambiguous older collisions require members to fill setup again.
+- **Catalog search shows current registry entries.** Live search now uses the
+  stable registry API and requests latest versions, so older package versions
+  cannot crowd current servers out of the result limit.
+- **Microsoft Learn is in the curated catalog.** Its hosted documentation
+  server works without an install or account.
 
 ### Added
 
