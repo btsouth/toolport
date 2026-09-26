@@ -57,6 +57,19 @@ const READY_POLL: Duration = Duration::from_millis(50);
 /// A default, not a user setting, in the first release.
 pub const DAEMON_IDLE_GRACE: Duration = Duration::from_secs(300);
 
+/// The idle grace in effect: [`DAEMON_IDLE_GRACE`] unless a test shortens it.
+/// A daemon inherits the environment of the adapter that spawned it, so both
+/// sides read the same value. Never zero: the watchdog polls at a fraction of it.
+pub fn idle_grace() -> Duration {
+    crate::brand::env_var(
+        "TOOLPORT_DAEMON_IDLE_GRACE_MS",
+        "CONDUIT_DAEMON_IDLE_GRACE_MS",
+    )
+    .and_then(|value| value.trim().parse::<u64>().ok())
+    .map(|millis| Duration::from_millis(millis.max(1)))
+    .unwrap_or(DAEMON_IDLE_GRACE)
+}
+
 /// Everything an adapter needs to reach and trust a running daemon. Written
 /// atomically into the data directory with user-only permissions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

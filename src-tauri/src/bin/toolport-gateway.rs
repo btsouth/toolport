@@ -4283,8 +4283,15 @@ fn execute_call(
     // not sanitize_segment(server_id) — that collapses team-slack / team_slack.
     if let Some(set) = allowed {
         if !server_in_allowed_scope(server_id, set) {
+            // A name with no route belongs to no server. Say so, as an unscoped
+            // caller would hear, rather than calling an empty server id out of scope.
+            let text = if server_id.is_empty() {
+                router.no_route_message_within(name, |server| server_in_allowed_scope(server, set))
+            } else {
+                format!("Toolport: '{srv}' is not available to this client.")
+            };
             return json!({
-                "content": [{ "type": "text", "text": format!("Toolport: '{srv}' is not available to this client.") }],
+                "content": [{ "type": "text", "text": text }],
                 "isError": true
             });
         }
@@ -17168,25 +17175,13 @@ fn activity_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// How long the host daemon may sit with nothing in flight and no live session
-/// before it exits. Defaults to the operational grace; the env override exists so a
-/// test can watch the exit without waiting minutes.
-fn daemon_idle_grace() -> Duration {
-    conduit_lib::brand::env_var(
-        "TOOLPORT_DAEMON_IDLE_GRACE_MS",
-        "CONDUIT_DAEMON_IDLE_GRACE_MS",
-    )
-    .and_then(|value| value.trim().parse::<u64>().ok())
-    .map(Duration::from_millis)
-    .unwrap_or(conduit_lib::daemon::DAEMON_IDLE_GRACE)
-}
-
 /// Exit the daemon once nothing has been in flight for `grace`. An open connection
-/// is what a connected adapter, its listen stream, its subscriptions, and a call in
-/// progress all reduce to, so "no in-flight request for the whole grace" is the idle
-/// condition. A session row left behind by an adapter that died without a DELETE
-/// does not pin the process. Discovery is withdrawn before the decision is final,
-/// and put back if work arrived in that window.
+/// is what a legacy adapter's listen stream, its subscriptions, and a call in
+/// progress all reduce to, and a modern adapter checks in well inside the grace,
+/// so "no request for the whole grace" is the idle condition. A session row left
+/// behind by an adapter that died without a DELETE does not pin the process.
+/// Discovery is withdrawn before the decision is final, and put back if work
+/// arrived in that window.
 fn spawn_daemon_idle_watchdog(
     host: Arc<HostState>,
     inflight: Arc<AtomicUsize>,
@@ -17305,7 +17300,7 @@ fn serve_daemon(state: GatewayState) -> ! {
         Arc::clone(&inflight),
         descriptor_path.clone(),
         descriptor.clone(),
-        daemon_idle_grace(),
+        conduit_lib::daemon::idle_grace(),
     );
     serve_http_loop_with_inflight(server, state, Some(token), search, confirm, false, inflight);
     conduit_lib::daemon::clear_descriptor(&descriptor_path);
@@ -26088,7 +26083,7 @@ mod tests {
             &host,
             &req,
             &reg,
-            &router(),
+            &routed_router("resend", "send"),
             &catalog(),
             true,
             None,
@@ -26107,7 +26102,10 @@ mod tests {
             .and_then(|b| b.get("text"))
             .and_then(|t| t.as_str())
             .unwrap_or("");
-        assert!(text.contains("not available to this client"));
+        assert!(
+            text.contains("'resend' is not available to this client"),
+            "got {text}"
+        );
         // An in-scope call passes the scope guard (it then fails at routing since
         // no server is connected, but NOT with the scope-refusal message).
         let req_ok = json!({
@@ -27886,6 +27884,79 @@ mod tests {
         assert!(
             !allowed_text.contains("not available to this client"),
             "personal server must not be a scope denial, got {allowed_call}"
+        );
+    }
+
+    #[test]
+    fn execute_call_reports_an_unknown_tool_the_same_with_or_without_scope() {
+        let _data_env = DataDirTestEnv::new("execute_call_reports_an_unknown_tool");
+        let reg = Registry::default();
+        let router = twin_router();
+        let cached = router.aggregated_tools();
+        let personal = personal_scope();
+        let unknown = execute_call(
+            &reg,
+            &router,
+            &cached,
+            Some("open-webui"),
+            None,
+            Some(&personal),
+            None,
+            Some(&ConfirmGuard::new()),
+            "no_such_tool",
+            json!({}),
+            None,
+            None,
+            CallOpts {
+                confirmed: true,
+                shape: false,
+                allow_app_only: true,
+            },
+            None,
+        );
+        assert_eq!(unknown["isError"], true, "got {unknown}");
+        assert_eq!(
+            unknown["content"][0]["text"], "no route for tool 'no_such_tool'",
+            "an unknown tool is not a scope denial for an empty server id"
+        );
+
+        // A client-side alias is resolved only to a tool the caller may call, so
+        // the hint cannot confirm that an out-of-scope tool exists.
+        let (personal_name, team_name) = twin_tool_names(&router, &cached);
+        let alias_text = |exposed: &str| {
+            execute_call(
+                &reg,
+                &router,
+                &cached,
+                Some("open-webui"),
+                None,
+                Some(&personal),
+                None,
+                Some(&ConfirmGuard::new()),
+                exposed,
+                json!({}),
+                None,
+                None,
+                CallOpts {
+                    confirmed: true,
+                    shape: false,
+                    allow_app_only: true,
+                },
+                None,
+            )["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let in_scope = format!("mcp__toolport__{personal_name}");
+        assert!(
+            alias_text(&in_scope).contains(&format!("named '{personal_name}'")),
+            "an in-scope alias still points at the real name"
+        );
+        let out_of_scope = format!("mcp__toolport__{team_name}");
+        assert_eq!(
+            alias_text(&out_of_scope),
+            format!("no route for tool '{out_of_scope}'")
         );
     }
 
