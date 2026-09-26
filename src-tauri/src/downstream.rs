@@ -106,44 +106,44 @@ pub fn encode_mcp_header_text(value: &str) -> String {
     }
 }
 
-fn modern_standard_headers(body: &Value) -> Result<Vec<(String, String)>, TransportError> {
+/// The name a modern method routes on: `None` when the method has none, and
+/// `Some(None)` when it has one but the body does not carry it.
+fn modern_routing_name<'a>(method: &str, body: &'a Value) -> Option<Option<&'a str>> {
+    let field = match method {
+        "tools/call" | "prompts/get" => "name",
+        "resources/read" => "uri",
+        "tasks/get" | "tasks/update" | "tasks/cancel" => "taskId",
+        _ => return None,
+    };
+    Some(
+        body.get("params")
+            .and_then(|params| params.get(field))
+            .and_then(Value::as_str),
+    )
+}
+
+/// `Mcp-Method`, plus `Mcp-Name` when the body carries the name its method
+/// routes on. Leaves a missing name for the receiving server to reject.
+pub(crate) fn modern_routing_headers(body: &Value) -> Vec<(String, String)> {
     let Some(method) = body.get("method").and_then(Value::as_str) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let mut headers = vec![("Mcp-Method".to_string(), encode_mcp_header_text(method))];
-    let name = match method {
-        "tools/call" | "prompts/get" => body
-            .get("params")
-            .and_then(|params| params.get("name"))
-            .and_then(Value::as_str),
-        "resources/read" => body
-            .get("params")
-            .and_then(|params| params.get("uri"))
-            .and_then(Value::as_str),
-        "tasks/get" | "tasks/update" | "tasks/cancel" => body
-            .get("params")
-            .and_then(|params| params.get("taskId"))
-            .and_then(Value::as_str),
-        _ => None,
-    };
-    if matches!(
-        method,
-        "tools/call"
-            | "prompts/get"
-            | "resources/read"
-            | "tasks/get"
-            | "tasks/update"
-            | "tasks/cancel"
-    ) && name.is_none()
-    {
-        return Err(TransportError::Fatal(format!(
-            "modern HTTP request '{method}' is missing its routing name"
-        )));
-    }
-    if let Some(name) = name {
+    if let Some(Some(name)) = modern_routing_name(method, body) {
         headers.push(("Mcp-Name".to_string(), encode_mcp_header_text(name)));
     }
-    Ok(headers)
+    headers
+}
+
+fn modern_standard_headers(body: &Value) -> Result<Vec<(String, String)>, TransportError> {
+    if let Some(method) = body.get("method").and_then(Value::as_str) {
+        if modern_routing_name(method, body) == Some(None) {
+            return Err(TransportError::Fatal(format!(
+                "modern HTTP request '{method}' is missing its routing name"
+            )));
+        }
+    }
+    Ok(modern_routing_headers(body))
 }
 
 fn contains_x_mcp_header(value: &Value) -> bool {

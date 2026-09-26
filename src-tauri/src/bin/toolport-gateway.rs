@@ -17168,25 +17168,13 @@ fn activity_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// How long the host daemon may sit with nothing in flight and no live session
-/// before it exits. Defaults to the operational grace; the env override exists so a
-/// test can watch the exit without waiting minutes.
-fn daemon_idle_grace() -> Duration {
-    conduit_lib::brand::env_var(
-        "TOOLPORT_DAEMON_IDLE_GRACE_MS",
-        "CONDUIT_DAEMON_IDLE_GRACE_MS",
-    )
-    .and_then(|value| value.trim().parse::<u64>().ok())
-    .map(Duration::from_millis)
-    .unwrap_or(conduit_lib::daemon::DAEMON_IDLE_GRACE)
-}
-
 /// Exit the daemon once nothing has been in flight for `grace`. An open connection
-/// is what a connected adapter, its listen stream, its subscriptions, and a call in
-/// progress all reduce to, so "no in-flight request for the whole grace" is the idle
-/// condition. A session row left behind by an adapter that died without a DELETE
-/// does not pin the process. Discovery is withdrawn before the decision is final,
-/// and put back if work arrived in that window.
+/// is what a legacy adapter's listen stream, its subscriptions, and a call in
+/// progress all reduce to, and a modern adapter checks in well inside the grace,
+/// so "no request for the whole grace" is the idle condition. A session row left
+/// behind by an adapter that died without a DELETE does not pin the process.
+/// Discovery is withdrawn before the decision is final, and put back if work
+/// arrived in that window.
 fn spawn_daemon_idle_watchdog(
     host: Arc<HostState>,
     inflight: Arc<AtomicUsize>,
@@ -17305,7 +17293,7 @@ fn serve_daemon(state: GatewayState) -> ! {
         Arc::clone(&inflight),
         descriptor_path.clone(),
         descriptor.clone(),
-        daemon_idle_grace(),
+        conduit_lib::daemon::idle_grace(),
     );
     serve_http_loop_with_inflight(server, state, Some(token), search, confirm, false, inflight);
     conduit_lib::daemon::clear_descriptor(&descriptor_path);

@@ -14,12 +14,15 @@
 //! Requests run on bounded worker threads, so a client that pipelines a slow call
 //! and a fast one is answered in completion order rather than arrival order. The
 //! first request runs inline, so `initialize` establishes the session before
-//! anything can reference it. Notifications stay on the reader thread, which keeps
-//! a cancellation ahead of whatever is queued behind it (MCP cancellation is
-//! best-effort, so one that loses the race simply does not apply).
+//! anything can reference it. A modern (2026-07-28) request declares its version
+//! in its own `_meta` and needs no session, so it never waits for one; the adapter
+//! mirrors that version and the routing fields into the headers the daemon
+//! requires. Notifications stay on the reader thread, which keeps a cancellation
+//! ahead of whatever is queued behind it (MCP cancellation is best-effort, so one
+//! that loses the race simply does not apply).
 
-use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -47,6 +50,12 @@ pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// A single request may legitimately run long (a slow downstream call), so the
 /// HTTP budget is generous; the listen stream is separate and reconnects.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// A subscription's reply stays open for the life of the subscription, so it has
+/// no overall deadline. The daemon sends a keepalive every 30 seconds; three
+/// missed ones mean it is gone.
+const SUBSCRIPTION_READ_TIMEOUT: Duration = Duration::from_secs(90);
+/// Budget for one idle check-in with the daemon.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait for the daemon to publish a session id before opening the
 /// server-initiated listen stream.
 const LISTEN_POLL: Duration = Duration::from_millis(100);
@@ -203,6 +212,38 @@ struct Session {
     /// Roots learned from this client's reply to the daemon's roots/list.
     declared_root: Mutex<Option<String>>,
     roots_request_ids: Mutex<HashSet<String>>,
+    /// Open `subscriptions/listen` requests by id, each with the flag the
+    /// client's cancellation sets.
+    subscriptions: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+/// Keeps an open subscription cancellable while its reply is relayed.
+struct SubscriptionGuard<'a> {
+    session: &'a Session,
+    key: String,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl SubscriptionGuard<'_> {
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for SubscriptionGuard<'_> {
+    fn drop(&mut self) {
+        let mut open = self
+            .session
+            .subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if open
+            .get(&self.key)
+            .is_some_and(|flag| Arc::ptr_eq(flag, &self.cancelled))
+        {
+            open.remove(&self.key);
+        }
+    }
 }
 
 impl Session {
@@ -235,6 +276,7 @@ impl Session {
             root_override,
             declared_root: Mutex::new(None),
             roots_request_ids: Mutex::new(HashSet::new()),
+            subscriptions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -384,19 +426,70 @@ impl Session {
         }
     }
 
-    /// POST one message to `/mcp`. `forward` writes the daemon's JSON-RPC frames to
-    /// stdout; a replayed handshake does not, because the client already has its
-    /// answer. A transport failure marks the daemon stale and is returned as-is.
+    fn open_subscription(&self, id: &serde_json::Value) -> SubscriptionGuard<'_> {
+        let key = id.to_string();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone(), Arc::clone(&cancelled));
+        SubscriptionGuard {
+            session: self,
+            key,
+            cancelled,
+        }
+    }
+
+    /// Stop relaying a subscription the client cancelled. Dropping its stream is
+    /// how an HTTP client ends one; the daemon releases the subscription when its
+    /// next keepalive finds the stream closed.
+    fn cancel_subscription(&self, message: &serde_json::Value) {
+        if message["method"] != "notifications/cancelled" {
+            return;
+        }
+        let Some(id) = message["params"].get("requestId") else {
+            return;
+        };
+        if let Some(cancelled) = self
+            .subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id.to_string())
+        {
+            cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// POST one message to `/mcp`. `forward` writes the daemon's JSON-RPC messages
+    /// to stdout as they arrive; a replayed handshake does not, because the client
+    /// already has its answer. A transport failure marks the daemon stale and is
+    /// returned as-is.
     fn post(&self, body: &str, forward: bool) -> Result<(), String> {
+        let message = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+        let id = message.get("id").filter(|id| !id.is_null());
+        let expects_reply = id.is_some() && message.get("method").is_some();
+        let subscription = match (message["method"].as_str(), id) {
+            (Some("subscriptions/listen"), Some(id)) => Some(self.open_subscription(id)),
+            _ => None,
+        };
         let descriptor = self.descriptor();
         let url = format!("http://{}/mcp", descriptor.endpoint);
+        let request = match subscription {
+            Some(_) => ureq::AgentBuilder::new()
+                .timeout_read(SUBSCRIPTION_READ_TIMEOUT)
+                .build()
+                .post(&url),
+            None => ureq::post(&url).timeout(REQUEST_TIMEOUT),
+        };
         let mut request = self.with_identity(
-            ureq::post(&url)
+            request
                 .set("Authorization", &format!("Bearer {}", descriptor.token))
                 .set("Content-Type", "application/json")
-                .set("Accept", "application/json, text/event-stream")
-                .timeout(REQUEST_TIMEOUT),
+                .set("Accept", "application/json, text/event-stream"),
         );
+        for (name, value) in modern_headers(&message) {
+            request = request.set(&name, &value);
+        }
         if let Some(session) = self.session_id() {
             request = request.set("Mcp-Session-Id", &session);
         }
@@ -406,6 +499,16 @@ impl Session {
             // recovery trigger; the body is the error the caller should see.
             Err(ureq::Error::Status(code, response)) => {
                 let body = response.into_string().unwrap_or_default();
+                // A modern protocol error comes with a 4xx status and a JSON-RPC
+                // body. That body is the answer, and the client needs it intact:
+                // an unsupported version lists the versions to retry with.
+                if is_json_rpc_reply(&body) {
+                    return if forward {
+                        self.write_message(body.trim())
+                    } else {
+                        Ok(())
+                    };
+                }
                 // A live profile switch changes the session's bound scope. The
                 // daemon then rejects its old id exactly like an expired
                 // session. Fail this call once, and replay the handshake on the
@@ -430,11 +533,35 @@ impl Session {
                 *guard = Some(session.to_string());
             }
         }
-        let frames = response_frames(response)?;
-        if forward {
-            for message in frames {
-                self.write_message(&message)?;
-            }
+        let is_sse = response
+            .header("Content-Type")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains("text/event-stream");
+        let mut replied = false;
+        relay_frames(
+            BufReader::new(response.into_reader()),
+            is_sse,
+            || {
+                subscription
+                    .as_ref()
+                    .is_some_and(SubscriptionGuard::cancelled)
+            },
+            |frame| {
+                replied |= !is_sse || is_reply_to(frame, id);
+                if forward {
+                    self.write_message(frame)
+                } else {
+                    Ok(())
+                }
+            },
+        )?;
+        if expects_reply && !replied {
+            return match &subscription {
+                Some(subscription) if subscription.cancelled() => Ok(()),
+                Some(_) => Err("the host daemon ended the subscription stream".to_string()),
+                None => Err("the host daemon closed the reply without an answer".to_string()),
+            };
         }
         Ok(())
     }
@@ -521,31 +648,90 @@ impl Session {
     }
 }
 
-/// Read a whole request response into the JSON-RPC frames to forward. A JSON body
-/// is one frame; an SSE body may carry several (progress, then the result), each
-/// of which is written on its own line.
-fn response_frames(response: ureq::Response) -> Result<Vec<String>, String> {
-    let is_sse = response
-        .header("Content-Type")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .contains("text/event-stream");
-    let body = response.into_string().map_err(|error| error.to_string())?;
+/// The protocol version a modern message declares in its `_meta`. A legacy
+/// message has none: its client negotiated once, at `initialize`.
+fn declared_version(message: &serde_json::Value) -> Option<&str> {
+    message
+        .get("params")?
+        .get("_meta")?
+        .get("io.modelcontextprotocol/protocolVersion")?
+        .as_str()
+}
+
+/// The headers a modern Streamable HTTP POST must carry, mirrored from the body
+/// the client wrote. The daemon rejects a modern request without them, or with
+/// values that disagree with the body.
+fn modern_headers(message: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(version) = declared_version(message) else {
+        return Vec::new();
+    };
+    let mut headers = vec![(
+        "MCP-Protocol-Version".to_string(),
+        crate::downstream::encode_mcp_header_text(version),
+    )];
+    headers.extend(crate::downstream::modern_routing_headers(message));
+    headers
+}
+
+/// Whether a daemon body is a JSON-RPC response, rather than a transport error.
+fn is_json_rpc_reply(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| {
+        value["jsonrpc"] == "2.0"
+            && value.get("id").is_some()
+            && (value.get("result").is_some() || value.get("error").is_some())
+    })
+}
+
+/// Whether an SSE frame is the response to `id`, rather than a notification.
+fn is_reply_to(frame: &str, id: Option<&serde_json::Value>) -> bool {
+    id.is_some()
+        && serde_json::from_str::<serde_json::Value>(frame)
+            .is_ok_and(|value| value.get("method").is_none() && value.get("id") == id)
+}
+
+/// Pass each JSON-RPC message in a daemon reply to `deliver` as it arrives. A JSON
+/// body is one message. An SSE body may carry several, and a subscription's stays
+/// open, so it is read one line at a time; `stop` is checked at each line,
+/// keepalives included, so a cancelled stream is dropped promptly.
+fn relay_frames<R: BufRead>(
+    mut reader: R,
+    is_sse: bool,
+    stop: impl Fn() -> bool,
+    mut deliver: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
     if !is_sse {
-        let trimmed = body.trim();
-        return Ok(if trimmed.is_empty() {
-            Vec::new()
+        let mut body = Vec::new();
+        (&mut reader)
+            .take(MAX_FRAME_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(|error| error.to_string())?;
+        if body.len() > MAX_FRAME_BYTES {
+            return Err("the host daemon's reply exceeds the 16 MiB limit".to_string());
+        }
+        let body = String::from_utf8_lossy(&body);
+        let body = body.trim();
+        return if body.is_empty() {
+            Ok(())
         } else {
-            vec![trimmed.to_string()]
-        });
+            deliver(body)
+        };
     }
-    Ok(body
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
+    while let Some(frame) = read_bounded_line(&mut reader, MAX_FRAME_BYTES)? {
+        if stop() {
+            return Ok(());
+        }
+        let ClientFrame::Line(line) = frame else {
+            return Err("an event from the host daemon exceeds the 16 MiB limit".to_string());
+        };
+        if let Some(data) = line
+            .strip_prefix("data:")
+            .map(str::trim)
+            .filter(|data| !data.is_empty())
+        {
+            deliver(data)?;
+        }
+    }
+    Ok(())
 }
 
 /// Releases one slot on drop, so the live count falls even if a worker panics.
@@ -655,6 +841,7 @@ impl Dispatcher {
 fn proxy_stdio(rendezvous: Rendezvous, descriptor: DaemonDescriptor) -> Result<(), String> {
     let session = Arc::new(Session::new(rendezvous, descriptor));
     spawn_listen_stream(Arc::clone(&session));
+    spawn_heartbeat(Arc::clone(&session));
 
     let dispatcher = Dispatcher::new(
         {
@@ -696,8 +883,11 @@ fn proxy_stdio(rendezvous: Rendezvous, descriptor: DaemonDescriptor) -> Result<(
             }
         };
         session.remember_roots_response(&request);
+        session.cancel_subscription(&request);
         let is_request = request.get("id").map(|id| !id.is_null()).unwrap_or(false);
-        if is_request && session.session_id().is_some() {
+        // A modern request carries everything it needs, so it runs as soon as it
+        // is read. A legacy one waits for `initialize` to open the session.
+        if is_request && (session.session_id().is_some() || declared_version(&request).is_some()) {
             dispatcher.dispatch(trimmed.to_string());
         } else if let Err(error) = session.exchange(trimmed) {
             report_request_error(&session, &request, &error);
@@ -764,6 +954,26 @@ fn spawn_listen_stream(session: Arc<Session>) {
             }
             Err(_) => std::thread::sleep(LISTEN_RECONNECT),
         }
+    });
+}
+
+/// The daemon leaves once nothing has reached it for its idle grace. A legacy
+/// session holds its listen stream open, but a modern client has no standing
+/// connection, so the adapter checks in well inside the grace for as long as its
+/// client is attached.
+fn spawn_heartbeat(session: Arc<Session>) {
+    let interval = (crate::daemon::idle_grace() / 5).max(Duration::from_millis(100));
+    std::thread::spawn(move || loop {
+        std::thread::sleep(interval);
+        let descriptor = session.descriptor();
+        let _ = ureq::get(&format!(
+            "http://{}{}",
+            descriptor.endpoint,
+            crate::daemon::IDENTITY_PATH
+        ))
+        .set("Authorization", &format!("Bearer {}", descriptor.token))
+        .timeout(HEARTBEAT_TIMEOUT)
+        .call();
     });
 }
 
@@ -875,6 +1085,100 @@ mod tests {
     }
 
     #[test]
+    fn modern_headers_mirror_the_body() {
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "wetter_überblick",
+                "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" }
+            }
+        });
+        let headers = modern_headers(&call);
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(header("MCP-Protocol-Version"), Some("2026-07-28"));
+        assert_eq!(header("Mcp-Method"), Some("tools/call"));
+        assert_eq!(
+            header("Mcp-Name"),
+            Some(crate::downstream::encode_mcp_header_text("wetter_überblick").as_str()),
+            "a non-ASCII name travels in its encoded form"
+        );
+
+        let legacy = serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
+        assert!(
+            modern_headers(&legacy).is_empty(),
+            "a legacy request declares no version, so it gets no modern headers"
+        );
+    }
+
+    #[test]
+    fn only_a_json_rpc_body_counts_as_a_reply() {
+        assert!(is_json_rpc_reply(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported"}}"#
+        ));
+        assert!(is_json_rpc_reply(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#));
+        assert!(!is_json_rpc_reply(
+            r#"{"error":"unknown or expired Mcp-Session-Id"}"#
+        ));
+        assert!(!is_json_rpc_reply("gateway busy"));
+    }
+
+    #[test]
+    fn sse_frames_are_relayed_one_at_a_time() {
+        let body = "event: message\r\ndata: {\"a\":1}\r\n\r\n:\r\n\r\ndata: {\"b\":2}\n\n";
+        let mut seen = Vec::new();
+        relay_frames(
+            body.as_bytes(),
+            true,
+            || false,
+            |frame| {
+                seen.push(frame.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, vec![r#"{"a":1}"#, r#"{"b":2}"#]);
+
+        let mut json = Vec::new();
+        relay_frames(
+            &b" {\"id\":1} \n"[..],
+            false,
+            || false,
+            |frame| {
+                json.push(frame.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(json, vec![r#"{"id":1}"#], "a JSON body is one message");
+    }
+
+    #[test]
+    fn a_cancelled_stream_stops_before_the_next_frame() {
+        let body = "data: {\"a\":1}\n\ndata: {\"b\":2}\n\n";
+        let cancelled = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        relay_frames(
+            body.as_bytes(),
+            true,
+            || cancelled.load(Ordering::SeqCst),
+            |frame| {
+                seen.push(frame.to_string());
+                cancelled.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, vec![r#"{"a":1}"#]);
+    }
+
+    #[test]
     fn client_request_id_does_not_consume_a_pending_roots_response() {
         let data_dir = std::env::temp_dir();
         let compat = CompatKey::new("test", data_dir.to_string_lossy());
@@ -899,6 +1203,38 @@ mod tests {
             *session.declared_root.lock().unwrap(),
             crate::downstream::file_uri_to_path(&uri)
         );
+    }
+
+    #[test]
+    fn a_cancellation_reaches_only_its_own_subscription() {
+        let data_dir = std::env::temp_dir();
+        let compat = CompatKey::new("test", data_dir.to_string_lossy());
+        let session = Session::new(
+            Rendezvous::new(&data_dir, compat.clone()),
+            DaemonDescriptor::new("127.0.0.1:1", "test-token", &compat),
+        );
+        let first = session.open_subscription(&serde_json::json!(1));
+        let second = session.open_subscription(&serde_json::json!("two"));
+        session.cancel_subscription(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": "two" }
+        }));
+        assert!(!first.cancelled());
+        assert!(second.cancelled());
+
+        // A reused id replaces the entry, and the old guard must not remove it.
+        let replacement = session.open_subscription(&serde_json::json!(1));
+        drop(first);
+        session.cancel_subscription(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 1 }
+        }));
+        assert!(replacement.cancelled());
+        drop(replacement);
+        drop(second);
+        assert!(session.subscriptions.lock().unwrap().is_empty());
     }
 
     use std::sync::Condvar;

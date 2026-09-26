@@ -6,6 +6,15 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Fixed
+
+- **Modern MCP clients work through the shared gateway.** The stdio adapter now
+  sends the `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name` headers a
+  2026-07-28 request needs, so discovery no longer fails with HTTP 400. Protocol
+  errors such as an unsupported version reach the client unchanged, modern
+  requests run concurrently, `subscriptions/listen` delivers notifications as
+  they arrive, and an idle modern client keeps its daemon running.
+
 ## [1.22.0] - 2026-09-25
 
 ### Fixed

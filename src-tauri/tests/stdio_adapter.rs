@@ -30,6 +30,11 @@ struct Harness {
 
 impl Harness {
     fn start() -> Self {
+        Self::start_with_env(&[])
+    }
+
+    /// Start the adapter with extra environment. The daemon it spawns inherits it.
+    fn start_with_env(env: &[(&str, &str)]) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "toolport-stdio-adapter-{}-{}-{}",
             std::process::id(),
@@ -46,6 +51,7 @@ impl Harness {
             .arg("--stdio-adapter")
             .env("TOOLPORT_DATA_DIR", &dir)
             .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Piped rather than null: the adapter's own lines are the only place a
@@ -328,5 +334,178 @@ fn the_adapter_recovers_after_the_daemon_dies() {
         recovered["result"]["tools"].is_array(),
         "the adapter did not recover: {recovered}\n{}",
         harness.diagnostics()
+    );
+}
+
+const MODERN: &str = "2026-07-28";
+
+/// A 2026-07-28 request. It has no session: the version rides in every body.
+fn modern_request(id: i64, method: &str, mut params: serde_json::Value) -> serde_json::Value {
+    params["_meta"] = serde_json::json!({ "io.modelcontextprotocol/protocolVersion": MODERN });
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+}
+
+/// The pid in the daemon descriptor the adapter published, if one is live.
+fn daemon_pid(dir: &std::path::Path) -> Option<u64> {
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !(name.starts_with("daemon-") && name.ends_with(".json")) {
+            return None;
+        }
+        let raw = std::fs::read_to_string(entry.path()).ok()?;
+        serde_json::from_str::<serde_json::Value>(&raw).ok()?["pid"].as_u64()
+    })
+}
+
+/// A modern stdio client has no handshake, so each POST must carry the routing
+/// headers the daemon requires of a modern Streamable HTTP request.
+#[test]
+fn a_modern_client_is_served_through_the_adapter() {
+    let mut harness = Harness::start();
+
+    harness.send(modern_request(1, "server/discover", serde_json::json!({})));
+    let discover = harness.response_to(1);
+    assert!(
+        discover["result"]["supportedVersions"]
+            .as_array()
+            .is_some_and(|versions| versions.iter().any(|version| version == MODERN)),
+        "server/discover did not answer: {discover}\n{}",
+        harness.diagnostics()
+    );
+
+    harness.send(modern_request(2, "tools/list", serde_json::json!({})));
+    let tools = harness.response_to(2);
+    assert!(
+        tools["result"]["tools"].is_array(),
+        "tools/list did not return an array: {tools}\n{}",
+        harness.diagnostics()
+    );
+
+    // A call also routes on its tool name.
+    harness.send(modern_request(
+        3,
+        "tools/call",
+        serde_json::json!({ "name": "toolport_status", "arguments": {} }),
+    ));
+    let status = harness.response_to(3);
+    assert!(
+        status.get("result").is_some(),
+        "tools/call did not answer: {status}\n{}",
+        harness.diagnostics()
+    );
+
+    // A name that is not safe as a raw header value still reaches the router.
+    harness.send(modern_request(
+        4,
+        "tools/call",
+        serde_json::json!({ "name": "wetter_überblick", "arguments": {} }),
+    ));
+    let unknown = harness.response_to(4);
+    assert!(
+        !unknown.to_string().contains("header"),
+        "a non-ASCII tool name was rejected at the transport: {unknown}\n{}",
+        harness.diagnostics()
+    );
+}
+
+/// Modern protocol errors are answered with a non-2xx status and a JSON-RPC body.
+/// The client needs that body as is: `-32022` lists the versions to retry with.
+#[test]
+fn modern_protocol_errors_reach_the_client_intact() {
+    let mut harness = Harness::start();
+
+    let mut unsupported = modern_request(1, "tools/list", serde_json::json!({}));
+    unsupported["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+        serde_json::json!("2099-01-01");
+    harness.send(unsupported);
+    let rejected = harness.response_to(1);
+    assert_eq!(
+        rejected["error"]["code"],
+        -32022,
+        "an unsupported version must be reported as such: {rejected}\n{}",
+        harness.diagnostics()
+    );
+    assert!(
+        rejected["error"]["data"]["supported"]
+            .as_array()
+            .is_some_and(|versions| versions.iter().any(|version| version == MODERN)),
+        "the error must list the supported versions: {rejected}"
+    );
+
+    harness.send(modern_request(2, "no/such-method", serde_json::json!({})));
+    let unknown = harness.response_to(2);
+    assert_eq!(
+        unknown["error"]["code"],
+        -32601,
+        "an unknown method must be reported as such: {unknown}\n{}",
+        harness.diagnostics()
+    );
+}
+
+/// `subscriptions/listen` stays open for the life of the subscription. Its frames
+/// must arrive as they are sent, other requests must not queue behind it, and the
+/// client must hear when the stream ends underneath it.
+#[test]
+fn a_modern_subscription_streams_beside_other_requests() {
+    let mut harness = Harness::start();
+
+    harness.send(modern_request(
+        1,
+        "subscriptions/listen",
+        serde_json::json!({ "notifications": { "toolsListChanged": true } }),
+    ));
+    let acknowledged = harness.next_response();
+    assert_eq!(
+        acknowledged["method"],
+        "notifications/subscriptions/acknowledged",
+        "the acknowledgement did not arrive while the stream is open: {acknowledged}\n{}",
+        harness.diagnostics()
+    );
+
+    harness.send(modern_request(2, "server/discover", serde_json::json!({})));
+    let discover = harness.response_to(2);
+    assert!(
+        discover.get("result").is_some(),
+        "a request behind an open subscription was not answered: {discover}\n{}",
+        harness.diagnostics()
+    );
+
+    kill_daemon(&harness.dir);
+    let ended = harness.response_to(1);
+    assert!(
+        ended.get("error").is_some(),
+        "the client must be told its subscription ended: {ended}\n{}",
+        harness.diagnostics()
+    );
+}
+
+/// A legacy session holds the daemon open with its listen stream. A modern client
+/// has no such stream, and must not lose its daemon to the idle timer between calls.
+#[test]
+fn a_modern_client_keeps_its_daemon_alive_while_idle() {
+    let mut harness = Harness::start_with_env(&[("TOOLPORT_DAEMON_IDLE_GRACE_MS", "2500")]);
+
+    harness.send(modern_request(1, "server/discover", serde_json::json!({})));
+    assert!(
+        harness.response_to(1).get("result").is_some(),
+        "the first request failed\n{}",
+        harness.diagnostics()
+    );
+    let first_daemon = daemon_pid(&harness.dir);
+    assert!(first_daemon.is_some(), "no daemon descriptor was published");
+
+    std::thread::sleep(Duration::from_millis(6_000));
+
+    harness.send(modern_request(2, "server/discover", serde_json::json!({})));
+    let later = harness.response_to(2);
+    assert!(
+        later.get("result").is_some(),
+        "a call after an idle pause failed: {later}\n{}",
+        harness.diagnostics()
+    );
+    assert_eq!(
+        daemon_pid(&harness.dir),
+        first_daemon,
+        "the daemon idled out under a connected client"
     );
 }
