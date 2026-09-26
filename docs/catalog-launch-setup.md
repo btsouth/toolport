@@ -68,3 +68,13 @@ can fill their own values from the Launch setup button without changing the
 team's command. A child failure after bound arguments are resolved is reported
 without the child's output, because even a bounded output tail could reveal a
 fragment of a value.
+
+New team-local IDs include the team identity and initial launch definition. IDs
+already associated with an original team entry stay stable across syncs, while
+ambiguous legacy suffixes require fresh setup. A changed remote destination
+requires a new enable decision just like a changed local command; repeated syncs
+preserve the disabled state. Removing and re-adding a changed definition cannot
+inherit the previous definition's vault namespace.
+Changes to OAuth client settings also require review. The review requirement is
+stored locally so registry reloads, Enable all, and the playground cannot skip it.
+Consent remains specific to each profile.

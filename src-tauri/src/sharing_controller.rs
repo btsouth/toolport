@@ -45,7 +45,9 @@ pub(crate) fn build_export(
             }
             let mask = registry::secret_arg_mask(&server.args);
             for (argument, secret) in server.args.iter_mut().zip(mask) {
-                if secret {
+                // A launch marker is structural, never a credential. Redacting
+                // it would invalidate the binding in the exported setup.
+                if secret && argument != "<launch-input>" {
                     *argument = "<redacted>".to_string();
                 }
             }
@@ -396,6 +398,32 @@ mod controller_tests {
         let servers = exported["servers"].as_array().unwrap();
         assert_eq!(servers[0]["requestTimeoutMs"], 90_000);
         assert_eq!(servers[1]["requestTimeoutMs"], 120_000);
+    }
+
+    #[test]
+    fn share_preserves_bound_secret_flag_markers() {
+        let mut registry = Registry::default();
+        registry.servers.push(
+            serde_json::from_value(serde_json::json!({
+                "id":"bound", "name":"Bound", "transport":"stdio", "command":"server",
+                "args":["--token", "<launch-input>", "--password", "literal-secret"],
+                "launch": { "inputs":[{"key":"TOKEN", "label":"Token", "secret":true}],
+                    "bindings":[{"index":1,"parts":[{"kind":"input","key":"TOKEN"}]}] }
+            }))
+            .unwrap(),
+        );
+        let exported = build_export(&registry, None, None, None);
+        assert_eq!(exported["servers"][0]["args"][1], "<launch-input>");
+        assert!(!exported.to_string().contains("literal-secret"));
+        let mut imported = Registry::default();
+        apply_import(&mut imported, &exported.to_string()).unwrap();
+        let server = &imported.servers[0];
+        server
+            .launch
+            .as_ref()
+            .unwrap()
+            .validate(&server.args, true)
+            .unwrap();
     }
 
     #[test]

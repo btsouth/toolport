@@ -10423,9 +10423,7 @@ fn open_server_editor_prefilled(
                             if let Some((_, _, value)) =
                                 launch_values.iter().find(|(key, _, _)| *key == input.key)
                             {
-                                if !value.is_empty() {
-                                    input.value = Some(value.clone());
-                                }
+                                apply_launch_probe_value(input, value);
                             }
                         }
                     }
@@ -10581,6 +10579,14 @@ fn open_server_editor_prefilled(
     });
     editor.present();
     Some(editor)
+}
+
+fn apply_launch_probe_value(input: &mut crate::registry::LaunchInput, value: &str) {
+    // Only a blank secret means "keep the vaulted value". Clearing a plain
+    // field must also clear the saved value used by this unsaved probe.
+    if !input.secret || !value.is_empty() {
+        input.value = (!value.is_empty()).then(|| value.to_string());
+    }
 }
 
 fn save_launch_entries(
@@ -10844,6 +10850,26 @@ fn state_card(icon_name: &str, title: &str, body: &str, error: bool) -> gtk::Box
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cleared_launch_field_is_missing_in_native_probe_but_blank_secret_keeps_vault() {
+        let mut input = crate::registry::LaunchInput {
+            key: "DIRECTORY".into(),
+            label: "Directory".into(),
+            secret: false,
+            required: true,
+            value: Some("/previous/directory".into()),
+        };
+        super::apply_launch_probe_value(&mut input, "");
+        assert_eq!(input.value, None, "the probe must use the cleared field");
+        input.secret = true;
+        super::apply_launch_probe_value(&mut input, "");
+        assert_eq!(
+            input.value, None,
+            "blank saved secrets resolve from the vault"
+        );
+        super::apply_launch_probe_value(&mut input, "unsaved-secret");
+        assert_eq!(input.value.as_deref(), Some("unsaved-secret"));
+    }
 
     fn preview_scratch(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(

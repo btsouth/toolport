@@ -35,6 +35,19 @@ Entries before the rename below shipped under the project's former name, Conduit
   the team's original entry identity, so reordering IDs with the same slug
   cannot swap member setup values, vaulted credentials, or standing consent.
   Ambiguous older collisions require members to fill setup again.
+- **Team credentials stay scoped to their team.** Newly assigned local IDs
+  include the team identity, preventing a later team from inheriting credentials
+  left in the vault. Changed remote destinations or OAuth client settings require
+  individual review, including after removal and re-addition. Enable all and the
+  playground respect that requirement. Legacy ID prefixes no longer transfer
+  setup or consent.
+- **Shared launch templates remain usable.** Export preserves bound input markers
+  after secret flags while removing actual values. The GTK connection probe also
+  honors cleared launch fields instead of testing an old saved value.
+- **Hosted setup follows current publisher requirements.** Langfuse uses its
+  documented path and Basic-auth guidance; Postiz uses its documented bearer
+  endpoint. Asana is held out of curated additions until Toolport supports its
+  preregistered OAuth client requirement. Existing saved URLs are unchanged.
 - **Catalog search shows current registry entries.** Live search now uses the
   stable registry API and requests latest versions, so older package versions
   cannot crowd current servers out of the result limit.

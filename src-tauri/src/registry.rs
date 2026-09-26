@@ -661,6 +661,13 @@ pub struct ServerEntry {
 }
 
 impl ServerEntry {
+    // Local sync metadata, like teamOriginalId. Persist it in the forward-
+    // compatible fields so reloads and repeated syncs cannot lose the gate.
+    pub(crate) fn require_team_enable_review(&mut self) {
+        self.unknown_fields
+            .insert("teamEnableReview".into(), serde_json::Value::Bool(true));
+    }
+
     pub fn initialize_timeout(&self) -> Result<Option<std::time::Duration>, String> {
         self.initialize_timeout_ms
             .map(validate_initialize_timeout_ms)
@@ -668,14 +675,17 @@ impl ServerEntry {
             .map(|value| value.map(std::time::Duration::from_millis))
     }
 
-    /// Team-synced local commands and LAN URLs stay off until the member enables
-    /// them after review. Enable-all and the playground must not skip that gate.
+    /// Team-synced local commands, LAN URLs and changed remote definitions need
+    /// individual consent. Enable-all and the playground must not skip that gate.
     pub fn needs_team_enable_review(&self) -> bool {
         let Some(src) = self.source.as_deref() else {
             return false;
         };
         if !src.starts_with("team:") {
             return false;
+        }
+        if self.unknown_fields.get("teamEnableReview") == Some(&serde_json::Value::Bool(true)) {
+            return true;
         }
         if self.transport == "stdio" || self.command.is_some() {
             return true;
@@ -2015,7 +2025,7 @@ impl Registry {
 
     /// Enable or disable every server in a profile at once.
     ///
-    /// Enabling skips team-review servers (local command / LAN URL). Those stay
+    /// Enabling skips team-review servers (local command / LAN URL / changed remote). Those stay
     /// as they were so Enable all cannot bypass the Teams confirm, and so a
     /// server the member already consented to is not wiped.
     pub fn set_all_enabled(&mut self, profile_id: &str, enabled: bool) -> Result<(), String> {

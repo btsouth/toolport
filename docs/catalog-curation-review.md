@@ -1,6 +1,6 @@
 # Catalog curation review for the next minor release
 
-Reviewed 2026-09-25. The curated catalog now has **56** entries: 20 fixed
+Reviewed 2026-09-25. The curated catalog now has **55** entries: 19 fixed
 hosted endpoints, 34 local stdio packages, and 2 self-hosted URL templates.
 The [official MCP Registry](https://registry.modelcontextprotocol.io/) remains
 available in Toolport for searching beyond this set. Registry publication and
@@ -59,6 +59,22 @@ Provider-authenticated probes remain a release acceptance task when
 credentials are available.
 
 ## Candidates held back
+
+Asana is removed from curated additions for this release. Its publisher now
+documents `https://mcp.asana.com/v2/mcp` and requires a preregistered OAuth
+authorization-code client ID and secret. Toolport supports CIMD/DCR for that
+flow, but has no preregistered-client setup. Its separate client-credentials
+grant is not a substitute. The live Asana authorization metadata advertises
+neither CIMD nor DCR. Existing saved Asana entries remain untouched.
+See [Asana's integration guide](https://developers.asana.com/docs/integrating-with-asanas-mcp-server).
+
+The release review also corrected Langfuse's URL hint to `/api/public/mcp` and
+added its [documented Basic-auth setup](https://langfuse.com/docs/api-and-data-platform/features/mcp-server).
+Postiz now uses the publisher's [documented bearer-token endpoint](https://docs.postiz.com/mcp/setup),
+`https://mcp.postiz.com/mcp`; unauthenticated 401s on both hosts do not establish
+that the old `api.postiz.com` URL is an equivalent authenticated route. No
+saved Postiz URL is silently redirected to a different host. OpenRouter's
+documentation link now points to its current publisher announcement.
 
 | Candidate                                                                                        | Current upstream finding                                                                                                                                                    | What would make it curatable                                                                      |
 | ------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |

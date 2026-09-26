@@ -1881,7 +1881,7 @@ pub fn apply_server_enabled(
             .any(|server| server.id == server_id && server.needs_team_enable_review())
     {
         return Err(
-            "this team server runs a local command or private address; enable it from Teams after review"
+            "this team server needs consent for its command, address or authentication; enable it from Teams after review"
                 .into(),
         );
     }

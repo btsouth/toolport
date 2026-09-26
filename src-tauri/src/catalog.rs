@@ -78,8 +78,8 @@ fn category_for(name: &str) -> &'static str {
         }
         "Firecrawl" | "Apify" | "Browserbase" => "Web & automation",
         "Stripe" | "Stripe (Full API)" | "Notion" | "Composio" | "Linear" | "Atlassian"
-        | "Asana" | "Airtable" | "Todoist" | "Slack" | "Resend" | "Figma" | "Postiz" | "Twilio"
-        | "n8n" | "Langfuse" | "Postman" => "Apps & productivity",
+        | "Airtable" | "Todoist" | "Slack" | "Resend" | "Figma" | "Postiz" | "Twilio" | "n8n"
+        | "Langfuse" | "Postman" => "Apps & productivity",
         "Filesystem"
         | "Fetch"
         | "Git"
@@ -165,7 +165,11 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
         ),
         "Postiz" => (
             "https://postiz.pro/settings/developers",
-            "Create an API key in Settings > Developers > Public API.",
+            "Create an API key in Settings > Developers > Public API, then paste it as the server's auth token.",
+        ),
+        "Langfuse" => (
+            "https://langfuse.com/docs/api-and-data-platform/features/mcp-server",
+            "Use your instance's /api/public/mcp URL. Paste Basic followed by base64(public-key:secret-key) as the server's auth token.",
         ),
         // Config you supply (no single token page).
         "PostgreSQL" => (
@@ -283,19 +287,18 @@ pub fn curated() -> Vec<CatalogEntry> {
         http("Composio", "Connect AI agents to 1,000+ apps (Gmail, Slack, GitHub, Notion, Linear, and more).", "https://connect.composio.dev/mcp", "https://composio.dev"),
         http("Linear", "Issues, projects, and cycles in Linear.", "https://mcp.linear.app/mcp", "https://linear.app/docs"),
         http("Atlassian", "Jira issues and Confluence pages.", "https://mcp.atlassian.com/v2/mcp?tools=all", "https://support.atlassian.com/atlassian-ai-gateway/docs/get-started-with-the-atlassian-remote-mcp-server/"),
-        http("Asana", "Tasks, projects, and portfolios in Asana.", "https://mcp.asana.com/mcp", "https://developers.asana.com/docs/mcp-server"),
         cmd("Airtable", "Read and write records in your Airtable bases.", "npx", &["-y", "airtable-mcp-server"], &["AIRTABLE_API_KEY"], "https://github.com/domdomegg/airtable-mcp-server"),
         cmd("Todoist", "Manage Todoist tasks and projects.", "npx", &["-y", "@abhiz123/todoist-mcp-server"], &["TODOIST_API_TOKEN"], "https://github.com/abhiz123/todoist-mcp-server"),
         // --- Communication ---
         cmd("Slack", "Read and send Slack messages and manage channels.", "npx", &["-y", "@modelcontextprotocol/server-slack"], &["SLACK_BOT_TOKEN", "SLACK_TEAM_ID"], "https://github.com/modelcontextprotocol/servers"),
         cmd("Twilio", "Send SMS, make calls, and manage Twilio messaging and voice.", "npx", &["-y", "@twilio-alpha/mcp", "<launch-input>"], &[], "https://github.com/twilio-labs/mcp"),
-        http("Postiz", "Schedule and publish social media posts across platforms.", "https://api.postiz.com/mcp", "https://postiz.pro"),
+        http("Postiz", "Schedule and publish social media posts across platforms.", "https://mcp.postiz.com/mcp", "https://docs.postiz.com/mcp/setup"),
         // --- Knowledge & search ---
         http("Context7", "Up-to-date docs and code examples for libraries.", "https://mcp.context7.com/mcp", "https://github.com/upstash/context7"),
         http("DeepWiki", "Ask questions about any public GitHub repo. No auth.", "https://mcp.deepwiki.com/mcp", "https://deepwiki.com"),
         http("Microsoft Learn", "Search official Microsoft and Azure documentation and code samples. No auth.", "https://learn.microsoft.com/api/mcp", "https://learn.microsoft.com/en-us/training/support/mcp"),
         http("Hugging Face", "Models, datasets, and Spaces on Hugging Face.", "https://huggingface.co/mcp", "https://huggingface.co/settings/mcp"),
-        http("OpenRouter", "Live model intelligence: list and compare models, prices, and your credits.", "https://mcp.openrouter.ai/mcp", "https://openrouter.ai/docs/mcp-server"),
+        http("OpenRouter", "Live model intelligence: list and compare models, prices, and your credits.", "https://mcp.openrouter.ai/mcp", "https://openrouter.ai/blog/announcements/openrouter-mcp-server/"),
         http("Parallel Search", "Live web search and clean content from URLs. No account or API key required.", "https://search.parallel.ai/mcp", "https://docs.parallel.ai/integrations/mcp/search-mcp"),
         cmd("Brave Search", "Web search via the Brave Search API.", "npx", &["-y", "@brave/brave-search-mcp-server"], &["BRAVE_API_KEY"], "https://github.com/brave/brave-search-mcp-server"),
         cmd("Exa", "AI-native web search built for agents.", "npx", &["-y", "exa-mcp-server"], &["EXA_API_KEY"], "https://github.com/exa-labs/exa-mcp-server"),
@@ -311,7 +314,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         cmd("Resend", "Send transactional email through Resend.", "npx", &["-y", "resend-mcp"], &["RESEND_API_KEY"], "https://resend.com/docs"),
         // --- Self-hosted (user supplies URL) ---
         self_hosted("n8n", "Trigger, manage, and edit n8n workflows via MCP.", "https://your-instance.com/mcp-server/http", "https://n8n.io"),
-        self_hosted("Langfuse", "Prompt management and observability for LLM apps.", "https://your-langfuse.com/mcp", "https://langfuse.com"),
+        self_hosted("Langfuse", "Prompt management and observability. Use /api/public/mcp with Basic auth; see setup docs.", "https://your-langfuse.com/api/public/mcp", "https://langfuse.com/docs/api-and-data-platform/features/mcp-server"),
         // --- Local utilities (no account needed) ---
         cmd("Filesystem", "Read and write files in directories you allow.", "npx", &["-y", "@modelcontextprotocol/server-filesystem", "<launch-input>"], &[], "https://github.com/modelcontextprotocol/servers"),
         cmd("Fetch", "Fetch a URL and return its content as markdown.", "uvx", &["mcp-server-fetch"], &[], "https://github.com/modelcontextprotocol/servers"),
@@ -836,6 +839,23 @@ pub fn search_registry(query: &str) -> Result<Vec<CatalogEntry>, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn curated_remote_setup_matches_supported_publisher_auth() {
+        let entries = curated();
+        // Asana v2 requires a preregistered authorization-code client, which
+        // Toolport's CIMD/DCR flow cannot yet supply. Keep it out of curated add.
+        assert!(!entries.iter().any(|e| e.name == "Asana"));
+        let langfuse = entries.iter().find(|e| e.name == "Langfuse").unwrap();
+        assert_eq!(
+            langfuse.url_hint.as_deref(),
+            Some("https://your-langfuse.com/api/public/mcp")
+        );
+        assert!(langfuse.setup_hint.as_deref().unwrap().contains("Basic"));
+        let postiz = entries.iter().find(|e| e.name == "Postiz").unwrap();
+        assert_eq!(postiz.url.as_deref(), Some("https://mcp.postiz.com/mcp"));
+        assert!(postiz.setup_hint.as_deref().unwrap().contains("token"));
+    }
 
     #[test]
     fn registry_search_requests_only_current_versions() {
