@@ -1242,7 +1242,7 @@ fn validate_search_query(query: &str) -> Result<(), String> {
 fn status_tool_def() -> Value {
     json!({
         "name": "toolport_status",
-        "description": "Report enabled MCP servers, their tool counts, and discovery mode. Unscoped callers may also see a local estimate of catalog exposure avoided.",
+        "description": "Report enabled MCP servers, their tool counts, and discovery mode. Unscoped callers may also see an estimate of the MCP tool definitions kept out of context.",
         "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
     })
 }
