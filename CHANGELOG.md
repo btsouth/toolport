@@ -6,6 +6,8 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.22.1] - 2026-09-26
+
 ### Fixed
 
 - **Modern MCP clients work through the shared gateway.** The stdio adapter now
@@ -22,11 +24,6 @@ Entries before the rename below shipped under the project's former name, Conduit
   context, replacing "schema token-equivalent". The estimate method stays in the
   tooltip and fine print. The native Linux shell, the share text, and
   `toolport_status` use the same wording.
-
-## [1.22.0] - 2026-09-25
-
-### Fixed
-
 - **Atlassian now uses its documented v2 MCP endpoint.** The catalog requests
   the gateway-compatible flat tool list. Only untouched saved v1 catalog
   entries migrate; custom URLs and tool choices stay as they are. Existing
