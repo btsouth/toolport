@@ -1272,6 +1272,18 @@ pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, S
     get_secret_result_raw(server_id, key)
 }
 
+/// Launch argument bindings read only Toolport's vault. Environment overrides
+/// remain available for legacy env keys, but must never construct an argv value.
+pub fn get_vault_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    if file::active() {
+        return file::get_secret_result(server_id, key);
+    }
+    platform::get_secret_result(server_id, key)
+}
+
 /// Look up a secret from the process environment for container / env-file deploys.
 /// Prefers `TOOLPORT_SECRET_<KEY>` (legacy `CONDUIT_SECRET_<KEY>`); falls back to the
 /// bare key name only when `TOOLPORT_ALLOW_BARE_SECRET_ENV` (legacy

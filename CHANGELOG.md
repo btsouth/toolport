@@ -6,6 +6,60 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.22.0] - 2026-09-25
+
+### Fixed
+
+- **Atlassian now uses its documented v2 MCP endpoint.** The catalog requests
+  the gateway-compatible flat tool list. Only untouched saved v1 catalog
+  entries migrate; custom URLs and tool choices stay as they are. Existing
+  OAuth sessions may need a new sign-in. The Atlassian and Parallel Search
+  documentation links were refreshed.
+- **Curated local servers now ask for required launch inputs.** Twilio composes its
+  account SID, API Key SID, and API Secret into the argument its API server
+  requires. PostgreSQL vaults its connection URL; Filesystem asks for an allowed
+  directory so standalone tests work. Browserbase uses its current package and
+  requests Gemini credentials. Brave, Perplexity, Qdrant, and AWS presets were
+  updated from confirmed upstream package and setup changes. Untouched saved
+  catalog entries migrate while edited entries keep their configuration. Team
+  members can fill launch setup values locally without changing the team server.
+- **Startup errors now say when stderr is empty.** The message no longer claims
+  the process had no output when stdout might have been used.
+- **Optional catalog credentials work in Test Connection.** The probe now follows
+  the same optional environment rules as the gateway, including AWS credential
+  chains and Qdrant clusters without an API key. Qdrant no longer requires a
+  default collection. Customizing a preset's command or arguments clears its
+  generated launch requirements, and missing env credentials no longer prevent
+  background package prewarming.
+- **Team sync keeps launch setup with the correct server.** Local IDs now follow
+  the team's original entry identity, so reordering IDs with the same slug
+  cannot swap member setup values, vaulted credentials, or standing consent.
+  Ambiguous older collisions require members to fill setup again.
+- **Team credentials stay scoped to their team.** Newly assigned local IDs
+  include the team identity, preventing a later team from inheriting credentials
+  left in the vault. Changed remote destinations or OAuth client settings require
+  individual review, including after removal and re-addition. Enable all and the
+  playground respect that requirement. Legacy ID prefixes no longer transfer
+  setup or consent.
+- **Shared launch templates remain usable.** Export preserves bound input markers
+  after secret flags while removing actual values. The GTK connection probe also
+  honors cleared launch fields instead of testing an old saved value.
+- **Hosted setup follows current publisher requirements.** Langfuse uses its
+  documented path and Basic-auth guidance; Postiz uses its documented bearer
+  endpoint. Asana is held out of curated additions until Toolport supports its
+  preregistered OAuth client requirement. Existing saved URLs are unchanged.
+- **Catalog search shows current registry entries.** Live search now uses the
+  stable registry API and requests latest versions, so older package versions
+  cannot crowd current servers out of the result limit.
+- **Microsoft Learn is in the curated catalog.** Its hosted documentation
+  server works without an install or account.
+
+### Added
+
+- **Postman and Redis join the curated catalog.** Postman uses its hosted OAuth
+  server in Minimal mode. Redis uses the publisher's `uvx` server and keeps its
+  required connection URL in Toolport's vault.
+
 ## [1.21.2] - 2026-09-25
 
 Toolport now uses one shared host gateway for registry-backed MCP clients by

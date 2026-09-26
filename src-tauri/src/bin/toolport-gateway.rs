@@ -9385,9 +9385,18 @@ fn connect_one(
             .cwd
             .as_deref()
             .and_then(|c| downstream::resolve_root_token(c, root));
+        let resolved = match conduit_lib::launch_inputs::resolve_args(server) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let msg = format!("'{}' failed: {error}", server.id);
+                eprintln!("toolport: {msg}");
+                glog(&msg);
+                return None;
+            }
+        };
         match StdioTransport::spawn_watched(
             command,
-            &server.args,
+            &resolved.args,
             &env,
             resolved_cwd.as_deref(),
             Arc::clone(dirty),
@@ -9400,8 +9409,9 @@ fn connect_one(
                 t.set_server_request_handler(Arc::clone(&server_handler));
                 t.set_progress_sink(progress);
                 DownstreamServer::connect(server.id.clone(), Box::new(t))
+                    .map_err(|error| resolved.redact(error))
             }
-            Err(e) => Err(e),
+            Err(e) => Err(resolved.redact(e)),
         }
     } else if server.url.is_some() {
         remote::connect_remote_with_handler(
@@ -25903,6 +25913,7 @@ mod tests {
                 client_credentials: None,
                 request_timeout_ms: None,
                 initialize_timeout_ms: None,
+                launch: None,
                 unknown_fields: serde_json::Map::new(),
             });
         }
@@ -25970,6 +25981,7 @@ mod tests {
                 client_credentials: None,
                 request_timeout_ms: None,
                 initialize_timeout_ms: None,
+                launch: None,
                 unknown_fields: serde_json::Map::new(),
             });
             reg.set_server_enabled("default", id, true).unwrap();
@@ -26052,6 +26064,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         reg.set_server_enabled("default", "github", true).unwrap();
@@ -27577,6 +27590,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -30730,6 +30744,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         reg.set_server_enabled("default", &id, true).unwrap();

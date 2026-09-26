@@ -113,7 +113,12 @@ export function CatalogView({ registry, onAdded }: Props) {
    * user-supplied URL, or args the user should review). False = safe to
    * immediate-add with no configuration. */
   function needsConfig(entry: CatalogEntry): boolean {
-    return entry.urlHint != null || entry.envKeys.length > 0 || entry.args.length > 0;
+    return (
+      entry.urlHint != null ||
+      entry.envKeys.length > 0 ||
+      entry.args.length > 0 ||
+      !!entry.launch?.inputs.length
+    );
   }
 
   async function add(entry: CatalogEntry) {
@@ -132,6 +137,7 @@ export function CatalogView({ registry, onAdded }: Props) {
         transport: entry.transport,
         command: entry.command,
         args: entry.args,
+        launch: entry.launch,
         env: entry.envKeys.map((key) => ({ key, value: null, secret: true })),
         url: entry.url,
         source: `catalog:${entry.source}`,
@@ -163,13 +169,19 @@ export function CatalogView({ registry, onAdded }: Props) {
           transport: entry.transport,
           command: entry.command,
           args: entry.args,
+          launch: entry.launch,
           env: entry.envKeys.map((key) => ({ key, value: null, secret: true })),
           url: entry.url,
           source: `catalog:${entry.source}`,
         };
         onAdded(await addServer(server));
         added++;
-        if (entry.credentialsUrl || entry.envKeys.length > 0) needCreds++;
+        if (
+          entry.credentialsUrl ||
+          entry.envKeys.length > 0 ||
+          entry.launch?.inputs.length
+        )
+          needCreds++;
       }
       if (added === 0) {
         toast.success(`${stack.name}: every server is already in Toolport`);
@@ -179,7 +191,7 @@ export function CatalogView({ registry, onAdded }: Props) {
           {
             description:
               needCreds > 0
-                ? `${needCreds} need credentials. Open "Setup steps" for the links.`
+                ? `${needCreds} need setup values. Open "Setup steps", then finish setup under Servers.`
                 : "Enable them under Servers.",
           },
         );
@@ -387,6 +399,7 @@ export function CatalogView({ registry, onAdded }: Props) {
             transport: configEntry.transport,
             command: configEntry.command,
             args: configEntry.args,
+            launch: configEntry.launch,
             env: configEntry.envKeys.map((key) => ({
               key,
               value: null,
@@ -514,6 +527,12 @@ function StackCard({
               <span className="font-medium text-foreground">{e.name}</span>
               {e.setupHint && (
                 <span className="text-muted-foreground">: {e.setupHint}</span>
+              )}
+              {!!e.launch?.inputs.length && (
+                <span className="text-muted-foreground">
+                  {e.setupHint ? " · " : ": "}Launch setup:{" "}
+                  {e.launch.inputs.map((input) => input.label).join(", ")}
+                </span>
               )}
               {e.credentialsUrl && (
                 <button

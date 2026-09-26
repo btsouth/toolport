@@ -14,7 +14,7 @@ fn server(server_id: &str) -> Result<ServerEntry, String> {
         let profile = registry.active_profile_id();
         if !registry.is_enabled(&profile, &server.id) {
             return Err(
-                "this team server runs a local command or private address; enable it from Teams after review"
+                "this team server needs consent for its command, address or authentication; enable it from Teams after review"
                     .into(),
             );
         }

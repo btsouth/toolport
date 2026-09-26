@@ -99,6 +99,16 @@ pub(crate) fn registry_summary(registry: &Registry) -> String {
                 .collect::<Vec<_>>();
             let _ = writeln!(output, "        env: {}", keys.join(", "));
         }
+        if let Some(launch) = &server.launch {
+            if !launch.inputs.is_empty() {
+                let labels = launch
+                    .inputs
+                    .iter()
+                    .map(|input| input.label.as_str())
+                    .collect::<Vec<_>>();
+                let _ = writeln!(output, "        launch setup: {}", labels.join(", "));
+            }
+        }
     }
     let _ = writeln!(output, "\nprofiles ({}):", registry.profiles.len());
     for profile in &registry.profiles {

@@ -441,6 +441,131 @@ pub struct EnvVar {
     pub secret: bool,
 }
 
+/// A named launch input. Only nonsecret values may be serialized here. Secret
+/// values are stored under the server id and key in Toolport's vault.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchInput {
+    pub key: String,
+    pub label: String,
+    pub secret: bool,
+    #[serde(default = "default_true")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ArgPart {
+    Literal { value: String },
+    Input { key: String },
+}
+
+/// Replaces exactly one argument at `index`. Parts are concatenated without a
+/// shell, environment expansion, or parsing of the resulting string.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ArgBinding {
+    pub index: usize,
+    pub parts: Vec<ArgPart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchConfig {
+    #[serde(default)]
+    pub inputs: Vec<LaunchInput>,
+    #[serde(default)]
+    pub bindings: Vec<ArgBinding>,
+    /// Env declarations whose values are needed before this preset can launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_env: Vec<String>,
+    /// Stable curated identity and revision; absent on imported/manual entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u32>,
+}
+
+impl LaunchConfig {
+    pub fn without_values(&self) -> Self {
+        let mut copy = self.clone();
+        for input in &mut copy.inputs {
+            input.value = None;
+        }
+        copy
+    }
+    pub fn validate(&self, args: &[String], stored: bool) -> Result<(), String> {
+        let mut keys = std::collections::HashSet::new();
+        for input in &self.inputs {
+            if input.key.is_empty()
+                || !input
+                    .key
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                || !input.key.as_bytes()[0].is_ascii_uppercase()
+                || !keys.insert(input.key.as_str())
+            {
+                return Err("launch inputs need unique, nonempty keys".into());
+            }
+            if input.label.is_empty()
+                || input.label.len() > 80
+                || input.label.chars().any(char::is_control)
+            {
+                return Err("launch input has an invalid label".into());
+            }
+            if stored && input.secret && input.value.is_some() {
+                return Err(format!(
+                    "secret launch input '{}' must be vaulted",
+                    input.label
+                ));
+            }
+        }
+        let mut indexes = std::collections::HashSet::new();
+        let mut used = std::collections::HashSet::new();
+        for binding in &self.bindings {
+            if binding.index >= args.len()
+                || args[binding.index] != "<launch-input>"
+                || !indexes.insert(binding.index)
+                || binding.parts.is_empty()
+            {
+                return Err("launch argument binding has an invalid or duplicate index".into());
+            }
+            for part in &binding.parts {
+                if let ArgPart::Literal { value } = part {
+                    if value.len() > 32
+                        || value.chars().any(|c| c.is_alphanumeric() || c.is_control())
+                    {
+                        return Err("launch argument literals may contain punctuation only".into());
+                    }
+                }
+                if let ArgPart::Input { key } = part {
+                    if !keys.contains(key.as_str()) {
+                        return Err(format!("launch argument refers to missing input '{key}'"));
+                    }
+                    used.insert(key.as_str());
+                }
+            }
+        }
+        if args
+            .iter()
+            .enumerate()
+            .any(|(index, arg)| arg == "<launch-input>" && !indexes.contains(&index))
+        {
+            return Err("launch argument marker has no binding".into());
+        }
+        if self
+            .inputs
+            .iter()
+            .any(|input| !used.contains(input.key.as_str()))
+        {
+            return Err("launch setup declares an unused input".into());
+        }
+        Ok(())
+    }
+}
+
 /// Long-running generation calls need room beyond the historical 30-second
 /// default, but a bounded ceiling ensures cancellation cannot leave a server's
 /// single HTTP worker draining for an effectively unlimited period.
@@ -487,6 +612,8 @@ pub struct ServerEntry {
     pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<LaunchConfig>,
     #[serde(default)]
     pub env: Vec<EnvVar>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -534,6 +661,13 @@ pub struct ServerEntry {
 }
 
 impl ServerEntry {
+    // Local sync metadata, like teamOriginalId. Persist it in the forward-
+    // compatible fields so reloads and repeated syncs cannot lose the gate.
+    pub(crate) fn require_team_enable_review(&mut self) {
+        self.unknown_fields
+            .insert("teamEnableReview".into(), serde_json::Value::Bool(true));
+    }
+
     pub fn initialize_timeout(&self) -> Result<Option<std::time::Duration>, String> {
         self.initialize_timeout_ms
             .map(validate_initialize_timeout_ms)
@@ -541,14 +675,17 @@ impl ServerEntry {
             .map(|value| value.map(std::time::Duration::from_millis))
     }
 
-    /// Team-synced local commands and LAN URLs stay off until the member enables
-    /// them after review. Enable-all and the playground must not skip that gate.
+    /// Team-synced local commands, LAN URLs and changed remote definitions need
+    /// individual consent. Enable-all and the playground must not skip that gate.
     pub fn needs_team_enable_review(&self) -> bool {
         let Some(src) = self.source.as_deref() else {
             return false;
         };
         if !src.starts_with("team:") {
             return false;
+        }
+        if self.unknown_fields.get("teamEnableReview") == Some(&serde_json::Value::Bool(true)) {
+            return true;
         }
         if self.transport == "stdio" || self.command.is_some() {
             return true;
@@ -1864,8 +2001,13 @@ impl Registry {
         server_id: &str,
         enabled: bool,
     ) -> Result<(), String> {
-        if !self.servers.iter().any(|s| s.id == server_id) {
-            return Err(format!("No server with id '{server_id}'"));
+        let server = self
+            .servers
+            .iter()
+            .find(|s| s.id == server_id)
+            .ok_or_else(|| format!("No server with id '{server_id}'"))?;
+        if enabled && server.launch.is_some() {
+            crate::launch_inputs::resolve_args(server)?;
         }
         let profile = self
             .profiles
@@ -1883,7 +2025,7 @@ impl Registry {
 
     /// Enable or disable every server in a profile at once.
     ///
-    /// Enabling skips team-review servers (local command / LAN URL). Those stay
+    /// Enabling skips team-review servers (local command / LAN URL / changed remote). Those stay
     /// as they were so Enable all cannot bypass the Teams confirm, and so a
     /// server the member already consented to is not wiped.
     pub fn set_all_enabled(&mut self, profile_id: &str, enabled: bool) -> Result<(), String> {
@@ -1891,6 +2033,7 @@ impl Registry {
             self.servers
                 .iter()
                 .filter(|s| !s.needs_team_enable_review())
+                .filter(|s| s.launch.is_none() || crate::launch_inputs::resolve_args(s).is_ok())
                 .map(|s| s.id.clone())
                 .collect()
         } else {
@@ -3109,7 +3252,332 @@ fn load_from_inner(path: &Path) -> Result<(Registry, LoadSource), String> {
         },
     }?;
     registry.normalize_profile_references();
+    // This path is reached only under the registry file lock. Save an exact
+    // legacy-template migration here so a concurrent older writer cannot race
+    // between detection and the atomic backup-preserving write.
+    if source == LoadSource::File {
+        let legacy_changed = migrate_curated_legacy(&mut registry);
+        let atlassian_changed = migrate_atlassian_v2(&mut registry);
+        if legacy_changed || atlassian_changed {
+            save_to(path, &registry)?;
+        }
+    }
     Ok((registry, source))
+}
+
+/// Only exact, unedited catalog definitions qualify. Keep ids, profile state,
+/// unknown fields and existing vault keys; never rewrite a manually edited argv.
+fn migrate_curated_legacy(registry: &mut Registry) -> bool {
+    let templates = crate::catalog::curated();
+    let mut changed = false;
+    for server in &mut registry.servers {
+        if server.source.as_deref() != Some("catalog:curated")
+            || server.launch.is_some()
+            || server.cwd.is_some()
+            || !server.disabled_tools.is_empty()
+        {
+            continue;
+        }
+        let Some(template) = templates.iter().find(|entry| entry.name == server.name) else {
+            continue;
+        };
+        let (old_args, old_env): (&[&str], &[&str]) = match server.name.as_str() {
+            "Twilio" => (
+                &["-y", "@twilio-alpha/mcp"],
+                &["TWILIO_API_KEY", "TWILIO_API_SECRET"],
+            ),
+            "PostgreSQL" => (&["-y", "@modelcontextprotocol/server-postgres"], &[]),
+            "Filesystem" => (&["-y", "@modelcontextprotocol/server-filesystem"], &[]),
+            "Browserbase" => (
+                &["-y", "@browserbasehq/mcp-server-browserbase"],
+                &["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"],
+            ),
+            "Perplexity" => (&["-y", "server-perplexity-ask"], &["PERPLEXITY_API_KEY"]),
+            "Brave Search" => (
+                &["-y", "@modelcontextprotocol/server-brave-search"],
+                &["BRAVE_API_KEY"],
+            ),
+            "Qdrant" => (&["mcp-server-qdrant"], &["QDRANT_URL", "QDRANT_API_KEY"]),
+            "AWS" => (
+                &["awslabs.core-mcp-server@latest"],
+                &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+            ),
+            _ => continue,
+        };
+        let expected_command = if matches!(server.name.as_str(), "Qdrant" | "AWS") {
+            "uvx"
+        } else {
+            "npx"
+        };
+        if server.transport != "stdio"
+            || server.command.as_deref() != Some(expected_command)
+            || server.url.is_some()
+            || server.client_credentials.is_some()
+            || !server.unknown_fields.is_empty()
+            || server.args.iter().map(String::as_str).collect::<Vec<_>>() != old_args
+            || server
+                .env
+                .iter()
+                .map(|e| e.key.as_str())
+                .collect::<Vec<_>>()
+                != old_env
+            || server.env.iter().any(|e| !e.secret || e.value.is_some())
+        {
+            continue;
+        }
+        server.args = template.args.clone();
+        server.command = template.command.clone();
+        server.launch = template.launch.clone();
+        server.env = template
+            .env_keys
+            .iter()
+            .map(|key| EnvVar {
+                key: key.clone(),
+                value: None,
+                secret: true,
+            })
+            .collect();
+        // Changed requirements must be reviewed and completed before launch.
+        if matches!(
+            server.name.as_str(),
+            "Twilio" | "PostgreSQL" | "Filesystem" | "Browserbase" | "Qdrant" | "AWS"
+        ) {
+            for profile in &mut registry.profiles {
+                profile.enabled_server_ids.retain(|id| id != &server.id);
+            }
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// Atlassian's v1 OAuth endpoint is superseded by v2. Migrate only the exact
+/// curated v1 URL and otherwise untouched setup. Existing ids, profile
+/// membership, and vaulted OAuth credentials stay with the entry; users may
+/// need to reauthenticate if the new endpoint rejects an old token.
+fn migrate_atlassian_v2(registry: &mut Registry) -> bool {
+    let template = crate::catalog::curated()
+        .into_iter()
+        .find(|entry| entry.name == "Atlassian")
+        .expect("curated Atlassian template");
+    let mut changed = false;
+    for server in &mut registry.servers {
+        let launch_is_original = server.launch.is_none()
+            || server.launch.as_ref().is_some_and(|launch| {
+                launch.template.as_deref() == Some("atlassian")
+                    && launch.revision == Some(1)
+                    && launch.inputs.is_empty()
+                    && launch.bindings.is_empty()
+                    && launch.required_env.is_empty()
+            });
+        if server.name != "Atlassian"
+            || server.source.as_deref() != Some("catalog:curated")
+            || server.transport != "http"
+            || server.url.as_deref() != Some("https://mcp.atlassian.com/v1/mcp/authv2")
+            || server.command.is_some()
+            || !server.args.is_empty()
+            || !server.env.is_empty()
+            || server.cwd.is_some()
+            || !server.disabled_tools.is_empty()
+            || server.client_credentials.is_some()
+            || server.request_timeout_ms.is_some()
+            || !server.unknown_fields.is_empty()
+            || !launch_is_original
+        {
+            continue;
+        }
+        server.url = template.url.clone();
+        server.launch = template.launch.clone();
+        changed = true;
+    }
+    changed
+}
+
+#[cfg(test)]
+mod catalog_launch_migration_tests {
+    use super::*;
+
+    #[test]
+    fn migrates_only_untouched_atlassian_v1_and_keeps_profiles() {
+        let old: ServerEntry = serde_json::from_str(
+            r#"{"id":"atlassian-work","name":"Atlassian","transport":"http",
+            "url":"https://mcp.atlassian.com/v1/mcp/authv2","source":"catalog:curated"}"#,
+        )
+        .unwrap();
+        let mut edited = old.clone();
+        edited.id = "atlassian-edited".into();
+        edited.disabled_tools.push("a-tool".into());
+        let mut v1_template = old.clone();
+        v1_template.id = "atlassian-with-template".into();
+        v1_template.launch = Some(LaunchConfig {
+            template: Some("atlassian".into()),
+            revision: Some(1),
+            ..Default::default()
+        });
+        let mut registry = Registry::default();
+        registry.servers = vec![old, edited.clone(), v1_template];
+        registry.profiles[0].enabled_server_ids = vec![
+            "atlassian-work".into(),
+            "atlassian-edited".into(),
+            "atlassian-with-template".into(),
+        ];
+        assert!(migrate_atlassian_v2(&mut registry));
+        for index in [0, 2] {
+            assert_eq!(
+                registry.servers[index].url.as_deref(),
+                Some("https://mcp.atlassian.com/v2/mcp?tools=all")
+            );
+            assert_eq!(
+                registry.servers[index].launch.as_ref().unwrap().revision,
+                Some(2)
+            );
+        }
+        assert_eq!(registry.servers[1], edited);
+        assert_eq!(registry.profiles[0].enabled_server_ids.len(), 3);
+        assert!(!migrate_atlassian_v2(&mut registry));
+    }
+
+    #[test]
+    fn migrates_only_untouched_catalog_entries_and_keeps_ids_profiles_and_env_keys() {
+        let mut registry = Registry::default();
+        let old: ServerEntry = serde_json::from_str(
+            r#"{
+            "id":"twilio-work","name":"Twilio","transport":"stdio","command":"npx",
+            "args":["-y","@twilio-alpha/mcp"],"source":"catalog:curated",
+            "env":[{"key":"TWILIO_API_KEY","secret":true},{"key":"TWILIO_API_SECRET","secret":true}]
+        }"#,
+        )
+        .unwrap();
+        let mut edited = old.clone();
+        edited.id = "twilio-edited".into();
+        edited.args.push("--services".into());
+        let mut forward_edited = old.clone();
+        forward_edited.id = "twilio-newer".into();
+        forward_edited
+            .unknown_fields
+            .insert("futureLaunchSetting".into(), serde_json::json!(true));
+        registry.servers = vec![old, edited.clone(), forward_edited.clone()];
+        registry.profiles[0].enabled_server_ids =
+            vec!["twilio-work".into(), "twilio-edited".into()];
+        assert!(migrate_curated_legacy(&mut registry));
+        let migrated = &registry.servers[0];
+        assert_eq!(migrated.id, "twilio-work");
+        assert_eq!(migrated.args[2], "<launch-input>");
+        assert!(migrated.env.is_empty());
+        assert_eq!(migrated.launch.as_ref().unwrap().revision, Some(2));
+        assert_eq!(registry.servers[1], edited);
+        assert_eq!(registry.servers[2], forward_edited);
+        assert_eq!(
+            registry.profiles[0].enabled_server_ids,
+            vec!["twilio-edited"]
+        );
+        assert!(!migrate_curated_legacy(&mut registry));
+    }
+
+    #[test]
+    fn loading_legacy_catalog_saves_one_backup_and_is_idempotent() {
+        let directory = std::env::temp_dir().join(format!(
+            "toolport-launch-migration-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("registry.json");
+        let mut registry = Registry::default();
+        registry.servers.push(
+            serde_json::from_str(
+                r#"{
+            "id":"postgres-work","name":"PostgreSQL","transport":"stdio",
+            "command":"npx","args":["-y","@modelcontextprotocol/server-postgres"],
+            "source":"catalog:curated"
+        }"#,
+            )
+            .unwrap(),
+        );
+        save_to(&path, &registry).unwrap();
+        let legacy_bytes = std::fs::read(&path).unwrap();
+        let migrated = load_from(&path).unwrap();
+        assert_eq!(migrated.servers[0].id, "postgres-work");
+        assert!(migrated.servers[0].launch.is_some());
+        assert_eq!(std::fs::read(backup_path(&path)).unwrap(), legacy_bytes);
+        let migrated_bytes = std::fs::read(&path).unwrap();
+        let backup_bytes = std::fs::read(backup_path(&path)).unwrap();
+        load_from(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), migrated_bytes);
+        assert_eq!(std::fs::read(backup_path(&path)).unwrap(), backup_bytes);
+        std::fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn incomplete_catalog_entry_cannot_be_enabled() {
+        let template = crate::catalog::curated()
+            .into_iter()
+            .find(|entry| entry.name == "Filesystem")
+            .unwrap();
+        let mut server: ServerEntry = serde_json::from_str(
+            r#"{"id":"files","name":"Filesystem","transport":"stdio","command":"npx"}"#,
+        )
+        .unwrap();
+        server.args = template.args;
+        server.launch = template.launch;
+        let mut registry = Registry::default();
+        registry.servers.push(server);
+        let profile = registry.active_profile_id();
+        let error = registry
+            .set_server_enabled(&profile, "files", true)
+            .unwrap_err();
+        assert!(error.contains("Allowed directory"), "{error}");
+        assert!(!registry.is_enabled(&profile, "files"));
+        registry.servers[0].launch.as_mut().unwrap().inputs[0].value = Some("/tmp".into());
+        registry
+            .set_server_enabled(&profile, "files", true)
+            .unwrap();
+        assert!(registry.is_enabled(&profile, "files"));
+    }
+
+    #[test]
+    fn removing_a_required_env_declaration_saves_but_blocks_enabling() {
+        let template = crate::catalog::curated()
+            .into_iter()
+            .find(|entry| entry.name == "Slack")
+            .unwrap();
+        let mut server: ServerEntry = serde_json::from_str(
+            r#"{"id":"slack","name":"Slack","transport":"stdio","command":"npx"}"#,
+        )
+        .unwrap();
+        server.args = template.args;
+        server.launch = template.launch;
+        server.env = vec![EnvVar {
+            key: "SLACK_BOT_TOKEN".into(),
+            value: None,
+            secret: true,
+        }];
+        server.env.push(EnvVar {
+            key: "SLACK_TEAM_ID".into(),
+            value: None,
+            secret: true,
+        });
+        let mut registry = Registry::default();
+        registry.servers.push(server);
+        // The Secrets dialog and the editor both remove declarations. That edit
+        // must persist even though the launch setup still names the key.
+        registry.servers[0].env.clear();
+        let directory = std::env::temp_dir().join(format!(
+            "toolport-launch-required-env-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("registry.json");
+        save_to(&path, &registry).unwrap();
+        let profile = registry.active_profile_id();
+        let error = registry
+            .set_server_enabled(&profile, "slack", true)
+            .unwrap_err();
+        assert!(error.contains("SLACK_BOT_TOKEN"), "{error}");
+        assert!(!registry.is_enabled(&profile, "slack"));
+        std::fs::remove_dir_all(directory).ok();
+    }
 }
 
 /// Load an explicit registry while holding its cross-process lock across the full
@@ -3142,6 +3610,15 @@ pub fn load_from_locked_with_source(
 }
 
 pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
+    for server in &registry.servers {
+        if let Some(launch) = &server.launch {
+            launch.validate(&server.args, true)?;
+            // A `required_env` key with no matching declaration is an incomplete
+            // entry, not a corrupt one: the editor and Secrets dialog both let a
+            // user remove a declaration, and enabling refuses until it is back.
+            // Structural validation above is enough for saving.
+        }
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -4024,6 +4501,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -4943,9 +5421,15 @@ mod tests {
 
     #[test]
     fn missing_file_yields_default() {
-        let path = std::env::temp_dir().join("conduit-does-not-exist-xyz.json");
+        // A fixed /tmp lock name can outlive an earlier run under another UID.
+        let path = std::env::temp_dir().join(format!(
+            "conduit-does-not-exist-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let r = load_from(&path).unwrap();
         assert_eq!(r.profiles.len(), 1);
+        std::fs::remove_file(format!("{}.lock", path.display())).ok();
     }
 
     /// The MSIX escape hatch: a drive-rooted path maps to its `\\localhost\<D>$`
@@ -5902,6 +6386,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         // Inject a per-server field this binary's ServerEntry doesn't define.

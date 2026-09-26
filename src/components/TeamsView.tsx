@@ -111,8 +111,8 @@ export function TeamsView({
     memberName?: string;
   } | null>(null);
 
-  // Team servers that run a local command or hit a LAN address arrive OFF (the member
-  // reviews + enables them below); link-local/metadata URLs are blocked outright. The
+  // Local commands, LAN addresses and changed remote definitions require review
+  // below; link-local/metadata URLs are blocked outright. The
   // backend emits the counts so the state is explained, not a silent mystery.
   useEffect(() => {
     const un = listen<{ review: number; blocked: number }>("team-servers-review", (e) => {
@@ -120,7 +120,7 @@ export function TeamsView({
       const parts: string[] = [];
       if (review > 0)
         parts.push(
-          `${review} team server${review === 1 ? "" : "s"} run${review === 1 ? "s" : ""} a local command or a LAN address, so ${review === 1 ? "it's" : "they're"} off until you review and enable ${review === 1 ? "it" : "them"} below.`,
+          `${review} team server${review === 1 ? "" : "s"} ${review === 1 ? "is" : "are"} off until you review and enable ${review === 1 ? "it" : "them"} below. Check the command, address and authentication before enabling.`,
         );
       if (blocked > 0)
         parts.push(
@@ -282,7 +282,7 @@ export function TeamsView({
               <p className="text-xs text-muted-foreground">
                 {isLocal
                   ? "Runs this local command on your machine:"
-                  : "Connects to this private/LAN address:"}
+                  : "Connects to this address:"}
               </p>
               <code className="block truncate font-mono text-xs text-foreground">
                 {detail}
@@ -303,7 +303,7 @@ export function TeamsView({
               description={
                 isLocal
                   ? `This runs a local command on your machine: ${detail}. Only enable it if you trust your team and recognize this command.`
-                  : `This connects Toolport to ${detail}, a private/LAN address. Only enable it if you trust your team.`
+                  : `This connects Toolport to ${detail} using this server's saved authentication. Verify the address and credentials before enabling it.`
               }
               confirmLabel="Enable"
               onConfirm={() => onEnable(s.id)}
@@ -692,8 +692,9 @@ export function TeamsView({
                             {review.length})
                           </div>
                           <p className="mt-1 mb-2 text-xs text-muted-foreground">
-                            These run a local command or reach a LAN address, so they stay
-                            off until you review and enable each one.
+                            Review each server's command, address and authentication
+                            before enabling it. Changed remote servers require a new
+                            review too.
                           </p>
                           <ul className="grid gap-2">{review.map(renderTeamServer)}</ul>
                         </div>

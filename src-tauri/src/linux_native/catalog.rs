@@ -574,7 +574,8 @@ fn suggestion_row(
                 })
                 .await;
                 match result {
-                    Ok(Ok(_)) => {
+                    Ok(Ok(registry)) => {
+                        open_added_setup(&registry, &page);
                         page.pending_notice.replace(Some(format!(
                             "Added {name}. Review credentials and enable it from Servers."
                         )));
@@ -606,6 +607,7 @@ fn configure_self_hosted(entry: &crate::catalog::CatalogEntry, hint: &str, page:
         transport_id: entry.transport.clone(),
         command: entry.command.clone(),
         args: entry.args.clone(),
+        launch: entry.launch.clone(),
         url: None,
         cwd: None,
         secret_keys: entry.env_keys.clone(),
@@ -670,10 +672,30 @@ fn stack_card(
         for entry in &stack.servers {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             let mut line = entry.name.clone();
+            let launch_labels = entry
+                .launch
+                .as_ref()
+                .map(|launch| {
+                    launch
+                        .inputs
+                        .iter()
+                        .filter(|input| input.required)
+                        .map(|input| input.label.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             match entry.setup_hint.as_deref() {
                 Some(hint) => line.push_str(&format!(" · {hint}")),
-                None if entry.env_keys.is_empty() => line.push_str(" · no credential needed"),
-                None => line.push_str(&format!(" · needs {}", entry.env_keys.join(", "))),
+                None if entry.env_keys.is_empty() && launch_labels.is_empty() => {
+                    line.push_str(" · no credential needed")
+                }
+                None if !entry.env_keys.is_empty() => {
+                    line.push_str(&format!(" · needs {}", entry.env_keys.join(", ")))
+                }
+                None => {}
+            }
+            if !launch_labels.is_empty() {
+                line.push_str(&format!(" · launch setup: {}", launch_labels.join(", ")));
             }
             row.append(
                 &gtk::Label::builder()
@@ -862,7 +884,8 @@ fn catalog_card(
                 .await;
                 button.set_sensitive(true);
                 match result {
-                    Ok(Ok(_)) => {
+                    Ok(Ok(registry)) => {
+                        open_added_setup(&registry, &page);
                         page.pending_notice.replace(Some(format!(
                             "Added {name}. Review credentials and enable it from Servers."
                         )));
@@ -878,4 +901,32 @@ fn catalog_card(
     actions.append(&action_slot);
     card.append(&actions);
     card
+}
+
+/// Catalog entries with argument inputs open the saved editor immediately so
+/// their vaulted and plain values can be entered before enabling the server.
+fn open_added_setup(registry: &crate::registry::Registry, page: &CatalogPage) {
+    let Some(last) = registry.servers.last() else {
+        return;
+    };
+    if !last
+        .launch
+        .as_ref()
+        .is_some_and(|launch| !launch.inputs.is_empty())
+    {
+        return;
+    }
+    let id = last.id.clone();
+    let view = super::state::RegistrySnapshot::from_registry(registry.clone())
+        .servers
+        .into_iter()
+        .find(|server| server.id == id);
+    if let Some(view) = view {
+        let _ = super::open_server_editor_prefilled(
+            Some(view),
+            Some(id),
+            page.server_page.clone(),
+            None,
+        );
+    }
 }

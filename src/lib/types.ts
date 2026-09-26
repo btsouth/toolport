@@ -319,6 +319,7 @@ export interface CatalogEntry {
   transport: Transport;
   command: string | null;
   args: string[];
+  launch?: LaunchConfig | null;
   url: string | null;
   envKeys: string[];
   source: "curated" | "registry" | "user";
@@ -352,12 +353,35 @@ export interface EnvVar {
   secret: boolean;
 }
 
+export interface LaunchInput {
+  key: string;
+  label: string;
+  secret: boolean;
+  required: boolean;
+  /** Present only for nonsecret inputs in saved configuration. */
+  value?: string | null;
+}
+
+export type ArgPart = { kind: "literal"; value: string } | { kind: "input"; key: string };
+export interface ArgBinding {
+  index: number;
+  parts: ArgPart[];
+}
+export interface LaunchConfig {
+  inputs: LaunchInput[];
+  bindings: ArgBinding[];
+  requiredEnv?: string[];
+  template?: string | null;
+  revision?: number | null;
+}
+
 export interface ServerEntry {
   id: string;
   name: string;
   transport: Transport;
   command: string | null;
   args: string[];
+  launch?: LaunchConfig | null;
   env: EnvVar[];
   url: string | null;
   source: string | null;

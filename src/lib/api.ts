@@ -746,6 +746,23 @@ export function setSecret(
   return invoke<Registry>("set_secret", { serverId, key, value });
 }
 
+/** Vault an argument input without exposing it as an environment variable. */
+export function setLaunchSecret(
+  serverId: string,
+  key: string,
+  value: string,
+): Promise<Registry> {
+  return invoke<Registry>("set_launch_secret", { serverId, key, value });
+}
+
+export function setLaunchInputValue(
+  serverId: string,
+  key: string,
+  value: string | null,
+): Promise<Registry> {
+  return invoke<Registry>("set_launch_input_value", { serverId, key, value });
+}
+
 /** Remove a secret from the keychain and the server entry. */
 export function deleteSecret(serverId: string, key: string): Promise<Registry> {
   return invoke<Registry>("delete_secret", { serverId, key });
@@ -938,6 +955,7 @@ export function addCatalogServer(entry: CatalogEntry): Promise<Registry> {
     transport: entry.transport,
     command: entry.command,
     args: entry.args,
+    launch: entry.launch,
     env: entry.envKeys.map((key) => ({ key, value: null, secret: true })),
     url: entry.url,
     source: `catalog:${entry.source}`,

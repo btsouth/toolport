@@ -1660,7 +1660,7 @@ fn team_server_export(reg: &Registry) -> Value {
                 .iter()
                 .zip(crate::registry::secret_arg_mask(&s.args))
                 .map(|(a, secret)| {
-                    if secret {
+                    if secret && a != "<launch-input>" {
                         "<redacted>".to_string()
                     } else {
                         a.clone()
@@ -1674,6 +1674,7 @@ fn team_server_export(reg: &Registry) -> Value {
                 "transport": s.transport,
                 "command": s.command,
                 "args": args,
+                "launch": s.launch.as_ref().map(|launch| launch.without_values()),
                 "url": url,
                 "env": s.env.iter().map(|e| serde_json::json!({ "key": e.key, "secret": e.secret })).collect::<Vec<_>>(),
                 "disabledTools": s.disabled_tools,
@@ -1712,8 +1713,8 @@ fn is_team_server(s: &ServerEntry, tag: &str) -> bool {
 /// `screeningPolicy` force-flags are adopted tighten-only: policy can only raise safety,
 /// never loosen it. Returns how many servers were merged and how many were skipped for
 /// safety (local/stdio or private-URL entries).
-/// Outcome of merging a team config: `applied` = ready remote servers (auto-enabled),
-/// `review` = local-command or LAN servers added but left OFF until the member opts in,
+/// Outcome of merging a team config: `applied` = public remote servers merged,
+/// `review` = servers left OFF awaiting consent, including changed public remotes,
 /// `blocked` = link-local / cloud-metadata URLs refused outright.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MergeOutcome {
@@ -1728,15 +1729,115 @@ enum TeamClass {
     Skip,
     /// Link-local / cloud-metadata URL: SSRF-to-credentials, never synced.
     Blocked,
-    /// Public remote server: safe to auto-enable.
+    /// Public remote server: safe to auto-enable only for a new local identity.
     Ready(ServerEntry),
     /// Runs a local command, or points at a loopback/LAN address: synced but never
     /// auto-run. The member must enable it after seeing the command (informed consent).
     Review(ServerEntry),
 }
 
+const TEAM_ORIGINAL_ID_FIELD: &str = "teamOriginalId";
+
+fn team_entry_original_id(value: &Value) -> Option<&str> {
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            value
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+        })
+}
+
+fn saved_team_original_id(server: &ServerEntry) -> Option<&str> {
+    server
+        .unknown_fields
+        .get(TEAM_ORIGINAL_ID_FIELD)
+        .and_then(Value::as_str)
+}
+
+fn team_id_conflicts(id: &str, used: &[String]) -> bool {
+    used.iter()
+        .any(|existing| crate::registry::ids_collide(id, existing))
+}
+
+/// A local id owns a member's vaulted credentials and profile consent. Reuse it
+/// only for the same original team entry. Old rows lack that identity, so an
+/// ambiguous slug collision gets a fresh deterministic id instead of another
+/// server's credentials.
+fn local_team_server_id(
+    entry: &ServerEntry,
+    tag: &str,
+    previous: &[ServerEntry],
+    used: &[String],
+    slug_collides: bool,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let base = &entry.id;
+    let original = saved_team_original_id(entry).expect("classified team entry has identity");
+    let identified: Vec<_> = previous
+        .iter()
+        .filter(|old| saved_team_original_id(old) == Some(original))
+        .collect();
+    if identified.len() == 1 && !team_id_conflicts(&identified[0].id, used) {
+        return identified[0].id.clone();
+    }
+
+    // One upgrade-time match can preserve an older server's vault keys. Never
+    // guess between legacy rows whose distinct original ids share a slug.
+    if identified.is_empty() && !slug_collides {
+        let fingerprint = consent_fingerprint(entry);
+        let legacy: Vec<_> = previous
+            .iter()
+            .filter(|old| saved_team_original_id(old).is_none())
+            // A suffix can be another original id (including numeric ids like
+            // db-2), not merely unique_id's collision counter. Without the
+            // original identity it cannot establish ownership of vault keys
+            // or standing consent. Only the exact legacy base is reusable.
+            .filter(|old| old.id == *base)
+            .filter(|old| old.name == entry.name && consent_fingerprint(old) == fingerprint)
+            .collect();
+        if legacy.len() == 1 && !team_id_conflicts(&legacy[0].id, used) {
+            return legacy[0].id.clone();
+        }
+    }
+
+    // New entries always include the team identity, even without a current
+    // collision. Leaving a team removes its rows but retains its vault keys;
+    // another team's same-named entry must not inherit those credentials. Include
+    // the initial definition too: removing and re-adding the same original id
+    // with a different destination must not bypass the consent checks on updates.
+    let digest =
+        Sha256::digest(format!("{tag}\0{original}\0{}", consent_fingerprint(entry)).as_bytes());
+    let suffix = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let stem = format!("{base}-{suffix}");
+    let mut candidate = stem.clone();
+    let mut attempt = 2;
+    while team_id_conflicts(&candidate, used)
+        || previous
+            .iter()
+            .any(|old| crate::registry::ids_collide(&candidate, &old.id))
+    {
+        candidate = format!("{stem}-{attempt}");
+        attempt += 1;
+    }
+    candidate
+}
+
 pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) -> MergeOutcome {
     let tag = tag_for(team_id);
+    let previous: Vec<ServerEntry> = reg
+        .servers
+        .iter()
+        .filter(|server| is_team_server(server, &tag))
+        .cloned()
+        .collect();
 
     // 1. Capture the prior generation of this team's servers, and which of them the
     //    member had ENABLED IN EACH PROFILE. That enablement is their standing consent for
@@ -1744,23 +1845,39 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     //    of forcing a re-approval on every sync. Capturing per-profile (not just the active
     //    one) is what keeps a team server the member enabled in a NON-active profile from
     //    being stripped on every sync and never restored.
-    let old_ids: Vec<String> = reg
-        .servers
-        .iter()
-        .filter(|s| is_team_server(s, &tag))
-        .map(|s| s.id.clone())
-        .collect();
+    let old_ids: Vec<String> = previous.iter().map(|server| server.id.clone()).collect();
     // What the member actually consented to, per id: the execution-relevant fields of the
     // entry as it stood when they enabled it. Standing consent is restored below only for a
     // review server whose new entry has the SAME fingerprint. An org config that keeps an
     // id but changes the command (or turns a public URL into a local command) therefore
     // arrives OFF again and is counted for review, instead of running at the next gateway
     // start on a consent the member gave to something else (SBS-1017).
-    let prev_consent: HashMap<String, String> = reg
-        .servers
+    let prev_consent: HashMap<String, String> = previous
         .iter()
-        .filter(|s| is_team_server(s, &tag))
         .map(|s| (s.id.clone(), consent_fingerprint(s)))
+        .collect();
+    // Team definitions deliberately omit setup values. Match saved member
+    // values by the original team id, which survives a local slug collision or
+    // a reorder. For pre-upgrade rows without that id, the local-id fallback is
+    // used only if local_team_server_id can make an unambiguous legacy match.
+    let mut previous_original_counts: HashMap<&str, usize> = HashMap::new();
+    for server in &previous {
+        if let Some(original) = saved_team_original_id(server) {
+            *previous_original_counts.entry(original).or_default() += 1;
+        }
+    }
+    let local_launch_values_by_original: HashMap<String, HashMap<String, String>> = previous
+        .iter()
+        .filter_map(|server| {
+            let original = saved_team_original_id(server)?;
+            (previous_original_counts.get(original) == Some(&1))
+                .then(|| (original.to_string(), plain_launch_values(server)))
+        })
+        .collect();
+    let legacy_launch_values_by_id: HashMap<String, HashMap<String, String>> = previous
+        .iter()
+        .filter(|server| saved_team_original_id(server).is_none())
+        .map(|server| (server.id.clone(), plain_launch_values(server)))
         .collect();
     let prev_enabled_by_profile: std::collections::HashMap<
         String,
@@ -1799,19 +1916,63 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     let mut tool_allows: HashMap<String, Option<Vec<String>>> = HashMap::new();
     let mut outcome = MergeOutcome::default();
     if let Some(arr) = team_cfg.get("servers").and_then(Value::as_array) {
+        let mut original_counts: HashMap<&str, usize> = HashMap::new();
+        let mut slug_counts: HashMap<String, usize> = HashMap::new();
+        for server in arr {
+            if let Some(original) = team_entry_original_id(server) {
+                *original_counts.entry(original).or_default() += 1;
+                *slug_counts
+                    .entry(format!("team_{}", slugify_id(original)))
+                    .or_default() += 1;
+            }
+        }
         for s in arr {
+            if team_entry_original_id(s)
+                .is_some_and(|original| original_counts.get(original).copied().unwrap_or(0) > 1)
+            {
+                outcome.blocked += 1;
+                continue;
+            }
             let allowed = parse_allowed_tools(s);
             match classify_team_server(s, &tag) {
                 TeamClass::Ready(mut entry) => {
-                    entry.id = crate::registry::unique_id(&entry.id, &used_ids);
+                    let collides = slug_counts.get(&entry.id).copied().unwrap_or(0) > 1;
+                    entry.id = local_team_server_id(&entry, &tag, &previous, &used_ids, collides);
+                    restore_local_launch_values(
+                        &mut entry,
+                        &local_launch_values_by_original,
+                        &legacy_launch_values_by_id,
+                    );
                     used_ids.push(entry.id.clone());
                     tool_allows.insert(entry.id.clone(), allowed);
-                    auto_enable.push(entry.id.clone());
+                    if prev_consent.contains_key(&entry.id) {
+                        // Existing public remotes may own bearer tokens. A new
+                        // destination cannot inherit enablement, and an unchanged
+                        // re-sync must preserve a member's decision to leave it off.
+                        let fingerprint = consent_fingerprint(&entry);
+                        if prev_consent.get(&entry.id) != Some(&fingerprint)
+                            || previous
+                                .iter()
+                                .any(|old| old.id == entry.id && old.needs_team_enable_review())
+                        {
+                            entry.require_team_enable_review();
+                        }
+                        review_ids.push(entry.id.clone());
+                        review_fingerprints.insert(entry.id.clone(), fingerprint);
+                    } else {
+                        auto_enable.push(entry.id.clone());
+                    }
                     reg.servers.push(entry);
                     outcome.applied += 1;
                 }
                 TeamClass::Review(mut entry) => {
-                    entry.id = crate::registry::unique_id(&entry.id, &used_ids);
+                    let collides = slug_counts.get(&entry.id).copied().unwrap_or(0) > 1;
+                    entry.id = local_team_server_id(&entry, &tag, &previous, &used_ids, collides);
+                    restore_local_launch_values(
+                        &mut entry,
+                        &local_launch_values_by_original,
+                        &legacy_launch_values_by_id,
+                    );
                     used_ids.push(entry.id.clone());
                     tool_allows.insert(entry.id.clone(), allowed);
                     review_ids.push(entry.id.clone());
@@ -1824,7 +1985,7 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
         }
     }
 
-    // 3. Enable per profile. Ready (public remote) servers auto-enable in the ACTIVE profile
+    // 3. Enable per profile. New public remotes auto-enable in the ACTIVE profile
     //    (first-run convenience). EVERY profile then restores the exact team servers the
     //    member had enabled in THAT profile before this sync — their standing consent — so a
     //    server enabled in a non-active profile survives the replace. Review servers the
@@ -1974,6 +2135,46 @@ fn apply_team_tool_scope(
 /// out: changing them does not change what runs on the member's machine, and re-prompting
 /// on a rename would train members to click through. Length-prefixed so no choice of
 /// separator inside a field can make two different definitions hash alike.
+fn restore_local_launch_values(
+    entry: &mut ServerEntry,
+    by_original: &HashMap<String, HashMap<String, String>>,
+    legacy_by_id: &HashMap<String, HashMap<String, String>>,
+) {
+    let Some(values) = saved_team_original_id(entry)
+        .and_then(|original| by_original.get(original))
+        .or_else(|| legacy_by_id.get(&entry.id))
+    else {
+        return;
+    };
+    if let Some(launch) = &mut entry.launch {
+        for input in &mut launch.inputs {
+            if !input.secret {
+                input.value = values.get(&input.key).cloned();
+            }
+        }
+    }
+}
+
+fn plain_launch_values(entry: &ServerEntry) -> HashMap<String, String> {
+    entry
+        .launch
+        .as_ref()
+        .map(|launch| {
+            launch
+                .inputs
+                .iter()
+                .filter(|input| !input.secret)
+                .filter_map(|input| {
+                    input
+                        .value
+                        .as_ref()
+                        .map(|value| (input.key.clone(), value.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn consent_fingerprint(entry: &ServerEntry) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -1987,6 +2188,11 @@ fn consent_fingerprint(entry: &ServerEntry) -> String {
     for arg in &entry.args {
         field("arg", arg);
     }
+    if let Some(launch) = &entry.launch {
+        if let Ok(encoded) = serde_json::to_string(&launch.without_values()) {
+            field("launch", &encoded);
+        }
+    }
     let mut env_keys: Vec<&str> = entry.env.iter().map(|e| e.key.as_str()).collect();
     env_keys.sort_unstable();
     for key in env_keys {
@@ -1994,6 +2200,11 @@ fn consent_fingerprint(entry: &ServerEntry) -> String {
     }
     field("cwd", entry.cwd.as_deref().unwrap_or(""));
     field("url", entry.url.as_deref().unwrap_or(""));
+    if let Some(credentials) = &entry.client_credentials {
+        if let Ok(encoded) = serde_json::to_string(credentials) {
+            field("clientCredentials", &encoded);
+        }
+    }
     hasher
         .finalize()
         .iter()
@@ -2012,6 +2223,11 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         None => return TeamClass::Skip,
     };
     let id = format!("team_{}", slugify_id(orig_id.unwrap_or(name)));
+    let mut unknown_fields = serde_json::Map::new();
+    unknown_fields.insert(
+        TEAM_ORIGINAL_ID_FIELD.into(),
+        Value::String(orig_id.unwrap_or(name).to_string()),
+    );
     let str_array = |k: &str| {
         s.get(k)
             .and_then(Value::as_array)
@@ -2087,6 +2303,14 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
 
     let transport = str_field("transport").unwrap_or("stdio").to_string();
     let command = str_field("command").map(String::from);
+    let launch = match s.get("launch").filter(|value| !value.is_null()) {
+        Some(value) => match serde_json::from_value::<crate::registry::LaunchConfig>(value.clone())
+        {
+            Ok(launch) => Some(launch.without_values()),
+            Err(_) => return TeamClass::Blocked,
+        },
+        None => None,
+    };
     let mut entry = ServerEntry {
         id,
         name: name.to_string(),
@@ -2104,8 +2328,16 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         client_credentials,
         request_timeout_ms: None,
         initialize_timeout_ms: None,
-        unknown_fields: serde_json::Map::new(),
+        launch,
+        unknown_fields,
     };
+    if entry
+        .launch
+        .as_ref()
+        .is_some_and(|launch| launch.validate(&entry.args, true).is_err())
+    {
+        return TeamClass::Blocked;
+    }
 
     // A server that runs a local command (stdio, or any command-bearing entry) is the RCE
     // case: carry the command so the member CAN run it, but only after they enable it.
@@ -2115,7 +2347,8 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
             Some(c) => entry.command = Some(c),
             None => return TeamClass::Skip, // stdio with no command is unusable
         }
-        entry.request_timeout_ms = match s.get("requestTimeoutMs").filter(|value| !value.is_null()) {
+        entry.request_timeout_ms = match s.get("requestTimeoutMs").filter(|value| !value.is_null())
+        {
             Some(value) => match value.as_u64().and_then(|milliseconds| {
                 crate::registry::validate_request_timeout_ms(milliseconds).ok()
             }) {
@@ -2166,10 +2399,9 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         .get("initializeTimeoutMs")
         .filter(|value| !value.is_null())
     {
-        Some(value) => match value
-            .as_u64()
-            .and_then(|milliseconds| crate::registry::validate_initialize_timeout_ms(milliseconds).ok())
-        {
+        Some(value) => match value.as_u64().and_then(|milliseconds| {
+            crate::registry::validate_initialize_timeout_ms(milliseconds).ok()
+        }) {
             Some(milliseconds) => Some(milliseconds),
             None => return TeamClass::Blocked,
         },
@@ -2882,6 +3114,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         let active = r.active_profile_id.clone().unwrap();
@@ -2904,6 +3137,16 @@ mod tests {
             .clone()
     }
 
+    fn member_id(registry: &Registry, original: &str) -> String {
+        registry
+            .servers
+            .iter()
+            .find(|s| saved_team_original_id(s) == Some(original))
+            .unwrap_or_else(|| panic!("missing team entry {original}"))
+            .id
+            .clone()
+    }
+
     #[test]
     fn merge_adds_team_servers_without_touching_local() {
         let mut r = base_registry();
@@ -2918,7 +3161,9 @@ mod tests {
             r.servers.iter().any(|s| s.id == "mine"),
             "local server preserved"
         );
-        let gh = r.servers.iter().find(|s| s.id == "team_github").unwrap();
+        let github = member_id(&r, "github");
+        let stripe = member_id(&r, "stripe");
+        let gh = r.servers.iter().find(|s| s.id == github).unwrap();
         assert_eq!(gh.source.as_deref(), Some("team:t1"));
         assert_eq!(gh.env[0].key, "TOKEN");
         assert_eq!(gh.request_timeout_ms, Some(90_000));
@@ -2928,8 +3173,8 @@ mod tests {
         );
 
         let enabled = active_enabled(&r);
-        assert!(enabled.contains(&"team_github".to_string()));
-        assert!(enabled.contains(&"team_stripe".to_string()));
+        assert!(enabled.contains(&github));
+        assert!(enabled.contains(&stripe));
         assert!(
             enabled.contains(&"mine".to_string()),
             "local enablement preserved"
@@ -2947,6 +3192,8 @@ mod tests {
                 { "id": "b", "name": "B", "transport": "http", "url": "https://1.2.3.5/mcp" }
             ]}),
         );
+        let a = member_id(&r, "a");
+        let b = member_id(&r, "b");
         // Team drops "b", adds "c".
         apply_team_config(
             &mut r,
@@ -2963,16 +3210,10 @@ mod tests {
             .map(|s| s.id.clone())
             .collect();
         assert_eq!(team_ids.len(), 2);
-        assert!(team_ids.contains(&"team_a".to_string()));
-        assert!(team_ids.contains(&"team_c".to_string()));
-        assert!(
-            !team_ids.contains(&"team_b".to_string()),
-            "removed team server is gone"
-        );
-        assert!(
-            !active_enabled(&r).contains(&"team_b".to_string()),
-            "no stale profile entry"
-        );
+        assert!(team_ids.contains(&a));
+        assert!(team_ids.contains(&member_id(&r, "c")));
+        assert!(!team_ids.contains(&b), "removed team server is gone");
+        assert!(!active_enabled(&r).contains(&b), "no stale profile entry");
     }
 
     #[test]
@@ -2993,24 +3234,25 @@ mod tests {
         ]});
         // First sync adds the review server (present, but left OFF everywhere until opt-in).
         apply_team_config(&mut r, "t1", &cfg);
-        assert!(r.servers.iter().any(|s| s.id == "team_review1"));
+        let id = member_id(&r, "review1");
+        assert!(r.servers.iter().any(|s| s.id == id));
         // Member consents to it in the NON-active profile p2.
         r.profiles
             .iter_mut()
             .find(|p| p.id == "p2")
             .unwrap()
             .enabled_server_ids
-            .push("team_review1".into());
+            .push(id.clone());
 
         // Re-sync with the same config: the non-active-profile consent must be restored.
         apply_team_config(&mut r, "t1", &cfg);
         let p2 = r.profiles.iter().find(|p| p.id == "p2").unwrap();
         assert!(
-            p2.enabled_server_ids.contains(&"team_review1".to_string()),
+            p2.enabled_server_ids.contains(&id),
             "team server enabled in a non-active profile survives re-sync"
         );
         // A review server with no consent in the active profile is still not auto-enabled there.
-        assert!(!active_enabled(&r).contains(&"team_review1".to_string()));
+        assert!(!active_enabled(&r).contains(&id));
     }
 
     #[test]
@@ -3045,6 +3287,164 @@ mod tests {
     }
 
     #[test]
+    fn leaving_a_team_does_not_give_its_vault_namespace_to_the_next_team() {
+        let mut registry = base_registry();
+        let config = json!({"servers":[{"id":"shared", "name":"Shared", "transport":"http", "url":"https://first.example/mcp"}]});
+        apply_team_config(&mut registry, "first", &config);
+        let old_id = registry
+            .servers
+            .iter()
+            .find(|s| is_team_server(s, "team:first"))
+            .unwrap()
+            .id
+            .clone();
+        remove_team(&mut registry, "first");
+        // remove_team deliberately leaves the vault intact. A different team
+        // must never acquire that token by reusing the same original entry id.
+        let config = json!({"servers":[{"id":"shared", "name":"Shared", "transport":"http", "url":"https://second.example/mcp"}]});
+        apply_team_config(&mut registry, "second", &config);
+        let new_id = &registry
+            .servers
+            .iter()
+            .find(|s| is_team_server(s, "team:second"))
+            .unwrap()
+            .id;
+        assert_ne!(new_id, &old_id);
+    }
+
+    #[test]
+    fn legacy_prefix_match_cannot_transfer_another_entries_vault_id_or_consent() {
+        for old_id in ["team_db-prod", "team_db-2"] {
+            let mut registry = base_registry();
+            let mut old: ServerEntry = serde_json::from_value(json!({
+                "id": old_id, "name": "Database", "transport": "stdio",
+                "command": "db-server", "source": "team:t1"
+            }))
+            .unwrap();
+            old.unknown_fields.remove(TEAM_ORIGINAL_ID_FIELD);
+            registry.servers.push(old);
+            registry.profiles[0].enabled_server_ids.push(old_id.into());
+            let outcome = apply_team_config(
+                &mut registry,
+                "t1",
+                &json!({ "servers": [{
+                    "id": "db", "name": "Database", "transport": "stdio", "command": "db-server"
+                }]}),
+            );
+            let added = registry
+                .servers
+                .iter()
+                .find(|s| is_team_server(s, "team:t1"))
+                .unwrap();
+            assert_ne!(
+                added.id, old_id,
+                "an ambiguous legacy suffix must not transfer vault ownership"
+            );
+            assert_eq!(outcome.review, 1);
+            assert!(!active_enabled(&registry).contains(&added.id));
+        }
+    }
+
+    #[test]
+    fn team_export_preserves_bound_secret_flag_markers() {
+        let mut registry = Registry::default();
+        registry.servers.push(
+            serde_json::from_value(json!({
+                "id":"bound", "name":"Bound", "transport":"stdio", "command":"server",
+                "args":["--token", "<launch-input>", "--password", "literal-secret"],
+                "launch": { "inputs":[{"key":"TOKEN", "label":"Token", "secret":true}],
+                    "bindings":[{"index":1,"parts":[{"kind":"input","key":"TOKEN"}]}] }
+            }))
+            .unwrap(),
+        );
+        let exported = team_server_export(&registry);
+        assert_eq!(exported[0]["args"][1], "<launch-input>");
+        assert!(!exported.to_string().contains("literal-secret"));
+        assert!(matches!(
+            classify_team_server(&exported[0], "team:t1"),
+            TeamClass::Review(_)
+        ));
+    }
+
+    #[test]
+    fn reordered_slug_collisions_keep_their_local_setup_ids_and_consent() {
+        let mut registry = base_registry();
+        let mut config = json!({ "servers": [
+            { "id": "a b", "name": "First", "transport": "stdio", "command": "node",
+              "args": ["server.js", "<launch-input>"],
+              "launch": { "inputs": [{ "key": "DIR", "label": "Directory", "secret": false }],
+                          "bindings": [{ "index": 1, "parts": [{ "kind": "input", "key": "DIR" }] }] } },
+            { "id": "a-b", "name": "Second", "transport": "stdio", "command": "node",
+              "args": ["server.js", "<launch-input>"],
+              "launch": { "inputs": [{ "key": "DIR", "label": "Directory", "secret": false }],
+                          "bindings": [{ "index": 1, "parts": [{ "kind": "input", "key": "DIR" }] }] } }
+        ]});
+        assert_eq!(apply_team_config(&mut registry, "t1", &config).review, 2);
+        let mut ids = HashMap::new();
+        for server in &mut registry.servers {
+            if let Some(original) = saved_team_original_id(server).map(str::to_string) {
+                server.launch.as_mut().unwrap().inputs[0].value =
+                    Some(format!("/member/{original}"));
+                ids.insert(original, server.id.clone());
+            }
+        }
+        registry.profiles[0]
+            .enabled_server_ids
+            .push(ids["a b"].clone());
+
+        registry = serde_json::from_str(&serde_json::to_string(&registry).unwrap()).unwrap();
+
+        config["servers"].as_array_mut().unwrap().reverse();
+        let outcome = apply_team_config(&mut registry, "t1", &config);
+        assert_eq!(outcome.review, 1);
+        for server in &registry.servers {
+            if let Some(original) = saved_team_original_id(server) {
+                assert_eq!(server.id, ids[original]);
+                assert_eq!(
+                    server.launch.as_ref().unwrap().inputs[0].value.as_deref(),
+                    Some(format!("/member/{original}").as_str())
+                );
+            }
+        }
+        let enabled = active_enabled(&registry);
+        assert!(enabled.contains(&ids["a b"]));
+        assert!(!enabled.contains(&ids["a-b"]));
+    }
+
+    #[test]
+    fn ambiguous_legacy_slug_collisions_do_not_reuse_vault_ids() {
+        let mut registry = base_registry();
+        let mut config = json!({ "servers": [
+            { "id": "a b", "name": "Same", "transport": "stdio", "command": "run-me" },
+            { "id": "a-b", "name": "Same", "transport": "stdio", "command": "run-me" }
+        ]});
+        apply_team_config(&mut registry, "t1", &config);
+        let mut count = 0;
+        for server in &mut registry.servers {
+            if saved_team_original_id(server).is_some() {
+                server.unknown_fields.remove(TEAM_ORIGINAL_ID_FIELD);
+                server.id = if count == 0 {
+                    "team_a-b".into()
+                } else {
+                    "team_a-b-2".into()
+                };
+                count += 1;
+            }
+        }
+        registry.profiles[0]
+            .enabled_server_ids
+            .push("team_a-b".into());
+        config["servers"].as_array_mut().unwrap().reverse();
+        let outcome = apply_team_config(&mut registry, "t1", &config);
+        assert_eq!(outcome.review, 2);
+        assert!(registry
+            .servers
+            .iter()
+            .filter(|server| saved_team_original_id(server).is_some())
+            .all(|server| server.id != "team_a-b" && server.id != "team_a-b-2"));
+    }
+
+    #[test]
     fn team_id_does_not_collide_with_an_existing_local_server() {
         // A team server whose id would slugify onto an EXISTING local server's id must be
         // deduped against the whole registry, not just this sync's batch — otherwise team
@@ -3064,6 +3464,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         let cfg = json!({ "servers": [
@@ -3114,7 +3515,8 @@ mod tests {
                 "disabledTools": ["delete_repo"]
             }]}),
         );
-        let sid = "team_github";
+        let id = member_id(&r, "github");
+        let sid = id.as_str();
         assert!(r.servers.iter().any(|s| s.id == sid));
         let server = r.servers.iter().find(|s| s.id == sid).unwrap();
         assert_eq!(
@@ -3178,17 +3580,16 @@ mod tests {
             }]}),
         );
         assert!(
-            !r.profile_allows_tool("default", "team_github", "anything"),
+            !r.profile_allows_tool("default", &member_id(&r, "github"), "anything"),
             "empty allow-list is a real block-all, not 'all tools'"
         );
     }
 
     #[test]
     fn org_allowed_tools_survives_unique_id_collision_rename() {
-        // Regression: unique_id renames collisions with `{base}-2` (hyphen). Fuzzy base_id
-        // matching used underscore and silently dropped the allow-list on the renamed server.
+        // An id collision must rename the team server without losing its allow-list.
         let mut r = base_registry();
-        // Occupy the natural team id so the team server is renamed to team_github-2.
+        // Occupy the natural team id so the team server gets a stable alternate id.
         r.servers.push(ServerEntry {
             id: "team_github".into(),
             name: "Local GitHub".into(),
@@ -3203,6 +3604,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         apply_team_config(
@@ -3221,7 +3623,8 @@ mod tests {
             .iter()
             .find(|s| s.source.as_deref() == Some("team:t1"))
             .expect("team server present");
-        assert_eq!(team.id, "team_github-2", "unique_id uses hyphen suffix");
+        assert!(team.id.starts_with("team_github-"));
+        assert!(!crate::registry::ids_collide(&team.id, "team_github"));
         assert!(
             r.profile_allows_tool("default", &team.id, "list_issues"),
             "allow-list must follow the post-unique_id server id"
@@ -3674,6 +4077,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         let cfg = json!({ "servers": [
@@ -3685,7 +4089,7 @@ mod tests {
             .iter()
             .find(|s| s.source.as_deref() == Some("team:t1"))
             .expect("team server applied");
-        assert_eq!(team.id, "team_acme-crm-2");
+        assert!(team.id.starts_with("team_acme-crm-"));
         assert!(
             !crate::registry::ids_collide(&team.id, "team-acme-crm"),
             "the renamed team id must not share the local server's sanitized form"
@@ -3744,7 +4148,10 @@ mod tests {
                     .find(|server| server.get("id").and_then(Value::as_str) == Some("mine"))
             })
             .expect("the server must be exported");
-        assert_eq!(entry.get("initializeTimeoutMs"), Some(&Value::from(240_000)));
+        assert_eq!(
+            entry.get("initializeTimeoutMs"),
+            Some(&Value::from(240_000))
+        );
 
         match classify_team_server(entry, "team:t1") {
             TeamClass::Review(imported) => {
@@ -3826,7 +4233,10 @@ mod tests {
         for (request_timeout_ms, should_block) in [
             (Value::from(0), true),
             (Value::from("not-a-number"), true),
-            (Value::from(crate::registry::MAX_REQUEST_TIMEOUT_MS + 1), true),
+            (
+                Value::from(crate::registry::MAX_REQUEST_TIMEOUT_MS + 1),
+                true,
+            ),
             (Value::from(90_000), false),
         ] {
             let server = serde_json::json!({
@@ -4062,6 +4472,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         // A team-sourced server: excluded too (don't echo the team's own set back).
@@ -4079,6 +4490,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         let servers = team_server_export(&r);
@@ -4210,7 +4622,9 @@ mod tests {
             "ready + review servers sync; only the blocked one is dropped"
         );
         assert!(
-            !team.iter().any(|s| s.id == "team_meta"),
+            !team
+                .iter()
+                .any(|s| saved_team_original_id(s) == Some("meta")),
             "link-local server never synced"
         );
 
@@ -4218,22 +4632,22 @@ mod tests {
         let rce = r
             .servers
             .iter()
-            .find(|s| s.id == "team_rce")
+            .find(|s| saved_team_original_id(s) == Some("rce"))
             .expect("review server synced");
         assert_eq!(rce.command.as_deref(), Some("powershell"));
 
         // ...but only the public remote server is enabled; review servers stay OFF.
         let enabled = active_enabled(&r);
         assert!(
-            enabled.contains(&"team_safe".to_string()),
+            enabled.contains(&member_id(&r, "safe")),
             "ready server auto-enabled"
         );
         assert!(
-            !enabled.contains(&"team_rce".to_string()),
+            !enabled.contains(&member_id(&r, "rce")),
             "local-command server stays off"
         );
         assert!(
-            !enabled.contains(&"team_lan".to_string()),
+            !enabled.contains(&member_id(&r, "lan")),
             "loopback server stays off"
         );
     }
@@ -4246,8 +4660,9 @@ mod tests {
         ]});
         // First sync: the stdio server is added but OFF (needs review).
         apply_team_config(&mut r, "t1", &cfg);
+        let id = member_id(&r, "tool");
         assert!(
-            !active_enabled(&r).contains(&"team_tool".to_string()),
+            !active_enabled(&r).contains(&id),
             "review server starts off"
         );
         // Member consents by enabling it.
@@ -4257,11 +4672,11 @@ mod tests {
             .find(|p| p.id == active)
             .unwrap()
             .enabled_server_ids
-            .push("team_tool".into());
+            .push(id.clone());
         // Re-sync (config unchanged): consent is preserved, the server stays enabled.
         apply_team_config(&mut r, "t1", &cfg);
         assert!(
-            active_enabled(&r).contains(&"team_tool".to_string()),
+            active_enabled(&r).contains(&id),
             "prior consent survives re-sync"
         );
     }
@@ -4288,7 +4703,8 @@ mod tests {
         ]});
         let first = apply_team_config(&mut r, "t1", &before);
         assert_eq!(first.review, 1, "a new review server is counted");
-        consent_to(&mut r, "team_tool");
+        let id = member_id(&r, "tool");
+        consent_to(&mut r, &id);
 
         // Same id, same name, different command: not what the member consented to.
         let swapped = json!({ "servers": [
@@ -4296,14 +4712,14 @@ mod tests {
         ]});
         let outcome = apply_team_config(&mut r, "t1", &swapped);
         assert!(
-            !active_enabled(&r).contains(&"team_tool".to_string()),
+            !active_enabled(&r).contains(&id),
             "a swapped command stays off until the member enables it again"
         );
         assert_eq!(
             outcome.review, 1,
             "the changed server is counted for review again"
         );
-        let entry = r.servers.iter().find(|s| s.id == "team_tool").unwrap();
+        let entry = r.servers.iter().find(|s| s.id == id).unwrap();
         assert_eq!(
             entry.command.as_deref(),
             Some("bash"),
@@ -4311,9 +4727,9 @@ mod tests {
         );
 
         // Re-consent under the new definition, then an unchanged re-sync keeps it.
-        consent_to(&mut r, "team_tool");
+        consent_to(&mut r, &id);
         let again = apply_team_config(&mut r, "t1", &swapped);
-        assert!(active_enabled(&r).contains(&"team_tool".to_string()));
+        assert!(active_enabled(&r).contains(&id));
         assert_eq!(
             again.review, 0,
             "nothing left to review once consent matches the definition"
@@ -4330,7 +4746,8 @@ mod tests {
             ]})
         };
         apply_team_config(&mut r, "t1", &mk("Tool", vec!["-y", "pkg"], vec!["TOKEN"]));
-        consent_to(&mut r, "team_tool");
+        let id = member_id(&r, "tool");
+        consent_to(&mut r, &id);
 
         // A rename changes nothing that runs: consent carries over.
         apply_team_config(
@@ -4338,10 +4755,7 @@ mod tests {
             "t1",
             &mk("Tool (renamed)", vec!["-y", "pkg"], vec!["TOKEN"]),
         );
-        assert!(
-            active_enabled(&r).contains(&"team_tool".to_string()),
-            "a rename keeps consent"
-        );
+        assert!(active_enabled(&r).contains(&id), "a rename keeps consent");
 
         // An extra arg is a different invocation: consent does not carry over.
         apply_team_config(
@@ -4354,10 +4768,10 @@ mod tests {
             ),
         );
         assert!(
-            !active_enabled(&r).contains(&"team_tool".to_string()),
+            !active_enabled(&r).contains(&id),
             "new args need new consent"
         );
-        consent_to(&mut r, "team_tool");
+        consent_to(&mut r, &id);
 
         // A new env key changes what the member is asked to vault and what the process sees.
         apply_team_config(
@@ -4370,7 +4784,7 @@ mod tests {
             ),
         );
         assert!(
-            !active_enabled(&r).contains(&"team_tool".to_string()),
+            !active_enabled(&r).contains(&id),
             "new env keys need new consent"
         );
     }
@@ -4386,8 +4800,9 @@ mod tests {
         ]});
         let first = apply_team_config(&mut r, "t1", &remote);
         assert_eq!(first.applied, 1);
+        let id = member_id(&r, "helper");
         assert!(
-            active_enabled(&r).contains(&"team_helper".to_string()),
+            active_enabled(&r).contains(&id),
             "public remote auto-enables"
         );
 
@@ -4396,11 +4811,111 @@ mod tests {
         ]});
         let outcome = apply_team_config(&mut r, "t1", &local);
         assert!(
-            !active_enabled(&r).contains(&"team_helper".to_string()),
+            !active_enabled(&r).contains(&id),
             "a remote-to-local swap on the same id arrives off"
         );
         assert_eq!(outcome.review, 1);
         assert_eq!(outcome.applied, 0);
+    }
+
+    #[test]
+    fn team_sync_preserves_local_setup_and_reviews_binding_changes() {
+        let mut registry = base_registry();
+        let config = |prefix: &str| {
+            json!({ "servers": [{
+                "id": "tool", "name": "Tool", "transport": "stdio",
+                "command": "node", "args": ["<launch-input>"],
+                "launch": {
+                    "inputs": [{"key": "ROOT", "label": "Root", "secret": false, "required": true}],
+                    "bindings": [{"index": 0, "parts": [
+                        {"kind": "literal", "value": prefix},
+                        {"kind": "input", "key": "ROOT"}
+                    ]}]
+                }
+            }]})
+        };
+        assert_eq!(
+            apply_team_config(&mut registry, "t1", &config("/")).review,
+            1
+        );
+        let id = member_id(&registry, "tool");
+        let member = registry.servers.iter_mut().find(|s| s.id == id).unwrap();
+        member.launch.as_mut().unwrap().inputs[0].value = Some("/home/member".into());
+        consent_to(&mut registry, &id);
+
+        let unchanged = apply_team_config(&mut registry, "t1", &config("/"));
+        assert_eq!(unchanged.review, 0);
+        assert!(active_enabled(&registry).contains(&id));
+        assert_eq!(
+            registry
+                .servers
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .launch
+                .as_ref()
+                .unwrap()
+                .inputs[0]
+                .value
+                .as_deref(),
+            Some("/home/member")
+        );
+
+        let changed = apply_team_config(&mut registry, "t1", &config(":"));
+        assert_eq!(changed.review, 1);
+        assert!(!active_enabled(&registry).contains(&id));
+        assert_eq!(
+            registry
+                .servers
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .launch
+                .as_ref()
+                .unwrap()
+                .inputs[0]
+                .value
+                .as_deref(),
+            Some("/home/member")
+        );
+    }
+
+    #[test]
+    fn changed_team_client_authentication_requires_consent() {
+        let initial = json!({"clientId":"client-a", "scope":"read"});
+        for next in [
+            json!({"clientId":"client-b", "scope":"read"}),
+            json!({"clientId":"client-a", "scope":"admin"}),
+            json!({"clientId":"client-a", "scope":"read", "tokenEndpointAuthMethod":"client_secret_post"}),
+            Value::Null,
+        ] {
+            let config = |credentials: Value| {
+                json!({"servers":[{
+                    "id":"remote", "name":"Remote", "transport":"http",
+                    "url":"https://1.2.3.4/mcp", "clientCredentials":credentials
+                }]})
+            };
+            let mut reg = base_registry();
+            apply_team_config(&mut reg, "t1", &config(initial.clone()));
+            let id = member_id(&reg, "remote");
+            assert!(active_enabled(&reg).contains(&id));
+            for _ in 0..2 {
+                assert_eq!(
+                    apply_team_config(&mut reg, "t1", &config(next.clone())).review,
+                    1
+                );
+                assert!(!active_enabled(&reg).contains(&id));
+                assert!(reg
+                    .servers
+                    .iter()
+                    .find(|s| s.id == id)
+                    .unwrap()
+                    .needs_team_enable_review());
+            }
+            consent_to(&mut reg, &id);
+            assert_eq!(apply_team_config(&mut reg, "t1", &config(next)).review, 0);
+            assert!(active_enabled(&reg).contains(&id));
+        }
     }
 
     #[test]
@@ -4430,9 +4945,36 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         };
         let fp = consent_fingerprint(&base);
+
+        let mut bound = base.clone();
+        bound.args.push("<launch-input>".into());
+        bound.launch = Some(crate::registry::LaunchConfig {
+            inputs: vec![crate::registry::LaunchInput {
+                key: "SID".into(),
+                label: "SID".into(),
+                secret: false,
+                required: true,
+                value: None,
+            }],
+            bindings: vec![crate::registry::ArgBinding {
+                index: 2,
+                parts: vec![crate::registry::ArgPart::Input { key: "SID".into() }],
+            }],
+            ..Default::default()
+        });
+        let before_binding_change = consent_fingerprint(&bound);
+        bound.launch.as_mut().unwrap().bindings[0]
+            .parts
+            .insert(0, crate::registry::ArgPart::Literal { value: "/".into() });
+        assert_ne!(
+            consent_fingerprint(&bound),
+            before_binding_change,
+            "changed launch binding needs review"
+        );
 
         let mut renamed = base.clone();
         renamed.name = "Y".into();

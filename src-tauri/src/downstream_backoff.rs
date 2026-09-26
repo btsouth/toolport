@@ -312,7 +312,8 @@ mod tests {
 
         // Another gateway process records a window after this one started.
         let mut disk = BackoffFile::default();
-        disk.not_before.insert("https://api.example.com".into(), now_ms() + 2_000);
+        disk.not_before
+            .insert("https://api.example.com".into(), now_ms() + 2_000);
         fs::write(&path, serde_json::to_string(&disk).unwrap()).unwrap();
 
         let remaining = remaining_for_url("https://api.example.com").unwrap();
@@ -385,7 +386,8 @@ mod tests {
         let dir = TestDir::new("expired");
         let path = dir.0.join(FILE_NAME);
         let mut file = BackoffFile::default();
-        file.not_before.insert("https://api.example.com".into(), now_ms() - 1);
+        file.not_before
+            .insert("https://api.example.com".into(), now_ms() - 1);
         fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
 
         bind_data_dir(&dir.0);
@@ -430,7 +432,8 @@ mod tests {
         let path = dir.0.join(FILE_NAME);
         let long = now_ms() + HTTP_RETRY_CAP.as_millis() as u64;
         let mut file = BackoffFile::default();
-        file.not_before.insert("https://api.example.com".into(), long);
+        file.not_before
+            .insert("https://api.example.com".into(), long);
         fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
         bind_data_dir(&dir.0);
 

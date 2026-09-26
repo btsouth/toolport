@@ -515,7 +515,8 @@ pub fn serve_identity(
                 } else if !authorized {
                     text_response(401, "unauthorized")
                 } else {
-                    let body = serde_json::to_string(&identity).unwrap_or_else(|_| "{}".to_string());
+                    let body =
+                        serde_json::to_string(&identity).unwrap_or_else(|_| "{}".to_string());
                     tiny_http::Response::from_string(body)
                         .with_status_code(200)
                         .with_header(json_header())
@@ -717,7 +718,11 @@ mod tests {
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(mode & 0o077, 0, "descriptor must not be group/world readable");
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "descriptor must not be group/world readable"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -748,7 +753,11 @@ mod tests {
             .into_iter()
             .map(|h| h.join().unwrap().expect("every contender reaches a daemon"))
             .collect();
-        assert_eq!(spawns.load(Ordering::SeqCst), 1, "only one contender may spawn");
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            1,
+            "only one contender may spawn"
+        );
         assert!(
             endpoints.windows(2).all(|w| w[0] == w[1]),
             "all contenders must observe the same daemon"
@@ -772,7 +781,9 @@ mod tests {
             })
             .unwrap();
         assert_ne!(descriptor.endpoint, "127.0.0.1:1");
-        assert!(probe_identity(&descriptor).unwrap().is_compatible_with(&compat));
+        assert!(probe_identity(&descriptor)
+            .unwrap()
+            .is_compatible_with(&compat));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -959,9 +959,8 @@ fn team_review_line(review: usize, blocked: usize) -> Option<String> {
     let mut parts = Vec::new();
     if review > 0 {
         parts.push(format!(
-            "{review} team {} a local command or a LAN address, so {} off until you review and enable {} below.",
-            if review == 1 { "server runs" } else { "servers run" },
-            if review == 1 { "it's" } else { "they're" },
+            "{review} team {} off until you review and enable {} below. Check the command, address and authentication before enabling.",
+            if review == 1 { "server is" } else { "servers are" },
             if review == 1 { "it" } else { "them" },
         ));
     }
@@ -1026,7 +1025,7 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
         let dialog = adw::MessageDialog::new(
             Some(&parent),
             Some(&format!("Enable {server_name}?")),
-            Some("This team server runs a local command or connects to a private address. Enable it only after verifying the target above."),
+            Some("Enable this team server only after verifying its command, address and saved authentication."),
         );
         dialog.add_response("cancel", "Keep disabled");
         dialog.add_response("enable", "Enable");
@@ -1076,14 +1075,14 @@ mod tests {
         assert_eq!(team_review_line(0, 0), None);
         assert_eq!(
             team_review_line(1, 0).unwrap(),
-            "1 team server runs a local command or a LAN address, so it's off until you \
-             review and enable it below."
+            "1 team server is off until you review and enable it below. \
+             Check the command, address and authentication before enabling."
         );
         assert_eq!(
             team_review_line(2, 1).unwrap(),
-            "2 team servers run a local command or a LAN address, so they're off until you \
-             review and enable them below. 1 was blocked as unsafe (link-local or \
-             cloud-metadata URLs)."
+            "2 team servers are off until you review and enable them below. \
+             Check the command, address and authentication before enabling. \
+             1 was blocked as unsafe (link-local or cloud-metadata URLs)."
         );
     }
 }

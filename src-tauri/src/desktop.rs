@@ -250,6 +250,9 @@ fn prewarm_launcher(server: &ServerEntry) {
     }
     let server = server.clone();
     std::thread::spawn(move || {
+        let Ok(resolved) = crate::launch_inputs::resolve_args_for_prewarm(&server) else {
+            return;
+        };
         let mut env: Vec<(String, String)> = Vec::new();
         for e in &server.env {
             match e.value.clone() {
@@ -272,7 +275,7 @@ fn prewarm_launcher(server: &ServerEntry) {
             .cwd
             .as_deref()
             .and_then(|c| resolve_root_token(c, None));
-        if let Ok(t) = StdioTransport::spawn(&command, &server.args, &env, cwd.as_deref()) {
+        if let Ok(t) = StdioTransport::spawn(&command, &resolved.args, &env, cwd.as_deref()) {
             // Attempting the handshake keeps the child alive until the download
             // finishes (dropping the transport kills it), and warms it end-to-end
             // when the server actually comes up.
@@ -838,6 +841,46 @@ async fn set_secret(
     })
     .await
     .map_err(|e| format!("keychain task join failed: {e}"))?
+}
+
+#[tauri::command]
+async fn set_launch_secret(
+    app: AppHandle,
+    server_id: String,
+    key: String,
+    value: String,
+) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        crate::registry_controller::set_launch_secret_with(
+            &server_id,
+            &key,
+            &value,
+            |server_id, key| {
+                let (registry, ()) = write_registry(state.inner(), |registry| {
+                    crate::registry_controller::apply_launch_secret_generation(
+                        registry, server_id, key,
+                    )
+                })?;
+                Ok(registry)
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
+}
+
+#[tauri::command]
+fn set_launch_input_value(
+    state: State<RegistryState>,
+    server_id: String,
+    key: String,
+    value: Option<String>,
+) -> Result<Registry, String> {
+    let (registry, ()) = write_registry(state.inner(), |registry| {
+        crate::registry_controller::apply_launch_input_value(registry, &server_id, &key, value)
+    })?;
+    Ok(registry)
 }
 
 /// Remove a secret from the keychain and drop the env var from the server entry.
@@ -4146,6 +4189,8 @@ pub fn run() {
             uninstall_gateway,
             migrate_client,
             set_secret,
+            set_launch_secret,
+            set_launch_input_value,
             delete_secret,
             set_client_credentials,
             clear_client_credentials,
@@ -4858,6 +4903,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -4894,6 +4940,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -5435,6 +5482,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
 
@@ -5543,6 +5591,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         let doc = build_export(&reg, None, None, None);
@@ -5613,6 +5662,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         let doc = build_export(&reg, None, None, None);
@@ -5665,6 +5715,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         let serialized = serde_json::to_string(&build_export(&reg, None, None, None)).unwrap();
@@ -5707,6 +5758,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         let json = serde_json::to_string(&build_export(&reg, None, None, None)).unwrap();
@@ -5823,6 +5875,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
         reg.add_server(ServerEntry {
@@ -5839,6 +5892,7 @@ mod tests {
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
+            launch: None,
             unknown_fields: serde_json::Map::new(),
         });
 
