@@ -680,6 +680,17 @@ impl Router {
 
     /// Why a call to `exposed_name` cannot be routed.
     pub fn no_route_message(&self, exposed_name: &str) -> String {
+        self.no_route_message_within(exposed_name, |_| true)
+    }
+
+    /// [`Router::no_route_message`] for a scoped caller: the alias hint only
+    /// names a tool whose server `visible` accepts, so the message cannot reveal
+    /// that a tool outside the caller's scope exists.
+    pub fn no_route_message_within(
+        &self,
+        exposed_name: &str,
+        visible: impl Fn(&str) -> bool,
+    ) -> String {
         // Several client harnesses expose gateway tools to their model as
         // `mcp__<gateway-alias>__<tool>`; models then reuse that spelling inside
         // toolport_run_script and land here (observed with Codex, 2026-08-13).
@@ -688,7 +699,11 @@ impl Router {
             .strip_prefix("mcp__")
             .and_then(|rest| rest.split_once("__"))
             .map(|(_, tool)| tool)
-            .filter(|candidate| self.routes.contains_key(*candidate));
+            .filter(|candidate| {
+                self.routes
+                    .get(*candidate)
+                    .is_some_and(|(server, _)| visible(server))
+            });
         match client_prefixed {
             Some(real) => format!(
                 "no route for tool '{exposed_name}'; that looks like a client-side alias - \

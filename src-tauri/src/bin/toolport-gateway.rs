@@ -4286,7 +4286,7 @@ fn execute_call(
             // A name with no route belongs to no server. Say so, as an unscoped
             // caller would hear, rather than calling an empty server id out of scope.
             let text = if server_id.is_empty() {
-                router.no_route_message(name)
+                router.no_route_message_within(name, |server| server_in_allowed_scope(server, set))
             } else {
                 format!("Toolport: '{srv}' is not available to this client.")
             };
@@ -27918,6 +27918,45 @@ mod tests {
         assert_eq!(
             unknown["content"][0]["text"], "no route for tool 'no_such_tool'",
             "an unknown tool is not a scope denial for an empty server id"
+        );
+
+        // A client-side alias is resolved only to a tool the caller may call, so
+        // the hint cannot confirm that an out-of-scope tool exists.
+        let (personal_name, team_name) = twin_tool_names(&router, &cached);
+        let alias_text = |exposed: &str| {
+            execute_call(
+                &reg,
+                &router,
+                &cached,
+                Some("open-webui"),
+                None,
+                Some(&personal),
+                None,
+                Some(&ConfirmGuard::new()),
+                exposed,
+                json!({}),
+                None,
+                None,
+                CallOpts {
+                    confirmed: true,
+                    shape: false,
+                    allow_app_only: true,
+                },
+                None,
+            )["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let in_scope = format!("mcp__toolport__{personal_name}");
+        assert!(
+            alias_text(&in_scope).contains(&format!("named '{personal_name}'")),
+            "an in-scope alias still points at the real name"
+        );
+        let out_of_scope = format!("mcp__toolport__{team_name}");
+        assert_eq!(
+            alias_text(&out_of_scope),
+            format!("no route for tool '{out_of_scope}'")
         );
     }
 
