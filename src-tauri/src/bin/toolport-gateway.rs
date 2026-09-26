@@ -1242,7 +1242,7 @@ fn validate_search_query(query: &str) -> Result<(), String> {
 fn status_tool_def() -> Value {
     json!({
         "name": "toolport_status",
-        "description": "Report enabled MCP servers, their tool counts, and discovery mode. Unscoped callers may also see a local estimate of catalog exposure avoided.",
+        "description": "Report enabled MCP servers, their tool counts, and discovery mode. Unscoped callers may also see an estimate of the MCP tool definitions kept out of context.",
         "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
     })
 }
@@ -3114,9 +3114,9 @@ fn savings_line() -> String {
         let loads = s.get("listLoads").and_then(Value::as_u64).unwrap_or(0);
         let peak = s.get("peakCatalog").and_then(Value::as_u64).unwrap_or(0);
         line.push_str(&format!(
-            "Catalog loads avoided exposing ≈{} token-equivalent of serialized MCP tool \
-             definitions across {loads} load(s). Estimated at UTF-8 bytes / 4; actual \
-             model usage depends on client transformations, gating, and caching",
+            "Toolport kept ≈{} tokens of MCP tool definitions out of context across \
+             {loads} load(s). Estimated at UTF-8 bytes / 4; actual model usage depends \
+             on client transformations, gating, and caching",
             fmt_tokens(saved)
         ));
         if peak > 4 {
@@ -25921,7 +25921,7 @@ mod tests {
         let full = enabled_summary(&host, &reg, &cached, None, None);
         assert!(full.contains("alpha"));
         assert!(!full.contains("bravo")); // not in the active profile
-        assert!(full.contains("Catalog loads avoided exposing"));
+        assert!(full.contains("tokens of MCP tool definitions out of context"));
         // Scoped to bravo: shows bravo (its real scope) even though bravo isn't in
         // the active profile, and never leaks alpha's name/command/tool count.
         let allowed: HashSet<String> = ["bravo".to_string()].into_iter().collect();
@@ -25929,7 +25929,7 @@ mod tests {
         assert!(scoped.contains("bravo"));
         assert!(!scoped.contains("alpha"));
         assert!(!scoped.contains("alpha-cmd"));
-        assert!(!scoped.contains("Catalog loads avoided exposing"));
+        assert!(!scoped.contains("tokens of MCP tool definitions out of context"));
         assert!(!scoped.contains("alpha-only-schema"));
         assert!(!scoped.contains("peak full catalog"));
         assert!(!scoped.contains("load(s)"));
@@ -25948,7 +25948,7 @@ mod tests {
         ).unwrap();
         let rpc_text = rpc["result"]["content"][0]["text"].as_str().unwrap();
         assert!(rpc_text.contains("bravo"));
-        assert!(!rpc_text.contains("Catalog loads avoided exposing"));
+        assert!(!rpc_text.contains("tokens of MCP tool definitions out of context"));
         // The status line reports the mode of the host it is asked about.
         host.set_discovery_mode(DiscoveryMode::Grouped);
         let grouped = enabled_summary(&host, &reg, &cached, None, None);

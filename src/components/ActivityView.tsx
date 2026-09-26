@@ -487,7 +487,7 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
       ? `across ${savings.listLoads.toLocaleString()} tool-list load${savings.listLoads === 1 ? "" : "s"}`
       : null,
     hasCatalog
-      ? `≈${fmtTokens(Math.round(savings.tokensSaved / savings.listLoads))} estimated/load`
+      ? `≈${fmtTokens(Math.round(savings.tokensSaved / savings.listLoads))} per load`
       : null,
     hasCatalog && savings.peakCatalog > 4
       ? `peak catalog ${savings.peakCatalog.toLocaleString()} tools`
@@ -496,11 +496,9 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
   ].filter(Boolean);
 
   const share = async () => {
-    const text =
-      (hasCatalog
-        ? `Toolport's catalog loads avoided exposing ≈${fmtTokens(savings.tokensSaved)} token-equivalent of MCP tool definitions across ${savings.listLoads.toLocaleString()} loads. `
-        : `Toolport recorded ${savings.discoveryCount ?? 0} discovery searches returning ${fmtBytes(savings.discoveryResponseBytes ?? 0)} of text. `) +
-      `Catalog token equivalents use serialized UTF-8 bytes / 4, not model billing. toolport.app`;
+    const text = hasCatalog
+      ? `Toolport kept ≈${fmtTokens(savings.tokensSaved)} tokens of MCP tool definitions out of my agent's context across ${savings.listLoads.toLocaleString()} loads. Estimated from serialized size (UTF-8 bytes / 4), not model billing. toolport.app`
+      : `Toolport recorded ${savings.discoveryCount ?? 0} discovery searches returning ${fmtBytes(savings.discoveryResponseBytes ?? 0)} of text at its MCP boundary. toolport.app`;
     try {
       await navigator.clipboard.writeText(text);
       toast.success("Savings copied, paste them anywhere");
@@ -514,7 +512,9 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
       <div className="flex items-center gap-2">
         <Sparkles className="size-4 text-success" />
         <span className="text-sm font-medium text-muted-foreground">
-          {hasCatalog ? "Catalog exposure avoided" : "Discovery payload returned"}
+          {hasCatalog
+            ? "Tool definitions kept out of your agent's context"
+            : "Discovery payload returned"}
         </span>
       </div>
       <div className="mt-2 flex flex-wrap items-end gap-x-6 gap-y-1">
@@ -523,7 +523,7 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
             ? `≈ ${fmtTokens(savings.tokensSaved)}`
             : fmtBytes(savings.discoveryResponseBytes ?? 0)}{" "}
           <span className="text-base font-normal text-muted-foreground">
-            {hasCatalog ? "token-equivalent" : "discovery text"}
+            {hasCatalog ? "tokens saved" : "discovery text"}
           </span>
         </span>
       </div>
@@ -1058,8 +1058,7 @@ function DiscoveryRow({ t }: { t: SearchTrace }) {
               {t.returned} matching schema{t.returned === 1 ? "" : "s"}.
               {t.catalogSchemaBytes !== undefined &&
                 ` Full scoped catalog schemas: ${fmtBytes(t.catalogSchemaBytes)}.`}{" "}
-              Token equivalent ≈{fmtTokens(t.estimatedResponseTokens ?? 0)} (UTF-8 bytes ÷
-              4).
+              ≈{fmtTokens(t.estimatedResponseTokens ?? 0)} tokens (UTF-8 bytes ÷ 4).
             </div>
           ) : (
             <div className="text-muted-foreground">

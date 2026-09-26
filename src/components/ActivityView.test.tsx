@@ -459,7 +459,7 @@ it("distinguishes measured bytes from legacy estimates in catalog savings", asyn
   expect(screen.getByText(/searches returned 2\.5 KB/)).toBeInTheDocument();
 });
 
-it("shares a token-equivalent catalog statement without a billing claim", async () => {
+it("shares a token savings statement without a billing claim", async () => {
   const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
   const writeText = vi.fn().mockResolvedValue(undefined);
   Object.defineProperty(navigator, "clipboard", {
@@ -475,7 +475,10 @@ it("shares a token-equivalent catalog statement without a billing claim", async 
   render(<ActivityView refreshKey={0} registry={null} />);
   await act(async () => {});
   await user.click(screen.getByRole("button", { name: "Share" }));
-  expect(writeText).toHaveBeenCalledWith(expect.stringContaining("token-equivalent"));
+  expect(writeText).toHaveBeenCalledWith(
+    expect.stringContaining("tokens of MCP tool definitions out of my agent's context"),
+  );
+  expect(writeText.mock.calls[0][0]).toContain("not model billing");
   expect(writeText.mock.calls[0][0]).toContain("2,751 loads");
   expect(writeText.mock.calls[0][0]).not.toMatch(/billed tokens|money saved/i);
 });
@@ -495,7 +498,7 @@ it("shows discovery bytes without a catalog load or a zero-token savings claim",
   expect(screen.getByText("Discovery payload returned")).toBeInTheDocument();
   expect(screen.getByText(/3 searches returned 12\.3 KB/)).toBeInTheDocument();
   expect(screen.queryByText(/0 tool-list loads/)).not.toBeInTheDocument();
-  expect(screen.queryByText(/≈ 0 token-equivalent/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/tokens saved/)).not.toBeInTheDocument();
 });
 
 it("reports unavailable catalog telemetry without showing an empty measurement", async () => {
@@ -503,7 +506,9 @@ it("reports unavailable catalog telemetry without showing an empty measurement",
   render(<ActivityView refreshKey={0} registry={null} />);
   await act(async () => {});
   expect(screen.getByRole("alert")).toHaveTextContent("Catalog telemetry unavailable");
-  expect(screen.queryByText("Catalog exposure avoided")).not.toBeInTheDocument();
+  expect(
+    screen.queryByText("Tool definitions kept out of your agent's context"),
+  ).not.toBeInTheDocument();
 });
 
 it("keeps last-loaded catalog telemetry visibly stale after a failed refresh", async () => {
@@ -519,7 +524,9 @@ it("keeps last-loaded catalog telemetry visibly stale after a failed refresh", a
   await act(async () => {});
   view.rerender(<ActivityView refreshKey={1} registry={null} />);
   await act(async () => {});
-  expect(screen.getByText("Catalog exposure avoided")).toBeInTheDocument();
+  expect(
+    screen.getByText("Tool definitions kept out of your agent's context"),
+  ).toBeInTheDocument();
   expect(screen.getByRole("alert")).toHaveTextContent("last loaded measurements");
 });
 

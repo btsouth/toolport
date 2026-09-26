@@ -17,6 +17,11 @@ Entries before the rename below shipped under the project's former name, Conduit
 - **Unknown tool names get the same answer in every topology.** The shared
   daemon now reports that the tool has no route instead of calling an empty
   server unavailable to the client.
+- **The savings badge says what it measures again.** The sidebar and Activity
+  view report tokens saved by keeping tool definitions out of the agent's
+  context, replacing "schema token-equivalent". The estimate method stays in the
+  tooltip and fine print. The native Linux shell, the share text, and
+  `toolport_status` use the same wording.
 
 ## [1.22.0] - 2026-09-25
 
