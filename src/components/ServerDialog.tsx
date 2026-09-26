@@ -179,11 +179,7 @@ export function ServerDialog({
   }
 
   function set<K extends keyof typeof form>(key: K, value: (typeof form)[K]) {
-    if (
-      (key === "args" || key === "command") &&
-      value !== form[key] &&
-      launch?.bindings.length
-    ) {
+    if ((key === "args" || key === "command") && value !== form[key] && launch) {
       setLaunch(null);
       setBindingCleared(true);
     }
@@ -509,9 +505,9 @@ export function ServerDialog({
                 />
                 {bindingCleared && (
                   <p className="text-xs text-warning">
-                    Generated argument bindings were removed when you edited the command
-                    or arguments. Add any required values as literal arguments or restore
-                    the catalog preset.
+                    Catalog launch setup was removed when you edited the command or
+                    arguments. Add any required values to the new command or restore the
+                    catalog preset.
                   </p>
                 )}
               </div>

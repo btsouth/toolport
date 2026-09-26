@@ -32,7 +32,7 @@ impl ResolvedArgs {
 }
 
 pub fn resolve_args(server: &ServerEntry) -> Result<ResolvedArgs, String> {
-    let args = resolve_args_with(server, crate::secrets::get_vault_secret_result)?;
+    let args = resolve_args_for_prewarm(server)?;
     if let Some(launch) = &server.launch {
         for key in &launch.required_env {
             let entry = server
@@ -61,6 +61,13 @@ pub fn resolve_args(server: &ServerEntry) -> Result<ResolvedArgs, String> {
         }
     }
     Ok(args)
+}
+
+/// Prewarming may fetch a package before its environment credentials have been
+/// entered. Argument bindings still need real values: a placeholder must never
+/// reach the child process, and a failed vault read must abort the prewarm.
+pub fn resolve_args_for_prewarm(server: &ServerEntry) -> Result<ResolvedArgs, String> {
+    resolve_args_with(server, crate::secrets::get_vault_secret_result)
 }
 
 pub fn resolve_args_with(
@@ -200,5 +207,32 @@ mod tests {
         let error = resolve_args_with(&server, |_, _| Ok(None)).unwrap_err();
         assert!(error.contains("spawn safety"));
         assert!(!error.contains("-e"));
+    }
+
+    #[test]
+    fn prewarm_allows_missing_environment_credentials_after_binding_args() {
+        let mut server: ServerEntry = serde_json::from_str(
+            r#"{"name":"Example","transport":"stdio","command":"npx","args":["-y","example-server","<launch-input>"],"env":[{"key":"API_KEY","secret":true}]}"#,
+        )
+        .unwrap();
+        server.launch = Some(LaunchConfig {
+            inputs: vec![LaunchInput {
+                key: "DIRECTORY".into(),
+                label: "Directory".into(),
+                secret: false,
+                required: true,
+                value: Some("/tmp".into()),
+            }],
+            bindings: vec![ArgBinding {
+                index: 2,
+                parts: vec![ArgPart::Input {
+                    key: "DIRECTORY".into(),
+                }],
+            }],
+            required_env: vec!["API_KEY".into()],
+            ..Default::default()
+        });
+        assert_eq!(resolve_args_for_prewarm(&server).unwrap().args[2], "/tmp");
+        assert!(resolve_args(&server).is_err());
     }
 }

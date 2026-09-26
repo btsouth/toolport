@@ -137,10 +137,38 @@ describe("ServerDialog", () => {
 
     render(<ServerDialog autoOpen initial={initial} onSaved={vi.fn()} />);
     await user.type(screen.getAllByLabelText("Arguments")[0], " extra");
-    expect(
-      screen.getByText(/Generated argument bindings were removed/),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/Catalog launch setup was removed/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add" })).toBeDisabled();
+  });
+
+  it("clears requirements when customizing a preset without argument bindings", async () => {
+    const initial: ServerEntry = {
+      id: "qdrant",
+      name: "Qdrant",
+      transport: "stdio",
+      command: "uvx",
+      args: ["mcp-server-qdrant"],
+      env: [{ key: "QDRANT_URL", value: null, secret: true }],
+      url: null,
+      source: "catalog:curated",
+      launch: {
+        inputs: [],
+        bindings: [],
+        requiredEnv: ["QDRANT_URL"],
+      },
+    };
+    api.updateServer.mockResolvedValue(savedRegistry("qdrant"));
+    const user = userEvent.setup();
+    render(<ServerDialog autoOpen editId="qdrant" initial={initial} onSaved={vi.fn()} />);
+
+    await user.type(screen.getByLabelText("Arguments"), " --transport stdio");
+    expect(screen.getByText(/Catalog launch setup was removed/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(api.updateServer).toHaveBeenCalledTimes(1));
+    expect(api.updateServer).toHaveBeenCalledWith(
+      expect.objectContaining({ launch: null, source: "manual" }),
+    );
   });
 
   it("opens from its trigger and shows the add form", async () => {

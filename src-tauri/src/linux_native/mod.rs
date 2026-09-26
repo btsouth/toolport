@@ -10172,31 +10172,30 @@ fn open_server_editor_prefilled(
                 launch_entries.push((input.clone(), field));
             }
             connection.append(&section);
-            let binding_warning = gtk::Label::builder()
-                .label("Editing the command or arguments removes generated launch bindings. Replace <launch-input> before saving, or restore the catalog preset.")
-                .halign(gtk::Align::Fill).xalign(0.0).wrap(true).visible(false)
-                .css_classes(["toolport-feedback", "error"]).build();
-            connection.append(&binding_warning);
-            let args_for_warning = args.clone();
-            let command_for_warning = command.clone();
-            let old_args = original_args.clone();
-            let old_command = original_command.clone();
-            let update_warning = move || {
-                let buffer = args_for_warning.buffer();
-                let text = buffer
-                    .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                    .to_string();
-                let parsed = text.lines().map(str::to_string).collect::<Vec<_>>();
-                binding_warning.set_visible(
-                    parsed != old_args
-                        || Some(command_for_warning.text().to_string()) != old_command,
-                );
-            };
-            let update_warning = std::rc::Rc::new(update_warning);
-            let on_args = update_warning.clone();
-            args.buffer().connect_changed(move |_| on_args());
-            command.connect_changed(move |_| update_warning());
         }
+        let binding_warning = gtk::Label::builder()
+            .label("Editing the command or arguments removes catalog launch setup. Replace <launch-input> before saving, or restore the catalog preset.")
+            .halign(gtk::Align::Fill).xalign(0.0).wrap(true).visible(false)
+            .css_classes(["toolport-feedback", "error"]).build();
+        connection.append(&binding_warning);
+        let args_for_warning = args.clone();
+        let command_for_warning = command.clone();
+        let old_args = original_args.clone();
+        let old_command = original_command.clone();
+        let update_warning = move || {
+            let buffer = args_for_warning.buffer();
+            let text = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                .to_string();
+            let parsed = text.lines().map(str::to_string).collect::<Vec<_>>();
+            binding_warning.set_visible(
+                parsed != old_args || Some(command_for_warning.text().to_string()) != old_command,
+            );
+        };
+        let update_warning = std::rc::Rc::new(update_warning);
+        let on_args = update_warning.clone();
+        args.buffer().connect_changed(move |_| on_args());
+        command.connect_changed(move |_| update_warning());
     }
 
     let cwd = gtk::Entry::builder()

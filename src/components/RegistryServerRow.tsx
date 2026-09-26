@@ -221,7 +221,7 @@ export function RegistryServerRow({
           {!!requiredLaunch.length && (
             <p className="text-xs text-muted-foreground">
               Launch setup: {requiredLaunch.map((input) => input.label).join(", ")}. Open
-              Edit to add or review these values before enabling.
+              Launch setup to add or review these values before enabling.
             </p>
           )}
           {target && (

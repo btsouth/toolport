@@ -19,38 +19,61 @@ pub struct ProbeResult {
     pub auth_required: bool,
 }
 
+fn env_key_required(server: &ServerEntry, key: &str) -> bool {
+    server
+        .launch
+        .as_ref()
+        .is_none_or(|launch| launch.required_env.iter().any(|required| required == key))
+}
+
 fn missing_secret(server: &ServerEntry) -> bool {
     server.env.iter().any(|entry| {
         entry.secret
+            && env_key_required(server, &entry.key)
             && entry.value.is_none()
             && matches!(secrets::get_secret_result(&server.id, &entry.key), Ok(None))
     })
 }
 
-pub fn connect_server(server: &ServerEntry) -> Result<DownstreamServer, String> {
-    if let Some(command) = &server.command {
-        let mut env = Vec::new();
-        for entry in &server.env {
-            if let Some(value) = &entry.value {
-                env.push((entry.key.clone(), value.clone()));
-            } else if entry.secret {
-                match secrets::get_secret_result(&server.id, &entry.key) {
-                    Ok(Some(value)) => env.push((entry.key.clone(), value)),
-                    Ok(None) => {
-                        return Err(format!(
-                            "missing secret '{}': add its value under this server's secrets",
-                            entry.key
-                        ));
+fn environment_for_probe_with(
+    server: &ServerEntry,
+    mut vault: impl FnMut(&str, &str) -> Result<Option<String>, String>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut env = Vec::new();
+    for entry in &server.env {
+        if let Some(value) = &entry.value {
+            env.push((entry.key.clone(), value.clone()));
+        } else if entry.secret {
+            match vault(&server.id, &entry.key) {
+                Ok(Some(value)) => env.push((entry.key.clone(), value)),
+                Ok(None) => {
+                    // Curated launch metadata distinguishes required keys
+                    // from optional ones (for example, an AWS profile can
+                    // replace explicit keys). Match the gateway's behavior
+                    // for those optional declarations during Test Connection.
+                    if !env_key_required(server, &entry.key) {
+                        continue;
                     }
-                    Err(error) => {
-                        return Err(format!(
-                            "could not read secret '{}' from the keychain: {error}",
-                            entry.key
-                        ));
-                    }
+                    return Err(format!(
+                        "missing secret '{}': add its value under this server's secrets",
+                        entry.key
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "could not read secret '{}' from the keychain: {error}",
+                        entry.key
+                    ));
                 }
             }
         }
+    }
+    Ok(env)
+}
+
+pub fn connect_server(server: &ServerEntry) -> Result<DownstreamServer, String> {
+    if let Some(command) = &server.command {
+        let env = environment_for_probe_with(server, secrets::get_secret_result)?;
         let cwd = server
             .cwd
             .as_deref()
@@ -98,9 +121,10 @@ fn probe_timeout(server: &ServerEntry) -> Duration {
         .ok()
         .flatten()
         .or_else(|| {
-            server.command.as_deref().map(|command| {
-                crate::downstream::stdio_connect_timeout(command, &server.args)
-            })
+            server
+                .command
+                .as_deref()
+                .map(|command| crate::downstream::stdio_connect_timeout(command, &server.args))
         })
         .unwrap_or(Duration::from_secs(30));
     PROBE_TIMEOUT.max(initialize.saturating_add(PROBE_FOLLOWUP_BUDGET))
@@ -310,5 +334,30 @@ mod tests {
         let missing = probe_one(&server);
         assert!(!missing.ok);
         assert!(missing.error.unwrap_or_default().contains("Secret"));
+    }
+
+    #[test]
+    fn optional_catalog_env_is_skipped_but_required_env_and_vault_errors_fail() {
+        let mut server = server();
+        server.env.push(crate::registry::EnvVar {
+            key: "API_KEY".into(),
+            value: None,
+            secret: true,
+        });
+        server.launch = Some(LaunchConfig::default());
+        assert!(!env_key_required(&server, "API_KEY"));
+        assert!(environment_for_probe_with(&server, |_, _| Ok(None))
+            .unwrap()
+            .is_empty());
+        server.launch.as_mut().unwrap().required_env = vec!["API_KEY".into()];
+        assert!(env_key_required(&server, "API_KEY"));
+        assert!(environment_for_probe_with(&server, |_, _| Ok(None))
+            .unwrap_err()
+            .contains("missing secret"));
+        assert!(
+            environment_for_probe_with(&server, |_, _| Err("vault locked".into()))
+                .unwrap_err()
+                .contains("vault locked")
+        );
     }
 }

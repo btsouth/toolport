@@ -250,7 +250,7 @@ fn prewarm_launcher(server: &ServerEntry) {
     }
     let server = server.clone();
     std::thread::spawn(move || {
-        let Ok(resolved) = crate::launch_inputs::resolve_args(&server) else {
+        let Ok(resolved) = crate::launch_inputs::resolve_args_for_prewarm(&server) else {
             return;
         };
         let mut env: Vec<(String, String)> = Vec::new();

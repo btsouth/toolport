@@ -11,7 +11,7 @@ use crate::registry::{ArgBinding, ArgPart, LaunchConfig, LaunchInput};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const REGISTRY_URL: &str = "https://registry.modelcontextprotocol.io/v0/servers";
+const REGISTRY_URL: &str = "https://registry.modelcontextprotocol.io/v0.1/servers";
 
 /// One addable server: enough to create a registry entry, plus display metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,8 +72,10 @@ fn category_for(name: &str) -> &'static str {
         "Supabase" | "Neon" | "PostgreSQL" | "MongoDB" | "Elasticsearch" | "Qdrant" | "Redis" => {
             "Databases"
         }
-        "Context7" | "DeepWiki" | "Hugging Face" | "OpenRouter" | "Parallel Search"
-        | "Brave Search" | "Exa" | "Tavily" | "Perplexity" | "DataForSEO" => "Search & knowledge",
+        "Context7" | "DeepWiki" | "Microsoft Learn" | "Hugging Face" | "OpenRouter"
+        | "Parallel Search" | "Brave Search" | "Exa" | "Tavily" | "Perplexity" | "DataForSEO" => {
+            "Search & knowledge"
+        }
         "Firecrawl" | "Apify" | "Browserbase" => "Web & automation",
         "Stripe" | "Stripe (Full API)" | "Notion" | "Composio" | "Linear" | "Atlassian"
         | "Asana" | "Airtable" | "Todoist" | "Slack" | "Resend" | "Figma" | "Postiz" | "Twilio"
@@ -181,7 +183,7 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
             "OAuth: click Authenticate when prompted; no manual token needed.",
         ),
         // No auth at all.
-        "Fetch" | "Context7" => ("", "No credential needed."),
+        "Fetch" | "Context7" | "Microsoft Learn" => ("", "No credential needed."),
         _ => return None,
     })
 }
@@ -291,6 +293,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         // --- Knowledge & search ---
         http("Context7", "Up-to-date docs and code examples for libraries.", "https://mcp.context7.com/mcp", "https://github.com/upstash/context7"),
         http("DeepWiki", "Ask questions about any public GitHub repo. No auth.", "https://mcp.deepwiki.com/mcp", "https://deepwiki.com"),
+        http("Microsoft Learn", "Search official Microsoft and Azure documentation and code samples. No auth.", "https://learn.microsoft.com/api/mcp", "https://learn.microsoft.com/en-us/training/support/mcp"),
         http("Hugging Face", "Models, datasets, and Spaces on Hugging Face.", "https://huggingface.co/mcp", "https://huggingface.co/settings/mcp"),
         http("OpenRouter", "Live model intelligence: list and compare models, prices, and your credits.", "https://mcp.openrouter.ai/mcp", "https://openrouter.ai/docs/mcp-server"),
         http("Parallel Search", "Live web search and clean content from URLs. No account or API key required.", "https://search.parallel.ai/mcp", "https://docs.parallel.ai/integrations/mcp/search-mcp"),
@@ -400,7 +403,10 @@ pub fn curated() -> Vec<CatalogEntry> {
                 launch.revision = Some(2);
             }
             "Qdrant" => {
-                launch.required_env = vec!["QDRANT_URL".into(), "COLLECTION_NAME".into()];
+                // The tools accept a collection name per call when no default
+                // is configured. QDRANT_API_KEY is also optional for local or
+                // unsecured clusters; this preset uses a URL connection.
+                launch.required_env = vec!["QDRANT_URL".into()];
                 launch.revision = Some(2);
             }
             "AWS" => launch.revision = Some(2),
@@ -785,14 +791,21 @@ fn is_active(item: &Value) -> bool {
         .is_none_or(|status| status == "active")
 }
 
+fn registry_search_url(query: &str) -> String {
+    let q = query.trim();
+    if q.is_empty() {
+        format!("{REGISTRY_URL}?limit=50&version=latest")
+    } else {
+        format!(
+            "{REGISTRY_URL}?limit=50&version=latest&search={}",
+            urlencoding::encode(q)
+        )
+    }
+}
+
 /// Search the official MCP Registry. Empty query lists popular/recent servers.
 pub fn search_registry(query: &str) -> Result<Vec<CatalogEntry>, String> {
-    let q = query.trim();
-    let url = if q.is_empty() {
-        format!("{REGISTRY_URL}?limit=50")
-    } else {
-        format!("{REGISTRY_URL}?limit=50&search={}", urlencoding::encode(q))
-    };
+    let url = registry_search_url(query);
     use std::io::Read;
     let resp = ureq::get(&url)
         .timeout(std::time::Duration::from_secs(20))
@@ -823,6 +836,18 @@ pub fn search_registry(query: &str) -> Result<Vec<CatalogEntry>, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn registry_search_requests_only_current_versions() {
+        assert_eq!(
+            registry_search_url(""),
+            "https://registry.modelcontextprotocol.io/v0.1/servers?limit=50&version=latest"
+        );
+        assert_eq!(
+            registry_search_url(" git hub "),
+            "https://registry.modelcontextprotocol.io/v0.1/servers?limit=50&version=latest&search=git%20hub"
+        );
+    }
 
     #[test]
     fn curated_is_nonempty_and_well_formed() {

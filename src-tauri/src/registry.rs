@@ -3301,6 +3301,9 @@ fn migrate_curated_legacy(registry: &mut Registry) -> bool {
         };
         if server.transport != "stdio"
             || server.command.as_deref() != Some(expected_command)
+            || server.url.is_some()
+            || server.client_credentials.is_some()
+            || !server.unknown_fields.is_empty()
             || server.args.iter().map(String::as_str).collect::<Vec<_>>() != old_args
             || server
                 .env
@@ -3438,7 +3441,12 @@ mod catalog_launch_migration_tests {
         let mut edited = old.clone();
         edited.id = "twilio-edited".into();
         edited.args.push("--services".into());
-        registry.servers = vec![old, edited.clone()];
+        let mut forward_edited = old.clone();
+        forward_edited.id = "twilio-newer".into();
+        forward_edited
+            .unknown_fields
+            .insert("futureLaunchSetting".into(), serde_json::json!(true));
+        registry.servers = vec![old, edited.clone(), forward_edited.clone()];
         registry.profiles[0].enabled_server_ids =
             vec!["twilio-work".into(), "twilio-edited".into()];
         assert!(migrate_curated_legacy(&mut registry));
@@ -3448,6 +3456,7 @@ mod catalog_launch_migration_tests {
         assert!(migrated.env.is_empty());
         assert_eq!(migrated.launch.as_ref().unwrap().revision, Some(2));
         assert_eq!(registry.servers[1], edited);
+        assert_eq!(registry.servers[2], forward_edited);
         assert_eq!(
             registry.profiles[0].enabled_server_ids,
             vec!["twilio-edited"]

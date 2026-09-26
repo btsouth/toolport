@@ -1736,8 +1736,109 @@ enum TeamClass {
     Review(ServerEntry),
 }
 
+const TEAM_ORIGINAL_ID_FIELD: &str = "teamOriginalId";
+
+fn team_entry_original_id(value: &Value) -> Option<&str> {
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            value
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+        })
+}
+
+fn saved_team_original_id(server: &ServerEntry) -> Option<&str> {
+    server
+        .unknown_fields
+        .get(TEAM_ORIGINAL_ID_FIELD)
+        .and_then(Value::as_str)
+}
+
+fn team_id_conflicts(id: &str, used: &[String]) -> bool {
+    used.iter()
+        .any(|existing| crate::registry::ids_collide(id, existing))
+}
+
+/// A local id owns a member's vaulted credentials and profile consent. Reuse it
+/// only for the same original team entry. Old rows lack that identity, so an
+/// ambiguous slug collision gets a fresh deterministic id instead of another
+/// server's credentials.
+fn local_team_server_id(
+    entry: &ServerEntry,
+    tag: &str,
+    previous: &[ServerEntry],
+    used: &[String],
+    slug_collides: bool,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let base = &entry.id;
+    let original = saved_team_original_id(entry).expect("classified team entry has identity");
+    let identified: Vec<_> = previous
+        .iter()
+        .filter(|old| saved_team_original_id(old) == Some(original))
+        .collect();
+    if identified.len() == 1 && !team_id_conflicts(&identified[0].id, used) {
+        return identified[0].id.clone();
+    }
+
+    // One upgrade-time match can preserve an older server's vault keys. Never
+    // guess between legacy rows whose distinct original ids share a slug.
+    if identified.is_empty() && !slug_collides {
+        let prefix = format!("{base}-");
+        let fingerprint = consent_fingerprint(entry);
+        let legacy: Vec<_> = previous
+            .iter()
+            .filter(|old| saved_team_original_id(old).is_none())
+            .filter(|old| old.id == *base || old.id.starts_with(&prefix))
+            .filter(|old| old.name == entry.name && consent_fingerprint(old) == fingerprint)
+            .collect();
+        if legacy.len() == 1 && !team_id_conflicts(&legacy[0].id, used) {
+            return legacy[0].id.clone();
+        }
+    }
+
+    if !slug_collides
+        && !base.ends_with('_')
+        && !team_id_conflicts(base, used)
+        && !previous
+            .iter()
+            .any(|old| crate::registry::ids_collide(base, &old.id))
+    {
+        return base.clone();
+    }
+
+    let digest = Sha256::digest(format!("{tag}\0{original}").as_bytes());
+    let suffix = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let stem = format!("{base}-{suffix}");
+    let mut candidate = stem.clone();
+    let mut attempt = 2;
+    while team_id_conflicts(&candidate, used)
+        || previous
+            .iter()
+            .any(|old| crate::registry::ids_collide(&candidate, &old.id))
+    {
+        candidate = format!("{stem}-{attempt}");
+        attempt += 1;
+    }
+    candidate
+}
+
 pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) -> MergeOutcome {
     let tag = tag_for(team_id);
+    let previous: Vec<ServerEntry> = reg
+        .servers
+        .iter()
+        .filter(|server| is_team_server(server, &tag))
+        .cloned()
+        .collect();
 
     // 1. Capture the prior generation of this team's servers, and which of them the
     //    member had ENABLED IN EACH PROFILE. That enablement is their standing consent for
@@ -1745,50 +1846,39 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     //    of forcing a re-approval on every sync. Capturing per-profile (not just the active
     //    one) is what keeps a team server the member enabled in a NON-active profile from
     //    being stripped on every sync and never restored.
-    let old_ids: Vec<String> = reg
-        .servers
-        .iter()
-        .filter(|s| is_team_server(s, &tag))
-        .map(|s| s.id.clone())
-        .collect();
+    let old_ids: Vec<String> = previous.iter().map(|server| server.id.clone()).collect();
     // What the member actually consented to, per id: the execution-relevant fields of the
     // entry as it stood when they enabled it. Standing consent is restored below only for a
     // review server whose new entry has the SAME fingerprint. An org config that keeps an
     // id but changes the command (or turns a public URL into a local command) therefore
     // arrives OFF again and is counted for review, instead of running at the next gateway
     // start on a consent the member gave to something else (SBS-1017).
-    let prev_consent: HashMap<String, String> = reg
-        .servers
+    let prev_consent: HashMap<String, String> = previous
         .iter()
-        .filter(|s| is_team_server(s, &tag))
         .map(|s| (s.id.clone(), consent_fingerprint(s)))
         .collect();
-    // Team definitions deliberately omit setup values. Keep the member's own
-    // nonsecret values when an otherwise matching server is replaced on sync.
-    let local_launch_values: HashMap<String, HashMap<String, String>> = reg
-        .servers
+    // Team definitions deliberately omit setup values. Match saved member
+    // values by the original team id, which survives a local slug collision or
+    // a reorder. For pre-upgrade rows without that id, the local-id fallback is
+    // used only if local_team_server_id can make an unambiguous legacy match.
+    let mut previous_original_counts: HashMap<&str, usize> = HashMap::new();
+    for server in &previous {
+        if let Some(original) = saved_team_original_id(server) {
+            *previous_original_counts.entry(original).or_default() += 1;
+        }
+    }
+    let local_launch_values_by_original: HashMap<String, HashMap<String, String>> = previous
         .iter()
-        .filter(|s| is_team_server(s, &tag))
-        .map(|s| {
-            let values = s
-                .launch
-                .as_ref()
-                .map(|launch| {
-                    launch
-                        .inputs
-                        .iter()
-                        .filter(|input| !input.secret)
-                        .filter_map(|input| {
-                            input
-                                .value
-                                .as_ref()
-                                .map(|value| (input.key.clone(), value.clone()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            (s.id.clone(), values)
+        .filter_map(|server| {
+            let original = saved_team_original_id(server)?;
+            (previous_original_counts.get(original) == Some(&1))
+                .then(|| (original.to_string(), plain_launch_values(server)))
         })
+        .collect();
+    let legacy_launch_values_by_id: HashMap<String, HashMap<String, String>> = previous
+        .iter()
+        .filter(|server| saved_team_original_id(server).is_none())
+        .map(|server| (server.id.clone(), plain_launch_values(server)))
         .collect();
     let prev_enabled_by_profile: std::collections::HashMap<
         String,
@@ -1827,12 +1917,33 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     let mut tool_allows: HashMap<String, Option<Vec<String>>> = HashMap::new();
     let mut outcome = MergeOutcome::default();
     if let Some(arr) = team_cfg.get("servers").and_then(Value::as_array) {
+        let mut original_counts: HashMap<&str, usize> = HashMap::new();
+        let mut slug_counts: HashMap<String, usize> = HashMap::new();
+        for server in arr {
+            if let Some(original) = team_entry_original_id(server) {
+                *original_counts.entry(original).or_default() += 1;
+                *slug_counts
+                    .entry(format!("team_{}", slugify_id(original)))
+                    .or_default() += 1;
+            }
+        }
         for s in arr {
+            if team_entry_original_id(s)
+                .is_some_and(|original| original_counts.get(original).copied().unwrap_or(0) > 1)
+            {
+                outcome.blocked += 1;
+                continue;
+            }
             let allowed = parse_allowed_tools(s);
             match classify_team_server(s, &tag) {
                 TeamClass::Ready(mut entry) => {
-                    entry.id = crate::registry::unique_id(&entry.id, &used_ids);
-                    restore_local_launch_values(&mut entry, &local_launch_values);
+                    let collides = slug_counts.get(&entry.id).copied().unwrap_or(0) > 1;
+                    entry.id = local_team_server_id(&entry, &tag, &previous, &used_ids, collides);
+                    restore_local_launch_values(
+                        &mut entry,
+                        &local_launch_values_by_original,
+                        &legacy_launch_values_by_id,
+                    );
                     used_ids.push(entry.id.clone());
                     tool_allows.insert(entry.id.clone(), allowed);
                     auto_enable.push(entry.id.clone());
@@ -1840,8 +1951,13 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
                     outcome.applied += 1;
                 }
                 TeamClass::Review(mut entry) => {
-                    entry.id = crate::registry::unique_id(&entry.id, &used_ids);
-                    restore_local_launch_values(&mut entry, &local_launch_values);
+                    let collides = slug_counts.get(&entry.id).copied().unwrap_or(0) > 1;
+                    entry.id = local_team_server_id(&entry, &tag, &previous, &used_ids, collides);
+                    restore_local_launch_values(
+                        &mut entry,
+                        &local_launch_values_by_original,
+                        &legacy_launch_values_by_id,
+                    );
                     used_ids.push(entry.id.clone());
                     tool_allows.insert(entry.id.clone(), allowed);
                     review_ids.push(entry.id.clone());
@@ -2006,9 +2122,13 @@ fn apply_team_tool_scope(
 /// separator inside a field can make two different definitions hash alike.
 fn restore_local_launch_values(
     entry: &mut ServerEntry,
-    local_values: &HashMap<String, HashMap<String, String>>,
+    by_original: &HashMap<String, HashMap<String, String>>,
+    legacy_by_id: &HashMap<String, HashMap<String, String>>,
 ) {
-    let Some(values) = local_values.get(&entry.id) else {
+    let Some(values) = saved_team_original_id(entry)
+        .and_then(|original| by_original.get(original))
+        .or_else(|| legacy_by_id.get(&entry.id))
+    else {
         return;
     };
     if let Some(launch) = &mut entry.launch {
@@ -2018,6 +2138,26 @@ fn restore_local_launch_values(
             }
         }
     }
+}
+
+fn plain_launch_values(entry: &ServerEntry) -> HashMap<String, String> {
+    entry
+        .launch
+        .as_ref()
+        .map(|launch| {
+            launch
+                .inputs
+                .iter()
+                .filter(|input| !input.secret)
+                .filter_map(|input| {
+                    input
+                        .value
+                        .as_ref()
+                        .map(|value| (input.key.clone(), value.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn consent_fingerprint(entry: &ServerEntry) -> String {
@@ -2063,6 +2203,11 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         None => return TeamClass::Skip,
     };
     let id = format!("team_{}", slugify_id(orig_id.unwrap_or(name)));
+    let mut unknown_fields = serde_json::Map::new();
+    unknown_fields.insert(
+        TEAM_ORIGINAL_ID_FIELD.into(),
+        Value::String(orig_id.unwrap_or(name).to_string()),
+    );
     let str_array = |k: &str| {
         s.get(k)
             .and_then(Value::as_array)
@@ -2164,7 +2309,7 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         request_timeout_ms: None,
         initialize_timeout_ms: None,
         launch,
-        unknown_fields: serde_json::Map::new(),
+        unknown_fields,
     };
     if entry
         .launch
@@ -2234,10 +2379,9 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         .get("initializeTimeoutMs")
         .filter(|value| !value.is_null())
     {
-        Some(value) => match value
-            .as_u64()
-            .and_then(|milliseconds| crate::registry::validate_initialize_timeout_ms(milliseconds).ok())
-        {
+        Some(value) => match value.as_u64().and_then(|milliseconds| {
+            crate::registry::validate_initialize_timeout_ms(milliseconds).ok()
+        }) {
             Some(milliseconds) => Some(milliseconds),
             None => return TeamClass::Blocked,
         },
@@ -3114,6 +3258,84 @@ mod tests {
     }
 
     #[test]
+    fn reordered_slug_collisions_keep_their_local_setup_ids_and_consent() {
+        let mut registry = base_registry();
+        let mut config = json!({ "servers": [
+            { "id": "a b", "name": "First", "transport": "stdio", "command": "node",
+              "args": ["server.js", "<launch-input>"],
+              "launch": { "inputs": [{ "key": "DIR", "label": "Directory", "secret": false }],
+                          "bindings": [{ "index": 1, "parts": [{ "kind": "input", "key": "DIR" }] }] } },
+            { "id": "a-b", "name": "Second", "transport": "stdio", "command": "node",
+              "args": ["server.js", "<launch-input>"],
+              "launch": { "inputs": [{ "key": "DIR", "label": "Directory", "secret": false }],
+                          "bindings": [{ "index": 1, "parts": [{ "kind": "input", "key": "DIR" }] }] } }
+        ]});
+        assert_eq!(apply_team_config(&mut registry, "t1", &config).review, 2);
+        let mut ids = HashMap::new();
+        for server in &mut registry.servers {
+            if let Some(original) = saved_team_original_id(server).map(str::to_string) {
+                server.launch.as_mut().unwrap().inputs[0].value =
+                    Some(format!("/member/{original}"));
+                ids.insert(original, server.id.clone());
+            }
+        }
+        registry.profiles[0]
+            .enabled_server_ids
+            .push(ids["a b"].clone());
+
+        registry = serde_json::from_str(&serde_json::to_string(&registry).unwrap()).unwrap();
+
+        config["servers"].as_array_mut().unwrap().reverse();
+        let outcome = apply_team_config(&mut registry, "t1", &config);
+        assert_eq!(outcome.review, 1);
+        for server in &registry.servers {
+            if let Some(original) = saved_team_original_id(server) {
+                assert_eq!(server.id, ids[original]);
+                assert_eq!(
+                    server.launch.as_ref().unwrap().inputs[0].value.as_deref(),
+                    Some(format!("/member/{original}").as_str())
+                );
+            }
+        }
+        let enabled = active_enabled(&registry);
+        assert!(enabled.contains(&ids["a b"]));
+        assert!(!enabled.contains(&ids["a-b"]));
+    }
+
+    #[test]
+    fn ambiguous_legacy_slug_collisions_do_not_reuse_vault_ids() {
+        let mut registry = base_registry();
+        let mut config = json!({ "servers": [
+            { "id": "a b", "name": "Same", "transport": "stdio", "command": "run-me" },
+            { "id": "a-b", "name": "Same", "transport": "stdio", "command": "run-me" }
+        ]});
+        apply_team_config(&mut registry, "t1", &config);
+        let mut count = 0;
+        for server in &mut registry.servers {
+            if saved_team_original_id(server).is_some() {
+                server.unknown_fields.remove(TEAM_ORIGINAL_ID_FIELD);
+                server.id = if count == 0 {
+                    "team_a-b".into()
+                } else {
+                    "team_a-b-2".into()
+                };
+                count += 1;
+            }
+        }
+        registry.profiles[0]
+            .enabled_server_ids
+            .push("team_a-b".into());
+        config["servers"].as_array_mut().unwrap().reverse();
+        let outcome = apply_team_config(&mut registry, "t1", &config);
+        assert_eq!(outcome.review, 2);
+        assert!(registry
+            .servers
+            .iter()
+            .filter(|server| saved_team_original_id(server).is_some())
+            .all(|server| server.id != "team_a-b" && server.id != "team_a-b-2"));
+    }
+
+    #[test]
     fn team_id_does_not_collide_with_an_existing_local_server() {
         // A team server whose id would slugify onto an EXISTING local server's id must be
         // deduped against the whole registry, not just this sync's batch — otherwise team
@@ -3255,10 +3477,9 @@ mod tests {
 
     #[test]
     fn org_allowed_tools_survives_unique_id_collision_rename() {
-        // Regression: unique_id renames collisions with `{base}-2` (hyphen). Fuzzy base_id
-        // matching used underscore and silently dropped the allow-list on the renamed server.
+        // An id collision must rename the team server without losing its allow-list.
         let mut r = base_registry();
-        // Occupy the natural team id so the team server is renamed to team_github-2.
+        // Occupy the natural team id so the team server gets a stable alternate id.
         r.servers.push(ServerEntry {
             id: "team_github".into(),
             name: "Local GitHub".into(),
@@ -3292,7 +3513,8 @@ mod tests {
             .iter()
             .find(|s| s.source.as_deref() == Some("team:t1"))
             .expect("team server present");
-        assert_eq!(team.id, "team_github-2", "unique_id uses hyphen suffix");
+        assert!(team.id.starts_with("team_github-"));
+        assert!(!crate::registry::ids_collide(&team.id, "team_github"));
         assert!(
             r.profile_allows_tool("default", &team.id, "list_issues"),
             "allow-list must follow the post-unique_id server id"
@@ -3757,7 +3979,7 @@ mod tests {
             .iter()
             .find(|s| s.source.as_deref() == Some("team:t1"))
             .expect("team server applied");
-        assert_eq!(team.id, "team_acme-crm-2");
+        assert!(team.id.starts_with("team_acme-crm-"));
         assert!(
             !crate::registry::ids_collide(&team.id, "team-acme-crm"),
             "the renamed team id must not share the local server's sanitized form"
@@ -3816,7 +4038,10 @@ mod tests {
                     .find(|server| server.get("id").and_then(Value::as_str) == Some("mine"))
             })
             .expect("the server must be exported");
-        assert_eq!(entry.get("initializeTimeoutMs"), Some(&Value::from(240_000)));
+        assert_eq!(
+            entry.get("initializeTimeoutMs"),
+            Some(&Value::from(240_000))
+        );
 
         match classify_team_server(entry, "team:t1") {
             TeamClass::Review(imported) => {
