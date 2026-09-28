@@ -91,6 +91,7 @@ function VersionFooter({
   const announceCheckRef = useRef(false);
   const installingRef = useRef(false);
   const lastCheckRef = useRef(0);
+  const updateRef = useRef<Update | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -104,6 +105,7 @@ function VersionFooter({
       });
     return () => {
       mountedRef.current = false;
+      if (!installingRef.current) void updateRef.current?.close().catch(() => {});
     };
   }, []);
 
@@ -132,7 +134,20 @@ function VersionFooter({
     try {
       const result = await checkForUpdate();
       if (result.kind !== "error") lastCheckRef.current = Date.now();
-      if (!mountedRef.current) return;
+      if (!mountedRef.current) {
+        if (result.kind === "update") void result.update.close().catch(() => {});
+        return;
+      }
+      if (result.kind !== "error") {
+        // Each Update owns a native resource that only close() frees, and package
+        // installs never install, so release the one this result replaces. An
+        // install in progress still needs it.
+        const previous = updateRef.current;
+        updateRef.current = result.kind === "update" ? result.update : null;
+        if (previous && previous !== updateRef.current && !installingRef.current) {
+          void previous.close().catch(() => {});
+        }
+      }
       const shouldAnnounce = announce || announceCheckRef.current;
       announceCheckRef.current = false;
       if (result.kind === "update") {

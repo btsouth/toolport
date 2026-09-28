@@ -60,6 +60,10 @@ vi.mock("@/components/ShareDialog", () => ({
   ShareDialog: ({ trigger }: { trigger: ReactNode }) => trigger,
 }));
 
+function fakeUpdate(version = "1.1.0") {
+  return { version, body: "Release notes", close: vi.fn().mockResolvedValue(undefined) };
+}
+
 beforeEach(() => {
   getSavingsSummary.mockReset();
   listQuarantined.mockReset();
@@ -189,7 +193,7 @@ describe("AppSidebar accessibility", () => {
   });
 
   it("shows byte-based download progress while installing", async () => {
-    const update = { version: "1.1.0", body: "Release notes" };
+    const update = fakeUpdate();
     checkForUpdate.mockResolvedValue({ kind: "update", update });
     installUpdate.mockImplementation(
       async (_update: unknown, onProgress: (progress: unknown) => void) => {
@@ -222,7 +226,7 @@ describe("AppSidebar accessibility", () => {
   });
 
   it("sends a .deb install to the release page instead of installing", async () => {
-    const update = { version: "1.1.0", body: "Release notes" };
+    const update = fakeUpdate();
     checkForUpdate.mockResolvedValue({ kind: "update", update, systemPackage: "deb" });
 
     render(
@@ -253,8 +257,40 @@ describe("AppSidebar accessibility", () => {
     expect(installUpdate).not.toHaveBeenCalled();
   });
 
+  it("releases an update once a newer check or unmount replaces it", async () => {
+    const first = fakeUpdate("1.1.0");
+    const second = fakeUpdate("1.2.0");
+    checkForUpdate
+      .mockResolvedValueOnce({ kind: "update", update: first, systemPackage: "deb" })
+      .mockResolvedValueOnce({ kind: "update", update: second, systemPackage: "deb" });
+
+    const { unmount } = render(
+      <TooltipProvider>
+        <AppSidebar
+          registry={null}
+          onRegistryChange={vi.fn()}
+          view="servers"
+          onSelectView={vi.fn()}
+          onReplayOnboarding={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+
+    await screen.findByRole("button", { name: /update to v1.1.0/i });
+    act(() => {
+      eventListeners.get("tray-check-updates")?.({ payload: undefined });
+    });
+    await screen.findByRole("heading", { name: "Update available: v1.2.0" });
+
+    expect(first.close).toHaveBeenCalledTimes(1);
+    expect(second.close).not.toHaveBeenCalled();
+
+    unmount();
+    expect(second.close).toHaveBeenCalledTimes(1);
+  });
+
   it("shows updater recovery guidance without losing the install error", async () => {
-    const update = { version: "1.1.0", body: "Release notes" };
+    const update = fakeUpdate();
     checkForUpdate.mockResolvedValue({ kind: "update", update });
     installUpdate.mockRejectedValue(
       Object.assign(new Error("package signature rejected"), {
@@ -293,7 +329,7 @@ describe("AppSidebar accessibility", () => {
   });
 
   it("turns an in-flight quiet check into an announced tray result", async () => {
-    const update = { version: "1.1.0", body: "Release notes" };
+    const update = fakeUpdate();
     let resolveCheck!: (result: unknown) => void;
     checkForUpdate.mockReturnValue(
       new Promise((resolve) => {
@@ -328,7 +364,7 @@ describe("AppSidebar accessibility", () => {
   });
 
   it("acknowledges an explicit tray check while an update is installing", async () => {
-    const update = { version: "1.1.0", body: "Release notes" };
+    const update = fakeUpdate();
     checkForUpdate.mockResolvedValue({ kind: "update", update });
     installUpdate.mockReturnValue(new Promise(() => {}));
 
