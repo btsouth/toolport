@@ -5,6 +5,7 @@ import {
   ArrowUpCircle,
   ClipboardList,
   Compass,
+  ExternalLink,
   FileText,
   FlaskConical,
   FolderOpen,
@@ -32,7 +33,13 @@ import {
   openDataDir,
 } from "@/lib/api";
 import { fmtTokens } from "@/lib/utils";
-import { checkForUpdate, installUpdate, type UpdateProgress } from "@/lib/updater";
+import {
+  checkForUpdate,
+  installUpdate,
+  releasePageUrl,
+  type SystemPackage,
+  type UpdateProgress,
+} from "@/lib/updater";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ProfileBar } from "@/components/ProfileBar";
@@ -63,7 +70,8 @@ function updateProgressLabel(progress: UpdateProgress | null): string {
 /** Footer showing the running version, and an in-app update button when a newer
  * release is published. The check is best-effort: any failure (dev build,
  * offline, no manifest yet) just shows the current version. Clicking downloads,
- * installs, and relaunches into the new version. */
+ * installs, and relaunches into the new version, except on .deb and .rpm installs,
+ * which link to the release page instead. */
 function VersionFooter({
   onImport,
   onReplay,
@@ -73,6 +81,7 @@ function VersionFooter({
 }) {
   const [version, setVersion] = useState("");
   const [update, setUpdate] = useState<Update | null>(null);
+  const [systemPackage, setSystemPackage] = useState<SystemPackage | null>(null);
   const [installing, setInstalling] = useState(false);
   const [installProgress, setInstallProgress] = useState<UpdateProgress | null>(null);
   const [checking, setChecking] = useState(false);
@@ -128,6 +137,7 @@ function VersionFooter({
       announceCheckRef.current = false;
       if (result.kind === "update") {
         setUpdate(result.update);
+        setSystemPackage(result.systemPackage ?? null);
         if (shouldAnnounce) setShowNotes(true);
       } else if (result.kind === "current") {
         setUpdate(null);
@@ -238,6 +248,7 @@ function VersionFooter({
         open={showNotes}
         onOpenChange={setShowNotes}
         update={update}
+        systemPackage={systemPackage}
         installing={installing}
         progressLabel={progressLabel}
         onInstall={applyUpdate}
@@ -299,6 +310,7 @@ function UpdateNotes({
   open,
   onOpenChange,
   update,
+  systemPackage,
   installing,
   progressLabel,
   onInstall,
@@ -306,6 +318,7 @@ function UpdateNotes({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   update: Update | null;
+  systemPackage: SystemPackage | null;
   installing: boolean;
   progressLabel: string;
   onInstall: () => void;
@@ -327,21 +340,39 @@ function UpdateNotes({
               A new version is ready to install.
             </p>
           )}
+          {systemPackage && (
+            <p className="text-sm text-muted-foreground">
+              This copy was installed from a .{systemPackage} package, so Toolport can't
+              replace it itself. Download the new .{systemPackage} and install it the same
+              way.
+            </p>
+          )}
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={() => onOpenChange(false)}>
               {installing ? "Hide" : "Later"}
             </Button>
-            <Button onClick={onInstall} disabled={installing}>
-              {installing ? (
-                <>
-                  <Loader2 className="size-4 animate-spin" /> {progressLabel}
-                </>
-              ) : (
-                <>
-                  <ArrowUpCircle className="size-4" /> Install and restart
-                </>
-              )}
-            </Button>
+            {systemPackage ? (
+              <Button
+                onClick={() => {
+                  onOpenChange(false);
+                  void openExternal(releasePageUrl(update.version));
+                }}
+              >
+                <ExternalLink className="size-4" /> Open download page
+              </Button>
+            ) : (
+              <Button onClick={onInstall} disabled={installing}>
+                {installing ? (
+                  <>
+                    <Loader2 className="size-4 animate-spin" /> {progressLabel}
+                  </>
+                ) : (
+                  <>
+                    <ArrowUpCircle className="size-4" /> Install and restart
+                  </>
+                )}
+              </Button>
+            )}
           </div>
         </div>
       </DialogContent>

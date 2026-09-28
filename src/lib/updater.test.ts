@@ -3,16 +3,29 @@ import type { Update } from "@tauri-apps/plugin-updater";
 
 const invoke = vi.fn();
 const relaunch = vi.fn();
+const check = vi.fn();
+const getBundleType = vi.fn();
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invoke(...args),
 }));
-vi.mock("@tauri-apps/plugin-updater", () => ({ check: vi.fn() }));
+vi.mock("@tauri-apps/api/app", () => ({
+  BundleType: { Deb: "deb", Rpm: "rpm", AppImage: "appimage" },
+  getBundleType: (...args: unknown[]) => getBundleType(...args),
+}));
+vi.mock("@tauri-apps/plugin-updater", () => ({
+  check: (...args: unknown[]) => check(...args),
+}));
 vi.mock("@tauri-apps/plugin-process", () => ({
   relaunch: (...args: unknown[]) => relaunch(...args),
 }));
 
-import { installUpdate, UpdateInstallError, type UpdateProgress } from "./updater";
+import {
+  checkForUpdate,
+  installUpdate,
+  UpdateInstallError,
+  type UpdateProgress,
+} from "./updater";
 
 const cleanShutdown = {
   killed: ["toolport-gateway (pid 10)"],
@@ -29,6 +42,54 @@ const cleanShutdown = {
 beforeEach(() => {
   invoke.mockReset().mockResolvedValue(cleanShutdown);
   relaunch.mockReset().mockResolvedValue(undefined);
+  check.mockReset();
+  getBundleType.mockReset();
+});
+
+describe("checkForUpdate", () => {
+  const update = { available: true, version: "1.1.0" };
+
+  it("flags a .deb install so the app never tries to replace it", async () => {
+    check.mockResolvedValue(update);
+    getBundleType.mockResolvedValue("deb");
+
+    await expect(checkForUpdate()).resolves.toEqual({
+      kind: "update",
+      update,
+      systemPackage: "deb",
+    });
+  });
+
+  it("flags an .rpm install the same way", async () => {
+    check.mockResolvedValue(update);
+    getBundleType.mockResolvedValue("rpm");
+
+    await expect(checkForUpdate()).resolves.toMatchObject({ systemPackage: "rpm" });
+  });
+
+  it("keeps the in-app path for an AppImage", async () => {
+    check.mockResolvedValue(update);
+    getBundleType.mockResolvedValue("appimage");
+
+    await expect(checkForUpdate()).resolves.toMatchObject({ systemPackage: null });
+  });
+
+  it("keeps the in-app path when the bundle type is unavailable", async () => {
+    check.mockResolvedValue(update);
+    getBundleType.mockRejectedValue(new Error("unknown command"));
+
+    await expect(checkForUpdate()).resolves.toMatchObject({
+      kind: "update",
+      systemPackage: null,
+    });
+  });
+
+  it("does not look up the bundle when already current", async () => {
+    check.mockResolvedValue(null);
+
+    await expect(checkForUpdate()).resolves.toEqual({ kind: "current" });
+    expect(getBundleType).not.toHaveBeenCalled();
+  });
 });
 
 describe("installUpdate", () => {

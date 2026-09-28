@@ -6,6 +6,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Fixed
+
+- **Updating a .deb install no longer drops every MCP connection.** The update
+  feed only carries an AppImage for Linux, so the in-app updater stopped every
+  gateway and then failed with "invalid updater binary format". Installs from a
+  .deb or .rpm package now link to the release page to download the new package
+  instead. (#961, thanks @JustinKeltner)
+
 ## [1.23.1] - 2026-09-27
 
 ### Fixed

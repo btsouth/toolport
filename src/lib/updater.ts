@@ -1,3 +1,4 @@
+import { BundleType, getBundleType } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -5,9 +6,12 @@ import { relaunch } from "@tauri-apps/plugin-process";
 /** Outcome of an update check. `error` is distinct from `current` so the UI can
  * tell "you're up to date" apart from "couldn't reach the update server". */
 export type UpdateCheck =
-  | { kind: "update"; update: Update }
+  | { kind: "update"; update: Update; systemPackage: SystemPackage | null }
   | { kind: "current" }
   | { kind: "error"; message: string };
+
+/** A system package format whose files the package manager owns. */
+export type SystemPackage = "deb" | "rpm";
 
 export type UpdateProgress =
   | { phase: "downloading"; downloadedBytes: number; totalBytes?: number }
@@ -149,12 +153,33 @@ async function recoverAfterFailure(shutdown: UpdateShutdownReport): Promise<{
   }
 }
 
+/** The package format this copy was installed from, when the in-app updater
+ * cannot replace it. A .deb or .rpm install lives in root-owned /usr/bin, and the
+ * release manifest only carries an AppImage for Linux. Installing anyway stops
+ * every gateway and then fails with "invalid updater binary format" (#961). */
+async function systemPackage(): Promise<SystemPackage | null> {
+  try {
+    const bundle = await getBundleType();
+    if (bundle === BundleType.Deb) return "deb";
+    if (bundle === BundleType.Rpm) return "rpm";
+  } catch {
+    // Older runtimes without the command keep the in-app path they always had.
+  }
+  return null;
+}
+
+/** Release page for a version, where package installs download the new build. */
+export function releasePageUrl(version: string): string {
+  return `https://github.com/btsouth/toolport/releases/tag/v${version}`;
+}
+
 /** Check for a newer release via the Tauri updater. Never throws; failures
  * (dev build, offline, or no manifest published yet) come back as `error`. */
 export async function checkForUpdate(): Promise<UpdateCheck> {
   try {
     const u = await check();
-    return u?.available ? { kind: "update", update: u } : { kind: "current" };
+    if (!u?.available) return { kind: "current" };
+    return { kind: "update", update: u, systemPackage: await systemPackage() };
   } catch (e) {
     return { kind: "error", message: String(e) };
   }

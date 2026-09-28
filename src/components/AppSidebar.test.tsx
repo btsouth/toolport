@@ -13,6 +13,7 @@ const installUpdate = vi.fn();
 const toastInfo = vi.fn();
 const toastError = vi.fn();
 const openDataDir = vi.fn();
+const openExternal = vi.fn();
 const eventListeners = new Map<string, (event: { payload: unknown }) => void>();
 
 vi.mock("sonner", () => ({
@@ -33,6 +34,10 @@ vi.mock("@/lib/api", () => ({
   openDataDir: (...args: unknown[]) => openDataDir(...args),
 }));
 
+vi.mock("@/lib/openUrl", () => ({
+  openExternal: (...args: unknown[]) => openExternal(...args),
+}));
+
 vi.mock("@tauri-apps/api/app", () => ({
   getVersion: vi.fn().mockResolvedValue("1.0.0"),
 }));
@@ -47,6 +52,8 @@ vi.mock("@tauri-apps/api/event", () => ({
 vi.mock("@/lib/updater", () => ({
   checkForUpdate: (...args: unknown[]) => checkForUpdate(...args),
   installUpdate: (...args: unknown[]) => installUpdate(...args),
+  releasePageUrl: (version: string) =>
+    `https://github.com/btsouth/toolport/releases/tag/v${version}`,
 }));
 
 vi.mock("@/components/ShareDialog", () => ({
@@ -61,6 +68,7 @@ beforeEach(() => {
   toastInfo.mockReset();
   toastError.mockReset();
   openDataDir.mockReset();
+  openExternal.mockReset().mockResolvedValue(undefined);
   eventListeners.clear();
   checkForUpdate.mockResolvedValue({ kind: "current" });
   getSavingsSummary.mockResolvedValue({
@@ -211,6 +219,38 @@ describe("AppSidebar accessibility", () => {
     await userEvent.click(screen.getByRole("button", { name: /install and restart/i }));
 
     expect((await screen.findAllByText("Downloading 50%")).length).toBeGreaterThan(0);
+  });
+
+  it("sends a .deb install to the release page instead of installing", async () => {
+    const update = { version: "1.1.0", body: "Release notes" };
+    checkForUpdate.mockResolvedValue({ kind: "update", update, systemPackage: "deb" });
+
+    render(
+      <TooltipProvider>
+        <AppSidebar
+          registry={null}
+          onRegistryChange={vi.fn()}
+          view="servers"
+          onSelectView={vi.fn()}
+          onReplayOnboarding={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: /update to v1.1.0/i }),
+    );
+    expect(screen.getByText(/installed from a \.deb package/i)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /install and restart/i }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /open download page/i }));
+
+    expect(openExternal).toHaveBeenCalledWith(
+      "https://github.com/btsouth/toolport/releases/tag/v1.1.0",
+    );
+    expect(installUpdate).not.toHaveBeenCalled();
   });
 
   it("shows updater recovery guidance without losing the install error", async () => {
