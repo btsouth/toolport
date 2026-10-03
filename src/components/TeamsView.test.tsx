@@ -34,6 +34,7 @@ import {
   TEAMS_FREE_SEATS,
   TEAMS_PAID_LINE,
   TEAMS_SEAT_PRICE,
+  TEAMS_ANNUAL_SEAT_PRICE,
   TEAMS_TRIAL_DAYS,
 } from "@/lib/teamsPlan";
 
@@ -717,8 +718,12 @@ describe("Teams plan copy", () => {
     expect(TEAMS_PAID_LINE).toContain(`$${TEAMS_BASE_PRICE}/month`);
     // "/month" on the seat price too: "$12 per person" reads as a one-time charge to add
     // someone, which undersells nothing and oversells the bill.
-    expect(TEAMS_PAID_LINE).toContain(`$${TEAMS_SEAT_PRICE}/month per person`);
+    expect(TEAMS_PAID_LINE).toContain(`$${TEAMS_SEAT_PRICE}/month per additional person`);
     expect(TEAMS_PAID_LINE).toContain(`$${TEAMS_ANNUAL_PRICE}/year`);
+    expect(TEAMS_PAID_LINE).toContain(
+      `$${TEAMS_ANNUAL_SEAT_PRICE}/year on annual billing`,
+    );
+    expect(TEAMS_ANNUAL_SEAT_PRICE).toBe(TEAMS_SEAT_PRICE * 10);
     expect(TEAMS_PAID_LINE).toContain(`up to ${TEAMS_FREE_SEATS}`);
     expect(TEAMS_PAID_LINE).toMatch(/same price hosted or self-hosted/i);
   });

@@ -36,11 +36,15 @@ them across Claude, Cursor, Codex, VS Code, and other clients.
    [catalog launch setup](docs/catalog-launch-setup.md) for inputs and package status,
    and the [curation review](docs/catalog-curation-review.md) for selection criteria.
 3. Authenticate the server, then open **Clients** and connect your AI apps.
+   Restart or reload the client once so it picks up Toolport.
 
 Installers and release notes are also on
 [GitHub Releases](https://github.com/btsouth/toolport/releases).
 On Arch and Omarchy, the [pacman repository](docs/arch-pacman-repo.md) keeps
 Toolport on your normal update path.
+
+Working with a team? [Toolport Teams](https://toolport.app/teams) shares server
+configuration and policies while each member keeps their own credentials.
 
 ## Documentation
 

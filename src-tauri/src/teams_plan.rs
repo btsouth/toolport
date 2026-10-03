@@ -14,6 +14,8 @@ pub const FREE_SEATS: u32 = 5;
 pub const BASE_PRICE: u32 = 39;
 /// Monthly price per person past [`FREE_SEATS`].
 pub const SEAT_PRICE: u32 = 12;
+/// Annual price per additional person: ten months of the monthly rate.
+pub const ANNUAL_SEAT_PRICE: u32 = 120;
 /// Annual price of the Team plan.
 pub const ANNUAL_PRICE: u32 = 390;
 /// Length of the Team trial, in days. No card is taken for it.
@@ -30,7 +32,7 @@ pub fn free_line() -> String {
 pub fn paid_line() -> String {
     format!(
         "Team is ${BASE_PRICE}/month (or ${ANNUAL_PRICE}/year) for up to {FREE_SEATS}, \
-then ${SEAT_PRICE}/month per person, and adds access control, rate limits, and audit. \
+then ${SEAT_PRICE}/month per additional person (or ${ANNUAL_SEAT_PRICE}/year on annual billing), and adds access control, rate limits, and audit. \
 Same price hosted or self-hosted."
     )
 }
@@ -63,6 +65,7 @@ mod tests {
             ("TEAMS_FREE_SEATS", FREE_SEATS),
             ("TEAMS_BASE_PRICE", BASE_PRICE),
             ("TEAMS_SEAT_PRICE", SEAT_PRICE),
+            ("TEAMS_ANNUAL_SEAT_PRICE", ANNUAL_SEAT_PRICE),
             ("TEAMS_ANNUAL_PRICE", ANNUAL_PRICE),
             ("TEAMS_TRIAL_DAYS", TRIAL_DAYS),
         ] {
@@ -88,6 +91,7 @@ mod tests {
             ("${TEAMS_FREE_SEATS}", FREE_SEATS),
             ("${TEAMS_BASE_PRICE}", BASE_PRICE),
             ("${TEAMS_SEAT_PRICE}", SEAT_PRICE),
+            ("${TEAMS_ANNUAL_SEAT_PRICE}", ANNUAL_SEAT_PRICE),
             ("${TEAMS_ANNUAL_PRICE}", ANNUAL_PRICE),
         ] {
             out = out.replace(token, &value.to_string());
