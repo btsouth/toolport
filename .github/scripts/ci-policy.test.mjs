@@ -37,7 +37,10 @@ test("native, shared, unknown, empty diffs and main pushes run native checks", (
   ])
     assert.equal(needsRust("pull_request", ["src/App.tsx", file]), true);
   assert.equal(needsRust("pull_request", []), true);
-  assert.equal(needsRust("pull_request", ["docs/a.md", ".github/workflows/ci.yml"]), true);
+  assert.equal(
+    needsRust("pull_request", ["docs/a.md", ".github/workflows/ci.yml"]),
+    true,
+  );
   assert.equal(needsRust("pull_request", ["packaging/x", "scripts/install.sh"]), true);
   assert.equal(needsRust("push", ["docs/a.md"]), true);
   assert.equal(needsRust("push", ["src/App.tsx"]), true);

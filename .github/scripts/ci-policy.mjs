@@ -29,7 +29,8 @@ function skipsRust(file) {
     SKIP_RUST_PREFIXES.some((prefix) => file.startsWith(prefix)) ||
     file.endsWith(".md") ||
     /^(vite\.config|tsconfig[^/]*)\.(ts|json)$/.test(file) ||
-    (/^\.github\/workflows\/[^/]+\.yml$/.test(file) && file !== ".github/workflows/ci.yml")
+    (/^\.github\/workflows\/[^/]+\.yml$/.test(file) &&
+      file !== ".github/workflows/ci.yml")
   );
 }
 
