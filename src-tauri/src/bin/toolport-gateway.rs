@@ -28698,7 +28698,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("conduit-ac-review-{}.json", std::process::id()));
         // A team-pushed local command and a changed team remote both await member review; a
-        // public team remote does not.
+        // public team remote (an IP literal, so no DNS lookup) does not.
         let json = r#"{"version":1,
             "servers":[
                 {"id":"cmd","name":"Team Tool","transport":"stdio","command":"x","args":[],
@@ -28707,7 +28707,7 @@ mod tests {
                  "url":"https://mcp.example.com/changed","env":[],"source":"team:acme",
                  "teamEnableReview":true},
                 {"id":"remote","name":"Team Remote","transport":"http",
-                 "url":"https://mcp.example.com/mcp","env":[],"source":"team:acme"}],
+                 "url":"https://8.8.8.8/mcp","env":[],"source":"team:acme"}],
             "profiles":[{"id":"p","name":"P","enabledServerIds":[]}],
             "activeProfileId":"p","allowAgentControl":true}"#;
         std::fs::write(&path, json).unwrap();
