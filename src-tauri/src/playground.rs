@@ -10,14 +10,9 @@ fn server(server_id: &str) -> Result<ServerEntry, String> {
         .find(|server| server.id == server_id)
         .cloned()
         .ok_or_else(|| format!("server '{server_id}' not found"))?;
-    if server.needs_team_enable_review() {
-        let profile = registry.active_profile_id();
-        if !registry.is_enabled(&profile, &server.id) {
-            return Err(
-                "this team server needs consent for its command, address or authentication; enable it from Teams after review"
-                    .into(),
-            );
-        }
+    // Connecting runs the server, so an unreviewed team server must already be on.
+    if !registry.is_enabled(&registry.active_profile_id(), &server.id) {
+        server.check_enable_allowed(false)?;
     }
     Ok(server)
 }

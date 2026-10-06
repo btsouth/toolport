@@ -2118,6 +2118,28 @@ fn set_server_enabled_via_agent(
             if enable { "on" } else { "off" }
         ));
     }
+    // A team server still pending the member's review is the user's call alone. Checked on
+    // the fresh copy so a team sync landing mid-request cannot slip a new definition past it.
+    let pending_review = fresh
+        .servers
+        .iter()
+        .find(|s| s.id == server_id)
+        .is_some_and(|s| s.check_enable_allowed(false).is_err());
+    if enable && pending_review {
+        audit::record_agent_toggle(
+            client,
+            &profile_id,
+            action,
+            target,
+            Some(&server_id),
+            "team_review_required",
+            scoped,
+        );
+        return Err(format!(
+            "Toolport: {server_name} is a team server waiting for the user's review, so an agent \
+            cannot enable it. Ask the user to review it and turn it on in Toolport's Teams page."
+        ));
+    }
     fresh.set_server_enabled(&profile_id, &server_id, enable)?;
     registry::save_to(path, &fresh)
         .map_err(|e| format!("Toolport: could not save the registry ({e})."))?;
@@ -28665,6 +28687,55 @@ mod tests {
             None,
         );
         assert!(ok.is_ok(), "in-scope toggle should resolve: {ok:?}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn agent_control_cannot_enable_a_team_server_pending_review() {
+        let _data_env =
+            DataDirTestEnv::new("agent_control_cannot_enable_a_team_server_pending_review");
+        let path =
+            std::env::temp_dir().join(format!("conduit-ac-review-{}.json", std::process::id()));
+        // A team-pushed local command and a changed team remote both await member review; a
+        // public team remote does not.
+        let json = r#"{"version":1,
+            "servers":[
+                {"id":"cmd","name":"Team Tool","transport":"stdio","command":"x","args":[],
+                 "env":[],"source":"team:acme"},
+                {"id":"changed","name":"Team Changed","transport":"http",
+                 "url":"https://mcp.example.com/changed","env":[],"source":"team:acme",
+                 "teamEnableReview":true},
+                {"id":"remote","name":"Team Remote","transport":"http",
+                 "url":"https://mcp.example.com/mcp","env":[],"source":"team:acme"}],
+            "profiles":[{"id":"p","name":"P","enabledServerIds":[]}],
+            "activeProfileId":"p","allowAgentControl":true}"#;
+        std::fs::write(&path, json).unwrap();
+        let reg = registry::load_from(&path).unwrap();
+
+        for target in ["Team Tool", "changed"] {
+            let refused =
+                set_server_enabled_via_agent(&reg, Some("p"), &path, target, true, None, None)
+                    .expect_err("a pending team server must not be enabled by an agent");
+            assert!(
+                refused.contains("waiting for the user's review"),
+                "{refused}"
+            );
+            assert!(refused.contains("Teams"), "{refused}");
+        }
+        let saved = registry::load_from(&path).unwrap();
+        assert!(!saved.is_enabled("p", "cmd"));
+        assert!(!saved.is_enabled("p", "changed"));
+
+        let ok =
+            set_server_enabled_via_agent(&reg, Some("p"), &path, "Team Remote", true, None, None);
+        assert!(
+            ok.is_ok(),
+            "a reviewed-safe team remote still enables: {ok:?}"
+        );
+        assert!(registry::load_from(&path)
+            .unwrap()
+            .is_enabled("p", "remote"));
 
         let _ = std::fs::remove_file(&path);
     }

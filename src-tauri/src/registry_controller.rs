@@ -1898,19 +1898,8 @@ pub fn apply_server_enabled(
             if server.launch.is_some() {
                 crate::launch_inputs::resolve_args(server)?;
             }
+            server.check_enable_allowed(reviewed)?;
         }
-    }
-    if enabled
-        && !reviewed
-        && registry
-            .servers
-            .iter()
-            .any(|server| server.id == server_id && server.needs_team_enable_review())
-    {
-        return Err(
-            "this team server needs consent for its command, address or authentication; enable it from Teams after review"
-                .into(),
-        );
     }
     registry.set_server_enabled(profile_id, server_id, enabled)
 }
