@@ -7420,6 +7420,11 @@ fn build_content(
         .build();
     menu_button.set_popover(Some(&menu_popover));
     header.pack_end(&menu_button);
+    let check_servers = gtk::Button::builder()
+        .icon_name("view-refresh-symbolic")
+        .tooltip_text("Check servers again")
+        .build();
+    header.pack_end(&check_servers);
     root.append(&header);
 
     let scroller = gtk::ScrolledWindow::builder()
@@ -7584,6 +7589,9 @@ fn build_content(
             health: std::rc::Rc::new(std::cell::RefCell::new(health::HealthCache::default())),
         },
     );
+    let page_for_check = server_page.1.clone();
+    check_servers
+        .connect_clicked(move |_| page_for_check.probe_servers(health::ProbeReason::Refresh));
     let page_for_add = server_page.1.clone();
     add_server.connect_clicked(move |_| open_server_editor(None, page_for_add.clone()));
     let add_action = gtk::gio::SimpleAction::new("add-server", None);
