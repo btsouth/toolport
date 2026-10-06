@@ -9453,7 +9453,9 @@ fn reconnect_backoff() -> ReconnectBackoff {
         std::env::var(name)
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .map(|ms| Duration::from_millis(ms.max(1)))
+            // Never below 100 ms, so a stray setting cannot turn every call that
+            // names a pending server into a fresh connect attempt.
+            .map(|ms| Duration::from_millis(ms.max(100)))
     };
     let mut backoff = ReconnectBackoff::default();
     if let Some(base) = millis("TOOLPORT_RECONNECT_BASE_MS") {
@@ -15080,14 +15082,17 @@ fn process_request(
 
     // Self-heal: a call with no live downstream servers means the startup read
     // found none (transient) or a server was authed after we built. Reload and
-    // rebuild once so the call can route instead of failing.
+    // rebuild once so the call can route instead of failing. Servers that failed
+    // their first connect are pending and retry on their own backoff; a rebuild
+    // here would respawn all of them on every call (REL-03).
+    let router_is_empty = |router: &Router| router.server_count() == 0 && !router.has_pending();
     if method == "tools/call"
-        && state
-            .router
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .server_count()
-            == 0
+        && router_is_empty(
+            &state
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
         && !(state.daemon_mode.load(Ordering::SeqCst) && {
             let reg = state
                 .registry
@@ -15112,12 +15117,12 @@ fn process_request(
             .rebuild_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let still_empty = state
-            .router
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .server_count()
-            == 0;
+        let still_empty = router_is_empty(
+            &state
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         if still_empty {
             let reg = state
                 .registry

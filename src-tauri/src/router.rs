@@ -717,7 +717,12 @@ impl PendingState {
         self.failures = self.failures.saturating_add(1);
         self.last_error = failure.message;
         self.needs_auth = failure.needs_auth;
-        self.next_attempt = now + backoff.delay(self.failures).mul_f64(jitter);
+        // Cap after jitter, so the slowest retry is the cap itself.
+        let delay = backoff
+            .delay(self.failures)
+            .mul_f64(jitter)
+            .min(backoff.cap);
+        self.next_attempt = now + delay;
     }
 }
 
@@ -822,7 +827,7 @@ pub struct PendingStatus {
 impl PendingStatus {
     /// One line describing the server's state, without its id.
     pub fn describe(&self) -> String {
-        let error = truncate_error(&self.last_error);
+        let error = client_safe_error(&self.last_error);
         if self.needs_auth {
             format!("needs sign-in in Toolport (last error: {error})")
         } else if self.connecting {
@@ -837,16 +842,46 @@ impl PendingStatus {
     }
 }
 
-/// One line, bounded: connect errors often carry a multi-line stderr tail.
-fn truncate_error(error: &str) -> String {
-    const MAX: usize = 300;
-    let error = error.split_whitespace().collect::<Vec<_>>().join(" ");
-    if error.chars().count() <= MAX {
-        return error;
-    }
-    let mut out: String = error.chars().take(MAX).collect();
-    out.push_str("...");
-    out
+/// What an MCP client may see about a connect failure. The raw error can carry a
+/// child's stderr or a server's response body, either of which may echo a secret
+/// the gateway injected, so only a fixed category (with an exit or HTTP status)
+/// reaches the model. The full text is already in the gateway log.
+fn client_safe_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    let code_after = |marker: &str| -> Option<String> {
+        let at = lower.find(marker)? + marker.len();
+        let code: String = lower[at..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        (!code.is_empty()).then_some(code)
+    };
+    let summary = if let Some(code) = code_after("http ") {
+        format!("the server answered HTTP {code}")
+    } else if lower.contains("exited") {
+        match code_after("status ") {
+            Some(code) => format!("the server process exited (status {code})"),
+            None => "the server process exited".to_string(),
+        }
+    } else if lower.contains("failed to spawn") {
+        "the server command could not be started".to_string()
+    } else if lower.contains("vault") || lower.contains("keychain") || lower.contains("keyring") {
+        "its stored credentials could not be read".to_string()
+    } else if lower.contains("name resolution")
+        || lower.contains("dns")
+        || lower.contains("resolve")
+    {
+        "the server's address could not be resolved".to_string()
+    } else if lower.contains("connection refused") {
+        "the connection was refused".to_string()
+    } else if lower.contains("certificate") || lower.contains("tls") {
+        "the TLS connection failed".to_string()
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "the server did not answer in time".to_string()
+    } else {
+        "the connection failed".to_string()
+    };
+    format!("{summary}; details are in the Toolport log")
 }
 
 /// Opaque handle on one pending server, so the gateway can cancel retries a
@@ -1246,6 +1281,11 @@ impl Router {
             state: Mutex::new(state),
             cancelled: std::sync::atomic::AtomicBool::new(false),
         }));
+    }
+
+    /// Whether any server is still waiting to connect in the background.
+    pub fn has_pending(&self) -> bool {
+        self.pending.iter().any(|p| !p.is_cancelled())
     }
 
     /// Every server still waiting to connect, with its retry state.
@@ -5474,7 +5514,7 @@ mod tests {
         router.add(mock_server("gamma"));
         let err = router.route_call("beta__echo", json!({})).unwrap_err();
         assert!(err.contains("has not connected yet"), "{err}");
-        assert!(err.contains("name resolution"), "{err}");
+        assert!(err.contains("address could not be resolved"), "{err}");
 
         // First retry fails (call #1), the second connects (call #2).
         assert!(wait_until(|| {
@@ -5540,5 +5580,46 @@ mod tests {
         assert_eq!(err, "no route for tool 'secret_team__x'");
         assert!(router.kick_pending("secret_team__x", |_| true).is_some());
         assert!(router.kick_pending("secret-team", |_| true).is_some());
+    }
+    #[test]
+    fn client_safe_error_never_repeats_downstream_text() {
+        for (raw, expected) in [
+            (
+                "downstream server exited (status 3): invalid token ghp_secret123",
+                "the server process exited (status 3)",
+            ),
+            (
+                "HTTP 401 (needs authentication): token refresh failed: body sk-live-1",
+                "the server answered HTTP 401",
+            ),
+            (
+                "Temporary failure in name resolution",
+                "the server's address could not be resolved",
+            ),
+            (
+                "could not read secret 'API_KEY' from the vault: locked",
+                "its stored credentials could not be read",
+            ),
+            ("failed to spawn 'npx': No such file", "the server command could not be started"),
+            ("timed out waiting for 'initialize' response", "the server did not answer in time"),
+            ("mock said: hunter2", "the connection failed"),
+        ] {
+            let shown = client_safe_error(raw);
+            assert!(shown.starts_with(expected), "{raw} -> {shown}");
+            for secret in ["ghp_secret123", "sk-live-1", "API_KEY", "hunter2", "npx"] {
+                assert!(!shown.contains(secret), "{raw} -> {shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn jitter_never_pushes_a_retry_past_the_cap() {
+        let backoff = ReconnectBackoff::default();
+        let t0 = Instant::now();
+        let mut state = PendingState::new(failure("dns", false), &backoff, t0, 1.2);
+        for _ in 0..12 {
+            state.record_failure(failure("dns", false), &backoff, t0, 1.2);
+        }
+        assert_eq!(state.next_attempt, t0 + backoff.cap);
     }
 }

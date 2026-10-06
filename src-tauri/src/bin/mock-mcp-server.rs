@@ -715,12 +715,20 @@ fn fail_start_if_configured() {
     let Ok(path) = std::env::var("MOCK_MCP_START_COUNTER") else {
         return;
     };
+    // One appended line per start, so two starts at once both count.
+    {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = file.write_all(b"start\n");
+        }
+    }
     let starts = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .unwrap_or(0)
-        + 1;
-    let _ = std::fs::write(&path, starts.to_string());
+        .map(|raw| raw.lines().count() as u64)
+        .unwrap_or(1);
     let failing: u64 = std::env::var("MOCK_MCP_FAIL_STARTS")
         .ok()
         .and_then(|raw| raw.trim().parse().ok())

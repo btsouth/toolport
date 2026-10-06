@@ -74,8 +74,7 @@ fn write_registry(dir: &Path, servers: &[Value], enabled: &[&str], legacy: bool)
 
 fn read_count(path: &Path) -> u64 {
     std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| raw.trim().parse().ok())
+        .map(|raw| raw.lines().count() as u64)
         .unwrap_or(0)
 }
 
@@ -100,14 +99,18 @@ struct Gateway {
 
 impl Gateway {
     fn start(dir: &Path) -> Self {
+        Self::start_with_backoff(dir, "300")
+    }
+
+    fn start_with_backoff(dir: &Path, base_ms: &str) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_toolport-gateway"))
             .env("TOOLPORT_DATA_DIR", dir)
             .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
             // File vault in the scratch dir: never the OS keychain.
             .env("TOOLPORT_SECRET_KEY", "reconnect-test")
             // Short steps so the schedule fits a test: 300 ms, then one try per watcher tick.
-            .env("TOOLPORT_RECONNECT_BASE_MS", "300")
-            .env("TOOLPORT_RECONNECT_CAP_MS", "300")
+            .env("TOOLPORT_RECONNECT_BASE_MS", base_ms)
+            .env("TOOLPORT_RECONNECT_CAP_MS", base_ms)
             .env("TOOLPORT_DAEMON_IDLE_GRACE_MS", "5000")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -531,4 +534,53 @@ fn disabling_a_failing_server_stops_its_retries() {
         gateway.diagnostics()
     );
     assert!(gateway.tool_names().contains(&"good__echo".to_string()));
+}
+
+/// When every server failed, status checks and calls must not respawn them: they
+/// wait for the background schedule. The schedule here is a minute, so any extra
+/// start inside the test came from a request. The error shown to the client names
+/// the failure class, never the server's own output.
+#[test]
+fn calls_do_not_respawn_servers_that_are_waiting_to_retry() {
+    for legacy in [true, false] {
+        let dir = scratch_dir();
+        let counter = dir.join("down-starts");
+        let counter_path = counter.to_string_lossy().to_string();
+        write_registry(
+            &dir,
+            &[mock_entry(
+                "down",
+                &[
+                    ("MOCK_MCP_FAIL_STARTS", "1000"),
+                    ("MOCK_MCP_START_COUNTER", &counter_path),
+                ],
+            )],
+            &["down"],
+            legacy,
+        );
+        let mut gateway = Gateway::start_with_backoff(&dir, "60000");
+        wait_for("the failed first connect", Duration::from_secs(60), || {
+            gateway.status().contains("Not connected yet")
+        });
+        let after_first = read_count(&counter);
+        assert!(after_first >= 1, "the first build started the server");
+        for _ in 0..5 {
+            let status = gateway.status();
+            assert!(status.contains("down"), "{status}");
+            assert!(
+                !status.contains("failing starts"),
+                "the server's own stderr must not reach the client: {status}"
+            );
+            let (is_error, text) = gateway.call("down__echo");
+            assert!(is_error, "{text}");
+            assert!(text.contains("exited (status 3)"), "{text}");
+            assert!(!text.contains("failing starts"), "{text}");
+        }
+        assert_eq!(
+            read_count(&counter),
+            after_first,
+            "requests must not respawn a pending server (legacy: {legacy})\n{}",
+            gateway.diagnostics()
+        );
+    }
 }
