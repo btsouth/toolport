@@ -854,8 +854,7 @@ fn read_registry_exact() -> Result<Registry, String> {
     let path = registry::resolved_path().ok_or("could not resolve the registry path")?;
     let contents = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read the registry: {error}"))?;
-    serde_json::from_str(&contents)
-        .map_err(|error| format!("could not parse the registry: {error}"))
+    registry::parse_registry_contents(&contents)
 }
 
 fn read_registry_exact_or_default() -> Result<Registry, String> {
@@ -867,8 +866,7 @@ fn read_registry_exact_or_default() -> Result<Registry, String> {
         }
         Err(error) => return Err(format!("could not read the registry: {error}")),
     };
-    serde_json::from_str(&contents)
-        .map_err(|error| format!("could not parse the registry: {error}"))
+    registry::parse_registry_contents(&contents)
 }
 
 pub fn essential_settings() -> Result<EssentialSettings, String> {
