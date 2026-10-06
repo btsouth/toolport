@@ -11,6 +11,19 @@ test("frontend-only PRs skip unchanged native code", () => {
     assert.equal(needsRust("pull_request", files), false);
 });
 
+test("docs, packaging and non-CI workflow PRs skip native checks", () => {
+  for (const files of [
+    ["docs/design.md"],
+    ["README.md", "src/lib/README.md", "LICENSE"],
+    [".github/ISSUE_TEMPLATE/bug_report.yml", ".github/PULL_REQUEST_TEMPLATE.md"],
+    [".coderabbit.yaml", ".vscode/settings.json"],
+    ["packaging/linux/native/PKGBUILD", "packaging/homebrew/toolport.rb"],
+    [".github/workflows/release.yml"],
+    [".github/workflows/docker-publish.yml", ".github/workflows/winget.yml"],
+  ])
+    assert.equal(needsRust("pull_request", files), false, files.join());
+});
+
 test("native, shared, unknown, empty diffs and main pushes run native checks", () => {
   for (const file of [
     "src-tauri/src/lib.rs",
@@ -18,11 +31,15 @@ test("native, shared, unknown, empty diffs and main pushes run native checks", (
     "package.json",
     "scripts/install.sh",
     ".github/workflows/ci.yml",
-    "docs/design.md",
+    ".github/scripts/ci-policy.mjs",
+    ".github/workflows/nested/x.yml",
     "new-file",
   ])
     assert.equal(needsRust("pull_request", ["src/App.tsx", file]), true);
   assert.equal(needsRust("pull_request", []), true);
+  assert.equal(needsRust("pull_request", ["docs/a.md", ".github/workflows/ci.yml"]), true);
+  assert.equal(needsRust("pull_request", ["packaging/x", "scripts/install.sh"]), true);
+  assert.equal(needsRust("push", ["docs/a.md"]), true);
   assert.equal(needsRust("push", ["src/App.tsx"]), true);
 });
 

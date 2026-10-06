@@ -117,6 +117,7 @@ jobs:
           workspaces: src-tauri
           key: ci-gtk
           cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build the native GTK shell
         run: cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --features gtk-desktop --bin toolport-gtk
 
@@ -158,6 +159,7 @@ jobs:
           workspaces: src-tauri
           key: ci-clippy
           cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --no-default-features --lib --bins
@@ -201,6 +203,7 @@ jobs:
           workspaces: src-tauri
           key: ci-desktop
           cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm ci
       - name: Build frontend assets for the desktop Rust tests
         run: npm run build
@@ -251,6 +254,7 @@ jobs:
           workspaces: src-tauri
           key: ci-headless
           cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Compile Rust tests and record build timings
         if: matrix.os != 'windows-latest'
         run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib --bins --tests --no-run --timings
