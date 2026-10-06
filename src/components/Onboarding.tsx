@@ -911,7 +911,9 @@ function servingSummary(health: ProbeResult[], connectedCount: number): string {
   const signIn = health.filter((r) => !r.ok && r.authRequired).length;
   const tools = plural(connectedCount, "connected tool");
   const base = `Toolport is serving ${plural(serving, "server")} to ${tools}`;
-  return signIn > 0 ? `${base}, and ${signIn} need${signIn === 1 ? "s" : ""} sign-in.` : `${base}.`;
+  return signIn > 0
+    ? `${base}, and ${signIn} need${signIn === 1 ? "s" : ""} sign-in.`
+    : `${base}.`;
 }
 
 function Done({
@@ -1022,11 +1024,11 @@ function Done({
           </>
         ) : ready ? (
           <>
-            {servingSummary(health ?? [], connectedCount)} Toggle one on or off and your clients
-            update live, no restart. Each client loads a handful of Toolport meta-tools
-            instead of every downstream tool, up to 91% fewer tokens at the same task
-            success. And Toolport watches every server for tampering and prompt injection,
-            see Activity.
+            {servingSummary(health ?? [], connectedCount)} Toggle one on or off and your
+            clients update live, no restart. Each client loads a handful of Toolport
+            meta-tools instead of every downstream tool, up to 91% fewer tokens at the
+            same task success. And Toolport watches every server for tampering and prompt
+            injection, see Activity.
           </>
         ) : configured && checkingHealth ? (
           <>

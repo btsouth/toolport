@@ -47,8 +47,22 @@ const empty: Registry = {
 const withServers = (enabled: string[]): Registry => ({
   ...empty,
   servers: [
-    { id: "memory", name: "memory", transport: "stdio", command: "npx", args: [], env: [] },
-    { id: "github", name: "github", transport: "stdio", command: "npx", args: [], env: [] },
+    {
+      id: "memory",
+      name: "memory",
+      transport: "stdio",
+      command: "npx",
+      args: [],
+      env: [],
+    },
+    {
+      id: "github",
+      name: "github",
+      transport: "stdio",
+      command: "npx",
+      args: [],
+      env: [],
+    },
   ],
   profiles: [{ id: "default", name: "Default", enabledServerIds: enabled }],
 });
@@ -90,7 +104,9 @@ describe("Onboarding import copy", () => {
         onProbe={vi.fn().mockResolvedValue([])}
       />,
     );
-    await user.click(await screen.findByRole("button", { name: /Import 2 from your clients/ }));
+    await user.click(
+      await screen.findByRole("button", { name: /Import 2 from your clients/ }),
+    );
     await user.click(await screen.findByRole("button", { name: "Import 2 servers" }));
   }
 

@@ -33,11 +33,17 @@ struct Moved {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "format", rename_all = "lowercase")]
 enum Raw {
-    Json { value: serde_json::Value },
+    Json {
+        value: serde_json::Value,
+    },
     /// A one-entry `[mcp_servers.<name>]` document, so nested tables and their
     /// comments survive the round trip.
-    Toml { text: String },
-    Yaml { text: String },
+    Toml {
+        text: String,
+    },
+    Yaml {
+        text: String,
+    },
 }
 
 /// Where a format keeps its name -> definition server list.
@@ -215,7 +221,11 @@ fn extract(container: Container, text: &str) -> Result<Vec<Moved>, String> {
             if let Some(nested) = nested {
                 servers = servers.and_then(|value| value.get(nested));
             }
-            for (name, definition) in servers.and_then(|value| value.as_object()).into_iter().flatten() {
+            for (name, definition) in servers
+                .and_then(|value| value.as_object())
+                .into_iter()
+                .flatten()
+            {
                 if !gateway_identity_matches(name, name, json_command(definition)) {
                     out.push(Moved {
                         name: name.clone(),
@@ -231,8 +241,7 @@ fn extract(container: Container, text: &str) -> Result<Vec<Moved>, String> {
             let doc = text
                 .parse::<toml_edit::DocumentMut>()
                 .map_err(|e| format!("Could not parse the existing config ({e})"))?;
-            let Some(servers) = doc.get("mcp_servers").and_then(|item| item.as_table_like())
-            else {
+            let Some(servers) = doc.get("mcp_servers").and_then(|item| item.as_table_like()) else {
                 return Ok(out);
             };
             for (name, item) in servers.iter() {
@@ -330,7 +339,9 @@ fn insert_missing(
             if let Some(nested) = nested {
                 servers = servers
                     .as_object_mut()
-                    .ok_or(format!("'{key}' must be an object; leaving the client config untouched."))?
+                    .ok_or(format!(
+                        "'{key}' must be an object; leaving the client config untouched."
+                    ))?
                     .entry(nested)
                     .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
             }
@@ -338,7 +349,9 @@ fn insert_missing(
                 .as_object_mut()
                 .ok_or("The server list must be an object; leaving the client config untouched.")?;
             for entry in entries {
-                let Raw::Json { value } = &entry.raw else { continue };
+                let Raw::Json { value } = &entry.raw else {
+                    continue;
+                };
                 if !has_name(servers.keys().map(String::as_str), &entry.name) {
                     servers.insert(entry.name.clone(), value.clone());
                     names.push(entry.name.clone());
@@ -355,7 +368,9 @@ fn insert_missing(
             let mut doc = load_toml_document(path)?;
             let servers = toml_mcp_servers_mut(&mut doc);
             for entry in entries {
-                let Raw::Toml { text } = &entry.raw else { continue };
+                let Raw::Toml { text } = &entry.raw else {
+                    continue;
+                };
                 if has_name(servers.iter().map(|(name, _)| name), &entry.name) {
                     continue;
                 }
@@ -382,7 +397,9 @@ fn insert_missing(
             let list = matches!(container, Container::YamlList(_));
             let (original, mut root) = read_existing_yaml_with_source(path)?;
             for entry in entries {
-                let Raw::Yaml { text } = &entry.raw else { continue };
+                let Raw::Yaml { text } = &entry.raw else {
+                    continue;
+                };
                 let value: serde_yaml::Value = serde_yaml::from_str(text)
                     .map_err(|e| format!("could not read the recorded {}: {e}", entry.name))?;
                 let inserted = if list {

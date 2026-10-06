@@ -2875,7 +2875,10 @@ mod tests {
     fn import_turns_imported_servers_on_in_the_active_profile() {
         let mut registry = Registry::default();
         let id = apply_import_entry(&mut registry, server("memory"));
-        assert!(registry.is_enabled("default", &id), "UX-01: an import must serve tools");
+        assert!(
+            registry.is_enabled("default", &id),
+            "UX-01: an import must serve tools"
+        );
     }
 
     /// A scratch home for Claude Code and Codex configs plus an overridden data dir
@@ -3001,7 +3004,11 @@ mod tests {
         );
         let after = json_file(&fixture.claude());
         assert_eq!(
-            after["mcpServers"].as_object().unwrap().keys().collect::<Vec<_>>(),
+            after["mcpServers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
             [clients::GATEWAY_ENTRY_NAME]
         );
         assert!(fixture.move_record("claude-code").exists());
@@ -3011,7 +3018,10 @@ mod tests {
         restored.sort();
         assert_eq!(restored, ["memory", "seq-thinking"]);
         let after = json_file(&fixture.claude());
-        assert_eq!(after["mcpServers"], servers, "Disconnect must restore the moved entries");
+        assert_eq!(
+            after["mcpServers"], servers,
+            "Disconnect must restore the moved entries"
+        );
         assert_eq!(after["numStartups"], 3);
         assert!(!fixture.move_record("claude-code").exists());
     }
@@ -3043,13 +3053,20 @@ DOCS_TOKEN = "tok"
         std::fs::write(fixture.codex(), original).unwrap();
 
         let outcome = migrate_client("codex", Some("Work"), false, None).unwrap();
-        assert_eq!(enabled_names(&outcome.result.registry, "work"), ["docs", "memory"]);
+        assert_eq!(
+            enabled_names(&outcome.result.registry, "work"),
+            ["docs", "memory"]
+        );
         assert!(enabled_names(&outcome.result.registry, "default").is_empty());
         let migrated: toml::Value =
             toml::from_str(&std::fs::read_to_string(fixture.codex()).unwrap()).unwrap();
         assert_eq!(migrated["model"].as_str(), Some("gpt-5"));
         assert_eq!(
-            migrated["mcp_servers"].as_table().unwrap().keys().collect::<Vec<_>>(),
+            migrated["mcp_servers"]
+                .as_table()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
             [clients::GATEWAY_ENTRY_NAME]
         );
 
@@ -3067,7 +3084,10 @@ DOCS_TOKEN = "tok"
         let before: toml::Value = toml::from_str(original).unwrap();
         assert_eq!(after["model"], before["model"]);
         assert_eq!(after["mcp_servers"]["docs"], before["mcp_servers"]["docs"]);
-        assert_eq!(after["mcp_servers"]["memory"]["command"].as_str(), Some("node"));
+        assert_eq!(
+            after["mcp_servers"]["memory"]["command"].as_str(),
+            Some("node")
+        );
         assert_eq!(after["mcp_servers"].as_table().unwrap().len(), 2);
         assert!(!fixture.move_record("codex").exists());
     }
