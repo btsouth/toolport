@@ -1049,6 +1049,8 @@ fn review_server_row(server: crate::registry::ServerEntry, page: TeamsPage) -> g
         &gtk::Label::builder()
             .label(&server.name)
             .halign(gtk::Align::Start)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .tooltip_text(&server.name)
             .css_classes(["heading"])
             .build(),
     );

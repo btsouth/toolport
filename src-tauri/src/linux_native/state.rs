@@ -441,6 +441,8 @@ pub(super) struct ServerView {
     pub(super) client_credentials: Option<ClientCredentialsView>,
     pub(super) enabled: bool,
     pub(super) requires_review: bool,
+    /// Changes whenever anything a probe reads from the registry entry does.
+    pub(super) probe_fingerprint: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -524,6 +526,7 @@ impl RegistrySnapshot {
                     }),
                     enabled,
                     requires_review: !enabled && server.needs_team_enable_review(),
+                    probe_fingerprint: probe_fingerprint(server),
                 }
             })
             .collect::<Vec<_>>();
@@ -546,6 +549,15 @@ impl RegistrySnapshot {
             servers,
         }
     }
+}
+
+fn probe_fingerprint(server: &crate::registry::ServerEntry) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(server)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 pub(super) fn transport_label(transport: &str) -> &'static str {
@@ -585,6 +597,9 @@ pub(super) struct RegistryController {
     render: Box<dyn Fn(RegistryState)>,
     monitors: RefCell<Vec<gio::FileMonitor>>,
     reload_pending: Cell<bool>,
+    /// Bumped per background read so an older read that lands late never
+    /// replaces a newer one.
+    reload_generation: Cell<u64>,
 }
 
 impl RegistryController {
@@ -594,6 +609,7 @@ impl RegistryController {
             render: Box::new(render),
             monitors: RefCell::new(Vec::new()),
             reload_pending: Cell::new(false),
+            reload_generation: Cell::new(0),
         })
     }
 
@@ -618,10 +634,32 @@ impl RegistryController {
         if controller.reload_pending.replace(true) {
             return;
         }
+        let controller = Rc::downgrade(&controller);
         gtk::glib::idle_add_local_once(move || {
-            if let Some(controller) = Rc::downgrade(&controller).upgrade() {
+            if let Some(controller) = controller.upgrade() {
                 controller.reload_pending.set(false);
-                controller.reload();
+                Self::reload_in_background(&controller);
+            }
+        });
+    }
+
+    /// Read and parse the registry off the GTK main thread. Registry file
+    /// events arrive in bursts while other processes write, and a large
+    /// registry must not stall the window.
+    fn reload_in_background(controller: &Rc<Self>) {
+        let generation = controller.reload_generation.get().wrapping_add(1);
+        controller.reload_generation.set(generation);
+        let path = controller.path.clone();
+        let controller = Rc::downgrade(controller);
+        gtk::glib::spawn_future_local(async move {
+            let Ok(state) = gio::spawn_blocking(move || load_read_only(path.as_deref())).await
+            else {
+                return;
+            };
+            if let Some(controller) = controller.upgrade() {
+                if controller.reload_generation.get() == generation {
+                    (controller.render)(state);
+                }
             }
         });
     }
@@ -755,6 +793,11 @@ mod tests {
             .enabled_server_ids
             .push("remote".into());
 
+        let fingerprints = registry
+            .servers
+            .iter()
+            .map(probe_fingerprint)
+            .collect::<Vec<_>>();
         let snapshot = RegistrySnapshot::from_registry(registry);
 
         assert_eq!(snapshot.enabled_count, 1);
@@ -778,6 +821,7 @@ mod tests {
                     client_credentials: None,
                     enabled: false,
                     requires_review: false,
+                    probe_fingerprint: fingerprints[0],
                 },
                 ServerView {
                     origin_label: "Personal".into(),
@@ -794,6 +838,7 @@ mod tests {
                     client_credentials: None,
                     enabled: true,
                     requires_review: false,
+                    probe_fingerprint: fingerprints[1],
                 },
             ]
         );

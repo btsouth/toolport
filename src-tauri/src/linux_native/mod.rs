@@ -5,8 +5,10 @@
 
 mod branding;
 mod catalog;
+mod health;
 mod hooks;
 mod http_bridge;
+mod notify;
 mod onboarding;
 mod pairing;
 mod permissions;
@@ -425,7 +427,6 @@ fn build_window(
 
     window.set_content(Some(&alerts));
     theme.attach(&window);
-    let page_for_focus = server_page.clone();
     let state = state::RegistryController::new(move |snapshot| {
         server_page.render(snapshot);
         if let Some(notice) = startup_notice.borrow_mut().take() {
@@ -441,13 +442,6 @@ fn build_window(
                 ),
                 true,
             );
-        }
-    });
-    let stack_for_focus = stack.clone();
-    window.connect_is_active_notify(move |window| {
-        if window.is_active() && stack_for_focus.visible_child_name().as_deref() == Some("servers")
-        {
-            page_for_focus.reprobe_if_stale();
         }
     });
     state.attach(&window);
@@ -1407,15 +1401,14 @@ struct ServerPage {
     /// Per-row health widgets for the rows currently on screen, keyed by server
     /// id, so probe results can land on live labels without a re-render.
     health_rows: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, HealthRow>>>,
-    /// Last known probe result per server. Survives re-renders so the list can
-    /// group needs-attention servers first without rows jumping mid-probe.
-    probe_results: std::rc::Rc<
-        std::cell::RefCell<std::collections::HashMap<String, crate::server_runtime::ProbeResult>>,
-    >,
-    /// Invalidates in-flight probes when the list re-renders.
-    probe_generation: std::rc::Rc<std::cell::Cell<u64>>,
-    last_probe_started: std::rc::Rc<std::cell::Cell<Option<std::time::Instant>>>,
-    pending_probes: std::rc::Rc<std::cell::Cell<usize>>,
+    /// Every rendered card with the server it shows, so search can hide and show
+    /// rows without rebuilding them.
+    rows: std::rc::Rc<std::cell::RefCell<Vec<(state::ServerView, gtk::Box)>>>,
+    no_matches: std::rc::Rc<std::cell::RefCell<Option<gtk::Box>>>,
+    /// Probe results and in-flight probes. Survives re-renders so the list can
+    /// group needs-attention servers first, and decides when a server is
+    /// launched to check it.
+    health: std::rc::Rc<std::cell::RefCell<health::HealthCache>>,
 }
 
 #[derive(Clone)]
@@ -1428,36 +1421,16 @@ struct HealthRow {
     copy_error: gtk::Button,
 }
 
-const HEALTH_REPROBE_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
-
-fn health_reprobe_due(
-    last_started: Option<std::time::Instant>,
-    pending: usize,
-    now: std::time::Instant,
-) -> bool {
-    pending == 0
-        && last_started
-            .is_none_or(|last| now.saturating_duration_since(last) >= HEALTH_REPROBE_AFTER)
-}
-
 impl ServerPage {
-    fn reprobe_after_auth_change(&self) {
-        if let Some(snapshot) = self.last_snapshot.borrow().clone() {
-            self.render_server_list(&snapshot);
-        }
+    /// Credentials live in the keychain, outside the registry fingerprint, so
+    /// a change to them has to ask for a fresh probe of that server.
+    fn reprobe_after_auth_change(&self, server_id: &str) {
+        self.health.borrow_mut().invalidate(server_id);
+        self.probe_servers(health::ProbeReason::ConfigChanged);
     }
 
     fn reprobe_if_stale(&self) {
-        if !health_reprobe_due(
-            self.last_probe_started.get(),
-            self.pending_probes.get(),
-            std::time::Instant::now(),
-        ) {
-            return;
-        }
-        if let Some(snapshot) = self.last_snapshot.borrow().clone() {
-            self.start_probes(&snapshot);
-        }
+        self.probe_servers(health::ProbeReason::Stale);
     }
 
     fn render(&self, state: state::RegistryState) {
@@ -1508,6 +1481,8 @@ impl ServerPage {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
+        self.rows.borrow_mut().clear();
+        self.no_matches.borrow_mut().take();
     }
 
     fn render_profiles(&self, snapshot: &state::RegistrySnapshot) {
@@ -1542,8 +1517,6 @@ impl ServerPage {
     fn render_server_list(&self, snapshot: &state::RegistrySnapshot) {
         self.clear_server_list();
         self.health_rows.borrow_mut().clear();
-        self.probe_generation
-            .set(self.probe_generation.get().wrapping_add(1));
         self.section_title
             .set_label(&format!("Servers in {}", snapshot.active_profile));
         if snapshot.servers.is_empty() {
@@ -1557,68 +1530,100 @@ impl ServerPage {
             return;
         }
 
-        let query = self.search.text();
-        let mut matches = snapshot
-            .servers
-            .iter()
-            .filter(|server| server_matches_query(server, query.as_str()))
-            .collect::<Vec<_>>();
-        if matches.is_empty() {
-            self.posture.set_visible(false);
-            self.list.append(&state_card(
-                "edit-find-symbolic",
-                "No matching servers",
-                "Try a different server name or transport.",
-                false,
-            ));
-            return;
-        }
         // Group like the shipping list: servers needing attention first, then
         // unprobed, ready, and disabled last. Ranks come from the last finished
-        // probe round so rows do not jump around while probes are in flight.
+        // probes so rows do not jump around while probes are in flight.
+        let mut servers = snapshot.servers.iter().collect::<Vec<_>>();
         {
-            let results = self.probe_results.borrow();
-            matches.sort_by_key(|server| {
+            let health = self.health.borrow();
+            servers.sort_by_key(|server| {
                 (
-                    server_health_rank(server, results.get(&server.id)),
+                    server_health_rank(server, health.result(&server.id)),
                     server.name.to_lowercase(),
                 )
             });
         }
-        for server in matches {
-            self.list.append(&server_card(
+        let mut rows = Vec::with_capacity(servers.len());
+        for server in servers {
+            let card = server_card(
                 server,
                 &snapshot.active_profile_id,
                 snapshot.active_profile_tool_scope.get(&server.id).cloned(),
                 self.clone(),
-            ));
+            );
+            self.list.append(&card);
+            rows.push((server.clone(), card));
         }
-        self.start_probes(snapshot);
+        *self.rows.borrow_mut() = rows;
+        let no_matches = state_card(
+            "edit-find-symbolic",
+            "No matching servers",
+            "Try a different server name or transport.",
+            false,
+        );
+        self.list.append(&no_matches);
+        *self.no_matches.borrow_mut() = Some(no_matches);
+        self.apply_filter();
+        self.probe_servers(health::ProbeReason::ConfigChanged);
     }
 
-    /// Probe every enabled server in the background and land each result on its
-    /// live row. Results also update the posture line and are remembered for
-    /// grouping on the next render.
-    fn start_probes(&self, snapshot: &state::RegistrySnapshot) {
-        let generation = self.probe_generation.get();
-        let to_probe: Vec<String> = snapshot
-            .servers
+    /// Show the rows matching the search. Filtering never probes: a probe
+    /// launches the server, and typing must not launch anything.
+    fn apply_filter(&self) {
+        let query = self.search.text();
+        let mut any = false;
+        for (server, card) in self.rows.borrow().iter() {
+            let visible = server_matches_query(server, query.as_str());
+            card.set_visible(visible);
+            any |= visible;
+        }
+        if let Some(no_matches) = self.no_matches.borrow().as_ref() {
+            no_matches.set_visible(!any && !self.rows.borrow().is_empty());
+        }
+        self.update_posture();
+    }
+
+    fn update_posture(&self) {
+        let snapshot = self.last_snapshot.borrow();
+        let enabled = snapshot
             .iter()
+            .flat_map(|snapshot| snapshot.servers.iter())
             .filter(|server| server.enabled)
-            .map(|server| server.id.clone())
-            .collect();
-        let total = to_probe.len();
-        if total == 0 {
-            self.pending_probes.set(0);
+            .map(|server| server.id.as_str())
+            .collect::<Vec<_>>();
+        let filtered_out = self
+            .no_matches
+            .borrow()
+            .as_ref()
+            .is_some_and(|card| card.is_visible());
+        if enabled.is_empty() || filtered_out {
             self.posture.set_visible(false);
             return;
         }
-        self.last_probe_started.set(Some(std::time::Instant::now()));
-        self.pending_probes.set(total);
+        let (ready, auth, errors, pending) = self.health.borrow().tally(enabled.iter().copied());
         self.posture.set_visible(true);
-        self.posture.set_label(&posture_line(0, 0, 0, total, total));
-        for server_id in &to_probe {
-            if let Some(row) = self.health_rows.borrow().get(server_id) {
+        self.posture
+            .set_label(&posture_line(ready, auth, errors, pending, enabled.len()));
+    }
+
+    /// Probe the enabled servers the health cache says need it, in the
+    /// background, and land each result on its live row.
+    fn probe_servers(&self, reason: health::ProbeReason) {
+        let Some(snapshot) = self.last_snapshot.borrow().clone() else {
+            return;
+        };
+        let enabled = snapshot
+            .servers
+            .iter()
+            .filter(|server| server.enabled)
+            .map(|server| (server.id.as_str(), server.probe_fingerprint))
+            .collect::<Vec<_>>();
+        let tickets = self
+            .health
+            .borrow_mut()
+            .plan(&enabled, reason, std::time::Instant::now());
+        for ticket in tickets {
+            if let Some(row) = self.health_rows.borrow().get(&ticket.server_id) {
                 row.label
                     .set_label(&format!("{} · Checking…", row.transport));
                 for class in ["success", "error", "review"] {
@@ -1628,67 +1633,52 @@ impl ServerPage {
                 row.authenticate.set_visible(false);
                 row.copy_error.set_visible(false);
             }
+            self.spawn_probe(ticket);
         }
-        // Per-round tallies: only this round's probes feed the posture line, so
-        // a server removed mid-round can never inflate the counts.
-        let counts = std::rc::Rc::new((
-            std::cell::Cell::new(0usize), // ready
-            std::cell::Cell::new(0usize), // needs sign-in
-            std::cell::Cell::new(0usize), // failing
-            std::cell::Cell::new(total),  // pending
-        ));
-        for server_id in to_probe {
-            let page = self.clone();
-            let counts = counts.clone();
-            gtk::glib::spawn_future_local(async move {
-                let id_for_probe = server_id.clone();
-                let result = gtk::gio::spawn_blocking(move || {
-                    crate::server_runtime::probe_registered(&id_for_probe)
-                })
-                .await;
-                if page.probe_generation.get() != generation {
-                    return;
-                }
-                let probe = match result {
-                    Ok(Ok(probe)) => probe,
-                    Ok(Err(error)) => crate::server_runtime::ProbeResult {
-                        server_id: server_id.clone(),
-                        ok: false,
-                        tool_count: 0,
-                        error: Some(error),
-                        auth_required: false,
-                    },
-                    Err(_) => crate::server_runtime::ProbeResult {
-                        server_id: server_id.clone(),
-                        ok: false,
-                        tool_count: 0,
-                        error: Some("the probe stopped unexpectedly".to_string()),
-                        auth_required: false,
-                    },
-                };
-                let (ready, auth, errors, pending) = &*counts;
-                if probe.ok {
-                    ready.set(ready.get() + 1);
-                } else if probe.auth_required {
-                    auth.set(auth.get() + 1);
-                } else {
-                    errors.set(errors.get() + 1);
-                }
-                pending.set(pending.get().saturating_sub(1));
-                page.pending_probes.set(pending.get());
-                page.apply_probe(&server_id, probe);
-                page.posture.set_label(&posture_line(
-                    ready.get(),
-                    auth.get(),
-                    errors.get(),
-                    pending.get(),
-                    total,
-                ));
-            });
-        }
+        self.update_posture();
     }
 
-    fn apply_probe(&self, server_id: &str, probe: crate::server_runtime::ProbeResult) {
+    fn spawn_probe(&self, ticket: health::ProbeTicket) {
+        let page = self.clone();
+        gtk::glib::spawn_future_local(async move {
+            let server_id = ticket.server_id.clone();
+            let id_for_probe = server_id.clone();
+            let result = gtk::gio::spawn_blocking(move || {
+                crate::server_runtime::probe_registered(&id_for_probe)
+            })
+            .await;
+            let probe = match result {
+                Ok(Ok(probe)) => probe,
+                Ok(Err(error)) => crate::server_runtime::ProbeResult {
+                    server_id: server_id.clone(),
+                    ok: false,
+                    tool_count: 0,
+                    error: Some(error),
+                    auth_required: false,
+                },
+                Err(_) => crate::server_runtime::ProbeResult {
+                    server_id: server_id.clone(),
+                    ok: false,
+                    tool_count: 0,
+                    error: Some("the probe stopped unexpectedly".to_string()),
+                    auth_required: false,
+                },
+            };
+            let outcome = page.health.borrow_mut().complete(
+                &ticket,
+                probe.clone(),
+                std::time::Instant::now(),
+            );
+            match outcome {
+                health::ProbeOutcome::Apply => page.apply_probe(&server_id, &probe),
+                health::ProbeOutcome::Rerun(next) => page.spawn_probe(next),
+                health::ProbeOutcome::Discard => {}
+            }
+            page.update_posture();
+        });
+    }
+
+    fn apply_probe(&self, server_id: &str, probe: &crate::server_runtime::ProbeResult) {
         if let Some(row) = self.health_rows.borrow().get(server_id) {
             let (status, class) = probe_status_line(&probe);
             row.label
@@ -1703,9 +1693,6 @@ impl ServerPage {
             row.copy_error
                 .set_visible(!probe.ok && probe.error.is_some());
         }
-        self.probe_results
-            .borrow_mut()
-            .insert(server_id.to_string(), probe);
     }
 
     fn reset_summary(&self) {
@@ -2305,6 +2292,8 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
         &gtk::Label::builder()
             .label(&client.name)
             .halign(gtk::Align::Start)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .tooltip_text(&client.name)
             .css_classes(["heading"])
             .build(),
     );
@@ -6940,8 +6929,8 @@ struct ApprovalPage {
     /// so the explanation renders once rather than on every poll.
     showing_inert: std::rc::Rc<std::cell::RefCell<bool>>,
     deadlines: std::rc::Rc<std::cell::RefCell<Vec<(u64, gtk::Label)>>>,
-    app: adw::Application,
     notified: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    notification: notify::ApprovalNotification,
 }
 
 impl ApprovalPage {
@@ -6977,8 +6966,8 @@ impl ApprovalPage {
             rendered: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             showing_inert: std::rc::Rc::new(std::cell::RefCell::new(false)),
             deadlines: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
-            app: app.clone(),
             notified: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashSet::new())),
+            notification: notify::ApprovalNotification::new(app),
         }
     }
 
@@ -7072,17 +7061,12 @@ impl ApprovalPage {
         }
         *notified = current;
         if pending.is_empty() {
-            self.app.withdraw_notification("toolport-approvals");
+            self.notification.withdraw();
             return;
         }
         let (title, body) = approval_queue_notification(pending)
             .expect("a non-empty approval queue has notification copy");
-        let notification = gtk::gio::Notification::new(&title);
-        notification.set_body(Some(&body));
-        notification.set_priority(gtk::gio::NotificationPriority::Urgent);
-        notification.set_default_action("app.show-approvals");
-        self.app
-            .send_notification(Some("toolport-approvals"), &notification);
+        self.notification.show(&title, &body);
     }
 
     fn decide(&self, id: &str, approved: bool) {
@@ -7163,6 +7147,7 @@ fn approval_card(
         .xalign(0.0)
         .hexpand(true)
         .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
         .css_classes(["heading"])
         .build();
     title_row.append(&title);
@@ -7594,12 +7579,9 @@ fn build_content(
             health_rows: std::rc::Rc::new(
                 std::cell::RefCell::new(std::collections::HashMap::new()),
             ),
-            probe_results: std::rc::Rc::new(std::cell::RefCell::new(
-                std::collections::HashMap::new(),
-            )),
-            probe_generation: std::rc::Rc::new(std::cell::Cell::new(0)),
-            last_probe_started: std::rc::Rc::new(std::cell::Cell::new(None)),
-            pending_probes: std::rc::Rc::new(std::cell::Cell::new(0)),
+            rows: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            no_matches: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            health: std::rc::Rc::new(std::cell::RefCell::new(health::HealthCache::default())),
         },
     );
     let page_for_add = server_page.1.clone();
@@ -7610,11 +7592,7 @@ fn build_content(
     app.add_action(&add_action);
     app.set_accels_for_action("app.add-server", &["<Primary>n"]);
     let page_for_search = server_page.1.clone();
-    search.connect_search_changed(move |_| {
-        if let Some(snapshot) = page_for_search.last_snapshot.borrow().clone() {
-            page_for_search.render_server_list(&snapshot);
-        }
-    });
+    search.connect_search_changed(move |_| page_for_search.apply_filter());
     let search_action = gtk::gio::SimpleAction::new("search-servers", None);
     let search_for_action = search.clone();
     search_action.connect_activate(move |_, _| {
@@ -8685,11 +8663,14 @@ fn server_card(
         &gtk::Label::builder()
             .label(&server.name)
             .halign(gtk::Align::Start)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .tooltip_text(&server.name)
             .css_classes(["heading"])
             .build(),
     );
     text.append(&gtk::Label::builder().label(&server.origin_label)
-        .halign(gtk::Align::Start).css_classes(["toolport-muted"]).build());
+        .halign(gtk::Align::Start).ellipsize(gtk::pango::EllipsizeMode::End)
+        .css_classes(["toolport-muted"]).build());
     // Transport and health share one line: a card per server is already the
     // densest thing on the page, and a third stacked line made each row read as
     // a paragraph.
@@ -8763,8 +8744,12 @@ fn server_card(
                 copy_error: copy_error.clone(),
             },
         );
-        // Show the last known result immediately; the in-flight round replaces it.
-        if let Some(previous) = page.probe_results.borrow().get(&server.id) {
+        // Show the last known result immediately unless a probe is replacing it.
+        let cache = page.health.borrow();
+        if let Some(previous) = cache
+            .result(&server.id)
+            .filter(|_| !cache.is_checking(&server.id))
+        {
             let (status, class) = probe_status_line(previous);
             health.set_label(&format!("{} · {status}", server.transport));
             health.add_css_class(class);
@@ -9536,6 +9521,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
             feedback.remove_css_class("error");
             feedback.remove_css_class("success");
             let server_id = server_id.clone();
+            let reprobe_id = server_id.clone();
             let server_name = server_name.clone();
             let server_url = server_url.clone();
             let feedback = feedback.clone();
@@ -9569,7 +9555,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                         feedback.add_css_class("success");
                         remove.set_sensitive(true);
                         page.show_confirmation(&format!("Authenticated {server_name}"));
-                        page.reprobe_after_auth_change();
+                        page.reprobe_after_auth_change(&reprobe_id);
                     }
                     Ok(Err(error)) => {
                         feedback.set_label(&error);
@@ -9654,6 +9640,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
         feedback_for_save.set_label("Storing token in the system keychain…");
         feedback_for_save.remove_css_class("error");
         let server_id = server_id.clone();
+        let reprobe_id = server_id.clone();
         let server_name = server_name.clone();
         let feedback = feedback_for_save.clone();
         let remove = remove_for_save.clone();
@@ -9672,7 +9659,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                     feedback.add_css_class("success");
                     remove.set_sensitive(true);
                     page.show_confirmation(&format!("Updated authentication for {server_name}"));
-                    page.reprobe_after_auth_change();
+                    page.reprobe_after_auth_change(&reprobe_id);
                 }
                 Ok(Err(error)) => {
                     feedback.set_label(&error);
@@ -9702,6 +9689,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
         feedback_for_remove.set_label("Removing token from the system keychain…");
         feedback_for_remove.remove_css_class("error");
         let server_id = server_id.clone();
+        let reprobe_id = server_id.clone();
         let server_name = server_name.clone();
         let feedback = feedback_for_remove.clone();
         let page = page_for_remove.clone();
@@ -9717,7 +9705,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                     feedback.remove_css_class("error");
                     feedback.add_css_class("success");
                     page.show_confirmation(&format!("Removed authentication for {server_name}"));
-                    page.reprobe_after_auth_change();
+                    page.reprobe_after_auth_change(&reprobe_id);
                 }
                 Ok(Err(error)) => {
                     button.set_sensitive(true);
@@ -9902,6 +9890,7 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
             }
             button.set_sensitive(false);
             let server_id = server_id.clone();
+            let reprobe_id = server_id.clone();
             let key = key_for_replace.clone();
             let page = page_for_replace.clone();
             let editor = editor_for_replace.clone();
@@ -9912,7 +9901,15 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
                     crate::registry_controller::set_server_secret(&server_id, &key, &secret)
                 })
                 .await;
-                finish_credential_update(result, &page, &editor, &feedback, &button, "Updated");
+                finish_credential_update(
+                    result,
+                    &reprobe_id,
+                    &page,
+                    &editor,
+                    &feedback,
+                    &button,
+                    "Updated",
+                );
             });
         });
 
@@ -9976,6 +9973,7 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
         }
         button.set_sensitive(false);
         let server_id = server_id.clone();
+        let reprobe_id = server_id.clone();
         let page = page_for_add.clone();
         let editor = editor_for_add.clone();
         let feedback = feedback_for_add.clone();
@@ -9985,7 +9983,15 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
                 crate::registry_controller::set_server_secret(&server_id, &key, &secret)
             })
             .await;
-            finish_credential_update(result, &page, &editor, &feedback, &button, "Stored");
+            finish_credential_update(
+                result,
+                &reprobe_id,
+                &page,
+                &editor,
+                &feedback,
+                &button,
+                "Stored",
+            );
         });
     });
 
@@ -10030,6 +10036,7 @@ fn confirm_remove_credential(
         }
         button.set_sensitive(false);
         let server_id = server_id.clone();
+        let reprobe_id = server_id.clone();
         let key = key.clone();
         let page = page.clone();
         let editor = editor.clone();
@@ -10040,7 +10047,15 @@ fn confirm_remove_credential(
                 crate::registry_controller::delete_server_secret(&server_id, &key)
             })
             .await;
-            finish_credential_update(result, &page, &editor, &feedback, &button, "Removed");
+            finish_credential_update(
+                result,
+                &reprobe_id,
+                &page,
+                &editor,
+                &feedback,
+                &button,
+                "Removed",
+            );
         });
         dialog.close();
     });
@@ -10052,6 +10067,7 @@ fn finish_credential_update(
         Result<crate::registry::Registry, String>,
         Box<dyn std::any::Any + Send + 'static>,
     >,
+    server_id: &str,
     page: &ServerPage,
     editor: &adw::Window,
     feedback: &gtk::Label,
@@ -10060,6 +10076,9 @@ fn finish_credential_update(
 ) {
     match result {
         Ok(Ok(registry)) => {
+            // Secret values live in the keychain, outside the fingerprint the
+            // health cache compares, so the new value needs its own probe.
+            page.health.borrow_mut().invalidate(server_id);
             page.render(state::RegistryState::Ready(
                 state::RegistrySnapshot::from_registry(registry),
             ));
@@ -11737,19 +11756,6 @@ mod tests {
     }
 
     #[test]
-    fn health_reprobe_waits_for_the_previous_round_and_refreshes_stale_results() {
-        let now = std::time::Instant::now();
-        assert!(health_reprobe_due(None, 0, now));
-        assert!(!health_reprobe_due(None, 1, now));
-        assert!(!health_reprobe_due(
-            Some(now - HEALTH_REPROBE_AFTER + std::time::Duration::from_millis(1)),
-            0,
-            now,
-        ));
-        assert!(health_reprobe_due(Some(now - HEALTH_REPROBE_AFTER), 0, now,));
-    }
-
-    #[test]
     fn attention_outranks_ready_and_disabled_sinks() {
         let mut server = server("github", "Remote HTTP");
         server.enabled = true;
@@ -11921,6 +11927,7 @@ mod tests {
             client_credentials: None,
             enabled: true,
             requires_review: false,
+            probe_fingerprint: 0,
         }
     }
 
