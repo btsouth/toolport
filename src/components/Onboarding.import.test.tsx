@@ -54,6 +54,8 @@ const withServers = (enabled: string[]): Registry => ({
       command: "npx",
       args: [],
       env: [],
+      url: null,
+      source: null,
     },
     {
       id: "github",
@@ -62,6 +64,8 @@ const withServers = (enabled: string[]): Registry => ({
       command: "npx",
       args: [],
       env: [],
+      url: null,
+      source: null,
     },
   ],
   profiles: [{ id: "default", name: "Default", enabledServerIds: enabled }],
@@ -91,6 +95,7 @@ describe("Onboarding import copy", () => {
         transport: "stdio",
         command: "npx",
         args: [name],
+        url: null,
         isNew: true,
       })),
     );
