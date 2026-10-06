@@ -45,7 +45,8 @@ use conduit_lib::pii;
 use conduit_lib::registry::{self, Registry, ServerEntry};
 use conduit_lib::remote;
 use conduit_lib::router::{
-    is_destructive, sanitize_segment, Reconnect, Router, SharedServerSlot, ToolPolicy,
+    is_destructive, sanitize_segment, Connect, ConnectFailure, PendingHandle, Reconnect,
+    ReconnectBackoff, Router, SharedServerSlot, ToolPolicy,
 };
 use conduit_lib::routine_advisor::{self, AdvisorLedger, HintSlot};
 use conduit_lib::routine_candidates::{
@@ -3063,6 +3064,45 @@ fn enabled_summary(
         ));
     }
 
+    // Servers that failed to connect and are being retried, or wait for a sign-in.
+    // Shown whether or not the catalog has populated: these are known, not guessed.
+    let pending: Vec<_> = host
+        .router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pending_statuses()
+        .into_iter()
+        .filter(|status| visible.contains(&status.id))
+        .collect();
+    let name_of = |id: &str| {
+        servers
+            .iter()
+            .find(|s| s.id == id)
+            .map_or(id.to_string(), |s| s.name.clone())
+    };
+    let (needs_auth, retrying): (Vec<_>, Vec<_>) =
+        pending.iter().partition(|status| status.needs_auth);
+    if !retrying.is_empty() {
+        out.push_str("\nNot connected yet, retrying in the background:\n");
+        for status in &retrying {
+            out.push_str(&format!(
+                "- {}: {}\n",
+                name_of(&status.id),
+                status.describe()
+            ));
+        }
+    }
+    if !needs_auth.is_empty() {
+        out.push_str("\nNeeds sign-in (not retried until its credentials change):\n");
+        for status in &needs_auth {
+            out.push_str(&format!(
+                "- {}: {}\n",
+                name_of(&status.id),
+                status.describe()
+            ));
+        }
+    }
+
     // Tool counts by server prefix, from the live catalog, gated by the same
     // visible set so a scoped client never sees another tenant's tool counts.
     if !cached.is_empty() {
@@ -3105,12 +3145,13 @@ fn enabled_summary(
                 .iter()
                 // `counts` is keyed by `tool_prefix`, which lower-cases.
                 .filter(|s| !counts.contains_key(&sanitize_segment(&s.id).to_lowercase()))
+                .filter(|s| !pending.iter().any(|status| status.id == s.id))
                 .map(|s| s.name.as_str())
                 .collect();
             if !silent.is_empty() {
                 out.push_str(
                     "\nEnabled but exposing 0 tools (may still be connecting, or may need \
-                     authentication - e.g. an OAuth sign-in in Conduit):\n",
+                     authentication - e.g. an OAuth sign-in in Toolport):\n",
                 );
                 for name in silent {
                     out.push_str(&format!("- {name}\n"));
@@ -8315,7 +8356,21 @@ fn handle_request_with_cancel(
                         matches.len().saturating_sub(pins_added)
                     )
                 } else if matches.is_empty() {
-                    format!("No tools matched{scope}. {exhaustive_hint}")
+                    // A search aimed at a server that has not connected says why, and
+                    // pulls its next retry forward (rate-limited by its backoff).
+                    let pending = server.and_then(|server| {
+                        router.kick_pending(server, |id| {
+                            allowed.is_none_or(|set| server_in_allowed_scope(id, set))
+                        })
+                    });
+                    match pending {
+                        Some(status) => format!(
+                            "No tools matched{scope}. Server '{}' is not connected: {}.",
+                            status.id,
+                            status.describe()
+                        ),
+                        None => format!("No tools matched{scope}. {exhaustive_hint}"),
+                    }
                 } else if low_confidence {
                     let broad_note = if broadened > 0 {
                         format!(" Added {broadened} fallback candidate(s) from the scoped catalog.")
@@ -9334,7 +9389,7 @@ fn build_router(
             let root_t = root_owned.clone();
             let resource_updated = resource_updated.clone();
             std::thread::spawn(move || {
-                let ds = connect_one(
+                let ds = connect_one_result(
                     &server,
                     &dirty,
                     handler,
@@ -9350,33 +9405,64 @@ fn build_router(
     // Per-tool exposure overrides (rename / re-describe) must be set before indexing,
     // since they're applied as each server's tools are added.
     router.set_overrides(reg.tool_overrides.clone());
+    let backoff = reconnect_backoff();
     for handle in handles {
-        if let Ok((server, dirty, resource_updated, Some(ds))) = handle.join() {
-            // The same `connect_one` used for the initial spawn is the reconnect
-            // factory, so a re-spawn re-injects keychain secrets and re-handshakes
-            // exactly like a fresh connect, then re-issues resource subscriptions
-            // this server still owns.
-            let handler = Arc::clone(&server_handler);
-            let root_c = root_owned.clone();
-            let subs = resource_subs.clone();
-            let server_id = server.id.clone();
-            let reconnect: Reconnect = Box::new(move || {
-                let mut ds = connect_one(
-                    &server,
-                    &dirty,
-                    Arc::clone(&handler),
-                    root_c.as_deref(),
-                    resource_updated.clone(),
-                )?;
-                if let Some(ref table) = subs {
-                    resubscribe_server_resources(&mut ds, &server_id, table);
-                }
-                Some(ds)
-            });
-            router.add_with_reconnect(ds, Some(reconnect));
+        let Ok((server, dirty, resource_updated, result)) = handle.join() else {
+            continue;
+        };
+        // The same `connect_one` used for the initial spawn is the reconnect
+        // factory, so a re-spawn re-injects keychain secrets and re-handshakes
+        // exactly like a fresh connect, then re-issues resource subscriptions
+        // this server still owns.
+        let handler = Arc::clone(&server_handler);
+        let root_c = root_owned.clone();
+        let subs = resource_subs.clone();
+        let server_id = server.id.clone();
+        let pending_id = server.id.clone();
+        let connect: Connect = Arc::new(move || {
+            let mut ds = connect_one_result(
+                &server,
+                &dirty,
+                Arc::clone(&handler),
+                root_c.as_deref(),
+                resource_updated.clone(),
+            )?;
+            if let Some(ref table) = subs {
+                resubscribe_server_resources(&mut ds, &server_id, table);
+            }
+            Ok(ds)
+        });
+        match result {
+            Ok(ds) => {
+                let reconnect: Reconnect = Box::new(move || connect().ok());
+                router.add_with_reconnect(ds, Some(reconnect));
+            }
+            // Keep the server and retry it in the background, so a server that was
+            // not ready at startup (no network yet, a locked keychain, a slow first
+            // `npx`) joins the catalog once it is, without a restart (REL-03).
+            Err(failure) => router.add_pending(pending_id, failure, connect, backoff),
         }
     }
     router
+}
+
+/// Backoff for retrying servers that failed to connect: 2 s doubling to 5 min.
+/// `TOOLPORT_RECONNECT_BASE_MS` / `TOOLPORT_RECONNECT_CAP_MS` shorten it for tests.
+fn reconnect_backoff() -> ReconnectBackoff {
+    let millis = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|ms| Duration::from_millis(ms.max(1)))
+    };
+    let mut backoff = ReconnectBackoff::default();
+    if let Some(base) = millis("TOOLPORT_RECONNECT_BASE_MS") {
+        backoff.base = base;
+    }
+    if let Some(cap) = millis("TOOLPORT_RECONNECT_CAP_MS") {
+        backoff.cap = cap;
+    }
+    backoff
 }
 
 /// Bind a shared resource-updated dispatch to one producer server id so the
@@ -9401,6 +9487,18 @@ fn connect_one(
     root: Option<&str>,
     resource_updated: Option<ResourceUpdatedDispatch>,
 ) -> Option<DownstreamServer> {
+    connect_one_result(server, dirty, server_handler, root, resource_updated).ok()
+}
+
+/// [`connect_one`], keeping why it failed so a background retry can report it and
+/// tell a sign-in problem from a transient one.
+fn connect_one_result(
+    server: &ServerEntry,
+    dirty: &Arc<AtomicU8>,
+    server_handler: ServerRequestHandler,
+    root: Option<&str>,
+    resource_updated: Option<ResourceUpdatedDispatch>,
+) -> Result<DownstreamServer, ConnectFailure> {
     // Close over this server's id so fanout can verify the producer (SOU-398).
     let resource_updated = resource_updated
         .as_ref()
@@ -9452,7 +9550,11 @@ fn connect_one(
             let msg = format!("'{}' failed: {err}", server.id);
             eprintln!("toolport: {msg}");
             glog(&msg);
-            return None;
+            // A locked vault is not a sign-in problem: it usually unlocks after login.
+            return Err(ConnectFailure {
+                message: err,
+                needs_auth: false,
+            });
         }
         // Resolve the ${ROOT} token against the client's project root (issue #239)
         // before spawning. `None` (no ${ROOT}, or ${ROOT} with no known root) means
@@ -9467,7 +9569,10 @@ fn connect_one(
                 let msg = format!("'{}' failed: {error}", server.id);
                 eprintln!("toolport: {msg}");
                 glog(&msg);
-                return None;
+                return Err(ConnectFailure {
+                    message: error,
+                    needs_auth: false,
+                });
             }
         };
         match StdioTransport::spawn_watched(
@@ -9519,13 +9624,16 @@ fn connect_one(
             let msg = format!("connected '{}' ({} tools)", server.id, ds.tools.len());
             eprintln!("toolport: {msg}");
             glog(&msg);
-            Some(ds)
+            Ok(ds)
         }
         Err(e) => {
             let msg = format!("'{}' failed: {e}", server.id);
             eprintln!("toolport: {msg}");
             glog(&msg);
-            None
+            Err(ConnectFailure {
+                needs_auth: server.url.is_some() && remote::is_auth_error(&e),
+                message: e,
+            })
         }
     }
 }
@@ -11329,6 +11437,95 @@ fn watch_registry(
     }
 }
 
+/// Background retries for servers that failed to connect (REL-03), run once per
+/// watcher tick. Cancels retries a replaced router still owns, adopts servers whose
+/// retry connected (and tells clients their tool list changed, scoped like any
+/// downstream refresh), then starts the attempts that are due. Attempts run on
+/// their own threads, so nothing here waits on a downstream server.
+fn drive_reconnects(host: &HostState, stdio: &SessionState, profile: &Arc<Mutex<Option<String>>>) {
+    let live = host
+        .router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let handles = live.pending_handles();
+    {
+        let mut tracked = host
+            .reconnect_tracked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for old in tracked.iter() {
+            if !handles.iter().any(|handle| handle.ptr_eq(old)) {
+                old.cancel();
+            }
+        }
+        *tracked = handles;
+    }
+    let live = if live.has_ready_reconnects() {
+        adopt_reconnected_servers(host, stdio, profile);
+        host.router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    } else {
+        live
+    };
+    live.start_due_reconnects();
+}
+
+fn adopt_reconnected_servers(
+    host: &HostState,
+    stdio: &SessionState,
+    profile: &Arc<Mutex<Option<String>>>,
+) {
+    // Single-flight with every other router build or swap.
+    let _rebuild = host
+        .rebuild_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous_router = {
+        let guard = host
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (**guard).clone()
+    };
+    let previous_adapter_tools = host.adapter_tools_before_refresh(&previous_router);
+    let mut next = previous_router.clone();
+    let adopted = next.adopt_ready_reconnects();
+    if adopted.is_empty() {
+        return;
+    }
+    let tools = next.aggregated_tools();
+    *host
+        .router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
+    let resolved = profile
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let tools = requarantine_if_needed(&host.registry, &host.router, tools, resolved.as_deref());
+    host.persist_and_emit_with_sessions(
+        &tools,
+        &host.cached_tools,
+        &host.router,
+        Some(&previous_router),
+        stdio,
+        Some(&host.mcp_sessions),
+        resolved.as_deref(),
+        true,
+        Some(&previous_adapter_tools),
+    );
+    let msg = format!(
+        "reconnected {} after retrying; {} tools, sent tools/list_changed",
+        adopted.join(", "),
+        tools.len()
+    );
+    eprintln!("toolport: {msg}");
+    glog(&msg);
+}
+
 /// One iteration of the registry watcher (no sleep).
 ///
 /// Quarantine reconciliation runs **before** the early-continue on
@@ -11350,6 +11547,7 @@ fn watch_tick(
     host: &HostState,
 ) -> TickOutcome {
     host.reap_root_launches();
+    drive_reconnects(host, stdio, profile);
     // Everything host-scoped in this tick comes off the host, so a caller cannot pair
     // one host with another host's router, cache, session table, or rebuild lock.
     let registry = &host.registry;
@@ -11903,6 +12101,10 @@ struct HostState {
     /// [`preserve_collapsed_servers_guarded`]. The streak belongs to the host's one
     /// router, so one host means one map.
     rebuild_shrink_streaks: Mutex<HashMap<String, u8>>,
+    /// Pending (never-connected) servers the live router owned at the last watcher
+    /// tick. One that a newer router no longer owns (disabled, removed, or rebuilt)
+    /// has its retries cancelled.
+    reconnect_tracked: Mutex<Vec<PendingHandle>>,
     /// The live discovery mode. Mutable (not a `OnceLock`) so the watcher can refresh it
     /// when the registry's per-client override changes; [`HostState::discovery_mode`] reads
     /// it lock-free.
@@ -18877,6 +19079,7 @@ fn main() {
         shutdown_if_idle: AtomicBool::new(false),
         last_activity_ms: AtomicU64::new(0),
         rebuild_shrink_streaks: Mutex::new(HashMap::new()),
+        reconnect_tracked: Mutex::new(Vec::new()),
         quarantine_read_failed: AtomicBool::new(false),
         code_mode: AtomicBool::new(code_mode_seed),
         discovery: AtomicU8::new(discovery_seed),
@@ -24627,6 +24830,7 @@ mod tests {
             // these are the test's own handles when it supplies them and empty otherwise.
             resource_updated_sink,
             rebuild_shrink_streaks: Mutex::new(HashMap::new()),
+            reconnect_tracked: Mutex::new(Vec::new()),
             quarantine_read_failed: AtomicBool::new(false),
             code_mode: AtomicBool::new(false),
             discovery: AtomicU8::new(0),
@@ -24681,6 +24885,7 @@ mod tests {
                 shutdown_if_idle: AtomicBool::new(false),
                 last_activity_ms: AtomicU64::new(0),
                 rebuild_shrink_streaks: Mutex::new(HashMap::new()),
+                reconnect_tracked: Mutex::new(Vec::new()),
                 quarantine_read_failed: AtomicBool::new(false),
                 code_mode: AtomicBool::new(false),
                 // The bridge resolves discovery from this live field, so seed it from the
