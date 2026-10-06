@@ -5,7 +5,7 @@
 desktop shell and WebKit dependencies. The default feature set (`desktop`) is
 for the full app.
 
-Run `toolport-gateway` without the desktop app — for Docker hosts, sandboxed
+Run `toolport-gateway` without the desktop app, for Docker hosts, sandboxed
 coding agents, and Open WebUI. The desktop app stays the local-first product
 (client config writers, HITL approvals, OAuth UX). This path is the same binary
 with HTTP enabled.
@@ -89,7 +89,7 @@ intermediary, is ignored on this modern path.
 ### Legacy MCP handshake (curl)
 
 ```bash
-# 1) initialize — capture Mcp-Session-Id from the response headers
+# 1) initialize: capture Mcp-Session-Id from the response headers
 curl -sD - -o /tmp/init.json -X POST http://127.0.0.1:8765/mcp \
   -H "Authorization: Bearer $TOOLPORT_HTTP_TOKEN" \
   -H "Content-Type: application/json" \
@@ -122,7 +122,7 @@ docker compose up -d
 
 ### Build locally
 
-From source (slow — compiles inside Docker):
+From source (slow: compiles inside Docker):
 
 ```bash
 docker build -f Dockerfile.source -t toolport-gateway .
@@ -165,7 +165,7 @@ TOOLPORT_SECRET_STRIPE_SECRET_KEY=sk_live_...
 ## Minimal `registry.json`
 
 Start from [`data/registry.json.example`](../data/registry.json.example) (remote
-MCP server — works in a minimal container with no extra runtime). Or copy a full
+MCP server: works in a minimal container with no extra runtime). Or copy a full
 `registry.json` from a machine that already runs the desktop app.
 
 A valid headless registry needs `profiles` and `activeProfileId`, not just
@@ -207,50 +207,50 @@ Use this before exposing a headless gateway beyond a trusted host or LAN.
 
 ### Network and auth
 
-- [ ] **Bearer token set** — `TOOLPORT_HTTP_TOKEN` with at least 24 bytes of
+- [ ] **Bearer token set**: `TOOLPORT_HTTP_TOKEN` with at least 24 bytes of
       entropy (`openssl rand -hex 24`), or a registered scoped HTTP client. The
       process refuses any bind without configured authentication unless an operator
       explicitly passes `--insecure-loopback` for isolated local development.
-- [ ] **Firewall** — only trusted clients can reach the port. Do not publish
+- [ ] **Firewall**: only trusted clients can reach the port. Do not publish
       `:8765` to the public internet without a reverse proxy.
-- [ ] **TLS in front** — the gateway speaks plain HTTP. Terminate TLS at nginx,
+- [ ] **TLS in front**: the gateway speaks plain HTTP. Terminate TLS at nginx,
       Caddy, Traefik, or a cloud load balancer. Never send the bearer token over
       untrusted HTTP.
-- [ ] **Scoped HTTP clients** — if the registry lists `httpClients[]`, give each
+- [ ] **Scoped HTTP clients**: if the registry lists `httpClients[]`, give each
       caller its own token and profile scope instead of sharing one global token.
-- [ ] **Request deadlines accounted for** — the gateway allows 10 seconds for complete
+- [ ] **Request deadlines accounted for**: the gateway allows 10 seconds for complete
       headers and 30 seconds for the request body, then closes the connection with 408.
       Keep reverse-proxy deadlines at least as strict when exposing the gateway remotely.
 
 ### Secrets and registry
 
-- [ ] **Vault passphrase** — set `TOOLPORT_SECRET_KEY` and use `secrets.enc`, or
+- [ ] **Vault passphrase**: set `TOOLPORT_SECRET_KEY` and use `secrets.enc`, or
       inject via `TOOLPORT_SECRET_<KEY>` env vars. Prefer prefixed names over bare
       `STRIPE_SECRET_KEY` unless you understand `TOOLPORT_ALLOW_BARE_SECRET_ENV`.
-- [ ] **`.env` permissions** — mode `600`, never commit, rotate if leaked.
-- [ ] **Registry on a volume** — persist `/data/registry.json`; back up before
+- [ ] **`.env` permissions**: mode `600`, never commit, rotate if leaked.
+- [ ] **Registry on a volume**: persist `/data/registry.json`; back up before
       upgrades. A corrupt file is quarantined, not silently wiped (#224).
-- [ ] **Disable HITL** — set `humanApproval: false` in the registry (and leave
+- [ ] **Disable HITL**: set `humanApproval: false` in the registry (and leave
       team-forced approval off). Without the desktop app's approval broker,
       gated tools **fail closed** with "approval service unreachable".
 
 ### Container hygiene
 
-- [ ] **Non-root** — the published image runs as user `toolport` (uid 10001).
-- [ ] **GHCR visibility** — make the package public only if you want anonymous
+- [ ] **Non-root**: the published image runs as user `toolport` (uid 10001).
+- [ ] **GHCR visibility**: make the package public only if you want anonymous
       pulls; otherwise configure registry auth.
-- [ ] **Pin the image** — use a digest or version tag in production, not only
+- [ ] **Pin the image**: use a digest or version tag in production, not only
       `:latest`, once you have a known-good deploy.
-- [ ] **Healthcheck token** — compose passes `TOOLPORT_HTTP_TOKEN` into the
+- [ ] **Healthcheck token**: compose passes `TOOLPORT_HTTP_TOKEN` into the
       healthcheck; ensure logs don't echo env vars.
 
 ### Runtime expectations
 
-- [ ] **OAuth** — browser OAuth still needs the desktop app. Use API keys /
+- [ ] **OAuth**: browser OAuth still needs the desktop app. Use API keys /
       pre-vaulted secrets for headless servers.
-- [ ] **npx/uvx cold start** — first connect can take up to ~2 minutes while a
+- [ ] **npx/uvx cold start**: first connect can take up to ~2 minutes while a
       package downloads; this is normal (v1.6.0+).
-- [ ] **HTTP downstream MCP** — some remote servers need server-initiated RPC
+- [ ] **HTTP downstream MCP**: some remote servers need server-initiated RPC
       outside an SSE `POST` response; those may not work until downstream
       `GET /mcp` listen ships. Prefer stdio or remote servers that answer inline.
 
@@ -262,7 +262,7 @@ The headless path reuses the same HTTP/OpenAPI server that shipped earlier:
 bearer auth, per-client profile scoping, 4 MB request body cap, spawn-command
 screening, downstream SSRF guards on OAuth, destructive-tool governance, and
 fail-closed approval when the broker is missing. Those paths were hardened in
-the v1.5.1–1.5.2 audit batch (#203–#207).
+the v1.5.1 to 1.5.2 audit batch (#203 to #207).
 
 ### What is new in 1.6.0
 
@@ -276,12 +276,12 @@ the v1.5.1–1.5.2 audit batch (#203–#207).
 
 **Known limitations (not bugs, but deploy constraints):**
 
-- No built-in TLS or rate limiting — use a reverse proxy.
+- No built-in TLS or rate limiting: use a reverse proxy.
 - `--insecure-loopback` warns and starts an unauthenticated **local-only** listener:
   any local process (including a malicious web page via browser) can call tools.
   Prefer a token even on localhost if browsers run on the same machine.
 - Headless + human approval on = destructive calls blocked, not prompted.
-- MCP HTTP test coverage is thinner than the stdio gateway path (see ROADMAP).
+- MCP HTTP test coverage is thinner than the stdio gateway path.
 
 ### Do you need a separate security audit?
 
@@ -322,7 +322,7 @@ headless and Docker configs do not break on upgrade.
 | `TOOLPORT_CLIENT_ID`             | Identifies the client to the gateway for live profile resolution.                                   | None             | Clients                   |
 | `TOOLPORT_DATA_DIR`              | Override the full path to the Toolport config directory.                                            | OS config root   | Everywhere                |
 | `TOOLPORT_DEBUG`                 | Enable trace and debug logging.                                                                     | None             | Everywhere                |
-| `TOOLPORT_CODE_MODE`             | Force-enable code mode (`toolport_run_script`) even if Settings/registry has it off.                | Off (force)      | Gateway                   |
+| `TOOLPORT_CODE_MODE`             | Force-enable Code Mode (`toolport_run_script`) even if Settings/registry has it off.                | Off (force)      | Gateway                   |
 | `TOOLPORT_DISCOVERY`             | Override discovery mode (`lazy`, `grouped`, `full`).                                                | Registry setting | Everywhere                |
 | `TOOLPORT_EMBED_BLEND`           | Semantic search embedding blend weight (float).                                                     | Registry setting | Gateway / semantic search |
 | `TOOLPORT_EMBED_ENDPOINT`        | Semantic search embedding endpoint URL.                                                             | Registry setting | Gateway / semantic search |
@@ -346,9 +346,9 @@ headless and Docker configs do not break on upgrade.
 - **HITL approvals** need the desktop app’s approval broker. Leave human
   approval off (or expect fail-closed) in pure headless mode.
 - **Client config writers** (Cursor/Claude local JSON) still need the desktop
-  app or a one-time manual URL in the client config — which is what sandboxed
+  app or a one-time manual URL in the client config, which is what sandboxed
   setups usually want anyway.
-- **Code mode** (`toolport_run_script`) is **on by default** in the registry
+- **Code Mode** (`toolport_run_script`) is **on by default** in the registry
   (Settings kill switch / `"codeMode": false`). It is not a security boundary:
   agents supply JS that can call many tools in one round-trip; each call still
   hits the same scope and approval gates. Shared multi-tenant gateways that do

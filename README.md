@@ -19,7 +19,8 @@ them across Claude, Cursor, Codex, VS Code, and other clients.
 ## Why Toolport?
 
 - **Less context overhead.** Agents search for tools when they need them instead
-  of loading every tool definition up front. See the [benchmarks](BENCHMARK.md).
+  of loading every tool definition up front. It pays off past roughly 10 to 25
+  tools, so a single small server sees no gain. See the [benchmarks](BENCHMARK.md).
 - **One setup for every client.** Add and authenticate each server once. Use
   profiles to choose which servers each client can access.
 - **Keys stay local.** Credentials live in your OS keychain, outside client configs.
@@ -32,9 +33,7 @@ them across Claude, Cursor, Codex, VS Code, and other clients.
 
 1. [Download Toolport](https://toolport.app/download) for Windows, macOS, or Linux.
 2. Add a server from the catalog, import an existing setup, or paste a server config.
-   Curated servers that need launch arguments show a Launch setup section; see
-   [catalog launch setup](docs/catalog-launch-setup.md) for inputs and package status,
-   and the [curation review](docs/catalog-curation-review.md) for selection criteria.
+   Curated servers that need launch arguments show a Launch setup section in the app.
 3. Authenticate the server, then open **Clients** and connect your AI apps.
    Restart or reload the client once so it picks up Toolport.
 
@@ -55,6 +54,7 @@ configuration and policies while each member keeps their own credentials.
 - [Arch and Omarchy install (pacman repository)](docs/arch-pacman-repo.md)
 - [Open WebUI](docs/openwebui.md) and [agent plugin](packaging/agent-plugin/toolport/README.md)
 - [Security](SECURITY.md) and [troubleshooting](docs/troubleshooting.md)
+- [Uninstall](docs/uninstall.md)
 - [Changelog](CHANGELOG.md)
 
 ## Development
