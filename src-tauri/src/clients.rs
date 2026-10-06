@@ -15,6 +15,7 @@ use serde::Serialize;
 
 use crate::registry::{ManagedEntry, ServerEntry};
 
+mod moved;
 mod zcode;
 
 /// One MCP server, normalized across every client format.
@@ -3090,6 +3091,9 @@ pub struct WriteOutcome {
     /// Absent on uninstall or when the write did not install a gateway entry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed: Option<ManagedEntry>,
+    /// Servers Disconnect put back from the "Move into gateway" record (UX-03).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub restored: Vec<String>,
 }
 
 /// Result of launch-time re-point (SOU-405/406).
@@ -5125,6 +5129,7 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
         path: path.display().to_string(),
         backup: backup.map(|b| b.display().to_string()),
         managed,
+        restored: Vec::new(),
     })
 }
 
@@ -5814,6 +5819,7 @@ fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<Wri
         path: path.display().to_string(),
         backup: backup.map(|b| b.display().to_string()),
         managed,
+        restored: Vec::new(),
     })
 }
 
@@ -5834,9 +5840,23 @@ pub fn install_gateway_shared_http(
     install_or_remove(client_id, Some(&entry))
 }
 
-/// Remove Toolport's gateway entry from a client's config.
+/// Remove Toolport's gateway entry from a client's config, first putting back
+/// any servers "Move into gateway" took out of it (UX-03). Restoring first means
+/// a failure in between leaves the client with both, never with neither.
 pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
-    install_or_remove(client_id, None)
+    let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
+    let path = resolved_definition_path(&def)?;
+    let restored = moved::restore(client_id, def.format, &path)?;
+    let mut outcome = install_or_remove(client_id, None)?;
+    if let Some(restored) = restored {
+        // A rollback must undo the restore too, so point at the copy taken before it.
+        if let Some(backup) = restored.backup {
+            outcome.backup = Some(backup.display().to_string());
+        }
+        outcome.restored = restored.names;
+        moved::forget(client_id);
+    }
+    Ok(outcome)
 }
 
 /// Replace a client's entire server list with just the Toolport gateway. Used by
@@ -5860,7 +5880,11 @@ pub fn migrate_to_gateway_with_transport(
         Some(spec) => gateway_entry_shared_http(client_id, profile, spec),
         None => gateway_entry(profile, client_id)?,
     };
-    write_servers(client_id, &[entry])
+    // Keep what this rewrite drops so Disconnect can put it back (UX-03).
+    let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
+    let path = resolved_definition_path(&def)?;
+    let previous = moved::record(client_id, def.format, &path)?;
+    write_servers(client_id, &[entry]).inspect_err(|_| previous.revert())
 }
 
 /// Whether a stored client-config command is recognizably one of *our* gateway

@@ -382,10 +382,14 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     setBusy(true);
     try {
       if (installed) {
-        await uninstallGateway(client.id);
-        toast.success(`Disconnected Toolport from ${client.name}`, {
-          description: clientRestartHintAfterRemoval(client.name),
-        });
+        const outcome = await uninstallGateway(client.id);
+        const restored = outcome.restored?.length ?? 0;
+        toast.success(
+          restored > 0
+            ? `Disconnected Toolport from ${client.name} and put back ${restored} server${restored === 1 ? "" : "s"}`
+            : `Disconnected Toolport from ${client.name}`,
+          { description: clientRestartHintAfterRemoval(client.name) },
+        );
         noteRestartNeeded("removed");
       } else {
         const outcome = await installGateway(
@@ -541,7 +545,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               description={
                 customized
                   ? "This removes the custom toolport entry from the client's MCP config. You can reconnect anytime."
-                  : "This rewrites the client's MCP config to remove the gateway. You can reconnect anytime."
+                  : "This rewrites the client's MCP config to remove the gateway and puts back any servers Toolport moved out of it. You can reconnect anytime."
               }
               confirmLabel="Disconnect"
               destructive
@@ -807,12 +811,13 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               <span className="font-medium text-foreground">
                 {movable.length} server{movable.length === 1 ? "" : "s"}
               </span>{" "}
-              from {client.name} into Toolport, then rewrites {client.name}'s config so it
-              uses{" "}
+              from {client.name} into Toolport and turns them on, then rewrites{" "}
+              {client.name}'s config so it uses{" "}
               <span className="font-medium text-foreground">
                 only the Toolport gateway
               </span>
-              . The original config is backed up first.
+              . The original config is backed up first, and Disconnect puts these servers
+              back.
             </p>
             <p className="rounded-md bg-warning/10 p-2 text-xs text-warning">
               Secret values (API keys, tokens) aren't carried over, they stay only in the
