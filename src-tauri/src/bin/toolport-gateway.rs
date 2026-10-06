@@ -18756,6 +18756,15 @@ fn main() {
             }
             (r, source.is_authoritative())
         }
+        Err(e) if registry::is_newer_version_error(&e) => {
+            // Version skew: this build cannot represent the on-disk schema, and
+            // serving from a partial view risks acting on a newer registry it
+            // does not fully understand. Refuse to start serving tools rather
+            // than fall back to defaults; the app shows the same message.
+            eprintln!("toolport-gateway: {e} Refusing to start serving tools from this registry.");
+            glog(&format!("load_resolved ERR (newer schema): {e}"));
+            std::process::exit(1);
+        }
         Err(e) => {
             // Always surface this (not only under CONDUIT_DEBUG). A corrupt or
             // unreadable registry would otherwise silently serve an empty catalog,

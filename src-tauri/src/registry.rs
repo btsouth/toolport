@@ -23,7 +23,65 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 pub(crate) static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The newest registry schema version this build knows how to load and write.
 const REGISTRY_VERSION: u32 = 1;
+
+/// One ordered schema migration: it rewrites a registry document at version N
+/// into version N+1. The loader stamps the `version` field after each step, so
+/// a step only transforms data. Index `i` migrates v(i+1) -> v(i+2).
+pub type Migration = fn(&mut serde_json::Value) -> Result<(), String>;
+
+/// The shipped `vN -> vN+1` pipeline, in order. Empty while the schema is still
+/// v1; every later schema change appends the next step here. Its length must
+/// stay `REGISTRY_VERSION - 1` (asserted by a test), so a step can neither be
+/// silently skipped nor applied twice.
+const MIGRATIONS: &[Migration] = &[];
+
+/// A registry that could not be loaded or safely written because of its schema
+/// version. Kept distinct from the generic corruption error so version skew (an
+/// older binary pointed at a newer file) is surfaced with its own message
+/// instead of being mistaken for a corrupt file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryError {
+    /// The file was written by a newer Toolport. `found` is the on-disk schema
+    /// version, `supported` the newest this build knows.
+    NewerVersion { found: u32, supported: u32 },
+}
+
+/// Shared prefix so [`is_newer_version_error`] and the `Display` text can never
+/// drift apart.
+const NEWER_VERSION_PREFIX: &str = "This registry was written by a newer Toolport";
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegistryError::NewerVersion { found, supported } => write!(
+                f,
+                "{NEWER_VERSION_PREFIX} (schema v{found}); this build supports up to v{supported}. \
+                 Update Toolport or restore a backup."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RegistryError {}
+
+impl From<RegistryError> for String {
+    fn from(error: RegistryError) -> Self {
+        error.to_string()
+    }
+}
+
+/// True when `error` is the refusal [`RegistryError::NewerVersion`] produces, so
+/// the app and gateway can show version-skew guidance rather than the generic
+/// corrupt-registry recovery steps.
+pub fn is_newer_version_error(error: &str) -> bool {
+    error.starts_with(NEWER_VERSION_PREFIX)
+}
+
+fn newer_version_error(found: u32, supported: u32) -> String {
+    RegistryError::NewerVersion { found, supported }.into()
+}
 
 /// Per-process counter for unique atomic-write temp names.
 static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -976,6 +1034,9 @@ pub const DEFAULT_GATEWAY_TOPOLOGY: GatewayTopology = GatewayTopology::Daemon;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Registry {
+    /// Schema version. Historically optional; a document with no `version` is a
+    /// v1 file, which is what [`legacy_registry_version`] supplies.
+    #[serde(default = "legacy_registry_version")]
     pub version: u32,
     pub servers: Vec<ServerEntry>,
     pub profiles: Vec<Profile>,
@@ -1473,6 +1534,14 @@ impl Default for SemanticSettings {
 
 fn default_true() -> bool {
     true
+}
+
+/// Serde default for [`Registry::version`]: a document that omits the field is
+/// a v1 file, no matter what the current [`REGISTRY_VERSION`] is. Loading still
+/// checks and migrates the declared version, so this only covers the historical
+/// shape that predates the field.
+fn legacy_registry_version() -> u32 {
+    1
 }
 
 impl Default for Registry {
@@ -3065,13 +3134,153 @@ fn write_backup_generation(path: &Path, content: &str, sequence: u128) {
     }
 }
 
+/// How many pre-migration snapshots to keep beside the registry. The registry
+/// is a few KB, so five generations are negligible and mean a migration that
+/// turns out wrong can be undone without reaching for an external backup.
+const MIGRATION_BACKUPS: usize = 5;
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// The schema version a raw registry document declares. A missing (or zero)
+/// version is read as v1: every registry that predates the enforced version
+/// field is a v1 document, and v1 is the only schema that does.
+fn document_version(value: &serde_json::Value) -> u32 {
+    match value.get("version").and_then(serde_json::Value::as_u64) {
+        Some(version) if version > 0 => version.min(u64::from(u32::MAX)) as u32,
+        _ => 1,
+    }
+}
+
+/// The `<registry>.vN-<unix-ms>.bak` files written before a schema migration,
+/// oldest-first by their embedded timestamp. Distinct from the `.bak` /
+/// `.bak.<sequence>` journal `save_to` keeps, so a migration snapshot is never
+/// pruned by an ordinary save.
+fn migration_backup_files(path: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(base)) = (path.parent(), path.file_name().and_then(|f| f.to_str())) else {
+        return Vec::new();
+    };
+    let prefix = format!("{base}.v");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut backups: Vec<(u128, PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter_map(|candidate| {
+            let name = candidate.file_name()?.to_str()?;
+            let rest = name.strip_prefix(&prefix)?.strip_suffix(".bak")?;
+            let (version, timestamp) = rest.split_once('-')?;
+            version.parse::<u32>().ok()?;
+            Some((timestamp.parse::<u128>().ok()?, candidate))
+        })
+        .collect();
+    backups.sort();
+    backups.into_iter().map(|(_, backup)| backup).collect()
+}
+
+fn migration_backup_path(path: &Path, from_version: u32, timestamp_ms: u128) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".v{from_version}-{timestamp_ms}.bak"));
+    PathBuf::from(name)
+}
+
+/// Snapshot the pre-migration registry next to it and prune to the newest
+/// [`MIGRATION_BACKUPS`]. A failure here aborts the migration: there is no
+/// point rewriting a registry we could not first preserve.
+fn write_migration_backup(path: &Path, content: &str, from_version: u32) -> Result<(), String> {
+    write_migration_backup_at(path, content, from_version, now_ms())
+}
+
+fn write_migration_backup_at(
+    path: &Path,
+    content: &str,
+    from_version: u32,
+    timestamp_ms: u128,
+) -> Result<(), String> {
+    // Two writes in the same millisecond must not land on one name, or the
+    // second would silently overwrite the first snapshot.
+    let mut timestamp = timestamp_ms;
+    loop {
+        let dest = migration_backup_path(path, from_version, timestamp);
+        if !dest.exists() {
+            atomic_write(&dest, content)?;
+            break;
+        }
+        timestamp = timestamp.saturating_add(1);
+    }
+    let mut backups = migration_backup_files(path);
+    while backups.len() > MIGRATION_BACKUPS {
+        let _ = std::fs::remove_file(backups.remove(0));
+    }
+    Ok(())
+}
+
+/// Run the ordered `vN -> vN+1` steps needed to reach `target_version`, stamping
+/// the version after each one. Mutates only the in-memory document, so a failed
+/// step leaves the caller free to abandon the write and keep the original file.
+fn run_migration_steps(
+    value: &mut serde_json::Value,
+    migrations: &[Migration],
+    target_version: u32,
+) -> Result<(), String> {
+    let mut version = document_version(value);
+    while version < target_version {
+        let step = migrations.get((version - 1) as usize).ok_or_else(|| {
+            format!(
+                "No registry migration from schema v{version} to v{} is registered",
+                version + 1
+            )
+        })?;
+        step(value).map_err(|error| {
+            format!(
+                "Registry migration from schema v{version} to v{} failed: {error}",
+                version + 1
+            )
+        })?;
+        version += 1;
+        value["version"] = serde_json::json!(version);
+    }
+    Ok(())
+}
+
+/// Back up the pre-migration file, then migrate the in-memory document to
+/// `target_version`. The primary is not touched here; the caller saves the
+/// migrated document only after it deserializes into a [`Registry`].
+fn migrate_document(
+    path: &Path,
+    value: &mut serde_json::Value,
+    original: &str,
+    migrations: &[Migration],
+    target_version: u32,
+) -> Result<(), String> {
+    let from_version = document_version(value);
+    if from_version >= target_version {
+        return Ok(());
+    }
+    write_migration_backup(path, original, from_version)?;
+    run_migration_steps(value, migrations, target_version)
+}
+
 /// Recover the registry from the backups `save_to` maintains, newest-first by
 /// filesystem modification time across both `.bak` and rolling generations.
 /// Returns the first that parses (and
 /// best-effort rewrites the primary from it so a later read self-heals), or None
 /// when nothing usable remains. Walking the journal means one stale or corrupt
 /// `.bak` no longer strands recovery when fresher snapshots exist.
-fn restore_from_backup(path: &Path) -> Option<Registry> {
+///
+/// A candidate whose schema is newer than `target_version` is skipped, never
+/// recovered: rewriting it in this build's shape would destroy a newer build's
+/// data, the same loss the primary-path version check exists to prevent.
+fn restore_from_backup(
+    path: &Path,
+    migrations: &[Migration],
+    target_version: u32,
+) -> Option<Registry> {
     let single_backup = backup_path(path);
     let single_sequence = std::fs::read_to_string(backup_sequence_path(path))
         .ok()
@@ -3114,12 +3323,35 @@ fn restore_from_backup(path: &Path) -> Option<Registry> {
         if content.trim().is_empty() {
             continue;
         }
-        if let Ok(registry) = serde_json::from_str::<Registry>(&content) {
-            // Best-effort: restore the primary so we don't keep reading a backup.
-            // Recovery still succeeds if this write fails.
-            let _ = atomic_write(path, &content);
-            return Some(registry);
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let from_version = document_version(&value);
+        if from_version > target_version {
+            // A newer build's backup. Leave it for that build rather than
+            // rewriting it in an older shape.
+            continue;
         }
+        if from_version < target_version {
+            // Preserve this backup too before migrating it, then migrate the
+            // in-memory copy; the write-back below publishes the new version.
+            if write_migration_backup(path, &content, from_version).is_err() {
+                continue;
+            }
+            if run_migration_steps(&mut value, migrations, target_version).is_err() {
+                continue;
+            }
+        }
+        let Ok(registry) = serde_json::from_value::<Registry>(value.clone()) else {
+            continue;
+        };
+        let Ok(restored) = serde_json::to_string_pretty(&value) else {
+            continue;
+        };
+        // Best-effort: restore the primary so we don't keep reading a backup.
+        // Recovery still succeeds if this write fails.
+        let _ = atomic_write(path, &restored);
+        return Some(registry);
     }
     None
 }
@@ -3253,12 +3485,23 @@ impl LoadSource {
 }
 
 fn load_from_inner(path: &Path) -> Result<(Registry, LoadSource), String> {
+    load_from_inner_with(path, MIGRATIONS, REGISTRY_VERSION)
+}
+
+/// [`load_from_inner`] with an explicit pipeline, so tests can prove the
+/// framework with a migration that has not shipped yet. Production always calls
+/// the empty [`MIGRATIONS`] against [`REGISTRY_VERSION`].
+fn load_from_inner_with(
+    path: &Path,
+    migrations: &[Migration],
+    target_version: u32,
+) -> Result<(Registry, LoadSource), String> {
     let (mut registry, source) = match read_registry_file(path) {
         // Genuinely missing or empty (not a rename race - read_registry_file
         // already waited that out): recover the last-known-good from the .bak
         // sibling if one survived, else this is a first run.
         ReadOutcome::Absent => {
-            if let Some(reg) = restore_from_backup(path) {
+            if let Some(reg) = restore_from_backup(path, migrations, target_version) {
                 record_registry_recovery("missing", None);
                 Ok((reg, LoadSource::Backup))
             } else {
@@ -3268,29 +3511,57 @@ fn load_from_inner(path: &Path) -> Result<(Registry, LoadSource), String> {
         // Same recovery, different truth: the file is there and we never saw it,
         // so a default here is a placeholder, not a first run (SBS-900).
         ReadOutcome::Unreadable => {
-            if let Some(reg) = restore_from_backup(path) {
+            if let Some(reg) = restore_from_backup(path, migrations, target_version) {
                 record_registry_recovery("missing", None);
                 Ok((reg, LoadSource::Backup))
             } else {
                 Ok((Registry::default(), LoadSource::Unreadable))
             }
         }
-        ReadOutcome::Content(content) => match serde_json::from_str(&content) {
-            Ok(reg) => Ok((reg, LoadSource::File)),
-            // Present but unparseable by THIS build: corrupt, or a newer schema.
-            // Quarantine the evidence BEFORE restore_from_backup self-heals the
-            // primary from .bak, so nothing is ever silently destroyed.
-            Err(e) => {
-                let quarantine = quarantine_unreadable(path, &content);
-                match restore_from_backup(path) {
-                    Some(reg) => {
-                        record_registry_recovery("corrupt", quarantine);
-                        Ok((reg, LoadSource::Backup))
+        ReadOutcome::Content(content) => {
+            // Parse the envelope first so the version is a fact we can check
+            // BEFORE deserializing the data model. A newer schema that happens to
+            // still deserialize (serde ignores unknown fields) would otherwise be
+            // accepted and then rewritten in this build's shape.
+            match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(mut value) => {
+                    let found = document_version(&value);
+                    if found > target_version {
+                        return Err(newer_version_error(found, target_version));
                     }
-                    None => Err(format!("Corrupt registry: {e}")),
+                    let needs_migration = found < target_version;
+                    if needs_migration {
+                        // Backs up first; mutates only the in-memory document, so
+                        // a failed step leaves the primary untouched.
+                        migrate_document(path, &mut value, &content, migrations, target_version)?;
+                    }
+                    match serde_json::from_value::<Registry>(value) {
+                        Ok(reg) => {
+                            // Publish the migrated document atomically, only
+                            // after it deserialized into a Registry.
+                            if needs_migration {
+                                save_to(path, &reg)?;
+                            }
+                            Ok((reg, LoadSource::File))
+                        }
+                        Err(e) => corrupt_registry(
+                            path,
+                            &content,
+                            e.to_string(),
+                            migrations,
+                            target_version,
+                        ),
+                    }
+                }
+                // Present but unparseable by THIS build: corrupt, or a newer
+                // schema that is not even JSON. Quarantine the evidence BEFORE
+                // restore_from_backup self-heals the primary from .bak, so
+                // nothing is ever silently destroyed.
+                Err(e) => {
+                    corrupt_registry(path, &content, e.to_string(), migrations, target_version)
                 }
             }
-        },
+        }
     }?;
     registry.normalize_profile_references();
     // This path is reached only under the registry file lock. Save an exact
@@ -3304,6 +3575,27 @@ fn load_from_inner(path: &Path) -> Result<(Registry, LoadSource), String> {
         }
     }
     Ok((registry, source))
+}
+
+/// Handle a primary registry that is not a parseable document at a supported
+/// version: quarantine the exact bytes, then try the backups. Kept separate so
+/// the newer-version refusal above can never fall into this path (it must not
+/// quarantine or recover anything).
+fn corrupt_registry(
+    path: &Path,
+    content: &str,
+    parse_error: String,
+    migrations: &[Migration],
+    target_version: u32,
+) -> Result<(Registry, LoadSource), String> {
+    let quarantine = quarantine_unreadable(path, content);
+    match restore_from_backup(path, migrations, target_version) {
+        Some(registry) => {
+            record_registry_recovery("corrupt", quarantine);
+            Ok((registry, LoadSource::Backup))
+        }
+        None => Err(format!("Corrupt registry: {parse_error}")),
+    }
 }
 
 /// Only exact, unedited catalog definitions qualify. Keep ids, profile state,
@@ -3650,6 +3942,35 @@ pub fn load_from_locked_with_source(
     load_from_inner(path)
 }
 
+/// Parse an already-read registry document, refusing one written by a newer
+/// Toolport.
+///
+/// Read-only callers (server probing, the native shell) that do not run the full
+/// recovery pipeline still must not accept a newer schema and act on a partial
+/// view of it. Full loads go through [`load_from`], which additionally migrates,
+/// recovers from backups, and takes the cross-process lock.
+pub fn parse_registry_contents(contents: &str) -> Result<Registry, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(contents).map_err(|error| format!("Corrupt registry: {error}"))?;
+    let found = document_version(&value);
+    if found > REGISTRY_VERSION {
+        return Err(newer_version_error(found, REGISTRY_VERSION));
+    }
+    serde_json::from_value(value).map_err(|error| format!("Corrupt registry: {error}"))
+}
+
+/// Run [`load_from_inner_with`] holding the registry lock, so a test can prove
+/// the migration pipeline through the same locked path production uses.
+#[cfg(test)]
+fn load_from_with_migrations_for_test(
+    path: &Path,
+    migrations: &[Migration],
+    target_version: u32,
+) -> Result<Registry, String> {
+    let _lock = lock_for(path, registry_lock_timeout())?;
+    load_from_inner_with(path, migrations, target_version).map(|(registry, _)| registry)
+}
+
 pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
     for server in &registry.servers {
         if let Some(launch) = &server.launch {
@@ -3665,6 +3986,18 @@ pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
     }
     let json = serde_json::to_string_pretty(registry).map_err(|e| e.to_string())?;
     let existing = std::fs::read_to_string(path).ok();
+    // An older binary must never overwrite a registry a newer build wrote: this
+    // is the write half of the mixed-version guard (the read half is in
+    // `load_from_inner_with`). Check BEFORE the no-op comparison and before any
+    // backup/quarantine work, so the newer file is left byte-for-byte as it was.
+    if let Some(cur) = existing.as_deref() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(cur) {
+            let found = document_version(&value);
+            if found > REGISTRY_VERSION {
+                return Err(newer_version_error(found, REGISTRY_VERSION));
+            }
+        }
+    }
     // No-op guard: if the on-disk registry is already semantically identical to what we
     // would write, skip the whole save so we never bump the file's mtime. This is NOT just
     // an IO optimization. The gateway watches this file's mtime and, on ANY change, does a
@@ -7038,5 +7371,368 @@ mod tests {
         assert_eq!(content, "{\"i\":7}\n{\"i\":8}\n{\"i\":9}\n");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Registry schema-version and migration contract (CODE-01). Kept in its own
+/// module so the version pipeline's tests are easy to find as the migration
+/// list grows.
+#[cfg(test)]
+mod registry_version_tests {
+    use super::*;
+
+    /// A migration that only exists for tests, proving the framework can run a
+    /// v1 -> v2 step without shipping a real schema change.
+    fn test_migration_v1_to_v2(value: &mut serde_json::Value) -> Result<(), String> {
+        value["testMigrated"] = serde_json::Value::Bool(true);
+        Ok(())
+    }
+
+    fn failing_migration_v1_to_v2(_value: &mut serde_json::Value) -> Result<(), String> {
+        Err("boom".to_string())
+    }
+
+    fn simple_server(name: &str) -> ServerEntry {
+        ServerEntry {
+            id: String::new(),
+            name: name.to_string(),
+            transport: "stdio".to_string(),
+            command: Some("npx".to_string()),
+            args: vec!["-y".to_string(), format!("@scope/{name}")],
+            env: vec![],
+            url: None,
+            source: Some("manual".to_string()),
+            disabled_tools: vec![],
+            cwd: None,
+            client_credentials: None,
+            request_timeout_ms: None,
+            initialize_timeout_ms: None,
+            launch: None,
+            unknown_fields: serde_json::Map::new(),
+        }
+    }
+
+    fn scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-regver-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A v1 document with no `version` field, exercising the historical shape
+    /// that predates the field.
+    const MISSING_VERSION: &str = r#"{
+        "servers": [],
+        "profiles": [{"id": "default", "name": "Default", "enabledServerIds": []}],
+        "activeProfileId": "default"
+    }"#;
+
+    /// The v1.0.0 shape: minimal `ServerEntry`/`Profile`/`Registry` fields, a
+    /// stdio server, and a secret env declaration.
+    const V1_0_0_SHAPE: &str = r#"{
+        "version": 1,
+        "servers": [
+            {
+                "id": "fs",
+                "name": "Filesystem",
+                "transport": "stdio",
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+                "env": [{"key": "FS_TOKEN", "secret": true}],
+                "source": "manual",
+                "disabledTools": ["write_file"]
+            }
+        ],
+        "profiles": [{"id": "default", "name": "Default", "enabledServerIds": ["fs"]}],
+        "activeProfileId": "default",
+        "denyDestructive": true,
+        "confirmDestructive": false,
+        "lazyDiscovery": true
+    }"#;
+
+    /// The v1.6.2 shape: adds human approval, tool overrides and HTTP clients.
+    const V1_6_2_SHAPE: &str = r#"{
+        "version": 1,
+        "servers": [
+            {
+                "id": "remote",
+                "name": "Remote MCP",
+                "transport": "http",
+                "url": "https://mcp.example.com/mcp",
+                "args": [],
+                "env": [],
+                "source": "manual"
+            }
+        ],
+        "profiles": [{"id": "default", "name": "Default", "enabledServerIds": ["remote"]}],
+        "activeProfileId": "default",
+        "humanApproval": true,
+        "humanApprovalAllow": ["remote/read"],
+        "toolOverrides": {"remote": {"list": {"description": "safe"}}},
+        "httpClients": [
+            {"id": "c1", "label": "Open WebUI", "tokenSha256": "deadbeef", "profile": "default"}
+        ],
+        "httpBridgeEnabled": true,
+        "gatewayInstructions": "hello"
+    }"#;
+
+    #[test]
+    fn migration_pipeline_covers_every_version() {
+        // Every version from v1 up to the current one needs exactly one step, so
+        // adding a schema version without its migration fails here instead of
+        // failing at a user's first upgrade.
+        assert_eq!(
+            MIGRATIONS.len() as u32,
+            REGISTRY_VERSION - 1,
+            "REGISTRY_VERSION and MIGRATIONS must stay in step"
+        );
+    }
+
+    #[test]
+    fn missing_version_loads_as_v1() {
+        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _data = data_dir_test_lock();
+        let dir = scratch_dir("missing-version");
+        let _override = DataDirOverride::set(&dir);
+        let path = resolved_path().unwrap();
+        std::fs::write(&path, MISSING_VERSION).unwrap();
+
+        let registry = load().unwrap();
+        assert_eq!(registry.version, 1, "a missing version is read as v1");
+        assert!(
+            migration_backup_files(&path).is_empty(),
+            "a current-version load must not migrate or back up"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn current_version_loads_unchanged() {
+        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _data = data_dir_test_lock();
+        let dir = scratch_dir("current-version");
+        let _override = DataDirOverride::set(&dir);
+        let path = resolved_path().unwrap();
+
+        let mut registry = Registry::default();
+        registry.servers.push(simple_server("alpha"));
+        save(&registry).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let loaded = load().unwrap();
+        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.servers.len(), 1);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "loading a current-version registry must not rewrite it"
+        );
+        assert!(migration_backup_files(&path).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn future_version_is_refused_and_the_file_is_untouched() {
+        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _data = data_dir_test_lock();
+        let dir = scratch_dir("future-version");
+        let _override = DataDirOverride::set(&dir);
+        let path = resolved_path().unwrap();
+
+        let future = r#"{
+            "version": 99,
+            "servers": [],
+            "profiles": [{"id": "default", "name": "Default"}],
+            "someFutureFeature": {"enabled": true}
+        }"#;
+        std::fs::write(&path, future).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let error = load().unwrap_err();
+        assert!(is_newer_version_error(&error), "{error}");
+        assert!(error.contains("schema v99"), "{error}");
+        assert!(
+            error.contains("Update Toolport"),
+            "the message must tell the user how to recover: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "refusing a newer registry must not mutate or back it up"
+        );
+        assert!(migration_backup_files(&path).is_empty());
+        assert!(!backup_path(&path).exists());
+
+        // The read-only parse helper used by probing and the native shell
+        // refuses the same document instead of acting on a partial view.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(parse_registry_contents(&contents).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_over_a_newer_on_disk_version_is_refused() {
+        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _data = data_dir_test_lock();
+        let dir = scratch_dir("save-over-newer");
+        let _override = DataDirOverride::set(&dir);
+        let path = resolved_path().unwrap();
+
+        std::fs::write(&path, r#"{"version": 7, "servers": [], "profiles": []}"#).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let error = save_to(&path, &Registry::default()).unwrap_err();
+        assert!(is_newer_version_error(&error), "{error}");
+        assert!(error.contains("schema v7"), "{error}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "an older binary must not overwrite a newer registry"
+        );
+        assert!(!backup_path(&path).exists());
+
+        // The resolved save path is guarded by the same check.
+        assert!(save(&Registry::default()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_only_migration_runs_writes_a_backup_and_saves_the_new_version() {
+        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _data = data_dir_test_lock();
+        let dir = scratch_dir("test-migration");
+        let _override = DataDirOverride::set(&dir);
+        let path = resolved_path().unwrap();
+        std::fs::write(&path, MISSING_VERSION).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+
+        let registry =
+            load_from_with_migrations_for_test(&path, &[test_migration_v1_to_v2], 2).unwrap();
+
+        assert_eq!(registry.version, 2, "the migrated version is stamped");
+        assert_eq!(
+            registry.unknown_fields.get("testMigrated"),
+            Some(&serde_json::Value::Bool(true)),
+            "the migration's change is present in the loaded registry"
+        );
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["version"], 2);
+        assert_eq!(on_disk["testMigrated"], serde_json::Value::Bool(true));
+
+        let backups = migration_backup_files(&path);
+        assert_eq!(backups.len(), 1, "exactly one pre-migration backup");
+        let name = backups[0].file_name().unwrap().to_string_lossy();
+        assert!(
+            name.starts_with("registry.json.v1-") && name.ends_with(".bak"),
+            "unexpected backup name: {name}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backups[0]).unwrap(),
+            original,
+            "the backup holds the exact pre-migration bytes"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failing_migration_leaves_the_original_and_no_partial_file() {
+        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _data = data_dir_test_lock();
+        let dir = scratch_dir("failing-migration");
+        let _override = DataDirOverride::set(&dir);
+        let path = resolved_path().unwrap();
+        std::fs::write(&path, MISSING_VERSION).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let error = load_from_with_migrations_for_test(&path, &[failing_migration_v1_to_v2], 2)
+            .unwrap_err();
+        assert!(error.contains("v1 to v2"), "{error}");
+        assert!(error.contains("boom"), "{error}");
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a failed migration must leave the primary byte-identical"
+        );
+        assert!(
+            !backup_path(&path).exists(),
+            "no last-known-good snapshot is written by a failed migration"
+        );
+        // No half-written temp or partial document survives next to the primary;
+        // only the pre-migration snapshot and the lock file are allowed.
+        let stray: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("tmp") || name.contains(".new"))
+            .collect();
+        assert!(stray.is_empty(), "partial files left behind: {stray:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_backups_are_pruned_to_five() {
+        let dir = scratch_dir("prune-migration-backups");
+        let path = dir.join("registry.json");
+
+        for timestamp in 1..=7u128 {
+            write_migration_backup_at(&path, &format!("snapshot-{timestamp}"), 1, timestamp)
+                .unwrap();
+        }
+
+        let backups = migration_backup_files(&path);
+        assert_eq!(backups.len(), MIGRATION_BACKUPS, "newest five are kept");
+        assert_eq!(
+            std::fs::read_to_string(&backups[0]).unwrap(),
+            "snapshot-3",
+            "the two oldest were pruned"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backups[4]).unwrap(),
+            "snapshot-7",
+            "the newest is retained"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn historical_registry_shapes_still_load() {
+        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _data = data_dir_test_lock();
+        let dir = scratch_dir("historical-shapes");
+        let _override = DataDirOverride::set(&dir);
+        let path = resolved_path().unwrap();
+
+        let fixtures: [(&str, &str); 3] = [
+            (
+                "shipped example",
+                include_str!("../../data/registry.json.example"),
+            ),
+            ("v1.0.0", V1_0_0_SHAPE),
+            ("v1.6.2", V1_6_2_SHAPE),
+        ];
+        for (label, document) in fixtures {
+            std::fs::write(&path, document).unwrap();
+            let registry = load().unwrap_or_else(|error| panic!("{label} failed to load: {error}"));
+            assert_eq!(registry.version, 1, "{label} is a v1 document");
+            assert!(!registry.servers.is_empty(), "{label} has a server");
+            assert!(
+                registry
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.id == "default"),
+                "{label} keeps its default profile"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
