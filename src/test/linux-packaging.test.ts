@@ -422,7 +422,10 @@ describe("install.sh installs the pacman package on Arch", () => {
     expect(installer).toContain("install_arch_repo");
     expect(installer).toContain("[toolport]");
     expect(installer).toContain("pacman-key --lsign-key");
-    expect(installer).toMatch(/pacman -Sy .*\btoolport\b/);
+    // A full upgrade, never `pacman -Sy <pkg>`: a partial upgrade can leave the
+    // system with a newer toolport linked against older libraries.
+    expect(installer).toMatch(/pacman -Syu .*\btoolport\b/);
+    expect(installer).not.toMatch(/pacman -Sy\s/);
   });
 
   it("pins the signing key instead of trusting whatever the URL serves", () => {
