@@ -24,7 +24,7 @@ curl -fsSL https://repo.toolport.app/toolport.gpg | sudo pacman-key --add -
 sudo pacman-key --lsign-key A16BFA2E1014BD6BD718CC6E6621247E3FFA6AA7
 
 printf '\n[toolport]\nServer = https://repo.toolport.app/$arch\n' | sudo tee -a /etc/pacman.conf
-sudo pacman -Sy toolport
+sudo pacman -Syu toolport
 ```
 
 The first two import the repository's public key and mark that exact fingerprint
@@ -37,7 +37,7 @@ inspect it yourself:
 pacman-key --finger A16BFA2E1014BD6BD718CC6E6621247E3FFA6AA7
 ```
 
-`pacman -Sy` then picks up the new repository and installs `toolport`, which
+`pacman -Syu` then picks up the new repository and installs `toolport`, which
 provides `toolport-gtk`, `toolport-gateway`, and a desktop entry. Launch it from
 your application menu, or run `toolport-gtk`.
 

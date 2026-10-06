@@ -4297,7 +4297,7 @@ pub fn run() {
             let report = secrets::migrate_secrets_to_dpk(&keys);
             if report.migrated > 0 || report.failed > 0 {
                 eprintln!(
-                    "conduit: keychain migration complete ({} entries moved to data-protection keychain, {} failed, {} not found)",
+                    "toolport: keychain migration complete ({} entries moved to data-protection keychain, {} failed, {} not found)",
                     report.migrated, report.failed, report.not_found
                 );
             }

@@ -56,11 +56,13 @@ function results(selected) {
       "pinned-install-urls",
       "build-test",
       "cross-platform-rust",
+      "linux-native",
     ].map((job) => [
       job,
       {
         result:
-          selected === "false" && ["build-test", "cross-platform-rust"].includes(job)
+          selected === "false" &&
+          ["build-test", "cross-platform-rust", "linux-native"].includes(job)
             ? "skipped"
             : "success",
         outputs: job === "changes" ? { rust: selected } : {},
@@ -80,7 +82,7 @@ test("any failed, canceled, missing or unexpectedly skipped required check block
       for (const result of ["failure", "cancelled", undefined, "skipped"]) {
         if (
           selected === "false" &&
-          ["build-test", "cross-platform-rust"].includes(job) &&
+          ["build-test", "cross-platform-rust", "linux-native"].includes(job) &&
           result === "skipped"
         )
           continue;

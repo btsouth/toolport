@@ -1411,7 +1411,7 @@ fn run_script_tool_def() -> Value {
             `return` one value. Top-level await works. Gates match toolport_call_tool (scope, human \
             approval). For reusable orchestration, pass mutually exclusive `input` + `inputSchema`; \
             Toolport deeply freezes `input`, validates it before any call, and assesses the successful \
-            real run for Routine promotion. Never pass a `reuse` flag. If the script fails partway, \
+            real run for Routine promotion. If the script fails partway, \
             `structuredContent.toolportScript.progress` lists \
             the calls that already ran, in order, as {index, name, ok} - those side effects are \
             committed. Resume by INDEX (entries 0..n ran, n onward did not); never skip by tool name, \
