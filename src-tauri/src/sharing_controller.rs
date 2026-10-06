@@ -49,10 +49,13 @@ pub(crate) fn build_export(
                 // it would invalidate the binding in the exported setup.
                 if secret && argument != "<launch-input>" {
                     *argument = "<redacted>".to_string();
+                } else if is_http_url(argument) {
+                    // mcp-remote style launchers carry the remote URL as an argument.
+                    *argument = redact_share_url(argument);
                 }
             }
             if let Some(url) = server.url.as_deref() {
-                server.url = Some(registry::redact_url_userinfo(url));
+                server.url = Some(redact_share_url(url));
             }
             server
         })
@@ -66,6 +69,86 @@ pub(crate) fn build_export(
         document["description"] = serde_json::json!(description);
     }
     document
+}
+
+/// Stands in for a credential-shaped URL path segment in a shared setup.
+pub(crate) const SHARE_KEY_PLACEHOLDER: &str = "YOUR_API_KEY";
+/// Stands in for every query parameter value in a shared setup.
+pub(crate) const SHARE_VALUE_PLACEHOLDER: &str = "YOUR_VALUE";
+
+fn is_http_url(value: &str) -> bool {
+    let lower = value.trim_start().to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Strip every credential a hosted MCP server might embed in its URL before the
+/// URL leaves the machine: userinfo, every query value (names are kept so the
+/// recipient knows what to fill in), credential-shaped path segments such as
+/// `https://mcp.instantly.ai/mcp/<key>`, and the fragment. Biased toward
+/// over-redacting: a recipient fixing a placeholder costs far less than a
+/// published key. A URL with none of these is returned unchanged.
+pub(crate) fn redact_share_url(url: &str) -> String {
+    let url = registry::redact_url_userinfo(url);
+    let url = url.split_once('#').map_or(url.as_str(), |(head, _)| head);
+    let (head, query) = match url.split_once('?') {
+        Some((head, query)) => (head, Some(query)),
+        None => (url, None),
+    };
+    let path_start = head.find("://").map_or(0, |at| {
+        let authority = &head[at + 3..];
+        at + 3 + authority.find('/').unwrap_or(authority.len())
+    });
+    let (origin, path) = head.split_at(path_start);
+    let path = path
+        .split('/')
+        .map(|segment| {
+            if url_part_looks_like_credential(segment) {
+                SHARE_KEY_PLACEHOLDER
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    let mut redacted = format!("{origin}{path}");
+    if let Some(query) = query {
+        let query = query
+            .split('&')
+            .map(|pair| match pair.split_once('=') {
+                Some((name, value)) if !value.is_empty() => {
+                    format!("{name}={SHARE_VALUE_PLACEHOLDER}")
+                }
+                None if url_part_looks_like_credential(pair) => SHARE_KEY_PLACEHOLDER.to_string(),
+                _ => pair.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        redacted.push('?');
+        redacted.push_str(&query);
+    }
+    redacted
+}
+
+/// True for a URL path segment that could be an API key or secret token: long
+/// and mixing letters with digits, mixed-case like base64, or carrying an inline
+/// credential marker. Words such as `mcp`, `v1` or `2025-03-26` stay readable.
+fn url_part_looks_like_credential(part: &str) -> bool {
+    let has_digit = part.chars().any(|c| c.is_ascii_digit());
+    let has_alpha = part.chars().any(|c| c.is_ascii_alphabetic());
+    let mixed_case = part.chars().any(|c| c.is_ascii_uppercase())
+        && part.chars().any(|c| c.is_ascii_lowercase());
+    registry::arg_looks_secret(part)
+        || (part.len() >= 16 && has_digit && has_alpha)
+        || (part.len() >= 10 && has_digit && mixed_case)
+        || (part.len() >= 20 && mixed_case)
+}
+
+/// True when a shared URL still holds a placeholder the importer must replace
+/// with their own value before the server can connect.
+fn url_needs_own_credentials(url: &str) -> bool {
+    url.contains(SHARE_KEY_PLACEHOLDER)
+        || url.contains(SHARE_VALUE_PLACEHOLDER)
+        || url.contains("<redacted>")
 }
 
 pub(crate) fn apply_import(registry: &mut Registry, json: &str) -> Result<usize, String> {
@@ -145,6 +228,9 @@ pub fn import_item_warnings(item: &SetupImportItem) -> Vec<&'static str> {
     if let Some(url) = item.url.as_deref() {
         if url_is_private_or_internal(url) {
             warnings.push("Connects to a private or internal address");
+        }
+        if url_needs_own_credentials(url) {
+            warnings.push("Replace the placeholders in its URL with your own values");
         }
     }
     warnings
@@ -457,5 +543,109 @@ mod controller_tests {
             .inputs
             .iter()
             .all(|input| input.value.is_none()));
+    }
+
+    const INSTANTLY_KEY: &str =
+        "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5bC7dE9fG1hJ3kL5mN7pQ9rS1tU3vW5xY7z";
+
+    #[test]
+    fn share_url_redaction_removes_query_values_and_keeps_names() {
+        assert_eq!(
+            redact_share_url("https://mcp.tavily.com/mcp/?tavilyApiKey=tvly-dev-abc123&region=us"),
+            "https://mcp.tavily.com/mcp/?tavilyApiKey=YOUR_VALUE&region=YOUR_VALUE"
+        );
+        assert_eq!(
+            redact_share_url("https://example.com/mcp?debug&empty=&A1b2C3d4E5f6G7h8"),
+            "https://example.com/mcp?debug&empty=&YOUR_API_KEY"
+        );
+    }
+
+    #[test]
+    fn share_url_redaction_replaces_credential_path_segments() {
+        assert_eq!(INSTANTLY_KEY.len(), 68);
+        assert_eq!(
+            redact_share_url(&format!("https://mcp.instantly.ai/mcp/{INSTANTLY_KEY}")),
+            "https://mcp.instantly.ai/mcp/YOUR_API_KEY"
+        );
+        assert_eq!(
+            redact_share_url("https://mcp.zapier.com/api/mcp/s/ZjE2NmM0YjgtOWQ3Ny00/sse"),
+            "https://mcp.zapier.com/api/mcp/s/YOUR_API_KEY/sse"
+        );
+        assert_eq!(
+            redact_share_url(
+                "https://mcp.composio.dev/server/8f14e45f-ceea-467a-9575-b2c7a5e0d9a1/mcp"
+            ),
+            "https://mcp.composio.dev/server/YOUR_API_KEY/mcp"
+        );
+        assert_eq!(
+            redact_share_url("https://example.com/token=abc/mcp#sk-live-abcdef"),
+            "https://example.com/YOUR_API_KEY/mcp"
+        );
+    }
+
+    #[test]
+    fn share_url_redaction_strips_userinfo_with_the_rest() {
+        assert_eq!(
+            redact_share_url("https://user:s3cr3t@mcp.example.com/mcp?key=abc"),
+            "https://<redacted>@mcp.example.com/mcp?key=YOUR_VALUE"
+        );
+    }
+
+    #[test]
+    fn share_url_redaction_leaves_secret_free_urls_unchanged() {
+        for url in [
+            "https://api.githubcopilot.com/mcp/",
+            "https://mcp.linear.app/sse",
+            "https://mcp.example.com",
+            "http://localhost:3000/mcp",
+            "https://example.com/v1/2025-03-26/github-mcp-server",
+            "https://example.com/mcp?debug",
+            "https://mcp.instantly.ai/mcp/YOUR_API_KEY",
+        ] {
+            assert_eq!(redact_share_url(url), url);
+        }
+    }
+
+    #[test]
+    fn export_redacts_url_credentials_in_the_url_and_launcher_args() {
+        let mut registry = Registry::default();
+        registry.servers.push(
+            serde_json::from_value(serde_json::json!({
+                "id":"instantly", "name":"Instantly", "transport":"http",
+                "url": format!("https://mcp.instantly.ai/mcp/{INSTANTLY_KEY}")
+            }))
+            .unwrap(),
+        );
+        registry.servers.push(
+            serde_json::from_value(serde_json::json!({
+                "id":"remote", "name":"Remote", "transport":"stdio", "command":"npx",
+                "args":["-y", "mcp-remote", "https://mcp.example.com/sse?apiKey=hunter2"]
+            }))
+            .unwrap(),
+        );
+        let exported = build_export(&registry, None, None, None);
+        let serialized = exported.to_string();
+        assert!(!serialized.contains(INSTANTLY_KEY), "{serialized}");
+        assert!(!serialized.contains("hunter2"), "{serialized}");
+        assert_eq!(
+            exported["servers"][0]["url"],
+            "https://mcp.instantly.ai/mcp/YOUR_API_KEY"
+        );
+        assert_eq!(exported["servers"][1]["args"][1], "mcp-remote");
+
+        let mut imported = Registry::default();
+        apply_import(&mut imported, &serialized).unwrap();
+        let item = SetupImportItem {
+            is_new: true,
+            name: "Instantly".to_string(),
+            transport: "http".to_string(),
+            command: None,
+            args: Vec::new(),
+            url: imported.servers[0].url.clone(),
+        };
+        assert_eq!(
+            import_item_warnings(&item),
+            vec!["Replace the placeholders in its URL with your own values"]
+        );
     }
 }
