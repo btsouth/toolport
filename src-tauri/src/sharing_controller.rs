@@ -546,7 +546,7 @@ mod controller_tests {
     }
 
     const INSTANTLY_KEY: &str =
-        "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5bC7dE9fG1hJ3kL5mN7pQ9rS1tU3vW5xY7z";
+        "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5bC7dE9fG1hJ3kL5mN7pQ9rS1tU3vW5xY";
 
     #[test]
     fn share_url_redaction_removes_query_values_and_keeps_names() {
