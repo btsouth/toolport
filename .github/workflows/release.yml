@@ -118,6 +118,7 @@ jobs:
           workspaces: src-tauri
           key: ${{ matrix.target }}
           cache-bin: "false"
+          save-if: false
 
       - name: Install dependencies
         run: npm ci

@@ -4,21 +4,41 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-// Only a narrow frontend allowlist can skip unchanged native code. Unknown
-// paths, dependencies, build scripts, workflows and main pushes run all tests.
+// Only a narrow allowlist can skip unchanged native code: the frontend, docs,
+// packaging and release workflows other than ci.yml (none feed the Rust jobs;
+// the frontend job still tests packaging/ and always runs). Unknown paths,
+// dependencies, build scripts, ci.yml, the CI scripts and main pushes run all tests.
+const SKIP_RUST_FILES = new Set([
+  "index.html",
+  "LICENSE",
+  ".coderabbit.yaml",
+  ".github/PULL_REQUEST_TEMPLATE.md",
+]);
+const SKIP_RUST_PREFIXES = [
+  "src/",
+  "public/",
+  "docs/",
+  "packaging/",
+  ".vscode/",
+  ".github/ISSUE_TEMPLATE/",
+];
+
+function skipsRust(file) {
+  return (
+    SKIP_RUST_FILES.has(file) ||
+    SKIP_RUST_PREFIXES.some((prefix) => file.startsWith(prefix)) ||
+    file.endsWith(".md") ||
+    /^(vite\.config|tsconfig[^/]*)\.(ts|json)$/.test(file) ||
+    (/^\.github\/workflows\/[^/]+\.yml$/.test(file) &&
+      file !== ".github/workflows/ci.yml")
+  );
+}
+
 export function needsRust(event, files) {
   return (
     event !== "pull_request" ||
     files.length === 0 ||
-    files.some(
-      (file) =>
-        !(
-          file.startsWith("src/") ||
-          file.startsWith("public/") ||
-          file === "index.html" ||
-          /^(vite\.config|tsconfig[^/]*)\.(ts|json)$/.test(file)
-        ),
-    )
+    files.some((file) => !skipsRust(file))
   );
 }
 

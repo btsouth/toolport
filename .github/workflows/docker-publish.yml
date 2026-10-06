@@ -58,9 +58,7 @@ jobs:
           workspaces: src-tauri
           key: docker-gateway
           cache-bin: "false"
-
-      - name: Build toolport-gateway
-        run: cargo build --release --bin toolport-gateway --manifest-path src-tauri/Cargo.toml --no-default-features
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Binary tests link the library without the library's `cfg(test)`, so
       # release-profile tests need the test-support hooks. Rebuild without the
