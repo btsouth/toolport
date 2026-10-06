@@ -1458,6 +1458,16 @@ fn gateway_daemon_role(pid: u32) -> Option<bool> {
 
 #[cfg(windows)]
 fn windows_gateway_daemon_roles(pids: &[u32]) -> std::collections::HashMap<u32, Option<bool>> {
+    windows_gateway_daemon_roles_within(pids, std::time::Duration::from_secs(5))
+}
+
+/// PowerShell and CIM can take longer than `limit` to start on a cold or busy
+/// machine; the caller then sees every role as unknown.
+#[cfg(windows)]
+fn windows_gateway_daemon_roles_within(
+    pids: &[u32],
+    limit: std::time::Duration,
+) -> std::collections::HashMap<u32, Option<bool>> {
     use std::os::windows::process::CommandExt;
 
     if pids.is_empty() {
@@ -1482,7 +1492,7 @@ fn windows_gateway_daemon_roles(pids: &[u32]) -> std::collections::HashMap<u32, 
     else {
         return std::collections::HashMap::new();
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + limit;
     let output = loop {
         match child.try_wait() {
             Ok(Some(_)) => break child.wait_with_output().ok(),
@@ -2210,7 +2220,10 @@ mod tests {
         let pid = std::process::id();
         #[cfg(windows)]
         assert_eq!(
-            windows_gateway_daemon_roles(&[pid]).get(&pid),
+            // A loaded CI runner can take longer than the production limit to
+            // start PowerShell; this checks the parse, not the startup time.
+            windows_gateway_daemon_roles_within(&[pid], std::time::Duration::from_secs(60))
+                .get(&pid),
             Some(&Some(false))
         );
         #[cfg(not(windows))]
