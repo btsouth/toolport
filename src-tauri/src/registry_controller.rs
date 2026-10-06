@@ -847,7 +847,9 @@ pub fn disconnect_client_stdio_with(
     }
     let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
     let outcome = clients::uninstall_gateway(client_id)?;
-    finish_client_config_mutation(outcome, write_registry)
+    let result = finish_client_config_mutation(outcome, write_registry)?;
+    clients::finish_uninstall(client_id, &result.outcome);
+    Ok(result)
 }
 
 fn read_registry_exact() -> Result<Registry, String> {
@@ -1472,6 +1474,7 @@ pub fn disconnect_client(client_id: &str) -> Result<ClientMutationResult, String
         registry.clear_client_managed_entry(client_id);
         Ok(())
     })?;
+    clients::finish_uninstall(client_id, &outcome);
     Ok(ClientMutationResult { registry, outcome })
 }
 
@@ -2722,6 +2725,7 @@ mod tests {
             backup: Some(backup.display().to_string()),
             managed: None,
             restored: Vec::new(),
+            used_move_record: false,
         };
 
         let error = finish_client_config_mutation(outcome, |_| Err("registry full".into()))
@@ -2748,6 +2752,7 @@ mod tests {
             backup: None,
             managed: None,
             restored: Vec::new(),
+            used_move_record: false,
         };
 
         let error = finish_client_config_mutation(outcome, |_| Err("registry full".into()))
@@ -2776,6 +2781,7 @@ mod tests {
             backup: Some(backup.display().to_string()),
             managed: None,
             restored: Vec::new(),
+            used_move_record: false,
         };
         let target_for_write = target.clone();
 
@@ -3023,6 +3029,40 @@ mod tests {
             "Disconnect must restore the moved entries"
         );
         assert_eq!(after["numStartups"], 3);
+        assert!(!fixture.move_record("claude-code").exists());
+    }
+
+    /// A Disconnect whose registry update fails rolls the config back to before the
+    /// restore, so the move record must survive for the next attempt.
+    #[test]
+    fn failed_disconnect_keeps_the_move_record() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let servers = serde_json::json!({
+            "memory": {"command": "npx", "env": {"API_KEY": "kept-secret"}}
+        });
+        std::fs::write(
+            fixture.claude(),
+            serde_json::to_string(&serde_json::json!({ "mcpServers": servers })).unwrap(),
+        )
+        .unwrap();
+        migrate_client("claude-code", None, false, None).unwrap();
+        let moved_config = std::fs::read_to_string(fixture.claude()).unwrap();
+
+        let error =
+            disconnect_client_stdio_with("claude-code", false, |_| Err("registry full".into()))
+                .unwrap_err();
+        assert!(error.contains("rolled back"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.claude()).unwrap(),
+            moved_config
+        );
+        assert!(
+            fixture.move_record("claude-code").exists(),
+            "the record is the only copy of the moved entries"
+        );
+
+        disconnect_client("claude-code").unwrap();
+        assert_eq!(json_file(&fixture.claude())["mcpServers"], servers);
         assert!(!fixture.move_record("claude-code").exists());
     }
 

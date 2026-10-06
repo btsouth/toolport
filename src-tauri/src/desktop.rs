@@ -694,6 +694,7 @@ async fn uninstall_gateway(
             reg.clear_client_managed_entry(&client_id);
             Ok(())
         })?;
+        clients::finish_uninstall(&client_id, &outcome);
         Ok(outcome)
     })
     .await

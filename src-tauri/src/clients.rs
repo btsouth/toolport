@@ -3094,6 +3094,10 @@ pub struct WriteOutcome {
     /// Servers Disconnect put back from the "Move into gateway" record (UX-03).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub restored: Vec<String>,
+    /// Disconnect used this client's move record. The caller drops it with
+    /// [`finish_uninstall`] once the whole Disconnect has succeeded.
+    #[serde(skip)]
+    pub used_move_record: bool,
 }
 
 /// Result of launch-time re-point (SOU-405/406).
@@ -5130,6 +5134,7 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
         backup: backup.map(|b| b.display().to_string()),
         managed,
         restored: Vec::new(),
+        used_move_record: false,
     })
 }
 
@@ -5820,6 +5825,7 @@ fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<Wri
         backup: backup.map(|b| b.display().to_string()),
         managed,
         restored: Vec::new(),
+        used_move_record: false,
     })
 }
 
@@ -5854,9 +5860,18 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
             outcome.backup = Some(backup.display().to_string());
         }
         outcome.restored = restored.names;
-        moved::forget(client_id);
+        outcome.used_move_record = true;
     }
     Ok(outcome)
+}
+
+/// Drop the move record a Disconnect used. Call it only after the registry
+/// update succeeded: a failed update rolls the config back to before the restore,
+/// and the record is then the only copy of the moved entries.
+pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) {
+    if outcome.used_move_record {
+        moved::forget(client_id);
+    }
 }
 
 /// Replace a client's entire server list with just the Toolport gateway. Used by
