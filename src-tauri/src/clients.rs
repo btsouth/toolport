@@ -11142,9 +11142,7 @@ rules:
         }
     }
 
-    /// Team-scope resolution, the default for these path tests. Scope changes only the owned-file
-    /// NAME; `rules_target_owned_file_name_follows_the_scope` covers the personal variant, and
-    /// sentinel clients share one file across scopes by design.
+    /// Team-scope resolution, the default for these path tests.
     fn team_rules_target(
         client_id: &str,
         home: &Path,
@@ -11166,61 +11164,6 @@ rules:
                 t.path
             );
             assert!(t.path.to_string_lossy().contains(".claude"));
-        }
-    }
-
-    /// Team and personal owned files are siblings in the client's rules DIRECTORY, never the same
-    /// file: the client reads the whole directory, so both apply and neither clobbers the other.
-    #[test]
-    fn rules_target_owned_file_name_follows_the_scope() {
-        use crate::instructions::Scope;
-        let home = mock_home(Platform::MacOs);
-        let p = Platform::MacOs;
-        for client in ["claude-code", "vscode", "kiro", "roo-code", "cline"] {
-            let team = resolve_rules_target(client, &home, p, Scope::Team).expect("supported");
-            let personal =
-                resolve_rules_target(client, &home, p, Scope::Personal).expect("supported");
-            assert_eq!(
-                team.path.parent(),
-                personal.path.parent(),
-                "{client}: both scopes live in the same rules directory"
-            );
-            assert_ne!(
-                team.path, personal.path,
-                "{client}: scopes must not share a file"
-            );
-            assert!(team.path.ends_with(Scope::Team.owned_file_name()));
-            assert!(personal.path.ends_with(Scope::Personal.owned_file_name()));
-            assert_eq!(personal.scope, Scope::Personal);
-        }
-    }
-
-    /// Sentinel clients deliberately resolve to ONE file for both scopes. The two managed spans
-    /// coexist there, separated by their disjoint markers.
-    #[test]
-    fn rules_target_sentinel_clients_share_one_file_across_scopes() {
-        use crate::instructions::Scope;
-        let home = mock_home(Platform::MacOs);
-        let p = Platform::MacOs;
-        for client in [
-            "codex",
-            "gemini-cli",
-            "windsurf",
-            "devin-cli",
-            "goose",
-            "zed",
-            "pi",
-            "omp",
-        ] {
-            let team = resolve_rules_target(client, &home, p, Scope::Team).expect("supported");
-            let personal =
-                resolve_rules_target(client, &home, p, Scope::Personal).expect("supported");
-            assert_eq!(team.path, personal.path, "{client}: one shared rules file");
-            assert_eq!(team.char_cap, personal.char_cap, "{client}: same cap");
-            assert_eq!(
-                team.blocked_if_present, personal.blocked_if_present,
-                "{client}: a shadow file blocks both scopes"
-            );
         }
     }
 

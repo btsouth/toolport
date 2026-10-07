@@ -39,7 +39,6 @@ const props = {
   onBrowseCatalog: vi.fn(),
   onProbe: vi.fn().mockResolvedValue([]),
   onOpenPlayground: vi.fn(),
-  onOpenRules: vi.fn(),
   onFinish: vi.fn(),
 };
 

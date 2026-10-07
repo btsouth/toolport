@@ -13,9 +13,7 @@ first.
 2. For every client that shows **connected to Toolport**, open it and click
    **Disconnect**. That removes the Toolport entry from that client's config file
    and leaves your other servers and the rest of the file untouched.
-3. If you turned on **Agent rules**, switch every client off in that tab, or delete
-   the applied set, so Toolport removes the block or file it wrote.
-4. Turn off **Launch at login** in Settings.
+3. Turn off **Launch at login** in Settings.
 
 ## 2. Remove the app
 

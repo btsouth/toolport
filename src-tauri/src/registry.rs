@@ -841,9 +841,9 @@ pub struct Profile {
     pub instructions: Option<String>,
 }
 
-/// One named set of the user's own agent rules (CLAUDE.md / AGENTS.md / GEMINI.md content),
-/// applied to every opted-in AI client by [`crate::rules`]. Several sets can exist so a user can
-/// switch between, say, "Work" and "Personal"; exactly one is active at a time.
+/// One named set of the user's own agent rules (CLAUDE.md / AGENTS.md / GEMINI.md content).
+/// Several sets can exist so a user can switch between, say, "Work" and "Personal"; exactly one
+/// is active at a time.
 ///
 /// `(id, revision)` is what the personal sentinel marker carries, standing in for the team
 /// scope's `(team_id, version)` — see [`crate::instructions::Scope`]. `revision` therefore only
@@ -912,8 +912,8 @@ pub struct PermissionRule {
 /// One registered project folder for project-level agent rules (SBS-1037). The consent unit
 /// inside it is a FILE, not a client: at project level nearly every client reads the root
 /// `AGENTS.md`, Gemini reads `GEMINI.md`, Claude Code and VS Code read `.claude/rules/`, so
-/// `files` maps each of those (by `rules::PROJECT_FILES` key) to whether the user switched it
-/// on. Off means never written.
+/// `files` maps each of those (by key) to whether the user switched it on. Off means never
+/// written.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RulesProject {
@@ -925,7 +925,7 @@ pub struct RulesProject {
     /// The rule set applied to this project, if any. Independent of the global active set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set_id: Option<String>,
-    /// Per-file opt-in, keyed by `rules::PROJECT_FILES` key. Absent means off.
+    /// Per-file opt-in, keyed by file key. Absent means off.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub files: HashMap<String, bool>,
     /// Absolute paths this project's applies have written, so removal touches exactly those.
@@ -1268,23 +1268,28 @@ pub struct Registry {
     /// the rest of the registry JSON is unchanged.
     #[serde(default)]
     pub secrets_generation: u64,
+    // 2.0: unused, dropped by the v2 migration.
     /// The user's own agent rule sets. Several can exist; `active_rule_set_id` picks the one
-    /// written to clients. See [`crate::rules`].
+    /// written to clients.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rule_sets: Vec<RuleSet>,
+    // 2.0: unused, dropped by the v2 migration.
     /// Which of `rule_sets` is currently applied. `None` = none; every file we wrote is removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_rule_set_id: Option<String>,
+    // 2.0: unused, dropped by the v2 migration.
     /// Per-client opt-in for personal rules, keyed by client id. ABSENT MEANS OFF: writing into
     /// someone's `~/.claude/rules` or `AGENTS.md` is not something to do unasked, so a client
     /// only receives rules once the user turns it on.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub rules_clients: HashMap<String, bool>,
+    // 2.0: unused, dropped by the v2 migration.
     /// Absolute paths of the personal-rules files we have written, so cleanup after a set
     /// switch / client opt-out / uninstall touches exactly what we created and nothing else.
     /// Same role as `TeamConnection::team_instructions_targets`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules_targets: Vec<String>,
+    // 2.0: unused, dropped by the v2 migration.
     /// Project folders the user registered for project-level agent rules (SBS-1037). Nothing
     /// is ever discovered: a folder is here because the user added it, and its files are
     /// written only by an explicit Apply for that project, never at startup.
@@ -2423,89 +2428,6 @@ impl Registry {
             instructions: None,
         });
         id
-    }
-
-    /// The rule set currently applied to clients, if any.
-    pub fn active_rule_set(&self) -> Option<&RuleSet> {
-        let id = self.active_rule_set_id.as_deref()?;
-        self.rule_sets.iter().find(|s| s.id == id)
-    }
-
-    /// Create a set (`id: None`) or update one in place. Returns the set's id.
-    ///
-    /// `revision` moves ONLY when `content` changes: it rides in the on-disk sentinel marker, so
-    /// bumping it on a rename would restale every client's file and force a pointless rewrite.
-    /// A newly created set becomes active when nothing else is, so the first set a user writes
-    /// applies without a second step.
-    ///
-    /// An `id` that names no existing set is an ERROR, not a create. Falling through to create
-    /// would silently duplicate a set whenever a second window (or a stale view) saved against an
-    /// id that had since been deleted, leaving the user with two "Work" sets and an edit that
-    /// went somewhere they did not mean.
-    pub fn upsert_rule_set(
-        &mut self,
-        id: Option<&str>,
-        name: &str,
-        content: &str,
-    ) -> Result<String, String> {
-        let name = if name.trim().is_empty() {
-            "Rules"
-        } else {
-            name.trim()
-        };
-        if let Some(id) = id {
-            let Some(existing) = self.rule_sets.iter_mut().find(|s| s.id == id) else {
-                return Err("That rule set no longer exists.".to_string());
-            };
-            if existing.content != content {
-                existing.content = content.to_string();
-                existing.revision += 1;
-            }
-            existing.name = name.to_string();
-            return Ok(existing.id.clone());
-        }
-        let id = unique_id(&slugify(name), &self.rule_set_ids());
-        self.rule_sets.push(RuleSet {
-            id: id.clone(),
-            name: name.to_string(),
-            content: content.to_string(),
-            revision: 1,
-        });
-        if self.active_rule_set_id.is_none() {
-            self.active_rule_set_id = Some(id.clone());
-        }
-        Ok(id)
-    }
-
-    /// Remove a set. Removing the ACTIVE one clears the selection rather than silently promoting
-    /// another, so the next apply removes our files instead of writing someone else's rules.
-    pub fn remove_rule_set(&mut self, id: &str) {
-        self.rule_sets.retain(|s| s.id != id);
-        if self.active_rule_set_id.as_deref() == Some(id) {
-            self.active_rule_set_id = None;
-        }
-    }
-
-    /// Select the active set. An unknown id clears the selection (same effect as `None`).
-    pub fn set_active_rule_set(&mut self, id: Option<&str>) {
-        self.active_rule_set_id = id
-            .filter(|id| self.rule_sets.iter().any(|s| s.id == *id))
-            .map(str::to_string);
-    }
-
-    /// Opt one client in or out of personal rules. `false` is stored explicitly rather than
-    /// removed so the UI can tell "turned off" from "never seen".
-    pub fn set_rules_client_enabled(&mut self, client_id: &str, enabled: bool) {
-        self.rules_clients.insert(client_id.to_string(), enabled);
-    }
-
-    /// Whether a client receives personal rules. Absent = off (see the field docs).
-    pub fn rules_client_enabled(&self, client_id: &str) -> bool {
-        self.rules_clients.get(client_id).copied().unwrap_or(false)
-    }
-
-    fn rule_set_ids(&self) -> Vec<String> {
-        self.rule_sets.iter().map(|s| s.id.clone()).collect()
     }
 
     pub fn remove_profile(&mut self, id: &str) -> Result<(), String> {

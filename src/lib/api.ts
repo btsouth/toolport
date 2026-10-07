@@ -22,10 +22,6 @@ import type {
   ProbeResult,
   Registry,
   RoutineSuggestion,
-  RulesImportCandidate,
-  RulesImportedFile,
-  RulesPreview,
-  RulesView,
   SavingsSummary,
   SearchTrace,
   ToolIdentity,
@@ -556,116 +552,6 @@ export function teamInstructionsStatus(): Promise<InstructionsStatusView | null>
 /** Leave the team: remove its merged servers and clear the saved token. */
 export function teamDisconnect(): Promise<Registry> {
   return invoke<Registry>("team_disconnect");
-}
-
-// ---- Personal agent rules (SBS-821) ----
-//
-// Every mutating call returns the refreshed view, so the tab never has to re-fetch to stay
-// honest about what is on disk. All of these work with no MCP server configured.
-
-/** The user's rule sets, which one is active, and each installed client's on-disk state. */
-export function rulesView(): Promise<RulesView> {
-  return invoke<RulesView>("rules_view");
-}
-
-/** Create (`id` omitted) or update a rule set, then apply it to every opted-in client. */
-export function rulesSaveSet(
-  name: string,
-  content: string,
-  id?: string,
-): Promise<RulesView> {
-  return invoke<RulesView>("rules_save_set", { id: id ?? null, name, content });
-}
-
-/** Delete a rule set. Deleting the active one also removes the files Toolport wrote. */
-export function rulesDeleteSet(id: string): Promise<RulesView> {
-  return invoke<RulesView>("rules_delete_set", { id });
-}
-
-/** Switch the active set, or pass nothing to clear it and remove our files everywhere. */
-export function rulesSetActive(id?: string): Promise<RulesView> {
-  return invoke<RulesView>("rules_set_active", { id: id ?? null });
-}
-
-/** Opt one client in or out. Opting out removes that client's rules file. */
-export function rulesSetClientEnabled(
-  clientId: string,
-  enabled: boolean,
-): Promise<RulesView> {
-  return invoke<RulesView>("rules_set_client_enabled", { clientId, enabled });
-}
-
-/**
- * Dry-run one client's write: the exact before/after bytes, without touching disk. `null` when
- * the client has no rules file we manage, or no set is active.
- *
- * Pass `content` to preview unsaved editor text. Do NOT save first to get an accurate preview: a
- * save applies to every opted-in client, which would turn the dry run into a write.
- */
-export function rulesPreview(
-  clientId: string,
-  content?: string,
-): Promise<RulesPreview | null> {
-  return invoke<RulesPreview | null>("rules_preview", {
-    clientId,
-    content: content ?? null,
-  });
-}
-
-/** Re-apply the active set to every opted-in client. */
-export function rulesApply(): Promise<RulesView> {
-  return invoke<RulesView>("rules_apply");
-}
-
-/** Overwrite ONE client's file from the set (its drift card's action); everything else reconciles. */
-export function rulesApplyClient(clientId: string): Promise<RulesView> {
-  return invoke<RulesView>("rules_apply_client", { clientId });
-}
-
-// Project-level rules (SBS-1037). Registered folders only; written only by `rulesProjectApply`.
-export function rulesProjectAdd(path: string): Promise<RulesView> {
-  return invoke<RulesView>("rules_project_add", { path });
-}
-export function rulesProjectRemove(id: string): Promise<RulesView> {
-  return invoke<RulesView>("rules_project_remove", { id });
-}
-export function rulesProjectSetSet(id: string, setId?: string): Promise<RulesView> {
-  return invoke<RulesView>("rules_project_set_set", { id, setId: setId ?? null });
-}
-export function rulesProjectSetFileEnabled(
-  id: string,
-  key: string,
-  enabled: boolean,
-): Promise<RulesView> {
-  return invoke<RulesView>("rules_project_set_file_enabled", { id, key, enabled });
-}
-export function rulesProjectApply(id: string): Promise<RulesView> {
-  return invoke<RulesView>("rules_project_apply", { id });
-}
-export function rulesProjectPreview(
-  id: string,
-  key: string,
-): Promise<RulesPreview | null> {
-  return invoke<RulesPreview | null>("rules_project_preview", { id, key });
-}
-
-/** Rules files the detected clients already have, for "Start from a file". Read-only. */
-export function rulesImportCandidates(): Promise<RulesImportCandidate[]> {
-  return invoke<RulesImportCandidate[]>("rules_import_candidates");
-}
-
-/**
- * Read one file as the seed for a new set. Read-only: nothing is saved and the file is left as it
- * was; the caller puts the text in the editor for the user to review and save.
- */
-export function rulesImportFile(
-  path: string,
-  clientName?: string,
-): Promise<RulesImportedFile> {
-  return invoke<RulesImportedFile>("rules_import_file", {
-    path,
-    clientName: clientName ?? null,
-  });
 }
 
 export interface ShareDefinitionPreview {

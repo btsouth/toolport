@@ -110,40 +110,6 @@ describe("AppSidebar accessibility", () => {
     );
   });
 
-  it("routes to the agent-rules view and marks it current", async () => {
-    const onSelectView = vi.fn();
-    const { rerender } = render(
-      <TooltipProvider>
-        <AppSidebar
-          registry={null}
-          onRegistryChange={vi.fn()}
-          view="servers"
-          onSelectView={onSelectView}
-          onReplayOnboarding={vi.fn()}
-        />
-      </TooltipProvider>,
-    );
-
-    await userEvent.click(screen.getByRole("button", { name: "Agent rules" }));
-    expect(onSelectView).toHaveBeenCalledWith("rules");
-
-    rerender(
-      <TooltipProvider>
-        <AppSidebar
-          registry={null}
-          onRegistryChange={vi.fn()}
-          view="rules"
-          onSelectView={onSelectView}
-          onReplayOnboarding={vi.fn()}
-        />
-      </TooltipProvider>,
-    );
-    expect(screen.getByRole("button", { name: "Agent rules" })).toHaveAttribute(
-      "aria-current",
-      "page",
-    );
-  });
-
   it("rechecks updates when a stale tray-hidden window is shown", async () => {
     let now = 1_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);

@@ -1,15 +1,11 @@
 //! Agent rules — write Toolport-managed agent rules to each AI client's rules file.
 //!
-//! Two [`Scope`]s share this engine and can coexist in one file:
+//! The [`Scope::Team`] engine: an admin authors the team's agent instructions once in the Teams
+//! dashboard; the server carries them in the team config under the top-level `instructions`
+//! key (see the `team-instructions` spec). This module is the client half (spec "W2").
 //!
-//!   * [`Scope::Team`] — an admin authors the team's agent instructions once in the Teams
-//!     dashboard; the server carries them in the team config under the top-level `instructions`
-//!     key (see the `team-instructions` spec). This module is the client half (spec "W2").
-//!   * [`Scope::Personal`] — the user's own rule set, authored in the desktop app (see the
-//!     `agent-rules` spec). No server; the version pair is `(rule_set_id, revision)`.
-//!
-//! Either way it turns that content into files on disk next to — never over — the user's own
-//! instructions, and removes them cleanly when the member leaves the team or switches rule set.
+//! It turns that content into files on disk next to — never over — the user's own instructions,
+//! and removes them cleanly when the member leaves the team.
 //!
 //! Two write strategies, both non-destructive:
 //!
@@ -20,12 +16,9 @@
 //!     the user may also edit, so we own only the span between two HTML-comment markers and
 //!     leave every byte outside them untouched.
 //!
-//! The invariants the tests pin:
-//!
-//!   * An upsert changes only the managed span (or appends one), and a remove takes the managed
-//!     span back out, so a full join→edit→leave cycle returns the user's own content unchanged.
-//!   * Every operation is scoped. A team block and a personal block can sit in the same file;
-//!     writing or removing one leaves the other byte-identical.
+//! The invariants the tests pin: an upsert changes only the managed span (or appends one), and a
+//! remove takes the managed span back out, so a full join→edit→leave cycle returns the user's own
+//! content unchanged.
 
 /// How a client's rules file is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,21 +31,14 @@ pub enum Strategy {
 
 /// Which set of rules a managed artifact belongs to.
 ///
-/// The two scopes coexist: a member of a Toolport Teams org still has their own personal rules,
-/// and both land in the same client files. Each scope therefore owns a DISTINCT sentinel marker
-/// pair and a DISTINCT owned-file name, chosen so neither family is a substring of the other. A
-/// scoped [`find_block`] can then never match the other scope's span, and removing one scope's
-/// artifact leaves the other byte-identical.
+/// Each scope owns a DISTINCT sentinel marker pair and a DISTINCT owned-file name. A scoped
+/// [`find_block`] can therefore never match another scope's span, and removing one scope's
+/// artifact leaves any other byte-identical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     /// Org-pushed Team Instructions, keyed by `(team_id, version)` from the server.
     Team,
-    /// The user's own rule set, keyed by `(rule_set_id, revision)` held locally.
-    Personal,
 }
-
-/// Every scope, for the checks that must consider all of them (see [`content_carries_a_marker`]).
-pub const ALL_SCOPES: [Scope; 2] = [Scope::Team, Scope::Personal];
 
 /// A resolved place to write one client's copy of the rules for one [`Scope`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,14 +78,6 @@ pub enum ApplyState {
     /// written, drifted, or hand-edited. Distinct from `Applied` so the coverage panel shows a
     /// truthful "not covered" for a client added after the last write (see [`current_state`]).
     Stale,
-    /// Toolport wrote this block for exactly the current set revision, and the body has since
-    /// been changed on disk by someone else. Personal rules only ([`current_state`] never
-    /// returns it; `rules::status_from` refines `Stale` into it via [`drifted_body`]): a
-    /// reconcile leaves such a block alone rather than silently putting Toolport's text back
-    /// over an edit the user made in the client's file, until they pull the edit into the set
-    /// or explicitly overwrite it (SBS-1036). Team instructions keep treating the same
-    /// situation as `Stale`, because org rules are authoritative over a member's edit.
-    Drifted,
 }
 
 /// One client's reported state, for the apply-status receipt (spec W5).
@@ -132,80 +110,47 @@ pub const SENTINEL_END: &str = "<!-- toolport:team-instructions:end -->";
 /// wrote), which must stay recognizable across versions.
 pub const OWNED_HEADER_PREFIX: &str = "<!-- Managed by Toolport";
 
-/// Personal-scope markers, frozen on the same terms from first release. Deliberately NOT a
-/// substring of (nor containing) their team counterparts: [`find_block`] matches on the START
-/// prefix alone, so an overlapping family would let one scope find and overwrite the other's
-/// span. `personal_and_team_marker_families_are_disjoint` pins this.
-pub const PERSONAL_SENTINEL_START_PREFIX: &str = "<!-- toolport:rules:start";
-pub const PERSONAL_SENTINEL_END: &str = "<!-- toolport:rules:end -->";
-pub const PERSONAL_OWNED_HEADER_PREFIX: &str = "<!-- Toolport personal rules";
-
 impl Scope {
     /// The frozen START-marker prefix this scope matches on.
     pub fn sentinel_start_prefix(self) -> &'static str {
-        match self {
-            Scope::Team => SENTINEL_START_PREFIX,
-            Scope::Personal => PERSONAL_SENTINEL_START_PREFIX,
-        }
+        SENTINEL_START_PREFIX
     }
 
     /// The frozen END marker that closes this scope's block.
     pub fn sentinel_end(self) -> &'static str {
-        match self {
-            Scope::Team => SENTINEL_END,
-            Scope::Personal => PERSONAL_SENTINEL_END,
-        }
+        SENTINEL_END
     }
 
     /// The frozen header prefix that identifies this scope's [`Strategy::OwnedFile`] files.
     pub fn owned_header_prefix(self) -> &'static str {
-        match self {
-            Scope::Team => OWNED_HEADER_PREFIX,
-            Scope::Personal => PERSONAL_OWNED_HEADER_PREFIX,
-        }
+        OWNED_HEADER_PREFIX
     }
 
-    /// The file name Toolport owns inside a client's rules DIRECTORY. Distinct per scope so a
-    /// team file and a personal file sit side by side rather than clobbering each other; both are
-    /// loaded by the client, which reads the whole directory.
+    /// The file name Toolport owns inside a client's rules DIRECTORY.
     pub fn owned_file_name(self) -> &'static str {
-        match self {
-            Scope::Team => "toolport-team-rules.md",
-            Scope::Personal => "toolport-rules.md",
-        }
+        "toolport-team-rules.md"
     }
 
     /// The one-line header stamped at the top of an [`Strategy::OwnedFile`] file so whoever opens
     /// it understands it is managed and will be overwritten.
     fn owned_header(self, id: &str, version: i64) -> String {
-        match self {
-            Scope::Team => format!(
-                "{OWNED_HEADER_PREFIX} — team {id}, v{version}. Edits are overwritten on sync; leave the team to remove. -->"
-            ),
-            Scope::Personal => format!(
-                "{PERSONAL_OWNED_HEADER_PREFIX}: set {id}, v{version}. Edits are overwritten on the next apply; change them in Toolport. -->"
-            ),
-        }
+        format!(
+            "{OWNED_HEADER_PREFIX} — team {id}, v{version}. Edits are overwritten on sync; leave the team to remove. -->"
+        )
     }
 
     fn start_marker(self, id: &str, version: i64) -> String {
-        match self {
-            Scope::Team => format!("{SENTINEL_START_PREFIX} team={id} v={version} -->"),
-            Scope::Personal => format!("{PERSONAL_SENTINEL_START_PREFIX} set={id} v={version} -->"),
-        }
+        format!("{SENTINEL_START_PREFIX} team={id} v={version} -->")
     }
 }
 
-/// True when `content` carries ANY scope's sentinel marker.
+/// True when `content` carries the sentinel marker.
 ///
-/// Checked across ALL scopes, not just the writing one, because the scopes share files: personal
-/// content carrying a *team* START marker, placed before the real team block, would make the
-/// team's [`find_block`] span the personal block and swallow it on the next org sync. Refusing
-/// every family is the only safe rule.
+/// Refusing content that embeds our markers is the only safe rule: an embedded END would fool
+/// [`find_block`] into terminating the managed span early, and an embedded START would make
+/// [`remove_recorded`] misclassify an owned file as a sentinel one.
 pub fn content_carries_a_marker(content: &str) -> bool {
-    ALL_SCOPES
-        .iter()
-        .any(|s| content.contains(s.sentinel_start_prefix()) || content.contains(s.sentinel_end()))
+    content.contains(SENTINEL_START_PREFIX) || content.contains(SENTINEL_END)
 }
 
 /// Read-only: is this scope's managed artifact present at `path` right now?
@@ -266,9 +211,6 @@ fn render_block(scope: Scope, id: &str, version: i64, content: &str) -> String {
 /// Byte range `[start, end)` of `scope`'s managed block in `existing`, or `None`. `start` is
 /// the offset of the START marker; `end` is just past the END marker (not its trailing
 /// newline). Matches on the frozen START prefix + END, so a block from any version is found.
-///
-/// Scope-exact: another scope's block in the same file is invisible here, because the two marker
-/// families are disjoint by construction (see [`Scope`]).
 fn find_block(existing: &str, scope: Scope) -> Option<(usize, usize)> {
     let start = existing.find(scope.sentinel_start_prefix())?;
     // The END marker that closes THIS block is the first one at or after START.
@@ -286,7 +228,6 @@ fn find_block(existing: &str, scope: Scope) -> Option<(usize, usize)> {
 ///     separator, so a later [`remove_block`] can take exactly those bytes back out.
 ///
 /// Idempotent: re-running with the same scope/id/version/content yields byte-identical output.
-/// Another scope's block in the same file is left byte-identical.
 pub fn upsert_block(existing: &str, scope: Scope, id: &str, version: i64, content: &str) -> String {
     let block = render_block(scope, id, version, content);
     if let Some((start, end)) = find_block(existing, scope) {
@@ -316,10 +257,6 @@ pub fn upsert_block(existing: &str, scope: Scope, id: &str, version: i64, conten
 /// own line is indistinguishable on the way out from a newline the user typed — an unavoidable
 /// ambiguity, and a cosmetically irrelevant one for a rules file. A block the user relocated
 /// mid-file is removed in place, leaving at most one blank line where it sat.
-///
-/// Scope-exact, including when the other scope's block is the immediate neighbour: the separator
-/// consumed here is exactly the one this scope's append added, so the survivor is byte-identical
-/// to what its own append produced (`removing_one_scope_leaves_an_adjacent_block_intact`).
 pub fn remove_block(existing: &str, scope: Scope) -> Option<String> {
     let (start, end) = find_block(existing, scope)?;
     // Consume the block's own trailing newline if present.
@@ -338,11 +275,8 @@ pub fn remove_block(existing: &str, scope: Scope) -> Option<String> {
         }
     }
     // A block at offset 0 has no preceding separator to eat, so the loop above cannot run — but
-    // the blank line BETWEEN it and whatever follows is still ours, added when that next thing was
-    // appended. Without this, removing the first of two blocks from a file we created (team writes
-    // AGENTS.md, personal appends, member leaves the team) leaves "\n{survivor}" where a lone
-    // append would have written "{survivor}". Symmetric with the trailing-separator rule above:
-    // exactly one newline, and only the one we are responsible for.
+    // the blank line after it is still ours, added when the block was appended into an absent
+    // file. Removing it must not leave "\n" behind where a lone file would have ended empty.
     let mut tail_start = cut_end;
     if cut_start == 0 && existing[tail_start..].starts_with('\n') {
         tail_start += 1;
@@ -380,11 +314,10 @@ fn read_existing(path: &std::path::Path) -> Result<String, String> {
 
 /// Serializes read-modify-write on rules files.
 ///
-/// Team and personal blocks share ONE file for every sentinel client (Codex, Gemini CLI, Windsurf,
-/// Goose, Zed, ...), and both writers read the file, insert their own span, and write it back.
-/// Without this, a team sync and a personal apply that read the same bytes concurrently each write
-/// back only their own block and whichever lands second silently drops the other's. That is not
-/// hypothetical: the ~25s team-sync loop and `rules::apply_on_startup` both run at launch.
+/// The team sync loop and an explicit apply both read a sentinel client's shared file (Codex,
+/// Gemini CLI, Windsurf, Goose, Zed, ...), insert our span, and write it back. Without this,
+/// two writers that read the same bytes concurrently would each write back only their own view
+/// and whichever lands second would silently drop the other's change.
 ///
 /// A process mutex is the whole exposure. Both writers live in the desktop app, and the gateway
 /// binary never touches rules files. Deliberately NOT a `<path>.lock` file next to the target:
@@ -413,7 +346,7 @@ fn write_atomic(path: &std::path::Path, contents: &str) -> Result<(), String> {
 /// never overwrites a shared file it couldn't read, and skips (reporting why) when a client
 /// shadow-file or hard cap makes the write pointless.
 pub fn write_target(t: &Target, id: &str, version: i64, content: &str) -> ApplyState {
-    // Held across the read AND the write: the other scope shares this file (see `WRITE_LOCK`).
+    // Held across the read AND the write (see `WRITE_LOCK`).
     let _guard = write_lock();
     // Codex-style shadow file: the client ignores our target entirely, so writing it would be
     // invisible and confusing. Report it instead.
@@ -422,11 +355,10 @@ pub fn write_target(t: &Target, id: &str, version: i64, content: &str) -> ApplyS
             return ApplyState::BlockedOverride;
         }
     }
-    // Content that contains any scope's frozen markers would corrupt everything downstream: an
-    // embedded END would fool `find_block` into terminating the managed span early, and an
-    // embedded START would make `remove_recorded` misclassify an owned file as a sentinel one, or
-    // make the OTHER scope's span swallow this block. Refuse rather than write something we can't
-    // later find and cleanly remove.
+    // Content that contains our frozen markers would corrupt everything downstream: an embedded
+    // END would fool `find_block` into terminating the managed span early, and an embedded START
+    // would make `remove_recorded` misclassify an owned file as a sentinel one. Refuse rather than
+    // write something we can't later find and cleanly remove.
     if content_carries_a_marker(content) {
         return ApplyState::Error;
     }
@@ -450,9 +382,8 @@ pub fn write_target(t: &Target, id: &str, version: i64, content: &str) -> ApplyS
         }
     };
     // Hard client cap (Windsurf) applies to the WHOLE global-rules file we're about to write —
-    // the user's existing rules, the OTHER scope's block if present, and our block and markers —
-    // not just this scope's content. Check the fully rendered result so we never write a file the
-    // client will silently truncate.
+    // the user's existing rules and our block and markers — not just this scope's content. Check
+    // the fully rendered result so we never write a file the client will silently truncate.
     if let Some(cap) = t.char_cap {
         if desired.chars().count() > cap {
             return ApplyState::TooLong;
@@ -462,35 +393,6 @@ pub fn write_target(t: &Target, id: &str, version: i64, content: &str) -> ApplyS
         Ok(()) => ApplyState::Applied,
         Err(_) => ApplyState::Error,
     }
-}
-
-/// The hand-edited body, when `t.path` carries this scope's artifact for exactly `id` at
-/// exactly `version` but with a body that is not `content`. That combination means Toolport
-/// wrote this block for the current revision and something else changed it since: drift, as
-/// opposed to a block for an older revision (an unapplied set change, which apply should
-/// write) or no block at all. `None` for absent, another id/version, identical, or unreadable.
-pub fn drifted_body(t: &Target, id: &str, version: i64, content: &str) -> Option<String> {
-    let existing = read_existing(&t.path).ok()?;
-    let want = content.trim_end_matches('\n');
-    let body = match t.strategy {
-        Strategy::OwnedFile => {
-            let rest = existing.strip_prefix(&t.scope.owned_header(id, version))?;
-            rest.strip_prefix("\n\n")
-                .or_else(|| rest.strip_prefix('\n'))
-                .unwrap_or(rest)
-                .trim_end_matches('\n')
-                .to_string()
-        }
-        Strategy::SentinelBlock => {
-            let (start, end) = find_block(&existing, t.scope)?;
-            let rest = existing[start..end].strip_prefix(&t.scope.start_marker(id, version))?;
-            let rest = rest.strip_prefix('\n').unwrap_or(rest);
-            rest.strip_suffix(t.scope.sentinel_end())?
-                .trim_end_matches('\n')
-                .to_string()
-        }
-    };
-    (body != want).then_some(body)
 }
 
 /// Read-only: what state IS this client's rules file in right now, relative to the current
@@ -541,16 +443,16 @@ pub fn current_state(t: &Target, id: &str, version: i64, content: &str) -> Apply
 /// deleted if nothing but whitespace remains. A file that is neither (already cleaned, or
 /// user-replaced) is left untouched.
 ///
-/// `scope` is required, not sniffed: a shared file can hold BOTH a team and a personal block, and
-/// leaving a team must strip only the team one. The "nothing but whitespace remains" delete is
-/// therefore also correct — a surviving other-scope block is not whitespace, so the file stays.
+/// `scope` is required, not sniffed, so cleanup strips exactly the span this scope wrote. The
+/// "nothing but whitespace remains" delete is therefore also correct: a surviving user block is
+/// not whitespace, so the file stays.
 ///
 /// Returns whether this scope's artifact is now GONE from `path`. `false` means the file still
 /// holds our block (unreadable, locked, read-only, or a hand-mangled marker pair) and the caller
 /// must KEEP the path on record: cleanup is driven by that recorded list, so forgetting a path we
 /// failed to clean strands the block forever with nothing left that would ever look for it.
 pub fn remove_recorded(path: &std::path::Path, scope: Scope) -> bool {
-    // Stripping our span is also read-modify-write on a file the other scope may be writing.
+    // Stripping our span is also read-modify-write on a file another writer may be touching.
     let _guard = write_lock();
     let existing = match std::fs::read_to_string(path) {
         // Already gone: nothing of ours can be there, so the caller may stop tracking it.
@@ -584,7 +486,6 @@ mod tests {
     use super::*;
 
     const TEAM: &str = "team_abc";
-    const SET: &str = "set_xyz";
 
     #[test]
     fn owned_file_has_header_and_content_and_trailing_newline() {
@@ -598,15 +499,6 @@ mod tests {
             f,
             render_owned_file(Scope::Team, TEAM, 3, "Never commit secrets.\n")
         );
-    }
-
-    #[test]
-    fn personal_owned_file_has_its_own_header() {
-        let f = render_owned_file(Scope::Personal, SET, 3, "Never commit secrets.");
-        assert!(f.starts_with(PERSONAL_OWNED_HEADER_PREFIX));
-        assert!(f.contains("set set_xyz, v3"));
-        // Must NOT be mistakable for a team-owned file, or cleanup would cross scopes.
-        assert!(!f.starts_with(OWNED_HEADER_PREFIX));
     }
 
     #[test]
@@ -738,139 +630,6 @@ mod tests {
         assert_eq!(back, user);
     }
 
-    // ---- scope isolation ----
-
-    /// The whole coexistence design rests on the two marker families being disjoint: `find_block`
-    /// matches on the START prefix alone, so if either family contained the other, one scope would
-    /// find and overwrite the other's span. Pin it here rather than trusting the eye.
-    #[test]
-    fn personal_and_team_marker_families_are_disjoint() {
-        let team = [SENTINEL_START_PREFIX, SENTINEL_END, OWNED_HEADER_PREFIX];
-        let personal = [
-            PERSONAL_SENTINEL_START_PREFIX,
-            PERSONAL_SENTINEL_END,
-            PERSONAL_OWNED_HEADER_PREFIX,
-        ];
-        for t in team {
-            for p in personal {
-                assert!(!t.contains(p), "team marker {t:?} contains personal {p:?}");
-                assert!(!p.contains(t), "personal marker {p:?} contains team {t:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn owned_file_names_differ_per_scope() {
-        assert_ne!(
-            Scope::Team.owned_file_name(),
-            Scope::Personal.owned_file_name(),
-            "a shared name would make one scope's owned file clobber the other's"
-        );
-    }
-
-    /// Both scopes write into one shared file, in either order, and each upsert leaves the other's
-    /// block byte-identical.
-    #[test]
-    fn team_and_personal_blocks_coexist_in_one_file() {
-        let user = "# Mine\nAlways run tests.\n";
-        let team_block = render_block(Scope::Team, TEAM, 1, "Org rule");
-        let personal_block = render_block(Scope::Personal, SET, 1, "My rule");
-        let apply = |acc: &str, s: Scope| match s {
-            Scope::Team => upsert_block(acc, Scope::Team, TEAM, 1, "Org rule"),
-            Scope::Personal => upsert_block(acc, Scope::Personal, SET, 1, "My rule"),
-        };
-
-        for (first, second) in [
-            (Scope::Team, Scope::Personal),
-            (Scope::Personal, Scope::Team),
-        ] {
-            let out = apply(&apply(user, first), second);
-            assert!(
-                out.starts_with(user),
-                "user bytes preserved ({first:?} then {second:?})"
-            );
-            assert!(out.contains(&team_block), "team block intact");
-            assert!(out.contains(&personal_block), "personal block intact");
-
-            // Updating one scope must not disturb the other's bytes.
-            let bumped = upsert_block(&out, Scope::Team, TEAM, 2, "Org rule v2");
-            assert!(
-                bumped.contains(&personal_block),
-                "personal survives a team bump"
-            );
-            assert!(!bumped.contains(&team_block), "team block was replaced");
-        }
-    }
-
-    /// The separator `remove_block` eats is exactly the one this scope's append added, so an
-    /// adjacent block from the other scope comes out as its own append left it.
-    #[test]
-    fn removing_one_scope_leaves_an_adjacent_block_intact() {
-        let user = "# Mine\nAlways run tests.\n";
-        let team_only = upsert_block(user, Scope::Team, TEAM, 1, "Org rule");
-        let personal_only = upsert_block(user, Scope::Personal, SET, 1, "My rule");
-        let both = upsert_block(&team_only, Scope::Personal, SET, 1, "My rule");
-
-        assert_eq!(
-            remove_block(&both, Scope::Personal).expect("personal block present"),
-            team_only,
-            "removing personal must restore the team-only file byte-for-byte"
-        );
-        assert_eq!(
-            remove_block(&both, Scope::Team).expect("team block present"),
-            personal_only,
-            "removing team must leave the personal file as its own append would write it"
-        );
-        // Removing both, in either order, gets the user's own file back.
-        let neither = remove_block(&remove_block(&both, Scope::Team).unwrap(), Scope::Personal)
-            .expect("personal block still present");
-        assert_eq!(neither, user);
-    }
-
-    /// The same invariant when the FILE ITSELF is ours: Toolport created it (the client had no
-    /// rules file), one scope appended after the other, and now the first scope leaves. The
-    /// survivor must look exactly as a lone append into an absent file would have written it,
-    /// with no leftover leading blank line. A block at offset 0 has no preceding separator, so
-    /// this is the case the generic separator rule cannot reach.
-    #[test]
-    fn removing_the_leading_scope_from_a_file_we_created_leaves_no_stray_newline() {
-        let personal_alone = upsert_block("", Scope::Personal, SET, 1, "My rule");
-        let team_alone = upsert_block("", Scope::Team, TEAM, 1, "Org rule");
-
-        // Team created the file, personal appended. Team leaves.
-        let team_then_personal = upsert_block(&team_alone, Scope::Personal, SET, 1, "My rule");
-        assert_eq!(
-            remove_block(&team_then_personal, Scope::Team).expect("team block present"),
-            personal_alone
-        );
-
-        // And the mirror image.
-        let personal_then_team = upsert_block(&personal_alone, Scope::Team, TEAM, 1, "Org rule");
-        assert_eq!(
-            remove_block(&personal_then_team, Scope::Personal).expect("personal block present"),
-            team_alone
-        );
-
-        // Removing the LAST one still empties the file, so `remove_recorded` deletes it.
-        assert!(remove_block(&personal_alone, Scope::Personal)
-            .expect("block present")
-            .trim()
-            .is_empty());
-    }
-
-    #[test]
-    fn a_scope_does_not_see_the_other_scopes_block() {
-        let personal_only = upsert_block("user\n", Scope::Personal, SET, 1, "My rule");
-        assert_eq!(remove_block(&personal_only, Scope::Team), None);
-        assert!(!block_is_current(
-            &personal_only,
-            Scope::Team,
-            TEAM,
-            1,
-            "My rule"
-        ));
-    }
-
     // ---- filesystem-level apply/remove ----
 
     use std::path::PathBuf;
@@ -941,8 +700,8 @@ mod tests {
 
         let s = Scratch::new();
         let t = owned_target(
-            s.path("rules").join(Scope::Personal.owned_file_name()),
-            Scope::Personal,
+            s.path("rules").join(Scope::Team.owned_file_name()),
+            Scope::Team,
         );
         assert_eq!(write_target(&t, "work", 1, "My rule"), ApplyState::Applied);
         let before = std::fs::metadata(&t.path).unwrap().modified().unwrap();
@@ -1058,115 +817,6 @@ mod tests {
         assert!(!block.path.exists());
     }
 
-    /// The guard spans every scope, not just the writing one. Personal content carrying a TEAM
-    /// START marker, appended before the real team block, would make the team's `find_block` span
-    /// the personal block and swallow it on the next org sync.
-    #[test]
-    fn content_carrying_the_other_scopes_markers_is_refused() {
-        let s = Scratch::new();
-        let personal = block_target(s.path("AGENTS.md"), Scope::Personal);
-        assert_eq!(
-            write_target(
-                &personal,
-                SET,
-                1,
-                &format!("evil {SENTINEL_START_PREFIX} x -->")
-            ),
-            ApplyState::Error
-        );
-        assert_eq!(
-            write_target(&personal, SET, 1, &format!("evil {SENTINEL_END} tail")),
-            ApplyState::Error
-        );
-        assert!(!personal.path.exists());
-
-        let team = block_target(s.path("team-AGENTS.md"), Scope::Team);
-        assert_eq!(
-            write_target(
-                &team,
-                TEAM,
-                1,
-                &format!("evil {PERSONAL_SENTINEL_START_PREFIX} x -->")
-            ),
-            ApplyState::Error
-        );
-        assert_eq!(
-            write_target(
-                &team,
-                TEAM,
-                1,
-                &format!("evil {PERSONAL_SENTINEL_END} tail")
-            ),
-            ApplyState::Error
-        );
-        assert!(!team.path.exists());
-    }
-
-    /// A shared file holding BOTH scopes: cleaning up one leaves the other and the user's own
-    /// bytes untouched, and the "delete when only whitespace remains" rule does not fire while the
-    /// other scope's block is still there.
-    #[test]
-    fn remove_recorded_is_scope_exact_in_a_shared_file() {
-        let s = Scratch::new();
-        let path = s.path("AGENTS.md");
-        let user = "# Mine\nAlways run tests.\n";
-        std::fs::write(&path, user).unwrap();
-        let team = block_target(path.clone(), Scope::Team);
-        let personal = block_target(path.clone(), Scope::Personal);
-        assert_eq!(
-            write_target(&team, TEAM, 1, "Org rule"),
-            ApplyState::Applied
-        );
-        assert_eq!(
-            write_target(&personal, SET, 1, "My rule"),
-            ApplyState::Applied
-        );
-
-        // Leaving the team strips only the org block; the personal one still applies.
-        remove_recorded(&path, Scope::Team);
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert!(after.starts_with(user), "user bytes preserved");
-        assert!(!after.contains(SENTINEL_START_PREFIX), "team block gone");
-        assert!(after.contains("My rule"), "personal block survives");
-        assert_eq!(
-            current_state(&personal, SET, 1, "My rule"),
-            ApplyState::Applied
-        );
-
-        // Dropping the personal set too takes the file back to the user's own content.
-        remove_recorded(&path, Scope::Personal);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), user);
-    }
-
-    /// Owned files are per-scope paths, so a personal cleanup must never delete the team file.
-    #[test]
-    fn remove_recorded_does_not_cross_scopes_on_owned_files() {
-        let s = Scratch::new();
-        let dir = s.path("rules");
-        let team = owned_target(dir.join(Scope::Team.owned_file_name()), Scope::Team);
-        let personal = owned_target(dir.join(Scope::Personal.owned_file_name()), Scope::Personal);
-        assert_eq!(
-            write_target(&team, TEAM, 1, "Org rule"),
-            ApplyState::Applied
-        );
-        assert_eq!(
-            write_target(&personal, SET, 1, "My rule"),
-            ApplyState::Applied
-        );
-        assert_ne!(team.path, personal.path, "scopes must own different files");
-
-        // Pointing a personal cleanup at the TEAM file is a no-op: the header prefix is not ours.
-        remove_recorded(&team.path, Scope::Personal);
-        assert!(
-            team.path.exists(),
-            "team file must survive a personal cleanup"
-        );
-
-        remove_recorded(&personal.path, Scope::Personal);
-        assert!(!personal.path.exists());
-        assert!(team.path.exists(), "team file untouched throughout");
-    }
-
     #[test]
     fn cap_counts_the_whole_rendered_file_not_just_content() {
         let s = Scratch::new();
@@ -1184,53 +834,6 @@ mod tests {
         assert_eq!(write_target(&t, TEAM, 1, "tiny"), ApplyState::TooLong);
         // The user's file must be left exactly as it was.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "x".repeat(40));
-    }
-
-    /// The cap counts the OTHER scope's block too. A personal set that fits on its own can still
-    /// tip a Windsurf file over once the org block is in there, and must report `TooLong` rather
-    /// than write a file the client silently truncates.
-    #[test]
-    fn the_cap_counts_the_other_scopes_block_too() {
-        let s = Scratch::new();
-        let path = s.path("global_rules.md");
-        let cap = 400;
-        let team = Target {
-            path: path.clone(),
-            strategy: Strategy::SentinelBlock,
-            scope: Scope::Team,
-            char_cap: Some(cap),
-            blocked_if_present: None,
-        };
-        let personal = Target {
-            path: path.clone(),
-            strategy: Strategy::SentinelBlock,
-            scope: Scope::Personal,
-            char_cap: Some(cap),
-            blocked_if_present: None,
-        };
-        // Alone, the personal set fits.
-        assert_eq!(
-            current_state(&personal, SET, 1, "My rule"),
-            ApplyState::Stale
-        );
-        // With the org block present, the same personal set no longer does.
-        assert_eq!(
-            write_target(&team, TEAM, 1, &"o".repeat(cap - 120)),
-            ApplyState::Applied
-        );
-        assert_eq!(
-            write_target(&personal, SET, 1, "My rule"),
-            ApplyState::TooLong
-        );
-        assert_eq!(
-            current_state(&personal, SET, 1, "My rule"),
-            ApplyState::TooLong
-        );
-        // Nothing was written: the org block is still exactly as it was.
-        assert_eq!(
-            current_state(&team, TEAM, 1, &"o".repeat(cap - 120)),
-            ApplyState::Applied
-        );
     }
 
     #[test]
@@ -1270,73 +873,6 @@ mod tests {
         );
     }
 
-    /// SBS-1036: drift is "our block, our id, our version, not our body". Everything else is
-    /// somebody else's business or an ordinary stale write.
-    #[test]
-    fn drifted_body_is_only_a_hand_edit_of_the_current_revision() {
-        let s = Scratch::new();
-        let personal = Scope::Personal;
-        // Sentinel: write v2, then edit the body by hand inside the markers.
-        let block = block_target(s.path("AGENTS.md"), personal);
-        std::fs::write(&block.path, "# mine\n").unwrap();
-        assert_eq!(
-            write_target(&block, "set", 2, "Be brief."),
-            ApplyState::Applied
-        );
-        assert_eq!(
-            drifted_body(&block, "set", 2, "Be brief."),
-            None,
-            "identical is not drift"
-        );
-        let on_disk = std::fs::read_to_string(&block.path).unwrap();
-        std::fs::write(
-            &block.path,
-            on_disk.replace("Be brief.", "Be brief.\nAnd kind."),
-        )
-        .unwrap();
-        assert_eq!(
-            drifted_body(&block, "set", 2, "Be brief.").as_deref(),
-            Some("Be brief.\nAnd kind.")
-        );
-        assert_eq!(
-            current_state(&block, "set", 2, "Be brief."),
-            ApplyState::Stale
-        );
-        // The same file seen from a newer revision of the set is an unapplied change, not drift.
-        assert_eq!(drifted_body(&block, "set", 3, "Be brief."), None);
-        // And from another set it is that set's stale write.
-        assert_eq!(drifted_body(&block, "other", 2, "Be brief."), None);
-        // No block at all is not drift.
-        std::fs::write(&block.path, "# mine\n").unwrap();
-        assert_eq!(drifted_body(&block, "set", 2, "Be brief."), None);
-
-        // Owned file: same rules, body is everything under the header.
-        let owned = owned_target(s.path("toolport-rules.md"), personal);
-        assert_eq!(
-            write_target(&owned, "set", 1, "Run tests.\n"),
-            ApplyState::Applied
-        );
-        assert_eq!(drifted_body(&owned, "set", 1, "Run tests."), None);
-        let on_disk = std::fs::read_to_string(&owned.path).unwrap();
-        std::fs::write(
-            &owned.path,
-            on_disk.replace("Run tests.", "Run tests twice."),
-        )
-        .unwrap();
-        assert_eq!(
-            drifted_body(&owned, "set", 1, "Run tests.").as_deref(),
-            Some("Run tests twice.")
-        );
-        assert_eq!(
-            drifted_body(&owned, "set", 2, "Run tests."),
-            None,
-            "newer revision: stale, not drift"
-        );
-        // A file that is not ours at all (no header) is not drift either.
-        std::fs::write(&owned.path, "somebody else's file\n").unwrap();
-        assert_eq!(drifted_body(&owned, "set", 1, "Run tests."), None);
-    }
-
     #[test]
     fn current_state_reports_too_long() {
         let s = Scratch::new();
@@ -1362,122 +898,40 @@ mod tests {
             remove_recorded(&path, Scope::Team),
             "nothing of ours to clean"
         );
-        assert!(remove_recorded(&path, Scope::Personal));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), foreign);
-    }
-
-    /// Team and personal share one file for every sentinel client, and both writers read it then
-    /// write it back. Unserialized, each would write back only its own block and the later write
-    /// would drop the other's. Run over many rounds because a single interleaving may not race.
-    #[test]
-    fn concurrent_team_and_personal_writes_both_survive() {
-        let s = Scratch::new();
-        for round in 0..200 {
-            let path = s.path(&format!("AGENTS-{round}.md"));
-            let user = "# Mine\nkeep me\n";
-            std::fs::write(&path, user).unwrap();
-
-            let team = block_target(path.clone(), Scope::Team);
-            let personal = block_target(path.clone(), Scope::Personal);
-            std::thread::scope(|scope| {
-                scope.spawn(|| {
-                    write_target(&team, TEAM, 1, "Org rule");
-                });
-                scope.spawn(|| {
-                    write_target(&personal, SET, 1, "My rule");
-                });
-            });
-
-            let after = std::fs::read_to_string(&path).unwrap();
-            assert!(
-                after.starts_with(user),
-                "round {round}: user bytes preserved"
-            );
-            assert!(after.contains("Org rule"), "round {round}: team block lost");
-            assert!(
-                after.contains("My rule"),
-                "round {round}: personal block lost"
-            );
-        }
-    }
-
-    /// Same shared file, but one writer is removing while the other writes. Stripping a span is
-    /// read-modify-write too, so it needs the same serialization.
-    #[test]
-    fn a_concurrent_remove_does_not_swallow_the_other_scopes_write() {
-        let s = Scratch::new();
-        for round in 0..200 {
-            let path = s.path(&format!("AGENTS-rm-{round}.md"));
-            let user = "# Mine\nkeep me\n";
-            std::fs::write(&path, user).unwrap();
-
-            let team = block_target(path.clone(), Scope::Team);
-            let personal = block_target(path.clone(), Scope::Personal);
-            // Fixture: both blocks present, then the team leaves while personal re-applies.
-            write_target(&team, TEAM, 1, "Org rule");
-            write_target(&personal, SET, 1, "My rule");
-
-            std::thread::scope(|scope| {
-                scope.spawn(|| {
-                    remove_recorded(&path, Scope::Team);
-                });
-                scope.spawn(|| {
-                    write_target(&personal, SET, 2, "My rule v2");
-                });
-            });
-
-            // Serialized, BOTH orders converge on the same end state, so this is deterministic:
-            // remove-then-write leaves user + personal v2; write-then-remove writes personal v2
-            // and then strips the team span from it. Either way the team block is gone and the
-            // new personal block is there. Unserialized, one of the two is lost.
-            let after = std::fs::read_to_string(&path).unwrap();
-            assert!(
-                after.starts_with(user),
-                "round {round}: user bytes preserved"
-            );
-            assert!(
-                after.contains("My rule v2"),
-                "round {round}: the personal write was swallowed by the team removal"
-            );
-            assert!(
-                !after.contains(SENTINEL_START_PREFIX),
-                "round {round}: the removed team block came back"
-            );
-        }
     }
 
     #[test]
     fn is_present_answers_only_whether_something_of_ours_is_there() {
         let s = Scratch::new();
         let absent = s.path("nope.md");
-        assert!(!is_present(&absent, Scope::Personal));
+        assert!(!is_present(&absent, Scope::Team));
 
         // A file that is entirely someone else's.
         let foreign = s.path("theirs.md");
         std::fs::write(&foreign, "# mine\n").unwrap();
-        assert!(!is_present(&foreign, Scope::Personal));
+        assert!(!is_present(&foreign, Scope::Team));
 
-        // Our block, and the other scope's block, are told apart.
-        let shared = block_target(s.path("AGENTS.md"), Scope::Personal);
-        write_target(&shared, SET, 1, "My rule");
-        assert!(is_present(&shared.path, Scope::Personal));
-        assert!(
-            !is_present(&shared.path, Scope::Team),
-            "a personal block is not a team block"
-        );
+        // Our block is present once written.
+        let shared = block_target(s.path("AGENTS.md"), Scope::Team);
+        write_target(&shared, TEAM, 1, "Org rule");
+        assert!(is_present(&shared.path, Scope::Team));
 
         // Presence does not care whether the content is current, unlike `current_state`.
         assert_eq!(
-            current_state(&shared, SET, 2, "My rule"),
+            current_state(&shared, TEAM, 2, "Org rule"),
             ApplyState::Stale,
             "fixture: a newer revision is not applied"
         );
-        assert!(is_present(&shared.path, Scope::Personal));
+        assert!(is_present(&shared.path, Scope::Team));
 
         // Owned files are recognised by their header.
-        let owned = owned_target(s.path("rules").join("toolport-rules.md"), Scope::Personal);
-        write_target(&owned, SET, 1, "My rule");
-        assert!(is_present(&owned.path, Scope::Personal));
+        let owned = owned_target(
+            s.path("rules").join(Scope::Team.owned_file_name()),
+            Scope::Team,
+        );
+        write_target(&owned, TEAM, 1, "Org rule");
+        assert!(is_present(&owned.path, Scope::Team));
     }
 
     /// The return value is what lets a caller keep a path on record when cleanup did not actually
@@ -1488,15 +942,12 @@ mod tests {
         let s = Scratch::new();
 
         // Absent file: nothing of ours can be there.
-        assert!(remove_recorded(
-            &s.path("never-existed.md"),
-            Scope::Personal
-        ));
+        assert!(remove_recorded(&s.path("never-existed.md"), Scope::Team));
 
         // A real removal.
-        let t = block_target(s.path("AGENTS.md"), Scope::Personal);
-        write_target(&t, SET, 1, "My rule");
-        assert!(remove_recorded(&t.path, Scope::Personal));
+        let t = block_target(s.path("AGENTS.md"), Scope::Team);
+        write_target(&t, TEAM, 1, "Org rule");
+        assert!(remove_recorded(&t.path, Scope::Team));
         assert!(!t.path.exists());
 
         // A START marker with no END: hand-mangled, our marker is still in the file, and we must
@@ -1504,15 +955,15 @@ mod tests {
         let mangled = s.path("mangled.md");
         std::fs::write(
             &mangled,
-            format!("{PERSONAL_SENTINEL_START_PREFIX} set=x v=1 -->\nrules, no end marker\n"),
+            format!("{SENTINEL_START_PREFIX} team=x v=1 -->\nrules, no end marker\n"),
         )
         .unwrap();
         assert!(
-            !remove_recorded(&mangled, Scope::Personal),
+            !remove_recorded(&mangled, Scope::Team),
             "a marker we could not remove must not be reported as gone"
         );
         assert!(std::fs::read_to_string(&mangled)
             .unwrap()
-            .contains(PERSONAL_SENTINEL_START_PREFIX));
+            .contains(SENTINEL_START_PREFIX));
     }
 }

@@ -7,7 +7,6 @@ export type View =
   | "activity"
   | "catalog"
   | "playground"
-  | "rules"
   | "hooks"
   | "teams"
   | "settings";
@@ -617,14 +616,7 @@ export interface TeamConnection {
 
 /** Per-client on-disk state of the org Team Instructions (spec W4/W5). */
 export type InstructionsApplyState =
-  | "applied"
-  | "stale"
-  | "blocked_override"
-  | "too_long"
-  | "unsupported"
-  | "error"
-  /** Toolport wrote this block for the current set revision and it was edited on disk since (personal rules only). */
-  | "drifted";
+  "applied" | "stale" | "blocked_override" | "too_long" | "unsupported" | "error";
 
 export interface InstructionsClientStatus {
   id: string;
@@ -637,97 +629,6 @@ export interface InstructionsStatusView {
   content: string;
   version: number;
   clients: InstructionsClientStatus[];
-}
-
-/**
- * One of the user's own named rule sets (SBS-821). `revision` moves only when `content` changes,
- * because it rides in the marker written into each client's file.
- */
-export interface RuleSet {
-  id: string;
-  name: string;
-  content: string;
-  revision: number;
-}
-
-/**
- * One client's row in the Rules tab. Reuses {@link InstructionsApplyState}: personal rules and
- * team instructions run through the same writer, so the states (and their badges) are identical.
- */
-export interface RulesClientStatus {
-  id: string;
-  name: string;
-  /** User opt-in. A client is off until turned on; nothing is written to it until then. */
-  enabled: boolean;
-  /** Absent when this client has no global-rules file Toolport can manage (Cursor, Warp). */
-  path?: string;
-  /**
-   * No global rules file, but the client reads one of the files the Projects section writes
-   * (Cursor, GitHub Copilot CLI), so the UI points at Projects instead of "unsupported".
-   */
-  projectCovered?: boolean;
-  state: InstructionsApplyState;
-  /** When `state` is `drifted`: the block's body as it is on disk, for the diff and Pull into set. */
-  onDisk?: string;
-}
-
-/** One file Toolport can write in a registered project folder, and its state there (SBS-1037). */
-export interface RulesProjectFileStatus {
-  key: string;
-  relPath: string;
-  path: string;
-  /** Display names of the detected clients that read this file in a project. */
-  clients: string[];
-  enabled: boolean;
-  state: InstructionsApplyState;
-  onDisk?: string;
-}
-
-/** One registered project folder for project-level rules (SBS-1037). */
-export interface RulesProjectStatus {
-  id: string;
-  path: string;
-  name: string;
-  setId?: string;
-  files: RulesProjectFileStatus[];
-}
-
-/** Everything the Rules tab renders, from one `rules_view` call. */
-export interface RulesView {
-  sets: RuleSet[];
-  activeSetId?: string;
-  clients: RulesClientStatus[];
-  projects: RulesProjectStatus[];
-}
-
-/** A dry run of one client's write, shown before the first apply. Nothing is written to get it. */
-export interface RulesPreview {
-  clientId: string;
-  path: string;
-  /** `ownedFile` = Toolport owns the file; `sentinelBlock` = it owns only the marked span. */
-  strategy: "ownedFile" | "sentinelBlock";
-  before: string;
-  after: string;
-  state: InstructionsApplyState;
-}
-
-/** A rules file already on this machine that a new set can start from (SBS-1035). */
-export interface RulesImportCandidate {
-  clientId: string;
-  clientName: string;
-  path: string;
-  bytes: number;
-}
-
-/**
- * What importing a file yields: the user's own text with anything Toolport wrote removed. Nothing
- * is saved by the import and the source file is not touched; the UI seeds a draft with it.
- */
-export interface RulesImportedFile {
-  path: string;
-  name: string;
-  content: string;
-  strippedOurs: boolean;
 }
 
 export function activeProfile(registry: Registry): Profile | undefined {

@@ -6,7 +6,6 @@ import {
   ClipboardList,
   Compass,
   ExternalLink,
-  FileText,
   FlaskConical,
   FolderOpen,
   Layers,
@@ -577,9 +576,6 @@ export function AppSidebar({
           )}
           {navItem(ScrollText, "Activity", view === "activity", () =>
             onSelectView("activity"),
-          )}
-          {navItem(FileText, "Agent rules", view === "rules", () =>
-            onSelectView("rules"),
           )}
           {navItem(Activity, "Agent activity", view === "hooks", () =>
             onSelectView("hooks"),
