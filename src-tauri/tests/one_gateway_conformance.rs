@@ -565,13 +565,20 @@ impl Drop for AdapterClient {
 
 /// A downstream `mock-mcp-server` registry entry with a transcript, so cases
 /// can count real downstream launches by counting `initialize` lines.
+///
+/// The transcript path is also passed as the one argument. `mock-mcp-server`
+/// ignores argv, but the path puts this case's scratch directory into every
+/// child's command line, which is what lets [`mock_child_process_count`] count
+/// only the children this case launched. Without it the count is machine-wide
+/// and a concurrent run in another worktree (or a leaked child from an earlier
+/// test binary) shifts it out from under the delta assertion.
 fn mock_server_entry(id: &str, transcript: &Path, cwd: Option<&str>) -> ServerEntry {
     ServerEntry {
         id: id.to_string(),
         name: format!("Mock {id}"),
         transport: "stdio".to_string(),
         command: Some(env!("CARGO_BIN_EXE_mock-mcp-server").to_string()),
-        args: vec![],
+        args: vec![transcript.display().to_string()],
         env: vec![EnvVar {
             key: "MOCK_MCP_TRANSCRIPT".to_string(),
             value: Some(transcript.display().to_string()),
@@ -785,10 +792,19 @@ fn daemon_process_count() -> usize {
         .count()
 }
 
-fn mock_child_process_count() -> usize {
+/// Live `mock-mcp-server` children launched for THIS case, recognized by the
+/// scratch directory in their command line (see [`mock_server_entry`]).
+///
+/// Counting every `mock-mcp-server` on the machine also sees children from a
+/// concurrent run in another worktree and children leaked by an earlier test
+/// binary that are still exiting. A delta assertion on that count then fails
+/// for processes the case never launched, which is what made the pooling rows
+/// flake under load.
+fn mock_child_process_count(dir: &Path) -> usize {
+    let needle = dir.to_string_lossy();
     process_command_lines()
         .iter()
-        .filter(|line| line.contains("mock-mcp-server"))
+        .filter(|line| line.contains("mock-mcp-server") && line.contains(needle.as_ref()))
         .count()
 }
 
@@ -1227,7 +1243,7 @@ fn matrix_pooling_sessions_share_one_downstream_child() {
         vec![mock_server_entry("mock", &transcript, None)],
         vec![],
     );
-    let before = mock_child_process_count();
+    let before = mock_child_process_count(&dir);
 
     let mut clients: Vec<AdapterClient> = (0..3)
         .map(|_| spawn_adapter(&dir, &AdapterOptions::default()))
@@ -1250,7 +1266,7 @@ fn matrix_pooling_sessions_share_one_downstream_child() {
     // both as live processes and as initialize lines in the child's transcript.
     assert_eq!(transcript_initialize_count(&transcript), 1);
     assert_eq!(
-        mock_child_process_count().saturating_sub(before),
+        mock_child_process_count(&dir).saturating_sub(before),
         1,
         "three sessions on one ordinary stdio server must share one child; \
          matching processes:\n{}",
@@ -1697,7 +1713,7 @@ fn matrix_pooling_root_sharding_two_roots_two_children() {
         vec![mock_server_entry("mock", &transcript, Some("${ROOT}"))],
         vec![],
     );
-    let before = mock_child_process_count();
+    let before = mock_child_process_count(&dir);
 
     let options = |root: PathBuf| AdapterOptions {
         roots: vec![root],
@@ -1733,7 +1749,7 @@ fn matrix_pooling_root_sharding_two_roots_two_children() {
     // Two distinct roots, two children; the third session shares A's child.
     assert_eq!(transcript_initialize_count(&transcript), 2);
     assert_eq!(
-        mock_child_process_count().saturating_sub(before),
+        mock_child_process_count(&dir).saturating_sub(before),
         2,
         "two distinct roots must shard into two downstream children; \
          matching processes:\n{}",
@@ -2164,7 +2180,7 @@ fn matrix_pooling_unused_root_launch_exits_while_another_root_stays_live() {
         vec![mock_server_entry("mock", &transcript, Some("${ROOT}"))],
         vec![],
     );
-    let before = mock_child_process_count();
+    let before = mock_child_process_count(&dir);
     let mut a = spawn_adapter(
         &dir,
         &AdapterOptions {
@@ -2185,12 +2201,12 @@ fn matrix_pooling_unused_root_launch_exits_while_another_root_stays_live() {
     let b_pwd = b.wait_for_tool("__pwd", Duration::from_secs(30));
     a.call_tool(&a_pwd, json!({}));
     b.call_tool(&b_pwd, json!({}));
-    assert_eq!(mock_child_process_count().saturating_sub(before), 2);
+    assert_eq!(mock_child_process_count(&dir).saturating_sub(before), 2);
 
     a.close_stdin();
     assert!(a.wait_exit(Duration::from_secs(10)).success());
     let deadline = Instant::now() + Duration::from_secs(10);
-    while mock_child_process_count().saturating_sub(before) > 1 {
+    while mock_child_process_count(&dir).saturating_sub(before) > 1 {
         assert!(
             Instant::now() < deadline,
             "unused root child stayed live:\n{}",
@@ -2222,7 +2238,7 @@ fn matrix_pooling_root_views_keep_one_ordinary_child() {
         ],
         vec![],
     );
-    let before = mock_child_process_count();
+    let before = mock_child_process_count(&dir);
     let mut a = spawn_adapter(
         &dir,
         &AdapterOptions {
@@ -2250,7 +2266,7 @@ fn matrix_pooling_root_views_keep_one_ordinary_child() {
     }
     assert_eq!(transcript_initialize_count(&ordinary_log), 1);
     assert_eq!(transcript_initialize_count(&rooted_log), 2);
-    assert_eq!(mock_child_process_count().saturating_sub(before), 3);
+    assert_eq!(mock_child_process_count(&dir).saturating_sub(before), 3);
 }
 
 #[test]
@@ -2266,7 +2282,7 @@ fn matrix_pooling_secret_generation_retires_the_old_root_launch() {
         vec![mock_server_entry("mock", &transcript, Some("${ROOT}"))],
         vec![],
     );
-    let before = mock_child_process_count();
+    let before = mock_child_process_count(&dir);
     let mut client = spawn_adapter(
         &dir,
         &AdapterOptions {
@@ -2297,7 +2313,7 @@ fn matrix_pooling_secret_generation_retires_the_old_root_launch() {
         "replacement child must remain callable"
     );
     let settled = Instant::now() + Duration::from_secs(10);
-    while mock_child_process_count().saturating_sub(before) != 1 {
+    while mock_child_process_count(&dir).saturating_sub(before) != 1 {
         assert!(
             Instant::now() < settled,
             "root launch did not settle to one live child: {}\n{}",

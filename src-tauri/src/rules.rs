@@ -2287,6 +2287,14 @@ mod tests {
     #[test]
     fn concurrent_applies_leave_the_active_sets_bytes_on_disk() {
         let _dirs = crate::registry::data_dir_test_lock();
+        // Two writers deliberately contend on the registry lock, and each apply
+        // holds it across `save_to`'s fsyncs. The test exists to prove the
+        // invariant "the active set's bytes are the bytes on disk", not to fit a
+        // latency budget, so it takes the concurrency-test budget rather than the
+        // 5s production deadline a loaded machine can exceed (SBS-895). Measured
+        // on devbox: with six concurrent fsync writers, 27 of 30 runs hit the 5s
+        // deadline; idle, 60 of 60 passed.
+        let _lock_budget = crate::registry::LockTimeoutOverride::generous();
         let s = Scratch::new();
         let _data_dir = crate::registry::DataDirOverride::set(s.path("data"));
 
