@@ -4436,17 +4436,38 @@ fn patch_yaml_map(
 }
 
 // Keep unchanged Continue list items verbatim, including native annotations.
+fn yaml_list_indent(span: &str) -> Option<String> {
+    for line in span.split_inclusive('\n').skip(1) {
+        let content = line.trim_start();
+        if content.trim().is_empty() || content.starts_with('#') {
+            continue;
+        }
+        if content.starts_with("- ") || content.trim_end() == "-" {
+            return Some(line[..line.len() - content.len()].to_string());
+        }
+        break;
+    }
+    None
+}
+
 fn yaml_list_nodes(span: &str, values: &[serde_yaml::Value]) -> Option<(String, Vec<String>)> {
     let (_, body) = span.split_once('\n')?;
-    let indent = yaml_child_indent(span);
-    let body = body.split_inclusive('\n').map(|line| line.strip_prefix(&indent).unwrap_or(line)).collect::<String>();
+    let indent = yaml_list_indent(span)?;
+    let body = body
+        .split_inclusive('\n')
+        .map(|line| line.strip_prefix(&indent).unwrap_or(line))
+        .collect::<String>();
     let mut starts = Vec::new();
     let mut offset = 0;
     for line in body.split_inclusive('\n') {
-        if line.starts_with("- ") || line.trim_end() == "-" { starts.push(offset); }
+        if line.starts_with("- ") || line.trim_end() == "-" {
+            starts.push(offset);
+        }
         offset += line.len();
     }
-    if starts.len() != values.len() { return None; }
+    if starts.len() != values.len() {
+        return None;
+    }
     let prefix = body[..starts.first().copied().unwrap_or(body.len())].to_string();
     let mut nodes = Vec::new();
     for (index, start) in starts.iter().enumerate() {
@@ -4455,28 +4476,55 @@ fn yaml_list_nodes(span: &str, values: &[serde_yaml::Value]) -> Option<(String, 
     Some((prefix, nodes))
 }
 
-fn patch_yaml_list(span: &str, before: &[serde_yaml::Value], after: &[serde_yaml::Value], seed: Option<(&str, &[serde_yaml::Value])>) -> Result<Option<String>, String> {
-    let Some((prefix, nodes)) = yaml_list_nodes(span, before) else { return Ok(None); };
-    let seed = seed.and_then(|(span, values)| yaml_list_nodes(span, values).map(|(_, nodes)| (values, nodes)));
+fn patch_yaml_list(
+    span: &str,
+    before: &[serde_yaml::Value],
+    after: &[serde_yaml::Value],
+    seed: Option<(&str, &[serde_yaml::Value])>,
+) -> Result<Option<String>, String> {
+    if after.is_empty() {
+        return Ok(None);
+    }
+    let Some((prefix, nodes)) = yaml_list_nodes(span, before) else {
+        return Ok(None);
+    };
+    let seed = seed
+        .and_then(|(span, values)| yaml_list_nodes(span, values).map(|(_, nodes)| (values, nodes)));
     let header = span.split_once('\n').unwrap().0;
     let mut body = prefix;
     let mut used = std::collections::BTreeSet::new();
     for value in after {
-        let raw = before.iter().enumerate().find(|(index, item)| !used.contains(index) && *item == value).map(|(index, _)| { used.insert(index); nodes[index].clone() })
-            .or_else(|| seed.as_ref().and_then(|(values, nodes)| values.iter().position(|item| item == value).map(|index| nodes[index].clone())));
-        if !body.is_empty() && !body.ends_with('\n') { body.push('\n'); }
-        body.push_str(&match raw { Some(raw) => raw, None => serde_yaml::to_string(&vec![value]).map_err(|e| e.to_string())? });
-    }
-    let indent = yaml_child_indent(span);
-    let mut output = format!("{header}\n");
-    if after.is_empty() {
-        output.push_str(&body);
-        output = format!("{} []\n", header.split(':').next().unwrap_or("mcpServers"));
-    } else {
-        for line in body.split_inclusive('\n') {
-            if !line.trim().is_empty() { output.push_str(&indent); }
-            output.push_str(line);
+        let raw = before
+            .iter()
+            .enumerate()
+            .find(|(index, item)| !used.contains(index) && *item == value)
+            .map(|(index, _)| {
+                used.insert(index);
+                nodes[index].clone()
+            })
+            .or_else(|| {
+                seed.as_ref().and_then(|(values, nodes)| {
+                    values
+                        .iter()
+                        .position(|item| item == value)
+                        .map(|index| nodes[index].clone())
+                })
+            });
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
         }
+        body.push_str(&match raw {
+            Some(raw) => raw,
+            None => serde_yaml::to_string(&vec![value]).map_err(|e| e.to_string())?,
+        });
+    }
+    let indent = yaml_list_indent(span).unwrap_or_default();
+    let mut output = format!("{header}\n");
+    for line in body.split_inclusive('\n') {
+        if !line.trim().is_empty() {
+            output.push_str(&indent);
+        }
+        output.push_str(line);
     }
     Ok(Some(output))
 }
@@ -4484,7 +4532,10 @@ fn patch_yaml_list(span: &str, before: &[serde_yaml::Value], after: &[serde_yaml
 fn remove_yaml_key_preserving(original: &str, key: &str) -> Result<String, String> {
     reject_duplicate_top_level_yaml_key(original, key)?;
     let mut output = original.to_string();
-    if let Some((_, start, end)) = top_level_yaml_key_spans(original).into_iter().find(|(name, _, _)| name == key) {
+    if let Some((_, start, end)) = top_level_yaml_key_spans(original)
+        .into_iter()
+        .find(|(name, _, _)| name == key)
+    {
         output.replace_range(start..end, "");
     }
     Ok(output)
@@ -4503,7 +4554,12 @@ fn rewrite_yaml_key_preserving(
     rewrite_yaml_key_preserving_seed(original, key, new_value, None)
 }
 
-fn rewrite_yaml_key_preserving_seed(original: &str, key: &str, new_value: &serde_yaml::Value, seed: Option<&str>) -> Result<String, String> {
+fn rewrite_yaml_key_preserving_seed(
+    original: &str,
+    key: &str,
+    new_value: &serde_yaml::Value,
+    seed: Option<&str>,
+) -> Result<String, String> {
     let spans = top_level_yaml_key_spans(original);
     let hits: Vec<&(String, usize, usize)> = spans.iter().filter(|(k, _, _)| k == key).collect();
     if hits.len() > 1 {
@@ -4523,16 +4579,31 @@ fn rewrite_yaml_key_preserving_seed(original: &str, key: &str, new_value: &serde
             .and_then(|(_, rest)| yaml_value_anchor(rest));
         let before = parse_existing_yaml_content(original)?;
         let patched = match (before.get(key), new_value) {
-            (Some(serde_yaml::Value::Mapping(before)), serde_yaml::Value::Mapping(after)) => patch_yaml_map(span, before, after)?,
+            (Some(serde_yaml::Value::Mapping(before)), serde_yaml::Value::Mapping(after)) => {
+                patch_yaml_map(span, before, after)?
+            }
             (Some(serde_yaml::Value::Sequence(before)), serde_yaml::Value::Sequence(after)) => {
                 let seed_root = seed.map(parse_existing_yaml_content).transpose()?;
-                let seed_span = seed.and_then(|seed| top_level_yaml_key_spans(seed).into_iter().find(|(name, _, _)| name == key).map(|(_, start, end)| &seed[start..end]));
-                let seed = seed_span.zip(seed_root.as_ref().and_then(|root| root.get(key)?.as_sequence()).map(Vec::as_slice));
+                let seed_span = seed.and_then(|seed| {
+                    top_level_yaml_key_spans(seed)
+                        .into_iter()
+                        .find(|(name, _, _)| name == key)
+                        .map(|(_, start, end)| &seed[start..end])
+                });
+                let seed = seed_span.zip(
+                    seed_root
+                        .as_ref()
+                        .and_then(|root| root.get(key)?.as_sequence())
+                        .map(Vec::as_slice),
+                );
                 patch_yaml_list(span, before, after, seed)?
             }
             _ => None,
         };
-        let block = match patched { Some(block) => block, None => format_yaml_key_block(key, new_value, anchor, &yaml_child_indent(span))? };
+        let block = match patched {
+            Some(block) => block,
+            None => format_yaml_key_block(key, new_value, anchor, &yaml_child_indent(span))?,
+        };
         let mut out = String::with_capacity(original.len() + block.len());
         out.push_str(&original[..*start]);
         out.push_str(&block);
