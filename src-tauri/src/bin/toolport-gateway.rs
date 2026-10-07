@@ -18973,7 +18973,6 @@ mod tests {
         // A team injection flag at member Off must withhold results without raising the level.
         let mut reg = Registry::default();
         reg.set_safety_level(registry::SafetyLevel::Off);
-        reg.content_defense = false;
         conduit_lib::teams::apply_team_config(
             &mut reg,
             "t1",
