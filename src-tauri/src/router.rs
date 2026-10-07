@@ -1199,11 +1199,16 @@ impl Router {
                 let Some((server_id, orig)) = self.routes.get(exposed) else {
                     return Ok(());
                 };
-                let definition = self
-                    .tools
-                    .iter()
-                    .find(|tool| tool.get("name").and_then(Value::as_str) == Some(exposed))
-                    .unwrap_or(&Value::Null);
+                // Only the destructive switch reads the definition; skip the scan
+                // on the common path.
+                let definition = if live.policy.deny_destructive {
+                    self.tools
+                        .iter()
+                        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(exposed))
+                        .unwrap_or(&Value::Null)
+                } else {
+                    &Value::Null
+                };
                 match live
                     .policy
                     .blocked_reason_unscoped(exposed, server_id, orig, definition)
@@ -2180,16 +2185,17 @@ impl Router {
         }
     }
 
-    /// The slot owning `server_id`, as a cloned `Arc` so the caller can lock and
-    /// use it after dropping any borrow of the router (this is what lets the
-    /// downstream call run without holding the router lock).
     /// [`Self::slot_for`] behind [`Self::authorize`], for every dispatch except
-    /// unsubscribe cleanup, which must still reach a server that was turned off.
+    /// cleanup (unsubscribe, task cancel), which must still reach a server that was
+    /// turned off.
     fn authorized_slot(&self, server_id: &str) -> Result<Arc<ServerSlot>, String> {
         self.authorize(DispatchTarget::Server(server_id))?;
         self.slot_for(server_id)
     }
 
+    /// The slot owning `server_id`, as a cloned `Arc` so the caller can lock and
+    /// use it after dropping any borrow of the router (this is what lets the
+    /// downstream call run without holding the router lock).
     fn slot_for(&self, server_id: &str) -> Result<Arc<ServerSlot>, String> {
         self.by_id
             .get(server_id)
@@ -2469,7 +2475,13 @@ impl Router {
             .ok_or_else(|| format!("{method} requires params.taskId"))?
             .to_string();
         let (server_id, native_task_id) = decode_task_id(&exposed)?;
-        let slot = self.authorized_slot(&server_id)?;
+        // Cancelling stops work the server already took on, so like unsubscribe
+        // cleanup it still reaches a server that was turned off since.
+        let slot = if method == "tasks/cancel" {
+            self.slot_for(&server_id)?
+        } else {
+            self.authorized_slot(&server_id)?
+        };
         let mut forwarded = params;
         forwarded["taskId"] = json!(native_task_id);
         let result = self.call_with_retry(
@@ -5932,5 +5944,54 @@ mod tests {
         assert!(snapshot
             .recheck_live_policy(&off, DispatchTarget::Server("db"))
             .is_err());
+    }
+
+    /// P1.3: a task on a server that was just turned off can no longer be polled or
+    /// updated, but it can still be cancelled, like unsubscribe cleanup.
+    #[test]
+    fn task_cancel_still_reaches_a_server_that_was_turned_off() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut router = Router::with_policy(ToolPolicy {
+            servers: Some(HashSet::from(["alpha".to_string()])),
+            ..Default::default()
+        });
+        router.add(task_server("alpha", Arc::clone(&seen)));
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": crate::downstream::MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": { "io.modelcontextprotocol/tasks": {} }
+            }
+        });
+        let started = router
+            .route_call_with_cancel("alpha__job", json!({}), None, Some(&meta))
+            .unwrap();
+        let task_id = started["taskId"].as_str().unwrap();
+
+        let mut policy = router.registry_policy();
+        policy.servers = Some(HashSet::new());
+        assert!(router.apply_registry_policy(policy));
+        for method in ["tasks/get", "tasks/update"] {
+            let err = router
+                .route_task(method, json!({ "taskId": task_id }), None, Some(&meta))
+                .unwrap_err();
+            assert!(
+                err.contains("server 'alpha' is turned off"),
+                "{method}: {err}"
+            );
+        }
+        let cancelled = router
+            .route_task(
+                "tasks/cancel",
+                json!({ "taskId": task_id }),
+                None,
+                Some(&meta),
+            )
+            .unwrap();
+        assert_eq!(cancelled["taskId"], task_id);
+        assert!(seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, _)| method == "tasks/cancel"));
     }
 }
