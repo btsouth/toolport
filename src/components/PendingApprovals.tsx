@@ -70,11 +70,6 @@ const REASON: Record<Reason, { label: string; className: string; Icon: typeof Tr
       className: "bg-destructive/10 text-destructive",
       Icon: ShieldAlert,
     },
-    agent_permission: {
-      label: "Ask first",
-      className: "bg-warning/15 text-warning",
-      Icon: ShieldAlert,
-    },
   };
 
 /**
@@ -257,13 +252,6 @@ export function PendingApprovals() {
                       <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
                         <Monitor className="size-3" />
                         Requested by {a.client}
-                      </div>
-                    )}
-                    {a.agentRule && (
-                      <div className="mt-1 text-xs text-muted-foreground">
-                        Your rule{" "}
-                        <span className="font-mono text-foreground">{a.agentRule}</span>{" "}
-                        asks before this.
                       </div>
                     )}
                   </div>
@@ -450,13 +438,9 @@ export function PendingApprovals() {
                     Never offered for a persistent code write (saving a routine is
                     always a one-shot decision on an exact definition), nor for a PII
                     release: the allow key binds a tool definition, and the broker
-                    deliberately refuses to auto-approve a release on one (SBS-696).
-                    Nor for an agent "ask first" rule: its tool is a class of calls,
-                    and the rule itself is the place to stop asking (SBS-1059).
-                    Offering it here would promise a bypass that never fires. */}
+                    deliberately refuses to auto-approve a release on one (SBS-696). */}
                 {!urlElicitation &&
                   a.reason !== "persistent_code_write" &&
-                  a.reason !== "agent_permission" &&
                   !piiRelease && (
                     <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-muted-foreground">
                       <span>Skip next time?</span>

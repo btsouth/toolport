@@ -12,14 +12,13 @@ use tauri::{AppHandle, Emitter, Listener, Manager, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_notification::NotificationExt;
 
-use crate::agent_guard;
-use crate::agent_permissions;
 use crate::approval;
 use crate::approval_broker;
 use crate::audit;
 use crate::catalog;
 use crate::clients;
 use crate::downstream::{resolve_root_token, DownstreamServer, StdioTransport};
+use crate::guard_cleanup;
 use crate::hooks;
 use crate::http_bridge::{HttpBridge, HttpBridgeState, HttpBridgeStatus};
 use crate::inspect;
@@ -2393,72 +2392,6 @@ async fn rules_apply() -> Result<rules::RulesView, String> {
         .map_err(|e| e.to_string())?
 }
 
-// --- Guard hook for Cursor (SBS-1059) ----------------------------------------------
-
-#[tauri::command]
-async fn agent_guard_view() -> Result<agent_guard::GuardView, String> {
-    tauri::async_runtime::spawn_blocking(agent_guard::view)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn agent_guard_set_cursor_mode(
-    mode: agent_guard::GuardMode,
-) -> Result<agent_guard::GuardView, String> {
-    tauri::async_runtime::spawn_blocking(move || agent_guard::set_cursor_mode(mode))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn agent_guard_preview(
-    mode: agent_guard::GuardMode,
-) -> Result<Option<agent_guard::GuardPreview>, String> {
-    tauri::async_runtime::spawn_blocking(move || agent_guard::preview(mode))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-// --- Native permission policy for Claude Code (SBS-1058) -------------------------
-//
-// Same shape as the hook sensor: every one of these reads or writes an agent settings
-// file, so none runs on the UI thread.
-
-#[tauri::command]
-async fn agent_permissions_view() -> Result<agent_permissions::PermissionsView, String> {
-    tauri::async_runtime::spawn_blocking(agent_permissions::view)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn agent_permissions_set_enabled(
-    enabled: bool,
-) -> Result<agent_permissions::PermissionsView, String> {
-    tauri::async_runtime::spawn_blocking(move || agent_permissions::set_enabled(enabled))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn agent_permissions_set_rules(
-    rules: Vec<agent_permissions::PermissionRule>,
-) -> Result<agent_permissions::PermissionsView, String> {
-    tauri::async_runtime::spawn_blocking(move || agent_permissions::set_rules(rules))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn agent_permissions_preview(
-    rules: Option<Vec<agent_permissions::PermissionRule>>,
-) -> Result<Vec<agent_permissions::PermissionsPreview>, String> {
-    tauri::async_runtime::spawn_blocking(move || agent_permissions::preview(rules))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
 // --- Agent hook sensor (SBS-822) -------------------------------------------
 //
 // Same shape and the same reasons as the rules commands above: every one of these
@@ -4449,13 +4382,6 @@ pub fn run() {
             rules_project_preview,
             rules_import_candidates,
             rules_import_file,
-            agent_guard_view,
-            agent_guard_set_cursor_mode,
-            agent_guard_preview,
-            agent_permissions_view,
-            agent_permissions_set_enabled,
-            agent_permissions_set_rules,
-            agent_permissions_preview,
             hooks_view,
             hooks_set_enabled,
             hooks_preview,
@@ -4675,8 +4601,9 @@ pub fn run() {
                     // no longer exists. Returns immediately when the sensor was never
                     // turned on.
                     hooks::apply_on_startup();
-                    agent_permissions::apply_on_startup();
-                    agent_guard::apply_on_startup();
+                    // One-time removal of the retired agent guard hook entries, then the
+                    // marker file stops it running again.
+                    guard_cleanup::run_once();
                 }
 
                 // Stop obsolete gateway processes. Path-based identity on all OS

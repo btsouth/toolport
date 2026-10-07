@@ -1290,14 +1290,17 @@ pub struct Registry {
     /// written only by an explicit Apply for that project, never at startup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules_projects: Vec<RulesProject>,
+    // 2.0: unused, dropped by the v2 migration.
     /// Cursor guard hook (SBS-1059): how the `--toolport-guard cursor` hook Toolport installs
     /// into `~/.cursor/hooks.json` treats the same permission rules. `Off` = not installed.
     #[serde(default, skip_serializing_if = "GuardMode::is_off")]
     pub guard_cursor_mode: GuardMode,
+    // 2.0: unused, dropped by the v2 migration.
     /// Cursor guard, when enforcing: route an "ask first" rule through Toolport's approval
     /// window instead of Cursor's own prompt (SBS-1059). Off = Cursor prompts.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub guard_cursor_ask_via_toolport: bool,
+    // 2.0: unused, dropped by the v2 migration.
     /// Claude Code guard (SBS-1059): the `--toolport-guard claude-code` PreToolUse hook.
     /// Claude Code enforces deny and allow natively, so this hook's one job is asks:
     /// `Enforce` moves the ask rules it can judge (shell commands, file reads, MCP tools)
@@ -1305,16 +1308,21 @@ pub struct Registry {
     /// hook and records what it would decide; the native rules stay as they are.
     #[serde(default, skip_serializing_if = "GuardMode::is_off")]
     pub guard_claude_mode: GuardMode,
+    // 2.0: unused, dropped by the v2 migration.
     /// Absolute paths of the hooks files the guard has been written into, for exact cleanup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guard_targets: Vec<String>,
+    // 2.0: unused, dropped by the v2 migration.
     /// Native permission policy for Claude Code (SBS-1058): rules in Claude Code's own
-    /// `permissions` syntax that Toolport writes into every profile's `settings.json`. Off
-    /// until the user opts in; nothing is written until then. See [`crate::agent_permissions`].
+    /// `permissions` syntax that Toolport wrote into every profile's `settings.json`.
+    /// The written entries are the user's policy and were left in place when the feature
+    /// was removed in 2.0.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub agent_permissions_enabled: bool,
+    // 2.0: unused, dropped by the v2 migration.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_permission_rules: Vec<PermissionRule>,
+    // 2.0: unused, dropped by the v2 migration.
     /// Per settings file, exactly the rule strings Toolport ADDED there (a rule the user
     /// already had is not added and not recorded, so it is never removed). Removal and
     /// policy changes strip exactly these. Same role as `hook_targets` / `rules_targets`.

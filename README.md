@@ -49,7 +49,7 @@ configuration and policies while each member keeps their own credentials.
 
 - [Supported clients and setup](docs/clients.md)
 - [Profiles, environment variables, and configuration](docs/configuration.md)
-- [Agent rules](docs/agent-rules.md) and [permissions](docs/agent-permissions.md)
+- [Agent rules](docs/agent-rules.md)
 - [Headless gateway and Docker](docs/headless.md)
 - [Arch and Omarchy install (pacman repository)](docs/arch-pacman-repo.md)
 - [Open WebUI](docs/openwebui.md) and [agent plugin](packaging/agent-plugin/toolport/README.md)

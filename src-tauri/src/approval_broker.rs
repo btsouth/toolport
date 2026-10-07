@@ -55,9 +55,6 @@ pub struct PendingView {
     /// approver to look at. Never persisted and never sent anywhere but this local UI.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pii_release: Option<PiiReleaseRequest>,
-    /// The permission rule behind an [`ApprovalReason::AgentPermission`] ask.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_rule: Option<String>,
     /// Wall-clock epoch-millis when this call auto-denies (park time + the fail-closed
     /// timeout). The UI counts down to this exactly, instead of approximating from when
     /// it first saw the request. App and broker share one clock, so it's accurate.
@@ -727,12 +724,7 @@ fn preflight(
     // binds a TOOL definition, and "this tool may run unprompted" is not consent to hand a
     // particular customer's address to a server that never had it. Auto-approving here would
     // let one earlier "always allow" quietly release every future value to that server.
-    // An agent permission ask is excluded too: its "tool" is a class of calls (every
-    // shell command that matches a rule), not one definition an allow key could bind.
-    if req.url_elicitation.is_none()
-        && req.pii_release.is_none()
-        && req.reason != ApprovalReason::AgentPermission
-    {
+    if req.url_elicitation.is_none() && req.pii_release.is_none() {
         if let Some(fp) = req.tool_fingerprint.as_deref() {
             let key = crate::approval::fingerprint_allow_key(&req.server, &req.tool, fp);
             if is_allowed(&key) {
@@ -844,7 +836,6 @@ fn handle_conn(stream: BrokerStream, broker: ApprovalBroker, host: BrokerHost) {
         arguments: req.arguments.clone(),
         url_elicitation: req.url_elicitation.clone(),
         pii_release: req.pii_release.clone(),
-        agent_rule: req.agent_rule.clone(),
         // Stamp the deadline now, right before we park on `recv_timeout` below.
         deadline_ms: deadline_ms_from_now(),
     };
@@ -930,14 +921,6 @@ fn notify_pending(app: &AppHandle, view: &PendingView) {
             format!(
                 "{} requested an external browser interaction. Review it in Toolport.",
                 elicitation.origin
-            ),
-        )
-    } else if let Some(rule) = &view.agent_rule {
-        (
-            "Toolport: approval required",
-            format!(
-                "{} asks before {}: your rule {rule}. Approve or deny it in Toolport.",
-                view.server, view.tool
             ),
         )
     } else {
@@ -1056,7 +1039,6 @@ mod tests {
             arguments: serde_json::json!({}),
             url_elicitation: None,
             pii_release: None,
-            agent_rule: None,
             deadline_ms: deadline_ms_from_now(),
         };
         b.inner
@@ -1245,7 +1227,6 @@ mod tests {
             tool_fingerprint: fingerprint.map(str::to_string),
             url_elicitation: None,
             pii_release: None,
-            agent_rule: None,
         }
     }
 

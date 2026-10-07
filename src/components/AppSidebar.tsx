@@ -18,7 +18,6 @@ import {
   Store,
   Users,
   Zap,
-  ShieldCheck,
 } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
 import { openExternal } from "@/lib/openUrl";
@@ -584,9 +583,6 @@ export function AppSidebar({
           )}
           {navItem(Activity, "Agent activity", view === "hooks", () =>
             onSelectView("hooks"),
-          )}
-          {navItem(ShieldCheck, "Agent permissions", view === "permissions", () =>
-            onSelectView("permissions"),
           )}
           {navItem(Users, "Teams", view === "teams", () => onSelectView("teams"))}
           {navItem(

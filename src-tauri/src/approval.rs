@@ -66,14 +66,6 @@ pub enum ApprovalReason {
     /// "the call fails", so the prompt can only turn a certain failure into a possible
     /// success.
     PiiCrossServer,
-    /// A native agent call (a shell command, a file read, an MCP tool in Cursor or
-    /// Claude Code) matched one of the user's "ask first" permission rules, and the
-    /// agent's guard hook routed the question here instead of to the agent's own
-    /// prompt (SBS-1059). `server` is the agent, `tool` the call kind, and
-    /// [`ApprovalRequest::agent_rule`] names the rule. Never produced by
-    /// [`gate_reason`]; never eligible for an allowlist entry, since the "tool" here is
-    /// a whole class of calls rather than one definition.
-    AgentPermission,
 }
 
 /// A request to release specific pseudonymized values to a server that did not produce them.
@@ -138,10 +130,6 @@ pub struct ApprovalRequest {
     /// Present only for [`ApprovalReason::PiiCrossServer`]; absent for ordinary approvals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pii_release: Option<PiiReleaseRequest>,
-    /// The permission rule that asked, for [`ApprovalReason::AgentPermission`] only
-    /// (`Bash(git push*)`), so the person sees which of their rules is prompting.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_rule: Option<String>,
 }
 
 /// The already-screened browser interaction carried over the local broker. The gateway
@@ -670,7 +658,6 @@ mod tests {
             tool_fingerprint: Some("v2:abc".into()),
             url_elicitation: None,
             pii_release: None,
-            agent_rule: None,
         };
         let round: ApprovalRequest =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
@@ -780,7 +767,6 @@ mod tests {
             tool_fingerprint: None,
             url_elicitation: None,
             pii_release: None,
-            agent_rule: None,
         })
         .unwrap();
         assert!(answer_challenge(&req, "tok").is_none());

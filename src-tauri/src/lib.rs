@@ -1,5 +1,3 @@
-pub mod agent_guard;
-pub mod agent_permissions;
 pub mod approval;
 #[cfg(any(feature = "desktop", feature = "gtk-desktop"))]
 pub(crate) mod approval_broker;
@@ -18,6 +16,7 @@ pub mod downstream;
 pub mod downstream_backoff;
 pub mod gateway_publish;
 pub mod gatewaylog;
+pub mod guard_cleanup;
 pub mod hooks;
 pub mod hostenv;
 pub mod http_bridge;

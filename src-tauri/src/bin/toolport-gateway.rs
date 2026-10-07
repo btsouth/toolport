@@ -4536,7 +4536,6 @@ fn execute_call(
                 tool_fingerprint: current_fp.clone(),
                 url_elicitation: None,
                 pii_release: None,
-                agent_rule: None,
             };
             let mut approval_reason = reason;
             let (decision, held_ms, approved_fp, audit_approval) = if modern_direct_call {
@@ -4641,7 +4640,6 @@ fn execute_call(
                 approval::ApprovalReason::UntrustedSource => "untrusted_source",
                 approval::ApprovalReason::DestructiveAndUntrusted => "destructive_and_untrusted",
                 approval::ApprovalReason::PersistentCodeWrite => "persistent_code_write",
-                approval::ApprovalReason::AgentPermission => "agent_permission",
                 // Unreachable here: this gate comes from `gate_reason`, which never returns
                 // it. The PII release gate runs later, at the dispatch boundary, and audits
                 // itself in `approve_pii_release`.
@@ -5364,7 +5362,6 @@ fn approve_pii_release(
             // re-checked against the map once the answer comes back.
             values: values.clone(),
         }),
-        agent_rule: None,
     });
     // The audit record names the tokens' count via the args hash only -- `record_decision`
     // hashes rather than stores, so the released values stay out of the log.
@@ -7279,7 +7276,6 @@ fn save_routine_promotion_dispatch(
         tool_fingerprint: None,
         url_elicitation: None,
         pii_release: None,
-        agent_rule: None,
     });
     audit::record_decision(
         "toolport",
@@ -7520,7 +7516,6 @@ fn save_routine_dispatch(
         tool_fingerprint: None,
         url_elicitation: None,
         pii_release: None,
-        agent_rule: None,
     });
     audit::record_decision(
         "toolport",
@@ -14333,7 +14328,6 @@ fn broker_url_elicitation(
             message: screened.message,
         }),
         pii_release: None,
-        agent_rule: None,
     });
     match decision {
         approval::ApprovalDecision::Approved => ServerRequestAction::Respond(
@@ -18580,9 +18574,9 @@ enum ArgAction {
     /// flag was written without one - [`conduit_lib::hooks::handle_event`] treats
     /// that as an unknown event rather than a reason to fail.
     Hook(String),
-    /// Invoked as an agent's blocking guard hook (`--toolport-guard <agent>`). Read the
-    /// call from stdin, evaluate the permission policy, print the agent's decision JSON
-    /// to stdout, exit 0. Carries the agent name.
+    /// Invoked as an agent's blocking guard hook (`--toolport-guard <agent>`). The guard
+    /// was removed in 2.0; the flag stays so a stale client hook still exits 0 with an
+    /// allow. Carries the agent name.
     Guard(String),
     /// Nothing that changes startup mode; fall through to normal gateway
     /// startup.
@@ -18614,7 +18608,7 @@ fn parse_args(args: &[String]) -> ArgAction {
     }
     if let Some(index) = args
         .iter()
-        .position(|a| a == conduit_lib::agent_guard::GUARD_MARKER)
+        .position(|a| a == conduit_lib::guard_cleanup::GUARD_MARKER)
     {
         return ArgAction::Guard(args.get(index + 1).cloned().unwrap_or_default());
     }
@@ -18674,9 +18668,8 @@ fn usage() -> String {
          \x20   --selftest-secrets    Diagnostic: read every vaulted secret and report\n\
          \x20   --toolport-hook EVENT Record one agent lifecycle event and exit (installed\n\
          \x20                         into an agent's settings by Toolport; always exits 0)\n\
-         \x20   --toolport-guard AGENT Decide one native tool call against the permission\n\
-         \x20                         policy and print the agent's decision JSON (installed\n\
-         \x20                         into an agent's hooks by Toolport; always exits 0)\n\
+         \x20   --toolport-guard AGENT Retired no-op kept for client hooks Toolport\n\
+         \x20                         installed in 1.x; always allows and exits 0\n\
          \x20   -h, --help            Print this message and exit\n\
          \x20   -V, --version         Print the version and exit\n\
          \n\
@@ -18766,18 +18759,12 @@ fn main() {
             conduit_lib::hooks::handle_event(&event, &payload);
             std::process::exit(0);
         }
-        ArgAction::Guard(agent) => {
-            // Same discipline as the sensor: first thing, no gateway startup, bounded
-            // read. The ONLY difference is that this one speaks: its stdout is the
-            // decision the agent acts on, and it always exits 0 with a complete
-            // response - a deny is said in the JSON, never by crashing out.
-            let (payload, truncated) = conduit_lib::hooks::read_payload_capped(
-                std::io::stdin(),
-                conduit_lib::agent_guard::MAX_GUARD_STDIN_BYTES,
-            );
-            let (out, code) = conduit_lib::agent_guard::handle_stdin(&agent, &payload, truncated);
-            println!("{out}");
-            std::process::exit(code);
+        ArgAction::Guard(_agent) => {
+            // The guard was removed in 2.0. The flag stays so a client hook Toolport
+            // installed and never removed does not fail: drain the payload and always
+            // answer allow, then exit 0. No gateway startup, no registry read, no policy.
+            println!("{}", conduit_lib::guard_cleanup::run_no_op_hook());
+            std::process::exit(0);
         }
         ArgAction::Run => {}
     }
@@ -21233,7 +21220,6 @@ mod tests {
             tool_fingerprint: Some("v2:abc".into()),
             url_elicitation: None,
             pii_release: None,
-            agent_rule: None,
         };
         // No endpoint descriptor (Toolport app not running) -> Unreachable (fail-closed),
         // distinct from a human Timeout so the caller can explain *why* it was blocked.
@@ -21290,7 +21276,6 @@ mod tests {
             tool_fingerprint: Some("v2:abc".into()),
             url_elicitation: None,
             pii_release: None,
-            agent_rule: None,
         };
         let desc = Some(approval::EndpointDescriptor {
             endpoint,
@@ -34618,6 +34603,25 @@ mod tests {
             parse_args(&[conduit_lib::hooks::HOOK_MARKER.to_string()]),
             ArgAction::Hook(String::new())
         );
+    }
+
+    #[test]
+    fn parse_args_routes_the_guard_flag_away_from_gateway_startup() {
+        assert_eq!(
+            parse_args(&[
+                conduit_lib::guard_cleanup::GUARD_MARKER.to_string(),
+                "cursor".to_string()
+            ]),
+            ArgAction::Guard("cursor".to_string())
+        );
+        assert_eq!(
+            parse_args(&[conduit_lib::guard_cleanup::GUARD_MARKER.to_string()]),
+            ArgAction::Guard(String::new())
+        );
+        // The retired flag still answers allow, so a stale hook cannot block a call.
+        let decision: serde_json::Value =
+            serde_json::from_str(&conduit_lib::guard_cleanup::no_op_allow()).unwrap();
+        assert_eq!(decision["permission"], "allow");
     }
 
     #[test]
