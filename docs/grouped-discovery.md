@@ -14,9 +14,9 @@ These are the core definitions. Code Mode, confirmation, agent-control,
 and negotiated MCP Apps settings can add or change definitions for a particular
 client. The exact measurement uses that client's resulting tool array.
 
-Measured with `tiktoken o200k_base`, the four core tools measure about 940 tokens
+Measured with `tiktoken o200k_base`, the four core tools measure about 500 tokens
 including the gateway's instructions, and enabling Code Mode adds `toolport_run_script`
-for a surface that stays under 2,000. The floor is flat regardless of server count, so lazy discovery costs
+for a surface of about 870. The floor is flat regardless of server count, so lazy discovery costs
 more than a flat client until the catalog passes roughly 10 to 25 tools.
 
 ## Why grouped exists

@@ -1519,6 +1519,14 @@ fn floor_tool_defs(host: &HostState) -> Vec<Value> {
     tools
 }
 
+/// UTF-8 byte ceiling for the default lazy-mode floor: the serialized `tools/list`
+/// meta-tool array plus the built-in `initialize` instructions, with Code Mode off.
+/// The goal is at most 600 `tiktoken o200k_base` tokens. Rust tests have no tokenizer,
+/// so this bounds bytes instead: the floor measures about 4.6 bytes/token with
+/// `o200k_base`, so 2,400 bytes is roughly 520 tokens, and even at a conservative
+/// 4 bytes/token it is exactly 600. See the regression test for the exact breakdown.
+const META_TOOL_FLOOR_BYTE_BUDGET: usize = 2_400;
+
 /// The floor, named in the error a client gets when it calls a meta-tool that 2.0
 /// removed. Kept as one string so every refusal reads the same.
 const AGENT_FACING_FLOOR: &str = "toolport_search_tools, toolport_call_tool, \
@@ -28703,6 +28711,42 @@ mod tests {
         assert!(!names.contains(&"toolport_run_script"));
         assert!(!names.contains(&"toolport_confirm"));
         assert!(!names.contains(&"toolport_enable_server"));
+    }
+
+    #[test]
+    fn lazy_meta_tool_floor_stays_within_the_context_budget() {
+        let host = dispatch_host(false);
+        host.set_code_mode(false);
+        let tools = floor_tool_defs(&host);
+        assert_eq!(tools.len(), 4, "Code Mode off means the floor is the core four");
+        let tools_json = serde_json::to_string(&tools).expect("floor tools serialize");
+        let bytes = tools_json.len() + DISCOVER_INSTRUCTIONS_PREAMBLE.len();
+        assert!(
+            bytes <= META_TOOL_FLOOR_BYTE_BUDGET,
+            "the lazy meta-tool floor is {bytes} bytes (tools {} + instructions {}); \
+             the budget is {META_TOOL_FLOOR_BYTE_BUDGET} bytes, about 520 o200k tokens",
+            tools_json.len(),
+            DISCOVER_INSTRUCTIONS_PREAMBLE.len()
+        );
+    }
+
+    #[test]
+    fn search_description_does_not_promise_the_first_result_is_ready_to_call() {
+        // TOK-04: top-1 is not always right and broad results omit schemas, so the
+        // description must point at the schemaOmitted recovery instead of claiming
+        // every first result is already callable.
+        let description = search_tool_def()["description"]
+            .as_str()
+            .expect("search description is a string")
+            .to_string();
+        assert!(
+            !description.contains("is ready to call") && !description.contains("first result"),
+            "search description still overclaims: {description}"
+        );
+        assert!(
+            description.contains("schemaOmitted"),
+            "search description must name the schemaOmitted recovery: {description}"
+        );
     }
 
     #[test]
