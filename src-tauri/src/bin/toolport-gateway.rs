@@ -13930,6 +13930,8 @@ fn process_request(
         rooted_router
             .demand_servers(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)));
     }
+    // Rooted composition can take a while, so its bound starts at its demand.
+    let rooted_catalog_deadline = Instant::now() + FIRST_CATALOG_WAIT;
     if daemon_adapter
         && (rooted_list || method == "tools/list" && rooted_router.aggregated_tools().is_empty())
     {
@@ -13937,7 +13939,7 @@ fn process_request(
         let visible = |id: &str| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope));
         while rooted_router.any_discovering(visible)
             && (!rooted_list
-                || Instant::now() < catalog_deadline
+                || Instant::now() < rooted_catalog_deadline
                 || rooted_router.any_publishing_first_catalog(visible))
             && Instant::now() < deadline
         {
