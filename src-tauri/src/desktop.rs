@@ -3476,6 +3476,48 @@ fn team_pair_cancel() {
     }
 }
 
+fn close_to_tray(tray_created: bool, host_present: bool) -> bool {
+    tray_created && host_present
+}
+
+#[cfg(target_os = "linux")]
+fn tray_host_present() -> bool {
+    use gio::prelude::*;
+    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
+        return false;
+    };
+    bus.call_sync(
+        Some("org.kde.StatusNotifierWatcher"),
+        "/StatusNotifierWatcher",
+        "org.freedesktop.DBus.Properties",
+        "Get",
+        Some(
+            &(
+                "org.kde.StatusNotifierWatcher",
+                "IsStatusNotifierHostRegistered",
+            )
+                .to_variant(),
+        ),
+        None,
+        gio::DBusCallFlags::NONE,
+        1000,
+        gio::Cancellable::NONE,
+    )
+    .ok()
+    .and_then(|reply| reply.child_value(0).as_variant())
+    .and_then(|value| value.get::<bool>())
+    .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tray_host_present() -> bool {
+    true
+}
+
+fn usable_tray(app: &AppHandle) -> bool {
+    close_to_tray(app.tray_by_id("main").is_some(), tray_host_present())
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         // A visible window means the app should own a Dock icon again (macOS).
@@ -3919,6 +3961,10 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
+                    if !usable_tray(window.app_handle()) {
+                        window.app_handle().exit(0);
+                        return;
+                    }
                     api.prevent_close();
                     let _ = window.hide();
                     // Hidden to the tray => menu-bar only, so drop the Dock icon (macOS).
@@ -3941,9 +3987,11 @@ pub fn run() {
             // Build the tray icon, then show the window - unless launched with `--hidden`
             // (auto-start at login), in which case we start straight to the tray. The
             // window is created hidden (visible:false) so a normal launch never flashes.
-            build_tray(handle)?;
+            if let Err(error) = build_tray(handle) {
+                eprintln!("toolport: tray unavailable: {error}");
+            }
             let start_hidden = std::env::args().any(|a| a == "--hidden");
-            if start_hidden {
+            if start_hidden && usable_tray(handle) {
                 // Auto-start at login goes straight to the tray: menu-bar only, no
                 // Dock icon until the user opens the window.
                 set_dock_icon_visible(handle, false);
@@ -4296,6 +4344,14 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn close_hides_only_with_a_created_tray_and_registered_host() {
+        assert!(close_to_tray(true, true));
+        assert!(!close_to_tray(true, false));
+        assert!(!close_to_tray(false, true));
+        assert!(!close_to_tray(false, false));
     }
 
     #[test]

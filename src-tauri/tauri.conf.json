@@ -15,8 +15,8 @@
         "title": "Toolport",
         "width": 1240,
         "height": 820,
-        "minWidth": 940,
-        "minHeight": 600,
+        "minWidth": 480,
+        "minHeight": 360,
         "visible": false
       }
     ],

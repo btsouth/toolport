@@ -7,6 +7,7 @@
     "core:default",
     "updater:default",
     "process:allow-restart",
+    "process:allow-exit",
     "dialog:allow-save",
     "dialog:allow-open",
     "deep-link:default",

@@ -204,7 +204,7 @@ export function CatalogView({ registry, onAdded }: Props) {
   );
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col gap-4">
+    <div className="flex min-w-0 w-full flex-col gap-4">
       <div className="relative">
         <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
         {loading && (

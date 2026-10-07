@@ -109,6 +109,7 @@ export function ServerDialog({
     ),
   );
   const [bindingCleared, setBindingCleared] = useState(false);
+  const [touched, setTouched] = useState<Set<string>>(() => new Set());
   const [busy, setBusy] = useState(false);
   const [test, setTest] = useState<TestState>(IDLE_TEST);
   const testRequestId = useRef(0);
@@ -176,6 +177,7 @@ export function ServerDialog({
       setPasteText("");
     }
     setOpen(next);
+    if (!next) setTouched(new Set());
   }
 
   function set<K extends keyof typeof form>(key: K, value: (typeof form)[K]) {
@@ -311,6 +313,13 @@ export function ServerDialog({
       errors.push("Startup timeout must be greater than 0 and at most 86,400 seconds.");
     }
   }
+  const visibleErrors = errors.filter((message) =>
+    message.startsWith("Give")
+      ? touched.has("srv-name")
+      : message.startsWith("Startup")
+        ? touched.has("srv-initialize-timeout")
+        : touched.has(isStdio ? "srv-cmd" : "srv-url") || touched.has("srv-args"),
+  );
   const ownName = editing
     ? (initial?.name ?? partialEdit?.name)?.trim().toLowerCase()
     : undefined;
@@ -404,7 +413,13 @@ export function ServerDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       {trigger && <DialogTrigger asChild>{trigger}</DialogTrigger>}
-      <DialogContent className="sm:max-w-md">
+      <DialogContent
+        className="sm:max-w-md"
+        onBlurCapture={(event) => {
+          if (event.target instanceof HTMLInputElement)
+            setTouched((previous) => new Set([...previous, event.target.id]));
+        }}
+      >
         <DialogHeader>
           <DialogTitle>{editing ? "Edit server" : "Add MCP server"}</DialogTitle>
         </DialogHeader>
@@ -456,7 +471,7 @@ export function ServerDialog({
             <Input
               id="srv-name"
               autoFocus
-              placeholder="revenuecat (work)"
+              placeholder="Server name"
               value={form.name}
               onChange={(e) => set("name", e.target.value)}
             />
@@ -653,12 +668,12 @@ export function ServerDialog({
             </Button>
           </div>
 
-          {(errors.length > 0 ||
+          {(visibleErrors.length > 0 ||
             duplicateName ||
             test.status === "ok" ||
             test.status === "fail") && (
             <div className="flex flex-col gap-1.5 text-xs">
-              {errors.map((msg) => (
+              {visibleErrors.map((msg) => (
                 <p key={msg} className="text-destructive">
                   {msg}
                 </p>

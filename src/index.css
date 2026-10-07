@@ -182,3 +182,36 @@
     scroll-behavior: auto !important;
   }
 }
+
+@media (max-width: 900px) {
+  .app-sidebar {
+    width: 64px;
+  }
+  .app-sidebar .sidebar-label,
+  .sidebar-profile,
+  .sidebar-savings,
+  .sidebar-version,
+  .sidebar-help-label {
+    display: none;
+  }
+  .sidebar-brand,
+  .sidebar-footer {
+    padding: 12px;
+    justify-content: center;
+  }
+  .app-sidebar nav {
+    padding: 4px;
+  }
+  .app-sidebar nav button {
+    justify-content: center;
+    padding: 10px 4px;
+  }
+}
+@media (max-height: 500px) {
+  .app-header p {
+    display: none;
+  }
+  .onboarding-hero {
+    display: none;
+  }
+}

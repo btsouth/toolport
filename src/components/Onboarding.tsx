@@ -257,7 +257,7 @@ function Welcome({
       <StepHeader icon={<Waypoints className="size-5" />} title="Welcome to Toolport">
         One place to set up and control every AI tool on your machine.
       </StepHeader>
-      <div className="grid gap-2.5">
+      <div className="onboarding-hero grid gap-2.5">
         {benefits.map(({ icon: Icon, title, body }) => (
           <div key={title} className="flex items-start gap-3">
             <div className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">

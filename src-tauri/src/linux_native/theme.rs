@@ -959,6 +959,10 @@ button.toolport-catalog-action {{
   border-color: alpha(@toolport_accent, 0.82);
 }}
 
+.toolport-native switch:checked slider {{
+  background-color: @toolport_bg_dark;
+}}
+
 .toolport-native switch slider {{
   background-color: @toolport_fg;
   box-shadow: 0 1px 2px alpha(@toolport_bg_dark, 0.34);

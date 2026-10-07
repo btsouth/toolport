@@ -15,6 +15,7 @@ const setAllEnabled = vi.fn();
 // invoke onProbe exactly the way the Done step does.
 const captured: {
   onProbe: (() => Promise<ProbeResult[]>) | null;
+  onFinish?: () => void;
 } = { onProbe: null };
 
 vi.mock("@/lib/api", () => ({
@@ -81,8 +82,12 @@ vi.mock("@/components/PendingApprovals", () => ({ PendingApprovals: () => null }
 vi.mock("@/components/QuarantineAlert", () => ({ QuarantineAlert: () => null }));
 
 vi.mock("@/components/Onboarding", () => ({
-  Onboarding: (props: { onProbe: () => Promise<ProbeResult[]> }) => {
+  Onboarding: (props: {
+    onProbe: () => Promise<ProbeResult[]>;
+    onFinish: () => void;
+  }) => {
     captured.onProbe = props.onProbe;
+    captured.onFinish = props.onFinish;
     return null;
   },
 }));
@@ -348,5 +353,61 @@ describe("App health visibility", () => {
       await screen.findByRole("button", { name: /checking 1/i }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+  });
+});
+
+describe("server list stability and automatic prompts", () => {
+  it("keeps adjacent toggle targets in place when enabled state changes", async () => {
+    const servers = ["Zulu", "Alpha", "Beta"].map((name) => ({
+      id: name,
+      name,
+      transport: "stdio",
+      command: "fixture",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+    }));
+    const registry = {
+      version: 1,
+      servers,
+      profiles: [{ id: "p", name: "Default", enabledServerIds: [] as string[] }],
+      activeProfileId: "p",
+    } as Registry;
+    getRegistry.mockResolvedValue(registry);
+    probeServers.mockResolvedValue([]);
+    setServerEnabled.mockImplementation((_profile, id, enabled) =>
+      Promise.resolve({
+        ...registry,
+        profiles: [{ ...registry.profiles[0], enabledServerIds: enabled ? [id] : [] }],
+      }),
+    );
+    render(<App />);
+    await screen.findByRole("switch", { name: "Toggle Alpha" });
+    const order = () =>
+      screen.getAllByRole("switch").map((row) => row.getAttribute("aria-label"));
+    const before = order();
+    await userEvent.click(screen.getByRole("switch", { name: "Toggle Alpha" }));
+    await waitFor(() => expect(setServerEnabled).toHaveBeenCalled());
+    expect(order()).toEqual(before);
+    expect(before).toEqual(["Toggle Alpha", "Toggle Beta", "Toggle Zulu"]);
+  });
+  it("never asks for a star after finishing onboarding or returning", async () => {
+    probeServers.mockResolvedValue([]);
+    const { unmount } = render(<App />);
+    await waitFor(() => expect(captured.onFinish).toBeDefined());
+    act(() => captured.onFinish!());
+    vi.useFakeTimers();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(16000);
+    });
+    expect(screen.queryByText(/Star.*GitHub/i)).not.toBeInTheDocument();
+    unmount();
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(16000);
+    });
+    expect(screen.queryByText(/Star.*GitHub/i)).not.toBeInTheDocument();
+    vi.useRealTimers();
   });
 });

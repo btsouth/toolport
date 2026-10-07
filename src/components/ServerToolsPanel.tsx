@@ -428,7 +428,7 @@ function ResourcesPanel({ serverId }: { serverId: string }) {
                 selected === r.uri ? "bg-accent" : "hover:bg-muted/40"
               }`}
             >
-              <span className="flex min-w-0 items-center gap-2">
+              <span className="flex w-full min-w-0 flex-wrap items-center gap-2">
                 <span className="truncate font-mono text-sm">
                   {r.name ?? r.title ?? r.uri}
                 </span>
@@ -872,7 +872,7 @@ export function ServerToolsPanel({
   }
 
   return (
-    <div className="flex max-w-3xl flex-col gap-5">
+    <div className="flex w-full min-w-0 flex-col gap-5">
       <p className="text-xs text-muted-foreground">
         Calls use the default access and gateway policy, including approval gates.
       </p>
@@ -1104,7 +1104,7 @@ export function ServerToolsPanel({
                           aria-pressed={selected}
                           className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left"
                         >
-                          <span className="flex min-w-0 items-center gap-2">
+                          <span className="flex w-full min-w-0 flex-wrap items-center gap-2">
                             {/* SEP-973. Only data: icons render (see pickIconSrc); a
                                 remote URL is a request to a server-chosen host on every
                                 paint, and the app's CSP blocks it anyway. Fixed box so a
@@ -1117,7 +1117,12 @@ export function ServerToolsPanel({
                                 className="size-4 shrink-0 rounded-sm object-contain"
                               />
                             )}
-                            <span className="truncate font-mono text-sm">{t.name}</span>
+                            <span
+                              title={t.name}
+                              className="min-w-0 max-w-full truncate font-mono text-sm"
+                            >
+                              {t.name}
+                            </span>
                             {destructive && <Badge variant="warning">destructive</Badge>}
                             {t.annotations?.readOnlyHint === true && (
                               <Badge variant="secondary">read-only</Badge>

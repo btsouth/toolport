@@ -19,6 +19,8 @@ const servers: ServerEntry[] = ["GitHub", "Linear", "Stripe"].map((name, i) => (
   url: null,
   source: "manual",
 }));
+const longNames = new URLSearchParams(location.search).has("long-names");
+if (longNames) servers[0].name = "A".repeat(70);
 const registry: Registry = {
   version: 3,
   servers,
@@ -109,6 +111,13 @@ mockIPC(
           [String(args.clientId)]: String(args.profile || ""),
         };
         return registry;
+      case "set_server_enabled": {
+        const server = registry.servers.find((server) => server.id === args.serverId);
+        if (server) server.enabled = args.enabled as boolean;
+        return structuredClone(registry);
+      }
+      case "plugin:process|exit":
+        return null;
       case "get_registry":
         return registry;
       case "detect_clients":
@@ -154,7 +163,7 @@ mockIPC(
       case "list_server_tools":
         return [
           {
-            name: "get_issue",
+            name: longNames ? "t".repeat(70) : "get_issue",
             toolportQuarantine: "clear",
             description: "Read an issue by number.",
             annotations: { readOnlyHint: true },

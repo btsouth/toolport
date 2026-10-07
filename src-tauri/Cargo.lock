@@ -858,6 +858,7 @@ dependencies = [
  "chacha20poly1305",
  "core-foundation 0.10.1",
  "dirs 5.0.1",
+ "gio 0.18.4",
  "fs2",
  "getrandom 0.2.17",
  "gtk4",

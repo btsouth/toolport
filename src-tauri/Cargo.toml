@@ -33,6 +33,7 @@ required-features = ["test-support"]
 default = ["desktop"]
 desktop = [
     "dep:tauri",
+    "dep:gio",
     "dep:tauri-build",
     "dep:tauri-plugin-updater",
     "dep:tauri-plugin-process",
@@ -142,6 +143,7 @@ security-framework-sys = "2"
 core-foundation = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+gio = { version = "0.18", optional = true }
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 gtk = { package = "gtk4", version = "0.11.4", features = ["v4_10"], optional = true }
 adw = { package = "libadwaita", version = "0.9.2", features = ["v1_4", "gtk_v4_10"], optional = true }

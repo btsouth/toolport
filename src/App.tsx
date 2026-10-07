@@ -1,16 +1,7 @@
-import {
-  lazy,
-  Suspense,
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   ArrowLeft,
-  ChevronDown,
   CircleCheck,
   KeyRound,
   MoreHorizontal,
@@ -96,7 +87,7 @@ const SettingsView = lazy(() =>
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/Callout";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
-import { GitHubStarPrompt, type StarSurface } from "@/components/GitHubStarPrompt";
+import { serverNameOrder } from "@/lib/serverOrder";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -161,13 +152,6 @@ function App() {
   // Toolport into their tools.
   const [onboardingStep, setOnboardingStep] = useState(0);
   const [resumeAtConnect, setResumeAtConnect] = useState(false);
-  // Set when the wizard is completed in this session, which is the only trigger
-  // for the GitHub star card (see GitHubStarPrompt).
-  const [justOnboarded, setJustOnboarded] = useState(false);
-  // The star prompt shares the bottom-right corner with the toast stack, so
-  // toasts are offset upward while it is on screen instead of covering it.
-  const [starSurface, setStarSurface] = useState<StarSurface>(null);
-
   const lastProbeRef = useRef(0);
   const probeFlightRef = useRef(createSingleFlight<ProbeResult[]>());
   const loadedOnce = useRef(false);
@@ -553,16 +537,7 @@ function App() {
     s.name.toLowerCase().includes(q) ||
     (s.url ?? "").toLowerCase().includes(q) ||
     (s.command ?? "").toLowerCase().includes(q);
-  const byName = (a: ServerEntry, b: ServerEntry) =>
-    a.name.toLowerCase().localeCompare(b.name.toLowerCase());
-
-  const visible = servers.filter(matches);
-  const grouped: Record<Group, ServerEntry[]> = {
-    attention: visible.filter((s) => groupOf(s) === "attention").sort(byName),
-    checking: visible.filter((s) => groupOf(s) === "checking").sort(byName),
-    active: visible.filter((s) => groupOf(s) === "active").sort(byName),
-    disabled: visible.filter((s) => groupOf(s) === "disabled").sort(byName),
-  };
+  const visible = servers.filter(matches).sort(serverNameOrder);
   // The posture and next action summarize the profile, not the current search.
   // Keep these counts independent of `visible` so a filter cannot produce a
   // misleading "0 servers" action while hiding an affected row.
@@ -616,7 +591,6 @@ function App() {
     // Drop the pre-rename key so brand remnants do not linger in DevTools.
     localStorage.removeItem("conduit.onboarded");
     setOnboarded(true);
-    setJustOnboarded(true);
     setShowOnboarding(false);
     setResumeAtConnect(false);
     setOnboardingStep(0);
@@ -752,6 +726,7 @@ function App() {
           onRegistryChange={applyRegistryChange}
           view={view}
           onSelectView={selectView}
+          onShortcuts={() => setShortcutsOpen(true)}
           onReplayOnboarding={() => {
             setOnboardingStep(0);
             setShowOnboarding(true);
@@ -763,7 +738,7 @@ function App() {
             registry={registry}
             onRegistryChange={applyRegistryChange}
           />
-          <header className="flex items-center justify-between gap-4 border-b px-6 py-4">
+          <header className="app-header flex flex-wrap items-center justify-between gap-2 border-b px-3 py-2 sm:px-6 sm:py-4">
             <div className="flex min-w-0 flex-1 items-center gap-3">
               {view === "clients" && selectedClient && (
                 <>
@@ -818,7 +793,7 @@ function App() {
                 </p>
               </div>
             </div>
-            <div className="flex shrink-0 items-center gap-2">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
               {view === "servers" && (
                 <>
                   <div className="relative">
@@ -829,7 +804,7 @@ function App() {
                       onChange={(e) => setQuery(e.target.value)}
                       placeholder="Search servers"
                       title={`Search servers (/ or ${isMac ? "⌘" : "Ctrl"}F)`}
-                      className="h-9 w-44 pl-8"
+                      className="h-9 w-32 pl-8 sm:w-44"
                     />
                   </div>
                   <ServerDialog
@@ -1032,22 +1007,9 @@ function App() {
                           errorServers={errorAttention}
                         />
                       )}
-                      <ServerGroup title="To finish" count={grouped.attention.length}>
-                        {grouped.attention.map(serverRow)}
-                      </ServerGroup>
-                      <ServerGroup title="Checking" count={grouped.checking.length}>
-                        {grouped.checking.map(serverRow)}
-                      </ServerGroup>
-                      <ServerGroup title="Ready" count={grouped.active.length}>
-                        {grouped.active.map(serverRow)}
-                      </ServerGroup>
-                      <ServerGroup
-                        title="Disabled"
-                        count={grouped.disabled.length}
-                        defaultCollapsed
-                      >
-                        {grouped.disabled.map(serverRow)}
-                      </ServerGroup>
+                      <div className="overflow-hidden rounded-xl border border-border/60 bg-card/40">
+                        {visible.map(serverRow)}
+                      </div>
                     </div>
                   )}
                 </Suspense>
@@ -1093,11 +1055,6 @@ function App() {
           />
         </Suspense>
       )}
-      <GitHubStarPrompt
-        justOnboarded={justOnboarded}
-        enabledCount={enabledCount}
-        onVisibleChange={setStarSurface}
-      />
       <PendingApprovals />
       <TeamPairingDialog onConnected={openTeams} />
       {/* Quarantine has no global signal otherwise: the first sign used to be an agent
@@ -1184,17 +1141,7 @@ function App() {
           </dl>
         </DialogContent>
       </Dialog>
-      <Toaster
-        theme={resolvedTheme}
-        position="bottom-right"
-        offset={
-          starSurface === "chip"
-            ? { bottom: "3.5rem" }
-            : starSurface
-              ? { bottom: "10rem" }
-              : undefined
-        }
-      />
+      <Toaster theme={resolvedTheme} position="bottom-right" offset={16} />
     </TooltipProvider>
   );
 }
@@ -1350,63 +1297,6 @@ function ServerNextAction({
         <p className="text-xs text-muted-foreground">{detail}</p>
       </div>
     </div>
-  );
-}
-
-/** A titled, collapsible section of server rows. Renders nothing when empty, so
- * the page only shows the buckets that have servers. Collapse state persists per
- * group; the Disabled bucket starts collapsed. */
-function ServerGroup({
-  title,
-  count,
-  defaultCollapsed = false,
-  children,
-}: {
-  title: string;
-  count: number;
-  defaultCollapsed?: boolean;
-  children: ReactNode;
-}) {
-  const slug = title.toLowerCase().replace(/\s+/g, "-");
-  const storageKey = `toolport.group.${slug}`;
-  const legacyStorageKey = `conduit.group.${slug}`;
-  const [collapsed, setCollapsed] = useState(() => {
-    const v = localStorage.getItem(storageKey) ?? localStorage.getItem(legacyStorageKey);
-    return v === null ? defaultCollapsed : v === "1";
-  });
-  if (count === 0) return null;
-  function toggle() {
-    setCollapsed((c) => {
-      const next = !c;
-      localStorage.setItem(storageKey, next ? "1" : "0");
-      localStorage.removeItem(legacyStorageKey);
-      return next;
-    });
-  }
-  return (
-    <section>
-      <button
-        onClick={toggle}
-        aria-expanded={!collapsed}
-        className="mb-2 flex w-full items-center gap-2 rounded text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-      >
-        <ChevronDown
-          className={`size-3.5 text-muted-foreground/60 transition-transform ${
-            collapsed ? "-rotate-90" : ""
-          }`}
-          aria-hidden="true"
-        />
-        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-          {title}
-        </h2>
-        <span className="text-xs text-muted-foreground/70">{count}</span>
-      </button>
-      {!collapsed && (
-        <div className="overflow-hidden rounded-xl border border-border/60 bg-card/40 shadow-[0_1px_0_rgba(255,255,255,.02)_inset,0_10px_28px_-24px_rgba(0,0,0,.9)]">
-          {children}
-        </div>
-      )}
-    </section>
   );
 }
 

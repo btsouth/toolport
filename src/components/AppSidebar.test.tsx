@@ -109,6 +109,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="clients"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -131,6 +132,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={onSelectView}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -160,6 +162,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={onSelectView}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -180,6 +183,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -205,6 +209,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -238,6 +243,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -265,6 +271,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -303,6 +310,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -338,6 +346,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -376,6 +385,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -407,6 +417,7 @@ describe("AppSidebar accessibility", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -434,6 +445,7 @@ describe("AppSidebar quarantine badge", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
@@ -579,12 +591,14 @@ describe("AppSidebar open data folder", () => {
           onRegistryChange={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
+          onShortcuts={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
       </TooltipProvider>,
     );
 
-    await user.click(await screen.findByLabelText("Open data folder"));
+    await user.click(await screen.findByRole("button", { name: /Help/ }));
+    await user.click(await screen.findByRole("button", { name: "Open data folder" }));
 
     await waitFor(() => {
       expect(toastError).toHaveBeenCalledWith("Couldn't open data folder");
@@ -608,6 +622,7 @@ it("shows negative net savings with the tokenizer method and excludes legacy est
         onRegistryChange={vi.fn()}
         view="servers"
         onSelectView={vi.fn()}
+        onShortcuts={vi.fn()}
         onReplayOnboarding={vi.fn()}
       />
     </TooltipProvider>,
