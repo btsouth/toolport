@@ -1154,7 +1154,8 @@ pub struct Registry {
     #[serde(default = "team_safety_floor_default")]
     pub team_min_safety_level: SafetyLevel,
     /// Retained legacy flags are recomputed each sync and cleared on leave.
-    /// In 2.0, team deny does not raise the safety level, and content labeling is always on.
+    /// Legacy team deny supplies a Strict floor when the payload has no valid floor.
+    /// Content labeling is always on in 2.0.
     /// Quarantine and injection blocking remain independent tighten-only protections.
     #[serde(default)]
     pub team_forced_deny_destructive: bool,
@@ -7930,7 +7931,6 @@ mod safety_level_tests {
                 for block in [false, true] {
                     let mut r = Registry::default();
                     r.set_safety_level(member);
-                    r.team_forced_deny_destructive = true;
                     r.team_forced_content_defense = true;
                     r.team_forced_pii_redaction = true;
                     r.team_forced_quarantine_on_drift = quarantine;
