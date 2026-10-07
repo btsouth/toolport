@@ -107,13 +107,19 @@ fn simultaneous_unauthorized_posts_share_one_forced_refresh() {
                 let mut length = 0;
                 let mut stale = false;
                 loop {
-                    let mut line=String::new(); reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {break;}
-                    if let Some(value)=line.to_ascii_lowercase().strip_prefix("content-length:") {length=value.trim().parse::<usize>().unwrap();}
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
                     stale |= line.trim().eq_ignore_ascii_case("authorization: Bearer stale");
                 }
-                let mut bytes=vec![0;length]; reader.read_exact(&mut bytes).unwrap();
-                let body:Value=serde_json::from_slice(&bytes).unwrap();
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
                 if stale {
                     rejected.wait();
                     write!(stream,"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
@@ -245,15 +251,22 @@ fn sse_fixture(calls: usize) -> (String, std::thread::JoinHandle<Vec<Value>>) {
             let collected = collected.clone();
             workers.push(std::thread::spawn(move || {
                 if body.get("method").is_some() {
-                    let root_id=format!("roots-{}",body["id"]);
-                    let (tx,rx)=mpsc::channel(); replies.lock().unwrap().insert(root_id.clone(),tx);
+                    let root_id = format!("roots-{}", body["id"]);
+                    let (tx, rx) = mpsc::channel();
+                    replies.lock().unwrap().insert(root_id.clone(), tx);
                     write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {}\n\n", json!({"jsonrpc":"2.0","id":root_id,"method":"roots/list","params":{"owner":body["params"]["owner"]}})).unwrap();
                     stream.flush().unwrap();
-                    let response:Value=rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    let response: Value = rx.recv_timeout(Duration::from_secs(10)).unwrap();
                     collected.send(response.clone()).unwrap();
-                    write!(stream,"data: {}\n\n",json!({"jsonrpc":"2.0","id":body["id"],"result":response})).unwrap(); stream.flush().unwrap();
+                    // Cancellation and shutdown retire the original SSE reader after
+                    // sending the refusal, so the final response may hit a closed socket.
+                    let final_response = write!(stream,"data: {}\n\n",json!({"jsonrpc":"2.0","id":body["id"],"result":response}))
+                        .and_then(|()| stream.flush());
+                    if let Err(error) = final_response {
+                        assert!(matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset), "{error}");
+                    }
                 } else {
-                    let id=body["id"].as_str().unwrap();
+                    let id = body["id"].as_str().unwrap();
                     replies.lock().unwrap().remove(id).unwrap().send(body).unwrap();
                     write!(stream,"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                 }
