@@ -1,4 +1,3 @@
-import { Buffer } from "node:buffer";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import process from "node:process";
@@ -35,39 +34,65 @@ const run = (command, args) =>
     timeout: 120000,
     maxBuffer: 32 * 1024 * 1024,
   });
+export function appImageOffset(bytes) {
+  let offset = -1;
+  // The runtime can contain the magic as a machine-code constant. Check the
+  // superblock too, so only the appended SquashFS filesystem is selected.
+  for (
+    let candidate = bytes.indexOf("hsqs");
+    candidate >= 0;
+    candidate = bytes.indexOf("hsqs", candidate + 1)
+  ) {
+    if (candidate + 96 > bytes.length) continue;
+    const blockSize = bytes.readUInt32LE(candidate + 12);
+    const used = bytes.readBigUInt64LE(candidate + 40);
+    if (
+      bytes.readUInt16LE(candidate + 28) === 4 &&
+      bytes.readUInt16LE(candidate + 30) === 0 &&
+      blockSize >= 4096 &&
+      (blockSize & (blockSize - 1)) === 0 &&
+      used >= 96n &&
+      used <= BigInt(bytes.length - candidate)
+    ) {
+      offset = candidate;
+      break;
+    }
+  }
+  return offset;
+}
 export function listContents(file) {
   if (file.endsWith(".deb")) {
-    const tar = execFileSync("dpkg-deb", ["--fsys-tarfile", file], {
-      timeout: 120000,
-      maxBuffer: 128 * 1024 * 1024,
-    });
-    return execFileSync("tar", ["-tf", "-"], {
-      input: tar,
-      encoding: "utf8",
-      timeout: 120000,
-    }).split("\n");
+    return run("bash", [
+      "-o",
+      "pipefail",
+      "-c",
+      'dpkg-deb --fsys-tarfile "$1" | tar -tf -',
+      "contents",
+      file,
+    ]).split(/\r?\n/);
   }
-  if (file.endsWith(".rpm")) return run("rpm", ["-qlp", file]).split("\n");
+  if (file.endsWith(".rpm")) return run("rpm", ["-qlp", file]).split(/\r?\n/);
   if (/\.(?:tar\.gz|pkg\.tar\.zst)$/.test(file))
-    return run("tar", ["-tf", file]).split("\n");
+    return run("tar", ["-tf", file]).split(/\r?\n/);
   if (file.endsWith(".exe"))
     return run("7z", ["l", "-slt", file])
-      .split("\n")
+      .split(/\r?\n/)
       .filter((line) => line.startsWith("Path = "))
       .slice(1)
       .map((line) => line.slice(7).replaceAll("\\", "/"));
   if (file.endsWith(".AppImage")) {
-    const offset = readFileSync(file).indexOf(Buffer.from("hsqs"));
+    const bytes = readFileSync(file);
+    const offset = appImageOffset(bytes);
     if (offset < 0) throw new Error("No AppImage squashfs found");
     return run("unsquashfs", ["-o", String(offset), "-l", file])
-      .split("\n")
+      .split(/\r?\n/)
       .filter((line) => line.startsWith("squashfs-root/"));
   }
   if (file.endsWith(".dmg")) {
     const mount = `${process.env.RUNNER_TEMP}/toolport-payload-${process.pid}`;
     run("hdiutil", ["attach", "-readonly", "-nobrowse", "-mountpoint", mount, file]);
     try {
-      return run("find", [mount, "-type", "f"]).split("\n");
+      return run("find", [mount, "-type", "f"]).split(/\r?\n/);
     } finally {
       run("hdiutil", ["detach", mount]);
     }

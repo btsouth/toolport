@@ -30,7 +30,7 @@ Development builds get generic instructions.
 ## Build and test
 
 On an Ubuntu 24.04 build machine with Rust stable, GTK4/libadwaita headers,
-pkg-config, D-Bus/OpenSSL headers, zip, curl and Docker:
+pkg-config, D-Bus/OpenSSL headers, zip, curl, Node.js, rpm and Docker:
 
 ```sh
 scripts/install-nfpm.sh .verify/nfpm

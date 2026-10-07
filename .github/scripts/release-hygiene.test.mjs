@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { releaseInstaller, manifests, submit } from "./winget.mjs";
-import { assertContents, listContents } from "./package-contents.mjs";
+import { assertContents, listContents, appImageOffset } from "./package-contents.mjs";
 import { parse } from "yaml";
 const bytes = Buffer.from("immutable signed installer fixture");
 const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -54,14 +54,19 @@ test("manifest versions, URLs and SHA256 come from the published release", () =>
 
 test("stale fork is synced before branching, failed PR creation retries the same branch", async () => {
   const calls = [];
+  let forkHead = "stale";
   let entries;
   let attempts = 0;
   let pr;
   const api = {
-    sync: async () => calls.push("sync"),
+    sync: async () => {
+      forkHead = "upstream";
+      calls.push("sync");
+    },
     branch: async () => entries,
     createBranch: async (_, branch, tree) => {
       assert.equal(calls.at(-1), "sync");
+      assert.equal(forkHead, "upstream");
       calls.push("branch");
       entries = tree;
     },
@@ -118,4 +123,17 @@ test("archive inspection lists a real payload and rejects an added helper", () =
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("AppImage offset skips runtime magic and rejects truncated filesystems", () => {
+  const bytes = Buffer.alloc(512);
+  bytes.write("hsqs", 16);
+  const offset = 128;
+  bytes.write("hsqs", offset);
+  bytes.writeUInt32LE(131072, offset + 12);
+  bytes.writeUInt16LE(4, offset + 28);
+  bytes.writeBigUInt64LE(256n, offset + 40);
+  assert.equal(appImageOffset(bytes), offset);
+  bytes.writeBigUInt64LE(1024n, offset + 40);
+  assert.equal(appImageOffset(bytes), -1);
 });
