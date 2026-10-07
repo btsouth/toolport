@@ -88,8 +88,9 @@ before opening the PR.
 
 Linux system packages now ship the GTK shell as `.deb` and `.rpm`, built once on
 Ubuntu 24.04 and tested before upload to the draft. The Tauri AppImage remains the
-fallback for Ubuntu 22.04 and keeps its in-app updater. The AUR repackage workflow
-is retired; Arch uses the native pacman package. See
+fallback for Ubuntu 22.04 and keeps its in-app updater. Stable releases also
+update AUR `toolport-bin` by repackaging the GTK deb, so existing AUR users can
+upgrade with their helper. The native pacman package remains an alternative. See
 [`docs/linux-packages.md`](linux-packages.md) for build and upgrade checks.
 
 Publishing is also when the **Homebrew tap** is bumped, and that is now
