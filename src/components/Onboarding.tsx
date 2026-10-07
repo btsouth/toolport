@@ -45,7 +45,7 @@ import {
 } from "@/lib/types";
 import { openExternal } from "@/lib/openUrl";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogFooter, DialogTitle } from "@/components/ui/dialog";
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
 import { Skeleton } from "@/components/ui/skeleton";
 
@@ -153,41 +153,40 @@ export function Onboarding({
               onFinish={onFinish}
             />
           ) : (
-            <>
-              {steps[step]}
-
-              <div className="flex items-center justify-between border-t pt-4">
-                <div
-                  className="flex items-center gap-1.5"
-                  role="progressbar"
-                  aria-valuenow={step + 1}
-                  aria-valuemin={1}
-                  aria-valuemax={steps.length}
-                  aria-label={`Setup step ${step + 1} of ${steps.length}`}
-                >
-                  {steps.map((_, i) => (
-                    <span
-                      key={i}
-                      aria-hidden="true"
-                      className={`size-1.5 rounded-full transition-colors ${
-                        i === step ? "bg-success" : "bg-muted-foreground/30"
-                      }`}
-                    />
-                  ))}
-                </div>
-                {step < steps.length - 1 && (
-                  <button
-                    type="button"
-                    onClick={onFinish}
-                    className="text-xs text-muted-foreground transition hover:text-foreground"
-                  >
-                    Skip setup
-                  </button>
-                )}
-              </div>
-            </>
+            steps[step]
           )}
         </div>
+        {!joining && (
+          <DialogFooter className="justify-between">
+            <div
+              className="flex items-center gap-1.5"
+              role="progressbar"
+              aria-valuenow={step + 1}
+              aria-valuemin={1}
+              aria-valuemax={steps.length}
+              aria-label={`Setup step ${step + 1} of ${steps.length}`}
+            >
+              {steps.map((_, i) => (
+                <span
+                  key={i}
+                  aria-hidden="true"
+                  className={`size-1.5 rounded-full transition-colors ${
+                    i === step ? "bg-success" : "bg-muted-foreground/30"
+                  }`}
+                />
+              ))}
+            </div>
+            {step < steps.length - 1 && (
+              <button
+                type="button"
+                onClick={onFinish}
+                className="text-xs text-muted-foreground transition hover:text-foreground"
+              >
+                Skip setup
+              </button>
+            )}
+          </DialogFooter>
+        )}
       </DialogContent>
     </Dialog>
   );
