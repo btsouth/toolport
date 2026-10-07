@@ -120,15 +120,17 @@ thread_local! {
         }) };
 }
 
+type DispatchScopeCheck = dyn Fn(&Router, DispatchTarget<'_>) -> bool + Send + Sync;
+
 /// A daemon adapter's view of the live router, for checks that run after its
 /// request took a snapshot.
 #[derive(Clone)]
 struct LiveRouterResolver {
-    /// Cheap: whether the registry or root has moved this adapter's view on since
-    /// the request started. Checked on every dispatch.
-    stale: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Cheap: whether this dispatch lost its adapter scope or project root.
+    /// Unrelated profile edits must not interrupt a stable server.
+    stale: Arc<DispatchScopeCheck>,
     /// The full live view, rebuilt from the registry. Only post-HITL revalidation
-    /// pays for it; a stale view resolves to [`stale_live_view`].
+    /// pays for it; a changed root resolves to [`stale_live_view`].
     resolve: Arc<dyn Fn() -> Arc<Router> + Send + Sync>,
 }
 
@@ -3833,13 +3835,13 @@ fn post_hitl_revalidation(
 /// This runs on every dispatch, so it reads only the base live router, whose policy
 /// the registry watcher republishes (servers, disabled tools, deny-destructive,
 /// quarantine). A daemon adapter's own profile scope is not in that policy, so its
-/// view is checked for staleness instead, and a stale view refuses everything.
+/// scope is rechecked for this target instead of invalidating the whole request.
 fn recheck_live_policy(
     router: &Router,
     live_router: Option<&Arc<Mutex<Arc<Router>>>>,
     target: DispatchTarget<'_>,
 ) -> Result<(), String> {
-    if active_live_router_resolver().is_some_and(|view| (view.stale)()) {
+    if active_live_router_resolver().is_some_and(|view| (view.stale)(router, target)) {
         return Err(STALE_LIVE_VIEW.to_string());
     }
     let live = live_router.map(|slot| {
@@ -4066,7 +4068,9 @@ fn execute_call(
     // `None` only in test wrappers that lack `GatewayState`.
     live_router: Option<&Arc<Mutex<Arc<Router>>>>,
 ) -> Value {
-    if active_live_router_resolver().is_some_and(|view| (view.stale)()) {
+    if active_live_router_resolver()
+        .is_some_and(|view| (view.stale)(router, DispatchTarget::Tool(name)))
+    {
         return json!({"content": [{"type": "text", "text": STALE_LIVE_VIEW}], "isError": true});
     }
     // Resolve a cold owner only through the collision-safe registry map. Scope
@@ -13714,70 +13718,99 @@ fn handle_client_notification(
     }
 }
 
-/// The live view of a daemon adapter's request on `profile`, which started on the
-/// registry `reg` with server scope `allowed` and project root `root`. The view is
-/// stale once any of those three no longer match the host.
+/// The live view of a daemon adapter's request. Registry churn only invalidates
+/// dispatches that lose their server/tool scope; a root change still invalidates
+/// the request because its downstream may have been launched in a different cwd.
 fn adapter_live_view(
     host: &Arc<HostState>,
     reg: &Registry,
     profile: &str,
-    allowed: Option<&HashSet<String>>,
     root: Option<String>,
+    client: Option<&str>,
 ) -> LiveRouterResolver {
-    let expected = Arc::new((
-        profile.to_string(),
-        allowed.cloned(),
-        adapter_tool_scope(reg, profile),
-        root,
-    ));
-    // The root is read before the registry lock is taken, never under it.
-    let is_stale = {
+    let folder_profile = root.as_deref().and_then(|root| reg.profile_for_root(root));
+    let client_binding = client.map(|id| (id.to_string(), reg.client_scopes.get(id).cloned()));
+    let expected = Arc::new((reg.resolve_profile_id(profile), root));
+    let context_stale = {
         let expected = Arc::clone(&expected);
-        move |current: &Registry, current_root: Option<String>| {
-            let (profile, scope, tool_scope, root) = &*expected;
-            let current_scope: HashSet<String> = current
-                .enabled_servers_for(profile)
-                .iter()
-                .map(|server| server.id.clone())
-                .collect();
-            scope.as_ref() != Some(&current_scope)
-                || *tool_scope != adapter_tool_scope(current, profile)
-                || current_root != *root
-        }
+        Arc::new(move |current: &Registry, current_root: Option<String>| {
+            let (_, root) = &*expected;
+            current_root != *root
+                || client_binding.as_ref().is_some_and(|(client, binding)| {
+                    current.client_scopes.get(client) != binding.as_ref()
+                })
+                || root
+                    .as_deref()
+                    .and_then(|root| current.profile_for_root(root))
+                    != folder_profile
+        })
     };
-    let is_stale = Arc::new(is_stale);
     let stale = {
         let host = Arc::clone(host);
-        let is_stale = Arc::clone(&is_stale);
-        Arc::new(move || {
+        let expected = Arc::clone(&expected);
+        let context_stale = Arc::clone(&context_stale);
+        Arc::new(move |router: &Router, target: DispatchTarget<'_>| {
+            let (profile, _) = &*expected;
             let root = host.active_adapter_root();
-            is_stale(
-                &host
-                    .registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-                root,
-            )
+            let current = host
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if context_stale(&current, root) {
+                return true;
+            }
+            let (server, tool) = match target {
+                DispatchTarget::Tool(name) => match router.route_of(name) {
+                    Some((server, tool)) => (server, Some(tool)),
+                    None => return false, // Unknown tools fail at routing.
+                },
+                DispatchTarget::Server(server) => (server, None),
+            };
+            if !current
+                .enabled_servers_for(profile)
+                .iter()
+                .any(|entry| entry.id == server)
+            {
+                return true;
+            }
+            tool.is_some_and(|tool| {
+                current
+                    .profiles
+                    .iter()
+                    .find(|entry| entry.id == *profile)
+                    .and_then(|entry| entry.tool_scope.get(server))
+                    .is_some_and(|allow| !allow.iter().any(|name| name == tool))
+            })
         })
     };
     let host = Arc::clone(host);
     let resolve = Arc::new(move || {
+        let (profile, root) = &*expected;
+        let current_root = host.active_adapter_root();
         let current = host
             .registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if is_stale(&current, host.active_adapter_root()) {
+        if context_stale(&current, current_root) {
             return stale_live_view();
         }
-        let (profile, scope, _, root) = &*expected;
+        let scope = current
+            .enabled_servers_for(profile)
+            .iter()
+            .map(|server| server.id.clone())
+            .collect();
         let base = host
             .router
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let rooted = host.router_for_root(base, &current, root.as_deref(), scope.as_ref());
-        host.router_for_adapter_profile(rooted, &current, profile).0
+        let rooted = host.router_for_root(base, &current, root.as_deref(), Some(&scope));
+        let mut view = (*host.router_for_adapter_profile(rooted, &current, profile).0).clone();
+        // Post-HITL owner/fingerprint checks need the current adapter visibility,
+        // not the host's union of profiles. Preserve the live quarantine state.
+        view.apply_registry_policy(registry_policy(&current, Some(profile), false, false));
+        Arc::new(view)
     });
     LiveRouterResolver { stale, resolve }
 }
@@ -14154,7 +14187,7 @@ fn process_request(
     }
     let live_view: Option<LiveRouterResolver> = if state.daemon_mode.load(Ordering::SeqCst) {
         adapter_profile.map(|profile| {
-            adapter_live_view(&state.host, &reg, profile, allowed, adapter_root.clone())
+            adapter_live_view(&state.host, &reg, profile, adapter_root.clone(), client)
         })
     } else {
         None
@@ -26398,13 +26431,11 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    /// P1.3: a daemon adapter's request keeps its view of the profile it started on.
-    /// Turning a server off in that profile (while another profile keeps it, so the
-    /// base router still connects it) refuses every later dispatch of the request.
-    /// The stale view used to resolve to an empty router with no server limit, which
-    /// the per-dispatch recheck read as "allow everything".
+    /// A request snapshot survives unrelated profile churn, but loses permission
+    /// as soon as its own tool or server is hidden, even if another profile keeps
+    /// that server enabled on the host router.
     #[test]
-    fn daemon_recheck_refuses_dispatch_once_the_adapter_profile_changes() {
+    fn daemon_recheck_ignores_unrelated_profile_changes_but_refuses_revocation() {
         let _data_env = DataDirTestEnv::new("daemon_recheck_refuses_stale_profile");
         let mut reg = Registry::default();
         reg.servers.push(stub_server("a", "A"));
@@ -26452,12 +26483,13 @@ mod tests {
             .iter()
             .map(|server| server.id.clone())
             .collect();
+        let _root = AdapterRootGuard::enter(Some("/work/flake".into()));
         let _live_view = LiveRouterResolverGuard::enter(Some(adapter_live_view(
             &host,
             &reg,
             "p",
-            Some(&allowed),
-            None,
+            Some("/work/flake".into()),
+            Some("test"),
         )));
         let snapshot = host.router.lock().unwrap().clone();
         let cached = snapshot.aggregated_tools();
@@ -26487,6 +26519,101 @@ mod tests {
         assert_ne!(allowed_call["isError"], true, "got {allowed_call}");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
+        // Deterministically move the registry on after the request snapshot.
+        // Disabling A and changing A's tool scope must not interrupt X, including
+        // a post-approval rebind to the live adapter view.
+        host.registry.lock().unwrap().profiles[0].enabled_server_ids = vec!["x".to_string()];
+        let steady = call("x__work");
+        assert_ne!(steady["isError"], true, "got {steady}");
+        host.registry.lock().unwrap().profiles[0]
+            .tool_scope
+            .insert("a".into(), Vec::new());
+        let steady = call("x__work");
+        assert_ne!(steady["isError"], true, "got {steady}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let live = clone_live_router(Some(&host.router)).unwrap();
+        assert!(live.route_of("x__work").is_some());
+        assert!(live.authorize(DispatchTarget::Server("a")).is_err());
+
+        // X still exists in Q and on the host router, but P now hides its tool.
+        host.registry.lock().unwrap().profiles[0]
+            .tool_scope
+            .insert("x".into(), Vec::new());
+        let denied = call("x__work");
+        assert_eq!(denied["isError"], true, "got {denied}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(clone_live_router(Some(&host.router))
+            .unwrap()
+            .route_of("x__work")
+            .is_none());
+        host.registry.lock().unwrap().profiles[0]
+            .tool_scope
+            .remove("x");
+
+        // Global disables and quarantine still win over the old snapshot.
+        let mut policy = snapshot.registry_policy();
+        policy
+            .disabled
+            .insert("x".into(), ["work".into()].into_iter().collect());
+        republish_registry_policy(&host.router, policy);
+        let denied = call("x__work");
+        assert_eq!(denied["isError"], true, "got {denied}");
+        republish_registry_policy(&host.router, snapshot.registry_policy());
+        {
+            let mut live = host.router.lock().unwrap();
+            Arc::make_mut(&mut live).requarantine(["x__work".into()].into_iter().collect());
+        }
+        let denied = call("x__work");
+        assert_eq!(denied["isError"], true, "got {denied}");
+        {
+            let mut live = host.router.lock().unwrap();
+            Arc::make_mut(&mut live).requarantine(BTreeSet::new());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        host.registry
+            .lock()
+            .unwrap()
+            .client_scopes
+            .insert("other".into(), "q".into());
+        assert!(recheck_live_policy(
+            &snapshot,
+            Some(&host.router),
+            DispatchTarget::Tool("x__work")
+        )
+        .is_ok());
+
+        // A rebind of this client must not keep dispatching under P's old scope.
+        host.registry
+            .lock()
+            .unwrap()
+            .client_scopes
+            .insert("test".into(), "q".into());
+        let denied = call("x__work");
+        assert_eq!(denied["isError"], true, "got {denied}");
+        assert!(clone_live_router(Some(&host.router))
+            .unwrap()
+            .route_of("x__work")
+            .is_none());
+        host.registry.lock().unwrap().client_scopes.remove("test");
+        host.registry
+            .lock()
+            .unwrap()
+            .folder_profiles
+            .push(registry::FolderProfile {
+                path: "/work/flake".into(),
+                profile: "q".into(),
+            });
+        let denied = call("x__work");
+        assert_eq!(denied["isError"], true, "got {denied}");
+        host.registry.lock().unwrap().folder_profiles.clear();
+        {
+            let _changed_root = AdapterRootGuard::enter(Some("/work/elsewhere".into()));
+            let denied = call("x__work");
+            assert_eq!(denied["isError"], true, "got {denied}");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
         host.registry.lock().unwrap().profiles[0].enabled_server_ids = vec!["a".to_string()];
         let denied = call("x__work");
         assert_eq!(denied["isError"], true, "got {denied}");
@@ -26496,7 +26623,7 @@ mod tests {
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            1,
+            3,
             "nothing may reach downstream"
         );
         assert!(
@@ -26504,10 +26631,10 @@ mod tests {
                 .is_err()
         );
 
-        // Post-HITL revalidation still sees the stale view as routing nothing.
+        // Post-HITL revalidation sees X removed from the adapter's live view.
         let live = clone_live_router(Some(&host.router)).unwrap();
         assert!(live.route_of("x__work").is_none());
-        assert!(live.authorize(DispatchTarget::Server("a")).is_err());
+        assert!(live.authorize(DispatchTarget::Server("x")).is_err());
     }
 
     struct BlockingRoute {
