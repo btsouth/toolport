@@ -230,6 +230,30 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn rollback_v3_fixture_is_the_real_ordered_v1_to_v3_migration() {
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-v3-rollback-{}-{}",
+            std::process::id(),
+            crate::registry::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+        let raw = include_str!("../../tests/fixtures/registry-v1-to-v2/v1.json");
+        std::fs::write(&path, raw).unwrap();
+        load_from(&path).unwrap();
+        let actual: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let expected: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/registry-v1-to-v2/v3.json"
+        ))
+        .unwrap();
+        assert_eq!(actual, expected);
+        let backups = migration_backup_files(&path);
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), raw);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn global_off_overrides_every_access_set_and_all_access_includes_unprofiled_servers() {
         let mut value = fixture(true);
         migrate_v2_to_v3(

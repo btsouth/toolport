@@ -2266,7 +2266,7 @@ impl Registry {
     /// profile ref imposes no extra tool restriction here (the server scope already blocks it).
     pub fn profile_allows_tool(&self, profile_ref: &str, server_id: &str, tool: &str) -> bool {
         let id = self.resolve_profile_id(profile_ref);
-        match self.profiles.iter().find(|p| p.id == id) {
+        match self.access_profile(&id) {
             Some(p) => match p.tool_scope.get(server_id) {
                 Some(allowed) => allowed.iter().any(|t| t == tool),
                 None => true,
@@ -5888,7 +5888,9 @@ mod tests {
 
     #[test]
     fn load_and_save_resolved_honor_registry_override() {
-        let _guard = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Resolves the data dir indirectly through save/load/update, so it owes
         // the same lock every other resolver takes. Without it this ran beside a
         // test holding a DataDirOverride and each saw the other's path.
@@ -5927,7 +5929,9 @@ mod tests {
 
     #[test]
     fn update_saves_to_the_same_resolved_path_it_locked() {
-        let _guard = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Resolves the data dir indirectly through save/load/update, so it owes
         // the same lock every other resolver takes. Without it this ran beside a
         // test holding a DataDirOverride and each saw the other's path.
@@ -7654,7 +7658,9 @@ mod registry_version_tests {
 
     #[test]
     fn missing_version_loads_as_v1() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("missing-version");
         let _override = DataDirOverride::set(&dir);
@@ -7681,7 +7687,9 @@ mod registry_version_tests {
 
     #[test]
     fn current_version_loads_unchanged() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("current-version");
         let _override = DataDirOverride::set(&dir);
@@ -7706,7 +7714,9 @@ mod registry_version_tests {
 
     #[test]
     fn future_version_is_refused_and_the_file_is_untouched() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("future-version");
         let _override = DataDirOverride::set(&dir);
@@ -7745,7 +7755,9 @@ mod registry_version_tests {
 
     #[test]
     fn save_over_a_newer_on_disk_version_is_refused() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("save-over-newer");
         let _override = DataDirOverride::set(&dir);
@@ -7772,7 +7784,9 @@ mod registry_version_tests {
 
     #[test]
     fn test_only_migration_runs_writes_a_backup_and_saves_the_new_version() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("test-migration");
         let _override = DataDirOverride::set(&dir);
@@ -7812,7 +7826,9 @@ mod registry_version_tests {
 
     #[test]
     fn failing_migration_leaves_the_original_and_no_partial_file() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("failing-migration");
         let _override = DataDirOverride::set(&dir);
@@ -7873,7 +7889,9 @@ mod registry_version_tests {
 
     #[test]
     fn historical_registry_shapes_still_load() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("historical-shapes");
         let _override = DataDirOverride::set(&dir);

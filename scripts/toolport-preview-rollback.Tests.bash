@@ -91,6 +91,25 @@ aside="$(find "$TOOLPORT_DATA_DIR" -name 'registry.json.v2-rollback-*')"
 echo "$out" | grep -q "Registry: version 2 copied to" && pass "migrated version reported" || fail "output: $out"
 [ -z "$(find "$TOOLPORT_DATA_DIR" -name '.registry.json.rollback-*')" ] && pass "no restore temp file left" || fail "temp file left behind"
 
+# v3 keeps the ordered migration's newest v1 backup, even when a later v2
+# snapshot exists. Restore exact v1 bytes and retain the exact v3 document.
+setup v3-migrated
+cp "$fixtures/v3.json" "$TOOLPORT_DATA_DIR/registry.json"
+printf '{"version":1,"servers":[]}\n' > "$TOOLPORT_DATA_DIR/registry.json.v1-1790000000000.bak"
+cp "$fixtures/v1.json" "$TOOLPORT_DATA_DIR/registry.json.v1-1791000000000.bak"
+cp "$fixtures/v2.json" "$TOOLPORT_DATA_DIR/registry.json.v2-1792000000000.bak"
+mkdir -p "$TOOLPORT_DATA_DIR/exports"
+printf 'Preserve this export.\n' > "$TOOLPORT_DATA_DIR/exports/rules-2026-10-07.md"
+touch "$TOOLPORT_ROLLBACK_PKG_CACHE/toolport-1.24.0-1-x86_64.pkg.tar.zst"
+out="$(rollback)"
+cmp -s "$fixtures/v1.json" "$TOOLPORT_DATA_DIR/registry.json" && pass "v3 restores newest exact v1 backup" || fail "v3 restored wrong backup"
+aside="$(find "$TOOLPORT_DATA_DIR" -name 'registry.json.v3-rollback-*')"
+[ -n "$aside" ] && cmp -s "$fixtures/v3.json" "$aside" && pass "exact v3 registry kept aside" || fail "no exact v3 copy kept"
+[ -f "$TOOLPORT_DATA_DIR/registry.json.v2-1792000000000.bak" ] && pass "later v2 backup left intact" || fail "v2 backup consumed"
+[ -f "$TOOLPORT_DATA_DIR/exports/rules-2026-10-07.md" ] && pass "v3 exports left intact" || fail "v3 exports removed"
+echo "$out" | grep -q 'Registry: version 3 copied to .*; restored registry.json.v1-1791000000000.bak' && pass "v3 rollback reported" || fail "output: $out"
+grep -qx -- "-U $TOOLPORT_ROLLBACK_PKG_CACHE/toolport-1.24.0-1-x86_64.pkg.tar.zst" "$PACMAN_LOG" && pass "1.x reinstalled after v3 restore" || fail "v3 reinstall missing"
+
 # Re-entry after a run stopped before its restore finished: no primary, the v2
 # copy aside and the v1 backups still there. The newest v1 backup is restored.
 setup missing-primary
