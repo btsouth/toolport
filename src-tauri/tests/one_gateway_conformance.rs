@@ -907,11 +907,19 @@ fn process_command_lines_are_not_truncated_by_columns() {
         NEXT.fetch_add(1, Ordering::Relaxed)
     );
     let pad = "x".repeat(240);
+    // `read` is a shell builtin, so the shell stays in the process table with
+    // this exact argv. A `sh -c "sleep 30"` probe execs the lone command
+    // instead, and the kernel replaces the argv with `sleep 30`, dropping the
+    // marker. bash does that exec (it is macOS `/bin/sh`), dash does not (it is
+    // the Linux CI `/bin/sh`), so the exec version only tested the width on
+    // Linux. stdin stays open in the guard below, so `read` blocks until the
+    // probe is killed.
     let child = Command::new("sh")
         .arg("-c")
-        .arg("sleep 30")
+        .arg("read _line")
         .arg(&pad)
         .arg(&marker)
+        .stdin(Stdio::piped())
         .spawn()
         .expect("spawn a long-command probe");
     struct ProbeGuard(std::process::Child);
