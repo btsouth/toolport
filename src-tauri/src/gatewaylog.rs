@@ -61,6 +61,10 @@ pub fn append(msg: &str) {
     let Some(path) = crate::registry::gateway_log_path() else {
         return;
     };
+    queue_at(&path, msg);
+}
+
+pub(crate) fn queue_at(path: &Path, msg: &str) {
     let role = match ROLE.load(Ordering::Relaxed) {
         1 => "adapter",
         2 => "daemon",
@@ -71,7 +75,7 @@ pub fn append(msg: &str) {
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     crate::telemetry::record(
-        &path,
+        path,
         &format_line(msg, millis, std::process::id(), role),
         crate::telemetry::Rotation::Gateway,
     );

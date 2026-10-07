@@ -686,16 +686,24 @@ mod tests {
     #[test]
     fn rotation_failure_is_reported_and_keeps_history() {
         use crate::registry::tests::{with_atomic_failure, FailingAtomicWriteStep::*};
-        let root = std::env::temp_dir().join(format!("toolport-savings-rotate-failure-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "toolport-savings-rotate-failure-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("savings.jsonl");
         let old = "{\"v\":2,\"kind\":\"list\",\"tokensSaved\":5}\n";
         for step in [Permissions, Write, Rename] {
             std::fs::write(&path, old).unwrap();
-            let result = with_atomic_failure(step, || super::append_lines_at(&path, &[old.trim().into()], 1, 1));
+            let result = with_atomic_failure(step, || {
+                super::append_lines_at(&path, &[old.trim().into()], 1, 1)
+            });
             assert!(result.is_err());
             let appended = serde_json::from_str::<serde_json::Value>(old).unwrap();
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{old}{appended}\n"));
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                format!("{old}{appended}\n")
+            );
         }
         super::append_lines_at(&path, &[old.trim().into()], 1, 1).unwrap();
         std::fs::remove_dir_all(root).unwrap();

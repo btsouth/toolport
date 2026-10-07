@@ -489,7 +489,9 @@ fn resolve_atomic_write_dest(path: &Path) -> Result<PathBuf, String> {
 /// link inode is left in place (SBS-886).
 pub fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     #[cfg(test)]
-    if let Some(result) = tests::injected_atomic_write(path, contents) { return result; }
+    if let Some(result) = tests::injected_atomic_write(path, contents) {
+        return result;
+    }
     atomic_write_with_ops(path, contents, &FsAtomicWriteOps)
 }
 
@@ -5891,17 +5893,24 @@ pub(crate) mod tests {
         static ATOMIC_FAILURE: std::cell::Cell<Option<FailingAtomicWriteStep>> = const { std::cell::Cell::new(None) };
     }
 
-    pub(crate) fn with_atomic_failure<T>(step: FailingAtomicWriteStep, operation: impl FnOnce() -> T) -> T {
+    pub(crate) fn with_atomic_failure<T>(
+        step: FailingAtomicWriteStep,
+        operation: impl FnOnce() -> T,
+    ) -> T {
         struct Restore(Option<FailingAtomicWriteStep>);
         impl Drop for Restore {
-            fn drop(&mut self) { ATOMIC_FAILURE.set(self.0); }
+            fn drop(&mut self) {
+                ATOMIC_FAILURE.set(self.0);
+            }
         }
         let _restore = Restore(ATOMIC_FAILURE.replace(Some(step)));
         operation()
     }
 
     pub(super) fn injected_atomic_write(path: &Path, contents: &str) -> Option<Result<(), String>> {
-        ATOMIC_FAILURE.get().map(|step| atomic_write_with_ops(path, contents, &FailingAtomicWriteOps(step)))
+        ATOMIC_FAILURE
+            .get()
+            .map(|step| atomic_write_with_ops(path, contents, &FailingAtomicWriteOps(step)))
     }
 
     /// Fails the publish rename `fail_times` times, then lets it through.

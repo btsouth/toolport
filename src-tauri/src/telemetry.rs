@@ -292,7 +292,9 @@ fn deliver(
             // Fixed text: paths and OS/downstream errors can contain credentials.
             // Do not enqueue diagnostics about a failed diagnostic write recursively.
             if rotation != Rotation::Gateway {
-                crate::gatewaylog::append("telemetry batch persistence failed; Activity, savings and diagnostics may be incomplete");
+                // Keep diagnostics beside the failed record's captured path, even
+                // if a test override or data directory migration has since changed.
+                crate::gatewaylog::queue_at(&path.with_file_name("gateway.log"), "telemetry batch persistence failed; Activity, savings and diagnostics may be incomplete");
             } else {
                 eprintln!("toolport: gateway diagnostic write failed");
             }
@@ -357,7 +359,7 @@ mod tests {
             let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
             let endpoint = server.server_addr().to_ip().unwrap().to_string();
             let mut descriptor =
-                crate::daemon::DaemonDescriptor::new(endpoint, "test-only-token".into(), &compat);
+                crate::daemon::DaemonDescriptor::new(endpoint, "test-only-token", &compat);
             descriptor.pid = 0;
             crate::daemon::write_descriptor(
                 &crate::daemon::descriptor_path(&dir, &compat),
@@ -468,7 +470,7 @@ mod tests {
     fn failed_batches_count_unconfirmed_records_for_audit_and_savings() {
         let _lock = crate::registry::data_dir_test_lock();
         let dir = scratch("failed-batches");
-        let _data = crate::registry::DataDirOverride::set(&dir);
+        let _data = crate::registry::DataDirOverride::set(dir.join("current"));
         for rotation in [
             trimmed(1024, 100),
             Rotation::Savings {
@@ -484,6 +486,7 @@ mod tests {
                 let counters = Counters::default();
                 let mut pending = vec![fixture_record(1), fixture_record(2)];
                 for record in &mut pending {
+                    record.path = dir.join("audit.jsonl");
                     record.rotation = rotation;
                 }
                 deliver(&mut pending, &counters, &mut |_, _, _| Err(error.into()));
@@ -497,6 +500,8 @@ mod tests {
             }
         }
         assert!(flush());
+        assert!(dir.join("gateway.log").exists());
+        assert!(!dir.join("current/gateway.log").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

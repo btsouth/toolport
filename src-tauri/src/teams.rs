@@ -1385,7 +1385,8 @@ fn canonical_team_audit(lines: &[Value], ids: &[String], team_id: &str) -> Vec<V
 /// only (`source = "team:<id>"` — a member's personal servers are never reported) and
 /// POST the rollups. Counts and token/dollar estimates only; tool names stay local
 /// (rows are per server). Skips silently when there is nothing new, the server is too
-/// old for the endpoint, or the network is down — never fails the sync it rides on.
+/// old for the endpoint, or the network is down. Failed local watermark saves are
+/// returned so the sync caller reports partial success.
 fn report_usage(conn: &TeamConnection, token: &str) -> Result<(), String> {
     let tag = tag_for(&conn.team_id);
     let (team_servers, reported, all_ids) = {
@@ -3911,7 +3912,10 @@ mod tests {
     fn instructions_state_save_failure_is_reported_without_deleting_previous_data() {
         use crate::registry::tests::{with_atomic_failure, FailingAtomicWriteStep::*};
         let _lock = crate::registry::data_dir_test_lock();
-        let root = std::env::temp_dir().join(format!("toolport-teams-state-failure-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "toolport-teams-state-failure-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         let _data = crate::registry::DataDirOverride::set(&root);
         let rules = root.join("rules.md");
@@ -3921,12 +3925,30 @@ mod tests {
         let rules_before = std::fs::read(&rules).unwrap();
         let key = rules.to_string_lossy().to_string();
         for step in [Permissions, Write, Rename] {
-            let result = with_atomic_failure(step, || record_applied_instructions("team_test", Some("next instructions".into()), 2, vec![key.clone()], &[key.clone()]));
-            assert!(result.is_err(), "a failed save must not be complete success");
+            let result = with_atomic_failure(step, || {
+                record_applied_instructions(
+                    "team_test",
+                    Some("next instructions".into()),
+                    2,
+                    vec![key.clone()],
+                    &[key.clone()],
+                )
+            });
+            assert!(
+                result.is_err(),
+                "a failed save must not be complete success"
+            );
             assert_eq!(std::fs::read(&registry).unwrap(), before);
             assert_eq!(std::fs::read(&rules).unwrap(), rules_before);
         }
-        record_applied_instructions("team_test", Some("next instructions".into()), 2, vec![key.clone()], &[key]).unwrap();
+        record_applied_instructions(
+            "team_test",
+            Some("next instructions".into()),
+            2,
+            vec![key.clone()],
+            &[key],
+        )
+        .unwrap();
         assert_eq!(loaded_instructions().1, 2);
         std::fs::remove_dir_all(root).unwrap();
     }
