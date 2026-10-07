@@ -38,7 +38,7 @@ const props = {
   onClientsRefresh: vi.fn(),
   onBrowseCatalog: vi.fn(),
   onProbe: vi.fn().mockResolvedValue([]),
-  onOpenPlayground: vi.fn(),
+  onOpenTools: vi.fn(),
   onFinish: vi.fn(),
 };
 

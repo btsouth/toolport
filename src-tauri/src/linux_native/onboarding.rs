@@ -311,7 +311,7 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
     let call_verifier = CallVerifier::new();
     done.append(&call_verifier.root);
     let done_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let destination = gtk::Button::with_label("Open Playground");
+    let destination = gtk::Button::with_label("Open server tools");
     destination.add_css_class("toolport-secondary-action");
     destination.set_hexpand(true);
     destination.set_halign(gtk::Align::End);
@@ -382,7 +382,7 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
     let health_for_done = check_health.clone();
     let verifier_for_done = call_verifier.clone();
     continue_connect.connect_clicked(move |_| {
-        destination_for_done.set_label("Open Playground");
+        destination_for_done.set_label("Open server tools");
         refresh_summary(&summary_for_done);
         stack_for_done.set_visible_child_name("done");
         health_for_done.emit_clicked();
@@ -395,7 +395,7 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
     let summary_for_destination = summary.clone();
     destination.connect_clicked(move |_| {
         if complete_and_close(&window_for_destination, &summary_for_destination) {
-            activate_page(&app_for_destination, "show-playground");
+            activate_page(&app_for_destination, "show-server-tools");
         }
     });
     let window_for_finish = window.clone();
@@ -741,7 +741,7 @@ impl CallVerifier {
             if Instant::now() >= deadline {
                 verifier.status.add_css_class("error");
                 verifier.status.set_label(
-                    "No call arrived yet. Restart the client, confirm it uses a profile with enabled servers, or test a tool in Playground.",
+                    "No call arrived yet. Restart the client, confirm it uses a profile with enabled servers, or test a tool in the server’s Tools tab.",
                 );
                 verifier.retry.set_visible(true);
                 return gtk::glib::ControlFlow::Break;

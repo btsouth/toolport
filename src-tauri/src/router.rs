@@ -1211,6 +1211,13 @@ impl Router {
     /// unknown. Callers that need a call's provenance or server-scoping MUST use this rather
     /// than string-splitting the exposed name on `__` — that split silently mis-derives the
     /// server for a renamed tool (overrides) or any server id containing `__`.
+    /// Resolve a server-detail selection without guessing a sanitized alias.
+    pub fn exposed_tool_name(&self, server_id: &str, tool: &str) -> Option<&str> {
+        self.routes.iter().find_map(|(alias, (server, upstream))| {
+            (server == server_id && upstream == tool).then_some(alias.as_str())
+        })
+    }
+
     pub fn route_of(&self, exposed: &str) -> Option<(&str, &str)> {
         self.routes
             .get(exposed)
@@ -4587,6 +4594,17 @@ mod tests {
             router.expired_cache_kinds() & crate::downstream::change::TOOLS,
             0
         );
+    }
+
+    #[test]
+    fn server_detail_resolves_exact_upstream_names_and_overrides() {
+        let mut router = Router::new();
+        router.routes.insert("renamed".into(), ("server-a".into(), "get-item".into()));
+        router.routes.insert("server_a__get_item_2".into(), ("server-a".into(), "get_item".into()));
+        assert_eq!(router.exposed_tool_name("server-a", "get-item"), Some("renamed"));
+        assert_eq!(router.exposed_tool_name("server-a", "get_item"), Some("server_a__get_item_2"));
+        assert_eq!(router.exposed_tool_name("server_a", "get-item"), None);
+        assert_eq!(router.exposed_tool_name("server-a", "missing"), None);
     }
 
     #[test]

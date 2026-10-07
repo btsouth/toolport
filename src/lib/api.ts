@@ -120,7 +120,7 @@ export function removeHttpClient(id: string): Promise<Registry> {
   return invoke<Registry>("remove_http_client", { id });
 }
 
-/** List the tools one server exposes (connects on demand). Playground picker. */
+/** List the tools one server exposes (connects on demand). Server > Tools picker. */
 export function listServerTools(serverId: string): Promise<McpTool[]> {
   return invoke<McpTool[]>("list_server_tools", { serverId });
 }
@@ -134,12 +134,12 @@ export function callTool(
   return invoke<ToolCallResult>("call_tool", { serverId, tool, arguments: args });
 }
 
-/** List the resources one server advertises (connects on demand). Playground. */
+/** List the resources one server advertises (connects on demand). Server > Tools. */
 export function listServerResources(serverId: string): Promise<McpResource[]> {
   return invoke<McpResource[]>("list_server_resources", { serverId });
 }
 
-/** List the prompts one server advertises (connects on demand). Playground. */
+/** List the prompts one server advertises (connects on demand). Server > Tools. */
 export function listServerPrompts(serverId: string): Promise<McpPrompt[]> {
   return invoke<McpPrompt[]>("list_server_prompts", { serverId });
 }

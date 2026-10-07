@@ -191,7 +191,7 @@ impl SettingsPage {
         );
         pinned_section.append(
             &gtk::Label::builder()
-                .label("Tools pinned in Playground always surface in lazy discovery with their full schema.")
+                .label("Tools pinned in Server > Tools always surface in lazy discovery with their full schema.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
@@ -788,7 +788,7 @@ impl SettingsPage {
             self.pinned_list.remove(&child);
         }
         if pins.is_empty() {
-            self.pinned_list.append(&empty_state("No prerequisites are pinned. Pin a load-bearing tool from Playground when lazy discovery must always surface it."));
+            self.pinned_list.append(&empty_state("No prerequisites are pinned. Pin a load-bearing tool from Server > Tools when lazy discovery must always surface it."));
             return;
         }
         for pin in pins {

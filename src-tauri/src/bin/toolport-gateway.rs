@@ -6567,7 +6567,16 @@ fn handle_request_with_cancel(
             // approval, shaping) that a code-mode toolport.call() also uses.
             let model_facing_meta_call = name == "toolport_call_tool";
             let (name, arguments) = if model_facing_meta_call {
-                unwrap_call_tool(&arguments)
+                if let Some(target) = arguments.get("_toolportTarget") {
+                    let server = target.get("serverId").and_then(Value::as_str).unwrap_or("");
+                    let tool = target.get("tool").and_then(Value::as_str).unwrap_or("");
+                    let Some(alias) = router.exposed_tool_name(server, tool) else {
+                        return Some(success(id, json!({"content": [{"type": "text", "text": "Tool unavailable in the active profile or blocked by gateway policy."}], "isError": true})));
+                    };
+                    (alias.to_string(), arguments.get("arguments").cloned().unwrap_or_else(|| json!({})))
+                } else {
+                    unwrap_call_tool(&arguments)
+                }
             } else {
                 (name, arguments)
             };
@@ -28506,6 +28515,38 @@ mod tests {
         assert!(!names.contains(&"toolport_run_script"));
         assert!(!names.contains(&"toolport_confirm"));
         assert!(!names.contains(&"toolport_enable_server"));
+    }
+
+    #[test]
+    fn tools_tab_targets_share_gateway_scope_and_policy() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tools-tab-{}", new_correlation_id()));
+        let _data = registry::DataDirOverride::set(&dir);
+        let mut routed = Router::new();
+        routed.add(DownstreamServer::connect("alpha".into(), Box::new(MockRoute {
+            tools: vec![json!({"name": "read-item", "inputSchema": {"type":"object"}})],
+        })).unwrap());
+        let reg = Registry { safety_level: None, ..Registry::default() };
+        let host = dispatch_host(false);
+        let req = json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params": {
+            "name":"toolport_call_tool", "arguments": {
+                "_toolportTarget":{"serverId":"alpha", "tool":"read-item"}, "arguments":{}
+            }
+        }});
+        let denied = std::collections::HashSet::from(["beta".to_string()]);
+        let result = handle_request(&host, &req, &reg, &routed, &[], true, None,
+            &SearchGuard::default(), Some(&denied), None).unwrap();
+        assert_eq!(result["result"]["isError"], true, "{result}");
+        let result = handle_request(&host, &req, &reg, &routed, &[], true, None,
+            &SearchGuard::default(), None, None).unwrap();
+        assert_ne!(result["result"]["isError"], true, "{result}");
+        let mut missing = req.clone();
+        missing["params"]["arguments"]["_toolportTarget"]["tool"] = json!("missing");
+        let result = handle_request(&host, &missing, &reg, &routed, &[], true, None,
+            &SearchGuard::default(), None, None).unwrap();
+        assert_eq!(result["result"]["isError"], true, "{result}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -4,23 +4,16 @@ use std::rc::Rc;
 use adw::prelude::*;
 
 #[derive(Clone)]
-pub(super) struct PlaygroundPage {
+pub(super) struct ServerToolsPanel {
     pub(super) root: gtk::Box,
     app: adw::Application,
-    server: gtk::DropDown,
+    server_id: String,
     feedback: gtk::Label,
     view_stack: gtk::Stack,
     tools: gtk::Box,
     resources: gtk::Box,
     prompts: gtk::Box,
-    servers: Rc<RefCell<Vec<(String, String)>>>,
     loading: Rc<Cell<bool>>,
-    /// Set while the dropdown's model and selection are being replaced.
-    /// `set_model` autoselects index 0 and emits `notify::selected`, which would
-    /// otherwise start loading the first server and hold the `loading` guard, so
-    /// the restore of the real selection was dropped and the tabs showed a
-    /// different server from the one named in the dropdown.
-    updating_selection: Rc<Cell<bool>>,
     tool_filter: gtk::SearchEntry,
     /// The last loaded capabilities and policy, so the tool filter re-renders
     /// without reconnecting to the server.
@@ -31,24 +24,14 @@ pub(super) struct PlaygroundPage {
 struct ToolPolicy {
     disabled: std::collections::HashSet<String>,
     pinned: std::collections::HashSet<String>,
+    quarantined: std::collections::HashSet<String>,
     overrides: std::collections::HashMap<String, crate::registry::ToolOverride>,
 }
 
-impl PlaygroundPage {
-    pub(super) fn new(app: &adw::Application) -> Self {
+impl ServerToolsPanel {
+    pub(super) fn new(app: &adw::Application, server_id: &str) -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("toolport-content");
-        let header = adw::HeaderBar::new();
-        header.add_css_class("toolport-header");
-        header.set_show_back_button(true);
-        header.set_title_widget(Some(
-            &gtk::Label::builder()
-                .label("Playground")
-                .css_classes(["title"])
-                .build(),
-        ));
-        root.append(&header);
-
         let scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
@@ -59,31 +42,17 @@ impl PlaygroundPage {
         page.set_margin_bottom(20);
         page.set_margin_start(20);
         page.set_margin_end(20);
-        page.append(
-            &gtk::Label::builder()
-                .label("Test servers directly")
-                .halign(gtk::Align::Start)
-                .css_classes(["title-2"])
-                .build(),
-        );
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         page.append(
             &gtk::Label::builder()
                 .label(
-                    "Run a server's tools locally, without an AI client. Calls appear in Activity.",
+                    "Calls follow the active profile and gateway policy, including approval gates.",
                 )
-                .halign(gtk::Align::Start)
-                .xalign(0.0)
                 .wrap(true)
+                .xalign(0.0)
                 .css_classes(["toolport-muted"])
                 .build(),
         );
-        // The server picker and the tool filter are both "narrow down what I am
-        // looking at", and each was taking a full row on its own.
-        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        let server = gtk::DropDown::new(None::<gtk::gio::ListModel>, None::<gtk::Expression>);
-        server.set_hexpand(false);
-        server.set_size_request(220, -1);
-        controls.append(&server);
         let feedback = gtk::Label::builder()
             .halign(gtk::Align::Fill)
             .xalign(0.0)
@@ -124,100 +93,35 @@ impl PlaygroundPage {
         scroller.set_child(Some(&page));
         root.append(&scroller);
 
-        let playground = Self {
+        let panel = Self {
             root,
             app: app.clone(),
-            server,
+            server_id: server_id.to_string(),
             feedback,
             view_stack,
             tools,
             resources,
             prompts,
-            servers: Rc::new(RefCell::new(Vec::new())),
             loading: Rc::new(Cell::new(false)),
-            updating_selection: Rc::new(Cell::new(false)),
             tool_filter,
             last_load: Rc::new(RefCell::new(None)),
         };
-        let page_for_selection = playground.clone();
-        playground.server.connect_selected_notify(move |_| {
-            if page_for_selection.updating_selection.get() {
-                return;
-            }
-            page_for_selection.load_selected();
-        });
-        let page_for_filter = playground.clone();
-        playground
+        let page_for_filter = panel.clone();
+        panel
             .tool_filter
             .connect_search_changed(move |_| page_for_filter.render_tools());
-        playground
+        panel
     }
 
     pub(super) fn refresh(&self) {
-        let page = self.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(|| {
-                let registry = crate::registry::load()?;
-                Ok::<_, String>(
-                    registry
-                        .servers
-                        .into_iter()
-                        .filter(|server| !crate::clients::is_gateway_server(server))
-                        .map(|server| (server.id, server.name))
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .await;
-            match result {
-                Ok(Ok(servers)) => {
-                    let previous = page.selected_server_id();
-                    if *page.servers.borrow() == servers {
-                        return;
-                    }
-                    let names = servers
-                        .iter()
-                        .map(|(_, name)| name.clone())
-                        .collect::<Vec<_>>();
-                    let selected = selected_server_index(&servers, previous.as_deref());
-                    *page.servers.borrow_mut() = servers;
-                    let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
-                    page.updating_selection.set(true);
-                    page.server
-                        .set_model(Some(&gtk::StringList::new(&name_refs)));
-                    if !names.is_empty() {
-                        page.server.set_selected(selected);
-                    }
-                    page.updating_selection.set(false);
-                    page.server.set_sensitive(!names.is_empty());
-                    if names.is_empty() {
-                        page.set_status("Add a server before using Playground.");
-                        page.set_capability_counts(None);
-                        *page.last_load.borrow_mut() = None;
-                        page.clear_lists();
-                    } else {
-                        page.load_selected();
-                    }
-                }
-                Ok(Err(error)) => page.show_error(&error),
-                Err(_) => page.show_error("the server list stopped unexpectedly"),
-            }
-        });
+        self.load_selected();
     }
 
     fn load_selected(&self) {
         if self.loading.replace(true) {
             return;
         }
-        let selected = self.server.selected() as usize;
-        let Some(server_id) = self
-            .servers
-            .borrow()
-            .get(selected)
-            .map(|(id, _)| id.clone())
-        else {
-            self.loading.set(false);
-            return;
-        };
+        let server_id = self.server_id.clone();
         self.set_status("Connecting to server…");
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
@@ -235,6 +139,18 @@ impl PlaygroundPage {
                     .get(&server_id)
                     .map(|tools| tools.iter().cloned().collect())
                     .unwrap_or_default();
+                let quarantined = crate::integrity::all_quarantined()?
+                    .into_iter()
+                    .filter(|q| {
+                        q.get("server").and_then(serde_json::Value::as_str)
+                            == Some(server_id.as_str())
+                    })
+                    .filter_map(|q| {
+                        q.get("tool")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect();
                 let overrides = registry
                     .tool_overrides
                     .get(&server_id)
@@ -246,6 +162,7 @@ impl PlaygroundPage {
                         disabled,
                         pinned,
                         overrides,
+                        quarantined,
                     },
                 ))
             })
@@ -347,6 +264,10 @@ impl PlaygroundPage {
             shown += 1;
             self.tools.append(&tool_row(
                 tool.clone(),
+                policy.quarantined.iter().any(|alias| {
+                    alias == &name
+                        || alias.ends_with(&format!("__{}", crate::router::sanitize_segment(&name)))
+                }),
                 !policy.disabled.contains(&name),
                 policy.pinned.contains(&name),
                 policy.overrides.get(&name).cloned(),
@@ -384,10 +305,7 @@ impl PlaygroundPage {
     }
 
     fn selected_server_id(&self) -> Option<String> {
-        self.servers
-            .borrow()
-            .get(self.server.selected() as usize)
-            .map(|(id, _)| id.clone())
+        Some(self.server_id.clone())
     }
 
     fn clear_lists(&self) {
@@ -399,15 +317,9 @@ impl PlaygroundPage {
     }
 
     fn show_error(&self, error: &str) {
-        self.set_status(&format!("Playground error: {error}"));
+        self.set_status(&format!("Tools error: {error}"));
         self.feedback.add_css_class("error");
     }
-}
-
-fn selected_server_index(servers: &[(String, String)], previous: Option<&str>) -> u32 {
-    previous
-        .and_then(|previous| servers.iter().position(|(id, _)| id == previous))
-        .unwrap_or(0) as u32
 }
 
 fn capability_list() -> gtk::Box {
@@ -442,10 +354,11 @@ fn state_badge(text: &str) -> gtk::Label {
 
 fn tool_row(
     tool: serde_json::Value,
+    quarantined: bool,
     enabled: bool,
     pinned: bool,
     exposure_override: Option<crate::registry::ToolOverride>,
-    page: PlaygroundPage,
+    page: ServerToolsPanel,
 ) -> gtk::Box {
     let name = tool
         .get("name")
@@ -486,6 +399,24 @@ fn tool_row(
     let renamed_badge = state_badge("Renamed");
     renamed_badge.set_visible(exposure_override.is_some());
     title.append(&renamed_badge);
+    for (hint, label) in [
+        ("readOnlyHint", "Read-only"),
+        ("destructiveHint", "Destructive"),
+    ] {
+        if tool
+            .pointer(&format!("/annotations/{hint}"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            title.append(&state_badge(label));
+        }
+    }
+    title.append(&state_badge(if enabled { "Enabled" } else { "Disabled" }));
+    title.append(&state_badge(if quarantined {
+        "Quarantined"
+    } else {
+        "Not quarantined"
+    }));
     copy.append(&title);
 
     copy.append(
@@ -687,7 +618,7 @@ fn set_visibility_look(button: &gtk::ToggleButton, enabled: bool) {
 }
 
 fn open_exposure_editor(
-    page: &PlaygroundPage,
+    page: &ServerToolsPanel,
     tool: &str,
     original_description: &str,
     current: Option<crate::registry::ToolOverride>,
@@ -846,7 +777,7 @@ fn open_exposure_editor(
     window.present();
 }
 
-fn resource_row(resource: serde_json::Value, page: PlaygroundPage) -> gtk::Box {
+fn resource_row(resource: serde_json::Value, page: ServerToolsPanel) -> gtk::Box {
     let uri = resource
         .get("uri")
         .and_then(serde_json::Value::as_str)
@@ -869,7 +800,7 @@ fn resource_row(resource: serde_json::Value, page: PlaygroundPage) -> gtk::Box {
     })
 }
 
-fn prompt_row(prompt: serde_json::Value, page: PlaygroundPage) -> gtk::Box {
+fn prompt_row(prompt: serde_json::Value, page: ServerToolsPanel) -> gtk::Box {
     let name = prompt
         .get("name")
         .and_then(serde_json::Value::as_str)
@@ -1155,7 +1086,7 @@ fn set_dialog_status(feedback: &gtk::Label, message: &str, error: bool) {
 }
 
 fn open_json_action(
-    page: &PlaygroundPage,
+    page: &ServerToolsPanel,
     title: &str,
     schema: &serde_json::Value,
     execute: impl FnOnce(String, serde_json::Value) -> Result<serde_json::Value, String>
@@ -1387,9 +1318,9 @@ fn open_json_action(
             }
             dialog.close();
             match result {
-                Ok(Ok(value)) => show_output(&page, "Playground result", value),
+                Ok(Ok(value)) => show_output(&page, "Tools result", value),
                 Ok(Err(error)) => page.show_error(&error),
-                Err(_) => page.show_error("the playground call stopped unexpectedly"),
+                Err(_) => page.show_error("the tool call stopped unexpectedly"),
             }
         });
     });
@@ -1397,7 +1328,7 @@ fn open_json_action(
 }
 
 fn run_output(
-    page: &PlaygroundPage,
+    page: &ServerToolsPanel,
     title: &str,
     operation: impl FnOnce() -> Result<serde_json::Value, String> + Send + 'static,
 ) {
@@ -1407,12 +1338,12 @@ fn run_output(
         match gtk::gio::spawn_blocking(operation).await {
             Ok(Ok(value)) => show_output(&page, &title, value),
             Ok(Err(error)) => page.show_error(&error),
-            Err(_) => page.show_error("the playground operation stopped unexpectedly"),
+            Err(_) => page.show_error("the tool operation stopped unexpectedly"),
         }
     });
 }
 
-fn show_output(page: &PlaygroundPage, title: &str, value: serde_json::Value) {
+fn show_output(page: &ServerToolsPanel, title: &str, value: serde_json::Value) {
     let Some(parent) = page.app.active_window() else {
         return;
     };
@@ -1484,17 +1415,6 @@ mod tests {
             one_paragraph("Retrieve an attachment's content by ID."),
             "Retrieve an attachment's content by ID."
         );
-    }
-
-    #[test]
-    fn refreshed_server_choices_keep_the_selected_server() {
-        let servers = vec![
-            ("linear".to_string(), "Linear".to_string()),
-            ("stripe".to_string(), "Stripe".to_string()),
-        ];
-        assert_eq!(selected_server_index(&servers, Some("stripe")), 1);
-        assert_eq!(selected_server_index(&servers, Some("removed")), 0);
-        assert_eq!(selected_server_index(&servers, None), 0);
     }
 
     #[test]

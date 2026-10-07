@@ -67,7 +67,7 @@ import {
 } from "@/components/ui/select";
 
 /** The set of tools pinned as lazy-discovery prerequisites, with one-click unpin.
- * Pinning happens contextually (a tool's card in Playground); this is where you see
+ * Pinning happens contextually (a tool's card in Server > Tools); this is where you see
  * and manage the whole set. Reads `registry.pinnedTools` (server id -> tool names). */
 function PinnedPrerequisites({
   registry,
@@ -120,7 +120,7 @@ function PinnedPrerequisites({
       {pins.length === 0 ? (
         <p className="mt-2 max-w-2xl text-xs text-muted-foreground">
           None yet. Pin a load-bearing tool (auth, list-before-act, or one whose
-          description doesn&apos;t match your keywords) from its card in Playground, so
+          description doesn&apos;t match your keywords) from its card in Server > Tools, so
           lazy discovery never hides it.
         </p>
       ) : (
@@ -495,7 +495,7 @@ function ProfileToolScope({
 }
 
 /** Global discovery + security policy. These apply to every client uniformly, so
- * they live here rather than in the per-server Playground. */
+ * they live here rather than in the per-server Server > Tools. */
 export function SettingsView({ registry, onRegistryChange }: Props) {
   const { theme, setTheme } = useTheme();
   const lazyDiscovery = registry?.lazyDiscovery ?? true;

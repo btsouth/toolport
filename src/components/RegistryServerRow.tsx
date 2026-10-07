@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { ChevronDown, Copy, KeyRound, LogIn, Pencil, Trash2, Users } from "lucide-react";
 import { isDownloadLauncher } from "@/lib/launcher";
 import { errorHeadline, shortenUrls } from "@/lib/errors";
@@ -12,7 +12,10 @@ import { LaunchSetupDialog } from "@/components/LaunchSetupDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ServerLogo } from "@/components/ServerLogo";
 
+const ServerToolsPanel = lazy(() => import("@/components/ServerToolsPanel").then((m) => ({ default: m.ServerToolsPanel })));
+
 interface Props {
+  openTools?: boolean;
   server: ServerEntry;
   registry: Registry | null;
   enabled: boolean;
@@ -65,8 +68,11 @@ export function RegistryServerRow({
   onRemove,
   onRegistryChange,
   onReprobe,
+  openTools,
 }: Props) {
   const [expanded, setExpanded] = useState(false);
+  const [detailTab, setDetailTab] = useState<"overview" | "tools">("overview");
+  useEffect(() => { if (openTools) { setExpanded(true); setDetailTab("tools"); } }, [openTools]);
 
   const target =
     server.command !== null
@@ -218,6 +224,10 @@ export function RegistryServerRow({
 
       {expanded && (
         <div className="flex flex-col gap-2.5 px-3.5 pt-0.5 pb-3 pl-12">
+          <div role="tablist" aria-label={`${server.name} details`} className="flex gap-1 border-b pb-2">
+            {(["overview", "tools"] as const).map((tab) => <button key={tab} role="tab" aria-selected={detailTab === tab} className={ACTION} onClick={() => setDetailTab(tab)}>{tab === "overview" ? "Overview" : "Tools"}</button>)}
+          </div>
+          {detailTab === "tools" ? <Suspense fallback={<p>Loading tools…</p>}><ServerToolsPanel serverId={server.id} registry={registry} onRegistryChange={onRegistryChange} /></Suspense> : <>
           {!!requiredLaunch.length && (
             <p className="text-xs text-muted-foreground">
               Launch setup: {requiredLaunch.map((input) => input.label).join(", ")}. Open
@@ -332,6 +342,7 @@ export function RegistryServerRow({
               </>
             )}
           </div>
+          </>}
         </div>
       )}
     </div>

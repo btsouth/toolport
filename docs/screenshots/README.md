@@ -9,7 +9,7 @@ from the native Linux app with Tokyo Night and a plain dark background.
 | `servers-tokyo-night.png` | Current native Linux Servers view, used in the README and website hero.                                            |
 | `servers.png`             | The "All servers" view, with a few servers and their status dots.                                                  |
 | `activity.png`            | The Activity view showing the per-server latency / error-rate panel.                                               |
-| `playground.png`          | The Playground: the lazy-discovery + destructive-tool switches and a tool's argument form (ideally with a result). |
+| `server-tools.png`          | The Server > Tools: the lazy-discovery + destructive-tool switches and a tool's argument form (ideally with a result). |
 | `catalog.png`             | The catalog / add-server view.                                                                                     |
 
 How to capture on Windows: `Win` + `Shift` + `S`, drag over the app window,

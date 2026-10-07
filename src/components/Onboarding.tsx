@@ -61,8 +61,8 @@ interface Props {
   onBrowseCatalog: () => void;
   /** Probe server health for the Done step (returns per-server results). */
   onProbe: () => Promise<ProbeResult[]>;
-  /** Close the wizard and open the Playground (the in-app verify fallback). */
-  onOpenPlayground: () => void;
+  /** Close the wizard and open the server’s Tools tab (the in-app verify fallback). */
+  onOpenTools: () => void;
   /** Mark onboarding complete (skipped or finished) and close. */
   onFinish: () => void;
 }
@@ -79,7 +79,7 @@ export function Onboarding({
   onClientsRefresh,
   onBrowseCatalog,
   onProbe,
-  onOpenPlayground,
+  onOpenTools,
   onFinish,
 }: Props) {
   const [step, setStep] = useState(initialStep);
@@ -122,7 +122,7 @@ export function Onboarding({
       serverCount={serverCount}
       connectedCount={connectedCount}
       onProbe={onProbe}
-      onOpenPlayground={onOpenPlayground}
+      onOpenTools={onOpenTools}
       onFinish={onFinish}
     />
   );
@@ -879,7 +879,7 @@ function Done({
   serverCount,
   connectedCount,
   onProbe,
-  onOpenPlayground,
+  onOpenTools,
   onFinish,
 }: {
   registry: Registry;
@@ -887,7 +887,7 @@ function Done({
   serverCount: number;
   connectedCount: number;
   onProbe: () => Promise<ProbeResult[]>;
-  onOpenPlayground: () => void;
+  onOpenTools: () => void;
   onFinish: () => void;
 }) {
   // Probe what was just added so we report the truth, not a blanket "you're set up"
@@ -1036,7 +1036,7 @@ function Done({
       )}
 
       {ready && verifyClient && (
-        <VerifyCall client={verifyClient} onOpenPlayground={onOpenPlayground} />
+        <VerifyCall client={verifyClient} onOpenTools={onOpenTools} />
       )}
 
       <Button onClick={onFinish} className="self-start">
@@ -1053,15 +1053,15 @@ function Done({
 
 /** Proves a real call actually reached Toolport: shows a safe copy-paste prompt for the
  *  connected client, then watches the LOCAL audit log for the first new call (nothing is
- *  sent anywhere). Optional and non-blocking; Playground is the in-app fallback. */
+ *  sent anywhere). Optional and non-blocking; Tools tab is the in-app fallback. */
 export function VerifyCall({
   client,
-  onOpenPlayground,
+  onOpenTools,
   pollMs = 2000,
   timeoutMs = 75_000,
 }: {
   client: DetectedClient;
-  onOpenPlayground: () => void;
+  onOpenTools: () => void;
   /** Poll interval and give-up deadline; overridable so tests run fast. */
   pollMs?: number;
   timeoutMs?: number;
@@ -1190,7 +1190,7 @@ export function VerifyCall({
               </span>
               <span className="text-muted-foreground">
                 An older or unrelated call will not be treated as proof. Retry when the
-                log is available, or use the Playground.
+                log is available, or use the server’s Tools tab.
               </span>
               <button
                 type="button"
@@ -1214,10 +1214,10 @@ export function VerifyCall({
 
           <button
             type="button"
-            onClick={onOpenPlayground}
+            onClick={onOpenTools}
             className="self-start text-xs font-medium text-primary hover:underline"
           >
-            Or test a tool in the Playground instead
+            Or test a tool in the server’s Tools tab instead
           </button>
         </>
       )}

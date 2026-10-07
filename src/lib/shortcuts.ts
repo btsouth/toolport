@@ -1,7 +1,7 @@
 import type { View } from "./types";
 
 /** Views in the order their number key selects them (SBS-143). The four 2.0
- * sidebar views, in sidebar order; Team is click-only and catalog, Playground,
+ * sidebar views, in sidebar order; Team is click-only and catalog, Server > Tools,
  * Agent rules and Agent activity are no longer top-level. */
 export const SHORTCUT_VIEWS: View[] = ["servers", "clients", "activity", "settings"];
 

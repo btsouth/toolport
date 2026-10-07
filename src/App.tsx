@@ -86,9 +86,6 @@ const ActivityView = lazy(() =>
 const CatalogView = lazy(() =>
   import("@/components/CatalogView").then((m) => ({ default: m.CatalogView })),
 );
-const PlaygroundView = lazy(() =>
-  import("@/components/PlaygroundView").then((m) => ({ default: m.PlaygroundView })),
-);
 const TeamsView = lazy(() =>
   import("@/components/TeamsView").then((m) => ({ default: m.TeamsView })),
 );
@@ -131,6 +128,7 @@ function App() {
   const [confirmDisableAll, setConfirmDisableAll] = useState(false);
   const [confirmEnableTeam, setConfirmEnableTeam] = useState<ServerEntry | null>(null);
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
+  const [toolsServerId, setToolsServerId] = useState<string | null>(null);
   const [view, setView] = useState<View>("servers");
   const [activityKey, setActivityKey] = useState(0);
   const [health, setHealth] = useState<Record<string, ProbeResult>>({});
@@ -733,6 +731,7 @@ function App() {
     <RegistryServerRow
       key={server.id}
       server={server}
+      openTools={toolsServerId === server.id}
       registry={registry}
       enabled={registry ? isEnabled(registry, server.id) : false}
       busy={busyId === server.id}
@@ -787,8 +786,6 @@ function App() {
                     ? "Activity"
                     : view === "catalog"
                       ? "Browse catalog"
-                      : view === "playground"
-                        ? "Playground"
                         : view === "teams"
                           ? "Teams"
                           : view === "settings"
@@ -802,8 +799,6 @@ function App() {
                     ? "Tool calls routed through Toolport"
                     : view === "catalog"
                       ? "Add MCP servers from the registry"
-                      : view === "playground"
-                        ? "Invoke a server's tools and see the raw result"
                         : view === "teams"
                           ? "Share one MCP server set across your team"
                           : view === "settings"
@@ -977,11 +972,6 @@ function App() {
                     <ActivityView refreshKey={activityKey} registry={registry} />
                   ) : view === "catalog" ? (
                     <CatalogView registry={registry} onAdded={applyRegistryChange} />
-                  ) : view === "playground" ? (
-                    <PlaygroundView
-                      registry={registry}
-                      onRegistryChange={applyRegistryChange}
-                    />
                   ) : view === "teams" ? (
                     <TeamsView
                       registry={registry}
@@ -1085,9 +1075,10 @@ function App() {
               selectView("catalog");
             }}
             onProbe={reprobe}
-            onOpenPlayground={() => {
+            onOpenTools={() => {
               setShowOnboarding(false);
-              selectView("playground");
+              setToolsServerId(registry?.servers[0]?.id ?? null);
+              selectView("servers");
             }}
             onFinish={finishOnboarding}
           />

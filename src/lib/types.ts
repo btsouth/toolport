@@ -2,7 +2,7 @@ export type Transport = "stdio" | "http" | "sse" | "unknown";
 
 /** The main content views, selected from the sidebar. */
 export type View =
-  "servers" | "clients" | "activity" | "catalog" | "playground" | "teams" | "settings";
+  "servers" | "clients" | "activity" | "catalog" | "teams" | "settings";
 
 export interface McpServer {
   name: string;
@@ -208,7 +208,7 @@ export interface McpPrompt {
   arguments?: Array<{ name: string; description?: string; required?: boolean }>;
 }
 
-/** The subset of JSON Schema the playground form renders per argument. */
+/** The subset of JSON Schema the tool arguments form renders per argument. */
 export interface JsonSchemaProp {
   type?: string | string[];
   description?: string;
