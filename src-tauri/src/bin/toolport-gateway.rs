@@ -13754,7 +13754,9 @@ fn process_request(
     }
 
     // Tools can use their disk cache immediately. Other first lists wait for
-    // startup because the disk cache contains tools only. Warm lists stay fast.
+    // startup because the disk cache contains tools only. A cold tools/list
+    // waits for every first catalog, not just the first server to publish.
+    // Warm lists stay fast.
     if matches!(
         method,
         "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
@@ -13768,16 +13770,6 @@ fn process_request(
     {
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
-            if method == "tools/list"
-                && !state
-                    .cached_tools
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .tools
-                    .is_empty()
-            {
-                break;
-            }
             let live = state
                 .router
                 .lock()
