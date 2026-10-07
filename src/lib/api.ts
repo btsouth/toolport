@@ -258,7 +258,7 @@ export function clearActivityLogs(): Promise<void> {
 }
 
 /** Every pinned tool's verifiable identity (alias -> server/profiles + fingerprint +
- * first-seen/last-changed) for the active profile. Empty until a baseline is pinned. */
+ * first-seen/last-changed) for the default access. Empty until a baseline is pinned. */
 export function getToolIdentities(): Promise<ToolIdentity[]> {
   return invoke<ToolIdentity[]>("list_tool_identities");
 }
@@ -498,7 +498,7 @@ export interface ShareDefinitionPreview {
   fields: { label: string; value: string }[];
 }
 
-/** What sharing does, or did, to one selected server in the active profile. */
+/** What sharing does, or did, to one selected server in the local access context. */
 export interface LocalHandoff {
   id: string;
   name: string;
@@ -886,8 +886,20 @@ export function deleteProfile(id: string): Promise<Registry> {
   return invoke<Registry>("delete_profile", { id });
 }
 
-export function setActiveProfile(id: string): Promise<Registry> {
-  return invoke<Registry>("set_active_profile", { id });
+export function setDefaultAccess(profile: string | null): Promise<Registry> {
+  return invoke<Registry>("set_default_access", { profile });
+}
+
+export function setAccessServer(
+  profileId: string,
+  serverId: string,
+  included: boolean,
+): Promise<Registry> {
+  return invoke<Registry>("set_access_server", { profileId, serverId, included });
+}
+
+export function dismissAccessUpgradeNotice(): Promise<Registry> {
+  return invoke<Registry>("dismiss_access_upgrade_notice");
 }
 
 /** Set (or clear with `null`) a profile's tool-granular scope for one server (SOU-189):
@@ -922,7 +934,7 @@ export function disableAutostart(): Promise<void> {
   return invoke<void>("disable_launch_at_login");
 }
 
-/** Explicitly use an identical managed definition in the active profile. */
+/** Explicitly use an identical managed definition in the local access context. */
 export function teamUseManaged(serverId: string): Promise<Registry> {
   return invoke<Registry>("team_use_managed", { serverId });
 }

@@ -173,7 +173,7 @@ export interface ProbeResult {
 
 /** A tool as advertised by a downstream MCP server (raw `tools/list` entry). */
 export interface McpTool {
-  /** Retained quarantine state for the active profile, supplied by Toolport. */
+  /** Retained quarantine state for the default access, supplied by Toolport. */
   toolportQuarantine?: "quarantined" | "clear" | "unknown";
   name: string;
   description?: string;
@@ -375,6 +375,7 @@ export interface LaunchConfig {
 }
 
 export interface ServerEntry {
+  enabled?: boolean;
   id: string;
   name: string;
   transport: Transport;
@@ -486,6 +487,10 @@ export interface Registry {
   servers: ServerEntry[];
   profiles: Profile[];
   activeProfileId: string | null;
+  defaultAccessProfileId?: string | null;
+  defaultAccessContextId?: string | null;
+  defaultAccessLegacyPolicy?: boolean;
+  accessUpgradeNoticeDismissed?: boolean;
   /** Folder -> profile auto-routing mappings. Absent/empty = no folder routing. */
   folderProfiles?: FolderProfile[];
   /** Per-tool exposure overrides (rename / re-describe), keyed by server id then original tool name. */
@@ -539,7 +544,7 @@ export interface Registry {
    * global default; 0 = never shape (full fidelity); n = cap that server at n bytes. */
   resultBudgets?: Record<string, number>;
   /** Which profile each client was connected with, keyed by client id (e.g.
-   * "cursor" -> "Billing"). Absent = that client follows the active profile. */
+   * "cursor" -> "Billing"). Absent = that client uses the default access. */
   clientScopes?: Record<string, string>;
   /** What Toolport last wrote into each client config as its gateway entry
    * (SOU-406 ownership record). Absent key = pre-ownership install. */
@@ -615,7 +620,9 @@ export function activeProfile(registry: Registry): Profile | undefined {
 }
 
 export function isEnabled(registry: Registry, serverId: string): boolean {
-  return activeProfile(registry)?.enabledServerIds.includes(serverId) ?? false;
+  if (registry.version < 3)
+    return activeProfile(registry)?.enabledServerIds.includes(serverId) ?? false;
+  return registry.servers.find((s) => s.id === serverId)?.enabled ?? false;
 }
 
 /** Whether a registry entry is Toolport's own gateway. It's infrastructure, not a

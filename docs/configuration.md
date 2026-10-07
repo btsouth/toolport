@@ -8,7 +8,7 @@ gateway entry, written for you when you connect a client:
 - `TOOLPORT_CLIENT_ID=<id>` - identifies this client for live profile resolution
   (written automatically when you Connect a client).
 - `TOOLPORT_PROFILE=<name>` - initial profile scope for a scoped install. Unset =
-  follow the active profile (resolved live via `TOOLPORT_CLIENT_ID`).
+  follow Default access (resolved live via `TOOLPORT_CLIENT_ID`).
 - `TOOLPORT_DISCOVERY=lazy|full|grouped` - optional per-client override of the global
   discovery setting. Rarely needed; the gateway reads the registry default otherwise.
 - `TOOLPORT_REGISTRY=<path>` - override the registry file location. Defaults to a
@@ -81,7 +81,7 @@ its own. Leave both out to keep the built-in text everywhere.
 
 The profile is the one the connection is scoped to: a registered HTTP client's
 `profile`, or the stdio client's profile. A connection without one uses the gateway's
-own profile, which is the active profile unless `TOOLPORT_PROFILE` sets another.
+own access set, which is Default access unless `TOOLPORT_PROFILE` sets another.
 Changes apply the next time a client connects and don't restart any servers.
 
 **Code mode limits.** Execution and validation run Boa in a separate

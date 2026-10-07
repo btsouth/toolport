@@ -377,6 +377,40 @@ pub(super) struct ClientSnapshot {
     pub(super) profiles: Vec<ProfileView>,
 }
 
+fn client_access_label(registry: &Registry, scope: Option<&str>) -> String {
+    match scope.filter(|scope| !scope.is_empty()) {
+        None => registry.default_access_label(),
+        Some(crate::registry::ALL_ENABLED_ACCESS) => "All enabled servers".into(),
+        Some(reference) => {
+            let name = registry
+                .profiles
+                .iter()
+                .find(|p| p.id == reference || p.name == reference)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| format!("{reference} (unavailable)"));
+            name
+        }
+    }
+}
+
+fn client_access_options(registry: &Registry) -> Vec<ProfileView> {
+    let mut options = vec![
+        ProfileView {
+            id: String::new(),
+            name: registry.default_access_label(),
+        },
+        ProfileView {
+            id: crate::registry::ALL_ENABLED_ACCESS.into(),
+            name: "All enabled servers".into(),
+        },
+    ];
+    options.extend(registry.profiles.iter().map(|profile| ProfileView {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+    }));
+    options
+}
+
 pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
     let path = registry::resolved_path().ok_or_else(|| "registry path unavailable".to_string())?;
     let registry = match std::fs::read_to_string(&path) {
@@ -402,13 +436,7 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
             .get(&client.id)
             .filter(|scope| !scope.is_empty())
             .cloned();
-        client.scope_name = client.scope_id.as_ref().and_then(|scope| {
-            registry
-                .profiles
-                .iter()
-                .find(|profile| profile.id == *scope || profile.name == *scope)
-                .map(|profile| profile.name.clone())
-        });
+        client.scope_name = Some(client_access_label(&registry, client.scope_id.as_deref()));
         client.discovery_mode = registry.client_discovery.get(&client.id).cloned();
     }
     clients.sort_by(|left, right| {
@@ -419,14 +447,7 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
     });
     Ok(ClientSnapshot {
         clients,
-        profiles: registry
-            .profiles
-            .into_iter()
-            .map(|profile| ProfileView {
-                id: profile.id,
-                name: profile.name,
-            })
-            .collect(),
+        profiles: client_access_options(&registry),
     })
 }
 
@@ -464,8 +485,6 @@ pub(super) struct RegistrySnapshot {
     pub(super) enabled_count: usize,
     pub(super) profile_count: usize,
     pub(super) active_profile_id: String,
-    pub(super) active_profile: String,
-    pub(super) active_profile_tool_scope: std::collections::HashMap<String, Vec<String>>,
     /// Whether this install is paired with a team. Drives the Team sidebar row,
     /// which has to appear the moment pairing writes the registry, not only on
     /// the next launch.
@@ -490,27 +509,24 @@ pub(super) enum RegistryState {
 impl RegistrySnapshot {
     pub(super) fn from_registry(registry: Registry) -> Self {
         let active_profile_id = registry.active_profile_id();
-        let active_profile = registry
-            .profiles
-            .iter()
-            .find(|profile| profile.id == active_profile_id)
-            .map(|profile| profile.name.clone())
-            .unwrap_or_else(|| "Default".to_string());
-        let active_profile_tool_scope = registry
-            .profiles
-            .iter()
-            .find(|profile| profile.id == active_profile_id)
-            .map(|profile| profile.tool_scope.clone())
-            .unwrap_or_default();
         let servers = registry
             .servers
             .iter()
             .map(|server| {
-                let enabled = registry.is_enabled(&active_profile_id, &server.id);
+                let enabled = registry.server_enabled(&server.id);
                 ServerView {
                     origin_label: if server.source.as_deref().unwrap_or("").starts_with("team:") {
-                        format!("Team · {}", registry.team.as_ref().and_then(|t| t.team_name.as_deref()).unwrap_or("Shared"))
-                    } else { "Personal".into() },
+                        format!(
+                            "Team · {}",
+                            registry
+                                .team
+                                .as_ref()
+                                .and_then(|t| t.team_name.as_deref())
+                                .unwrap_or("Shared")
+                        )
+                    } else {
+                        "Personal".into()
+                    },
                     id: server.id.clone(),
                     name: server.name.clone(),
                     transport: transport_label(&server.transport).to_string(),
@@ -554,8 +570,6 @@ impl RegistrySnapshot {
             enabled_count: servers.iter().filter(|server| server.enabled).count(),
             profile_count: registry.profiles.len(),
             active_profile_id,
-            active_profile,
-            active_profile_tool_scope,
             profiles,
             servers,
             paired: registry.team.is_some(),
@@ -776,6 +790,7 @@ mod tests {
 
     fn server(id: &str, name: &str, transport: &str) -> ServerEntry {
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: id.to_string(),
             name: name.to_string(),
@@ -796,6 +811,37 @@ mod tests {
     }
 
     #[test]
+    fn client_access_labels_show_migrated_default_all_and_missing_sets() {
+        let mut registry = Registry::default();
+        assert_eq!(client_access_label(&registry, None), "Default access");
+        registry.default_access_profile_id = Some("default".into());
+        assert_eq!(
+            client_access_label(&registry, None),
+            "Default access (Default)"
+        );
+        let options = client_access_options(&registry);
+        assert_eq!(options[0].id, "");
+        assert_eq!(options[0].name, "Default access (Default)");
+        assert_eq!(options[1].id, "@all-enabled");
+        registry.default_access_profile_id = None;
+        registry.default_access_context_id = Some("default".into());
+        registry.default_access_legacy_policy = true;
+        assert_eq!(
+            client_access_label(&registry, Some("")),
+            "Default access (Default)"
+        );
+        assert_eq!(
+            client_access_label(&registry, Some(crate::registry::ALL_ENABLED_ACCESS)),
+            "All enabled servers"
+        );
+        assert_eq!(client_access_label(&registry, Some("default")), "Default");
+        assert_eq!(
+            client_access_label(&registry, Some("missing")),
+            "missing (unavailable)"
+        );
+    }
+
+    #[test]
     fn maps_only_non_secret_server_fields() {
         let mut registry = Registry::default();
         let mut local = server("local", "Files", "stdio");
@@ -807,9 +853,7 @@ mod tests {
         });
         registry.servers.push(local);
         registry.servers.push(server("remote", "GitHub", "http"));
-        registry.profiles[0]
-            .enabled_server_ids
-            .push("remote".into());
+        registry.set_global_server_enabled("remote", true).unwrap();
 
         let fingerprints = registry
             .servers
@@ -820,7 +864,6 @@ mod tests {
 
         assert_eq!(snapshot.enabled_count, 1);
         assert_eq!(snapshot.profile_count, 1);
-        assert_eq!(snapshot.active_profile, "Default");
         assert_eq!(
             snapshot.servers,
             vec![
@@ -1022,7 +1065,7 @@ mod tests {
         assert!(initial.servers.is_empty());
 
         registry.servers.push(server("files", "Files", "stdio"));
-        registry.profiles[0].enabled_server_ids.push("files".into());
+        registry.set_global_server_enabled("files", true).unwrap();
         std::fs::write(&path, serde_json::to_vec(&registry).unwrap()).unwrap();
 
         let RegistryState::Ready(updated) = load_read_only(Some(&path)) else {

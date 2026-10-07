@@ -352,7 +352,43 @@ fn build_window(
         });
     }
     split.set_sidebar(Some(&adw::NavigationPage::new(&sidebar, "Navigation")));
-    split.set_content(Some(&adw::NavigationPage::new(&stack, "Toolport")));
+    let content_with_notice = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    if crate::registry::load().is_ok_and(|reg| reg.access_upgrade_notice_pending()) {
+        let notice = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        notice.add_css_class("toolport-setting-row");
+        notice.append(&gtk::Label::builder().label(
+            "Old Toolport gateways may still be running from before the upgrade. Stop old gateways, then restart any apps still using them so they use the new client access controls."
+        ).wrap(true).xalign(0.0).build());
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let stop = gtk::Button::with_label("Stop old gateways");
+        let settings = settings_page.clone();
+        let stack_for_stop = stack.clone();
+        stop.connect_clicked(move |_| {
+            stack_for_stop.set_visible_child_name("settings");
+            settings.stop_stale.emit_clicked();
+        });
+        actions.append(&stop);
+        let dismiss = gtk::Button::with_label("Dismiss");
+        let notice_for_dismiss = notice.clone();
+        dismiss.connect_clicked(move |_| {
+            match crate::registry::update(|reg| {
+                reg.dismiss_access_upgrade_notice();
+                Ok(())
+            }) {
+                Ok(_) => notice_for_dismiss.set_visible(false),
+                Err(error) => eprintln!("toolport: could not dismiss upgrade notice: {error}"),
+            }
+        });
+        actions.append(&dismiss);
+        notice.append(&actions);
+        content_with_notice.append(&notice);
+    }
+    stack.set_vexpand(true);
+    content_with_notice.append(&stack);
+    split.set_content(Some(&adw::NavigationPage::new(
+        &content_with_notice,
+        "Toolport",
+    )));
 
     let review_quarantine = gtk::gio::SimpleAction::new("review-quarantine", None);
     let app_for_quarantine = app.clone();
@@ -1425,17 +1461,12 @@ struct ServerPage {
     server_count: gtk::Label,
     enabled_count: gtk::Label,
     profile_count: gtk::Label,
-    profile_dropdown: gtk::DropDown,
-    profile_options: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
-    add_profile: gtk::Button,
-    delete_profile: gtk::Button,
     section_title: gtk::Label,
     posture: gtk::Label,
     search: gtk::SearchEntry,
     feedback: gtk::Label,
     list: gtk::Box,
     last_snapshot: std::rc::Rc<std::cell::RefCell<Option<state::RegistrySnapshot>>>,
-    updating_profile: std::rc::Rc<std::cell::Cell<bool>>,
     feedback_timer: std::rc::Rc<std::cell::RefCell<Option<gtk::glib::SourceId>>>,
     /// Per-row health widgets for the rows currently on screen, keyed by server
     /// id, so probe results can land on live labels without a re-render.
@@ -1484,7 +1515,6 @@ impl ServerPage {
                     .set_label(&snapshot.enabled_count.to_string());
                 self.profile_count
                     .set_label(&snapshot.profile_count.to_string());
-                self.render_profiles(&snapshot);
                 self.render_server_list(&snapshot);
             }
             state::RegistryState::FirstRun => {
@@ -1538,40 +1568,10 @@ impl ServerPage {
         self.no_matches.borrow_mut().take();
     }
 
-    fn render_profiles(&self, snapshot: &state::RegistrySnapshot) {
-        self.updating_profile.set(true);
-        let options = snapshot
-            .profiles
-            .iter()
-            .map(|profile| (profile.id.clone(), profile.name.clone()))
-            .collect::<Vec<_>>();
-        if *self.profile_options.borrow() != options {
-            let names = options
-                .iter()
-                .map(|(_, name)| name.as_str())
-                .collect::<Vec<_>>();
-            let model = gtk::StringList::new(&names);
-            self.profile_dropdown.set_model(Some(&model));
-            *self.profile_options.borrow_mut() = options;
-        }
-        let selected = snapshot
-            .profiles
-            .iter()
-            .position(|profile| profile.id == snapshot.active_profile_id)
-            .unwrap_or(0) as u32;
-        self.profile_dropdown.set_selected(selected);
-        self.profile_dropdown
-            .set_sensitive(!snapshot.profiles.is_empty());
-        self.delete_profile
-            .set_sensitive(snapshot.profiles.len() > 1);
-        self.updating_profile.set(false);
-    }
-
     fn render_server_list(&self, snapshot: &state::RegistrySnapshot) {
         self.clear_server_list();
         self.health_rows.borrow_mut().clear();
-        self.section_title
-            .set_label(&format!("Servers in {}", snapshot.active_profile));
+        self.section_title.set_label("Servers");
         if snapshot.servers.is_empty() {
             self.posture.set_visible(false);
             self.list.append(&state_card(
@@ -1598,12 +1598,7 @@ impl ServerPage {
         }
         let mut rows = Vec::with_capacity(servers.len());
         for server in servers {
-            let card = server_card(
-                server,
-                &snapshot.active_profile_id,
-                snapshot.active_profile_tool_scope.get(&server.id).cloned(),
-                self.clone(),
-            );
+            let card = server_card(server, &snapshot.active_profile_id, self.clone());
             self.list.append(&card);
             rows.push((server.clone(), card));
         }
@@ -2362,8 +2357,8 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
                 &client
                     .scope_name
                     .as_deref()
-                    .map(|scope| format!(" · only {scope}"))
-                    .unwrap_or_else(|| " · follows active profile".to_string()),
+                    .map(|scope| format!(" · {scope}"))
+                    .unwrap_or_else(|| " · default access".to_string()),
             );
         }
         detail
@@ -2390,8 +2385,8 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
                 &client
                     .scope_name
                     .as_deref()
-                    .map(|scope| format!(" · only {scope}"))
-                    .unwrap_or_else(|| " · follows active profile".to_string()),
+                    .map(|scope| format!(" · {scope}"))
+                    .unwrap_or_else(|| " · default access".to_string()),
             );
         }
         detail
@@ -2478,9 +2473,7 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             actions.append(&reset);
         }
         state::ClientGatewayState::Connected => {
-            if page.profiles.borrow().len() > 1 {
-                actions.append(&client_scope_menu(client.clone(), page.clone()));
-            }
+            actions.append(&client_scope_menu(client.clone(), page.clone()));
             actions.append(&connected_client_actions_menu(client.clone(), page));
         }
     }
@@ -2689,11 +2682,11 @@ fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuBu
     let label = client
         .scope_name
         .as_deref()
-        .map(|scope| format!("Only {scope}"))
-        .unwrap_or_else(|| "Active profile".to_string());
+        .map(|scope| scope.to_string())
+        .unwrap_or_else(|| "Default access".to_string());
     let menu = gtk::MenuButton::builder()
-        .label(label)
-        .tooltip_text("Choose which profile this client can use")
+        .label(format!("Access: {label}"))
+        .tooltip_text("Choose this client's access to enabled servers")
         .build();
     menu.add_css_class("toolport-secondary-action");
     let popover = toolport_menu_popover();
@@ -2703,24 +2696,8 @@ fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuBu
     content.set_margin_start(6);
     content.set_margin_end(6);
 
-    let active = toolport_menu_button("Follow active profile");
-    let client_for_active = client.clone();
-    let page_for_active = page.clone();
-    let menu_for_active = menu.clone();
-    active.connect_clicked(move |button| {
-        menu_for_active.popdown();
-        run_client_mutation(
-            &client_for_active,
-            true,
-            false,
-            None,
-            button,
-            page_for_active.clone(),
-        );
-    });
-    content.append(&active);
     for profile in page.profiles.borrow().iter().cloned() {
-        let button = toolport_menu_button(&format!("Only {}", profile.name));
+        let button = toolport_menu_button(&profile.name);
         let client = client.clone();
         let page = page.clone();
         let menu = menu.clone();
@@ -5713,7 +5690,7 @@ fn build_content(
     summary.set_column_spacing(10);
     summary.set_column_homogeneous(true);
     let mut values = Vec::new();
-    for (column, (value, label)) in [("0", "Servers"), ("0", "Enabled"), ("1", "Profiles")]
+    for (column, (value, label)) in [("0", "Servers"), ("0", "Enabled"), ("1", "Access sets")]
         .into_iter()
         .enumerate()
     {
@@ -5725,36 +5702,9 @@ fn build_content(
     }
     page.append(&summary);
 
-    let profile_controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    profile_controls.append(
-        &gtk::Label::builder()
-            .label("Active profile")
-            .halign(gtk::Align::Start)
-            .xalign(0.0)
-            .hexpand(true)
-            .css_classes(["heading"])
-            .build(),
-    );
-    let profile_dropdown = gtk::DropDown::new(
-        Some(gtk::StringList::new(&["Default"])),
-        gtk::Expression::NONE,
-    );
-    profile_dropdown.set_tooltip_text(Some("Choose which server profile is active"));
-    profile_controls.append(&profile_dropdown);
-    let add_profile = gtk::Button::builder()
-        .icon_name("list-add-symbolic")
-        .tooltip_text("Create profile")
-        .build();
-    profile_controls.append(&add_profile);
-    let delete_profile = gtk::Button::builder()
-        .icon_name("user-trash-symbolic")
-        .tooltip_text("Delete active profile")
-        .css_classes(["flat"])
-        .build();
-    profile_controls.append(&delete_profile);
     let profile_actions = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
-        .tooltip_text("Profile actions")
+        .tooltip_text("Server actions")
         .build();
     profile_actions.add_css_class("flat");
     let profile_popover = toolport_menu_popover();
@@ -5769,8 +5719,7 @@ fn build_content(
     profile_action_list.append(&disable_all);
     profile_popover.set_child(Some(&profile_action_list));
     profile_actions.set_popover(Some(&profile_popover));
-    profile_controls.append(&profile_actions);
-    page.append(&profile_controls);
+    header.pack_end(&profile_actions);
 
     let section_title = gtk::Label::builder()
         .label("Servers")
@@ -5807,20 +5756,12 @@ fn build_content(
             server_count: values.remove(0),
             enabled_count: values.remove(0),
             profile_count: values.remove(0),
-            profile_dropdown: profile_dropdown.clone(),
-            profile_options: std::rc::Rc::new(std::cell::RefCell::new(vec![(
-                "default".to_string(),
-                "Default".to_string(),
-            )])),
-            add_profile: add_profile.clone(),
-            delete_profile: delete_profile.clone(),
             section_title,
             posture,
             search: search.clone(),
             feedback,
             list,
             last_snapshot: std::rc::Rc::new(std::cell::RefCell::new(None)),
-            updating_profile: std::rc::Rc::new(std::cell::Cell::new(false)),
             feedback_timer: std::rc::Rc::new(std::cell::RefCell::new(None)),
             health_rows: std::rc::Rc::new(
                 std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -5876,31 +5817,6 @@ fn build_content(
         open_shared_setup(url, page_for_share.clone());
     });
     app.add_action(&open_share_action);
-    let page_for_profile = server_page.1.clone();
-    profile_dropdown.connect_selected_notify(move |dropdown| {
-        if page_for_profile.updating_profile.get() {
-            return;
-        }
-        let Some(snapshot) = page_for_profile.last_snapshot.borrow().clone() else {
-            return;
-        };
-        let Some(profile) = snapshot.profiles.get(dropdown.selected() as usize) else {
-            return;
-        };
-        if profile.id != snapshot.active_profile_id {
-            let id = profile.id.clone();
-            run_profile_mutation(
-                page_for_profile.clone(),
-                "Switched active profile",
-                move || crate::registry_controller::set_active_profile(&id),
-            );
-        }
-    });
-    let page_for_add_profile = server_page.1.clone();
-    add_profile.connect_clicked(move |_| open_profile_editor(page_for_add_profile.clone()));
-    let page_for_delete_profile = server_page.1.clone();
-    delete_profile
-        .connect_clicked(move |_| confirm_delete_profile(page_for_delete_profile.clone()));
     let page_for_enable_all = server_page.1.clone();
     enable_all.connect_clicked(move |_| {
         let Some(snapshot) = page_for_enable_all.last_snapshot.borrow().clone() else {
@@ -6579,9 +6495,6 @@ fn run_profile_mutation(
     success: &'static str,
     operation: impl FnOnce() -> Result<crate::registry::Registry, String> + Send + 'static,
 ) {
-    page.profile_dropdown.set_sensitive(false);
-    page.add_profile.set_sensitive(false);
-    page.delete_profile.set_sensitive(false);
     gtk::glib::spawn_future_local(async move {
         let result = gtk::gio::spawn_blocking(operation).await;
         match result {
@@ -6589,97 +6502,12 @@ fn run_profile_mutation(
                 page.render(state::RegistryState::Ready(
                     state::RegistrySnapshot::from_registry(registry),
                 ));
-                page.add_profile.set_sensitive(true);
                 page.show_confirmation(success);
             }
-            Ok(Err(error)) => page.restore_after_error(&format!("Profile error: {error}")),
-            Err(_) => page.restore_after_error("Profile update stopped unexpectedly"),
+            Ok(Err(error)) => page.restore_after_error(&format!("Server update failed: {error}")),
+            Err(_) => page.restore_after_error("Server update stopped unexpectedly"),
         }
     });
-}
-
-fn open_profile_editor(page: ServerPage) {
-    #[allow(deprecated)]
-    let dialog = adw::MessageDialog::new(
-        page.app.active_window().as_ref(),
-        Some("Create a profile"),
-        Some("Profiles let you switch between server sets for different workflows. New profiles start with every server disabled."),
-    );
-    dialog.add_css_class("toolport-native");
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("create", "Create profile");
-    dialog.set_close_response("cancel");
-    dialog.set_default_response(Some("create"));
-    dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
-    dialog.set_response_enabled("create", false);
-
-    let field = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    field.add_css_class("toolport-form-section");
-    field.append(
-        &gtk::Label::builder()
-            .label("Profile name")
-            .halign(gtk::Align::Start)
-            .css_classes(["toolport-field-label"])
-            .build(),
-    );
-    let name = gtk::Entry::builder()
-        .placeholder_text("Work")
-        .activates_default(true)
-        .width_chars(28)
-        .css_classes(["toolport-input"])
-        .build();
-    field.append(&name);
-    dialog.set_extra_child(Some(&field));
-
-    let dialog_for_name = dialog.clone();
-    name.connect_changed(move |name| {
-        dialog_for_name.set_response_enabled("create", !name.text().trim().is_empty());
-    });
-    dialog.connect_response(None, move |dialog, response| {
-        if response == "create" {
-            let value = name.text().trim().to_string();
-            run_profile_mutation(page.clone(), "Created profile", move || {
-                crate::registry_controller::create_profile(&value)
-            });
-        }
-        dialog.close();
-    });
-    dialog.present();
-}
-
-fn confirm_delete_profile(page: ServerPage) {
-    let Some(snapshot) = page.last_snapshot.borrow().clone() else {
-        return;
-    };
-    let Some(profile) = snapshot
-        .profiles
-        .iter()
-        .find(|profile| profile.id == snapshot.active_profile_id)
-    else {
-        return;
-    };
-    #[allow(deprecated)]
-    let dialog = adw::MessageDialog::new(
-        page.app.active_window().as_ref(),
-        Some(&format!("Delete {}?", profile.name)),
-        Some("The profile is removed, but its servers and other profiles stay intact."),
-    );
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("delete", "Delete profile");
-    dialog.set_close_response("cancel");
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-    let id = profile.id.clone();
-    dialog.connect_response(None, move |dialog, response| {
-        if response == "delete" {
-            let id = id.clone();
-            run_profile_mutation(page.clone(), "Deleted profile", move || {
-                crate::registry_controller::delete_profile(&id)
-            });
-        }
-        dialog.close();
-    });
-    dialog.present();
 }
 
 fn server_matches_query(server: &state::ServerView, query: &str) -> bool {
@@ -6932,12 +6760,7 @@ fn open_server_details(server: &state::ServerView, page: &ServerPage, show_tools
     window.present();
 }
 
-fn server_card(
-    server: &state::ServerView,
-    profile_id: &str,
-    tool_scope: Option<Vec<String>>,
-    page: ServerPage,
-) -> gtk::Box {
+fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     card.add_css_class("toolport-card");
     card.set_margin_top(1);
@@ -7148,20 +6971,6 @@ fn server_card(
     tools.connect_clicked(move |_| open_server_details(&server_for_tools, &page_for_tools, true));
     actions.append(&tools);
 
-    let scope = action_menu_button("Profile tool scope", "view-list-symbolic");
-    let server_for_scope = server.clone();
-    let profile_for_scope = profile_id.to_string();
-    let page_for_scope = page.clone();
-    scope.connect_clicked(move |_| {
-        open_profile_tool_scope(
-            server_for_scope.clone(),
-            profile_for_scope.clone(),
-            tool_scope.clone(),
-            page_for_scope.clone(),
-        )
-    });
-    actions.append(&scope);
-
     let edit = action_menu_button("Edit", "document-edit-symbolic");
     edit.set_sensitive(matches!(
         server.transport_id.as_str(),
@@ -7230,158 +7039,6 @@ fn server_card(
         .build();
     card.append(&menu);
     card
-}
-
-fn open_profile_tool_scope(
-    server: state::ServerView,
-    profile_id: String,
-    current_scope: Option<Vec<String>>,
-    page: ServerPage,
-) {
-    let Some(parent) = page.app.active_window() else {
-        return;
-    };
-    let window = adw::Window::builder()
-        .application(&page.app)
-        .transient_for(&parent)
-        .modal(true)
-        .title(format!("Tool scope for {}", server.name))
-        .default_width(520)
-        .default_height(560)
-        .build();
-    window.add_css_class("toolport-editor");
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let header = adw::HeaderBar::new();
-    let cancel = gtk::Button::with_label("Cancel");
-    cancel.add_css_class("toolport-secondary-action");
-    header.pack_start(&cancel);
-    let save = gtk::Button::with_label("Save");
-    save.add_css_class("suggested-action");
-    save.set_sensitive(false);
-    header.pack_end(&save);
-    root.append(&header);
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.add_css_class("toolport-editor-body");
-    content.append(&editor_intro(
-        "view-list-symbolic",
-        "Tools available in this profile",
-        "Uncheck tools this profile should hide. Selecting every tool restores the server's default full scope.",
-    ));
-    let feedback = gtk::Label::builder()
-        .label("Loading server tools…")
-        .halign(gtk::Align::Fill)
-        .xalign(0.0)
-        .wrap(true)
-        .css_classes(["toolport-feedback"])
-        .build();
-    content.append(&feedback);
-    let tool_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    tool_list.add_css_class("toolport-settings-group");
-    content.append(&tool_list);
-    let scroller = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&content)
-        .build();
-    root.append(&scroller);
-    window.set_content(Some(&root));
-    let window_for_cancel = window.clone();
-    cancel.connect_clicked(move |_| window_for_cancel.close());
-
-    let selections = std::rc::Rc::new(std::cell::RefCell::new(
-        Vec::<(gtk::CheckButton, String)>::new(),
-    ));
-    let selections_for_save = selections.clone();
-    let page_for_save = page.clone();
-    let window_for_save = window.clone();
-    let server_id = server.id;
-    let server_id_for_save = server_id.clone();
-    save.connect_clicked(move |button| {
-        button.set_sensitive(false);
-        let selections = selections_for_save.borrow();
-        let selected = selections
-            .iter()
-            .filter(|(check, _)| check.is_active())
-            .map(|(_, tool)| tool.clone())
-            .collect::<Vec<_>>();
-        let tools = (selected.len() != selections.len()).then_some(selected);
-        drop(selections);
-        let profile_id = profile_id.clone();
-        let server_id = server_id_for_save.clone();
-        let page = page_for_save.clone();
-        let window = window_for_save.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::registry_controller::set_profile_server_tools(&profile_id, &server_id, tools)
-            })
-            .await;
-            match result {
-                Ok(Ok(registry)) => {
-                    page.render(state::RegistryState::Ready(
-                        state::RegistrySnapshot::from_registry(registry),
-                    ));
-                    page.show_confirmation("Updated the active profile's tool scope.");
-                    window.close();
-                }
-                Ok(Err(error)) => {
-                    page.show_feedback(&format!("Could not update tool scope: {error}"), true)
-                }
-                Err(_) => page.show_feedback("The tool-scope update stopped unexpectedly.", true),
-            }
-        });
-    });
-
-    let current_scope =
-        current_scope.map(|tools| tools.into_iter().collect::<std::collections::HashSet<_>>());
-    let selections_for_load = selections;
-    gtk::glib::spawn_future_local(async move {
-        let result =
-            gtk::gio::spawn_blocking(move || crate::playground::list_tools(&server_id)).await;
-        match result {
-            Ok(Ok(tools)) => {
-                if tools.is_empty() {
-                    feedback.set_label("This server does not advertise any tools.");
-                    return;
-                }
-                for tool in tools {
-                    let Some(name) = tool
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                    else {
-                        continue;
-                    };
-                    let check = gtk::CheckButton::builder()
-                        .label(&name)
-                        .active(
-                            current_scope
-                                .as_ref()
-                                .is_none_or(|scope| scope.contains(&name)),
-                        )
-                        .build();
-                    check.set_margin_top(8);
-                    check.set_margin_bottom(8);
-                    check.set_margin_start(12);
-                    check.set_margin_end(12);
-                    tool_list.append(&check);
-                    selections_for_load.borrow_mut().push((check, name));
-                }
-                feedback.set_label("Changes apply only to the active server profile.");
-                feedback.remove_css_class("error");
-                feedback.add_css_class("success");
-                save.set_sensitive(!selections_for_load.borrow().is_empty());
-            }
-            Ok(Err(error)) => {
-                feedback.set_label(&format!("Could not load tools: {error}"));
-                feedback.add_css_class("error");
-            }
-            Err(_) => {
-                feedback.set_label("The server tool read stopped unexpectedly.");
-                feedback.add_css_class("error");
-            }
-        }
-    });
-    window.present();
 }
 
 /// The one-line explanation of a live auth probe, shown above the credential

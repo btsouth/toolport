@@ -93,7 +93,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   // Snapshotted at dialog-open time so a registry-changed event mid-review can't
   // reshuffle `toImport` out from under the indices the user already confirmed.
   const [bulkImportServers, setBulkImportServers] = useState<McpServer[] | null>(null);
-  // "" = follow the active profile; else scope to one.
+  // Empty uses the default access; named access sets narrow enabled servers.
   const [profile, setProfile] = useState("");
   const [migrateOpen, setMigrateOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
@@ -104,8 +104,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   // config into a client that isn't installed just creates a file nothing reads.
   const present = client.appPresent;
   const profiles = registry?.profiles ?? [];
-  // The scope Toolport last connected this client with ("" = follow the active
-  // profile). Keep the picker in sync with it as the selected client changes.
+  // The access Toolport last connected this client with (empty uses the default). Keep the picker in sync with it as the selected client changes.
   const currentScope = registry?.clientScopes?.[client.id] ?? "";
   useEffect(() => {
     if (!currentScope) {
@@ -172,37 +171,36 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     }
   }
 
-  /** How many servers a given scope ("" = active profile, else a named profile)
-   * resolves to, for the "scoped to X · N servers" summary. */
-  function scopeServerCount(scopeRef: string): number {
-    const target = scopeRef
-      ? profiles.find(
-          (p) => p.id === scopeRef || p.name.toLowerCase() === scopeRef.toLowerCase(),
-        )
-      : (profiles.find((p) => p.id === registry?.activeProfileId) ?? profiles[0]);
-    if (!target) return 0;
-    // Exclude Toolport's own gateway entry so the count matches the Servers list (which
-    // filters it out) instead of over-counting by one.
-    const ids = new Set(
-      (registry?.servers ?? []).filter((s) => !isGatewayServer(s)).map((s) => s.id),
+  function scopeServers(scopeRef: string): { id: string; name: string }[] {
+    const ref = scopeRef || registry?.defaultAccessProfileId || "@all-enabled";
+    const target = profiles.find(
+      (p) => p.id === ref || p.name.toLowerCase() === ref.toLowerCase(),
     );
-    return target.enabledServerIds.filter((id) => ids.has(id)).length;
+    return (registry?.servers ?? [])
+      .filter(
+        (s) =>
+          s.enabled &&
+          !isGatewayServer(s) &&
+          (ref === "@all-enabled" || target?.enabledServerIds.includes(s.id)),
+      )
+      .map((s) => ({ id: s.id, name: s.name }));
   }
 
-  /** The actual servers a scope resolves to, so a connected client shows WHAT it can
-   * reach, not just a count. */
-  function scopeServers(scopeRef: string): { id: string; name: string }[] {
-    const target = scopeRef
-      ? profiles.find(
-          (p) => p.id === scopeRef || p.name.toLowerCase() === scopeRef.toLowerCase(),
-        )
-      : (profiles.find((p) => p.id === registry?.activeProfileId) ?? profiles[0]);
-    if (!target) return [];
-    const enabled = new Set(target.enabledServerIds);
-    // Never surface the gateway's own entry as a reachable server.
-    return (registry?.servers ?? [])
-      .filter((s) => enabled.has(s.id) && !isGatewayServer(s))
-      .map((s) => ({ id: s.id, name: s.name }));
+  function scopeServerCount(scopeRef: string): number {
+    return scopeServers(scopeRef).length;
+  }
+  function accessLabel(scopeRef: string): string {
+    if (!scopeRef) {
+      const defaultId =
+        registry?.defaultAccessProfileId ||
+        (registry?.defaultAccessLegacyPolicy ? registry.defaultAccessContextId : null);
+      const name = profiles.find((p) => p.id === defaultId)?.name;
+      return name ? `Default access (${name})` : "Default access";
+    }
+    return scopeRef === "@all-enabled"
+      ? "All enabled servers"
+      : (profiles.find((p) => p.id === scopeRef || p.name === scopeRef)?.name ??
+          scopeRef);
   }
 
   /** Re-apply a scope to an already-connected client (overwrites its gateway
@@ -218,11 +216,10 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       await installGateway(client.id, profile || undefined, false);
       // Rescope rewrites the client's MCP config the same way Connect does; without a
       // restart hint the change is invisible until the next cold start (SOU-317).
-      const scopeName = profiles.find((p) => p.id === profile)?.name ?? profile;
       toast.success(
         profile
-          ? `${client.name} scoped to "${scopeName}".`
-          : `${client.name} now follows the active profile.`,
+          ? `${client.name} access set to "${accessLabel(profile)}".`
+          : `${client.name} now uses the default access.`,
         { description: clientRestartHint(client.name) },
       );
       noteRestartNeeded("applied");
@@ -385,9 +382,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         // pick up a new gateway entry until relaunch. Scope/backup are secondary.
         toast.success(`Connected Toolport to ${client.name}`, {
           description: connectSuccessDescription(client.name, [
-            profile
-              ? `Scoped to the "${profiles.find((p) => p.id === profile)?.name ?? profile}" profile.`
-              : null,
+            profile ? `Access: ${accessLabel(profile)}.` : null,
             !profile && outcome.backup ? "Previous config backed up." : null,
           ]),
         });
@@ -443,7 +438,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             <p className="mt-1 text-xs text-muted-foreground">
               Sees{" "}
               <span className="font-medium text-foreground">
-                {currentScope ? `the "${currentScope}" profile` : "the active profile"}
+                {accessLabel(currentScope)}
               </span>{" "}
               · {scopeServerCount(currentScope)} server
               {scopeServerCount(currentScope) === 1 ? "" : "s"}
@@ -456,19 +451,23 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          {profiles.length > 1 && !customized && (
+          {!customized && <span className="text-xs text-muted-foreground">Access</span>}
+          {!customized && (
             <Select
-              value={profile || "__all__"}
-              onValueChange={(v) => setProfile(v === "__all__" ? "" : v)}
+              value={profile || "@default-access"}
+              onValueChange={(value) =>
+                setProfile(value === "@default-access" ? "" : value)
+              }
             >
-              <SelectTrigger size="sm" className="w-52">
+              <SelectTrigger aria-label="Access" size="sm" className="w-52">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="__all__">Follow active profile</SelectItem>
+                <SelectItem value="@default-access">{accessLabel("")}</SelectItem>
+                <SelectItem value="@all-enabled">All enabled servers</SelectItem>
                 {profiles.map((p) => (
                   <SelectItem key={p.id} value={p.id}>
-                    Only: {p.name}
+                    {p.name}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -477,7 +476,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           {installed && !customized && profile !== currentScope && (
             <Button size="sm" onClick={applyScope} disabled={busy}>
               <Check className="size-4" />
-              Apply scope
+              Apply access
             </Button>
           )}
           {customized && (
@@ -612,7 +611,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           </div>
           {scopeServers(currentScope).length === 0 ? (
             <p className="text-xs text-muted-foreground">
-              No enabled servers in this scope yet. Enable some under All servers.
+              No enabled servers in this access set yet. Turn servers on in Servers and
+              include them under Settings &gt; Advanced.
             </p>
           ) : (
             <div className="flex flex-wrap gap-1.5">
@@ -803,29 +803,6 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                 plugins or extensions can't be moved, only {client.name} controls those.
                 They stay where they are (you can still import a copy above).
               </p>
-            )}
-            {profiles.length > 1 && (
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs text-muted-foreground">
-                  Scope this client to
-                </span>
-                <Select
-                  value={profile || "__all__"}
-                  onValueChange={(v) => setProfile(v === "__all__" ? "" : v)}
-                >
-                  <SelectTrigger size="sm" className="w-52">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__all__">Follow active profile</SelectItem>
-                    {profiles.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>
-                        Only: {p.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
             )}
           </div>
           <DialogFooter>

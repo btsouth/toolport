@@ -113,7 +113,7 @@ for line in sys.stdin:
             Some("audit-echo")
         );
         // Explicit synthetic review. The final usability gate must use the actual UI.
-        r.profiles[0].enabled_server_ids.push(id);
+        r.set_server_enabled("default", &id, true)?;
         Ok(())
     })
     .unwrap();
@@ -246,8 +246,8 @@ fn selected_share_is_additive_conflict_safe_and_locally_usable() {
         .into_json()
         .unwrap();
     registry::update(|r| {
-        r.servers.push(serde_json::from_value(json!({"id":"selected-one","name":"Selected one","transport":"stdio","command":"python3","args":["/home/sbx/activation-mcp.py"],"cwd":"/home/sbx","env":[{"key":"SYNTHETIC_KEY","secret":true}]})).unwrap());
-        r.servers.push(serde_json::from_value(json!({"id":"keep-personal","name":"Keep personal","transport":"stdio","command":"python3","args":[],"env":[]})).unwrap());
+        r.servers.push(serde_json::from_value(json!({"id":"selected-one","name":"Selected one","enabled":true,"transport":"stdio","command":"python3","args":["/home/sbx/activation-mcp.py"],"cwd":"/home/sbx","env":[{"key":"SYNTHETIC_KEY","secret":true}]})).unwrap());
+        r.servers.push(serde_json::from_value(json!({"id":"keep-personal","name":"Keep personal","enabled":true,"transport":"stdio","command":"python3","args":[],"env":[]})).unwrap());
         r.profiles[0].enabled_server_ids.extend(["selected-one".into(),"keep-personal".into()]);
         Ok(())
     }).unwrap();

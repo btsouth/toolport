@@ -345,6 +345,7 @@ pub fn apply_add_server(registry: &mut Registry, fields: ServerFields) -> Result
     Ok(apply_add_entry(
         registry,
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: String::new(),
             name: fields.name,
@@ -365,12 +366,14 @@ pub fn apply_add_server(registry: &mut Registry, fields: ServerFields) -> Result
     ))
 }
 
-pub fn apply_add_entry(registry: &mut Registry, entry: ServerEntry) -> String {
+pub fn apply_add_entry(registry: &mut Registry, mut entry: ServerEntry) -> String {
+    entry.enabled = false;
     registry.add_server(entry)
 }
 
 pub(crate) fn server_from_detected(server: &clients::McpServer, client_id: &str) -> ServerEntry {
     ServerEntry {
+        enabled: false,
         inherit_env: false,
         id: String::new(),
         name: server.name.clone(),
@@ -606,6 +609,7 @@ pub fn add_snippet_server(
 
 fn catalog_server(entry: crate::catalog::CatalogEntry) -> ServerEntry {
     ServerEntry {
+        enabled: false,
         inherit_env: false,
         id: String::new(),
         name: entry.name,
@@ -693,6 +697,7 @@ pub fn server_entry_for_probe(
         None => {
             let fields = fields.normalized()?;
             Ok(ServerEntry {
+                enabled: false,
                 inherit_env: false,
                 id: "native-connection-test".into(),
                 name: fields.name,
@@ -719,16 +724,14 @@ pub fn remove_server(server_id: &str) -> Result<Registry, String> {
     Ok(registry)
 }
 
-pub fn apply_create_profile(registry: &mut Registry, name: &str) {
-    registry.add_profile(name);
+pub fn apply_create_profile(registry: &mut Registry, name: &str) -> Result<(), String> {
+    registry::validate_access_set_name(name)?;
+    registry.add_profile(name.trim());
+    Ok(())
 }
 
 pub fn apply_delete_profile(registry: &mut Registry, profile_id: &str) -> Result<(), String> {
     registry.remove_profile(profile_id)
-}
-
-pub fn apply_set_active_profile(registry: &mut Registry, profile_id: &str) -> Result<(), String> {
-    registry.set_active_profile(profile_id)
 }
 
 pub fn create_profile(name: &str) -> Result<Registry, String> {
@@ -736,10 +739,7 @@ pub fn create_profile(name: &str) -> Result<Registry, String> {
     if name.is_empty() {
         return Err("give the profile a name".into());
     }
-    let (registry, ()) = registry::update(|registry| {
-        apply_create_profile(registry, name);
-        Ok(())
-    })?;
+    let (registry, ()) = registry::update(|registry| apply_create_profile(registry, name))?;
     Ok(registry)
 }
 
@@ -748,10 +748,16 @@ pub fn delete_profile(profile_id: &str) -> Result<Registry, String> {
     Ok(registry)
 }
 
-pub fn set_active_profile(profile_id: &str) -> Result<Registry, String> {
-    let (registry, ()) =
-        registry::update(|registry| apply_set_active_profile(registry, profile_id))?;
-    Ok(registry)
+pub fn set_default_access(profile: Option<&str>) -> Result<Registry, String> {
+    registry::update(|r| r.set_default_access(profile)).map(|(r, ())| r)
+}
+
+pub fn set_access_server(
+    profile_id: &str,
+    server_id: &str,
+    included: bool,
+) -> Result<Registry, String> {
+    registry::update(|r| r.set_access_server(profile_id, server_id, included)).map(|(r, ())| r)
 }
 
 pub fn set_all_enabled(profile_id: &str, enabled: bool) -> Result<Registry, String> {
@@ -1017,6 +1023,7 @@ fn apply_add_http_client(
     profile: String,
 ) -> Result<(), String> {
     if !profile.is_empty()
+        && profile != registry::ALL_ENABLED_ACCESS
         && !registry
             .profiles
             .iter()
@@ -1242,6 +1249,15 @@ fn enable_moved_servers(
     moved: &[String],
 ) -> Result<(), String> {
     let profile_id = registry.resolve_profile_id(profile.unwrap_or(""));
+    let access_set = registry.access_profile(&profile_id).map(|p| p.id.clone());
+    let all = profile_id == registry.all_access_id()
+        || (profile_id == registry.default_access_id()
+            && registry.default_access_profile_id.is_none());
+    if access_set.is_none() && !all {
+        return Err(
+            "The access set no longer exists, so the client's config was left unchanged".into(),
+        );
+    }
     for name in moved {
         let Some(id) = registry
             .servers
@@ -1254,6 +1270,9 @@ fn enable_moved_servers(
         apply_server_enabled(registry, &profile_id, &id, true, false).map_err(|error| {
             format!("Could not turn on {name} in Toolport, so the client's config was left unchanged: {error}")
         })?;
+        if let Some(profile) = &access_set {
+            registry.set_access_server(profile, &id, true)?;
+        }
     }
     Ok(())
 }
@@ -1263,8 +1282,13 @@ fn enable_moved_servers(
 /// server awaiting review, an unresolved launch input) is still imported, off.
 pub(crate) fn apply_import_entry(registry: &mut Registry, entry: ServerEntry) -> String {
     let id = registry.add_server(entry);
-    let profile_id = registry.active_profile_id();
-    let _ = apply_server_enabled(registry, &profile_id, &id, true, false);
+    let profile_id = registry
+        .default_access_profile_id
+        .clone()
+        .unwrap_or_else(|| registry.active_profile_id());
+    if apply_server_enabled(registry, &profile_id, &id, true, false).is_ok() {
+        let _ = registry.set_access_server(&profile_id, &id, true);
+    }
     id
 }
 
@@ -1860,7 +1884,29 @@ pub fn apply_server_enabled(
             server.check_enable_allowed(reviewed)?;
         }
     }
-    registry.set_server_enabled(profile_id, server_id, enabled)
+    if registry.version >= 3 {
+        // Teams restores consent by access-set membership during definition sync.
+        // Record a reviewed enable in its existing local context without changing
+        // any other access set; a global off keeps that consent but stays off.
+        if enabled
+            && registry.servers.iter().any(|s| {
+                s.id == server_id
+                    && s.source
+                        .as_deref()
+                        .is_some_and(|source| source.starts_with("team:"))
+            })
+        {
+            let context = registry.active_profile_id();
+            if let Some(profile) = registry.profiles.iter_mut().find(|p| p.id == context) {
+                if !profile.enabled_server_ids.iter().any(|id| id == server_id) {
+                    profile.enabled_server_ids.push(server_id.into());
+                }
+            }
+        }
+        registry.set_global_server_enabled(server_id, enabled)
+    } else {
+        registry.set_server_enabled(profile_id, server_id, enabled)
+    }
 }
 
 pub fn set_server_enabled(
@@ -1969,6 +2015,24 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.root).ok();
         }
+    }
+
+    #[test]
+    fn access_review_renderer_add_starts_disabled() {
+        let mut reg = Registry::default();
+        let mut entry = server("one");
+        entry.enabled = true;
+        let id = apply_add_entry(&mut reg, entry);
+        assert!(!reg.server_enabled(&id));
+    }
+
+    #[test]
+    fn access_review_creation_rejects_reserved_names() {
+        let mut reg = Registry::default();
+        for name in ["@all-enabled", " @default-access:default"] {
+            assert!(apply_create_profile(&mut reg, name).is_err());
+        }
+        assert_eq!(reg.profiles.len(), 1);
     }
 
     #[test]
@@ -2118,6 +2182,7 @@ mod tests {
 
     fn server(id: &str) -> ServerEntry {
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: id.into(),
             name: id.into(),
@@ -2269,7 +2334,7 @@ mod tests {
     #[test]
     fn shared_profile_mutations_keep_registry_invariants() {
         let mut registry = Registry::default();
-        apply_create_profile(&mut registry, "Work");
+        apply_create_profile(&mut registry, "Work").unwrap();
         let work = registry
             .profiles
             .iter()
@@ -2278,8 +2343,6 @@ mod tests {
             .id
             .clone();
 
-        apply_set_active_profile(&mut registry, &work).unwrap();
-        assert_eq!(registry.active_profile_id(), work);
         apply_delete_profile(&mut registry, &work).unwrap();
         assert_eq!(registry.profiles.len(), 1);
         assert!(apply_delete_profile(&mut registry, "default").is_err());
@@ -2312,7 +2375,7 @@ mod tests {
         registry::save_to(&path, &external).unwrap();
 
         let updated = set_server_enabled_at(&path, "default", "one", true, false).unwrap();
-        assert!(updated.is_enabled("default", "one"));
+        assert!(updated.server_enabled("one"));
         assert!(updated.servers.iter().any(|server| server.id == "two"));
         cleanup(&path);
     }
@@ -2343,8 +2406,8 @@ mod tests {
         }
 
         let updated = registry::load_from(&path).unwrap();
-        assert!(updated.is_enabled("default", "one"));
-        assert!(updated.is_enabled("default", "two"));
+        assert!(updated.server_enabled("one"));
+        assert!(updated.server_enabled("two"));
         cleanup(&path);
     }
 
@@ -2894,7 +2957,7 @@ mod tests {
         let mut names = registry
             .servers
             .iter()
-            .filter(|server| registry.is_enabled(profile, &server.id))
+            .filter(|server| registry.is_enabled(&registry.resolve_profile_id(profile), &server.id))
             .map(|server| server.name.clone())
             .collect::<Vec<_>>();
         names.sort();
@@ -3015,7 +3078,7 @@ mod tests {
         moved.sort();
         assert_eq!(moved, ["memory", "seq-thinking"]);
         assert_eq!(
-            enabled_names(&outcome.result.registry, "default"),
+            enabled_names(&outcome.result.registry, ""),
             ["memory", "seq-thinking"],
             "every moved server must be served after the move"
         );

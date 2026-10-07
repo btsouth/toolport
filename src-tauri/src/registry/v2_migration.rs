@@ -348,11 +348,17 @@ fn matching_export(dir: &Path, stem: &str, extension: &str, content: &str) -> Op
 mod tests {
     use super::*;
     use crate::registry::{
-        backup_path, data_dir_test_lock, load_from, load_from_with_migrations_for_test,
+        backup_path, data_dir_test_lock, load_from_with_migrations_for_test,
         migration_backup_files, DataDirOverride, Migration, Registry, SafetyLevel,
-        REGISTRY_ENV_LOCK, REGISTRY_VERSION,
+        REGISTRY_ENV_LOCK,
     };
     use serde_json::json;
+
+    const REGISTRY_VERSION: u32 = 2;
+
+    fn load_from(path: &std::path::Path) -> Result<Registry, String> {
+        load_from_with_migrations_for_test(path, &[migrate_v1_to_v2], 2)
+    }
 
     fn scratch_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -720,6 +726,139 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn brandon_like_v1_to_v3_preserves_every_clients_existing_access() {
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _data = data_dir_test_lock();
+        for active in ["default", "work", " Work ", "deleted", ""] {
+            let dir = scratch_dir("brandon-v3");
+            let _override = DataDirOverride::set(&dir);
+            let client_files = seed_user_files(&dir);
+            let client_bytes: Vec<_> = client_files
+                .iter()
+                .map(|p| std::fs::read(p).unwrap())
+                .collect();
+            let path = dir.join("registry.json");
+            let mut v1 = brandon_v1(&dir);
+            v1["activeProfileId"] = json!(active);
+            if active.is_empty() {
+                v1["profiles"][1]["name"] = json!("");
+            }
+            v1["teamMinSafetyLevel"] = json!("strict");
+            v1["team"]["minSafetyLevel"] = json!("strict");
+            v1["profiles"][0]["futureProfileField"] = json!({"keep": true});
+            v1["folderProfiles"][0]["futureFolderField"] = json!("keep-folder");
+            v1["httpClients"] = json!([
+                {"id":"unscoped-http", "label":"Unscoped", "tokenSha256":"hash", "profile":"", "futureHttpField":"keep-http"},
+                {"id":"scoped-http", "label":"Scoped", "tokenSha256":"hash2", "profile":"default"}
+            ]);
+            v1["clientScopes"]["empty"] = json!("");
+            let mut before: Registry = serde_json::from_value(v1.clone()).unwrap();
+            before.normalize_profile_references();
+            let original = write_json(&path, &v1);
+            let after = crate::registry::load_from(&path).unwrap();
+            let v3 = read_json(&path);
+            assert_eq!(v3["version"], 3);
+            assert_eq!(
+                after.default_access_profile_id.as_deref(),
+                matches!(active, "work" | " Work ").then_some("work")
+            );
+            let ids = |servers: Vec<&crate::registry::ServerEntry>| -> Vec<String> {
+                servers.iter().map(|s| s.id.clone()).collect()
+            };
+            // No explicit access means EXACTLY the pre-upgrade view, including an
+            // absent binding and an explicit empty binding. No server appears or disappears.
+            for client in ["claude-desktop", "new-client", "empty", "cursor"] {
+                let scope = before
+                    .client_scopes
+                    .get(client)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                assert_eq!(
+                    ids(before.enabled_servers_for(scope)),
+                    ids(after.enabled_servers_for(scope)),
+                    "{active}: {client}"
+                );
+                assert_eq!(
+                    before.configured_instructions(Some(scope)),
+                    after.configured_instructions(Some(scope))
+                );
+                for server in &before.servers {
+                    for tool in ["search_code", "delete_repository"] {
+                        assert_eq!(
+                            before.profile_allows_tool(scope, &server.id, tool),
+                            after.profile_allows_tool(scope, &server.id, tool),
+                            "{active}: {client}/{tool}"
+                        );
+                    }
+                }
+            }
+            for scope in before.folder_profiles.iter().map(|f| f.profile.as_str()) {
+                assert_eq!(
+                    ids(before.enabled_servers_for(scope)),
+                    ids(after.enabled_servers_for(scope))
+                );
+            }
+            assert_eq!(
+                ids(before.bridge_enabled_servers(None)),
+                ids(after.bridge_enabled_servers(None)),
+                "unscoped HTTP retains its connected union"
+            );
+            for client in before.http_clients.iter().filter(|c| !c.profile.is_empty()) {
+                assert_eq!(
+                    ids(before.enabled_servers_for(&client.profile)),
+                    ids(after.enabled_servers_for(&client.profile))
+                );
+            }
+            for (field, value) in
+                v1.as_object().unwrap().iter().filter(|(k, _)| {
+                    k.starts_with("teamForced") || k.as_str() == "teamMinSafetyLevel"
+                })
+            {
+                assert_eq!(&v3[field], value, "{field}");
+            }
+            for field in [
+                "profiles",
+                "clientScopes",
+                "folderProfiles",
+                "httpClients",
+                "clientManagedEntries",
+            ] {
+                assert_eq!(v3[field], v1[field], "{field}");
+            }
+            assert_eq!(v3["team"]["minSafetyLevel"], "strict");
+            assert_eq!(after.safety_level_effective(), SafetyLevel::Strict);
+            let backups = migration_backup_files(&path);
+            assert_eq!(backups.len(), 1);
+            assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), original);
+            let bytes = std::fs::read(&path).unwrap();
+            let export_names = exports(&dir);
+            crate::registry::load_from(&path).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(migration_backup_files(&path).len(), 1);
+            assert_eq!(exports(&dir), export_names);
+            crate::registry::save_to(&path, &after).unwrap();
+            let saved = read_json(&path);
+            for pointer in [
+                "/servers/0/env/0/futureEnvField",
+                "/team/futureTeamField",
+                "/team/minSafetyLevel",
+                "/profiles/0/futureProfileField",
+                "/folderProfiles/0/futureFolderField",
+                "/httpClients/0/futureHttpField",
+                "/clientManagedEntries/claude-desktop/futureEntryField",
+            ] {
+                assert_eq!(saved.pointer(pointer), v1.pointer(pointer), "{pointer}");
+            }
+            for (file, bytes) in client_files.iter().zip(client_bytes) {
+                assert_eq!(std::fs::read(file).unwrap(), bytes);
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     #[test]
@@ -1091,6 +1230,7 @@ mod tests {
         let _override = DataDirOverride::set(&dir);
         let path = dir.join("registry.json");
         let mut document = serde_json::to_value(crate::registry::Registry::default()).unwrap();
+        document["version"] = json!(2);
         document["servers"] = json!([{
             "id": "custom", "name": "Custom", "transport": "stdio", "command": "echo",
             "args": ["<launch-input>"], "env": [{"key": "ENV", "value": null}],

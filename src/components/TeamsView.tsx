@@ -179,7 +179,7 @@ export function TeamsView({
       if (r.status === "connected" && r.registry) {
         onRegistryChange(r.registry);
         setInviteCode("");
-        setNotice("Connected. The team's servers were added to your active profile.");
+        setNotice("Connected. The team's servers were added to Toolport.");
         return;
       }
       throw new Error("The server returned an unexpected connect response.");
@@ -202,7 +202,7 @@ export function TeamsView({
           setPending(null);
           onRegistryChange(r.registry);
           setInviteCode("");
-          setNotice("Approved. The team's servers were added to your active profile.");
+          setNotice("Approved. The team's servers were added to Toolport.");
         } else if (r.status === "denied") {
           setPending(null);
           setError("An admin declined your request to join this team.");
@@ -273,11 +273,11 @@ export function TeamsView({
   const onEnable = (serverId: string) =>
     run("enable", async () => {
       const pid = registry ? activeProfile(registry)?.id : undefined;
-      if (!pid) throw new Error("No active profile to enable into.");
+      if (!pid) throw new Error("Access context unavailable.");
       // reviewed=true: this runs only from the ConfirmDialog below, which showed
       // the member the exact command/URL. The backend refuses without it.
       onRegistryChange(await setServerEnabled(pid, serverId, true, true));
-      setNotice("Enabled. That server now runs in your active profile.");
+      setNotice("Enabled. That server is now on.");
     });
 
   // One row in the Shared-servers list. Extracted so the review and active groups
@@ -439,8 +439,8 @@ export function TeamsView({
             >
               <h3 className="text-sm font-medium">Have an invite or connect code?</h3>
               <p className="mt-1 mb-4 text-sm text-muted-foreground">
-                Paste it here and the team's shared servers appear in your active profile,
-                kept in sync as your admin updates them.
+                Paste it here and the team's shared servers appear in Toolport, kept in
+                sync as your admin updates them.
               </p>
               <div className="grid gap-3">
                 <label className="grid gap-1 text-sm">

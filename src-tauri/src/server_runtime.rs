@@ -194,6 +194,7 @@ mod tests {
 
     fn server() -> ServerEntry {
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "probe".into(),
             name: "Probe".into(),

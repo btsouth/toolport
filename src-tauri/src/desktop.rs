@@ -216,7 +216,8 @@ fn parse_server_snippet(text: String) -> Result<Vec<clients::ParsedSnippetServer
 }
 
 #[tauri::command]
-fn add_server(state: State<RegistryState>, entry: ServerEntry) -> Result<Registry, String> {
+fn add_server(state: State<RegistryState>, mut entry: ServerEntry) -> Result<Registry, String> {
+    entry.enabled = false;
     let (reg, id) = write_registry(state.inner(), |reg| {
         Ok(crate::registry_controller::apply_add_entry(reg, entry))
     })?;
@@ -347,10 +348,30 @@ fn set_all_enabled(
 }
 
 #[tauri::command]
+fn set_default_access(
+    state: State<RegistryState>,
+    profile: Option<String>,
+) -> Result<Registry, String> {
+    write_registry(state.inner(), |r| r.set_default_access(profile.as_deref())).map(|(r, ())| r)
+}
+
+#[tauri::command]
+fn set_access_server(
+    state: State<RegistryState>,
+    profile_id: String,
+    server_id: String,
+    included: bool,
+) -> Result<Registry, String> {
+    write_registry(state.inner(), |r| {
+        r.set_access_server(&profile_id, &server_id, included)
+    })
+    .map(|(r, ())| r)
+}
+
+#[tauri::command]
 fn create_profile(state: State<RegistryState>, name: String) -> Result<Registry, String> {
     let (reg, _) = write_registry(state.inner(), |reg| {
-        crate::registry_controller::apply_create_profile(reg, &name);
-        Ok(())
+        crate::registry_controller::apply_create_profile(reg, &name)
     })?;
     Ok(reg)
 }
@@ -364,11 +385,12 @@ fn delete_profile(state: State<RegistryState>, id: String) -> Result<Registry, S
 }
 
 #[tauri::command]
-fn set_active_profile(state: State<RegistryState>, id: String) -> Result<Registry, String> {
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        crate::registry_controller::apply_set_active_profile(reg, &id)
-    })?;
-    Ok(reg)
+fn dismiss_access_upgrade_notice(state: State<RegistryState>) -> Result<Registry, String> {
+    write_registry(state.inner(), |reg| {
+        reg.dismiss_access_upgrade_notice();
+        Ok(())
+    })
+    .map(|(reg, ())| reg)
 }
 
 /// Replace the folder -> profile auto-routing mappings (SOU-188). A gateway serving a client
@@ -3789,8 +3811,10 @@ pub fn run() {
             remove_server,
             set_server_enabled,
             create_profile,
+            set_default_access,
+            set_access_server,
             delete_profile,
-            set_active_profile,
+            dismiss_access_upgrade_notice,
             set_folder_profiles,
             set_profile_server_tools,
             install_gateway,
@@ -4470,6 +4494,7 @@ mod tests {
 
     fn github_with_secret() -> ServerEntry {
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "gh".into(),
             name: "GitHub".into(),
@@ -4513,6 +4538,7 @@ mod tests {
 
     fn plain_server(id: &str, name: &str) -> ServerEntry {
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: id.into(),
             name: name.into(),
@@ -5018,6 +5044,7 @@ mod tests {
         let mut reg = Registry::default();
         reg.add_server(github_with_secret());
         reg.add_server(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: String::new(),
             name: "conduit".into(),
@@ -5128,6 +5155,7 @@ mod tests {
         // A remote server whose URL carries inline creds must not leak them in a share.
         let mut reg = Registry::default();
         reg.add_server(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "remote".into(),
             name: "Remote".into(),
@@ -5195,6 +5223,7 @@ mod tests {
 
         let mut reg = Registry::default();
         reg.add_server(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "pg".into(),
             name: "PostgreSQL".into(),
@@ -5254,6 +5283,7 @@ mod tests {
 
         let mut reg = Registry::default();
         reg.add_server(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "remote".into(),
             name: "Remote".into(),
@@ -5295,6 +5325,7 @@ mod tests {
         // through the full share path (export -> serialize -> import elsewhere).
         let mut reg = Registry::default();
         reg.add_server(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "pg".into(),
             name: "PostgreSQL".into(),
@@ -5411,6 +5442,7 @@ mod tests {
     fn diagnostics_redacts_inline_arg_and_url_secrets() {
         let mut reg = Registry::default();
         reg.add_server(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "pg".into(),
             name: "Postgres".into(),
@@ -5434,6 +5466,7 @@ mod tests {
             unknown_fields: serde_json::Map::new(),
         });
         reg.add_server(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "remote".into(),
             name: "Remote".into(),

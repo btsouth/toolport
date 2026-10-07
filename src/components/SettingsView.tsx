@@ -43,6 +43,10 @@ import {
   setSafetyLevel,
   setLazyDiscovery,
   setFolderProfiles,
+  setDefaultAccess,
+  setAccessServer,
+  createProfile,
+  deleteProfile,
   setLiveInspect,
   setPiiRedaction,
   setToolPinned,
@@ -239,7 +243,7 @@ function FolderRouting({
       )}
       {profiles.length === 0 ? (
         <p className="mt-2 text-xs text-muted-foreground">
-          Create a profile first, then map a folder to it here.
+          Create an access set first, then map a folder to it here.
         </p>
       ) : (
         <div className="mt-2 flex items-center gap-2">
@@ -265,7 +269,7 @@ function FolderRouting({
           </button>
           <Select value={profile} onValueChange={setProfile}>
             <SelectTrigger className="h-7 w-32 text-xs">
-              <SelectValue placeholder="Profile" />
+              <SelectValue placeholder="Access set" />
             </SelectTrigger>
             <SelectContent>
               {profiles.map((p) => (
@@ -285,6 +289,43 @@ function FolderRouting({
         </div>
       )}
     </div>
+  );
+}
+
+function AccessSetCreator({
+  onRegistryChange,
+}: {
+  onRegistryChange: (r: Registry) => void;
+}) {
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  return (
+    <form
+      className="flex gap-2"
+      onSubmit={async (event) => {
+        event.preventDefault();
+        setBusy(true);
+        try {
+          onRegistryChange(await createProfile(name));
+          setName("");
+        } catch (e) {
+          toastError(`${e}`);
+        } finally {
+          setBusy(false);
+        }
+      }}
+    >
+      <input
+        aria-label="Access set name"
+        placeholder="Access set name"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        className="rounded border px-2"
+      />
+      <button disabled={busy || !name.trim()} type="submit">
+        Create access set
+      </button>
+    </form>
   );
 }
 
@@ -865,81 +906,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           </div>
         </div>
       </section>
-      {profiles.length > 0 && (
-        <section className="flex flex-col gap-2">
-          <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-            Profiles
-          </h2>
-          <p className="text-xs text-muted-foreground">
-            A profile is a named set of servers you can scope a client to. Expand a server
-            to narrow it to specific tools (a "FeatureSet"); leaving every tool checked
-            exposes the whole server. Tool narrowing applies to stdio clients (Claude
-            Desktop, Cursor, VS Code, and the like); HTTP-bridge clients still see the
-            whole server for now.
-          </p>
-          <div className="flex flex-col divide-y rounded-lg border">
-            {profiles.map((p) => {
-              const names = p.enabledServerIds
-                .map((id) => serverName.get(id))
-                .filter((n): n is string => !!n)
-                .sort((a, b) => a.localeCompare(b));
-              const active = p.id === registry?.activeProfileId;
-              const isOpen = openProfiles.has(p.id);
-              const toggle = () =>
-                setOpenProfiles((prev) => {
-                  const next = new Set(prev);
-                  if (next.has(p.id)) next.delete(p.id);
-                  else next.add(p.id);
-                  return next;
-                });
-              return (
-                <div key={p.id} className="flex flex-col gap-1 px-3 py-2.5">
-                  <button
-                    type="button"
-                    onClick={toggle}
-                    aria-expanded={isOpen}
-                    disabled={names.length === 0}
-                    className="flex items-center gap-2 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-border disabled:cursor-default"
-                  >
-                    <ChevronRight
-                      className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${
-                        isOpen ? "rotate-90" : ""
-                      } ${names.length === 0 ? "invisible" : ""}`}
-                    />
-                    <span className="text-sm font-medium">{p.name}</span>
-                    {active && (
-                      <span className="rounded-full bg-info/15 px-1.5 py-0.5 text-[10px] font-medium text-info">
-                        active
-                      </span>
-                    )}
-                    <span className="ml-auto text-xs text-muted-foreground">
-                      {names.length} {names.length === 1 ? "server" : "servers"}
-                    </span>
-                  </button>
-                  {names.length === 0 ? (
-                    <p className="pl-5 text-xs text-muted-foreground italic">
-                      No servers in this profile.
-                    </p>
-                  ) : isOpen ? (
-                    registry && (
-                      <ProfileToolScope
-                        profile={p}
-                        registry={registry}
-                        onRegistryChange={onRegistryChange}
-                      />
-                    )
-                  ) : (
-                    <p className="truncate pl-5 text-xs text-muted-foreground">
-                      {names.join(", ")}
-                    </p>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-          <FolderRouting registry={registry} onRegistryChange={onRegistryChange} />
-        </section>
-      )}
+
       <section className="flex flex-col gap-2">
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
           Discovery
@@ -1072,12 +1039,179 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         )}
         <details>
           <summary>Advanced</summary>
+          {profiles.length > 0 && (
+            <section className="flex flex-col gap-2">
+              <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+                Access sets
+              </h2>
+              <p className="text-xs text-muted-foreground">
+                Access sets narrow enabled servers and, for stdio clients, tools. Servers
+                that are off stay hidden from every client.
+              </p>
+              <p className="text-sm">Default access</p>
+              <Select
+                value={registry?.defaultAccessProfileId || "@all-enabled"}
+                onValueChange={async (id) => {
+                  try {
+                    onRegistryChange(
+                      await setDefaultAccess(id === "@all-enabled" ? null : id),
+                    );
+                  } catch (e) {
+                    toastError(`${e}`);
+                  }
+                }}
+              >
+                <SelectTrigger aria-label="Default access">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="@all-enabled">All enabled servers</SelectItem>
+                  {profiles.map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {registry?.defaultAccessLegacyPolicy &&
+                !registry.defaultAccessProfileId && (
+                  <div className="flex flex-col gap-2 text-xs text-muted-foreground">
+                    <p>
+                      The upgrade retained the default access set&apos;s tool restrictions
+                      and instructions.
+                    </p>
+                    <button
+                      className="w-fit rounded border px-2 py-1"
+                      onClick={async () => {
+                        try {
+                          onRegistryChange(await setDefaultAccess(null));
+                        } catch (e) {
+                          toastError(`${e}`);
+                        }
+                      }}
+                    >
+                      Use All enabled servers
+                    </button>
+                  </div>
+                )}
+              <AccessSetCreator onRegistryChange={onRegistryChange} />
+              <div className="flex flex-col divide-y rounded-lg border">
+                {profiles.map((p) => {
+                  const names = p.enabledServerIds
+                    .map((id) => serverName.get(id))
+                    .filter((n): n is string => !!n)
+                    .sort((a, b) => a.localeCompare(b));
+                  const active = p.id === registry?.defaultAccessProfileId;
+                  const isOpen = openProfiles.has(p.id);
+                  const toggle = () =>
+                    setOpenProfiles((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(p.id)) next.delete(p.id);
+                      else next.add(p.id);
+                      return next;
+                    });
+                  return (
+                    <div key={p.id} className="flex flex-col gap-1 px-3 py-2.5">
+                      <button
+                        type="button"
+                        onClick={toggle}
+                        aria-expanded={isOpen}
+
+                        className="flex items-center gap-2 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-border disabled:cursor-default"
+                      >
+                        <ChevronRight
+                          className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${
+                            isOpen ? "rotate-90" : ""
+                          }`}
+                        />
+                        <span className="text-sm font-medium">{p.name}</span>
+                        {active && (
+                          <span className="rounded-full bg-info/15 px-1.5 py-0.5 text-[10px] font-medium text-info">
+                            default
+                          </span>
+                        )}
+                        <span className="ml-auto text-xs text-muted-foreground">
+                          {names.length} {names.length === 1 ? "server" : "servers"}
+                        </span>
+                      </button>
+                      {isOpen && registry && (
+                        <div className="flex flex-col gap-2 pl-5">
+                          {registry.servers
+                            .filter((server) => !isGatewayServer(server))
+                            .map((server) => (
+                              <label
+                                key={server.id}
+                                className="flex items-center gap-2 text-xs"
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={p.enabledServerIds.includes(server.id)}
+                                  onChange={async (e) => {
+                                    try {
+                                      onRegistryChange(
+                                        await setAccessServer(
+                                          p.id,
+                                          server.id,
+                                          e.target.checked,
+                                        ),
+                                      );
+                                    } catch (error) {
+                                      toastError(`${error}`);
+                                    }
+                                  }}
+                                />
+                                {server.name}
+                                {!server.enabled && " (off)"}
+                              </label>
+                            ))}
+                          <button
+                            disabled={
+                              profiles.length <= 1 ||
+                              p.id === registry.defaultAccessProfileId ||
+                              p.id === registry.defaultAccessContextId
+                            }
+                            onClick={async () => {
+                              try {
+                                onRegistryChange(await deleteProfile(p.id));
+                              } catch (e) {
+                                toastError(`${e}`);
+                              }
+                            }}
+                          >
+                            Delete access set
+                          </button>
+                        </div>
+                      )}
+                      {names.length === 0 ? (
+                        <p className="pl-5 text-xs text-muted-foreground italic">
+                          No servers in this access set.
+                        </p>
+                      ) : isOpen ? (
+                        registry && (
+                          <ProfileToolScope
+                            profile={p}
+                            registry={registry}
+                            onRegistryChange={onRegistryChange}
+                          />
+                        )
+                      ) : (
+                        <p className="truncate pl-5 text-xs text-muted-foreground">
+                          {names.join(", ")}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              <FolderRouting registry={registry} onRegistryChange={onRegistryChange} />
+            </section>
+          )}
           {toggle(
             Braces,
             codeMode,
             "text-info",
             "Code mode",
-            "Off by default: enable agents to run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary; turn off to hide toolport_run_script. TOOLPORT_CODE_MODE=1 still forces it on.",
+            "Off by default: enable agents to run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects access scope and human approval. Not a security boundary; turn off to hide toolport_run_script. TOOLPORT_CODE_MODE=1 still forces it on.",
             apply("code-mode", setCodeMode),
             "code-mode",
           )}
@@ -1254,7 +1388,13 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                           {c.label || "(unnamed)"}
                         </span>
                         <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                          {c.profile || "all servers"}
+                          {c.profile === "@all-enabled"
+                            ? "All enabled servers"
+                            : profiles.find(
+                                (p) => p.id === c.profile || p.name === c.profile,
+                              )?.name ||
+                              c.profile ||
+                              "Full connected set"}
                         </span>
                         <button
                           type="button"
@@ -1312,20 +1452,21 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   />
                   {profiles.length > 0 && (
                     <Select
-                      value={newProfile || "__all__"}
-                      onValueChange={(v) => setNewProfile(v === "__all__" ? "" : v)}
+                      value={newProfile || "__default__"}
+                      onValueChange={(v) => setNewProfile(v === "__default__" ? "" : v)}
                     >
                       <SelectTrigger
                         size="sm"
-                        aria-label="Scope"
+                        aria-label="Access"
                         className="h-8 w-32 shrink-0 text-xs"
                       >
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="__all__">All servers</SelectItem>
+                        <SelectItem value="__default__">Full connected set</SelectItem>
+                        <SelectItem value="@all-enabled">All enabled servers</SelectItem>
                         {profiles.map((p) => (
-                          <SelectItem key={p.id} value={p.name}>
+                          <SelectItem key={p.id} value={p.id}>
                             {p.name}
                           </SelectItem>
                         ))}

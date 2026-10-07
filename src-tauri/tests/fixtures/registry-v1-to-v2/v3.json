@@ -1,0 +1,69 @@
+{
+  "activeProfileId": "default",
+  "blockOnInjection": false,
+  "clientManagedEntries": {
+    "claude-desktop": {
+      "args": [],
+      "command": "toolport-gateway",
+      "env": {
+        "TOOLPORT_CLIENT_ID": "claude-desktop"
+      },
+      "transport": "sharedHttp",
+      "updatedAt": 1790000000000,
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  },
+  "clientScopes": {
+    "cursor": "default"
+  },
+  "codeMode": false,
+  "confirmDestructive": false,
+  "defaultAccessContextId": "default",
+  "defaultAccessLegacyPolicy": true,
+  "denyDestructive": false,
+  "humanApproval": true,
+  "humanApprovalAllow": ["github/search_code"],
+  "lazyDiscovery": true,
+  "pinnedTools": {
+    "github": ["get_me"]
+  },
+  "profiles": [
+    {
+      "enabledServerIds": ["github"],
+      "id": "default",
+      "name": "Default",
+      "toolScope": {
+        "github": ["search_code"]
+      }
+    }
+  ],
+  "quarantineOnDrift": false,
+  "safetyLevel": "ask",
+  "servers": [
+    {
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "command": "npx",
+      "disabledTools": ["delete_repository"],
+      "enabled": true,
+      "env": [
+        {
+          "key": "GITHUB_TOKEN",
+          "secret": true
+        }
+      ],
+      "id": "github",
+      "name": "GitHub",
+      "source": "manual",
+      "transport": "stdio"
+    }
+  ],
+  "toolOverrides": {
+    "github": {
+      "create_issue": {
+        "description": "Open an issue"
+      }
+    }
+  },
+  "version": 3,
+  "accessUpgradeNoticeDismissed": false
+}

@@ -29,7 +29,7 @@ pub fn gather() -> String {
 pub(crate) fn registry_summary(registry: &Registry) -> String {
     use std::fmt::Write as _;
     let mut output = String::new();
-    let active = registry.active_profile_id();
+    let active = registry.default_access_id();
     let _ = writeln!(output, "\nsettings:");
     let _ = writeln!(output, "  lazy discovery: {}", registry.lazy_discovery);
     let global_mode = registry
@@ -71,7 +71,11 @@ pub(crate) fn registry_summary(registry: &Registry) -> String {
             .map(|port| format!(" (port {port})"))
             .unwrap_or_default()
     );
-    let _ = writeln!(output, "  active profile: {active}");
+    let _ = writeln!(
+        output,
+        "  default access: {}",
+        registry.default_access_label()
+    );
     let _ = writeln!(output, "\nservers ({}):", registry.servers.len());
     for server in &registry.servers {
         let enabled = if registry.is_enabled(&active, &server.id) {
@@ -207,4 +211,19 @@ pub fn open_data_dir() -> Result<(), String> {
         .spawn()
         .map_err(|error| format!("could not open the data directory: {error}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn access_review_diagnostics_labels_default_access() {
+        let mut reg = crate::registry::Registry::default();
+        reg.default_access_profile_id = Some("default".into());
+        let text = super::registry_summary(&reg);
+        assert!(
+            text.contains("default access: Default access (Default)"),
+            "{text}"
+        );
+        assert!(!text.contains("active profile"));
+    }
 }

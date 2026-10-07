@@ -1,0 +1,77 @@
+import { useState } from "react";
+import { dismissAccessUpgradeNotice, stopStaleGateways } from "@/lib/api";
+import type { Registry } from "@/lib/types";
+import { toastError } from "@/lib/toast";
+
+export function AccessUpgradeNotice({
+  registry,
+  onRegistryChange,
+}: {
+  registry: Registry | null;
+  onRegistryChange: (registry: Registry) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState("");
+  if (!registry || registry.version < 3 || registry.accessUpgradeNoticeDismissed)
+    return null;
+  return (
+    <div
+      role="status"
+      className="flex flex-wrap items-center gap-3 border-b bg-info/10 px-6 py-3 text-sm"
+    >
+      <p className="min-w-0 flex-1">
+        Old Toolport gateways may still be running from before the upgrade. Stop old
+        gateways, then restart any apps still using them so they use the new client access
+        controls.
+        {result && <span className="block">{result}</span>}
+      </p>
+      <button
+        disabled={busy}
+        onClick={async () => {
+          setBusy(true);
+          try {
+            const outcome = await stopStaleGateways();
+            setResult(
+              [
+                `Stopped ${outcome.killed.length} old gateways.`,
+                outcome.failed.length
+                  ? `Could not stop: ${outcome.failed.join("; ")}.`
+                  : "",
+                outcome.needsRestart.length
+                  ? `Restart: ${outcome.needsRestart.map((app) => app.client).join(", ")}.`
+                  : "",
+              ]
+                .filter(Boolean)
+                .join(" "),
+            );
+          } catch (error) {
+            toastError("Could not stop old gateways", { description: String(error) });
+          } finally {
+            setBusy(false);
+          }
+        }}
+        className="rounded border px-2 py-1"
+      >
+        Stop old gateways
+      </button>
+      <button
+        disabled={busy}
+        onClick={async () => {
+          setBusy(true);
+          try {
+            onRegistryChange(await dismissAccessUpgradeNotice());
+          } catch (error) {
+            toastError("Could not dismiss upgrade notice", {
+              description: String(error),
+            });
+          } finally {
+            setBusy(false);
+          }
+        }}
+        className="rounded border px-2 py-1"
+      >
+        Dismiss
+      </button>
+    </div>
+  );
+}

@@ -428,7 +428,7 @@ pub struct PushPreview {
 }
 
 /// How one selected personal server relates to the Team, and what sharing it will
-/// do in the active profile. Both desktop shells render these sentences as-is.
+/// do in the local access context. Both desktop shells render these sentences as-is.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareSelectionPreview {
@@ -442,7 +442,7 @@ pub struct ShareSelectionPreview {
     pub local: LocalHandoff,
 }
 
-/// What sharing does, or did, to one selected server in the active profile.
+/// What sharing does, or did, to one selected server in the local access context.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalHandoff {
@@ -1287,7 +1287,7 @@ fn report_activation(conn: &TeamConnection, token: &str) -> Result<(), String> {
                     .get(&c.id)
                     .filter(|s| !s.is_empty())
                     .cloned()
-                    .unwrap_or_else(|| reg.active_profile_id());
+                    .unwrap_or_else(|| reg.default_access_id());
                 reg.enabled_servers_for(&scope)
                     .iter()
                     .any(|s| s.id == server.id)
@@ -2233,10 +2233,10 @@ fn apply_use_managed(reg: &mut Registry, managed_id: &str, profile: &str) -> Res
         || serde_json::to_value(&managed.client_credentials).ok()
             != serde_json::to_value(&personal.client_credentials).ok()
     {
-        return Err("The managed definition differs from your personal server. Complete its setup separately before switching profiles.".into());
+        return Err("The managed definition differs from your personal server. Complete its setup separately before using the Team copy.".into());
     }
     if !reg.profiles.iter().any(|p| p.id == profile) {
-        return Err("active profile unavailable".into());
+        return Err("local access context unavailable".into());
     }
     crate::local_auth::ensure_unconfigured(reg, &managed)?;
     // One local vault owner also shares OAuth refresh state and its lock.
@@ -2284,6 +2284,7 @@ fn apply_use_managed(reg: &mut Registry, managed_id: &str, profile: &str) -> Res
     if !p.enabled_server_ids.iter().any(|id| id == managed_id) {
         p.enabled_server_ids.push(managed_id.into());
     }
+    reg.set_server_enabled(profile, managed_id, true)?;
     reg.set_server_enabled(profile, &personal.id, false)?;
     reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
     Ok(())
@@ -2369,7 +2370,7 @@ fn managed_copy_of(reg: &Registry, original: &str) -> Result<String, String> {
     }
 }
 
-/// Hand each selected server that is in use in the active profile over to its
+/// Hand each selected server that is in use in the local access context over to its
 /// Team copy. Each selection is staged on its own, so one that needs separate
 /// setup leaves the others switched, and a failed one keeps a working route.
 /// `before` is the registry the share was confirmed against; `reg` already has
@@ -2790,7 +2791,7 @@ fn is_team_server(s: &ServerEntry, tag: &str) -> bool {
 
 /// Merge a team config (registry-format JSON `{ servers, denyDestructive?, screeningPolicy? }`)
 /// into the local registry. Team servers are tagged `source = "team:<id>"`, their ids prefixed
-/// `team_`, and enabled in the active profile so they're actually exposed. Re-running
+/// `team_`, with local consent and global enablement preserved. Re-running
 /// REPLACES this team's servers (a removed team server disappears) while leaving the
 /// member's own servers and profiles untouched. A team `denyDestructive: true` and any
 /// `screeningPolicy` force-flags are adopted tighten-only: policy can only raise safety,
@@ -2947,11 +2948,10 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     }
 
     // 1. Capture the prior generation of this team's servers, and which of them the
-    //    member had ENABLED IN EACH PROFILE. That enablement is their standing consent for
+    //    member had INCLUDED IN EACH ACCESS SET. That enablement is their standing consent for
     //    the review-required ones, so we re-apply it per profile after the replace instead
-    //    of forcing a re-approval on every sync. Capturing per-profile (not just the active
-    //    one) is what keeps a team server the member enabled in a NON-active profile from
-    //    being stripped on every sync and never restored.
+    //    of forcing a re-approval on every sync. Capturing each set keeps an explicitly
+    //    scoped client's membership from being stripped on every sync.
     let old_ids: Vec<String> = previous.iter().map(|server| server.id.clone()).collect();
     // What the member actually consented to, per id: the execution-relevant fields of the
     // entry as it stood when they enabled it. Standing consent is restored below only for a
@@ -2985,6 +2985,11 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
         .iter()
         .filter(|server| saved_team_original_id(server).is_none())
         .map(|server| (server.id.clone(), plain_launch_values(server)))
+        .collect();
+    let previous_global: HashMap<String, bool> = reg
+        .servers
+        .iter()
+        .map(|s| (s.id.clone(), s.enabled))
         .collect();
     let prev_enabled_by_profile: std::collections::HashMap<
         String,
@@ -3111,10 +3116,9 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
         conn.managed_server_ids = managed_server_ids;
     }
 
-    // 3. Enable per profile. New public remotes auto-enable in the ACTIVE profile
-    //    (first-run convenience). EVERY profile then restores the exact team servers the
-    //    member had enabled in THAT profile before this sync — their standing consent — so a
-    //    server enabled in a non-active profile survives the replace. Review servers the
+    // 3. Restore access-set membership. New public remotes join the local context
+    //    (first-run convenience). Each set keeps the exact team servers it included before
+    //    this sync. In v1/v2 that membership is also enablement. Review servers the
     //    member never consented to stay off, so nothing local runs without an explicit opt-in.
     //
     //    For a review server, consent is to a DEFINITION, not to an id: it is carried over
@@ -3144,8 +3148,20 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
             }
         }
     }
-    // What the member still has to look at: review servers that are OFF in the active
-    // profile after consent was restored. Counting every review server here (as before)
+    if reg.version >= 3 {
+        for server in reg.servers.iter_mut().filter(|s| is_team_server(s, &tag)) {
+            // Keep the user's switch across sync. A changed review-required
+            // definition still loses consent, regardless of access membership.
+            server.enabled = if review_ids.contains(&server.id) {
+                previous_global.get(&server.id).copied().unwrap_or(false)
+                    && consent_holds(&server.id)
+            } else {
+                previous_global.get(&server.id).copied().unwrap_or(true)
+            };
+        }
+    }
+    // What the member still has to look at: review servers missing consent in the local
+    // access context after the prior consent was restored. Counting every review server here (as before)
     // told the member that servers they had already enabled were "off until you review
     // them", which was untrue for the carried-over ones and hid the changed ones among them.
     let active_enabled: HashSet<&String> = reg
@@ -3480,6 +3496,7 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         None => None,
     };
     let mut entry = ServerEntry {
+        enabled: false,
         inherit_env: false,
         id,
         name: name.to_string(),
@@ -4328,12 +4345,31 @@ mod tests {
         assert_eq!(merged["github"], [5, 50]);
     }
 
+    #[test]
+    fn v3_reviewed_global_enable_keeps_consent_and_global_off_survives_sync() {
+        let mut registry = Registry::default();
+        let config = json!({"servers":[{"id":"reviewed","name":"Reviewed","transport":"stdio","command":"fixture-only","args":[],"env":[]}]});
+        apply_team_config(&mut registry, "t1", &config);
+        let id = registry.servers[0].id.clone();
+        assert!(!registry.server_enabled(&id));
+        crate::registry_controller::apply_server_enabled(&mut registry, "default", &id, true, true)
+            .unwrap();
+        assert!(registry.profiles[0].enabled_server_ids.contains(&id));
+        apply_team_config(&mut registry, "t1", &config);
+        assert!(registry.server_enabled(&id));
+        registry.set_global_server_enabled(&id, false).unwrap();
+        apply_team_config(&mut registry, "t1", &config);
+        assert!(!registry.server_enabled(&id));
+        assert!(registry.profiles[0].enabled_server_ids.contains(&id));
+    }
+
     fn base_registry() -> Registry {
         let mut r = Registry::default();
         // Exercise retained v1 fields and releasable team overlays.
         r.version = 1;
         r.safety_level = None;
         r.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "mine".into(),
             name: "Mine".into(),
@@ -4996,6 +5032,7 @@ mod tests {
         // sync would overwrite the member's own server's secrets/profile/tool routing.
         let mut r = base_registry();
         r.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "team_github".into(),
             name: "My own".into(),
@@ -5137,6 +5174,7 @@ mod tests {
         let mut r = base_registry();
         // Occupy the natural team id so the team server gets a stable alternate id.
         r.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "team_github".into(),
             name: "Local GitHub".into(),
@@ -5735,6 +5773,7 @@ mod tests {
     fn team_id_never_collides_with_a_local_id_under_sanitize() {
         let mut r = base_registry();
         r.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "team-acme-crm".into(),
             name: "Team Acme CRM".into(),
@@ -6228,6 +6267,7 @@ mod tests {
         let mut r = base_registry(); // has "mine" (manual)
                                      // Toolport's own gateway entry: infra, must never be pushed to the team.
         r.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "toolport".into(),
             name: "Toolport".into(),
@@ -6249,6 +6289,7 @@ mod tests {
         });
         // A team-sourced server: excluded too (don't echo the team's own set back).
         r.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "shared".into(),
             name: "Shared".into(),
@@ -6694,6 +6735,7 @@ mod tests {
     #[test]
     fn consent_fingerprint_tracks_only_what_runs() {
         let base = ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "team_x".into(),
             name: "X".into(),
@@ -6890,6 +6932,54 @@ mod tests {
 
         fn handed_off() -> (Registry, Value) {
             handed_off_with(LocalValue::None)
+        }
+
+        #[test]
+        fn access_review_team_sync_preserves_switch_without_membership() {
+            crate::secrets::tests::with_isolated_vault(|| {
+                let mut personal = publisher_registry();
+                personal.version = 3;
+                personal.servers[0].enabled = true;
+                let remote = team_server_export(&personal);
+                let mut reg = synced(&personal, &remote, 1);
+                let managed = team_copy(&reg, "mine");
+                apply_use_managed(&mut reg, &managed, "default").unwrap();
+                assert!(reg.server_enabled(&managed));
+                for profile in &mut reg.profiles {
+                    profile.enabled_server_ids.clear();
+                }
+                reg = synced(&reg, &remote, 2);
+                assert!(reg.server_enabled(&managed));
+                reg.set_global_server_enabled(&managed, false).unwrap();
+                reg = synced(&reg, &remote, 3);
+                assert!(!reg.server_enabled(&managed));
+            });
+        }
+
+        #[test]
+        fn access_review_team_copy_turns_personal_off_globally_keeps_membership() {
+            crate::secrets::tests::with_isolated_vault(|| {
+                let mut personal = publisher_registry();
+                personal.version = 3;
+                personal.servers[0].enabled = true;
+                let other = personal.add_profile("Other");
+                personal.set_access_server(&other, "mine", true).unwrap();
+                let mut reg = synced(&personal, &team_server_export(&personal), 1);
+                let managed = team_copy(&reg, "mine");
+                apply_use_managed(&mut reg, &managed, "default").unwrap();
+                assert!(!reg.server_enabled("mine"));
+                assert!(reg.server_enabled(&managed));
+                assert!(reg
+                    .profiles
+                    .iter()
+                    .all(|p| p.enabled_server_ids.iter().any(|id| id == "mine")));
+                let all = reg
+                    .enabled_servers_for(crate::registry::ALL_ENABLED_ACCESS)
+                    .iter()
+                    .map(|s| s.id.clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(all, [managed]);
+            });
         }
 
         #[test]

@@ -449,7 +449,7 @@ pub struct ToolPolicy {
     pub servers: Option<HashSet<String>>,
     /// server id -> original tool names the user switched off.
     pub disabled: HashMap<String, HashSet<String>>,
-    /// server id -> the ONLY original tool names the active profile exposes (tool-granular
+    /// server id -> the ONLY original tool names this client exposes (tool-granular
     /// scoping / "FeatureSet"). A server present here allow-lists: every other tool on it is
     /// hidden and blocked. A server ABSENT exposes all of its tools. Empty = no tool-granular
     /// scoping, so this is fully backward compatible.
@@ -485,13 +485,13 @@ impl ToolPolicy {
         tool: &Value,
     ) -> Option<&'static str> {
         // Tool-granular profile scope: if this server is narrowed to an allow-list, a tool
-        // not on it is outside the active profile's scope (hidden + blocked, same as disabled).
+        // not on it is outside this client's scope (hidden + blocked, same as disabled).
         if self
             .allow
             .get(server_id)
             .is_some_and(|set| !set.contains(orig))
         {
-            return Some("outside the active profile's tool scope");
+            return Some("outside this client's tool scope");
         }
         self.blocked_reason_unscoped(exposed, server_id, orig, tool)
     }
@@ -6657,7 +6657,10 @@ mod tests {
 
         // Hidden, and also blocked on a direct call (not merely invisible).
         let err = router.route_call("db__add", json!({})).unwrap_err();
-        assert!(err.contains("tool scope"), "unexpected: {err}");
+        assert!(
+            err.contains("outside this client's tool scope"),
+            "unexpected: {err}"
+        );
         assert!(router.route_call("db__echo", json!({})).is_ok());
     }
 

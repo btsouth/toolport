@@ -11,6 +11,7 @@ if (!import.meta.env.DEV) throw new Error("Fixtures require the development serv
 const servers: ServerEntry[] = ["GitHub", "Linear", "Stripe"].map((name, i) => ({
   id: `fixture-${i}`,
   name,
+  enabled: true,
   transport: "stdio",
   command: "fixture-only",
   args: [],
@@ -19,12 +20,17 @@ const servers: ServerEntry[] = ["GitHub", "Linear", "Stripe"].map((name, i) => (
   source: "manual",
 }));
 const registry: Registry = {
-  version: 1,
+  version: 3,
   servers,
   profiles: [
     { id: "local", name: "Local fixture", enabledServerIds: servers.map((s) => s.id) },
+    { id: "work", name: "Work", enabledServerIds: [servers[0].id] },
   ],
   activeProfileId: "local",
+  defaultAccessContextId: "local",
+  defaultAccessLegacyPolicy: true,
+  accessUpgradeNoticeDismissed: false,
+  clientScopes: { codex: "" },
 };
 const auditRows = Array.from({ length: 200 }, (_, i) => ({
   ts: 1_700_000_000_000 - i * 1000,
@@ -64,8 +70,45 @@ localStorage.setItem("toolport.onboarded", "1");
 
 mockIPC(
   (command, payload) => {
+    const args: Record<string, unknown> =
+      payload &&
+      !Array.isArray(payload) &&
+      !(payload instanceof ArrayBuffer) &&
+      !(payload instanceof Uint8Array)
+        ? payload
+        : {};
     calls[command] = (calls[command] ?? 0) + 1;
     switch (command) {
+      case "dismiss_access_upgrade_notice":
+        registry.accessUpgradeNoticeDismissed = true;
+        return registry;
+      case "set_default_access":
+        registry.defaultAccessProfileId = args.profile as string | null;
+        return registry;
+      case "set_access_server": {
+        const profile = registry.profiles.find((p) => p.id === args.profileId)!;
+        profile.enabledServerIds = profile.enabledServerIds.filter(
+          (id) => id !== args.serverId,
+        );
+        if (args.included) profile.enabledServerIds.push(args.serverId as string);
+        return registry;
+      }
+      case "create_profile":
+        registry.profiles.push({
+          id: String(args.name).toLowerCase(),
+          name: String(args.name),
+          enabledServerIds: [],
+        });
+        return registry;
+      case "delete_profile":
+        registry.profiles = registry.profiles.filter((p) => p.id !== args.id);
+        return registry;
+      case "install_gateway":
+        registry.clientScopes = {
+          ...registry.clientScopes,
+          [String(args.clientId)]: String(args.profile || ""),
+        };
+        return registry;
       case "get_registry":
         return registry;
       case "detect_clients":
@@ -137,6 +180,15 @@ mockIPC(
           content: [{ type: "text", text: `Fixture result: ${JSON.stringify(payload)}` }],
           isError: false,
         };
+      case "is_launch_at_login_enabled":
+      case "plugin:autostart|is_enabled":
+        return false;
+      case "http_bridge_status":
+        return { running: false, port: null, url: null, token: null };
+      case "stop_stale_gateways":
+        return { killed: [], failed: [], needsRestart: [] };
+      case "clients_needing_restart":
+      case "list_allowed_tools":
       case "list_quarantined":
       case "list_pending_approvals":
       case "get_security_events":

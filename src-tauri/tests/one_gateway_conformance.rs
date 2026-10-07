@@ -574,6 +574,7 @@ impl Drop for AdapterClient {
 /// test binary) shifts it out from under the delta assertion.
 fn mock_server_entry(id: &str, transcript: &Path, cwd: Option<&str>) -> ServerEntry {
     ServerEntry {
+        enabled: true,
         inherit_env: false,
         id: id.to_string(),
         name: format!("Mock {id}"),
@@ -1789,7 +1790,8 @@ fn matrix_retired_legacy_registry_uses_shared_daemon() {
     assert_eq!(transcript_initialize_count(&transcript), 1);
     let migrated: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(migrated["version"], 2);
+    assert_eq!(migrated["version"], Registry::default().version);
+    assert_eq!(migrated["servers"][0]["enabled"], true);
     assert!(migrated.get("gatewayTopology").is_none());
 }
 

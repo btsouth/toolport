@@ -55,6 +55,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { AccessUpgradeNotice } from "@/components/AccessUpgradeNotice";
 import { AppSidebar } from "@/components/AppSidebar";
 import { ClientLogo } from "@/components/ClientLogo";
 import { PendingApprovals } from "@/components/PendingApprovals";
@@ -219,11 +220,11 @@ function App() {
   const applyRegistryChange = useCallback(
     (next: Registry) => {
       const activeId = (value: Registry | null) =>
-        value?.activeProfileId ?? value?.profiles[0]?.id;
+        value?.defaultAccessProfileId ?? value?.defaultAccessContextId;
       const enabledIds = (value: Registry | null) =>
         new Set(
-          value?.profiles.find((profile) => profile.id === activeId(value))
-            ?.enabledServerIds ?? [],
+          value?.servers.filter((server) => server.enabled).map((server) => server.id) ??
+            [],
         );
       const previous = registryRef.current;
       const previousProfileId = activeId(previous);
@@ -517,7 +518,7 @@ function App() {
   }, [load]);
 
   const profileId = registry
-    ? (registry.activeProfileId ?? registry.profiles[0]?.id)
+    ? (registry.defaultAccessProfileId ?? registry.profiles[0]?.id)
     : undefined;
   // The gateway entry is Toolport itself, not a server it proxies - never list it.
   const servers = (registry?.servers ?? []).filter((s) => !isGatewayServer(s));
@@ -758,6 +759,10 @@ function App() {
         />
 
         <main className="flex min-w-0 flex-1 flex-col">
+          <AccessUpgradeNotice
+            registry={registry}
+            onRegistryChange={applyRegistryChange}
+          />
           <header className="flex items-center justify-between gap-4 border-b px-6 py-4">
             <div className="flex min-w-0 flex-1 items-center gap-3">
               {view === "clients" && selectedClient && (
@@ -1102,7 +1107,7 @@ function App() {
         open={confirmDisableAll}
         onOpenChange={setConfirmDisableAll}
         title="Disable all servers?"
-        description={`This turns off all ${servers.length} servers for this profile. Clients will lose their tools until you re-enable them.`}
+        description={`This turns off all ${servers.length} servers for every client. Clients will lose their tools until you re-enable them.`}
         confirmLabel="Disable all"
         destructive
         onConfirm={handleToggleAll}
@@ -1233,7 +1238,7 @@ export function serverPostureCopy({
         : `Last known: ${connected} reachable. Status may be out of date.`
       : "The last health check did not complete."
     : enabled === 0
-      ? `${disabled} server${disabled === 1 ? "" : "s"} disabled in this profile.`
+      ? `${disabled} server${disabled === 1 ? "" : "s"} turned off.`
       : probing
         ? `${checked} of ${enabled} checked so far.`
         : checked < enabled
@@ -1241,8 +1246,8 @@ export function serverPostureCopy({
           : attention > 0
             ? `${attention} need${attention === 1 ? "s" : ""} a quick check.`
             : disabled > 0
-              ? `${disabled} disabled in this profile.`
-              : "Everything enabled in this profile is ready.";
+              ? `${disabled} turned off.`
+              : "Every enabled server is ready.";
   return { healthy, title, detail };
 }
 

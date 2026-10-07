@@ -2794,14 +2794,9 @@ fn enabled_summary(
 ) -> String {
     let active = match profile {
         Some(p) => reg.resolve_profile_id(p),
-        None => reg.active_profile_id(),
+        None => reg.default_access_id(),
     };
-    let profile_name = reg
-        .profiles
-        .iter()
-        .find(|p| p.id == active)
-        .map(|p| p.name.clone())
-        .unwrap_or(active.clone());
+    let profile_name = reg.access_label(profile.unwrap_or(""));
 
     // The set of server prefixes this caller may see. A scoped HTTP client sees
     // exactly its allowed set (its real scope, drawn from its own profile via the
@@ -2825,7 +2820,7 @@ fn enabled_summary(
         .collect();
     let header = match allowed {
         Some(_) => "Servers available to this client".to_string(),
-        None => format!("Profile '{profile_name}'"),
+        None => profile_name,
     };
     // A daemon that replaced one which crashed says so first.
     let crash = conduit_lib::daemon_log::previous_exit_note()
@@ -3551,7 +3546,7 @@ struct HttpCaller {
 /// one-client gateway does, then use the HTTP bridge's per-request scope gate.
 fn adapter_tool_scope(reg: &Registry, profile: &str) -> Vec<(String, Vec<String>)> {
     let resolved = reg.resolve_profile_id(profile);
-    let Some(profile) = reg.profiles.iter().find(|entry| entry.id == resolved) else {
+    let Some(profile) = reg.access_profile(&resolved) else {
         return Vec::new();
     };
     let mut scope: Vec<(String, Vec<String>)> = profile
@@ -3575,7 +3570,7 @@ fn resolve_adapter_caller(
     root: Option<&str>,
 ) -> (Option<std::collections::HashSet<String>>, HttpCaller) {
     let profile = effective_profile(reg, Some(client_id), &env_profile.map(str::to_string), root)
-        .unwrap_or_else(|| reg.active_profile_id());
+        .unwrap_or_else(|| reg.default_access_id());
     let allowed: std::collections::HashSet<String> = reg
         .enabled_servers_for(&profile)
         .iter()
@@ -6737,7 +6732,7 @@ fn handle_request_with_cancel(
                     let Some(alias) = router.exposed_tool_name(server, tool) else {
                         return Some(success(
                             id,
-                            json!({"content": [{"type": "text", "text": "Tool unavailable in the active profile or blocked by gateway policy."}], "isError": true}),
+                            json!({"content": [{"type": "text", "text": "Tool unavailable in this client's access set or blocked by gateway policy."}], "isError": true}),
                         ));
                     };
                     (
@@ -7349,10 +7344,7 @@ fn daemon_root_servers(reg: &Registry) -> Vec<ServerEntry> {
         .filter(|server| {
             !clients::is_gateway_server(server)
                 && server_uses_project_root(server)
-                && reg
-                    .profiles
-                    .iter()
-                    .any(|profile| reg.is_enabled(&profile.id, &server.id))
+                && reg.server_enabled(&server.id)
         })
         .cloned()
         .collect()
@@ -7408,11 +7400,7 @@ fn router_servers<'a>(
         // not start the daemon. The per-request allowed set narrows this union.
         reg.servers
             .iter()
-            .filter(|server| {
-                reg.profiles
-                    .iter()
-                    .any(|profile| reg.is_enabled(&profile.id, &server.id))
-            })
+            .filter(|server| reg.server_enabled(&server.id))
             .collect()
     } else if http_mode {
         reg.bridge_enabled_servers(profile)
@@ -7457,8 +7445,8 @@ fn registry_policy(
         let mut allow = std::collections::HashMap::new();
         let pid = profile
             .map(|p| reg.resolve_profile_id(p))
-            .unwrap_or_else(|| reg.active_profile_id());
-        if let Some(prof) = reg.profiles.iter().find(|p| p.id == pid) {
+            .unwrap_or_else(|| reg.default_access_id());
+        if let Some(prof) = reg.access_profile(&pid) {
             for (server_id, tools) in &prof.tool_scope {
                 allow.insert(server_id.clone(), tools.iter().cloned().collect());
             }
@@ -9699,14 +9687,14 @@ fn resolve_live_profile(
     env_profile: &Option<String>,
 ) -> Option<String> {
     let profile_ref = match client_id.and_then(|id| reg.client_scopes.get(id)) {
-        Some(p) if p.trim().is_empty() => return Some(reg.active_profile_id()),
+        Some(p) if p.trim().is_empty() => return Some(reg.default_access_id()),
         Some(p) => Some(p.as_str()),
         None => env_profile.as_deref(),
     };
     Some(
         profile_ref
             .map(|profile| reg.resolve_profile_id(profile))
-            .unwrap_or_else(|| reg.active_profile_id()),
+            .unwrap_or_else(|| reg.default_access_id()),
     )
 }
 
@@ -10229,7 +10217,7 @@ fn watch_tick(
         );
         let fmt_profile = |p: &Option<String>| match p {
             Some(name) => format!("'{name}'"),
-            None => "(active profile / unscoped)".to_string(),
+            None => "Default access".to_string(),
         };
         eprintln!(
             "toolport: registry changed{} -> profile {} (was {}); {} server(s), {} tools; sent tools/list_changed",
@@ -11570,7 +11558,7 @@ impl HostState {
         profile: &str,
     ) -> (Arc<Router>, Arc<CatalogSnapshot>) {
         let resolved = reg.resolve_profile_id(profile);
-        if !reg.profiles.iter().any(|entry| entry.id == resolved) {
+        if !resolved.starts_with("@all-enabled:") && reg.access_profile(&resolved).is_none() {
             let catalog = Arc::new(CatalogSnapshot::new(base.aggregated_tools()));
             return (base, catalog);
         }
@@ -13797,9 +13785,7 @@ fn adapter_live_view(
             }
             tool.is_some_and(|tool| {
                 current
-                    .profiles
-                    .iter()
-                    .find(|entry| entry.id == *profile)
+                    .access_profile(profile)
                     .and_then(|entry| entry.tool_scope.get(server))
                     .is_some_and(|allow| !allow.iter().any(|name| name == tool))
             })
@@ -14027,10 +14013,7 @@ fn process_request(
             !reg.servers.iter().any(|server| {
                 !clients::is_gateway_server(server)
                     && !server_uses_project_root(server)
-                    && reg
-                        .profiles
-                        .iter()
-                        .any(|profile| reg.is_enabled(&profile.id, &server.id))
+                    && reg.server_enabled(&server.id)
             })
         })
     {
@@ -17929,10 +17912,10 @@ fn main() {
     let (loaded, registry_loaded) = match load_outcome {
         Ok((r, source)) => {
             glog(&format!(
-                "load_resolved OK ({source:?}): {} servers total, {} enabled (active={})",
+                "load_resolved OK ({source:?}): {} servers total, {} enabled (default access={})",
                 r.servers.len(),
                 r.enabled_servers().len(),
-                r.active_profile_id()
+                r.default_access_id()
             ));
             if !source.is_authoritative() {
                 eprintln!(
@@ -19678,6 +19661,111 @@ mod tests {
     }
 
     #[test]
+    fn access_review_default_tool_revocation_while_call_waits_for_startup() {
+        let _env = DataDirTestEnv::new("access-review-startup");
+        let state = http_state(false);
+        let mut reg = Registry::default();
+        let mut server = stub_server("s", "S");
+        server.enabled = true;
+        reg.servers.push(server);
+        reg.profiles[0].enabled_server_ids.push("s".into());
+        reg.default_access_context_id = Some("default".into());
+        reg.default_access_legacy_policy = true;
+        reg.safety_level = Some(registry::SafetyLevel::Off);
+        *state.registry.lock().unwrap() = reg.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::with_policy(
+            registry_policy(&reg, None, false, false).with_quarantine(BTreeSet::new(), false),
+        );
+        let connect_calls = Arc::clone(&calls);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        router.add_supervised(
+            "s".into(),
+            vec![json!({"name":"work", "description":"fixture", "inputSchema":{"type":"object"}, "annotations":{"destructiveHint":false}})],
+            Arc::new(move || {
+                started_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(DownstreamServer::connect(
+                    "s".into(),
+                    Box::new(CountingRoute {
+                        calls: Arc::clone(&connect_calls),
+                        destructive: false,
+                    }),
+                ).unwrap())
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        let snapshot = Arc::new(router);
+        *state.router.lock().unwrap() = Arc::clone(&snapshot);
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        let profile = reg.default_access_id();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let _live = LiveRouterResolverGuard::enter(Some(adapter_live_view(
+                    &state.host,
+                    &reg,
+                    &profile,
+                    None,
+                    None,
+                )));
+                match prepare_dispatch(
+                    &snapshot,
+                    Some(&state.router),
+                    DispatchTarget::Tool("s__work"),
+                    None,
+                    false,
+                )
+                .and_then(|()| snapshot.route_call("s__work", json!({})))
+                {
+                    Ok(result) => result,
+                    Err(message) => {
+                        json!({"isError":true, "content":[{"type":"text", "text":message}]})
+                    }
+                }
+            });
+            // The connector holds the call until its live tool scope is revoked.
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            state.registry.lock().unwrap().profiles[0]
+                .tool_scope
+                .insert("s".into(), Vec::new());
+            release_tx.send(()).unwrap();
+            wait_for_supervisor_result(&snapshot);
+            let mut published = (*snapshot).clone();
+            published.adopt_ready_reconnects();
+            *state.router.lock().unwrap() = Arc::new(published);
+            snapshot.activate_supervisors();
+            let result = worker.join().unwrap();
+            assert_eq!(result["isError"], true, "{result}");
+            assert!(result.to_string().contains(STALE_LIVE_VIEW), "{result}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "revoked call reached downstream"
+            );
+        });
+    }
+
+    #[test]
+    fn access_review_status_uses_public_access_names() {
+        let _env = DataDirTestEnv::new("access-review-status");
+        let state = http_state(false);
+        let mut reg = Registry::default();
+        reg.default_access_context_id = Some("default".into());
+        for (reference, label) in [
+            (reg.default_access_id(), "Default access"),
+            (reg.all_access_id(), "All enabled servers"),
+            ("default".into(), "Default"),
+        ] {
+            let text = enabled_summary(&state.host, &reg, &[], Some(&reference), None);
+            assert!(text.starts_with(label), "{text}");
+            assert!(!text.contains('@'), "{text}");
+        }
+    }
+
+    #[test]
     fn supervisor_dispatch_rechecks_policy_after_waiting_for_startup() {
         let _env = DataDirTestEnv::new("supervisor-wait-policy");
         let state = http_state(false);
@@ -20373,6 +20461,7 @@ mod tests {
         let mut entry = stub_server("cache", "Cache");
         entry.command = Some(_env.dir.join("missing-replacement").display().to_string());
         reg.servers.push(entry);
+        reg.set_access_server("default", "cache", true).unwrap();
         reg.set_server_enabled("default", "cache", true).unwrap();
         let built = build_router_incremental(
             &reg,
@@ -20602,7 +20691,7 @@ mod tests {
         let env_profile = Some("Default".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            Some(reg.active_profile_id())
+            Some("default".into())
         );
     }
 
@@ -20618,7 +20707,7 @@ mod tests {
         let env_profile = Some("Billing".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            Some(reg.active_profile_id())
+            Some(reg.default_access_id())
         );
     }
 
@@ -20629,7 +20718,7 @@ mod tests {
         let env_profile = Some("Default".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            Some(reg.active_profile_id())
+            Some("default".into())
         );
     }
 
@@ -20642,8 +20731,56 @@ mod tests {
         reg.set_client_scope("cursor", Some("Billing"));
         assert_eq!(
             resolve_live_profile(&reg, None, &None),
-            Some(reg.active_profile_id())
+            Some(reg.default_access_id())
         );
+    }
+
+    #[test]
+    fn access_precedence_and_global_off_apply_to_every_gateway_scope() {
+        let mut reg = Registry::default();
+        reg.default_access_context_id = Some("default".into());
+        let work = reg.add_profile("Work");
+        let mut server: ServerEntry = serde_json::from_value(json!({"id":"files","name":"Files","transport":"http","url":"https://example.test","enabled":true})).unwrap();
+        reg.servers.push(server.clone());
+        reg.set_access_server("default", "files", true).unwrap();
+        reg.set_access_server(&work, "files", true).unwrap();
+        reg.set_default_access(Some("default")).unwrap();
+        reg.set_client_scope("cursor", Some(&work));
+        let env = Some("default".into());
+        reg.set_folder_profiles(vec![registry::FolderProfile {
+            path: "/work".into(),
+            profile: "default".into(),
+            unknown_fields: Default::default(),
+        }]);
+        assert_eq!(
+            effective_profile(&reg, Some("cursor"), &env, Some("/work/project")),
+            Some("default".into())
+        );
+        assert_eq!(
+            effective_profile(&reg, Some("cursor"), &env, None),
+            Some(work.clone())
+        );
+        assert_eq!(
+            effective_profile(&reg, Some("other"), &env, None),
+            Some("default".into())
+        );
+        assert_eq!(
+            effective_profile(&reg, None, &None, None),
+            Some(reg.default_access_id())
+        );
+        reg.set_client_scope("cursor", Some(registry::ALL_ENABLED_ACCESS));
+        let all = effective_profile(&reg, Some("cursor"), &env, None).unwrap();
+        assert_eq!(all, reg.all_access_id());
+        server.id = "unprofiled".into();
+        reg.servers.push(server);
+        assert_eq!(reg.enabled_servers_for(&all).len(), 2);
+        assert!(adapter_tool_scope(&reg, &all).is_empty());
+        reg.set_global_server_enabled("files", false).unwrap();
+        for id in ["default".to_string(), work, all, reg.default_access_id()] {
+            assert!(!reg.is_enabled(&id, "files"));
+        }
+        assert!(reg.enabled_servers_for("@all-enabled:forged").is_empty());
+        assert!(reg.enabled_servers_for("@default-access:forged").is_empty());
     }
 
     #[test]
@@ -24631,6 +24768,7 @@ mod tests {
         let mut reg = Registry::default();
         for id in ["alpha", "bravo"] {
             reg.servers.push(ServerEntry {
+                enabled: false,
                 inherit_env: false,
                 id: id.into(),
                 name: id.into(),
@@ -24649,15 +24787,18 @@ mod tests {
                 unknown_fields: serde_json::Map::new(),
             });
         }
-        // alpha is in the active (default) profile; bravo only in a separate one.
+        // The migrated default is pinned to alpha; Billing can see bravo.
+        reg.set_access_server("default", "alpha", true).unwrap();
         reg.set_server_enabled("default", "alpha", true).unwrap();
         let billing = reg.add_profile("Billing");
+        reg.set_access_server(&billing, "bravo", true).unwrap();
         reg.set_server_enabled(&billing, "bravo", true).unwrap();
+        reg.default_access_profile_id = Some("default".into());
         let cached = vec![json!({ "name": "alpha__x" }), json!({ "name": "bravo__y" })];
-        // Unscoped (legacy/stdio): the active profile -> alpha only.
+        // Unscoped stdio keeps the pinned default access: alpha only.
         let full = enabled_summary(&host, &reg, &cached, None, None);
         assert!(full.contains("alpha"));
-        assert!(!full.contains("bravo")); // not in the active profile
+        assert!(!full.contains("bravo")); // outside the pinned default access
         assert!(full.contains("tokens saved"));
         // Scoped to bravo: shows bravo (its real scope) even though bravo isn't in
         // the active profile, and never leaks alpha's name/command/tool count.
@@ -24699,6 +24840,7 @@ mod tests {
         let mut reg = Registry::default();
         for id in ["github", "atlassian"] {
             reg.servers.push(ServerEntry {
+                enabled: false,
                 inherit_env: false,
                 id: id.into(),
                 name: id.into(),
@@ -24783,6 +24925,7 @@ mod tests {
         // the hint must stay silent - otherwise every server reads as "0 tools".
         let mut reg = Registry::default();
         reg.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "github".into(),
             name: "github".into(),
@@ -26264,6 +26407,7 @@ mod tests {
 
     fn stub_server(id: &str, name: &str) -> ServerEntry {
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: id.into(),
             name: name.into(),
@@ -26291,6 +26435,8 @@ mod tests {
         reg.servers.push(stub_server("team-slack", "Team Slack"));
         reg.servers.push(stub_server("team_slack", "slack"));
         let personal = reg.add_profile("Personal");
+        reg.set_access_server(&personal, "team-slack", true).unwrap();
+        reg.set_access_server("default", "team_slack", true).unwrap();
         reg.set_server_enabled(&personal, "team-slack", true)
             .unwrap();
         reg.set_server_enabled("default", "team_slack", true)
@@ -26657,6 +26803,9 @@ mod tests {
         let mut reg = Registry::default();
         reg.servers.push(stub_server("a", "A"));
         reg.servers.push(stub_server("x", "X"));
+        for server in &mut reg.servers {
+            server.enabled = true;
+        }
         reg.profiles.clear();
         for (id, servers) in [("p", vec!["a", "x"]), ("q", vec!["x"])] {
             reg.profiles.push(registry::Profile {
@@ -30214,6 +30363,7 @@ mod tests {
         let host = dispatch_host(false);
         let mut reg = Registry::default();
         let id = reg.add_server(registry::ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: String::new(),
             name: "github".to_string(),
