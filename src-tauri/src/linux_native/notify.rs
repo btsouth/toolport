@@ -4,7 +4,7 @@
 //! `withdraw_notification` can no longer close it. Notification servers that
 //! keep a clicked urgent notification on screen (the Omarchy shell does) then
 //! show an approval that was already decided. Talking to the server directly
-//! keeps its id, so a resolved, expired or replaced approval always closes.
+//! keeps its id so a resolved, expired or replaced approval can be withdrawn.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -132,7 +132,7 @@ impl ApprovalNotification {
             if current.get() == generation {
                 shown.set(id);
             } else if id != 0 && id != shown.get() {
-                close(&connection, id);
+                withdraw(&connection, id);
             }
         });
     }
@@ -146,7 +146,7 @@ impl ApprovalNotification {
         self.bump();
         let id = self.shown.replace(0);
         if id != 0 {
-            close(connection, id);
+            withdraw(connection, id);
         }
     }
 
@@ -155,6 +155,55 @@ impl ApprovalNotification {
         self.generation.set(generation);
         generation
     }
+}
+
+fn withdrawal_parameters(id: u32) -> glib::Variant {
+    let mut hints = HashMap::<String, glib::Variant>::new();
+    hints.insert("urgency".into(), 0u8.to_variant());
+    hints.insert("desktop-entry".into(), super::APP_ID.to_variant());
+    (
+        "Toolport",
+        id,
+        "toolport",
+        "Approval handled",
+        "",
+        Vec::<String>::new(),
+        hints,
+        1000i32,
+    )
+        .to_variant()
+}
+
+fn withdraw(connection: &gio::DBusConnection, id: u32) {
+    // Omarchy ignores sender close for popup cards; a low-urgency replacement
+    // expires instead. Keep close for notification servers that honor it.
+    let connection = connection.clone();
+    glib::spawn_future_local(async move {
+        let reply = connection
+            .call_future(
+                Some(BUS_NAME),
+                OBJECT_PATH,
+                BUS_NAME,
+                "Notify",
+                Some(&withdrawal_parameters(id)),
+                Some(glib::VariantTy::new("(u)").expect("static variant type")),
+                gio::DBusCallFlags::NONE,
+                5000,
+            )
+            .await;
+        let close_id = match reply {
+            Ok(reply) => reply
+                .child_value(0)
+                .get::<u32>()
+                .filter(|id| *id != 0)
+                .unwrap_or(id),
+            Err(error) => {
+                eprintln!("toolport-gtk: could not replace the approval notification: {error}");
+                id
+            }
+        };
+        close(&connection, close_id);
+    });
 }
 
 fn close(connection: &gio::DBusConnection, id: u32) {
@@ -170,4 +219,35 @@ fn close(connection: &gio::DBusConnection, id: u32) {
         gio::Cancellable::NONE,
         |_| {},
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn withdrawal_replaces_the_pending_id_without_actions_or_critical_urgency() {
+        let parameters = withdrawal_parameters(42);
+        assert_eq!(parameters.type_().as_str(), "(susssasa{sv}i)");
+        assert_eq!(parameters.child_value(1).get::<u32>(), Some(42));
+        assert_eq!(
+            parameters.child_value(3).get::<String>().as_deref(),
+            Some("Approval handled")
+        );
+        assert!(parameters
+            .child_value(5)
+            .get::<Vec<String>>()
+            .unwrap()
+            .is_empty());
+        let hints = parameters
+            .child_value(6)
+            .get::<HashMap<String, glib::Variant>>()
+            .unwrap();
+        assert_eq!(hints["urgency"].get::<u8>(), Some(0));
+        assert_eq!(
+            hints["desktop-entry"].get::<String>().as_deref(),
+            Some(super::super::APP_ID)
+        );
+        assert_eq!(parameters.child_value(7).get::<i32>(), Some(1000));
+    }
 }
