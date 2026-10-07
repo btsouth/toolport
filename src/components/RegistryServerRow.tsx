@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { ChevronDown, Copy, KeyRound, LogIn, Pencil, Trash2, Users } from "lucide-react";
 import { isDownloadLauncher } from "@/lib/launcher";
 import { errorHeadline, shortenUrls } from "@/lib/errors";
@@ -12,7 +12,12 @@ import { LaunchSetupDialog } from "@/components/LaunchSetupDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ServerLogo } from "@/components/ServerLogo";
 
+const ServerToolsPanel = lazy(() =>
+  import("@/components/ServerToolsPanel").then((m) => ({ default: m.ServerToolsPanel })),
+);
+
 interface Props {
+  openTools?: boolean;
   server: ServerEntry;
   registry: Registry | null;
   enabled: boolean;
@@ -65,8 +70,16 @@ export function RegistryServerRow({
   onRemove,
   onRegistryChange,
   onReprobe,
+  openTools,
 }: Props) {
   const [expanded, setExpanded] = useState(false);
+  const [detailTab, setDetailTab] = useState<"overview" | "tools">("overview");
+  useEffect(() => {
+    if (openTools) {
+      setExpanded(true);
+      setDetailTab("tools");
+    }
+  }, [openTools]);
 
   const target =
     server.command !== null
@@ -218,120 +231,149 @@ export function RegistryServerRow({
 
       {expanded && (
         <div className="flex flex-col gap-2.5 px-3.5 pt-0.5 pb-3 pl-12">
-          {!!requiredLaunch.length && (
-            <p className="text-xs text-muted-foreground">
-              Launch setup: {requiredLaunch.map((input) => input.label).join(", ")}. Open
-              Launch setup to add or review these values before enabling.
-            </p>
-          )}
-          {target && (
-            <code className="block rounded-md bg-muted px-2 py-1.5 font-mono text-xs break-all text-muted-foreground">
-              {target}
-            </code>
-          )}
-          {status === "error" && health?.error && (
-            <div className="flex flex-col gap-1">
-              {/* Lead with a readable headline so the useful signal (exit status,
+          <div
+            role="tablist"
+            aria-label={`${server.name} details`}
+            className="flex gap-1 border-b pb-2"
+          >
+            {(["overview", "tools"] as const).map((tab) => (
+              <button
+                key={tab}
+                role="tab"
+                aria-selected={detailTab === tab}
+                className={ACTION}
+                onClick={() => setDetailTab(tab)}
+              >
+                {tab === "overview" ? "Overview" : "Tools"}
+              </button>
+            ))}
+          </div>
+          {detailTab === "tools" ? (
+            <Suspense fallback={<p>Loading tools…</p>}>
+              <ServerToolsPanel
+                serverId={server.id}
+                registry={registry}
+                onRegistryChange={onRegistryChange}
+              />
+            </Suspense>
+          ) : (
+            <>
+              {!!requiredLaunch.length && (
+                <p className="text-xs text-muted-foreground">
+                  Launch setup: {requiredLaunch.map((input) => input.label).join(", ")}.
+                  Open Launch setup to add or review these values before enabling.
+                </p>
+              )}
+              {target && (
+                <code className="block rounded-md bg-muted px-2 py-1.5 font-mono text-xs break-all text-muted-foreground">
+                  {target}
+                </code>
+              )}
+              {status === "error" && health?.error && (
+                <div className="flex flex-col gap-1">
+                  {/* Lead with a readable headline so the useful signal (exit status,
                   EADDRINUSE, a 401) isn't buried under a stack trace + a giant
                   OAuth URL; the full output stays below, bounded and scrollable
                   with long URLs shortened. */}
-              <div className="flex items-start justify-between gap-2">
-                <p className="text-xs font-medium text-warning">
-                  {errorHeadline(health.error)}
-                </p>
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void navigator.clipboard.writeText(health?.error ?? "");
-                    toast.success("Error copied");
-                  }}
-                  title="Copy the full error"
-                  className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                >
-                  <Copy className="size-3" />
-                  Copy
-                </button>
-              </div>
-              <p className="max-h-32 overflow-y-auto font-mono text-[11px] break-words whitespace-pre-wrap text-muted-foreground">
-                {shortenUrls(health.error)}
-              </p>
-            </div>
-          )}
-
-          <div className="flex flex-wrap items-center gap-1">
-            <SecretsDialog
-              server={server}
-              onSaved={onRegistryChange}
-              onChanged={onReprobe}
-              trigger={
-                <button className={ACTION}>
-                  <KeyRound className="size-3.5" />
-                  Secrets{secretCount > 0 ? ` (${secretCount})` : ""}
-                </button>
-              }
-            />
-
-            {!!server.launch?.inputs.length && (
-              <LaunchSetupDialog
-                server={server}
-                onSaved={onRegistryChange}
-                onChanged={onReprobe}
-                trigger={<button className={ACTION}>Launch setup</button>}
-              />
-            )}
-
-            {isTeam ? (
-              <span className="inline-flex items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground">
-                <Users className="size-3.5" aria-hidden="true" />
-                Managed by your team. Ask an admin to change or remove it.
-              </span>
-            ) : (
-              <>
-                <ServerDialog
-                  onSaved={onRegistryChange}
-                  initial={{ ...server, name: duplicateName }}
-                  existingNames={registry?.servers.map((s) => s.name) ?? []}
-                  trigger={
-                    <button className={ACTION} title="Add another account">
-                      <Copy className="size-3.5" />
-                      Duplicate
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="text-xs font-medium text-warning">
+                      {errorHeadline(health.error)}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void navigator.clipboard.writeText(health?.error ?? "");
+                        toast.success("Error copied");
+                      }}
+                      title="Copy the full error"
+                      className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    >
+                      <Copy className="size-3" />
+                      Copy
                     </button>
-                  }
-                />
+                  </div>
+                  <p className="max-h-32 overflow-y-auto font-mono text-[11px] break-words whitespace-pre-wrap text-muted-foreground">
+                    {shortenUrls(health.error)}
+                  </p>
+                </div>
+              )}
 
-                <ServerDialog
+              <div className="flex flex-wrap items-center gap-1">
+                <SecretsDialog
+                  server={server}
                   onSaved={onRegistryChange}
-                  editId={server.id}
-                  initial={server}
-                  existingNames={registry?.servers.map((s) => s.name) ?? []}
+                  onChanged={onReprobe}
                   trigger={
                     <button className={ACTION}>
-                      <Pencil className="size-3.5" />
-                      Edit
+                      <KeyRound className="size-3.5" />
+                      Secrets{secretCount > 0 ? ` (${secretCount})` : ""}
                     </button>
                   }
                 />
 
-                <ConfirmDialog
-                  trigger={
-                    <button
-                      disabled={busy}
-                      className={`${ACTION} hover:bg-destructive/10 hover:text-destructive`}
-                    >
-                      <Trash2 className="size-3.5" />
-                      Remove
-                    </button>
-                  }
-                  title={`Remove ${server.name}?`}
-                  description="This deletes the server from Toolport. Any saved secrets stay in your keychain."
-                  confirmLabel="Remove"
-                  destructive
-                  onConfirm={onRemove}
-                />
-              </>
-            )}
-          </div>
+                {!!server.launch?.inputs.length && (
+                  <LaunchSetupDialog
+                    server={server}
+                    onSaved={onRegistryChange}
+                    onChanged={onReprobe}
+                    trigger={<button className={ACTION}>Launch setup</button>}
+                  />
+                )}
+
+                {isTeam ? (
+                  <span className="inline-flex items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground">
+                    <Users className="size-3.5" aria-hidden="true" />
+                    Managed by your team. Ask an admin to change or remove it.
+                  </span>
+                ) : (
+                  <>
+                    <ServerDialog
+                      onSaved={onRegistryChange}
+                      initial={{ ...server, name: duplicateName }}
+                      existingNames={registry?.servers.map((s) => s.name) ?? []}
+                      trigger={
+                        <button className={ACTION} title="Add another account">
+                          <Copy className="size-3.5" />
+                          Duplicate
+                        </button>
+                      }
+                    />
+
+                    <ServerDialog
+                      onSaved={onRegistryChange}
+                      editId={server.id}
+                      initial={server}
+                      existingNames={registry?.servers.map((s) => s.name) ?? []}
+                      trigger={
+                        <button className={ACTION}>
+                          <Pencil className="size-3.5" />
+                          Edit
+                        </button>
+                      }
+                    />
+
+                    <ConfirmDialog
+                      trigger={
+                        <button
+                          disabled={busy}
+                          className={`${ACTION} hover:bg-destructive/10 hover:text-destructive`}
+                        >
+                          <Trash2 className="size-3.5" />
+                          Remove
+                        </button>
+                      }
+                      title={`Remove ${server.name}?`}
+                      description="This deletes the server from Toolport. Any saved secrets stay in your keychain."
+                      confirmLabel="Remove"
+                      destructive
+                      onConfirm={onRemove}
+                    />
+                  </>
+                )}
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>

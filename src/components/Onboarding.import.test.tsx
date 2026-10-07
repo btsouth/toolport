@@ -76,7 +76,7 @@ const props = {
   onRegistryChange: vi.fn(),
   onClientsRefresh: vi.fn(),
   onBrowseCatalog: vi.fn(),
-  onOpenPlayground: vi.fn(),
+  onOpenTools: vi.fn(),
   onFinish: vi.fn(),
 };
 

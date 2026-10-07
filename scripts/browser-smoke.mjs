@@ -54,6 +54,16 @@ try {
   await expect(page.getByText("GitHub", { exact: true })).toBeVisible();
   await expect(page.getByText("≈41.1k tokens saved")).toBeVisible();
   await page.screenshot({ path: path.join(output, "servers.png") });
+  await page.getByRole("button", { name: "Show GitHub details", exact: true }).click();
+  await page.getByRole("tab", { name: "Tools", exact: true }).click();
+  await expect(page.getByText("get_issue", { exact: true })).toBeVisible();
+  await expect(page.getByText("read-only", { exact: true })).toBeVisible();
+  await expect(page.getByText("destructive", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /^get_issue / }).click();
+  await page.getByLabel("number", { exact: false }).fill("42");
+  await page.getByRole("button", { name: "Call tool", exact: true }).click();
+  await expect(page.getByText(/Fixture result:/)).toBeVisible();
+  await page.screenshot({ path: path.join(output, "server-tools.png") });
   await page.getByRole("button", { name: "Activity", exact: true }).click();
   await expect(page.getByText("Protection active.", { exact: true })).toBeVisible();
   await expect(

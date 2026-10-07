@@ -36,7 +36,7 @@ describe("VerifyCall", () => {
         { ts: 100, server: "GitHub", tool: "old", ok: true },
       ]);
 
-    render(<VerifyCall client={client} onOpenPlayground={vi.fn()} pollMs={5} />);
+    render(<VerifyCall client={client} onOpenTools={vi.fn()} pollMs={5} />);
 
     await waitFor(() => expect(screen.getByText(/It works/)).toBeInTheDocument());
     // Names the tool + server that succeeded, without claiming Cursor sent it.
@@ -51,7 +51,7 @@ describe("VerifyCall", () => {
       .mockRejectedValueOnce(new Error("audit unavailable"))
       .mockResolvedValue([{ ts: 50, server: "GitHub", tool: "old", ok: true }]);
 
-    render(<VerifyCall client={client} onOpenPlayground={vi.fn()} pollMs={5} />);
+    render(<VerifyCall client={client} onOpenTools={vi.fn()} pollMs={5} />);
 
     await waitFor(() =>
       expect(screen.getByText(/Couldn't read the audit log/)).toBeInTheDocument(),
@@ -80,7 +80,7 @@ describe("VerifyCall", () => {
       ]);
     const user = userEvent.setup();
 
-    render(<VerifyCall client={client} onOpenPlayground={vi.fn()} pollMs={5} />);
+    render(<VerifyCall client={client} onOpenTools={vi.fn()} pollMs={5} />);
 
     await waitFor(() =>
       expect(screen.getByText(/Couldn't read the audit log/)).toBeInTheDocument(),
@@ -108,7 +108,7 @@ describe("VerifyCall", () => {
       ]);
 
     render(
-      <VerifyCall client={client} onOpenPlayground={vi.fn()} pollMs={5} timeoutMs={40} />,
+      <VerifyCall client={client} onOpenTools={vi.fn()} pollMs={5} timeoutMs={40} />,
     );
 
     await waitFor(() => expect(screen.getByText(/No call yet/)).toBeInTheDocument());
@@ -121,7 +121,7 @@ describe("VerifyCall", () => {
     getAuditLog.mockResolvedValue([{ ts: 100, server: "GitHub", tool: "old", ok: true }]);
 
     render(
-      <VerifyCall client={client} onOpenPlayground={vi.fn()} pollMs={5} timeoutMs={20} />,
+      <VerifyCall client={client} onOpenTools={vi.fn()} pollMs={5} timeoutMs={20} />,
     );
 
     await waitFor(() => expect(screen.getByText(/No call yet/)).toBeInTheDocument());
@@ -130,12 +130,12 @@ describe("VerifyCall", () => {
     expect(screen.queryByText(/It works/)).not.toBeInTheDocument();
   });
 
-  it("offers the Playground fallback while waiting", () => {
+  it("offers the server’s Tools tab fallback while waiting", () => {
     getAuditLog.mockResolvedValue([]);
-    const onOpenPlayground = vi.fn();
-    render(<VerifyCall client={client} onOpenPlayground={onOpenPlayground} pollMs={5} />);
-    const btn = screen.getByRole("button", { name: /Playground/ });
+    const onOpenTools = vi.fn();
+    render(<VerifyCall client={client} onOpenTools={onOpenTools} pollMs={5} />);
+    const btn = screen.getByRole("button", { name: /Tools tab/ });
     btn.click();
-    expect(onOpenPlayground).toHaveBeenCalledOnce();
+    expect(onOpenTools).toHaveBeenCalledOnce();
   });
 });

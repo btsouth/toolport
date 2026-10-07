@@ -1207,6 +1207,29 @@ impl Router {
         self.overrides = overrides;
     }
 
+    /// Preview one server's aliases using the same collision and override rules as dispatch.
+    pub fn server_tool_aliases(
+        server_id: &str,
+        tools: &[Value],
+        overrides: HashMap<String, HashMap<String, ToolOverride>>,
+    ) -> HashMap<String, String> {
+        let mut router = Self::new();
+        router.set_overrides(overrides);
+        router.index_server(server_id, tools, &[], &[], &[], false);
+        router
+            .routes
+            .into_iter()
+            .map(|(alias, (_, upstream))| (upstream, alias))
+            .collect()
+    }
+
+    /// Resolve a server-detail selection without guessing a sanitized alias.
+    pub fn exposed_tool_name(&self, server_id: &str, tool: &str) -> Option<&str> {
+        self.routes.iter().find_map(|(alias, (server, upstream))| {
+            (server == server_id && upstream == tool).then_some(alias.as_str())
+        })
+    }
+
     /// The real `(server id, original tool name)` an exposed name routes to, or `None` if
     /// unknown. Callers that need a call's provenance or server-scoping MUST use this rather
     /// than string-splitting the exposed name on `__` — that split silently mis-derives the
@@ -4587,6 +4610,44 @@ mod tests {
             router.expired_cache_kinds() & crate::downstream::change::TOOLS,
             0
         );
+    }
+
+    #[test]
+    fn server_detail_resolves_exact_upstream_names_and_overrides() {
+        let tools = vec![json!({"name":"get-item"}), json!({"name":"get_item"})];
+        let aliases = Router::server_tool_aliases("server-a", &tools, HashMap::new());
+        assert_eq!(aliases["get-item"], "server_a__get_item");
+        assert_eq!(aliases["get_item"], "server_a__get_item_2");
+        let overrides = HashMap::from([(
+            "server-a".to_string(),
+            HashMap::from([(
+                "get-item".to_string(),
+                ToolOverride {
+                    name: Some("renamed".to_string()),
+                    description: None,
+                },
+            )]),
+        )]);
+        let aliases = Router::server_tool_aliases("server-a", &tools, overrides);
+        assert_eq!(aliases["get-item"], "renamed");
+        let mut router = Router::new();
+        router
+            .routes
+            .insert("renamed".into(), ("server-a".into(), "get-item".into()));
+        router.routes.insert(
+            "server_a__get_item_2".into(),
+            ("server-a".into(), "get_item".into()),
+        );
+        assert_eq!(
+            router.exposed_tool_name("server-a", "get-item"),
+            Some("renamed")
+        );
+        assert_eq!(
+            router.exposed_tool_name("server-a", "get_item"),
+            Some("server_a__get_item_2")
+        );
+        assert_eq!(router.exposed_tool_name("server_a", "get-item"), None);
+        assert_eq!(router.exposed_tool_name("server-a", "missing"), None);
     }
 
     #[test]

@@ -1,8 +1,7 @@
 export type Transport = "stdio" | "http" | "sse" | "unknown";
 
 /** The main content views, selected from the sidebar. */
-export type View =
-  "servers" | "clients" | "activity" | "catalog" | "playground" | "teams" | "settings";
+export type View = "servers" | "clients" | "activity" | "catalog" | "teams" | "settings";
 
 export interface McpServer {
   name: string;
@@ -174,6 +173,8 @@ export interface ProbeResult {
 
 /** A tool as advertised by a downstream MCP server (raw `tools/list` entry). */
 export interface McpTool {
+  /** Retained quarantine state for the active profile, supplied by Toolport. */
+  toolportQuarantine?: "quarantined" | "clear" | "unknown";
   name: string;
   description?: string;
   inputSchema?: {
@@ -208,7 +209,7 @@ export interface McpPrompt {
   arguments?: Array<{ name: string; description?: string; required?: boolean }>;
 }
 
-/** The subset of JSON Schema the playground form renders per argument. */
+/** The subset of JSON Schema the tool arguments form renders per argument. */
 export interface JsonSchemaProp {
   type?: string | string[];
   description?: string;

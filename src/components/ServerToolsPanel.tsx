@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   Check,
   CheckCircle2,
@@ -237,7 +237,7 @@ interface FieldProps {
 /** One argument input, shaped by the property's JSON-schema type. */
 function ArgField({ name, schema, required, value, onChange }: FieldProps) {
   const t = primaryType(schema);
-  const id = `arg-${name}`;
+  const id = useId();
   const enumVals = schema.enum;
 
   let control;
@@ -605,16 +605,22 @@ function PromptsPanel({ serverId }: { serverId: string }) {
   );
 }
 
-interface PlaygroundProps {
+interface ServerToolsProps {
+  serverId: string;
   registry: Registry | null;
   onRegistryChange: (registry: Registry) => void;
 }
 
-export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) {
+export function ServerToolsPanel({
+  serverId,
+  registry,
+  onRegistryChange,
+}: ServerToolsProps) {
   const servers = registry?.servers ?? [];
   const denyDestructive = registry?.denyDestructive ?? false;
+  const activeProfileId = registry?.activeProfileId;
+  const overrideVersion = JSON.stringify(registry?.toolOverrides?.[serverId] ?? {});
 
-  const [serverId, setServerId] = useState<string | null>(null);
   const [tab, setTab] = useState<"tools" | "resources" | "prompts">("tools");
   const [policyBusy, setPolicyBusy] = useState(false);
   const [tools, setTools] = useState<McpTool[] | null>(null);
@@ -684,7 +690,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
     return () => {
       alive = false;
     };
-  }, [serverId]);
+  }, [serverId, activeProfileId, overrideVersion]);
 
   const tool = useMemo(
     () => tools?.find((t) => t.name === selectedTool) ?? null,
@@ -841,14 +847,13 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
 
   // Stop waiting on an in-flight call: invalidate its id so the eventual result is
   // dropped, and reset the UI. A Tauri invoke can't be aborted, so this is NOT an
-  // abort — the downstream tool keeps executing and its side effects still happen.
-  // The copy must say so; Playground skips approval gates, so implying a destructive
-  // call was stopped would be a false all-clear.
+  // abort: the downstream tool keeps executing and its side effects still happen.
+  // Stopping the wait does not cancel a pending approval or downstream call.
   function cancelCall() {
     callSeq.current++;
     if (tickerRef.current) clearInterval(tickerRef.current);
     setCalling(false);
-    setCallError("Stopped waiting — the call may still be running on the server.");
+    setCallError("Stopped waiting: the call may still be running on the server.");
   }
 
   if (servers.length === 0) {
@@ -868,25 +873,9 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
 
   return (
     <div className="flex max-w-3xl flex-col gap-5">
-      {/* Server picker */}
-      <div className="flex w-64 flex-col gap-1.5">
-        <Label className="text-xs text-muted-foreground">Server</Label>
-        <Select value={serverId ?? ""} onValueChange={setServerId}>
-          <SelectTrigger className="h-9">
-            <SelectValue placeholder="Pick a server…" />
-          </SelectTrigger>
-          <SelectContent>
-            {servers.map((s) => (
-              <SelectItem key={s.id} value={s.id}>
-                {s.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <p className="text-[11px] text-muted-foreground">
-          Tests any server directly, regardless of the active profile.
-        </p>
-      </div>
+      <p className="text-xs text-muted-foreground">
+        Calls follow the active profile and gateway policy, including approval gates.
+      </p>
 
       {serverId && (
         <div className="flex w-fit gap-1 rounded-lg border bg-muted/30 p-1 text-sm">
@@ -960,7 +949,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
               {!isExposed(tool) && (
                 <p className="flex items-center gap-1.5 text-xs text-warning">
                   <ShieldAlert className="size-3.5" />
-                  Hidden from clients by policy. You can still test it here.
+                  Hidden from clients by policy. The gateway will refuse blocked calls.
                 </p>
               )}
 
@@ -1130,6 +1119,19 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
                             )}
                             <span className="truncate font-mono text-sm">{t.name}</span>
                             {destructive && <Badge variant="warning">destructive</Badge>}
+                            {t.annotations?.readOnlyHint === true && (
+                              <Badge variant="secondary">read-only</Badge>
+                            )}
+                            <span className="text-xs text-muted-foreground">
+                              {perToolOff ? "Disabled" : "Enabled"}
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                              {t.toolportQuarantine === "quarantined"
+                                ? "Quarantined"
+                                : t.toolportQuarantine === "clear"
+                                  ? "Not quarantined"
+                                  : "Quarantine unknown"}
+                            </span>
                             {!exposed && (
                               <span className="text-xs text-muted-foreground">
                                 hidden

@@ -1,4 +1,4 @@
-//! Shell-neutral MCP playground operations.
+//! Shell-neutral server capability and tool runner operations.
 
 use crate::registry::ServerEntry;
 
@@ -18,7 +18,60 @@ fn server(server_id: &str) -> Result<ServerEntry, String> {
 }
 
 pub fn list_tools(server_id: &str) -> Result<Vec<serde_json::Value>, String> {
-    crate::server_runtime::connect_server(&server(server_id)?).map(|downstream| downstream.tools)
+    let mut tools = crate::server_runtime::connect_server(&server(server_id)?)?.tools;
+    annotate_quarantine(server_id, &mut tools)?;
+    Ok(tools)
+}
+
+// Quarantine is keyed by the exposed alias, not by the raw downstream name.
+// Reuse the router's allocator so renamed tools and same-server collisions match.
+fn annotate_quarantine(server_id: &str, tools: &mut [serde_json::Value]) -> Result<(), String> {
+    let registry = crate::registry::load()?;
+    let prefix = crate::router::sanitize_segment(server_id);
+    let ambiguous_prefix = registry.servers.iter().any(|server| {
+        server.id != server_id && crate::router::sanitize_segment(&server.id) == prefix
+    });
+    let aliases = crate::router::Router::server_tool_aliases(
+        server_id,
+        tools,
+        registry.tool_overrides.clone(),
+    );
+    let quarantined = crate::integrity::quarantined_checked(Some(&registry.active_profile_id()));
+    for tool in tools {
+        let alias = tool
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|name| aliases.get(name));
+        // Another server may have reserved a renamed alias. Without its live catalog
+        // the state is unknown, never an invented clean bill of health.
+        let ambiguous_alias = alias.is_some_and(|alias| {
+            registry.servers.iter().any(|server| {
+                server.id != server_id
+                    && alias.starts_with(&format!(
+                        "{}__",
+                        crate::router::sanitize_segment(&server.id)
+                    ))
+            }) || registry.tool_overrides.iter().any(|(id, overrides)| {
+                id != server_id
+                    && overrides.values().any(|value| {
+                        value
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| crate::router::sanitize_segment(name) == *alias)
+                    })
+            })
+        });
+        tool["toolportQuarantine"] = serde_json::json!(match (&quarantined, alias) {
+            (Ok(names), Some(alias)) if !ambiguous_prefix && !ambiguous_alias =>
+                if names.contains(alias) {
+                    "quarantined"
+                } else {
+                    "clear"
+                },
+            _ => "unknown",
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -31,6 +84,7 @@ pub struct Capabilities {
 pub fn capabilities(server_id: &str) -> Result<Capabilities, String> {
     let mut downstream = crate::server_runtime::connect_server(&server(server_id)?)?;
     downstream.load_resources_prompts();
+    annotate_quarantine(server_id, &mut downstream.tools)?;
     Ok(Capabilities {
         tools: downstream.tools,
         resources: downstream.resources,
@@ -43,25 +97,39 @@ pub fn call_tool(
     tool: &str,
     arguments: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let server = server(server_id)?;
-    let mut downstream = crate::server_runtime::connect_server(&server)?;
-    let started = std::time::Instant::now();
-    let result = downstream
-        .call(tool, arguments)
-        .map_err(|error| error.to_string());
-    let duration_ms = started.elapsed().as_millis() as u64;
-    let ok = result
-        .as_ref()
-        .map(|result| {
-            !result
-                .get("isError")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
-    let error = result.as_ref().err().map(String::as_str);
-    crate::audit::record_timed(&server.id, tool, ok, Some(duration_ms), error, None);
-    result
+    // Use the same gateway dispatch as clients, including profile scope, quarantine,
+    // human approval and result inspection. Never call the downstream directly.
+    let gateway = crate::clients::resolve_gateway_path_readonly()
+        .ok_or("Could not locate the toolport-gateway binary")?;
+    let registry = crate::registry::load()?;
+    let env = vec![
+        (
+            "TOOLPORT_DATA_DIR".to_string(),
+            crate::registry::conduit_dir()
+                .ok_or("Toolport data directory unavailable")?
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        ("TOOLPORT_PROFILE".to_string(), registry.active_profile_id()),
+    ];
+    let transport = crate::downstream::StdioTransport::spawn(
+        &gateway.to_string_lossy(),
+        &[],
+        &env,
+        None,
+        false,
+    )?;
+    let mut gateway =
+        crate::downstream::DownstreamServer::connect("tools-tab".to_string(), Box::new(transport))?;
+    gateway
+        .call(
+            "toolport_call_tool",
+            serde_json::json!({
+                "_toolportTarget": {"serverId": server_id, "tool": tool},
+                "arguments": arguments
+            }),
+        )
+        .map_err(|error| error.to_string())
 }
 
 pub fn list_resources(server_id: &str) -> Result<Vec<serde_json::Value>, String> {

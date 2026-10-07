@@ -56,7 +56,7 @@ Object.assign(window, { toolportFixture: { calls, missing } });
 localStorage.setItem("toolport.onboarded", "1");
 
 mockIPC(
-  (command) => {
+  (command, payload) => {
     calls[command] = (calls[command] ?? 0) + 1;
     switch (command) {
       case "get_registry":
@@ -101,6 +101,35 @@ mockIPC(
         return auditRows;
       case "audit_stats":
         return { total: 200, errors: 0, errorRate: 0, servers: [] };
+      case "list_server_tools":
+        return [
+          {
+            name: "get_issue",
+            toolportQuarantine: "clear",
+            description: "Read an issue by number.",
+            annotations: { readOnlyHint: true },
+            inputSchema: {
+              type: "object",
+              required: ["number"],
+              properties: { number: { type: "integer", description: "Issue number" } },
+            },
+          },
+          {
+            name: "delete_issue",
+            toolportQuarantine: "clear",
+            description: "Delete an issue permanently.",
+            annotations: { destructiveHint: true },
+            inputSchema: { type: "object", properties: {} },
+          },
+        ];
+      case "list_server_resources":
+      case "list_server_prompts":
+        return [];
+      case "call_tool":
+        return {
+          content: [{ type: "text", text: `Fixture result: ${JSON.stringify(payload)}` }],
+          isError: false,
+        };
       case "list_quarantined":
       case "list_pending_approvals":
       case "get_security_events":

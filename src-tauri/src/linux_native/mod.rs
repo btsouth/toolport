@@ -10,19 +10,19 @@ mod http_bridge;
 mod notify;
 mod onboarding;
 mod pairing;
-mod playground;
 mod settings;
 mod state;
 mod teams;
 mod theme;
+mod tools;
 mod tray;
 
 use adw::prelude::*;
 use catalog::CatalogPage;
 use gtk::glib::prelude::ToValue;
-use playground::PlaygroundPage;
 use settings::SettingsPage;
 use teams::TeamsPage;
+use tools::ServerToolsPanel;
 
 /// The desktop identity. The GTK shell replaces the Tauri one on Linux rather
 /// than sitting beside it (they share `~/.config/Toolport` and only one can hold
@@ -301,7 +301,6 @@ fn build_window(
     let client_page = ClientPage::new(app);
     let activity_page = ActivityPage::new(app);
     let catalog_page = CatalogPage::new(server_page.clone());
-    let playground_page = PlaygroundPage::new(app);
     let teams_page = TeamsPage::new(app);
     let settings_page = SettingsPage::new(bridge, broker);
     let stack = gtk::Stack::builder()
@@ -314,7 +313,6 @@ fn build_window(
     stack.add_named(&client_page.root, Some("clients"));
     stack.add_named(&activity_page.root, Some("activity"));
     stack.add_named(&catalog_page.root, Some("catalog"));
-    stack.add_named(&playground_page.root, Some("playground"));
     stack.add_named(&teams_page.root, Some("teams"));
     stack.add_named(&settings_page.root, Some("settings"));
     let (sidebar, quarantine_badge, team_button) = build_sidebar(
@@ -325,7 +323,6 @@ fn build_window(
         client_page.clone(),
         activity_page.clone(),
         catalog_page.clone(),
-        playground_page.clone(),
         teams_page.clone(),
         settings_page.clone(),
         paired,
@@ -653,7 +650,7 @@ fn run_registry_startup_failure(app: &adw::Application, args: &[String], error: 
 }
 
 /// The 2.0 top-level navigation, in sidebar order. Team joins only on a paired
-/// install (see [`is_sidebar_row`]). Catalog and Playground leave the sidebar
+/// install (see [`is_sidebar_row`]). Catalog leaves the sidebar
 /// here; their pages and `show-*` actions stay so onboarding, the tray and
 /// pairing can still reach them until a later PR removes or relocates them.
 const NAV_SECTIONS: &[(&str, &str, &str)] = &[
@@ -663,7 +660,6 @@ const NAV_SECTIONS: &[(&str, &str, &str)] = &[
     ("settings", "Settings", "emblem-system-symbolic"),
     ("teams", "Team", "system-users-symbolic"),
     ("catalog", "Catalog", "system-software-install-symbolic"),
-    ("playground", "Playground", "applications-science-symbolic"),
 ];
 
 /// Number-key order for the fixed sidebar rows. Team is click-only, matching the
@@ -675,7 +671,7 @@ const NAV_SHORTCUTS: &[&str] = &["servers", "clients", "activity", "settings"];
 fn is_sidebar_row(target: &str, paired: bool) -> bool {
     match target {
         "teams" => paired,
-        "catalog" | "playground" => false,
+        "catalog" => false,
         _ => true,
     }
 }
@@ -688,7 +684,6 @@ fn build_sidebar(
     client_page: ClientPage,
     activity_page: ActivityPage,
     catalog_page: CatalogPage,
-    playground_page: PlaygroundPage,
     teams_page: TeamsPage,
     settings_page: SettingsPage,
     paired: bool,
@@ -724,6 +719,40 @@ fn build_sidebar(
         .css_classes(["toolport-badge", "review"])
         .build();
 
+    let tools_action = gtk::gio::SimpleAction::new("show-server-tools", None);
+    let page_for_tools = server_page.clone();
+    tools_action.connect_activate(move |_, _| {
+        let page = page_for_tools.clone();
+        gtk::glib::spawn_future_local(async move {
+            // Onboarding may have just added the first server. Read the current
+            // registry rather than the Servers page's pre-onboarding snapshot.
+            let result = gtk::gio::spawn_blocking(|| {
+                crate::registry::load().map(state::RegistrySnapshot::from_registry)
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => {
+                    let server = snapshot
+                        .servers
+                        .iter()
+                        .find(|server| server.enabled)
+                        .or_else(|| snapshot.servers.first())
+                        .cloned();
+                    page.render(state::RegistryState::Ready(snapshot));
+                    if let Some(server) = server {
+                        open_server_details(&server, &page, true);
+                    } else {
+                        page.show_confirmation("Add a server to try its tools.");
+                    }
+                }
+                Ok(Err(error)) => page.restore_after_error(&error),
+                Err(_) => {
+                    page.restore_after_error("Could not load server tools: the operation stopped")
+                }
+            }
+        });
+    });
+    app.add_action(&tools_action);
     let mut buttons = Vec::new();
     let mut team_button = None;
     for &(target, label, icon) in NAV_SECTIONS {
@@ -749,7 +778,7 @@ fn build_sidebar(
             button.add_css_class("selected");
         }
         // Hidden pages keep their button, page and action so `show-catalog`,
-        // `show-playground` and `show-teams` still resolve from onboarding,
+        // `show-teams` still resolve from onboarding,
         // pairing and the tray; only the sidebar row is dropped.
         if is_sidebar_row(target, paired) {
             nav.append(&button);
@@ -772,7 +801,6 @@ fn build_sidebar(
         let server_page = server_page.clone();
         let activity_page = activity_page.clone();
         let catalog_page = catalog_page.clone();
-        let playground_page = playground_page.clone();
         let teams_page = teams_page.clone();
         let settings_page = settings_page.clone();
         button.connect_clicked(move |_| {
@@ -785,7 +813,6 @@ fn build_sidebar(
                 &client_page,
                 &activity_page,
                 &catalog_page,
-                &playground_page,
                 &teams_page,
                 &settings_page,
             );
@@ -808,7 +835,6 @@ fn build_sidebar(
         let server_page = server_page.clone();
         let activity_page = activity_page.clone();
         let catalog_page = catalog_page.clone();
-        let playground_page = playground_page.clone();
         let teams_page = teams_page.clone();
         let settings_page = settings_page.clone();
         action.connect_activate(move |_, _| {
@@ -821,7 +847,6 @@ fn build_sidebar(
                 &client_page,
                 &activity_page,
                 &catalog_page,
-                &playground_page,
                 &teams_page,
                 &settings_page,
             );
@@ -1366,7 +1391,6 @@ fn show_native_page(
     client_page: &ClientPage,
     activity_page: &ActivityPage,
     catalog_page: &CatalogPage,
-    playground_page: &PlaygroundPage,
     teams_page: &TeamsPage,
     settings_page: &SettingsPage,
 ) {
@@ -1387,8 +1411,6 @@ fn show_native_page(
         activity_page.refresh();
     } else if target == "catalog" {
         catalog_page.refresh();
-    } else if target == "playground" {
-        playground_page.refresh();
     } else if target == "teams" {
         teams_page.refresh();
     } else if target == "settings" {
@@ -6858,6 +6880,55 @@ fn server_health_rank(
     }
 }
 
+fn open_server_details(server: &state::ServerView, page: &ServerPage, show_tools: bool) {
+    let window = adw::Window::builder()
+        .application(&page.app)
+        .title(&server.name)
+        .default_width(1000)
+        .default_height(760)
+        .modal(true)
+        .build();
+    window.set_transient_for(page.app.active_window().as_ref());
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&gtk::Label::new(Some(&server.name))));
+    root.append(&header);
+    let stack = gtk::Stack::new();
+    stack.set_vexpand(true);
+    let overview = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    overview.set_margin_top(20);
+    overview.set_margin_start(20);
+    overview.set_margin_end(20);
+    for text in [&server.name, &server.origin_label, &server.transport] {
+        overview.append(
+            &gtk::Label::builder()
+                .label(text)
+                .xalign(0.0)
+                .wrap(true)
+                .build(),
+        );
+    }
+    let tools = ServerToolsPanel::new(&page.app, &server.id);
+    stack.add_titled(&overview, Some("overview"), "Overview");
+    stack.add_titled(&tools.root, Some("tools"), "Tools");
+    let switcher = gtk::StackSwitcher::new();
+    switcher.set_stack(Some(&stack));
+    switcher.set_halign(gtk::Align::Center);
+    root.append(&switcher);
+    root.append(&stack);
+    let tools_for_tab = tools.clone();
+    stack.connect_visible_child_name_notify(move |stack| {
+        if stack.visible_child_name().as_deref() == Some("tools") {
+            tools_for_tab.refresh();
+        }
+    });
+    if show_tools {
+        stack.set_visible_child_name("tools");
+    }
+    window.set_content(Some(&root));
+    window.present();
+}
+
 fn server_card(
     server: &state::ServerView,
     profile_id: &str,
@@ -6874,18 +6945,26 @@ fn server_card(
 
     let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
     text.set_hexpand(true);
+    let details = gtk::Button::builder()
+        .label(&server.name)
+        .halign(gtk::Align::Start)
+        .css_classes(["flat", "heading"])
+        .tooltip_text("Open server details")
+        .build();
+    let server_for_details = server.clone();
+    let page_for_details = page.clone();
+    details.connect_clicked(move |_| {
+        open_server_details(&server_for_details, &page_for_details, false)
+    });
+    text.append(&details);
     text.append(
         &gtk::Label::builder()
-            .label(&server.name)
+            .label(&server.origin_label)
             .halign(gtk::Align::Start)
             .ellipsize(gtk::pango::EllipsizeMode::End)
-            .tooltip_text(&server.name)
-            .css_classes(["heading"])
+            .css_classes(["toolport-muted"])
             .build(),
     );
-    text.append(&gtk::Label::builder().label(&server.origin_label)
-        .halign(gtk::Align::Start).ellipsize(gtk::pango::EllipsizeMode::End)
-        .css_classes(["toolport-muted"]).build());
     // Transport and health share one line: a card per server is already the
     // densest thing on the page, and a third stacked line made each row read as
     // a paragraph.
@@ -7059,6 +7138,12 @@ fn server_card(
         test_server_connection(&server_for_test, button, page_for_test.clone());
     });
     actions.append(&test);
+
+    let tools = action_menu_button("Server details and tools", "applications-science-symbolic");
+    let server_for_tools = server.clone();
+    let page_for_tools = page.clone();
+    tools.connect_clicked(move |_| open_server_details(&server_for_tools, &page_for_tools, true));
+    actions.append(&tools);
 
     let scope = action_menu_button("Profile tool scope", "view-list-symbolic");
     let server_for_scope = server.clone();
@@ -9246,7 +9331,7 @@ fn state_card(icon_name: &str, title: &str, body: &str, error: bool) -> gtk::Box
 #[cfg(test)]
 mod tests {
     /// The 2.0 sidebar is the four fixed views in order, with Team appended only
-    /// on a paired install. Catalog and Playground are no longer rows even though
+    /// on a paired install. Catalog is no longer a row even though
     /// their pages and actions stay reachable.
     #[test]
     fn sidebar_rows_are_the_four_views_plus_team_only_when_paired() {
