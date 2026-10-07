@@ -294,11 +294,7 @@ interface Props {
 }
 
 type SettingKey =
-  | "autostart"
-  | "lazy-discovery"
-  | "code-mode"
-  | "pii-redaction"
-  | "live-inspect";
+  "autostart" | "lazy-discovery" | "code-mode" | "pii-redaction" | "live-inspect";
 
 type RegistrySettingKey = Exclude<SettingKey, "autostart">;
 
