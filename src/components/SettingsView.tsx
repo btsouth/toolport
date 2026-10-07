@@ -746,6 +746,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   const allowAgentControl = registry?.allowAgentControl ?? false;
   const piiRedaction = registry?.piiRedaction ?? false;
   const liveInspect = registry?.liveInspect ?? false;
+  const [safetyBusy, setSafetyBusy] = useState(false);
   const [busySettings, setBusySettings] = useState<ReadonlySet<SettingKey>>(
     () => new Set(),
   );
@@ -1235,6 +1236,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           Safety
           <select
             aria-label="Safety"
+            disabled={safetyBusy}
             value={
               registry?.safetyLevel ??
               (registry?.denyDestructive ||
@@ -1246,6 +1248,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   : "off")
             }
             onChange={async (event) => {
+              setSafetyBusy(true);
               try {
                 const updated = await setSafetyLevel(
                   event.target.value as "off" | "ask" | "strict",
@@ -1258,7 +1261,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                 onRegistryChange(reconciled);
               } catch (error) {
                 toastError(`Couldn't update safety: ${error}`);
-              }
+              } finally { setSafetyBusy(false); }
             }}
           >
             <option value="off">Off</option>
