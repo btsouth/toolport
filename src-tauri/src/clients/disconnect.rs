@@ -97,3 +97,29 @@ fn run(
         .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn bulk_disconnect_continues_after_one_client_fails_and_dry_run_writes_nothing() {
+        let targets = vec![
+            ("first".into(), "/first".into()),
+            ("broken".into(), "/broken".into()),
+            ("last".into(), "/last".into()),
+        ];
+        let mut called = Vec::new();
+        let results = run(targets.clone(), false, |id| {
+            called.push(id.to_string());
+            if id == "broken" {
+                Err("read-only config".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(called, ["first", "broken", "last"]);
+        assert!(results[0].error.is_none());
+        assert_eq!(results[1].error.as_deref(), Some("read-only config"));
+        assert!(results[2].error.is_none());
+        run(targets, true, |_| panic!("dry run must not mutate"));
+    }
+}

@@ -3162,6 +3162,17 @@ mod tests {
         assert!(!fixture.move_record("claude-code").exists());
     }
 
+    #[test]
+    fn registry_failure_during_disconnect_retains_exact_restore_for_retry() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let original = r#"{ "mcpServers": {"native":{"command":"native"}}, "setting": 7 }"#;
+        std::fs::write(fixture.claude(), original).unwrap();
+        migrate_client("claude-code", None, false).unwrap();
+        disconnect_client_stdio_with("claude-code", false, |_| Err("registry full".into())).unwrap_err();
+        let result = disconnect_client("claude-code").unwrap();
+        assert_eq!(std::fs::read_to_string(&result.outcome.path).unwrap(), original);
+    }
+
     /// UX-03 for Codex: the moved TOML tables come back (nested env table too) into
     /// the profile-scoped client, and an entry the user re-added since is kept.
     #[test]

@@ -18397,6 +18397,14 @@ mod tests {
     /// verbs, and a cached entry carries the namespaced `server__tool` form, so
     /// judging it whole lets the prefix decide for every tool on that server.
     #[test]
+    fn disconnect_all_is_a_standalone_role_and_dry_run_cannot_start_gateway() {
+        assert_eq!(parse_args(&["--disconnect-all".into()]), ArgAction::DisconnectAll { dry_run: false });
+        assert_eq!(parse_args(&["--disconnect-all".into(), "--dry-run".into()]), ArgAction::DisconnectAll { dry_run: true });
+        assert!(matches!(parse_args(&["--dry-run".into()]), ArgAction::Unknown(_)));
+        assert!(matches!(parse_args(&["--disconnect-all".into(), "--daemon".into()]), ArgAction::Unknown(_)));
+    }
+
+    #[test]
     fn a_server_named_after_a_write_verb_keeps_its_read_only_tools() {
         let cached = vec![
             serde_json::json!({"name": "create_hub__list_items", "description": "read only"}),

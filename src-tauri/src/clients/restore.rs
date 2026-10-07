@@ -564,3 +564,310 @@ pub(super) fn recorded_paths() -> Vec<(String, PathBuf, Result<Format, String>)>
     paths
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn entry() -> ServerEntry {
+        serde_json::from_value(serde_json::json!({"id":"toolport","name":"toolport","transport":"stdio","command":"/fixture/toolport-gateway"})).unwrap()
+    }
+    fn fixtures() -> Vec<(Format, &'static str)> {
+        vec![
+            (Format::JsonMcpServers, r#"{ "setting" : 7, "mcpServers" : {"native":{"command":"native","args":[]},"toolport":{"command":"custom","args":["--custom"]}} }"#),
+            (Format::JsonCopilotMcpServers, r#"{"mcpServers":{"native":{"command":"native","tools":["*"]}}}"#),
+            (Format::JsonDroidMcpServers, r#"{"mcpServers":{"native":{"command":"native","type":"stdio"}}}"#),
+            (Format::JsonQwenMcpServers, r#"{"mcpServers":{"native":{"httpUrl":"https://example.test","headers":{"Authorization":"fixture"}}}}"#),
+            (Format::JsonKimiMcpServers, r#"{"mcpServers":{"native":{"command":"native"}}}"#),
+            (Format::JsonAmpMcpServers, r#"{"amp.mcpServers":{"native":{"command":"native"}},"theme":"dark"}"#),
+            (Format::JsonZCodeMcp, r#"{"mcp":{"servers":{"native":{"command":"native"}}},"theme":"dark"}"#),
+            (Format::JsonServers, "{ // user's comment\r\n \"servers\": {\"native\":{\"command\":\"native\",},},\r\n \"theme\": \"dark\",\r\n}"),
+            (Format::JsonMcp, r#"{"mcp":{"native":{"command":"native","type":"stdio"}},"theme":"dark"}"#),
+            (Format::JsonOpenCodeMcp, "{ // comment\n \"mcp\": {\"native\":{\"type\":\"local\",\"command\":[\"native\"],\"enabled\":true,},},\n}"),
+            (Format::JsonContextServers, "{ // comment\n \"context_servers\": {\"native\":{\"command\":{\"path\":\"native\",\"args\":[]},},},\n}"),
+            (Format::TomlMcpServers, "# annotation\r\ntheme = 'dark'\r\n[mcp_servers.native]\r\ncommand = 'native' # keep\r\nargs = [ ]"),
+            (Format::YamlExtensions, "# annotation\r\ntheme: dark\r\nextensions:\r\n  native:\r\n    enabled: true\r\n    type: stdio\r\n    cmd: native\r\n    args: []"),
+            (Format::YamlMcpServers, "# annotation\r\ntheme: dark\r\nmcp_servers:\r\n  native:\r\n    command: native\r\n    args: []"),
+            (Format::YamlMcpServersList, "# annotation\r\nname: Example\r\nversion: 1.0.0\r\nschema: v1\r\nmcpServers:\r\n  - name: native\r\n    command: native\r\n    args: []"),
+        ]
+    }
+    fn disconnect(id: &str, path: &Path, format: Format) -> Result<(), String> {
+        mutation::run(id, path, format, || {
+            assert!(apply(id, format, path)?);
+            moved::restore(id, format, path)?;
+            Ok(())
+        })?;
+        let revision = if path.exists() {
+            Some(crate::registry::sha256_hex(&read_config_file(path)?))
+        } else {
+            None
+        };
+        finish(id, path, revision.as_deref())
+    }
+    #[test]
+    fn every_writer_import_connect_move_disconnect_restores_exact_bytes() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-exact-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        for (index, (format, original)) in fixtures().into_iter().enumerate() {
+            for (ending, original) in [
+                original.to_string(),
+                format!("{}\n", original.replace("\r\n", "\n")),
+                format!(
+                    "{}\r\n",
+                    original.replace("\r\n", "\n").replace('\n', "\r\n")
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for moved in [false, true] {
+                    let id = "vscode".to_string();
+                    let path = dir.join(format!("config-{index}-{ending}-{moved}"));
+                    std::fs::write(&path, &original).unwrap();
+                    // Import's read-only inventory must leave original bytes intact.
+                    mutation::value(format, Some(&read_config_file(&path).unwrap())).unwrap();
+                    assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+                    mutation::run(&id, &path, format, || {
+                        edit_format(format, &path, Some(&entry()), true)
+                    })
+                    .unwrap();
+                    if moved {
+                        mutation::run(&id, &path, format, || {
+                            moved::record(&id, format, &path)?;
+                            write_format(format, &path, &[entry()], true)
+                        })
+                        .unwrap();
+                    }
+                    disconnect(&id, &path, format).unwrap();
+                    assert_eq!(
+                        std::fs::read(&path).unwrap(),
+                        original.as_bytes(),
+                        "format {index}, moved={moved}"
+                    );
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn absent_file_and_parent_are_restored_for_json_toml_and_yaml() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-absent-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        for (index, (format, _)) in fixtures().into_iter().enumerate() {
+            for missing_parent in [false, true] {
+                let id = format!("fixture-{index}-{missing_parent}");
+                let parent = dir
+                    .join(format!("parent-{index}-{missing_parent}"))
+                    .join("client")
+                    .join("cli");
+                if !missing_parent {
+                    std::fs::create_dir_all(&parent).unwrap();
+                }
+                let path = parent.join("config");
+                mutation::run(&id, &path, format, || {
+                    edit_format(format, &path, Some(&entry()), true)
+                })
+                .unwrap();
+                disconnect(&id, &path, format).unwrap();
+                assert!(!path.exists());
+                assert_eq!(parent.exists(), !missing_parent);
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn native_disconnect_edit_survives_and_moved_entries_return() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-undo-race-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("config.json");
+        let original = r#"{"session":1,"mcpServers":{"native":{"command":"native","env":{"TOKEN":"fixture"}}}}"#;
+        std::fs::write(&path, original).unwrap();
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            moved::record("fixture", Format::JsonMcpServers, &path)?;
+            write_format(Format::JsonMcpServers, &path, &[entry()], true)
+        })
+        .unwrap();
+        mutation::BEFORE_COMMIT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|path| {
+                let mut root = parse_json_value(&std::fs::read_to_string(path).unwrap()).unwrap();
+                root["session"] = serde_json::json!(2);
+                root["mcpServers"]["new"] = serde_json::json!({"command":"new"});
+                std::fs::write(path, serde_json::to_string(&root).unwrap()).unwrap();
+            }))
+        });
+        disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
+        let root = parse_json_value(&read_config_file(&path).unwrap()).unwrap();
+        assert_eq!(root["session"], 2);
+        assert_eq!(root["mcpServers"]["native"]["env"]["TOKEN"], "fixture");
+        assert_eq!(root["mcpServers"]["new"]["command"], "new");
+        assert!(root["mcpServers"].get("toolport").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn native_overlapping_disconnect_edit_is_a_conflict_without_overwrite() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-disconnect-conflict-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            edit_format(Format::JsonMcpServers, &path, Some(&entry()), true)
+        })
+        .unwrap();
+        let native = r#"{"mcpServers":{"toolport":{"command":"custom"}}}"#;
+        mutation::BEFORE_COMMIT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                std::fs::write(path, native).unwrap();
+            }))
+        });
+        assert!(disconnect("fixture", &path, Format::JsonMcpServers)
+            .unwrap_err()
+            .contains("conflict"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), native);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn changed_config_preserves_custom_gateway_and_readded_moved_entry() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-custom-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"mcpServers":{"native":{"command":"old"},"toolport":{"command":"original-custom"}}}"#).unwrap();
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            write_format(Format::JsonMcpServers, &path, &[entry()], true)
+        })
+        .unwrap();
+        let native = r#"{"theme":"new","mcpServers":{"native":{"command":"new"},"toolport":{"command":"user-custom"}}}"#;
+        std::fs::write(&path, native).unwrap();
+        disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
+        assert_eq!(
+            parse_json_value(&read_config_file(&path).unwrap()).unwrap(),
+            parse_json_value(native).unwrap()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn edit_before_repoint_survives_disconnect_even_when_last_write_matches() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-repoint-edit-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"session":1,"mcpServers":{}}"#).unwrap();
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            edit_format(Format::JsonMcpServers, &path, Some(&entry()), true)
+        })
+        .unwrap();
+        let mut native = parse_json_value(&read_config_file(&path).unwrap()).unwrap();
+        native["session"] = serde_json::json!(2);
+        std::fs::write(&path, serde_json::to_string(&native).unwrap()).unwrap();
+        let mut repointed = entry();
+        repointed.command = Some("/fixture/toolport-gateway-2".into());
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            edit_format(Format::JsonMcpServers, &path, Some(&repointed), true)
+        })
+        .unwrap();
+        disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
+        let restored = parse_json_value(&read_config_file(&path).unwrap()).unwrap();
+        assert_eq!(restored["session"], 2);
+        assert!(restored["mcpServers"].get("toolport").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_preview_move_record_restores_after_first_two_point_zero_repoint() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-legacy-restore-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"native":{"command":"native","env":{"TOKEN":"fixture"}}}}"#,
+        )
+        .unwrap();
+        // This is the pre-snapshot 1.x/preview record shape, with no version field.
+        moved::record("fixture", Format::JsonMcpServers, &path).unwrap();
+        write_format(Format::JsonMcpServers, &path, &[entry()], true).unwrap();
+        let mut repointed = entry();
+        repointed.command = Some("/fixture/toolport-gateway-2".into());
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            edit_format(Format::JsonMcpServers, &path, Some(&repointed), true)
+        })
+        .unwrap();
+        disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
+        let restored = parse_json_value(&read_config_file(&path).unwrap()).unwrap();
+        assert_eq!(restored["mcpServers"]["native"]["env"]["TOKEN"], "fixture");
+        assert!(restored["mcpServers"].get("toolport").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn edited_comments_inside_unrelated_server_nodes_survive_disconnect() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-comment-edits-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        for (index, format) in [Format::JsonServers, Format::YamlMcpServers]
+            .into_iter()
+            .enumerate()
+        {
+            let path = dir.join(format!("config-{index}"));
+            let original = if index == 0 {
+                "{\n \"servers\": {\n  \"native\": {\"command\": \"native\"}\n }\n}"
+            } else {
+                "mcp_servers:\n  native:\n    command: native\n"
+            };
+            std::fs::write(&path, original).unwrap();
+            mutation::run("vscode", &path, format, || {
+                edit_format(format, &path, Some(&entry()), true)
+            })
+            .unwrap();
+            let edited = read_config_file(&path)
+                .unwrap()
+                .replace("native\"", "native\" /* newly annotated */")
+                .replace("command: native", "command: native # newly annotated");
+            std::fs::write(&path, edited).unwrap();
+            disconnect("vscode", &path, format).unwrap();
+            assert!(read_config_file(&path).unwrap().contains("newly annotated"));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
