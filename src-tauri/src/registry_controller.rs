@@ -1581,11 +1581,7 @@ pub fn set_client_credentials(
     scope: Option<&str>,
 ) -> Result<Registry, String> {
     let _mutation = acquire_auth_lock(server_id)?;
-    if crate::local_auth::owner(server_id)? != server_id {
-        return Err(
-            "Edit the personal original to change the shared local sign-in configuration.".into(),
-        );
-    }
+    if crate::local_auth::owner(server_id)? != server_id { return Err("Edit the personal original to change the shared local sign-in configuration.".into()); }
     let client_id = client_id.trim().to_string();
     if client_id.is_empty() {
         return Err("a client id is required for client-credentials auth".into());
@@ -1643,11 +1639,7 @@ pub fn set_client_credentials(
 
 pub fn clear_client_credentials(server_id: &str) -> Result<Registry, String> {
     let _mutation = acquire_auth_lock(server_id)?;
-    if crate::local_auth::owner(server_id)? != server_id {
-        return Err(
-            "Edit the personal original to change the shared local sign-in configuration.".into(),
-        );
-    }
+    if crate::local_auth::owner(server_id)? != server_id { return Err("Edit the personal original to change the shared local sign-in configuration.".into()); }
     crate::remote::reset_client_credentials(server_id)?;
     let (registry, ()) = registry::update(|registry| {
         let Some(server) = registry
@@ -1943,9 +1935,7 @@ pub fn apply_server_enabled(
     enabled: bool,
     reviewed: bool,
 ) -> Result<(), String> {
-    if reviewed {
-        crate::local_auth::detach_changed(registry, server_id)?;
-    }
+    if reviewed { crate::local_auth::detach_changed(registry, server_id)?; }
     if enabled {
         if let Some(server) = registry
             .servers

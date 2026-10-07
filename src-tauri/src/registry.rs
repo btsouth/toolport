@@ -1093,6 +1093,10 @@ pub enum SafetyLevel {
     Strict,
 }
 
+impl Default for SafetyLevel {
+    fn default() -> Self { Self::Ask }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Registry {
