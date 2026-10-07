@@ -2996,23 +2996,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         return build(config_path, true, Vec::new(), None);
     }
 
-    let parsed = match def.format {
-        Format::JsonMcpServers => parse_json(&content, "mcpServers"),
-        Format::JsonCopilotMcpServers => parse_json(&content, "mcpServers"),
-        Format::JsonDroidMcpServers => parse_json(&content, "mcpServers"),
-        Format::JsonAmpMcpServers => parse_json(&content, "amp.mcpServers"),
-        Format::JsonQwenMcpServers => parse_qwen_json(&content),
-        Format::JsonKimiMcpServers => parse_json(&content, "mcpServers"),
-        Format::JsonZCodeMcp => zcode::parse(&content),
-        Format::JsonServers => parse_json(&content, "servers"),
-        Format::JsonMcp => parse_json(&content, "mcp"),
-        Format::JsonOpenCodeMcp => parse_opencode_json(&content),
-        Format::JsonContextServers => parse_json(&content, "context_servers"),
-        Format::TomlMcpServers => parse_toml(&content),
-        Format::YamlExtensions => parse_yaml_extensions(&content),
-        Format::YamlMcpServers => parse_hermes_yaml_servers(&content),
-        Format::YamlMcpServersList => parse_continue_yaml_servers(&content),
-    };
+    let parsed = parse_client_content(def.format, &content);
 
     match parsed {
         Ok(servers) => build(config_path, true, servers, None),
@@ -3046,6 +3030,27 @@ pub(crate) fn validate_client_import(
 /// Whether a detected gateway slot matches the ownership record we last wrote.
 /// Auth headers / bearer args are stripped before compare so shared-HTTP entries
 /// still match without storing tokens on the registry (SOU-406/407).
+fn parse_client_content(format: Format, content: &str) -> Result<Vec<McpServer>, String> {
+    match format {
+        Format::JsonMcpServers => parse_json(content, "mcpServers"),
+        Format::JsonCopilotMcpServers => parse_json(content, "mcpServers"),
+        Format::JsonDroidMcpServers => parse_json(content, "mcpServers"),
+        Format::JsonAmpMcpServers => parse_json(content, "amp.mcpServers"),
+        Format::JsonQwenMcpServers => parse_qwen_json(content),
+        Format::JsonKimiMcpServers => parse_json(content, "mcpServers"),
+        Format::JsonZCodeMcp => zcode::parse(content),
+        Format::JsonServers => parse_json(content, "servers"),
+        Format::JsonMcp => parse_json(content, "mcp"),
+        Format::JsonOpenCodeMcp => parse_opencode_json(content),
+        Format::JsonContextServers => parse_json(content, "context_servers"),
+        Format::TomlMcpServers => parse_toml(content),
+        Format::YamlExtensions => parse_yaml_extensions(content),
+        Format::YamlMcpServers => parse_hermes_yaml_servers(content),
+        Format::YamlMcpServersList => parse_continue_yaml_servers(content),
+    }
+
+}
+
 fn managed_matches_detected(server: &McpServer, rec: &ManagedEntry) -> bool {
     let cmd = server.command.as_deref().unwrap_or("");
     // A command that differs only by *which of our gateway binaries* it names is

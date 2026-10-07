@@ -18,6 +18,7 @@ struct Snapshot {
     last_written_hash: Option<String>,
     created_parents: Vec<PathBuf>,
     exact_eligible: bool,
+    preexisting_gateways: Vec<String>,
 }
 
 pub(super) fn record_path(client_id: &str, path: &Path) -> Result<PathBuf, String> {
@@ -102,6 +103,7 @@ pub(super) fn remember(
                 created_parents.push(dir.into());
                 parent = dir.parent();
             }
+            let preexisting_gateways = original_gateways(client_id, format, before)?;
             Snapshot {
                 version: 1,
                 format,
@@ -114,7 +116,8 @@ pub(super) fn remember(
                 last_written: None,
                 last_written_hash: None,
                 created_parents,
-                exact_eligible: gateway_names(format, &mutation::value(format, before)?).is_empty(),
+                exact_eligible: preexisting_gateways.is_empty(),
+                preexisting_gateways,
             }
         }
     };
@@ -202,6 +205,12 @@ fn undo(
             let written = written.and_then(Value::as_object).unwrap_or(&empty);
             let keys: std::collections::BTreeSet<_> = before.keys().chain(written.keys()).collect();
             for key in keys {
+                if depth + 1 == entry_depth
+                    && !current.contains_key(key)
+                    && current.keys().any(|name| name.eq_ignore_ascii_case(key))
+                {
+                    continue;
+                }
                 match undo(
                     before.get(key),
                     written.get(key),
@@ -233,6 +242,26 @@ fn key(format: Format) -> &'static str {
         Format::YamlExtensions => "extensions",
         _ => "mcpServers",
     }
+}
+
+fn original_gateways(
+    client_id: &str,
+    format: Format,
+    text: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut names = gateway_names(format, &mutation::value(format, text)?);
+    let registry = crate::registry_controller::registry_for_disconnect()?;
+    if let (Some(record), Some(text)) = (registry.client_managed_entries.get(client_id), text) {
+        for server in parse_client_content(format, text)? {
+            if detected_is_gateway(&server)
+                && managed_matches_detected(&server, record)
+                && !names.contains(&server.name)
+            {
+                names.push(server.name);
+            }
+        }
+    }
+    Ok(names)
 }
 
 fn gateway_names(format: Format, root: &Value) -> Vec<String> {
@@ -303,7 +332,21 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
     // A preview/1.x install can already have our gateway at first capture.
     // Its real pre-install bytes are unknown, so remove that owned entry and
     // restore the legacy moved record rather than resurrecting a dead gateway.
-    let owned = gateway_names(format, &before);
+    let mut owned = gateway_names(format, &before);
+    let original = mutation::value(format, record.original.as_deref())?;
+    for name in &record.preexisting_gateways {
+        let key = key(format);
+        let entry = |root: &Value| {
+            let mut servers = root.get(key)?;
+            if matches!(format, Format::JsonZCodeMcp) {
+                servers = servers.get("servers")?;
+            }
+            servers.get(name).cloned()
+        };
+        if entry(&before) == entry(&original) && !owned.contains(name) {
+            owned.push(name.clone());
+        }
+    }
     let key = key(format);
     if matches!(format, Format::YamlMcpServersList) {
         if let Some(list) = before.get_mut(key).and_then(Value::as_array_mut) {
