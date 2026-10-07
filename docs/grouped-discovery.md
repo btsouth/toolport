@@ -111,17 +111,22 @@ session would break it; grouped mode works everywhere today.
 
 ## Tokenizer cost
 
-On the shared Linux x64 devbox, the release gateway grew from 30,099,080 to
-31,966,656 bytes (+1,867,576 bytes, 6.2%). A release probe initialized the bundled
-cl100k_base vocabulary in 38.2 ms on the telemetry worker; a preserved 150,558-byte
-catalog capture took 6.1 ms to count. This is the trimmed audit capture, not a
-reconstruction of the audit's full 166,913-byte response. All 15 preserved compact
-catalog captures matched Python tiktoken with the same bundled vocabulary offline.
+On the shared Linux x64 devbox, matching release builds on the supervisor base
+grew from 30,285,720 to 32,199,600 bytes (+1,913,880 bytes, 6.3%). A release probe
+initialized the bundled cl100k_base vocabulary in 38.2 ms on the telemetry worker;
+a preserved 150,558-byte catalog capture took 6.1 ms to count. This is the trimmed
+audit capture, not a reconstruction of the audit's full 166,913-byte response.
+All 15 preserved compact catalog captures matched Python tiktoken with the same
+bundled vocabulary offline.
 
-Five paired 200-iteration gateway latency runs had median tools/list latency
-0.708 ms before and after, search 0.893 to 0.867 ms, and routed calls 0.690 to
-0.638 ms. Median cold catalog-ready time was 639 to 359 ms; the shared machine's
-load makes that startup difference noisy, not evidence of a tokenizer speedup.
-The 10,000-row debug audit benchmark's cached aggregation median was 0.759 to
-0.599 ms (uncached: 58.6 to 54.6 ms). The binary growth is acceptable for an offline
-measurement, and there was no observed request-latency regression.
+Five paired 200-iteration gateway runs had median tools/list latency 0.284 to
+0.271 ms, search 0.344 to 0.374 ms, and routed calls 0.243 to 0.241 ms. All paired
+warm p95 values remained below 0.5 ms. Median handshake time was 52.3 to 52.4 ms;
+cold catalog-ready time was 347 to 311 ms. Shared-machine load makes startup
+differences noisy, not evidence of a tokenizer speedup. Both variants prime cold
+discovery with tools/list, as the supervisor requires.
+
+The 10,000-row debug audit benchmark's cached aggregation median was 0.460 to
+0.527 ms (uncached: 52.1 to 55.5 ms; record enqueue: 5.472 to 5.482 microseconds).
+The binary growth is acceptable for offline measurements, with vocabulary
+initialization and counting deferred to the telemetry worker.
