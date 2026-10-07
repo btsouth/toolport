@@ -5434,7 +5434,7 @@ impl Drop for HttpAuthGuard<'_> {
 struct HttpConcurrency {
     closed: AtomicBool,
     workers: AtomicUsize,
-    pending: Mutex<HashMap<String, (RequestContext, Instant, PendingHttpMrtr)>>,
+    pending: Mutex<HashMap<String, (Instant, PendingHttpMrtr)>>,
 }
 
 struct HttpCallTransport {
@@ -5527,12 +5527,13 @@ impl ConcurrentTransport for HttpCallTransport {
         owned.deadline = Some(deadline);
         let mut retired = Vec::new();
         let mut continuation_error = None;
+        let mut suspended_since = None;
         {
             let mut pending = shared
                 .pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending.retain(|_, (_, since, request)| {
+            pending.retain(|_, (since, request)| {
                 if since.elapsed() < SUSPENDED_LEGACY_MRTR_TTL {
                     return true;
                 }
@@ -5547,26 +5548,15 @@ impl ConcurrentTransport for HttpCallTransport {
                 });
                 false
             });
-            if let Some(token) = params
-                .get("requestState")
-                .and_then(Value::as_str)
-                .filter(|_| !owned.is_modern())
-            {
-                if let Some((owner, _, _)) = pending.get(token) {
-                    if owner.client() != context.client() {
-                        continuation_error = Some(TransportError::Rpc(
-                            json!({"code":-32602,"message":"requestState belongs to another client"}),
-                        ));
-                    }
-                }
-                if continuation_error.is_none() {
-                    if let Some((_, _, request)) = pending.remove(token) {
-                        owned.pending_mrtr = Some(request);
-                    } else {
-                        continuation_error = Some(TransportError::Rpc(
-                            json!({"code":-32602,"message":"unknown or expired requestState; start the call again"}),
-                        ));
-                    }
+            if let Some(token) = params.get("requestState").and_then(Value::as_str) {
+                // Like stdio, the random requestState plus method/base params is
+                // continuation proof. A sessionless retry has a new context nonce.
+                if let Some((since, request)) = pending.remove(token) {
+                    suspended_since = Some(since);
+                    owned.pending_mrtr = Some(request);
+                } else if !owned.is_modern() {
+                    continuation_error = Some(TransportError::Rpc(json!({"code":-32602,
+                        "message":"unknown or expired requestState; start the call again"})));
                 }
             }
         }
@@ -5710,7 +5700,7 @@ impl ConcurrentTransport for HttpCallTransport {
                         }
                         pending.insert(
                             request.common.token.clone(),
-                            (context, Instant::now(), request),
+                            (suspended_since.unwrap_or_else(Instant::now), request),
                         );
                     }
                     return outcome.result;
@@ -7251,7 +7241,7 @@ impl Drop for HttpTransport {
                 let mut shell = self.request_shell();
                 std::thread::spawn(move || {
                     let deadline = Instant::now() + HTTP_CANCEL_FORWARD_TIMEOUT;
-                    for (_, (_, _, pending)) in pending {
+                    for (_, (_, pending)) in pending {
                         if Instant::now() >= deadline {
                             break;
                         }
@@ -10744,6 +10734,49 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("desktop broker"));
+    }
+
+    #[test]
+    fn http_mrtr_retry_keeps_the_original_suspension_deadline() {
+        let transport = HttpTransport::new("http://127.0.0.1:9/");
+        let common = super::PendingLegacyMrtr::new(
+            json!({"jsonrpc":"2.0","id":"roots","method":"roots/list","params":{}}),
+            json!(1),
+            "echo",
+            &json!({}),
+        )
+        .unwrap();
+        let token = common.token.clone();
+        let since = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        transport.concurrency.pending.lock().unwrap().insert(
+            token.clone(),
+            (
+                since,
+                super::PendingHttpMrtr {
+                    common,
+                    reader: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+                    bytes_read: 0,
+                },
+            ),
+        );
+        let handle = transport.concurrent().unwrap();
+        let result = handle
+            .request_with_cancel("echo", json!({"requestState":token}), None)
+            .unwrap();
+        assert_eq!(result["resultType"], "input_required");
+        assert_eq!(
+            transport
+                .concurrency
+                .pending
+                .lock()
+                .unwrap()
+                .get(&token)
+                .unwrap()
+                .0,
+            since
+        );
+        // This in-memory fixture has no open server request to retire over HTTP.
+        transport.concurrency.pending.lock().unwrap().clear();
     }
 
     #[test]

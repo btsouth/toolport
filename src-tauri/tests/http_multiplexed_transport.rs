@@ -341,10 +341,10 @@ fn background_http_sse_requests_are_refused_without_discovery_deadlock() {
 }
 
 #[test]
-fn http_sse_continuations_keep_their_owner_and_resume_the_same_post() {
+fn http_sse_continuations_validate_the_call_and_allow_a_new_request_nonce() {
     use conduit_lib::downstream::ServerRequestAction;
     install_owner();
-    set_owner("client-a");
+    set_owner("client-a|#1");
     let (url, wire) = sse_fixture(1);
     let mut transport = HttpTransport::new(&url);
     transport.set_server_request_handler(Arc::new(|_| Some(ServerRequestAction::InputRequired)));
@@ -361,11 +361,13 @@ fn http_sse_continuations_keep_their_owner_and_resume_the_same_post() {
         .unwrap();
     let retry = json!({"owner":"client-a","requestState":incomplete["requestState"],"inputResponses":{key:{"roots":[]}}});
     set_owner("client-b");
+    let mut different_call = retry.clone();
+    different_call["owner"] = json!("client-b");
     assert!(handle
-        .request_with_cancel("echo", retry.clone(), None)
+        .request_with_cancel("echo", different_call, None)
         .is_err());
     assert_eq!(handle.suspended_calls(), 1);
-    set_owner("client-a");
+    set_owner("client-a|#2");
     assert!(handle.request_with_cancel("echo", retry, None).is_ok());
     assert_eq!(handle.suspended_calls(), 0);
     assert_eq!(wire.join().unwrap().len(), 1);
