@@ -272,6 +272,7 @@ fn append_line_at(
         keep_lines,
         after_snapshot,
     )
+    .map_err(|error| error.message)
 }
 
 /// Append a batch of already-serialized JSONL `lines` under ONE acquisition of the
@@ -283,7 +284,7 @@ pub(crate) fn append_lines_at(
     lines: &[String],
     max_bytes: u64,
     keep_lines: usize,
-) -> Result<(), String> {
+) -> Result<(), crate::telemetry::AppendError> {
     // Deferred texts exist only in the bounded in-memory queue, never on disk.
     let lines: Vec<String> = lines.iter().map(|line| tokenize_line(line)).collect();
     append_lines_at_with_hook(path, &lines, max_bytes, keep_lines, None)
@@ -342,7 +343,7 @@ fn append_lines_at_with_hook(
     max_bytes: u64,
     keep_lines: usize,
     after_snapshot: Option<&mut dyn FnMut()>,
-) -> Result<(), String> {
+) -> Result<(), crate::telemetry::AppendError> {
     let _lock = crate::registry::lock_at(path)?;
     let mut file = crate::registry::open_append_private(path).map_err(|e| e.to_string())?;
     let mut bytes = String::new();
@@ -354,10 +355,14 @@ fn append_lines_at_with_hook(
     }
     file.write_all(bytes.as_bytes())
         .map_err(|e| e.to_string())?;
-    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    let size = file
+        .metadata()
+        .map_err(|e| crate::telemetry::AppendError::after_append(e.to_string()))?
+        .len();
     drop(file);
     if size > max_bytes {
-        rotate_if_large(path, keep_lines, after_snapshot)?;
+        rotate_if_large(path, keep_lines, after_snapshot)
+            .map_err(crate::telemetry::AppendError::after_append)?;
     }
     Ok(())
 }

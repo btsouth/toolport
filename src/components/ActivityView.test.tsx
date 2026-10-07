@@ -628,6 +628,28 @@ describe("ActivityView live inspector", () => {
 });
 
 describe("telemetry health", () => {
+  it("keeps persisted drop evidence visible after the gateway exits", async () => {
+    getAuditLog.mockResolvedValue([]);
+    getAuditStats.mockResolvedValue({
+      total: 0,
+      errors: 0,
+      errorRate: 0,
+      servers: [],
+      telemetry: {
+        queueDropped: 0,
+        writeFailedRecords: 0,
+        writeFailures: 0,
+        incompleteFlushes: 0,
+        retainedDropped: 7,
+      },
+    });
+    render(<ActivityView refreshKey={0} registry={null} />);
+    expect(
+      await screen.findByText(
+        /7 dropped telemetry records are recorded in retained history/,
+      ),
+    ).toBeInTheDocument();
+  });
   it("shows dropped records and partial persistence even with no calls", async () => {
     getAuditLog.mockResolvedValue([]);
     getAuditStats.mockResolvedValue({

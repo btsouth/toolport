@@ -19,11 +19,14 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 static ROLE: AtomicU8 = AtomicU8::new(0);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Adapter,
     Daemon,
     Private,
+    HttpProxy,
+    LegacyHttp,
+    LegacyTty,
 }
 
 pub fn set_role(role: Role) {
@@ -32,6 +35,9 @@ pub fn set_role(role: Role) {
             Role::Adapter => 1,
             Role::Daemon => 2,
             Role::Private => 0,
+            Role::HttpProxy => 3,
+            Role::LegacyHttp => 4,
+            Role::LegacyTty => 5,
         },
         Ordering::Relaxed,
     );
@@ -65,20 +71,23 @@ pub fn append(msg: &str) {
 }
 
 pub(crate) fn queue_at(path: &Path, msg: &str) {
+    crate::telemetry::record(path, &line(msg), crate::telemetry::Rotation::Gateway);
+}
+
+pub(crate) fn line(msg: &str) -> String {
     let role = match ROLE.load(Ordering::Relaxed) {
         1 => "adapter",
         2 => "daemon",
+        3 => "http-proxy",
+        4 => "legacy-http",
+        5 => "legacy-tty",
         _ => "private",
     };
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
-    crate::telemetry::record(
-        path,
-        &format_line(msg, millis, std::process::id(), role),
-        crate::telemetry::Rotation::Gateway,
-    );
+    format_line(msg, millis, std::process::id(), role)
 }
 
 /// How long an append waits for the shared log lock before writing without it.
@@ -118,22 +127,31 @@ pub(crate) fn append_to(path: &Path, msg: &str) {
     let _ = append_batch_to(path, &[msg.to_string()]);
 }
 
-pub(crate) fn append_batch_to(path: &Path, lines: &[String]) -> Result<(), String> {
+pub(crate) fn append_batch_to(
+    path: &Path,
+    lines: &[String],
+) -> Result<(), crate::telemetry::AppendError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     match crate::registry::lock_at_for(path, lock_wait()) {
         Ok(_lock) => {
-            for line in lines {
-                append_line(path, line)?;
+            for (index, line) in lines.iter().enumerate() {
+                append_line(path, line).map_err(|message| crate::telemetry::AppendError {
+                    message,
+                    unconfirmed: Some(lines.len() - index),
+                })?;
             }
-            try_trim_log_if_large(path)
+            try_trim_log_if_large(path).map_err(crate::telemetry::AppendError::after_append)
         }
         // A contended diagnostic lock defers only rotation. No caller waits here:
         // this runs on the telemetry writer, with each whole line in one append.
         Err(_) => {
-            for line in lines {
-                append_line(path, line)?;
+            for (index, line) in lines.iter().enumerate() {
+                append_line(path, line).map_err(|message| crate::telemetry::AppendError {
+                    message,
+                    unconfirmed: Some(lines.len() - index),
+                })?;
             }
             Ok(())
         }
@@ -188,7 +206,14 @@ mod tests {
 
     #[test]
     fn log_line_has_timestamp_pid_role_and_redacts_credentials() {
-        for role in ["adapter", "daemon", "private"] {
+        for role in [
+            "adapter",
+            "daemon",
+            "private",
+            "http-proxy",
+            "legacy-http",
+            "legacy-tty",
+        ] {
             let line = format_line("connect https://alice:password@example.com api_key=sk-live-secretvalue1234567890\nforged", 1234, 42, role);
             assert!(line.starts_with(&format!("1970-01-01T00:00:01.234Z pid=42 role={role} ")));
             assert!(!line.contains("password"));

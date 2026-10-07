@@ -152,12 +152,11 @@ fn finish_stdio_adapter(
     private: Option<std::process::Child>,
 ) -> ! {
     let result = proxy_stdio(rendezvous, descriptor, private);
-    crate::telemetry::shutdown();
     match result {
-        Ok(()) => std::process::exit(0),
+        Ok(()) => crate::telemetry::exit_with(0),
         Err(error) => {
             eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: {error}");
-            std::process::exit(1);
+            crate::telemetry::exit_with(1);
         }
     }
 }
@@ -173,7 +172,7 @@ pub fn run_stdio_adapter() -> ! {
                     &dir,
                     CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string()),
                 ),
-                None => std::process::exit(1),
+                None => crate::telemetry::exit_with(1),
             };
             match start_private_gateway(&error.detail) {
                 Ok((child, descriptor)) => {
@@ -184,13 +183,13 @@ pub fn run_stdio_adapter() -> ! {
                         "toolport-gateway {STDIO_ADAPTER_FLAG}: {}; {detail}",
                         error.detail
                     );
-                    std::process::exit(1);
+                    crate::telemetry::exit_with(1);
                 }
             }
         }
         Err(error) => {
             eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: {}", error.detail);
-            std::process::exit(1);
+            crate::telemetry::exit_with(1);
         }
     }
 }
@@ -235,7 +234,7 @@ pub fn run_selected_stdio_adapter() {
                  refusing an in-process fallback",
                 error.detail
             );
-            std::process::exit(1);
+            crate::telemetry::exit_with(1);
         }
     }
 }

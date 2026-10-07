@@ -255,6 +255,7 @@ export interface TelemetryHealth {
   writeFailures: number;
   incompleteFlushes: number;
   unavailable?: boolean;
+  retainedDropped?: number;
 }
 
 export interface AuditStats {

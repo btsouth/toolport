@@ -20,6 +20,19 @@ pub const HTTP_AUTH_KEY: &str = "__http_auth__";
 /// `clientId` / scopes / auth method live there.
 pub const CLIENT_SECRET_KEY: &str = "__oauth_client_secret__";
 
+#[cfg(any(target_os = "macos", test))]
+fn keychain_gateway_path(
+    result: Result<Option<std::path::PathBuf>, String>,
+) -> Option<std::path::PathBuf> {
+    match result {
+        Ok(path) => path,
+        Err(_) => {
+            crate::gatewaylog::append("gateway publication failed; keychain ACL is app-only");
+            None
+        }
+    }
+}
+
 fn account(server_id: &str, key: &str) -> String {
     format!("{server_id}::{key}")
 }
@@ -223,7 +236,7 @@ mod platform {
         let app_path = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut trusted_apps: Vec<CFType> = Vec::with_capacity(2);
         trusted_apps.push(trusted_app(&app_path)?);
-        match crate::clients::resolve_gateway_path()? {
+        match super::keychain_gateway_path(crate::clients::resolve_gateway_path()) {
             Some(gw_path) => match trusted_app(&gw_path) {
                 Ok(t) => trusted_apps.push(t),
                 Err(e) => eprintln!("toolport: gateway not added to keychain ACL ({e}); app-only"),
@@ -1525,6 +1538,32 @@ fn create_dpk_migration_marker() -> bool {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn keychain_publication_failure_keeps_app_only_acl() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir =
+            std::env::temp_dir().join(format!("toolport-acl-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&dir);
+
+        assert_eq!(
+            super::keychain_gateway_path(Err("manifest failed".into())),
+            None
+        );
+        let path = std::path::PathBuf::from("gateway");
+        assert_eq!(
+            super::keychain_gateway_path(Ok(Some(path.clone()))),
+            Some(path)
+        );
+        assert!(crate::telemetry::flush_for_test(
+            std::time::Duration::from_secs(5)
+        ));
+        assert!(std::fs::read_to_string(dir.join("gateway.log"))
+            .unwrap()
+            .contains("publication failed"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use super::*;
     use std::sync::Mutex;
 

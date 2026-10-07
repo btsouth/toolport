@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 /// Trim the log once it passes this size, so it can't grow without bound.
-const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
 /// Cap on a stored error message. Enough to show why a call failed, bounded so a
 /// pathological error string can't bloat the log line.
 const MAX_AUDIT_ERR_CHARS: usize = 600;
 /// How many of the most recent lines to keep when trimming. Comfortably more than
 /// any dashboard window, so the trim is invisible to the stats/log views.
-const KEEP_LINES: usize = 5000;
+pub(crate) const KEEP_LINES: usize = 5000;
 
 pub fn audit_path() -> Option<PathBuf> {
     // Same anchor as the registry, so the app and a client-spawned gateway (which
@@ -486,7 +486,8 @@ pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
     Ok(content
         .lines()
         .rev()
-        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|row| row["kind"] != "telemetry_gap")
         .take(limit)
         .collect())
 }
@@ -525,7 +526,8 @@ pub fn read_all() -> std::io::Result<Vec<Value>> {
     Ok(content
         .lines()
         .rev()
-        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|row| row["kind"] != "telemetry_gap")
         .collect())
 }
 
@@ -541,7 +543,9 @@ pub fn read_all() -> std::io::Result<Vec<Value>> {
 pub fn tool_call_ok(entry: &Value) -> Option<bool> {
     let ok = entry.get("ok").and_then(Value::as_bool)?;
     match entry.get("kind").and_then(Value::as_str) {
-        Some("approval" | "routine" | "advisor" | "suggestion" | "candidate") => None,
+        Some("approval" | "routine" | "advisor" | "suggestion" | "candidate" | "telemetry_gap") => {
+            None
+        }
         _ => Some(ok),
     }
 }
@@ -570,6 +574,7 @@ pub fn stats() -> std::io::Result<Value> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(content);
     stats["telemetry"] = crate::telemetry::activity_health();
+    stats["telemetry"]["retainedDropped"] = stats["retainedDropped"].clone();
     stats["gatewayNotes"] = serde_json::json!(crate::daemon::status_notes());
     Ok(stats)
 }
@@ -645,9 +650,14 @@ fn aggregate_rows<T: std::borrow::Borrow<Value>>(entries: impl IntoIterator<Item
     let mut by_server: HashMap<String, Agg> = HashMap::new();
     let mut total = 0u64;
     let mut errors = 0u64;
+    let mut dropped = 0u64;
 
     for row in entries {
         let e = row.borrow();
+        if e["kind"] == "telemetry_gap" {
+            dropped = dropped.saturating_add(e["dropped"].as_u64().unwrap_or(0));
+            continue;
+        }
         let Some(ok) = tool_call_ok(e) else {
             continue;
         };
@@ -728,6 +738,7 @@ fn aggregate_rows<T: std::borrow::Borrow<Value>>(entries: impl IntoIterator<Item
 
     json!({
         "total": total,
+        "retainedDropped": dropped,
         "errors": errors,
         "errorRate": if total > 0 { errors as f64 / total as f64 } else { 0.0 },
         "servers": servers,
@@ -797,6 +808,33 @@ fn csv_cell(value: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn retained_telemetry_gaps_warn_after_daemon_exit_without_fake_calls() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("toolport-gap-history-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        std::fs::write(
+            audit_path().unwrap(),
+            concat!(
+                "{\"server\":\"fixture\",\"tool\":\"read\",\"ok\":true}\n",
+                "{\"kind\":\"telemetry_gap\",\"dropped\":3,\"since\":42,\"ts\":45}\n"
+            ),
+        )
+        .unwrap();
+        let stats = stats().unwrap();
+        assert_eq!(stats["total"], 1);
+        assert_eq!(stats["telemetry"]["retainedDropped"], 3);
+        assert!(crate::telemetry::activity_notices(&stats["telemetry"])
+            .iter()
+            .any(|note| note.contains("3 dropped telemetry records")));
+        assert_eq!(read_recent(1).unwrap().len(), 1);
+        assert_eq!(read_recent(1).unwrap()[0]["tool"], "read");
+        assert_eq!(read_all().unwrap().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use super::*;
 
     fn oversized_audit_content() -> String {
@@ -1038,7 +1076,7 @@ mod tests {
         ));
         let path = root.join("nested").join("audit.jsonl");
         write_line_at(&path, &json!({"server":"fixture","ok":true}));
-        crate::telemetry::flush();
+        crate::telemetry::flush_for_test(std::time::Duration::from_secs(5));
         let content = std::fs::read_to_string(&path).expect("audit line");
         assert!(content.ends_with('\n'));
         assert_eq!(content.lines().count(), 1);

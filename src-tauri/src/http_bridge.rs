@@ -97,7 +97,7 @@ pub fn start_with_token_at(
             "Port {port} is already in use. Stop whatever is using it, then try again."
         ));
     }
-    let bin = crate::clients::resolve_gateway_path()?
+    let bin = crate::clients::resolve_gateway_path_for_launch()?
         .ok_or_else(|| "toolport-gateway binary not found next to the app".to_string())?;
     let token = match token {
         Some(token) => token,

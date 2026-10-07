@@ -832,6 +832,11 @@ export function TelemetryNotice({ stats }: { stats: AuditStats | null }) {
       `Activity, savings, Teams reporting and diagnostics may be incomplete: ${health.queueDropped} records dropped, ${health.writeFailedRecords} records with unconfirmed writes, ${health.writeFailures} write failures, ${health.incompleteFlushes} incomplete flushes since gateway start.`,
     );
   }
+  if (health?.retainedDropped) {
+    messages.push(
+      `${health.retainedDropped} dropped telemetry records are recorded in retained history. Activity and savings may be incomplete.`,
+    );
+  }
   if (health?.unavailable) {
     messages.push(
       "Gateway telemetry health is unavailable. Activity and savings may be incomplete.",

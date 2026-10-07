@@ -216,8 +216,8 @@ pub(crate) fn append_line_locked(
 /// writing the trimmed result, so a test can prove an append landing in that window
 /// is not lost.
 ///
-/// Returns `Err` only when the lines could not be recorded. Trimming is best-effort:
-/// a failure there never fails the append it follows.
+/// Reports append and rotation failures. The telemetry outcome preserves whether
+/// the lines already landed before rotation failed.
 pub(crate) fn append_lines_locked(
     path: &Path,
     lines: &[String],
@@ -225,6 +225,17 @@ pub(crate) fn append_lines_locked(
     keep_lines: usize,
     after_snapshot: Option<&mut dyn FnMut()>,
 ) -> Result<(), String> {
+    append_lines_with_outcome(path, lines, max_bytes, keep_lines, after_snapshot)
+        .map_err(|error| error.message)
+}
+
+pub(crate) fn append_lines_with_outcome(
+    path: &Path,
+    lines: &[String],
+    max_bytes: u64,
+    keep_lines: usize,
+    after_snapshot: Option<&mut dyn FnMut()>,
+) -> Result<(), crate::telemetry::AppendError> {
     use std::io::Write as _;
 
     let _lock = lock_at(path)?;
@@ -241,7 +252,7 @@ pub(crate) fn append_lines_locked(
             }
             open().map_err(|e| e.to_string())?
         }
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(error.to_string().into()),
     };
     let mut bytes = String::new();
     for line in lines {
@@ -268,14 +279,16 @@ pub(crate) fn append_lines_locked(
         // as replacement characters, which readers already skip (they `filter_map` the
         // JSON parse), and it ages out of the keep window like any other line.
         //
-        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        let bytes = std::fs::read(path)
+            .map_err(|error| crate::telemetry::AppendError::after_append(error.to_string()))?;
         if let Some(hook) = after_snapshot {
             hook();
         }
         let content = String::from_utf8_lossy(&bytes);
         // A failed rotation keeps the appended history intact, but must be
         // reported so telemetry health does not claim complete persistence.
-        atomic_write(path, &trimmed_tail(&content, keep_lines))?;
+        atomic_write(path, &trimmed_tail(&content, keep_lines))
+            .map_err(crate::telemetry::AppendError::after_append)?;
     }
     Ok(())
 }
