@@ -35,6 +35,7 @@ import {
   TEAMS_PAID_LINE,
   TEAMS_SEAT_PRICE,
   TEAMS_ANNUAL_SEAT_PRICE,
+  TEAMS_TEAM_SEATS,
   TEAMS_TRIAL_DAYS,
 } from "@/lib/teamsPlan";
 
@@ -607,12 +608,12 @@ describe("TeamsView disconnected pitch", () => {
 
     expect(screen.getByText(TEAMS_FREE_LINE)).toBeInTheDocument();
     expect(screen.getByText(TEAMS_PAID_LINE)).toBeInTheDocument();
-    // Team costs the same at the free seat count as Free does; the difference is
-    // governance. Quoting a per-person price on its own would read as a seat paywall.
+    // The paid tier is a flat team price whose difference from Free is governance, so
+    // it has to name what it buys rather than just quote a per-person figure.
     expect(TEAMS_PAID_LINE).toMatch(/access control/i);
-    // Anchored to the phrase, not to the bare digit: "5" also appears inside "$39" and
-    // "$390", so a `toContain("5")` would survive the seat count being dropped entirely.
-    expect(TEAMS_FREE_LINE).toContain(`up to ${TEAMS_FREE_SEATS} people`);
+    // Anchored to the phrase, not to the bare digit: a `toContain("2")` would match a
+    // price string elsewhere and survive the seat count being dropped entirely.
+    expect(TEAMS_FREE_LINE).toContain(`Free for ${TEAMS_FREE_SEATS} people`);
   });
 
   it("says how long the free trial of Team features lasts", () => {
@@ -716,7 +717,7 @@ describe("TeamsView disconnected pitch", () => {
 describe("Teams plan copy", () => {
   it("builds its copy from the shared numbers", () => {
     expect(TEAMS_PAID_LINE).toContain(`$${TEAMS_BASE_PRICE}/month`);
-    // "/month" on the seat price too: "$12 per person" reads as a one-time charge to add
+    // "/month" on the seat price too: "$4 per person" reads as a one-time charge to add
     // someone, which undersells nothing and oversells the bill.
     expect(TEAMS_PAID_LINE).toContain(`$${TEAMS_SEAT_PRICE}/month per additional person`);
     expect(TEAMS_PAID_LINE).toContain(`$${TEAMS_ANNUAL_PRICE}/year`);
@@ -724,7 +725,9 @@ describe("Teams plan copy", () => {
       `$${TEAMS_ANNUAL_SEAT_PRICE}/year on annual billing`,
     );
     expect(TEAMS_ANNUAL_SEAT_PRICE).toBe(TEAMS_SEAT_PRICE * 10);
-    expect(TEAMS_PAID_LINE).toContain(`up to ${TEAMS_FREE_SEATS}`);
+    expect(TEAMS_PAID_LINE).toContain(
+      `for your whole team, up to ${TEAMS_TEAM_SEATS} people`,
+    );
     expect(TEAMS_PAID_LINE).toMatch(/same price hosted or self-hosted/i);
   });
 
