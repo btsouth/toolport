@@ -19,12 +19,9 @@
   "codeMode": false,
   "confirmDestructive": false,
   "denyDestructive": false,
-  "httpBridgeEnabled": false,
-  "humanApproval": false,
+  "humanApproval": true,
   "humanApprovalAllow": ["github/search_code"],
   "lazyDiscovery": true,
-  "liveInspect": false,
-  "piiRedaction": false,
   "pinnedTools": {
     "github": ["get_me"]
   },
@@ -40,13 +37,6 @@
   ],
   "quarantineOnDrift": false,
   "safetyLevel": "ask",
-  "secretsGeneration": 0,
-  "semanticSearch": {
-    "blend": 0.5,
-    "enabled": false,
-    "endpoint": "",
-    "model": ""
-  },
   "servers": [
     {
       "args": ["-y", "@modelcontextprotocol/server-github"],
@@ -64,12 +54,6 @@
       "transport": "stdio"
     }
   ],
-  "teamForcedBlockOnInjection": false,
-  "teamForcedContentDefense": false,
-  "teamForcedDenyDestructive": false,
-  "teamForcedHumanApproval": false,
-  "teamForcedPiiRedaction": false,
-  "teamForcedQuarantineOnDrift": false,
   "toolOverrides": {
     "github": {
       "create_issue": {
