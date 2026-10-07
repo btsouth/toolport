@@ -1,0 +1,82 @@
+[
+  {
+    "name": "off",
+    "config": {
+      "rateLimits": [],
+      "screeningPolicy": {
+        "minSafetyLevel": "off"
+      },
+      "servers": []
+    }
+  },
+  {
+    "name": "quarantine",
+    "config": {
+      "rateLimits": [],
+      "screeningPolicy": {
+        "forceQuarantineOnDrift": true,
+        "minSafetyLevel": "off"
+      },
+      "servers": []
+    }
+  },
+  {
+    "name": "injection",
+    "config": {
+      "rateLimits": [],
+      "screeningPolicy": {
+        "forceBlockOnInjection": true,
+        "minSafetyLevel": "off"
+      },
+      "servers": []
+    }
+  },
+  {
+    "name": "ask",
+    "config": {
+      "rateLimits": [],
+      "screeningPolicy": {
+        "forceHumanApproval": true,
+        "minSafetyLevel": "ask"
+      },
+      "servers": []
+    }
+  },
+  {
+    "name": "strict",
+    "config": {
+      "denyDestructive": true,
+      "rateLimits": [],
+      "screeningPolicy": {
+        "forceBlockOnInjection": true,
+        "forceContentDefense": true,
+        "forceHumanApproval": true,
+        "forceQuarantineOnDrift": true,
+        "minSafetyLevel": "strict"
+      },
+      "servers": []
+    }
+  },
+  {
+    "name": "legacy-approval",
+    "config": {
+      "rateLimits": [],
+      "screeningPolicy": {
+        "forceHumanApproval": true,
+        "minSafetyLevel": "ask"
+      },
+      "servers": []
+    }
+  },
+  {
+    "name": "legacy-deny",
+    "config": {
+      "denyDestructive": true,
+      "rateLimits": [],
+      "screeningPolicy": {
+        "minSafetyLevel": "off"
+      },
+      "servers": []
+    }
+  }
+]

@@ -184,6 +184,7 @@ pub struct PinnedPrerequisite {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EssentialSettings {
     pub safety_level: registry::SafetyLevel,
+    pub team_min_safety_level: registry::SafetyLevel,
     pub lazy_discovery: bool,
     pub code_mode: bool,
     pub live_inspect: bool,
@@ -223,7 +224,8 @@ pub struct AddedHttpClient {
 impl EssentialSettings {
     fn from_registry(registry: &Registry) -> Self {
         Self {
-            safety_level: registry.safety_level_selected(),
+            safety_level: registry.safety_level_effective(),
+            team_min_safety_level: registry.safety_level_team_floor(),
             lazy_discovery: registry.lazy_discovery,
             code_mode: registry.code_mode,
             live_inspect: registry.live_inspect,
@@ -2186,6 +2188,7 @@ mod tests {
     fn essential_settings_report_effective_team_forced_values() {
         let mut registry = Registry::default();
         registry.deny_destructive = false;
+        registry.team_min_safety_level = registry::SafetyLevel::Strict;
         registry.team_forced_deny_destructive = true;
         registry.human_approval = false;
         registry.team_forced_human_approval = true;
@@ -2206,6 +2209,23 @@ mod tests {
         assert!(!settings.lazy_discovery);
         assert!(!settings.code_mode);
         assert!(settings.live_inspect);
+    }
+
+    #[test]
+    fn essential_safety_control_reports_floor_and_independent_protections() {
+        for floor in [registry::SafetyLevel::Off, registry::SafetyLevel::Ask, registry::SafetyLevel::Strict] {
+            let mut registry = Registry::default();
+            registry.set_safety_level(registry::SafetyLevel::Off);
+            registry.team_min_safety_level = floor;
+            registry.team_forced_quarantine_on_drift = true;
+            registry.team_forced_block_on_injection = true;
+            let settings = EssentialSettings::from_registry(&registry);
+            assert_eq!(settings.safety_level, floor);
+            assert_eq!(settings.team_min_safety_level, floor);
+            assert_eq!(settings.deny_destructive, floor == registry::SafetyLevel::Strict);
+            assert!(settings.quarantine_on_drift && settings.quarantine_on_drift_forced);
+            assert!(settings.block_on_injection && settings.block_on_injection_forced);
+        }
     }
 
     #[test]
@@ -3130,6 +3150,7 @@ DOCS_TOKEN = "tok"
 /// Update the member's safety choice without changing releasable team policy.
 pub fn set_safety_level(level: registry::SafetyLevel) -> Result<Registry, String> {
     let (registry, _) = registry::update(|registry| {
+        registry.validate_safety_level(level)?;
         registry.set_safety_level(level);
         Ok(())
     })?;

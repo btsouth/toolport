@@ -8940,7 +8940,7 @@ fn maybe_check_integrity(
         ));
             eprintln!("toolport: SECURITY tool drift ({change}) {tool}");
         }
-        // Drift quarantine is Strict-only; baseline tamper also blocks at Ask.
+        // Drift quarantine is Strict or team-forced; baseline tamper also blocks at Ask.
         if quarantine_on || (blocking && integrity::baseline_tamper_detected(&events)) {
             let pending = integrity::quarantine_candidates(tools, &events);
             integrity::apply_quarantine(profile, tools, &events)
@@ -8958,7 +8958,7 @@ fn maybe_check_integrity(
         }
     })();
     match result {
-        Err((error, _)) if !blocking => {
+        Err((error, _)) if !blocking && !quarantine_on => {
             glog(&format!("SECURITY: integrity recording failed: {error}"));
             Ok(None)
         }
@@ -9069,20 +9069,20 @@ fn fail_closed_integrity_catalog(
 }
 
 /// The quarantine set the router SHOULD be enforcing right now, mirroring how the
-/// initial build gates on safety: Strict enforces all entries, Ask enforces baseline
-/// tamper entries, and Off leaves the persisted findings unenforced.
+/// initial build gates on safety: Strict or team-forced drift quarantine enforces all
+/// entries. Otherwise Ask enforces baseline tamper and Off leaves findings unenforced.
 fn effective_quarantine(
     registry: &Arc<Mutex<Registry>>,
     profile: Option<&str>,
     read_failed: &AtomicBool,
 ) -> Option<BTreeSet<String>> {
-    let level = {
+    let (level, quarantine_on) = {
         let r = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        r.safety_level_effective()
+        (r.safety_level_effective(), r.quarantine_on_drift_effective())
     };
-    let stored = if level == registry::SafetyLevel::Strict {
+    let stored = if quarantine_on {
         integrity::quarantined_checked(profile)
     } else if level == registry::SafetyLevel::Ask {
         integrity::mandatory_quarantined_checked(profile)
@@ -29792,6 +29792,34 @@ mod tests {
     /// publishes the catalog and sets `ready`, so a server that reworded a read-only
     /// tool's description while the gateway was down is quarantined before the first
     /// `tools/list` rather than on the watcher's first tick.
+    #[test]
+    fn team_quarantine_at_member_off_enforces_drift_and_survives_watcher_reconciliation() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(dir.path());
+        let profile = Some("team-quarantine-off");
+        let baseline = readonly_router("srv", "Read a record.");
+        integrity::check_staged(profile, &baseline.aggregated_tools()).unwrap();
+        integrity::ensure_quarantine_store_for_existing_pins(profile);
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Off);
+        conduit_lib::teams::apply_team_config(&mut reg, "t1", &json!({"servers": [], "screeningPolicy": {"forceQuarantineOnDrift": true}}));
+        assert_eq!(reg.safety_level_effective(), registry::SafetyLevel::Off);
+        assert!(!reg.deny_destructive_effective());
+        let registry = Arc::new(Mutex::new(reg));
+        let mut drifted = readonly_router("srv", "Read a record. Summary text updated.");
+        let tools = drifted.aggregated_tools();
+        let published = requarantine_if_needed(&registry, &mut drifted, tools, profile);
+        assert!(!published.iter().any(|tool| tool["name"] == "srv__read"));
+        assert!(drifted.quarantined().contains("srv__read"));
+        let read_failed = AtomicBool::new(false);
+        assert!(effective_quarantine(&registry, profile, &read_failed).unwrap().contains("srv__read"));
+        // Store failures must keep enforced quarantine at Off rather than silently release it.
+        std::fs::write(dir.path().join(format!("quarantine-v2-{}.json", registry::profile_store_key("team-quarantine-off"))), b"corrupt").unwrap();
+        assert!(effective_quarantine(&registry, profile, &read_failed).is_none());
+        assert!(maybe_check_integrity(&registry, &baseline.aggregated_tools(), profile).is_err());
+    }
+
     #[test]
     fn startup_build_quarantines_readonly_description_drift_before_ready() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

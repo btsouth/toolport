@@ -19,6 +19,8 @@ pub(super) struct SettingsPage {
     feedback: gtk::Label,
     posture: gtk::Label,
     safety_level: gtk::DropDown,
+    safety_floor: Rc<Cell<crate::registry::SafetyLevel>>,
+    safety_policy: gtk::Label,
     lazy_discovery: gtk::Switch,
     pinned_section: gtk::Box,
     pinned_list: gtk::Box,
@@ -220,6 +222,11 @@ impl SettingsPage {
         let safety_level = gtk::DropDown::from_strings(&["Off", "Ask", "Strict"]);
         safety_level.set_tooltip_text(Some("Ask holds destructive calls. Strict also blocks destructive tools, risky drift and high-confidence injection, and asks before untrusted calls. Labeling and integrity recording stay on."));
         safety.append(&safety_level);
+        let safety_policy = gtk::Label::new(None);
+        safety_policy.set_xalign(0.0);
+        safety_policy.set_wrap(true);
+        safety_policy.add_css_class("dim-label");
+        safety.append(&safety_policy);
         page.append(&safety);
         page.append(&settings_heading(
             "Advanced",
@@ -489,6 +496,8 @@ impl SettingsPage {
             feedback,
             posture,
             safety_level,
+            safety_floor: Rc::new(Cell::new(crate::registry::SafetyLevel::Off)),
+            safety_policy,
             lazy_discovery,
             pinned_section,
             pinned_list,
@@ -1201,7 +1210,7 @@ impl SettingsPage {
             if page.updating.get() {
                 return;
             }
-            let level = match control.selected() {
+            let level = match control.selected() + page.safety_floor.get() as u32 {
                 0 => crate::registry::SafetyLevel::Off,
                 1 => crate::registry::SafetyLevel::Ask,
                 _ => crate::registry::SafetyLevel::Strict,
@@ -1459,11 +1468,29 @@ impl SettingsPage {
         self.code_mode.set_sensitive(true);
         set_switch(&self.live_inspect, settings.live_inspect);
         self.live_inspect.set_sensitive(true);
-        self.safety_level.set_selected(match settings.safety_level {
-            crate::registry::SafetyLevel::Off => 0,
-            crate::registry::SafetyLevel::Ask => 1,
-            crate::registry::SafetyLevel::Strict => 2,
-        });
+        self.safety_floor.set(settings.team_min_safety_level);
+        let choices = match settings.team_min_safety_level {
+            crate::registry::SafetyLevel::Off => vec!["Off", "Ask", "Strict"],
+            crate::registry::SafetyLevel::Ask => vec!["Ask", "Strict"],
+            crate::registry::SafetyLevel::Strict => vec!["Strict"],
+        };
+        self.safety_level.set_model(Some(&gtk::StringList::new(&choices)));
+        self.safety_level.set_selected(settings.safety_level as u32 - settings.team_min_safety_level as u32);
+        let floor = match settings.team_min_safety_level {
+            crate::registry::SafetyLevel::Off => "Off",
+            crate::registry::SafetyLevel::Ask => "Ask",
+            crate::registry::SafetyLevel::Strict => "Strict",
+        };
+        let mut policy = format!("Team minimum safety level: {floor}.");
+        if settings.quarantine_on_drift_forced {
+            policy.push_str(" Team also enforces quarantine on drift.");
+        }
+        if settings.block_on_injection_forced {
+            policy.push_str(" Team also enforces block on injection.");
+        }
+        self.safety_policy.set_label(&policy);
+        self.safety_policy.set_visible(settings.team_min_safety_level != crate::registry::SafetyLevel::Off
+            || settings.quarantine_on_drift_forced || settings.block_on_injection_forced);
         self.safety_level.set_sensitive(true);
         set_switch(&self.pii_redaction, settings.pii_redaction);
         set_team_managed(&self.pii_redaction, settings.pii_redaction_forced);

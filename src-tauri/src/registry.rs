@@ -1093,6 +1093,10 @@ pub enum SafetyLevel {
     Strict,
 }
 
+fn team_safety_floor_default() -> SafetyLevel {
+    SafetyLevel::Off
+}
+
 impl Default for SafetyLevel {
     fn default() -> Self {
         Self::Ask
@@ -1146,6 +1150,9 @@ pub struct Registry {
     /// The gate holds a call when either is true (see [`Registry::human_approval_effective`]).
     #[serde(default)]
     pub team_forced_human_approval: bool,
+    /// Releasable team floor, kept separate from the member's own safety choice.
+    #[serde(default = "team_safety_floor_default")]
+    pub team_min_safety_level: SafetyLevel,
     /// The same releasable org-lock treatment as [`team_forced_human_approval`] for the other
     /// tighten-only screening flags (`denyDestructive`, `forceContentDefense`,
     /// `forceQuarantineOnDrift`, `forceBlockOnInjection`). Set from the active team's policy,
@@ -1637,6 +1644,7 @@ impl Default for Registry {
             human_approval: false,
             human_approval_allow: Vec::new(),
             team_forced_human_approval: false,
+            team_min_safety_level: SafetyLevel::Off,
             team_forced_deny_destructive: false,
             team_forced_content_defense: false,
             team_forced_quarantine_on_drift: false,
@@ -2371,18 +2379,23 @@ impl Registry {
         })
     }
 
-    pub fn safety_level_effective(&self) -> SafetyLevel {
-        let team = if self.team_forced_deny_destructive
-            || self.team_forced_quarantine_on_drift
-            || self.team_forced_block_on_injection
-        {
-            SafetyLevel::Strict
-        } else if self.team_forced_human_approval {
+    pub fn safety_level_team_floor(&self) -> SafetyLevel {
+        self.team_min_safety_level.max(if self.team_forced_human_approval {
             SafetyLevel::Ask
         } else {
             SafetyLevel::Off
-        };
-        self.safety_level_selected().max(team)
+        })
+    }
+
+    pub fn safety_level_effective(&self) -> SafetyLevel {
+        self.safety_level_selected().max(self.safety_level_team_floor())
+    }
+
+    pub fn validate_safety_level(&self, level: SafetyLevel) -> Result<(), String> {
+        if level < self.safety_level_team_floor() {
+            return Err("Safety cannot be set below the team's minimum level".into());
+        }
+        Ok(())
     }
 
     pub fn set_safety_level(&mut self, level: SafetyLevel) {
@@ -2414,11 +2427,11 @@ impl Registry {
         self.pii_redaction || self.team_forced_pii_redaction
     }
     pub fn quarantine_on_drift_effective(&self) -> bool {
-        self.safety_level_effective() == SafetyLevel::Strict
+        self.safety_level_effective() == SafetyLevel::Strict || self.team_forced_quarantine_on_drift
     }
     /// Member's own OR team-forced fail-closed injection block (SOU-345).
     pub fn block_on_injection_effective(&self) -> bool {
-        self.safety_level_effective() == SafetyLevel::Strict
+        self.safety_level_effective() == SafetyLevel::Strict || self.team_forced_block_on_injection
     }
     /// Whether this server should fail closed on a high-confidence injection hit:
     /// block mode effective, and the server is not on the exempt list.
@@ -7858,11 +7871,63 @@ mod safety_level_tests {
                 level.max(SafetyLevel::Ask)
             );
             registry.team_forced_block_on_injection = true;
-            assert_eq!(registry.safety_level_effective(), SafetyLevel::Strict);
+            assert_eq!(registry.safety_level_effective(), level.max(SafetyLevel::Ask));
             registry.team_forced_human_approval = false;
             registry.team_forced_block_on_injection = false;
             assert_eq!(registry.safety_level_effective(), level);
         }
+    }
+
+    #[test]
+    fn team_floors_take_the_maximum_and_release_without_changing_member_choice() {
+        for member in [SafetyLevel::Off, SafetyLevel::Ask, SafetyLevel::Strict] {
+            for floor in [SafetyLevel::Off, SafetyLevel::Ask, SafetyLevel::Strict] {
+                for legacy in [false, true] {
+                    let mut r = Registry::default();
+                    r.set_safety_level(member);
+                    r.team_min_safety_level = floor;
+                    r.team_forced_human_approval = legacy;
+                    let expected = member.max(floor).max(if legacy { SafetyLevel::Ask } else { SafetyLevel::Off });
+                    assert_eq!(r.safety_level_effective(), expected);
+                    assert_eq!(r.deny_destructive_effective(), expected == SafetyLevel::Strict);
+                    assert_eq!(r.requires_human_approval(true, false), expected >= SafetyLevel::Ask);
+                    assert_eq!(r.requires_human_approval(false, true), expected == SafetyLevel::Strict);
+                    assert_eq!(r.safety_level_selected(), member);
+                    for choice in [SafetyLevel::Off, SafetyLevel::Ask, SafetyLevel::Strict] {
+                        assert_eq!(r.validate_safety_level(choice).is_ok(), choice >= r.safety_level_team_floor());
+                    }
+                    r.team_min_safety_level = SafetyLevel::Off;
+                    r.team_forced_human_approval = false;
+                    assert_eq!(r.safety_level_effective(), member);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn independent_team_protections_never_raise_the_safety_level() {
+        for member in [SafetyLevel::Off, SafetyLevel::Ask, SafetyLevel::Strict] {
+            for quarantine in [false, true] {
+                for block in [false, true] {
+                    let mut r = Registry::default();
+                    r.set_safety_level(member);
+                    r.team_forced_deny_destructive = true;
+                    r.team_forced_content_defense = true;
+                    r.team_forced_pii_redaction = true;
+                    r.team_forced_quarantine_on_drift = quarantine;
+                    r.team_forced_block_on_injection = block;
+                    assert_eq!(r.safety_level_team_floor(), SafetyLevel::Off);
+                    assert_eq!(r.safety_level_effective(), member);
+                    assert_eq!(r.deny_destructive_effective(), member == SafetyLevel::Strict);
+                    assert_eq!(r.quarantine_on_drift_effective(), member == SafetyLevel::Strict || quarantine);
+                    assert_eq!(r.block_on_injection_effective(), member == SafetyLevel::Strict || block);
+                    assert!(r.content_defense_effective());
+                    assert!(r.pii_redaction_effective());
+                }
+            }
+        }
+        let r: Registry = serde_json::from_value(serde_json::json!({"servers": [], "profiles": []})).unwrap();
+        assert_eq!(r.team_min_safety_level, SafetyLevel::Off, "absent floor has no effect");
     }
 
     #[test]
