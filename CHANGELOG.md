@@ -6,6 +6,9 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+- After upgrading to client access sets, use Stop old gateways and restart any apps
+  still running a 1.x gateway so they use the new access controls.
+
 ## [1.24.0] - 2026-10-06
 
 ### Added

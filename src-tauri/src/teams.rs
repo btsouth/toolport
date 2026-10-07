@@ -442,7 +442,7 @@ pub struct ShareSelectionPreview {
     pub local: LocalHandoff,
 }
 
-/// What sharing does, or did, to one selected server in the active profile.
+/// What sharing does, or did, to one selected server in the local access context.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalHandoff {
@@ -2370,7 +2370,7 @@ fn managed_copy_of(reg: &Registry, original: &str) -> Result<String, String> {
     }
 }
 
-/// Hand each selected server that is in use in the active profile over to its
+/// Hand each selected server that is in use in the local access context over to its
 /// Team copy. Each selection is staged on its own, so one that needs separate
 /// setup leaves the others switched, and a failed one keeps a working route.
 /// `before` is the registry the share was confirmed against; `reg` already has
@@ -2791,7 +2791,7 @@ fn is_team_server(s: &ServerEntry, tag: &str) -> bool {
 
 /// Merge a team config (registry-format JSON `{ servers, denyDestructive?, screeningPolicy? }`)
 /// into the local registry. Team servers are tagged `source = "team:<id>"`, their ids prefixed
-/// `team_`, and enabled in the active profile so they're actually exposed. Re-running
+/// `team_`, with local consent and global enablement preserved. Re-running
 /// REPLACES this team's servers (a removed team server disappears) while leaving the
 /// member's own servers and profiles untouched. A team `denyDestructive: true` and any
 /// `screeningPolicy` force-flags are adopted tighten-only: policy can only raise safety,
@@ -6932,6 +6932,32 @@ mod tests {
 
         fn handed_off() -> (Registry, Value) {
             handed_off_with(LocalValue::None)
+        }
+
+        #[test]
+        fn access_review_team_copy_turns_personal_off_globally_keeps_membership() {
+            crate::secrets::tests::with_isolated_vault(|| {
+                let mut personal = publisher_registry();
+                personal.version = 3;
+                personal.servers[0].enabled = true;
+                let other = personal.add_profile("Other");
+                personal.set_access_server(&other, "mine", true).unwrap();
+                let mut reg = synced(&personal, &team_server_export(&personal), 1);
+                let managed = team_copy(&reg, "mine");
+                apply_use_managed(&mut reg, &managed, "default").unwrap();
+                assert!(!reg.server_enabled("mine"));
+                assert!(reg.server_enabled(&managed));
+                assert!(reg
+                    .profiles
+                    .iter()
+                    .all(|p| p.enabled_server_ids.iter().any(|id| id == "mine")));
+                let all = reg
+                    .enabled_servers_for(crate::registry::ALL_ENABLED_ACCESS)
+                    .iter()
+                    .map(|s| s.id.clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(all, [managed]);
+            });
         }
 
         #[test]

@@ -40,6 +40,13 @@ pub(super) fn migrate_v2_to_v3(value: &mut Value, _: &MigrationContext) -> Resul
     .and_then(Value::as_str)
     .unwrap_or("default")
     .to_string();
+    for profile in profiles {
+        if let Some(name) = profile.get("name").and_then(Value::as_str) {
+            if name.trim().starts_with('@') {
+                return Err("Access-set names beginning with @ are reserved; the original registry was left untouched".into());
+            }
+        }
+    }
     if profiles.iter().any(|p| {
         p.get("id")
             .and_then(Value::as_str)
@@ -76,6 +83,7 @@ pub(super) fn migrate_v2_to_v3(value: &mut Value, _: &MigrationContext) -> Resul
         Value::String(active.clone()),
     );
     document.insert("defaultAccessLegacyPolicy".into(), Value::Bool(true));
+    document.insert("accessUpgradeNoticePending".into(), Value::Bool(true));
     if active_set != union || active_missing {
         document.insert("defaultAccessProfileId".into(), Value::String(active));
     } else {
@@ -141,6 +149,40 @@ mod tests {
             .unwrap_or(json!({}));
         (servers, scope)
     }
+    #[test]
+    fn access_review_migration_rejects_reserved_names_without_writing() {
+        let mut value = fixture(false);
+        value["profiles"][0]["name"] = json!(" @all-enabled");
+        let original = value.clone();
+        assert!(migrate_v2_to_v3(
+            &mut value,
+            &MigrationContext {
+                date: "2026-10-07".into(),
+                data_dir: std::env::temp_dir(),
+            }
+        )
+        .is_err());
+        assert_eq!(value, original);
+    }
+
+    #[test]
+    fn access_review_upgrade_notice_dismissal_survives_reload() {
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-access-notice-{}-{}",
+            std::process::id(),
+            crate::registry::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+        std::fs::write(&path, fixture(false).to_string()).unwrap();
+        let mut reg = load_from(&path).unwrap();
+        assert!(reg.access_upgrade_notice_pending());
+        reg.dismiss_access_upgrade_notice();
+        crate::registry::save_to(&path, &reg).unwrap();
+        assert!(!load_from(&path).unwrap().access_upgrade_notice_pending());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn v3_migration_preserves_unscoped_scoped_and_folder_access() {
         for multiple in [false, true] {

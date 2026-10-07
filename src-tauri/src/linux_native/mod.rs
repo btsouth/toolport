@@ -352,7 +352,43 @@ fn build_window(
         });
     }
     split.set_sidebar(Some(&adw::NavigationPage::new(&sidebar, "Navigation")));
-    split.set_content(Some(&adw::NavigationPage::new(&stack, "Toolport")));
+    let content_with_notice = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    if crate::registry::load().is_ok_and(|reg| reg.access_upgrade_notice_pending()) {
+        let notice = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        notice.add_css_class("toolport-setting-row");
+        notice.append(&gtk::Label::builder().label(
+            "Old Toolport gateways may still be running from before the upgrade. Stop old gateways, then restart any apps still using them so they use the new client access controls."
+        ).wrap(true).xalign(0.0).build());
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let stop = gtk::Button::with_label("Stop old gateways");
+        let settings = settings_page.clone();
+        let stack_for_stop = stack.clone();
+        stop.connect_clicked(move |_| {
+            stack_for_stop.set_visible_child_name("settings");
+            settings.stop_stale.emit_clicked();
+        });
+        actions.append(&stop);
+        let dismiss = gtk::Button::with_label("Dismiss");
+        let notice_for_dismiss = notice.clone();
+        dismiss.connect_clicked(move |_| {
+            match crate::registry::update(|reg| {
+                reg.dismiss_access_upgrade_notice();
+                Ok(())
+            }) {
+                Ok(_) => notice_for_dismiss.set_visible(false),
+                Err(error) => eprintln!("toolport: could not dismiss upgrade notice: {error}"),
+            }
+        });
+        actions.append(&dismiss);
+        notice.append(&actions);
+        content_with_notice.append(&notice);
+    }
+    stack.set_vexpand(true);
+    content_with_notice.append(&stack);
+    split.set_content(Some(&adw::NavigationPage::new(
+        &content_with_notice,
+        "Toolport",
+    )));
 
     let review_quarantine = gtk::gio::SimpleAction::new("review-quarantine", None);
     let app_for_quarantine = app.clone();
@@ -2660,22 +2696,6 @@ fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuBu
     content.set_margin_start(6);
     content.set_margin_end(6);
 
-    let all = toolport_menu_button("All enabled servers");
-    let all_client = client.clone();
-    let all_page = page.clone();
-    let all_menu = menu.clone();
-    all.connect_clicked(move |button| {
-        all_menu.popdown();
-        run_client_mutation(
-            &all_client,
-            true,
-            false,
-            Some(crate::registry::ALL_ENABLED_ACCESS.into()),
-            button,
-            all_page.clone(),
-        );
-    });
-    content.append(&all);
     for profile in page.profiles.borrow().iter().cloned() {
         let button = toolport_menu_button(&profile.name);
         let client = client.clone();

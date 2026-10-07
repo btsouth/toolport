@@ -190,10 +190,17 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     return scopeServers(scopeRef).length;
   }
   function accessLabel(scopeRef: string): string {
-    const ref = scopeRef || registry?.defaultAccessProfileId;
-    return !ref || ref === "@all-enabled"
+    if (!scopeRef) {
+      const defaultId =
+        registry?.defaultAccessProfileId ||
+        (registry?.defaultAccessLegacyPolicy ? registry.defaultAccessContextId : null);
+      const name = profiles.find((p) => p.id === defaultId)?.name;
+      return name ? `Default access (${name})` : "Default access";
+    }
+    return scopeRef === "@all-enabled"
       ? "All enabled servers"
-      : (profiles.find((p) => p.id === ref || p.name === ref)?.name ?? ref);
+      : (profiles.find((p) => p.id === scopeRef || p.name === scopeRef)?.name ??
+          scopeRef);
   }
 
   /** Re-apply a scope to an already-connected client (overwrites its gateway
@@ -447,13 +454,16 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           {!customized && <span className="text-xs text-muted-foreground">Access</span>}
           {!customized && (
             <Select
-              value={profile || registry?.defaultAccessProfileId || "@all-enabled"}
-              onValueChange={setProfile}
+              value={profile || "@default-access"}
+              onValueChange={(value) =>
+                setProfile(value === "@default-access" ? "" : value)
+              }
             >
               <SelectTrigger aria-label="Access" size="sm" className="w-52">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
+                <SelectItem value="@default-access">{accessLabel("")}</SelectItem>
                 <SelectItem value="@all-enabled">All enabled servers</SelectItem>
                 {profiles.map((p) => (
                   <SelectItem key={p.id} value={p.id}>

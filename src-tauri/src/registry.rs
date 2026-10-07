@@ -2053,6 +2053,49 @@ impl Registry {
         })
     }
 
+    pub fn access_label(&self, reference: &str) -> String {
+        if reference.trim().is_empty() || reference.starts_with("@default-access:") {
+            return "Default access".into();
+        }
+        if reference == ALL_ENABLED_ACCESS || reference.starts_with("@all-enabled:") {
+            return "All enabled servers".into();
+        }
+        let id = self.resolve_profile_id(reference);
+        self.profiles
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| reference.to_string())
+    }
+
+    pub fn default_access_label(&self) -> String {
+        let name = self
+            .default_access_profile_id
+            .as_deref()
+            .or_else(|| {
+                self.default_access_legacy_policy
+                    .then_some(self.default_access_context_id.as_deref())
+                    .flatten()
+            })
+            .and_then(|id| self.profiles.iter().find(|p| p.id == id))
+            .map(|p| p.name.as_str());
+        name.map(|name| format!("Default access ({name})"))
+            .unwrap_or_else(|| "Default access".into())
+    }
+
+    pub fn access_upgrade_notice_pending(&self) -> bool {
+        self.version >= 3
+            && self.unknown_fields.get("accessUpgradeNoticePending")
+                == Some(&serde_json::Value::Bool(true))
+    }
+
+    pub fn dismiss_access_upgrade_notice(&mut self) {
+        self.unknown_fields.insert(
+            "accessUpgradeNoticePending".into(),
+            serde_json::Value::Bool(false),
+        );
+    }
+
     pub fn all_access_id(&self) -> String {
         format!(
             "@all-enabled:{}",
@@ -2105,8 +2148,13 @@ impl Registry {
         server: &str,
         included: bool,
     ) -> Result<(), String> {
-        if !self.servers.iter().any(|s| s.id == server) {
-            return Err(format!("No server with id '{server}'"));
+        let entry = self
+            .servers
+            .iter()
+            .find(|s| s.id == server)
+            .ok_or_else(|| format!("No server with id '{server}'"))?;
+        if included {
+            entry.check_enable_allowed(false)?;
         }
         let profile = self
             .profiles
@@ -2150,13 +2198,16 @@ impl Registry {
             .unwrap_or(false)
     }
 
-    /// Toggle a server's enabled state within a profile.
+    /// Toggle the user's global switch in v3, or legacy profile membership in v1/v2.
     pub fn set_server_enabled(
         &mut self,
         profile_id: &str,
         server_id: &str,
         enabled: bool,
     ) -> Result<(), String> {
+        if self.version >= 3 {
+            return self.set_global_server_enabled(server_id, enabled);
+        }
         let server = self
             .servers
             .iter()
@@ -2175,13 +2226,6 @@ impl Registry {
             profile.enabled_server_ids.push(server_id.to_string());
         } else if !enabled && present {
             profile.enabled_server_ids.retain(|s| s != server_id);
-        }
-        if self.version >= 3 {
-            let globally_enabled = self
-                .profiles
-                .iter()
-                .any(|p| p.enabled_server_ids.iter().any(|id| id == server_id));
-            self.set_global_server_enabled(server_id, globally_enabled)?;
         }
         Ok(())
     }
@@ -2521,6 +2565,12 @@ impl Registry {
     }
 
     pub fn remove_profile(&mut self, id: &str) -> Result<(), String> {
+        if self.version >= 3
+            && (self.default_access_profile_id.as_deref() == Some(id)
+                || self.default_access_context_id.as_deref() == Some(id))
+        {
+            return Err("Cannot remove the default access set or its policy context".into());
+        }
         if self.profiles.len() <= 1 {
             return Err("Cannot remove the last profile".to_string());
         }
@@ -2532,14 +2582,6 @@ impl Registry {
         if self.active_profile_id.as_deref() == Some(id) {
             self.active_profile_id = self.profiles.first().map(|p| p.id.clone());
         }
-        Ok(())
-    }
-
-    pub fn set_active_profile(&mut self, id: &str) -> Result<(), String> {
-        if !self.profiles.iter().any(|p| p.id == id) {
-            return Err(format!("No profile with id '{id}'"));
-        }
-        self.active_profile_id = Some(id.to_string());
         Ok(())
     }
 
@@ -4028,7 +4070,24 @@ fn load_from_with_migrations_for_test(
     load_from_inner_with(path, migrations, target_version).map(|(registry, _)| registry)
 }
 
+pub fn validate_access_set_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("Give the access set a name".into());
+    }
+    if name.trim().starts_with('@') {
+        return Err("Access-set names beginning with @ are reserved".into());
+    }
+    Ok(())
+}
+
 pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
+    if registry.version >= 3 {
+        for profile in &registry.profiles {
+            if profile.name.trim().starts_with('@') {
+                return Err("Access-set names beginning with @ are reserved".into());
+            }
+        }
+    }
     validate_server_launches(registry)?;
     let mut registry = registry.clone();
     registry.sync_legacy_safety_mirror();
@@ -4763,6 +4822,79 @@ mod tests {
     use crate::approval::fingerprint_allow_key;
 
     static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn access_review_global_switch_never_follows_membership() {
+        let mut reg = Registry::default();
+        let server: ServerEntry = serde_json::from_value(serde_json::json!({
+            "id":"s", "name":"S", "transport":"http", "url":"https://example.com"
+        }))
+        .unwrap();
+        reg.servers.push(server);
+        let other = reg.add_profile("Other");
+        reg.set_access_server("default", "s", true).unwrap();
+        reg.set_access_server(&other, "s", true).unwrap();
+        reg.set_server_enabled("default", "s", false).unwrap();
+        assert!(!reg.server_enabled("s"));
+        assert!(reg.profiles.iter().all(|p| p.enabled_server_ids == ["s"]));
+        reg.set_server_enabled("default", "s", true).unwrap();
+        assert!(reg.server_enabled("s"));
+        reg.set_server_enabled(&other, "s", false).unwrap();
+        assert!(!reg.server_enabled("s"));
+        assert!(reg.enabled_servers_for(ALL_ENABLED_ACCESS).is_empty());
+    }
+
+    #[test]
+    fn access_review_membership_cannot_bypass_team_review() {
+        for transport in ["stdio", "http"] {
+            let mut reg = Registry::default();
+            let server: ServerEntry = serde_json::from_value(serde_json::json!({
+                "id":"team_s", "name":"S", "transport":transport,
+                "command":if transport == "stdio" { Some("fixture") } else { None },
+                "url":"https://example.com", "source":"team:t", "teamEnableReview":true
+            }))
+            .unwrap();
+            reg.servers.push(server);
+            assert_eq!(
+                reg.set_access_server("default", "team_s", true)
+                    .unwrap_err(),
+                TEAM_REVIEW_REQUIRED
+            );
+            assert!(reg.profiles[0].enabled_server_ids.is_empty());
+            reg.profiles[0].enabled_server_ids.push("team_s".into());
+            reg.set_access_server("default", "team_s", false).unwrap();
+            assert!(reg.profiles[0].enabled_server_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn access_review_pinned_default_and_context_cannot_be_removed() {
+        let mut reg = Registry::default();
+        let context = reg.add_profile("Context");
+        let spare = reg.add_profile("Spare");
+        reg.default_access_profile_id = Some("default".into());
+        reg.default_access_context_id = Some(context.clone());
+        assert!(reg.remove_profile("default").is_err());
+        assert!(reg.remove_profile(&context).is_err());
+        reg.remove_profile(&spare).unwrap();
+        assert_eq!(reg.profiles.len(), 2);
+    }
+
+    #[test]
+    fn access_review_reserved_name_rename_cannot_be_saved() {
+        let mut reg = Registry::default();
+        reg.profiles[0].name = " @all-enabled".into();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-access-name-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+        assert!(save_to(&path, &reg).is_err());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// SBS-890: an error body is the downstream server's own words. It has been
     /// through the injection scan and the PII pass, and neither is a credential

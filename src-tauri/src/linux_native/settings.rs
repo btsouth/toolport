@@ -14,6 +14,7 @@ pub(super) const LEGACY_AUTOSTART_NAME: &str = "ToolportNativePreview";
 #[derive(Clone)]
 pub(super) struct SettingsPage {
     pub(super) root: gtk::Box,
+    pub(super) stop_stale: gtk::Button,
     bridge: super::http_bridge::BridgeController,
     broker: crate::approval_broker::ApprovalBroker,
     feedback: gtk::Label,
@@ -504,6 +505,7 @@ impl SettingsPage {
         scroller.set_child(Some(&page));
         root.append(&scroller);
         let settings_page = Self {
+            stop_stale: stop_stale.clone(),
             root,
             bridge,
             broker,

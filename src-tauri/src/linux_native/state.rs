@@ -378,9 +378,9 @@ pub(super) struct ClientSnapshot {
 }
 
 fn client_access_label(registry: &Registry, scope: Option<&str>) -> String {
-    let reference = scope.or(registry.default_access_profile_id.as_deref());
-    match reference {
-        None | Some(crate::registry::ALL_ENABLED_ACCESS) => "All enabled servers".into(),
+    match scope.filter(|scope| !scope.is_empty()) {
+        None => registry.default_access_label(),
+        Some(crate::registry::ALL_ENABLED_ACCESS) => "All enabled servers".into(),
         Some(reference) => {
             let name = registry
                 .profiles
@@ -391,6 +391,24 @@ fn client_access_label(registry: &Registry, scope: Option<&str>) -> String {
             name
         }
     }
+}
+
+fn client_access_options(registry: &Registry) -> Vec<ProfileView> {
+    let mut options = vec![
+        ProfileView {
+            id: String::new(),
+            name: registry.default_access_label(),
+        },
+        ProfileView {
+            id: crate::registry::ALL_ENABLED_ACCESS.into(),
+            name: "All enabled servers".into(),
+        },
+    ];
+    options.extend(registry.profiles.iter().map(|profile| ProfileView {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+    }));
+    options
 }
 
 pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
@@ -429,14 +447,7 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
     });
     Ok(ClientSnapshot {
         clients,
-        profiles: registry
-            .profiles
-            .into_iter()
-            .map(|profile| ProfileView {
-                id: profile.id,
-                name: profile.name,
-            })
-            .collect(),
+        profiles: client_access_options(&registry),
     })
 }
 
@@ -802,9 +813,23 @@ mod tests {
     #[test]
     fn client_access_labels_show_migrated_default_all_and_missing_sets() {
         let mut registry = Registry::default();
-        assert_eq!(client_access_label(&registry, None), "All enabled servers");
+        assert_eq!(client_access_label(&registry, None), "Default access");
         registry.default_access_profile_id = Some("default".into());
-        assert_eq!(client_access_label(&registry, None), "Default");
+        assert_eq!(
+            client_access_label(&registry, None),
+            "Default access (Default)"
+        );
+        let options = client_access_options(&registry);
+        assert_eq!(options[0].id, "");
+        assert_eq!(options[0].name, "Default access (Default)");
+        assert_eq!(options[1].id, "@all-enabled");
+        registry.default_access_profile_id = None;
+        registry.default_access_context_id = Some("default".into());
+        registry.default_access_legacy_policy = true;
+        assert_eq!(
+            client_access_label(&registry, Some("")),
+            "Default access (Default)"
+        );
         assert_eq!(
             client_access_label(&registry, Some(crate::registry::ALL_ENABLED_ACCESS)),
             "All enabled servers"

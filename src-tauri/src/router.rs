@@ -491,7 +491,7 @@ impl ToolPolicy {
             .get(server_id)
             .is_some_and(|set| !set.contains(orig))
         {
-            return Some("outside the active profile's tool scope");
+            return Some("outside this client's tool scope");
         }
         self.blocked_reason_unscoped(exposed, server_id, orig, tool)
     }

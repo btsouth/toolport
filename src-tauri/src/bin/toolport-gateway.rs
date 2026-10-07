@@ -2796,12 +2796,7 @@ fn enabled_summary(
         Some(p) => reg.resolve_profile_id(p),
         None => reg.default_access_id(),
     };
-    let profile_name = reg
-        .profiles
-        .iter()
-        .find(|p| p.id == active)
-        .map(|p| p.name.clone())
-        .unwrap_or(active.clone());
+    let profile_name = reg.access_label(profile.unwrap_or(""));
 
     // The set of server prefixes this caller may see. A scoped HTTP client sees
     // exactly its allowed set (its real scope, drawn from its own profile via the
@@ -2825,7 +2820,7 @@ fn enabled_summary(
         .collect();
     let header = match allowed {
         Some(_) => "Servers available to this client".to_string(),
-        None => format!("Profile '{profile_name}'"),
+        None => profile_name,
     };
     // A daemon that replaced one which crashed says so first.
     let crash = conduit_lib::daemon_log::previous_exit_note()
@@ -6737,7 +6732,7 @@ fn handle_request_with_cancel(
                     let Some(alias) = router.exposed_tool_name(server, tool) else {
                         return Some(success(
                             id,
-                            json!({"content": [{"type": "text", "text": "Tool unavailable in the active profile or blocked by gateway policy."}], "isError": true}),
+                            json!({"content": [{"type": "text", "text": "Tool unavailable in this client's access set or blocked by gateway policy."}], "isError": true}),
                         ));
                     };
                     (
@@ -10222,7 +10217,7 @@ fn watch_tick(
         );
         let fmt_profile = |p: &Option<String>| match p {
             Some(name) => format!("'{name}'"),
-            None => "(active profile / unscoped)".to_string(),
+            None => "Default access".to_string(),
         };
         eprintln!(
             "toolport: registry changed{} -> profile {} (was {}); {} server(s), {} tools; sent tools/list_changed",
@@ -13790,9 +13785,7 @@ fn adapter_live_view(
             }
             tool.is_some_and(|tool| {
                 current
-                    .profiles
-                    .iter()
-                    .find(|entry| entry.id == *profile)
+                    .access_profile(profile)
                     .and_then(|entry| entry.tool_scope.get(server))
                     .is_some_and(|allow| !allow.iter().any(|name| name == tool))
             })
@@ -19664,6 +19657,105 @@ mod tests {
                 1,
                 "{method} returned the rooted tools-only cache"
             );
+        }
+    }
+
+    #[test]
+    fn access_review_default_tool_revocation_while_call_waits_for_startup() {
+        let _env = DataDirTestEnv::new("access-review-startup");
+        let state = http_state(false);
+        let mut reg = Registry::default();
+        let mut server = stub_server("s", "S");
+        server.enabled = true;
+        reg.servers.push(server);
+        reg.profiles[0].enabled_server_ids.push("s".into());
+        reg.default_access_context_id = Some("default".into());
+        reg.default_access_legacy_policy = true;
+        reg.safety_level = Some(registry::SafetyLevel::Off);
+        *state.registry.lock().unwrap() = reg.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::with_policy(registry_policy(&reg, None, false, false));
+        let connect_calls = Arc::clone(&calls);
+        router.add_supervised(
+            "s".into(),
+            vec![json!({"name":"work"})],
+            Arc::new(move || {
+                DownstreamServer::connect(
+                    "s".into(),
+                    Box::new(CountingRoute {
+                        calls: Arc::clone(&connect_calls),
+                        destructive: false,
+                    }),
+                )
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        let snapshot = Arc::new(router);
+        *state.router.lock().unwrap() = Arc::clone(&snapshot);
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        let profile = reg.default_access_id();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let _live = LiveRouterResolverGuard::enter(Some(adapter_live_view(
+                    &state.host,
+                    &reg,
+                    &profile,
+                    None,
+                    None,
+                )));
+                execute_call(
+                    &reg,
+                    &snapshot,
+                    &snapshot.aggregated_tools(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    "s__work",
+                    json!({}),
+                    None,
+                    None,
+                    CallOpts {
+                        direct: true,
+                        shape: false,
+                        allow_app_only: true,
+                    },
+                    Some(&state.router),
+                )
+            });
+            // A completed connection waits for adoption, so the call is still held.
+            wait_for_supervisor_result(&snapshot);
+            state.registry.lock().unwrap().profiles[0]
+                .tool_scope
+                .insert("s".into(), Vec::new());
+            let mut published = (*snapshot).clone();
+            published.adopt_ready_reconnects();
+            *state.router.lock().unwrap() = Arc::new(published);
+            snapshot.activate_supervisors();
+            let result = worker.join().unwrap();
+            assert_eq!(result["isError"], true, "{result}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "revoked call reached downstream"
+            );
+        });
+    }
+
+    #[test]
+    fn access_review_status_uses_public_access_names() {
+        let state = http_state(false);
+        let mut reg = Registry::default();
+        reg.default_access_context_id = Some("default".into());
+        for (reference, label) in [
+            (reg.default_access_id(), "Default access"),
+            (reg.all_access_id(), "All enabled servers"),
+            ("default".into(), "Default"),
+        ] {
+            let text = enabled_summary(&state.host, &reg, &[], Some(&reference), None);
+            assert!(text.starts_with(label), "{text}");
+            assert!(!text.contains('@'), "{text}");
         }
     }
 

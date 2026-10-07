@@ -71,7 +71,11 @@ pub(crate) fn registry_summary(registry: &Registry) -> String {
             .map(|port| format!(" (port {port})"))
             .unwrap_or_default()
     );
-    let _ = writeln!(output, "  active profile: {active}");
+    let _ = writeln!(
+        output,
+        "  default access: {}",
+        registry.default_access_label()
+    );
     let _ = writeln!(output, "\nservers ({}):", registry.servers.len());
     for server in &registry.servers {
         let enabled = if registry.is_enabled(&active, &server.id) {

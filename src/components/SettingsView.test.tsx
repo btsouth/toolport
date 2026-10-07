@@ -506,3 +506,22 @@ it("keeps access sets and folder routing under Advanced and changes the default 
     expect.objectContaining({ defaultAccessProfileId: null }),
   );
 });
+
+it("shows the expand affordance for an empty access set", async () => {
+  const empty = {
+    ...registry,
+    version: 3,
+    profiles: [{ id: "empty", name: "Empty set", enabledServerIds: [] }],
+  };
+  render(
+    <ThemeProvider>
+      <SettingsView registry={empty} onRegistryChange={vi.fn()} />
+    </ThemeProvider>,
+  );
+  await userEvent.click(screen.getByText("Advanced"));
+  const toggle = screen.getByRole("button", { name: /Empty set/ });
+  expect(toggle.querySelector("svg")).not.toHaveClass("invisible");
+  await userEvent.click(toggle);
+  expect(toggle).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByRole("checkbox", { name: /GitHub/ })).not.toBeChecked();
+});

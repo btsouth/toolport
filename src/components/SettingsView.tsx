@@ -1122,7 +1122,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                         <ChevronRight
                           className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${
                             isOpen ? "rotate-90" : ""
-                          } ${names.length === 0 ? "invisible" : ""}`}
+                          }`}
                         />
                         <span className="text-sm font-medium">{p.name}</span>
                         {active && (

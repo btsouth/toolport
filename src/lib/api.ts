@@ -898,8 +898,8 @@ export function setAccessServer(
   return invoke<Registry>("set_access_server", { profileId, serverId, included });
 }
 
-export function setActiveProfile(id: string): Promise<Registry> {
-  return invoke<Registry>("set_active_profile", { id });
+export function dismissAccessUpgradeNotice(): Promise<Registry> {
+  return invoke<Registry>("dismiss_access_upgrade_notice");
 }
 
 /** Set (or clear with `null`) a profile's tool-granular scope for one server (SOU-189):

@@ -338,7 +338,9 @@ it("shows a migrated default without rewriting the client and explicitly applies
       onRegistryChange={() => {}}
     />,
   );
-  expect(screen.getByRole("combobox", { name: "Access" })).toHaveTextContent("Default");
+  expect(screen.getByRole("combobox", { name: "Access" })).toHaveTextContent(
+    "Default access (Default)",
+  );
   expect(installGateway).not.toHaveBeenCalled();
   await userEvent.click(screen.getByRole("combobox", { name: "Access" }));
   await userEvent.click(
@@ -348,4 +350,41 @@ it("shows a migrated default without rewriting the client and explicitly applies
   await waitFor(() =>
     expect(installGateway).toHaveBeenCalledWith("claude-desktop", "@all-enabled", false),
   );
+});
+
+it("restores Default access with an empty scope and retains the default tool limits", async () => {
+  const reg = emptyRegistry();
+  reg.version = 3;
+  reg.defaultAccessContextId = "default";
+  reg.defaultAccessLegacyPolicy = true;
+  reg.profiles = [
+    {
+      id: "default",
+      name: "Kept tools",
+      enabledServerIds: [],
+      toolScope: { s: ["read"] },
+    },
+  ];
+  reg.clientScopes = { "claude-desktop": "@all-enabled" };
+  installGateway.mockResolvedValue({ backup: false });
+  render(
+    <ClientDetail
+      client={client({ gatewayInstalled: true, entryState: "managed" })}
+      registry={reg}
+      onChanged={() => {}}
+      onRegistryChange={() => {}}
+    />,
+  );
+  expect(screen.getByRole("combobox", { name: "Access" })).toHaveTextContent(
+    "All enabled servers",
+  );
+  await userEvent.click(screen.getByRole("combobox", { name: "Access" }));
+  await userEvent.click(
+    await screen.findByRole("option", { name: "Default access (Kept tools)" }),
+  );
+  await userEvent.click(screen.getByRole("button", { name: /apply access/i }));
+  await waitFor(() =>
+    expect(installGateway).toHaveBeenCalledWith("claude-desktop", undefined, false),
+  );
+  expect(reg.profiles[0]?.toolScope).toEqual({ s: ["read"] });
 });

@@ -216,7 +216,8 @@ fn parse_server_snippet(text: String) -> Result<Vec<clients::ParsedSnippetServer
 }
 
 #[tauri::command]
-fn add_server(state: State<RegistryState>, entry: ServerEntry) -> Result<Registry, String> {
+fn add_server(state: State<RegistryState>, mut entry: ServerEntry) -> Result<Registry, String> {
+    entry.enabled = false;
     let (reg, id) = write_registry(state.inner(), |reg| {
         Ok(crate::registry_controller::apply_add_entry(reg, entry))
     })?;
@@ -370,8 +371,7 @@ fn set_access_server(
 #[tauri::command]
 fn create_profile(state: State<RegistryState>, name: String) -> Result<Registry, String> {
     let (reg, _) = write_registry(state.inner(), |reg| {
-        crate::registry_controller::apply_create_profile(reg, &name);
-        Ok(())
+        crate::registry_controller::apply_create_profile(reg, &name)
     })?;
     Ok(reg)
 }
@@ -385,11 +385,12 @@ fn delete_profile(state: State<RegistryState>, id: String) -> Result<Registry, S
 }
 
 #[tauri::command]
-fn set_active_profile(state: State<RegistryState>, id: String) -> Result<Registry, String> {
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        crate::registry_controller::apply_set_active_profile(reg, &id)
-    })?;
-    Ok(reg)
+fn dismiss_access_upgrade_notice(state: State<RegistryState>) -> Result<Registry, String> {
+    write_registry(state.inner(), |reg| {
+        reg.dismiss_access_upgrade_notice();
+        Ok(())
+    })
+    .map(|(reg, ())| reg)
 }
 
 /// Replace the folder -> profile auto-routing mappings (SOU-188). A gateway serving a client
@@ -3823,7 +3824,7 @@ pub fn run() {
             set_default_access,
             set_access_server,
             delete_profile,
-            set_active_profile,
+            dismiss_access_upgrade_notice,
             set_folder_profiles,
             set_profile_server_tools,
             write_to_client,

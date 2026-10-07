@@ -366,7 +366,8 @@ pub fn apply_add_server(registry: &mut Registry, fields: ServerFields) -> Result
     ))
 }
 
-pub fn apply_add_entry(registry: &mut Registry, entry: ServerEntry) -> String {
+pub fn apply_add_entry(registry: &mut Registry, mut entry: ServerEntry) -> String {
+    entry.enabled = false;
     registry.add_server(entry)
 }
 
@@ -723,16 +724,14 @@ pub fn remove_server(server_id: &str) -> Result<Registry, String> {
     Ok(registry)
 }
 
-pub fn apply_create_profile(registry: &mut Registry, name: &str) {
-    registry.add_profile(name);
+pub fn apply_create_profile(registry: &mut Registry, name: &str) -> Result<(), String> {
+    registry::validate_access_set_name(name)?;
+    registry.add_profile(name.trim());
+    Ok(())
 }
 
 pub fn apply_delete_profile(registry: &mut Registry, profile_id: &str) -> Result<(), String> {
     registry.remove_profile(profile_id)
-}
-
-pub fn apply_set_active_profile(registry: &mut Registry, profile_id: &str) -> Result<(), String> {
-    registry.set_active_profile(profile_id)
 }
 
 pub fn create_profile(name: &str) -> Result<Registry, String> {
@@ -740,10 +739,7 @@ pub fn create_profile(name: &str) -> Result<Registry, String> {
     if name.is_empty() {
         return Err("give the profile a name".into());
     }
-    let (registry, ()) = registry::update(|registry| {
-        apply_create_profile(registry, name);
-        Ok(())
-    })?;
+    let (registry, ()) = registry::update(|registry| apply_create_profile(registry, name))?;
     Ok(registry)
 }
 
@@ -762,12 +758,6 @@ pub fn set_access_server(
     included: bool,
 ) -> Result<Registry, String> {
     registry::update(|r| r.set_access_server(profile_id, server_id, included)).map(|(r, ())| r)
-}
-
-pub fn set_active_profile(profile_id: &str) -> Result<Registry, String> {
-    let (registry, ()) =
-        registry::update(|registry| apply_set_active_profile(registry, profile_id))?;
-    Ok(registry)
 }
 
 pub fn set_all_enabled(profile_id: &str, enabled: bool) -> Result<Registry, String> {
@@ -1907,7 +1897,11 @@ pub fn apply_server_enabled(
             })
         {
             let context = registry.active_profile_id();
-            registry.set_access_server(&context, server_id, true)?;
+            if let Some(profile) = registry.profiles.iter_mut().find(|p| p.id == context) {
+                if !profile.enabled_server_ids.iter().any(|id| id == server_id) {
+                    profile.enabled_server_ids.push(server_id.into());
+                }
+            }
         }
         registry.set_global_server_enabled(server_id, enabled)
     } else {
@@ -2021,6 +2015,19 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.root).ok();
         }
+    }
+
+    #[test]
+    fn access_review_renderer_add_starts_disabled_and_names_are_reserved() {
+        let mut reg = Registry::default();
+        let mut entry = server("one");
+        entry.enabled = true;
+        let id = apply_add_entry(&mut reg, entry);
+        assert!(!reg.server_enabled(&id));
+        for name in ["@all-enabled", " @default-access:default"] {
+            assert!(apply_create_profile(&mut reg, name).is_err());
+        }
+        assert_eq!(reg.profiles.len(), 1);
     }
 
     #[test]
@@ -2322,7 +2329,7 @@ mod tests {
     #[test]
     fn shared_profile_mutations_keep_registry_invariants() {
         let mut registry = Registry::default();
-        apply_create_profile(&mut registry, "Work");
+        apply_create_profile(&mut registry, "Work").unwrap();
         let work = registry
             .profiles
             .iter()
@@ -2331,8 +2338,6 @@ mod tests {
             .id
             .clone();
 
-        apply_set_active_profile(&mut registry, &work).unwrap();
-        assert_eq!(registry.active_profile_id(), work);
         apply_delete_profile(&mut registry, &work).unwrap();
         assert_eq!(registry.profiles.len(), 1);
         assert!(apply_delete_profile(&mut registry, "default").is_err());

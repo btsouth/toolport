@@ -55,6 +55,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { AccessUpgradeNotice } from "@/components/AccessUpgradeNotice";
 import { AppSidebar } from "@/components/AppSidebar";
 import { ClientLogo } from "@/components/ClientLogo";
 import { PendingApprovals } from "@/components/PendingApprovals";
@@ -758,6 +759,10 @@ function App() {
         />
 
         <main className="flex min-w-0 flex-1 flex-col">
+          <AccessUpgradeNotice
+            registry={registry}
+            onRegistryChange={applyRegistryChange}
+          />
           <header className="flex items-center justify-between gap-4 border-b px-6 py-4">
             <div className="flex min-w-0 flex-1 items-center gap-3">
               {view === "clients" && selectedClient && (
