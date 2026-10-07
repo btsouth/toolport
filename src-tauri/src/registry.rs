@@ -268,18 +268,14 @@ pub(crate) fn append_lines_locked(
         // as replacement characters, which readers already skip (they `filter_map` the
         // JSON parse), and it ages out of the keep window like any other line.
         //
-        // The `atomic_write` result stays ignored on purpose, and is a different case: a
-        // failed rotation leaves the file oversized, so the NEXT append past the cap tries
-        // again. That self-heals; an unreadable file never would.
-        if let Ok(bytes) = std::fs::read(path) {
-            if let Some(hook) = after_snapshot {
-                hook();
-            }
-            let content = String::from_utf8_lossy(&bytes);
-            // Atomic + unique temp: several processes share this file, so a bespoke
-            // fixed temp name could let two rotations collide.
-            let _ = atomic_write(path, &trimmed_tail(&content, keep_lines));
+        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        if let Some(hook) = after_snapshot {
+            hook();
         }
+        let content = String::from_utf8_lossy(&bytes);
+        // A failed rotation keeps the appended history intact, but must be
+        // reported so telemetry health does not claim complete persistence.
+        atomic_write(path, &trimmed_tail(&content, keep_lines))?;
     }
     Ok(())
 }

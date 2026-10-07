@@ -2773,7 +2773,10 @@ fn project_budgeted(tools: &[&Value]) -> Vec<Value> {
 /// Append this process's health notes, such as a client moved to a private
 /// gateway, so an agent sees why its gateway behaves differently.
 fn with_status_notes(summary: String) -> String {
-    let notes = conduit_lib::daemon::status_notes();
+    let mut notes = conduit_lib::daemon::status_notes();
+    if let Some(notice) = conduit_lib::telemetry::health().notice() {
+        notes.push(notice);
+    }
     if notes.is_empty() {
         return summary;
     }
@@ -16284,6 +16287,7 @@ fn daemon_identity_json() -> String {
         "protocol": conduit_lib::daemon::PROTOCOL_GENERATION,
         "pid": std::process::id(),
         "gatewayVersion": env!("CARGO_PKG_VERSION"),
+        "telemetry": conduit_lib::telemetry::health(),
     })
     .to_string()
 }
@@ -16383,7 +16387,7 @@ fn spawn_daemon_idle_watchdog(
         }
         glog("daemon: idle exit");
         // Land any queued audit/savings/search-trace lines before the process exits.
-        conduit_lib::telemetry::flush();
+        conduit_lib::telemetry::shutdown();
         if let Some(dir) = descriptor_path.parent() {
             conduit_lib::daemon_log::end_run_cleanly(dir);
         }
@@ -16463,7 +16467,7 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
             while stdin.read(&mut bytes).unwrap_or(0) > 0 {}
             glog("private gateway: adapter closed its pipe, exiting");
             // Land any queued telemetry before the process exits.
-            conduit_lib::telemetry::flush();
+            conduit_lib::telemetry::shutdown();
             std::process::exit(0);
         });
         glog(&format!(
@@ -16477,7 +16481,7 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
             false,
             Arc::new(AtomicUsize::new(0)),
         );
-        conduit_lib::telemetry::flush();
+        conduit_lib::telemetry::shutdown();
         std::process::exit(0);
     }
     // Learn how the previous daemon ended and drop pointers to dead ones
@@ -16512,7 +16516,7 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
     );
     serve_http_loop_with_inflight(server, state, Some(token), search, false, inflight);
     // Land any queued telemetry before returning; the process exits right after.
-    conduit_lib::telemetry::flush();
+    conduit_lib::telemetry::shutdown();
     conduit_lib::daemon::clear_descriptor(&descriptor_path);
     conduit_lib::daemon_log::end_run_cleanly(&dir);
     std::process::exit(0);
@@ -16840,7 +16844,7 @@ fn serve_http_proxy(port: u16) -> Result<(), String> {
     }
     state.release();
     // stdin closed: land any queued telemetry before returning from the proxy loop.
-    conduit_lib::telemetry::flush();
+    conduit_lib::telemetry::shutdown();
     Ok(())
 }
 
@@ -17726,6 +17730,13 @@ fn main() {
         }
         ArgAction::Run => {}
     }
+    conduit_lib::gatewaylog::set_role(if daemon_requested(&cli_args) {
+        conduit_lib::gatewaylog::Role::Daemon
+    } else if cli_args.iter().any(|arg| arg == "--private-gateway") {
+        conduit_lib::gatewaylog::Role::Private
+    } else {
+        conduit_lib::gatewaylog::Role::Adapter
+    });
     if let Some(index) = cli_args.iter().position(|arg| arg == "--http-proxy") {
         let port = match cli_args.get(index + 1) {
             Some(value) => match value.parse::<u16>() {
@@ -18282,7 +18293,7 @@ fn main() {
     }
     // Client disconnected (stdin EOF or a broken pipe): land any queued
     // audit/savings/search-trace lines before this gateway exits.
-    conduit_lib::telemetry::flush();
+    conduit_lib::telemetry::shutdown();
 }
 
 #[cfg(test)]
@@ -24503,7 +24514,7 @@ mod tests {
         assert_eq!(call.status, 200, "body={}", call.body);
 
         // The audit append is asynchronous now: land it before reading the file.
-        conduit_lib::telemetry::flush();
+        conduit_lib::telemetry::shutdown();
         let audit = std::fs::read_to_string(dir.join("audit.jsonl")).expect("audit log exists");
 
         let entry: Value = audit

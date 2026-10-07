@@ -61,6 +61,7 @@ pub(super) struct ActivitySnapshot {
     /// Per-server aggregation of the full retained log (`audit::stats` rows),
     /// busiest first; each row carries its per-tool breakdown.
     pub(super) server_stats: Vec<serde_json::Value>,
+    pub(super) telemetry_notices: Vec<String>,
 }
 
 impl ActivitySnapshot {
@@ -151,6 +152,7 @@ impl ActivitySnapshot {
             tool_identities: Vec::new(),
             tool_identities_error: None,
             server_stats: Vec::new(),
+            telemetry_notices: Vec::new(),
         }
     }
 }
@@ -268,6 +270,8 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
         .unwrap_or_default();
     let mut snapshot = ActivitySnapshot::from_entries(entries, 100);
     snapshot.server_stats = server_stats;
+    snapshot.telemetry_notices =
+        crate::telemetry::activity_notices(&crate::telemetry::activity_health());
     snapshot.security_events = crate::integrity::read_recent(25)
         .map_err(|error| format!("could not read security events: {error}"))?;
     snapshot.search_traces = crate::searchtrace::read_recent(25)

@@ -15,6 +15,41 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+static ROLE: AtomicU8 = AtomicU8::new(0);
+
+#[derive(Clone, Copy)]
+pub enum Role {
+    Adapter,
+    Daemon,
+    Private,
+}
+
+pub fn set_role(role: Role) {
+    ROLE.store(
+        match role {
+            Role::Adapter => 1,
+            Role::Daemon => 2,
+            Role::Private => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+fn format_line(msg: &str, millis: u64, pid: u32, role: &str) -> String {
+    let seconds = millis / 1000 % 86_400;
+    let msg = crate::registry::redact_secret_text(&crate::redact_url_userinfo(msg))
+        .replace(['\n', '\r'], " ");
+    format!(
+        "{}T{:02}:{:02}:{:02}.{:03}Z pid={pid} role={role} {msg}",
+        crate::usage_report::utc_day(millis),
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60,
+        millis % 1000
+    )
+}
 
 /// Keep the always-on gateway log bounded; trimmed to roughly the back half once
 /// it grows past this, so a long-running client can't let it grow without limit.
@@ -26,7 +61,16 @@ pub fn append(msg: &str) {
     let Some(path) = crate::registry::gateway_log_path() else {
         return;
     };
-    append_to(&path, msg);
+    let role = match ROLE.load(Ordering::Relaxed) {
+        1 => "adapter",
+        2 => "daemon",
+        _ => "private",
+    };
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    append_to(&path, &format_line(msg, millis, std::process::id(), role));
 }
 
 /// How long an append waits for the shared log lock before writing without it.
@@ -135,6 +179,17 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn log_line_has_timestamp_pid_role_and_redacts_credentials() {
+        for role in ["adapter", "daemon", "private"] {
+            let line = format_line("connect https://alice:password@example.com api_key=sk-live-secretvalue1234567890\nforged", 1234, 42, role);
+            assert!(line.starts_with(&format!("1970-01-01T00:00:01.234Z pid=42 role={role} ")));
+            assert!(!line.contains("password"));
+            assert!(!line.contains("secretvalue"));
+            assert!(!line.contains('\n'));
+        }
+    }
 
     static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
 

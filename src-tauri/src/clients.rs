@@ -5147,11 +5147,11 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
 // edit: existing servers (and their secret env values) are left untouched.
 // ---------------------------------------------------------------------------
 
-pub(crate) fn resolve_gateway_path() -> Option<PathBuf> {
-    if let Some(p) = crate::gateway_publish::client_gateway_path() {
-        return Some(p);
+pub(crate) fn resolve_gateway_path() -> Result<Option<PathBuf>, String> {
+    if let Some(p) = crate::gateway_publish::client_gateway_path()? {
+        return Ok(Some(p));
     }
-    resolve_gateway_sidecar()
+    Ok(resolve_gateway_sidecar())
 }
 
 /// [`resolve_gateway_path`] with every side effect removed: no publish of the bundled
@@ -5390,7 +5390,7 @@ fn files_have_same_bytes(a: &std::path::Path, b: &std::path::Path) -> bool {
 }
 
 fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, String> {
-    let path = resolve_gateway_path().ok_or("Could not locate the toolport-gateway binary")?;
+    let path = resolve_gateway_path()?.ok_or("Could not locate the toolport-gateway binary")?;
     let env_var = |k: &str, v: &str| crate::registry::EnvVar {
         key: k.to_string(),
         value: Some(v.to_string()),
@@ -6024,8 +6024,15 @@ fn referenced_gateway_paths_in(clients: &[DetectedClient]) -> Option<Vec<PathBuf
 }
 
 pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> RepointOutcome {
-    let outcome = RepointOutcome::default();
-    let Some(current) = resolve_gateway_path().map(|p| p.to_string_lossy().into_owned()) else {
+    let mut outcome = RepointOutcome::default();
+    let current = match resolve_gateway_path() {
+        Ok(path) => path,
+        Err(error) => {
+            outcome.failed.push(("gateway publication".into(), error));
+            return outcome;
+        }
+    };
+    let Some(current) = current.map(|p| p.to_string_lossy().into_owned()) else {
         return outcome;
     };
     // Never re-point onto a binary that isn't there (resolve_gateway_path returns a

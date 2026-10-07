@@ -3459,7 +3459,10 @@ impl ActivityPage {
         self.feedback.set_label("");
         self.feedback.remove_css_class("error");
         self.feedback.remove_css_class("success");
-        self.feedback.set_visible(false);
+        self.feedback
+            .set_label(&snapshot.telemetry_notices.join("\n"));
+        self.feedback
+            .set_visible(!snapshot.telemetry_notices.is_empty());
         self.clear_button.set_sensitive(
             snapshot.call_count > 0
                 || snapshot.savings_list_loads > 0
@@ -5947,9 +5950,13 @@ fn open_shared_setup(url: &str, page: ServerPage) {
             open_url: Box::new(|url| { let _ = crate::oauth::open_web_url(url); }),
         };
         let pair_origin = origin.clone();
-        pairing::request(hooks, &origin, Box::new(move |cancel, show| {
-            crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
-        }));
+        pairing::request(
+            hooks,
+            &origin,
+            Box::new(move |cancel, show| {
+                crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
+            }),
+        );
         return;
     }
     let Some(id) = crate::sharing_controller::parse_share_url(url) else {

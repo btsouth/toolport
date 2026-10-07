@@ -1843,8 +1843,12 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
                         if stop.load(std::sync::atomic::Ordering::Acquire) { break; }
                         let state = handle.state::<RegistryState>();
                         match finish_sync(&handle, state.inner(), result) {
-                            Ok(fresh) => { let _ = handle.emit("team-sync-registry", &fresh); }
-                            Err(error) => eprintln!("Toolport: Teams registry refresh failed: {error}"),
+                            Ok(fresh) => {
+                                let _ = handle.emit("team-sync-registry", &fresh);
+                            }
+                            Err(error) => {
+                                eprintln!("Toolport: Teams registry refresh failed: {error}")
+                            }
                         }
                         teams::retry_delay_seconds(0)
                     }
@@ -1941,8 +1945,14 @@ fn team_disconnect(state: State<RegistryState>) -> Result<Registry, String> {
 }
 
 #[tauri::command]
-async fn team_use_managed(app: tauri::AppHandle, state: State<'_, RegistryState>, server_id: String) -> Result<Registry, String> {
-    tauri::async_runtime::spawn_blocking(move || teams::use_managed_server(&server_id)).await.map_err(|e| e.to_string())??;
+async fn team_use_managed(
+    app: tauri::AppHandle,
+    state: State<'_, RegistryState>,
+    server_id: String,
+) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || teams::use_managed_server(&server_id))
+        .await
+        .map_err(|e| e.to_string())??;
     let fresh = reload_into_state(state.inner())?;
     let _ = app.emit("team-sync-registry", &fresh);
     Ok(fresh)
@@ -1952,11 +1962,17 @@ async fn team_use_managed(app: tauri::AppHandle, state: State<'_, RegistryState>
 /// only, secret values never sent). Remote instructions and policy fields are preserved, and
 /// an optimistic-concurrency conflict is returned rather than overwriting another admin.
 #[tauri::command]
-async fn team_push_preview(state: State<'_, RegistryState>, selected_ids: Option<Vec<String>>) -> Result<teams::PushPreview, String> {
+async fn team_push_preview(
+    state: State<'_, RegistryState>,
+    selected_ids: Option<Vec<String>>,
+) -> Result<teams::PushPreview, String> {
     refresh_from_disk(state.inner())?;
-    tauri::async_runtime::spawn_blocking(move || match selected_ids { Some(ids) => teams::preview_push_selected(&ids), None => teams::preview_push_current() })
-        .await
-        .map_err(|e| format!("push preview task join failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || match selected_ids {
+        Some(ids) => teams::preview_push_selected(&ids),
+        None => teams::preview_push_current(),
+    })
+    .await
+    .map_err(|e| format!("push preview task join failed: {e}"))?
 }
 
 #[tauri::command]
@@ -1968,8 +1984,10 @@ async fn team_push(
 ) -> Result<teams::PublishResult, String> {
     refresh_from_disk(state.inner())?;
     // push_current does a blocking GET + PUT to the team server; keep it off the main thread.
-    tauri::async_runtime::spawn_blocking(move || {
-        match selected_ids { Some(ids) => teams::push_selected(&ids, base_version, &local_fingerprint), None => teams::push_current(base_version, &local_fingerprint).map(teams::PublishResult::whole_set) }
+    tauri::async_runtime::spawn_blocking(move || match selected_ids {
+        Some(ids) => teams::push_selected(&ids, base_version, &local_fingerprint),
+        None => teams::push_current(base_version, &local_fingerprint)
+            .map(teams::PublishResult::whole_set),
     })
     .await
     .map_err(|e| format!("push task join failed: {e}"))?
@@ -3392,7 +3410,11 @@ struct TeamPairEvent {
 
 impl TeamPairEvent {
     fn new(state: &'static str) -> Self {
-        Self { state, check: None, message: None }
+        Self {
+            state,
+            check: None,
+            message: None,
+        }
     }
 }
 
@@ -3407,12 +3429,21 @@ fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
         if let Some(current) = pairing.as_ref() {
             // A repeated link brings the waiting prompt back instead of pairing twice.
             if let Some(check) = &current.check {
-                let _ = app.emit("team-pair", TeamPairEvent { check: Some(check.clone()), ..TeamPairEvent::new("pending") });
+                let _ = app.emit(
+                    "team-pair",
+                    TeamPairEvent {
+                        check: Some(check.clone()),
+                        ..TeamPairEvent::new("pending")
+                    },
+                );
             }
             return;
         }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        *pairing = Some(TeamPairing { cancel: std::sync::Arc::clone(&cancel), check: None });
+        *pairing = Some(TeamPairing {
+            cancel: std::sync::Arc::clone(&cancel),
+            check: None,
+        });
         cancel
     };
     let pending = TeamPairGuard(std::sync::Arc::clone(&cancel));
@@ -3968,11 +3999,15 @@ pub fn run() {
                         );
                     }
                 }
-                if let Some(published) = crate::gateway_publish::publish_bundled_gateway() {
-                    eprintln!(
-                        "toolport: published client gateway at {}",
-                        published.display()
-                    );
+                match crate::gateway_publish::publish_bundled_gateway() {
+                    Ok(Some(published)) => eprintln!("toolport: published client gateway at {}", published.display()),
+                    Ok(None) => {}
+                    Err(error) => {
+                        crate::daemon::add_status_note("Gateway publication incomplete. Retry after fixing data directory access.");
+                        eprintln!("toolport: gateway publication incomplete: {error}");
+                        let _ = migrate_handle.notification().builder().title("Gateway publication incomplete")
+                            .body("The gateway manifest could not be saved. Fix data directory access and reopen Toolport.").show();
+                    }
                 }
                 // An in-app update deliberately stops the supervised HTTP child
                 // before replacing files. The durable intent carries its exact
@@ -4017,12 +4052,17 @@ pub fn run() {
                             ids.join(", ")
                         );
                         // Refresh ownership records for everything we rewrote (SOU-406).
-                        let _ = registry::update(|reg| {
+                        if let Err(error) = registry::update(|reg| {
                             for (id, entry) in &repoint.repointed {
                                 reg.set_client_managed_entry(id, entry.clone());
                             }
                             Ok(())
-                        });
+                        }) {
+                            crate::daemon::add_status_note("Client configs updated, but ownership state was not saved. Retry after fixing registry access.");
+                            eprintln!("toolport: client configs updated, but ownership state was not saved: {error}");
+                            let _ = migrate_handle.notification().builder().title("Client update incomplete")
+                                .body("Client configs changed, but their ownership state could not be saved. Fix registry access and reopen Toolport.").show();
+                        }
                     }
                     if !repoint.customized.is_empty() {
                         eprintln!(
@@ -4201,7 +4241,7 @@ pub fn run() {
             // (a clean Unreachable) rather than connecting to the dead port we left behind.
             if matches!(event, tauri::RunEvent::Exit) {
                 // Land any queued audit/savings/search-trace lines before the app exits.
-                crate::telemetry::flush();
+                crate::telemetry::shutdown();
                 if let Some(stop) = app_handle.try_state::<TeamLifecycleStop>() {
                     stop.0.store(true, std::sync::atomic::Ordering::Release);
                 }

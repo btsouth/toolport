@@ -30,7 +30,11 @@ pub fn audit_path() -> Option<PathBuf> {
 pub fn try_clear() -> std::io::Result<()> {
     // Write anything queued before deleting, so a line already accepted by a
     // `record_*` call cannot reappear after the clear.
-    crate::telemetry::flush();
+    if !crate::telemetry::flush() {
+        return Err(std::io::Error::other(
+            "Telemetry is still pending; retry clearing Activity",
+        ));
+    }
     let Some(path) = audit_path() else {
         return Ok(());
     };
@@ -561,10 +565,13 @@ pub fn stats() -> std::io::Result<Value> {
         content: None,
         stats: Value::Null,
     });
-    Ok(CACHE
+    let mut stats = CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(content))
+        .get(content);
+    stats["telemetry"] = crate::telemetry::activity_health();
+    stats["gatewayNotes"] = serde_json::json!(crate::daemon::status_notes());
+    Ok(stats)
 }
 
 /// Cache one exact snapshot, bounded by the normal log cap. Idle Activity polls

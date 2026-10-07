@@ -1,54 +1,28 @@
-//! Background writer for the append-only telemetry logs.
+//! Bounded background writer for audit, savings and search-trace logs.
 //!
-//! The audit, savings and search-trace logs used to be appended on the request
-//! thread. That put a cross-process file lock, a write and - whenever a cap was
-//! crossed - a full read-and-rewrite with fsync between a request and its
-//! response (PERF-05, PERF-10; 46 ms p95 rotation stall). Now the caller formats
-//! the line and hands it to one process-wide writer thread, which batches records
-//! per file, takes each file's existing cross-process lock once per batch, and
-//! applies the existing cap and rotation logic there. The on-disk formats, file
-//! names, caps and lock files are unchanged, so the app and a second gateway keep
-//! reading and writing the same files; they just see lines up to one flush
-//! interval later.
-//!
-//! Failure policy: the logs are an audit trail, so a record must not vanish
-//! silently. When the queue is full or the writer is gone, the caller appends
-//! synchronously through the same capped path. The queue is bounded, so a stalled
-//! writer cannot grow memory without limit.
-//!
-//! Durability: a plain batch append is not fsynced per line, so a crash can lose
-//! up to the last flush interval ([`FLUSH_INTERVAL`]). Rotation still publishes
-//! through [`crate::registry::atomic_write`], which fsyncs its temp file before the
-//! rename. [`flush`] blocks until everything queued before it is on disk; gateway
-//! shutdown and every in-process reader call it so they never miss their own
-//! writes.
+//! Admission never performs disk IO or waits for queue space. Overload and write
+//! failures are counted in process-lifetime health, exposed by status and Activity.
+//! A crash can lose queued records. Flush is a bounded FIFO barrier, not an fsync
+//! guarantee; a timed-out barrier leaves the writer running and health degraded.
 
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Lines held before a batch is written even when the interval has not elapsed.
 const BATCH_MAX: usize = 64;
-/// Longest a queued line waits for the batch to fill.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
-/// Bounded queue. A full queue falls back to the synchronous append, so a burst
-/// never blocks the caller and memory cannot grow without limit. Generous enough
-/// that the fallback only triggers when the writer is genuinely backed up.
 const QUEUE_CAPACITY: usize = 8192;
+const FLUSH_BUDGET: Duration = Duration::from_millis(500);
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
 
-/// Which existing cap/rotation contract applies to a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Rotation {
-    /// [`crate::registry::append_lines_locked`]: trim to `keep_lines` once past
-    /// `max_bytes`. Used by the audit and search-trace logs.
     TrimTail { max_bytes: u64, keep_lines: usize },
-    /// [`crate::savings::append_lines_at`]: fold older lines into one carry line
-    /// once past `max_bytes`, preserving the running total.
     Savings { max_bytes: u64, keep_lines: usize },
 }
 
-/// One queued append.
 struct Record {
     path: std::path::PathBuf,
     line: String,
@@ -57,130 +31,244 @@ struct Record {
 
 enum Msg {
     Record(Record),
-    /// Flush everything queued before this message, then acknowledge.
     Flush(SyncSender<()>),
 }
 
-static WRITER: OnceLock<Option<SyncSender<Msg>>> = OnceLock::new();
-
-/// The process-wide writer's sender, spawning the thread on first use.
-fn sender() -> &'static Option<SyncSender<Msg>> {
-    WRITER.get_or_init(|| {
-        let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE_CAPACITY);
-        match std::thread::Builder::new()
-            .name("toolport-telemetry".to_string())
-            .spawn(move || writer_loop(rx))
-        {
-            Ok(_) => Some(tx),
-            // No writer thread means every `record` falls back to the synchronous
-            // append; the logs still fill, just on the caller.
-            Err(_) => None,
-        }
-    })
+#[derive(Default)]
+struct Counters {
+    queue_dropped: AtomicU64,
+    write_failed_records: AtomicU64,
+    write_failures: AtomicU64,
+    flush_timeouts: AtomicU64,
 }
 
-/// Queue one already-serialized JSONL `line` for `path`, falling back to a
-/// synchronous append when the queue is full or the writer is gone. Never blocks
-/// on file IO on the calling thread.
+/// Counters since this process started, not durable totals. A failed batch may
+/// have partially landed; `write_failed_records` means persistence was unconfirmed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Health {
+    pub queue_dropped: u64,
+    pub write_failed_records: u64,
+    pub write_failures: u64,
+    pub flush_timeouts: u64,
+}
+
+impl Health {
+    pub fn notice(&self) -> Option<String> {
+        if self == &Self::default() {
+            return None;
+        }
+        Some(format!(
+            "Activity and savings may be incomplete: {} records dropped, {} records with unconfirmed writes, {} write failures, {} flush timeouts since gateway start.",
+            self.queue_dropped, self.write_failed_records, self.write_failures, self.flush_timeouts
+        ))
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.queue_dropped = self.queue_dropped.saturating_add(other.queue_dropped);
+        self.write_failed_records = self
+            .write_failed_records
+            .saturating_add(other.write_failed_records);
+        self.write_failures = self.write_failures.saturating_add(other.write_failures);
+        self.flush_timeouts = self.flush_timeouts.saturating_add(other.flush_timeouts);
+    }
+}
+
+impl Counters {
+    fn health(&self) -> Health {
+        Health {
+            queue_dropped: self.queue_dropped.load(Ordering::Relaxed),
+            write_failed_records: self.write_failed_records.load(Ordering::Relaxed),
+            write_failures: self.write_failures.load(Ordering::Relaxed),
+            flush_timeouts: self.flush_timeouts.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct Writer {
+    tx: Option<SyncSender<Msg>>,
+    counters: Arc<Counters>,
+}
+
+static WRITER: OnceLock<Writer> = OnceLock::new();
+
+fn writer() -> &'static Writer {
+    WRITER.get_or_init(|| Writer::spawn(QUEUE_CAPACITY, append_batch))
+}
+
+impl Writer {
+    fn spawn(
+        capacity: usize,
+        append: impl FnMut(&Path, &[String], Rotation) -> Result<(), String> + Send + 'static,
+    ) -> Self {
+        let counters = Arc::new(Counters::default());
+        let worker_counters = counters.clone();
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        let tx = std::thread::Builder::new()
+            .name("toolport-telemetry".into())
+            .spawn(move || writer_loop(rx, &worker_counters, append))
+            .ok()
+            .map(|_| tx);
+        Self { tx, counters }
+    }
+
+    fn record(&self, record: Record) {
+        if self
+            .tx
+            .as_ref()
+            .is_none_or(|tx| tx.try_send(Msg::Record(record)).is_err())
+        {
+            self.counters.queue_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn flush(&self, budget: Duration) -> bool {
+        let Some(tx) = &self.tx else {
+            self.counters.flush_timeouts.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        if tx.try_send(Msg::Flush(done_tx)).is_ok() && done_rx.recv_timeout(budget).is_ok() {
+            return true;
+        }
+        self.counters.flush_timeouts.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
 pub(crate) fn record(path: &Path, line: &str, rotation: Rotation) {
-    let record = Record {
+    writer().record(Record {
         path: path.to_path_buf(),
         line: line.to_string(),
         rotation,
-    };
-    let pending = if let Some(tx) = sender() {
-        tx.try_send(Msg::Record(record)).err().and_then(rejected_record)
-    } else {
-        Some(record)
-    };
-    if let Some(record) = pending {
-        append_sync(&record);
+    });
+}
+
+/// Bounded barrier for in-process readers. False means queued writes are still
+/// pending or the writer is unavailable; callers must not claim a complete read.
+pub fn flush() -> bool {
+    WRITER.get().is_none_or(|writer| writer.flush(FLUSH_BUDGET))
+}
+
+/// Drain on orderly gateway exit for at most two seconds. Never joins a writer
+/// stuck in filesystem IO. The OS ends it when the process exits.
+pub fn shutdown() {
+    if WRITER
+        .get()
+        .is_some_and(|writer| !writer.flush(SHUTDOWN_BUDGET))
+    {
+        eprintln!("toolport: telemetry shutdown budget exhausted; queued records may be lost");
     }
 }
 
-/// The record a failed `try_send` handed back. `try_send` only returns the message
-/// it was given, which is always a record on this path.
-fn rejected_record(error: TrySendError<Msg>) -> Option<Record> {
-    match error {
-        TrySendError::Full(Msg::Record(record))
-        | TrySendError::Disconnected(Msg::Record(record)) => Some(record),
-        _ => None,
-    }
+pub fn health() -> Health {
+    WRITER
+        .get()
+        .map(|writer| writer.counters.health())
+        .unwrap_or_default()
 }
 
-/// Block until every line queued before this call has been written and any
-/// rotation it triggered has completed.
-///
-/// A no-op when nothing was ever queued, so read-only processes never start the
-/// writer thread just to read.
-pub fn flush() {
-    let Some(Some(tx)) = WRITER.get() else {
-        return;
+/// Activity reads the current shared daemon's live counters over its authenticated
+/// identity endpoint. Failure is visible as unknown; it is never a healthy zero.
+/// This read-only probe never starts a daemon or touches disk on the call path.
+pub fn activity_health() -> serde_json::Value {
+    let mut local = health();
+    let Some(dir) = crate::registry::conduit_dir() else {
+        return serde_json::json!(local);
     };
-    let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
-    if tx.send(Msg::Flush(done_tx)).is_ok() {
-        // FIFO: the writer reaches this only after every record queued before it.
-        // A disconnected writer has already drained or handed its records back to
-        // the synchronous fallback.
-        let _ = done_rx.recv();
+    let compat =
+        crate::topology::CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string());
+    let path = crate::daemon::descriptor_path(&dir, &compat);
+    let Some(descriptor) = crate::daemon::read_descriptor(&path) else {
+        return serde_json::json!(local);
+    };
+    if descriptor.pid == std::process::id() {
+        return serde_json::json!(local);
+    }
+    let result = ureq::get(&format!(
+        "http://{}{}",
+        descriptor.endpoint,
+        crate::daemon::IDENTITY_PATH
+    ))
+    .set("Authorization", &format!("Bearer {}", descriptor.token))
+    .timeout(Duration::from_millis(500))
+    .call()
+    .map_err(|_| ())
+    .and_then(|response| response.into_json::<serde_json::Value>().map_err(|_| ()))
+    .and_then(|identity| {
+        if identity["compat"].as_str() != Some(compat.fingerprint().as_str()) {
+            return Err(());
+        }
+        serde_json::from_value::<Health>(identity["telemetry"].clone()).map_err(|_| ())
+    });
+    match result {
+        Ok(remote) => {
+            local.merge(&remote);
+            serde_json::json!(local)
+        }
+        Err(()) => {
+            let mut value = serde_json::json!(local);
+            value["unavailable"] = serde_json::json!(true);
+            value
+        }
     }
 }
 
-fn writer_loop(rx: Receiver<Msg>) {
-    let mut pending: Vec<Record> = Vec::new();
-    let mut waiters: Vec<SyncSender<()>> = Vec::new();
+/// Shared wording for the existing native Activity status surface.
+pub fn activity_notices(value: &serde_json::Value) -> Vec<String> {
+    let mut notes = crate::daemon::status_notes();
+    if let Ok(health) = serde_json::from_value::<Health>(value.clone()) {
+        if let Some(notice) = health.notice() {
+            notes.push(notice);
+        }
+    }
+    if value["unavailable"].as_bool() == Some(true) {
+        notes.push(
+            "Gateway telemetry health is unavailable. Activity and savings may be incomplete."
+                .into(),
+        );
+    }
+    notes
+}
+
+fn writer_loop(
+    rx: Receiver<Msg>,
+    counters: &Counters,
+    mut append: impl FnMut(&Path, &[String], Rotation) -> Result<(), String>,
+) {
+    let mut pending = Vec::new();
     loop {
-        let mut disconnected = false;
-        let flush_now = match rx.recv() {
-            Ok(Msg::Record(record)) => {
-                pending.push(record);
-                false
-            }
-            Ok(Msg::Flush(done)) => {
-                waiters.push(done);
-                true
-            }
+        let mut done = None;
+        match rx.recv() {
+            Ok(Msg::Record(record)) => pending.push(record),
+            Ok(Msg::Flush(waiter)) => done = Some(waiter),
             Err(_) => break,
-        };
-        if !flush_now {
+        }
+        if done.is_none() {
             let deadline = Instant::now() + FLUSH_INTERVAL;
             while pending.len() < BATCH_MAX {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                match rx.recv_timeout(remaining) {
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(Msg::Record(record)) => pending.push(record),
-                    Ok(Msg::Flush(done)) => {
-                        waiters.push(done);
+                    Ok(Msg::Flush(waiter)) => {
+                        done = Some(waiter);
                         break;
                     }
-                    Err(RecvTimeoutError::Timeout) => break,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
                 }
             }
         }
-        if !pending.is_empty() {
-            deliver(&mut pending);
+        deliver(&mut pending, counters, &mut append);
+        if let Some(done) = done {
+            let _ = done.send(());
         }
-        // Acknowledge only after the batch is on disk.
-        for waiter in waiters.drain(..) {
-            let _ = waiter.send(());
-        }
-        if disconnected {
-            break;
-        }
-    }
-    // Channel closed: write whatever is left so a clean shutdown loses nothing.
-    if !pending.is_empty() {
-        deliver(&mut pending);
     }
 }
 
-/// Group a batch by file and append each file's lines under one lock. Batches are
-/// at most [`BATCH_MAX`] lines, so a linear scan for the (few) distinct paths is
-/// cheaper than allocating a map.
-fn deliver(pending: &mut Vec<Record>) {
+fn deliver(
+    pending: &mut Vec<Record>,
+    counters: &Counters,
+    append: &mut impl FnMut(&Path, &[String], Rotation) -> Result<(), String>,
+) {
     let mut groups: Vec<(std::path::PathBuf, Rotation, Vec<String>)> = Vec::new();
     for record in pending.drain(..) {
         match groups.iter_mut().find(|group| group.0 == record.path) {
@@ -189,35 +277,31 @@ fn deliver(pending: &mut Vec<Record>) {
         }
     }
     for (path, rotation, lines) in groups {
-        append_batch(&path, &lines, rotation);
+        if append(&path, &lines, rotation).is_err() {
+            counters.write_failures.fetch_add(1, Ordering::Relaxed);
+            counters
+                .write_failed_records
+                .fetch_add(lines.len() as u64, Ordering::Relaxed);
+            // Fixed text: paths and OS/downstream errors can contain credentials.
+            // Only the writer logs, so even a blocked gateway log cannot stall admission.
+            crate::gatewaylog::append(
+                "telemetry batch persistence failed; Activity and savings may be incomplete",
+            );
+        }
     }
 }
 
-fn append_batch(path: &Path, lines: &[String], rotation: Rotation) {
+fn append_batch(path: &Path, lines: &[String], rotation: Rotation) -> Result<(), String> {
     match rotation {
         Rotation::TrimTail {
             max_bytes,
             keep_lines,
-        } => {
-            if let Err(error) =
-                crate::registry::append_lines_locked(path, lines, max_bytes, keep_lines, None)
-            {
-                eprintln!("toolport: telemetry batch dropped for '{}': {error}", path.display());
-            }
-        }
+        } => crate::registry::append_lines_locked(path, lines, max_bytes, keep_lines, None),
         Rotation::Savings {
             max_bytes,
             keep_lines,
-        } => {
-            let _ = crate::savings::append_lines_at(path, lines, max_bytes, keep_lines);
-        }
+        } => crate::savings::append_lines_at(path, lines, max_bytes, keep_lines),
     }
-}
-
-/// The synchronous fallback, also used directly by tests. Same capped path as the
-/// writer thread so a full queue changes only WHEN a line lands, not whether.
-fn append_sync(record: &Record) {
-    append_batch(&record.path, std::slice::from_ref(&record.line), record.rotation);
 }
 
 #[cfg(test)]
@@ -244,6 +328,110 @@ mod tests {
             max_bytes,
             keep_lines,
         }
+    }
+
+    fn fixture_record(n: u64) -> Record {
+        Record {
+            path: PathBuf::from("unused"),
+            line: n.to_string(),
+            rotation: trimmed(1024, 100),
+        }
+    }
+
+    #[test]
+    fn slow_writer_and_full_queue_never_block_admission_or_flush() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut gate = Some(release_rx);
+        let writer = Arc::new(Writer::spawn(2, move |_, _, _| {
+            if let Some(gate) = gate.take() {
+                started_tx.send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            Ok(())
+        }));
+        writer.record(fixture_record(0));
+        // FIFO barrier forces delivery without a sleep or waiting for a timer.
+        let (barrier_tx, barrier_rx) = mpsc::sync_channel(1);
+        writer
+            .tx
+            .as_ref()
+            .unwrap()
+            .try_send(Msg::Flush(barrier_tx))
+            .unwrap_or_else(|_| panic!("barrier queue full"));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (returned_tx, returned_rx) = mpsc::sync_channel(1);
+        let caller = writer.clone();
+        let handle = std::thread::spawn(move || {
+            caller.record(fixture_record(1));
+            caller.record(fixture_record(2));
+            caller.record(fixture_record(3));
+            let flushed = caller.flush(Duration::ZERO);
+            returned_tx
+                .send((caller.counters.health(), flushed))
+                .unwrap();
+        });
+        // A bounded receive proves the caller completes WHILE the writer is held.
+        let result = returned_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        handle.join().unwrap();
+        barrier_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (health, flushed) = result.expect("admission stalled behind the slow writer");
+        assert!(!flushed);
+        assert_eq!(health.queue_dropped, 1);
+        assert_eq!(health.flush_timeouts, 1);
+        let status = serde_json::to_value(&health).unwrap();
+        assert_eq!(status["queueDropped"], 1);
+        assert!(health.notice().unwrap().contains("1 records dropped"));
+        assert!(writer.flush(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn disconnected_writer_counts_drops_without_disk_fallback() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(rx);
+        let writer = Writer {
+            tx: Some(tx),
+            counters: Arc::new(Counters::default()),
+        };
+        writer.record(fixture_record(0));
+        assert_eq!(writer.counters.health().queue_dropped, 1);
+        assert!(!writer.flush(Duration::ZERO));
+    }
+
+    #[test]
+    fn failed_batches_count_unconfirmed_records_for_audit_and_savings() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = scratch("failed-batches");
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        for rotation in [
+            trimmed(1024, 100),
+            Rotation::Savings {
+                max_bytes: 1024,
+                keep_lines: 100,
+            },
+        ] {
+            for error in [
+                "Permission denied",
+                "No space left on device",
+                "rename failed",
+            ] {
+                let counters = Counters::default();
+                let mut pending = vec![fixture_record(1), fixture_record(2)];
+                for record in &mut pending {
+                    record.rotation = rotation;
+                }
+                deliver(&mut pending, &counters, &mut |_, _, _| Err(error.into()));
+                let health = counters.health();
+                assert_eq!(health.write_failures, 1);
+                assert_eq!(health.write_failed_records, 2);
+                assert!(health
+                    .notice()
+                    .unwrap()
+                    .contains("2 records with unconfirmed writes"));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Concurrent recorders all land exactly once, never torn or interleaved.
@@ -301,8 +489,7 @@ mod tests {
     fn record_does_not_block_on_a_held_lock() {
         let dir = scratch("held-lock");
         let path = dir.join("audit.jsonl");
-        // Drain anything other tests queued, so this record takes the non-blocking
-        // enqueue path rather than the (allowed) synchronous fallback.
+        // Drain anything other tests queued before holding the append lock.
         flush();
         let guard = crate::registry::lock_at(&path).expect("hold the append lock");
 
@@ -317,37 +504,10 @@ mod tests {
         drop(guard);
         flush();
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("{\"held\":true}"), "line landed: {content}");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// When the queue is full the caller falls back to the synchronous append, so
-    /// a full channel loses nothing. Uses a local channel to avoid racing the
-    /// process-wide writer.
-    #[test]
-    fn full_queue_falls_back_to_the_synchronous_append() {
-        let (tx, _rx) = mpsc::sync_channel::<Msg>(1);
-        let dir = scratch("fallback");
-        let path = dir.join("audit.jsonl");
-
-        // Fill the lone slot.
-        assert!(tx.try_send(Msg::Record(Record {
-            path: path.clone(),
-            line: "{\"first\":true}".to_string(),
-            rotation: trimmed(1024 * 1024, 100),
-        })).is_ok());
-
-        let blocked = Record {
-            path: path.clone(),
-            line: "{\"second\":true}".to_string(),
-            rotation: trimmed(1024 * 1024, 100),
-        };
-        let error = tx.try_send(Msg::Record(blocked)).expect_err("queue is full");
-        let record = rejected_record(error).expect("a record came back");
-        append_sync(&record);
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("{\"second\":true}"), "fallback wrote: {content}");
+        assert!(
+            content.contains("{\"held\":true}"),
+            "line landed: {content}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

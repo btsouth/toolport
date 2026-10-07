@@ -780,8 +780,10 @@ fn stringify(e: ureq::Error) -> String {
 /// A portal link for this installation's existing Team opens it without replacing
 /// the connection or resetting local review/authentication. This is not a health check.
 pub fn pair_target_is_current(reg: &Registry, origin: &str, team: &str) -> bool {
-    reg.team.as_ref().is_some_and(|current| current.team_id == team
-        && current.server_url.trim_end_matches('/') == origin.trim_end_matches('/'))
+    reg.team.as_ref().is_some_and(|current| {
+        current.team_id == team
+            && current.server_url.trim_end_matches('/') == origin.trim_end_matches('/')
+    })
 }
 
 pub fn parse_pair_link(raw: &str) -> Option<(String, String)> {
@@ -867,7 +869,7 @@ pub fn pair_device(
         if let Some(code) = data["connectCode"].as_str() {
             match connect(origin, code, None)? {
                 ConnectOutcome::Connected(_) => {
-                    let _ = sync_now();
+                    sync_now()?;
                     return crate::registry::load();
                 }
                 _ => return Err("Unexpected approval state".into()),
@@ -998,7 +1000,9 @@ fn finish_connect(
         Ok(outcome)
     })?;
     if let Some((version, desired)) = desired_instr {
-        apply_instructions(&joined.team_id, version, desired.as_deref());
+        apply_instructions(&joined.team_id, version, desired.as_deref()).map_err(|error| {
+            format!("Team joined, but instructions state was not saved: {error}")
+        })?;
     }
     let conn = reg
         .team
@@ -1160,30 +1164,46 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
     // Write/refresh the org instructions to each installed client's rules file (skips unless the
     // content actually changed, or a target moved). Outside the lock, best-effort, never fails
     // the sync.
-    match desired_instr {
+    let mut state_errors = Vec::new();
+    let mut check_state = |result: Result<(), String>| {
+        if let Err(error) = result {
+            state_errors.push(error);
+        }
+    };
+    check_state(match desired_instr {
         Some((version, desired)) => apply_instructions(&conn.team_id, version, desired.as_deref()),
         // A 304 means the org text is unchanged, but a release can still move where a client
         // reads its rules from (Goose/Zed under XDG, SBS-899). Re-run against the content we
         // already applied so the block relocates on the next quiet cycle rather than waiting for
         // an admin edit; `apply_instructions` returns immediately unless a target really moved.
         None => relocate_stored_instructions(&conn.team_id),
-    }
+    });
     // Best-effort showback after the config work: report today's/yesterday's per-server
     // usage rollup to the team server. Any failure here must never affect the sync
     // result — the member's config is already applied and saved.
     if let Err(error) = report_activation(&conn, &token) {
         eprintln!("Toolport: Teams activation reporting pending: {error}");
     }
-    report_usage(&conn, &token);
+    check_state(report_usage(&conn, &token));
     // Report each installed client's instructions coverage (spec W5), every cycle, deduped so an
     // unchanged receipt isn't re-sent. Independent of the config change above, so a client
     // installed after the last edit is reflected as soon as it appears.
-    report_instructions_status(&conn, &token);
+    check_state(report_instructions_status(&conn, &token));
     // Report as-enforced screening-policy flags (SOU-339) so the org can prove cooperative
     // enforcement took effect on this machine. Deduped like the instructions receipt.
-    report_policy_status(&conn, &token);
+    check_state(report_policy_status(&conn, &token));
     // Opt-in per-call audit export (SOU-171): tool name/ts/duration/ok/argsHash only.
-    report_call_events(&conn, &token);
+    check_state(report_call_events(&conn, &token));
+    if !state_errors.is_empty() {
+        crate::daemon::add_status_note(
+            "Team config applied, but some Teams state was not saved. Retry sync.",
+        );
+        crate::gatewaylog::append("Teams sync partially completed: state persistence failed");
+        return Err(format!(
+            "Team config applied, but some Teams state was not saved. Retry sync: {}",
+            state_errors.join("; ")
+        ));
+    }
     Ok(SyncResult::Ok {
         role,
         role_changed,
@@ -1368,16 +1388,14 @@ fn canonical_team_audit(lines: &[Value], ids: &[String], team_id: &str) -> Vec<V
 /// POST the rollups. Counts and token/dollar estimates only; tool names stay local
 /// (rows are per server). Skips silently when there is nothing new, the server is too
 /// old for the endpoint, or the network is down — never fails the sync it rides on.
-fn report_usage(conn: &TeamConnection, token: &str) {
+fn report_usage(conn: &TeamConnection, token: &str) -> Result<(), String> {
     let tag = tag_for(&conn.team_id);
     let (team_servers, reported, all_ids) = {
-        let Ok(reg) = crate::registry::load() else {
-            return;
-        };
+        let reg = crate::registry::load()?;
         // The user disconnected or switched teams mid-sync: report nothing.
         match reg.team.as_ref() {
             Some(t) if t.team_id == conn.team_id => {}
-            _ => return,
+            _ => return Ok(()),
         }
         let ids: HashSet<String> = reg
             .servers
@@ -1397,16 +1415,16 @@ fn report_usage(conn: &TeamConnection, token: &str) {
         )
     };
     if team_servers.is_empty() {
-        return;
+        return Ok(());
     }
     // An unreadable audit log is not "zero usage". Skip this cycle rather than
     // POST a false empty report (SBS-873).
     let Ok(audit_lines) = crate::audit::read_recent(usize::MAX) else {
-        return;
+        return Ok(());
     };
     let audit_lines = canonical_team_audit(&audit_lines, &all_ids, &conn.team_id);
     let Ok(savings_lines) = crate::savings::try_entries() else {
-        return;
+        return Ok(());
     };
     let mut new_state: HashMap<String, HashMap<String, [u64; 2]>> = HashMap::new();
     let mut changed = false;
@@ -1460,19 +1478,20 @@ fn report_usage(conn: &TeamConnection, token: &str) {
         }
     }
     if !changed {
-        return;
+        return Ok(());
     }
     // Persist the watermarks on a FRESH registry (same clobber-avoidance as sync_inner:
     // the POSTs above are network round trips another command may have raced past).
     // `new_state` only ever holds today + yesterday, so old days prune themselves.
-    let _ = crate::registry::update(|reg| {
+    crate::registry::update(|reg| {
         if let Some(t) = reg.team.as_mut() {
             if t.team_id == conn.team_id {
                 t.usage_reported = new_state;
             }
         }
         Ok(())
-    });
+    })?;
+    Ok(())
 }
 
 /// The org instructions the pulled config wants applied: the `content` string when the block
@@ -1530,24 +1549,24 @@ fn targets_need_apply(
 /// org content is unchanged since the last write (hash match) and every client's rules file is
 /// still at the path we wrote it to, so the ~25s sync loop only ever touches rules files when an
 /// admin actually edits the instructions or a target needs repair ([`targets_need_apply`]).
-fn apply_instructions(team_id: &str, version: i64, desired: Option<&str>) {
-    apply_instructions_to(team_id, version, desired, &installed_rules_targets());
+fn apply_instructions(team_id: &str, version: i64, desired: Option<&str>) -> Result<(), String> {
+    apply_instructions_to(team_id, version, desired, &installed_rules_targets())?;
+    Ok(())
 }
 
 /// Re-run [`apply_instructions`] with the content already on record, so a moved rules path is
 /// still picked up on a cycle that pulled nothing (HTTP 304). A no-op when the team has no
 /// instructions, and [`apply_instructions`] itself is a no-op unless a target moved.
-fn relocate_stored_instructions(team_id: &str) {
-    let Ok(reg) = crate::registry::load() else {
-        return;
-    };
+fn relocate_stored_instructions(team_id: &str) -> Result<(), String> {
+    let reg = crate::registry::load()?;
     let Some(team) = reg.team.as_ref().filter(|t| t.team_id == team_id) else {
-        return;
+        return Ok(());
     };
     let Some(content) = team.team_instructions_content.clone() else {
-        return;
+        return Ok(());
     };
-    apply_instructions(team_id, team.team_instructions_version, Some(&content));
+    apply_instructions(team_id, team.team_instructions_version, Some(&content))?;
+    Ok(())
 }
 
 /// [`apply_instructions`] over an explicit target set.
@@ -1556,7 +1575,7 @@ fn apply_instructions_to(
     version: i64,
     desired: Option<&str>,
     targets: &[crate::instructions::Target],
-) {
+) -> Result<(), String> {
     use crate::instructions::{self, ApplyState};
     // Prior state: only act if still connected to THIS team.
     let (prev_content, prev_version, prev_targets) = match crate::registry::load() {
@@ -1566,9 +1585,9 @@ fn apply_instructions_to(
                 t.team_instructions_version,
                 t.team_instructions_targets.clone(),
             ),
-            _ => return,
+            _ => return Ok(()),
         },
-        Err(_) => return,
+        Err(error) => return Err(error),
     };
     // Skip only when the content is unchanged and every target already holds it. A moved target
     // or a refusal that has since cleared leaves the org text identical but its current state
@@ -1595,7 +1614,7 @@ fn apply_instructions_to(
         .collect();
     if content_unchanged && !needs_apply {
         if obsolete.is_empty() {
-            return; // content unchanged and every target is still where we left it
+            return Ok(()); // content unchanged and every target is still where we left it
         }
         // Only the target set changed (or nothing is wanted any more). Clean up without
         // rewriting still-current files or advancing their marker to an unrelated config version.
@@ -1612,7 +1631,7 @@ fn apply_instructions_to(
                 retained.push(old);
             }
         }
-        let _ = crate::registry::update(|reg| {
+        crate::registry::update(|reg| {
             if let Some(t) = reg.team.as_mut() {
                 if t.team_id == team_id
                     && t.team_instructions_content == prev_content
@@ -1622,8 +1641,8 @@ fn apply_instructions_to(
                 }
             }
             Ok(())
-        });
-        return;
+        })?;
+        return Ok(());
     }
 
     let mut written: Vec<String> = Vec::new();
@@ -1673,7 +1692,8 @@ fn apply_instructions_to(
     let new_content = desired.map(str::to_string);
     let mut recorded_targets = written.clone();
     recorded_targets.extend(keep);
-    record_applied_instructions(team_id, new_content, version, recorded_targets, &written);
+    record_applied_instructions(team_id, new_content, version, recorded_targets, &written)?;
+    Ok(())
 }
 
 /// Persist the outcome of one apply: the content+version watermark and the recorded set, by
@@ -1698,7 +1718,7 @@ fn record_applied_instructions(
     version: i64,
     recorded_targets: Vec<String>,
     written: &[String],
-) {
+) -> Result<(), String> {
     use crate::instructions;
     let recorded = crate::registry::update(|reg| {
         if let Some(t) = reg.team.as_mut() {
@@ -1710,9 +1730,9 @@ fn record_applied_instructions(
             }
         }
         Ok(false)
-    });
-    if matches!(recorded, Ok((_, true))) {
-        return;
+    })?;
+    if recorded.1 {
+        return Ok(());
     }
     // Adopt into whichever team is connected, content or not. A winner still mid-connect has
     // content None for a moment and fills it right after, so "no content" cannot be read as
@@ -1729,8 +1749,8 @@ fn record_applied_instructions(
             return Ok(true);
         }
         Ok(false)
-    });
-    if !matches!(adopted, Ok((_, true))) {
+    })?;
+    if !adopted.1 {
         for path in written {
             let _ = instructions::remove_recorded(
                 std::path::Path::new(path),
@@ -1738,6 +1758,7 @@ fn record_applied_instructions(
             );
         }
     }
+    Ok(())
 }
 
 /// Build the apply-status receipt (spec W5): for each INSTALLED client, the current on-disk state
@@ -1848,12 +1869,10 @@ fn receipt_fresh(reported: Option<&str>, reported_at: Option<i64>, fingerprint: 
 /// [`RECEIPT_HEARTBEAT_MS`] (so the server's `instructions_status_at` does not go false-stale
 /// while the member keeps syncing). Best-effort; a failure just retries next cycle. No-op
 /// when the team has no active instructions.
-fn report_instructions_status(conn: &TeamConnection, token: &str) {
+fn report_instructions_status(conn: &TeamConnection, token: &str) -> Result<(), String> {
     use crate::instructions;
     let (content, version, reported, reported_at) = {
-        let Ok(reg) = crate::registry::load() else {
-            return;
-        };
+        let reg = crate::registry::load()?;
         match reg.team.as_ref() {
             Some(t) if t.team_id == conn.team_id => (
                 t.team_instructions_content.clone(),
@@ -1861,19 +1880,19 @@ fn report_instructions_status(conn: &TeamConnection, token: &str) {
                 t.team_instructions_reported.clone(),
                 t.team_instructions_reported_at,
             ),
-            _ => return,
+            _ => return Ok(()),
         }
     };
     let Some(content) = content else {
-        return; // no instructions active for this team
+        return Ok(()); // no instructions active for this team
     };
     let receipt = build_instructions_receipt(&conn.team_id, version, &content);
     let Ok(receipt_json) = serde_json::to_value(&receipt) else {
-        return;
+        return Ok(());
     };
     let fingerprint = instructions::content_hash(&receipt_json.to_string());
     if receipt_fresh(reported.as_deref(), reported_at, &fingerprint) {
-        return;
+        return Ok(());
     }
     let day = usage_report::utc_day_back(0);
     match post_usage_day(
@@ -1887,7 +1906,7 @@ fn report_instructions_status(conn: &TeamConnection, token: &str) {
     ) {
         Ok(true) => {
             let at = now_ms();
-            let _ = crate::registry::update(|reg| {
+            crate::registry::update(|reg| {
                 if let Some(t) = reg.team.as_mut() {
                     if t.team_id == conn.team_id {
                         t.team_instructions_reported = Some(fingerprint.clone());
@@ -1895,12 +1914,13 @@ fn report_instructions_status(conn: &TeamConnection, token: &str) {
                     }
                 }
                 Ok(())
-            });
+            })?;
         }
         // Old server without the endpoint, or a transient failure: leave `reported` unset so we
         // retry on a later cycle.
         _ => {}
     }
+    Ok(())
 }
 
 /// Build the screening-policy apply receipt (SOU-339 / SOU-345): safety flags as currently
@@ -1918,15 +1938,13 @@ fn build_policy_receipt(reg: &crate::registry::Registry) -> Value {
 
 /// Upload new local audit lines for team servers when org has `callAuditExport` on (SOU-171).
 /// Fields: ts, server, tool, ok, durationMs, argsHash, client — never args/results.
-fn report_call_events(conn: &TeamConnection, token: &str) {
+fn report_call_events(conn: &TeamConnection, token: &str) -> Result<(), String> {
     let tag = tag_for(&conn.team_id);
     let (enabled, cursor, team_servers, all_ids) = {
-        let Ok(reg) = crate::registry::load() else {
-            return;
-        };
+        let reg = crate::registry::load()?;
         match reg.team.as_ref() {
             Some(t) if t.team_id == conn.team_id && t.call_audit_export => {}
-            _ => return,
+            _ => return Ok(()),
         }
         let team_servers: HashSet<String> = reg
             .servers
@@ -1935,7 +1953,7 @@ fn report_call_events(conn: &TeamConnection, token: &str) {
             .map(|s| s.id.clone())
             .collect();
         if team_servers.is_empty() {
-            return;
+            return Ok(());
         }
         let cursor = reg
             .team
@@ -1950,12 +1968,12 @@ fn report_call_events(conn: &TeamConnection, token: &str) {
         )
     };
     if !enabled {
-        return;
+        return Ok(());
     }
     // An unreadable audit log is not "no new calls". Skip this cycle rather
     // than POST an empty batch that would advance nothing honestly (SBS-873).
     let Ok(lines) = crate::audit::read_recent(usize::MAX) else {
-        return;
+        return Ok(());
     };
     let lines = canonical_team_audit(&lines, &all_ids, &conn.team_id);
     let mut batch: Vec<Value> = Vec::new();
@@ -1980,7 +1998,7 @@ fn report_call_events(conn: &TeamConnection, token: &str) {
             "server": server,
             "tool": tool,
             "ok": line.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
-        });
+        })?;
         if let Some(ms) = line.get("durationMs").and_then(|v| v.as_u64()) {
             ev["durationMs"] = json!(ms);
         }
@@ -1997,21 +2015,22 @@ fn report_call_events(conn: &TeamConnection, token: &str) {
         }
     }
     if batch.is_empty() {
-        return;
+        return Ok(());
     }
     match post_call_events(&conn.server_url, &conn.team_id, token, &batch) {
         Ok(true) => {
-            let _ = crate::registry::update(|reg| {
+            crate::registry::update(|reg| {
                 if let Some(t) = reg.team.as_mut() {
                     if t.team_id == conn.team_id {
                         t.call_audit_export_cursor = Some(max_ts);
                     }
                 }
                 Ok(())
-            });
+            })?;
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn post_call_events(
@@ -2039,19 +2058,17 @@ fn post_call_events(
 
 /// Report this member's as-enforced screening policy to the team server once per sync cycle.
 /// Deduped by receipt hash, with a 12h heartbeat so `policy_status_at` stays fresh. Best-effort.
-fn report_policy_status(conn: &TeamConnection, token: &str) {
+fn report_policy_status(conn: &TeamConnection, token: &str) -> Result<(), String> {
     use crate::instructions;
     let (receipt_json, fingerprint, reported, reported_at) = {
-        let Ok(reg) = crate::registry::load() else {
-            return;
-        };
+        let reg = crate::registry::load()?;
         match reg.team.as_ref() {
             Some(t) if t.team_id == conn.team_id => {}
-            _ => return,
+            _ => return Ok(()),
         }
         let receipt = build_policy_receipt(&reg);
         let Ok(receipt_json) = serde_json::to_value(&receipt) else {
-            return;
+            return Ok(());
         };
         let fingerprint = instructions::content_hash(&receipt_json.to_string());
         let (reported, reported_at) = reg
@@ -2062,7 +2079,7 @@ fn report_policy_status(conn: &TeamConnection, token: &str) {
         (receipt_json, fingerprint, reported, reported_at)
     };
     if receipt_fresh(reported.as_deref(), reported_at, &fingerprint) {
-        return;
+        return Ok(());
     }
     let day = usage_report::utc_day_back(0);
     match post_usage_day(
@@ -2076,7 +2093,7 @@ fn report_policy_status(conn: &TeamConnection, token: &str) {
     ) {
         Ok(true) => {
             let at = now_ms();
-            let _ = crate::registry::update(|reg| {
+            crate::registry::update(|reg| {
                 if let Some(t) = reg.team.as_mut() {
                     if t.team_id == conn.team_id {
                         t.team_policy_reported = Some(fingerprint.clone());
@@ -2084,10 +2101,11 @@ fn report_policy_status(conn: &TeamConnection, token: &str) {
                     }
                 }
                 Ok(())
-            });
+            })?;
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Leave the team: remove its merged servers, clear the connection and the token.
@@ -2519,7 +2537,9 @@ pub fn personal_share_hint(reg: &Registry, personal: &ServerEntry) -> Option<&'s
     reg.servers
         .iter()
         .any(|s| is_team_server(s, &tag) && same_display_name(&s.name, &personal.name))
-        .then_some("The team has a different server with this name. Sharing adds a separate definition.")
+        .then_some(
+            "The team has a different server with this name. Sharing adds a separate definition.",
+        )
 }
 
 /// The preview's explanation for each selection, including a dry run of the local
@@ -2634,9 +2654,11 @@ pub fn push_selected(
     let servers = additive_server_set(remote, &selected)?;
     // Re-sharing definitions the Team already has unchanged only runs the local step.
     let before = server_index(remote)?;
-    let published = server_index(&servers)?
-        .iter()
-        .any(|(id, server)| before.get(id).is_none_or(|current| !same_definition(current, server)));
+    let published = server_index(&servers)?.iter().any(|(id, server)| {
+        before
+            .get(id)
+            .is_none_or(|current| !same_definition(current, server))
+    });
     let version = if published {
         let config = replace_server_set(config, servers)?;
         push_config(&conn.server_url, &conn.team_id, &token, &config, version)?
@@ -3075,7 +3097,10 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
                         review_ids.push(entry.id.clone());
                         review_fingerprints.insert(entry.id.clone(), fingerprint);
                     } else {
-                        if !reg.servers.iter().any(|s| s.id == shared_id && !s.source.as_deref().unwrap_or("").starts_with("team:")) {
+                        if !reg.servers.iter().any(|s| {
+                            s.id == shared_id
+                                && !s.source.as_deref().unwrap_or("").starts_with("team:")
+                        }) {
                             auto_enable.push(entry.id.clone());
                         }
                     }
@@ -3106,7 +3131,11 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     // Only rows that exist keep a mapping. A definition deleted from the Team and
     // shared again later can get a new local id; its old mapping must not linger
     // beside the new one for the same original.
-    managed_server_ids.retain(|id, _| reg.servers.iter().any(|s| &s.id == id && is_team_server(s, &tag)));
+    managed_server_ids.retain(|id, _| {
+        reg.servers
+            .iter()
+            .any(|s| &s.id == id && is_team_server(s, &tag))
+    });
     if let Some(conn) = reg.team.as_mut().filter(|c| c.team_id == team_id) {
         conn.managed_server_ids = managed_server_ids;
     }
@@ -3471,12 +3500,13 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
     let transport = str_field("transport").unwrap_or("stdio").to_string();
     let command = str_field("command").map(String::from);
     let launch = match s.get("launch").filter(|value| !value.is_null()) {
-        Some(value) => match serde_json::from_value::<crate::registry::LaunchConfig>(
-            team_launch_value(value),
-        ) {
-            Ok(launch) => Some(launch.without_values()),
-            Err(_) => return TeamClass::Blocked,
-        },
+        Some(value) => {
+            match serde_json::from_value::<crate::registry::LaunchConfig>(team_launch_value(value))
+            {
+                Ok(launch) => Some(launch.without_values()),
+                Err(_) => return TeamClass::Blocked,
+            }
+        }
         None => None,
     };
     let mut entry = ServerEntry {
@@ -3792,7 +3822,7 @@ mod tests {
         );
 
         // Same content, same version. Only the PATH moved.
-        apply_instructions_to(TEAM, VERSION, Some(CONTENT), std::slice::from_ref(&target));
+        apply_instructions_to(TEAM, VERSION, Some(CONTENT), std::slice::from_ref(&target)).unwrap();
 
         let moved = std::fs::read_to_string(&target.path).unwrap_or_default();
         let recorded = crate::registry::load()
@@ -3843,7 +3873,7 @@ mod tests {
         };
         let before = std::fs::read_to_string(&path).unwrap();
 
-        apply_instructions_to(TEAM, 5, Some(CONTENT), std::slice::from_ref(&target));
+        apply_instructions_to(TEAM, 5, Some(CONTENT), std::slice::from_ref(&target)).unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();
         let (_, version, recorded) = loaded_instructions();
@@ -3933,7 +3963,7 @@ mod tests {
             char_cap: Some(20),
             blocked_if_present: None,
         };
-        apply_instructions_to(TEAM, 2, Some(V2), std::slice::from_ref(&too_long_target));
+        apply_instructions_to(TEAM, 2, Some(V2), std::slice::from_ref(&too_long_target)).unwrap();
         let on_disk = std::fs::read_to_string(&too_long_path).unwrap_or_default();
         let (content, version, recorded) = loaded_instructions();
         assert!(
@@ -3968,7 +3998,7 @@ mod tests {
             blocked_if_present: None,
         };
         let poisoned = format!("{} injected", crate::instructions::SENTINEL_START_PREFIX);
-        apply_instructions_to(TEAM, 3, Some(&poisoned), std::slice::from_ref(&err_target));
+        apply_instructions_to(TEAM, 3, Some(&poisoned), std::slice::from_ref(&err_target)).unwrap();
         let on_disk = std::fs::read_to_string(&err_path).unwrap_or_default();
         let (_, _, recorded) = loaded_instructions();
         assert!(
@@ -3989,7 +4019,7 @@ mod tests {
             char_cap: None,
             blocked_if_present: Some(shadow.clone()),
         };
-        apply_instructions_to(TEAM, 4, Some(V2), std::slice::from_ref(&blocked_target));
+        apply_instructions_to(TEAM, 4, Some(V2), std::slice::from_ref(&blocked_target)).unwrap();
         let on_disk = std::fs::read_to_string(&blocked_path).unwrap_or_default();
         let (_, _, recorded) = loaded_instructions();
         assert!(
@@ -3999,7 +4029,7 @@ mod tests {
         assert_eq!(recorded, vec![blocked_path.to_string_lossy().to_string()]);
 
         std::fs::remove_file(&shadow).unwrap();
-        apply_instructions_to(TEAM, 4, Some(V2), std::slice::from_ref(&blocked_target));
+        apply_instructions_to(TEAM, 4, Some(V2), std::slice::from_ref(&blocked_target)).unwrap();
         let retried = std::fs::read_to_string(&blocked_path).unwrap_or_default();
         assert!(
             retried.contains(V2) && !retried.contains(V1),
@@ -4034,10 +4064,10 @@ mod tests {
             char_cap: Some(20),
             blocked_if_present: None,
         };
-        apply_instructions_to(TEAM, 2, Some(V2), std::slice::from_ref(&target));
+        apply_instructions_to(TEAM, 2, Some(V2), std::slice::from_ref(&target)).unwrap();
         assert!(path.exists(), "fixture: refused rewrite keeps last-good");
 
-        apply_instructions_to(TEAM, 2, Some(V2), &[]);
+        apply_instructions_to(TEAM, 2, Some(V2), &[]).unwrap();
 
         let (_, version, recorded) = loaded_instructions();
         let leftover = std::fs::read_to_string(&path).unwrap_or_default();
@@ -4080,7 +4110,7 @@ mod tests {
             char_cap: None,
             blocked_if_present: None,
         };
-        apply_instructions_to(TEAM, 2, None, std::slice::from_ref(&target));
+        apply_instructions_to(TEAM, 2, None, std::slice::from_ref(&target)).unwrap();
         let leftover = std::fs::read_to_string(&path).unwrap_or_default();
         let (_, _, recorded) = loaded_instructions();
         let _ = std::fs::remove_dir_all(&scratch);
@@ -4119,7 +4149,7 @@ mod tests {
             ),
         )
         .unwrap();
-        apply_instructions_to(TEAM, 2, None, &[]);
+        apply_instructions_to(TEAM, 2, None, &[]).unwrap();
         let (content, version, recorded) = loaded_instructions();
         assert_eq!(content, None);
         assert_eq!(version, 2);
@@ -4128,7 +4158,7 @@ mod tests {
         // Once the file is readable and well-formed again, the unchanged-content cleanup path
         // retries the recorded location and can finally forget it.
         std::fs::write(&path, valid).unwrap();
-        apply_instructions_to(TEAM, 2, None, &[]);
+        apply_instructions_to(TEAM, 2, None, &[]).unwrap();
         let (_, _, recorded) = loaded_instructions();
         assert!(
             !path.exists(),
@@ -4198,7 +4228,8 @@ mod tests {
             3,
             vec![key.clone()],
             &[key.clone()],
-        );
+        )
+        .unwrap();
         assert!(
             instructions::is_present(&path, Scope::Team),
             "the block is left for the winner to reconcile, not deleted"
@@ -4234,7 +4265,8 @@ mod tests {
             3,
             vec![key.clone()],
             &[key.clone()],
-        );
+        )
+        .unwrap();
         assert!(path.exists(), "adoption never deletes");
         let (_, _, recorded) = loaded_instructions();
         assert_eq!(
@@ -4242,7 +4274,7 @@ mod tests {
             vec![key.clone()],
             "the content-less winner now owns the path"
         );
-        apply_instructions_to("team_c", 1, None, &[target.clone()]);
+        apply_instructions_to("team_c", 1, None, &[target.clone()]).unwrap();
         assert!(
             !path.exists(),
             "the winner's no-content pass cleans the adopted block"
@@ -4266,7 +4298,8 @@ mod tests {
             4,
             vec![key.clone()],
             &[key.clone()],
-        );
+        )
+        .unwrap();
         assert!(
             !path.exists(),
             "with no team left, our block (and the file we created) is removed"
@@ -4284,7 +4317,8 @@ mod tests {
             5,
             vec![key.clone()],
             &[key.clone()],
-        );
+        )
+        .unwrap();
         let (content, version, recorded) = loaded_instructions();
         assert_eq!(content.as_deref(), Some("a's rules"));
         assert_eq!(version, 5);
@@ -4440,15 +4474,24 @@ mod tests {
     fn publisher_changed_scope_or_target_fails_without_partial_handoff() {
         crate::secrets::tests::with_isolated_vault(|| {
             let before = publisher_registry();
-            for field in ["team", "origin", "device", "role", "profile", "target", "version"] {
+            for field in [
+                "team", "origin", "device", "role", "profile", "target", "version",
+            ] {
                 let mut r = sync_publisher(&before);
                 let id = member_id(&r, "mine");
                 match field {
                     "team" => r.team.as_mut().unwrap().team_id = "other".into(),
-                    "origin" => r.team.as_mut().unwrap().server_url = "https://other.example.test".into(),
+                    "origin" => {
+                        r.team.as_mut().unwrap().server_url = "https://other.example.test".into()
+                    }
                     "device" => r.team.as_mut().unwrap().reporting_device_id = "other".into(),
                     "role" => r.team.as_mut().unwrap().role = "member".into(),
-                    "profile" => { let mut other = r.profiles[0].clone(); other.id = "other".into(); r.profiles.push(other); r.active_profile_id = Some("other".into()); },
+                    "profile" => {
+                        let mut other = r.profiles[0].clone();
+                        other.id = "other".into();
+                        r.profiles.push(other);
+                        r.active_profile_id = Some("other".into());
+                    }
                     "version" => r.team.as_mut().unwrap().last_version = 3,
                     _ => {
                         r.servers.iter_mut().find(|s| s.id == id).unwrap().command =
@@ -6831,7 +6874,11 @@ mod tests {
         }
 
         /// Publish, sync and hand off. Returns the registry and the published set.
-        fn share(before: &Registry, remote: &Value, ids: &[&str]) -> (Registry, Value, Vec<LocalHandoff>) {
+        fn share(
+            before: &Registry,
+            remote: &Value,
+            ids: &[&str],
+        ) -> (Registry, Value, Vec<LocalHandoff>) {
             let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
             let merged = additive_server_set(remote, &selected_export(before, &ids).unwrap()).unwrap();
             let mut r = synced(before, &merged, 2);
@@ -6942,7 +6989,12 @@ mod tests {
                 let before = synced(&personal, &remote, 1);
                 let managed = team_copy(&before, "mine");
                 crate::registry::save(&before).unwrap();
-                crate::secrets::set_secret(&managed, crate::secrets::HTTP_AUTH_KEY, "independent-synthetic").unwrap();
+                crate::secrets::set_secret(
+                    &managed,
+                    crate::secrets::HTTP_AUTH_KEY,
+                    "independent-synthetic",
+                )
+                .unwrap();
 
                 let predicted = preview(&before, &remote, &["mine"]);
                 assert_eq!(predicted[0].local.outcome, HandoffOutcome::Attention);
@@ -6972,7 +7024,12 @@ mod tests {
                 let before = synced(&two, &remote, 1);
                 let other = team_copy(&before, "other");
                 crate::registry::save(&before).unwrap();
-                crate::secrets::set_secret(&other, crate::secrets::HTTP_AUTH_KEY, "independent-synthetic").unwrap();
+                crate::secrets::set_secret(
+                    &other,
+                    crate::secrets::HTTP_AUTH_KEY,
+                    "independent-synthetic",
+                )
+                .unwrap();
 
                 let (r, _, handoffs) = share(&before, &remote, &["mine", "other"]);
 
@@ -7041,7 +7098,11 @@ mod tests {
 
                 // The next sync keeps the owner's local value and binding.
                 let mut again = r.clone();
-                apply_team_config(&mut again, "publisher-test", &stored_definition(&json!({"servers": published})));
+                apply_team_config(
+                    &mut again,
+                    "publisher-test",
+                    &stored_definition(&json!({"servers": published})),
+                );
                 let owner_copy = again.servers.iter().find(|s| s.id == copy).unwrap();
                 assert_eq!(local_value(owner_copy).as_deref(), Some("/work"));
                 assert!(again.is_enabled(&profile, &copy));
@@ -7050,7 +7111,11 @@ mod tests {
                 // A member receives a Team copy to set up, with the input vaulted.
                 let mut member = base_registry();
                 member.servers.clear();
-                let outcome = apply_team_config(&mut member, "publisher-test", &stored_definition(&json!({"servers": published})));
+                let outcome = apply_team_config(
+                    &mut member,
+                    "publisher-test",
+                    &stored_definition(&json!({"servers": published})),
+                );
                 assert_eq!((outcome.blocked, outcome.review), (0, 1));
                 let input = &member.servers[0].launch.as_ref().unwrap().inputs[0];
                 assert!(input.secret && input.value.is_none());
@@ -7123,10 +7188,8 @@ mod tests {
         fn definitions_compare_in_the_form_the_service_stores() {
             crate::secrets::tests::with_isolated_vault(|| {
                 let mut personal = publisher_registry();
-                personal.servers[0].env = vec![serde_json::from_value(
-                    json!({"key":"API_TOKEN","secret":true}),
-                )
-                .unwrap()];
+                personal.servers[0].env =
+                    vec![serde_json::from_value(json!({"key":"API_TOKEN","secret":true})).unwrap()];
                 // The service drops every `secret` flag and `value` before saving.
                 let stored = stored_definition(&team_server_export(&personal));
                 assert!(!stored.to_string().contains("\"secret\""));
@@ -7186,7 +7249,11 @@ mod tests {
                 version: 5,
                 published: true,
                 local_setup_error: None,
-                handoffs: vec![handoff("Vercel", HandoffOutcome::Attention, "Needs setup. Your personal server stays on in this profile.")],
+                handoffs: vec![handoff(
+                    "Vercel",
+                    HandoffOutcome::Attention,
+                    "Needs setup. Your personal server stays on in this profile.",
+                )],
                 summary: String::new(),
             };
             assert!(result.needs_attention());

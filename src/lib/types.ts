@@ -249,7 +249,17 @@ export interface ServerStat {
   tools: ToolStat[];
 }
 
+export interface TelemetryHealth {
+  queueDropped: number;
+  writeFailedRecords: number;
+  writeFailures: number;
+  flushTimeouts: number;
+  unavailable?: boolean;
+}
+
 export interface AuditStats {
+  telemetry?: TelemetryHealth;
+  gatewayNotes?: string[];
   total: number;
   errors: number;
   errorRate: number;

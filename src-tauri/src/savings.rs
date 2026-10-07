@@ -75,7 +75,11 @@ fn v3_path() -> Option<PathBuf> {
 /// total resets to zero and the next serve starts a fresh file.
 pub fn try_clear() -> std::io::Result<()> {
     // Write anything queued before deleting, so a queued line cannot reappear.
-    crate::telemetry::flush();
+    if !crate::telemetry::flush() {
+        return Err(std::io::Error::other(
+            "Telemetry is still pending; retry clearing Activity",
+        ));
+    }
     let mut first_error = None;
     for path in [savings_path(), v2_path(), v3_path()].into_iter().flatten() {
         let _lock = match crate::registry::lock_at(&path) {
@@ -353,21 +357,22 @@ fn append_lines_at_with_hook(
     let size = file.metadata().map_err(|e| e.to_string())?.len();
     drop(file);
     if size > max_bytes {
-        rotate_if_large(path, keep_lines, after_snapshot);
+        rotate_if_large(path, keep_lines, after_snapshot)?;
     }
     Ok(())
 }
 
 /// Collapse old lines into a single carry line once the log exceeds the cap, so
-/// the running total is preserved while the file stays bounded. Best-effort.
-fn rotate_if_large(path: &Path, keep_lines: usize, mut after_snapshot: Option<&mut dyn FnMut()>) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+/// the running total is preserved while the file stays bounded.
+fn rotate_if_large(
+    path: &Path,
+    keep_lines: usize,
+    mut after_snapshot: Option<&mut dyn FnMut()>,
+) -> Result<(), String> {
+    let content = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.len() <= keep_lines {
-        return;
+        return Ok(());
     }
     let Ok(parsed): Result<Vec<Value>, _> = lines
         .iter()
@@ -376,10 +381,10 @@ fn rotate_if_large(path: &Path, keep_lines: usize, mut after_snapshot: Option<&m
     else {
         // Preserve damaged history for explicit recovery instead of folding it
         // away during a later append.
-        return;
+        return Ok(());
     };
     if parsed.iter().any(|row| !row.is_object()) {
-        return;
+        return Ok(());
     }
     let mut details: Vec<Value> = parsed
         .iter()
@@ -387,7 +392,7 @@ fn rotate_if_large(path: &Path, keep_lines: usize, mut after_snapshot: Option<&m
         .cloned()
         .collect();
     if details.len() <= keep_lines {
-        return;
+        return Ok(());
     }
     let retained = details.split_off(details.len() - keep_lines);
     let carry = fold(&details);
@@ -417,7 +422,7 @@ fn rotate_if_large(path: &Path, keep_lines: usize, mut after_snapshot: Option<&m
     }
     // Atomic + unique temp: every client's gateway shares this file, so a
     // bespoke fixed temp name could let two rotations collide.
-    let _ = crate::registry::atomic_write(path, &out);
+    crate::registry::atomic_write(path, &out)
 }
 
 fn merge_team_bucket(buckets: &mut BTreeMap<String, BTreeMap<String, u64>>, row: &Value) {
