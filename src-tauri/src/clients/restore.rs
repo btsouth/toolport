@@ -661,8 +661,21 @@ pub(super) fn finish(client_id: &str, path: &Path, expected: Option<&str>) -> Re
     check_finished(client_id, path, expected)?;
     if let Some(mut record) = load(client_id, path)? {
         for parent in &record.created_parents {
-            let _ = std::fs::remove_dir(parent);
-        } // Empty directories only.
+            match std::fs::remove_dir(parent) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "Config restored, but could not remove empty parent {}: {error}",
+                        parent.display()
+                    ))
+                }
+            }
+        } // Nonempty native directories are preserved.
           // Keep immutable original provenance and a completed-removal marker.
           // A later uninstaller/retry must not claim the restored native entries.
         record.disconnected = true;
