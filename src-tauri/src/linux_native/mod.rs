@@ -9064,12 +9064,12 @@ mod tests {
         client.legacy_bearer_argv = false;
         assert!(client_needs_reset_action(&client));
         assert_eq!(client_reset_label(&client), "Reset and connect");
-        client.scope_id = Some(crate::registry::ALL_ENABLED_ACCESS.into());
+        client.scope_id = Some(registry.all_access_id());
         let scope = client_reset_scope(&client);
         crate::registry_controller::apply_client_stdio_update(
             &mut registry, &client.id, scope.as_deref(), None,
         );
-        assert_eq!(registry.client_scopes.get(&client.id).map(String::as_str), Some(crate::registry::ALL_ENABLED_ACCESS));
+        assert_eq!(registry.client_scopes.get(&client.id), Some(&registry.all_access_id()));
         client.scope_id = Some(String::new());
         let scope = client_reset_scope(&client);
         crate::registry_controller::apply_client_stdio_update(
