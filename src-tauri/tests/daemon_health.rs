@@ -224,6 +224,9 @@ impl Client {
             command.env("TOOLPORT_GATEWAY_TOPOLOGY", "daemon");
         }
         let mut child = command
+            .env("ADAPTER_AMBIENT_CREDENTIAL", "must-not-leak")
+            // Force the inherit-env fallback to expose the gateway process boundary.
+            .env("SHELL", dir.join("missing-login-shell"))
             .env(
                 "TOOLPORT_CLIENT_ID",
                 format!("health-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
@@ -533,6 +536,25 @@ fn a_wedged_daemon_moves_clients_to_their_own_gateways() {
     let _guard = CASE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let fixture = Fixture::new("wedged");
     write_registry(&fixture.dir, &[]);
+    // A real downstream launcher records its environment after private recovery.
+    let launcher = fixture.dir.join("env-launcher.sh");
+    let dump = fixture.dir.join("private-child-env.txt");
+    std::fs::write(
+        &launcher,
+        format!(
+            "#!/bin/sh\nenv > '{}'\nexec '{}' \"$@\"\n",
+            dump.display(),
+            env!("CARGO_BIN_EXE_mock-mcp-server")
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = fixture.dir.join("registry.json");
+    let mut reg = registry::load_from(&path).unwrap();
+    reg.servers[0].command = Some(launcher.display().to_string());
+    reg.servers[0].inherit_env = true;
+    registry::save_to(&path, &reg).unwrap();
 
     let mut attached = Client::spawn(&fixture.dir, false);
     attached.initialize();
@@ -569,6 +591,15 @@ fn a_wedged_daemon_moves_clients_to_their_own_gateways() {
     explicit.initialize();
     assert!(explicit.echo("explicit").contains("explicit"));
     assert!(explicit.status().contains("private gateway"));
+    let dumped = std::fs::read_to_string(&dump).unwrap();
+    assert!(
+        !dumped.contains("ADAPTER_AMBIENT_CREDENTIAL"),
+        "private gateway child inherited adapter credentials"
+    );
+    assert!(
+        dumped.contains("MOCK_MCP_TRANSCRIPT="),
+        "configured env was lost"
+    );
 
     // The attached client notices the silence on its own and moves its session.
     let deadline = Instant::now() + RESPONSE_TIMEOUT;

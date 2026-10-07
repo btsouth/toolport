@@ -1708,7 +1708,15 @@ pub fn resolve_command(command: &str) -> String {
     if command.contains('/') {
         return command.to_string();
     }
-    for dir in augmented_path().split(':').filter(|d| !d.is_empty()) {
+    resolve_command_in_path(command, augmented_path())
+}
+
+#[cfg(not(windows))]
+fn resolve_command_in_path(command: &str, path: &str) -> String {
+    if command.contains('/') {
+        return command.to_string();
+    }
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
         let candidate = Path::new(dir).join(command);
         if candidate.is_file() {
             return candidate.to_string_lossy().into_owned();
@@ -4515,13 +4523,121 @@ fn process_env_map() -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
+// Cache both success and fallback so a broken shell is tried only once per
+// registry generation. Holding the lock also serializes concurrent first spawns.
+static LOGIN_ENV: Mutex<Option<std::collections::BTreeMap<String, String>>> = Mutex::new(None);
+
+/// Re-source the opt-in environment on the next spawn after a registry reload.
+pub fn invalidate_login_environment() {
+    *LOGIN_ENV
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+fn inherited_environment() -> std::collections::BTreeMap<String, String> {
+    #[cfg(windows)]
+    return process_env_map();
+    #[cfg(not(windows))]
+    {
+        let mut cached = LOGIN_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cached
+            .get_or_insert_with(|| {
+                login_environment_or_process(&process_env_map(), Duration::from_secs(5))
+            })
+            .clone()
+    }
+}
+
+#[cfg(not(windows))]
+fn login_environment_or_process(
+    parent: &std::collections::BTreeMap<String, String>,
+    timeout: Duration,
+) -> std::collections::BTreeMap<String, String> {
+    source_login_environment(parent, timeout).unwrap_or_else(|| parent.clone())
+}
+
+#[cfg(not(windows))]
+fn source_login_environment(
+    parent: &std::collections::BTreeMap<String, String>,
+    timeout: Duration,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    use std::os::unix::process::CommandExt;
+    let shell = parent.get("SHELL")?;
+    let mut command = Command::new(shell);
+    // Start from locators, not whichever client's credentials started the daemon.
+    // Login startup files supply the user's explicitly opted-in environment.
+    command
+        .env_clear()
+        .envs(child_environment(parent, &[], false));
+    command
+        .args(["-lc", "env -0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = command.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take(4 * 1024 * 1024)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = send.send(result);
+    });
+    let deadline = Instant::now() + timeout;
+    let result = (|| {
+        loop {
+            if let Some(status) = child.try_wait().ok()? {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let bytes = receive
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()?
+            .ok()?;
+        if bytes.is_empty() || bytes.len() >= 4 * 1024 * 1024 || !bytes.ends_with(&[0]) {
+            return None;
+        }
+        let mut env = std::collections::BTreeMap::new();
+        for entry in bytes[..bytes.len() - 1].split(|byte| *byte == 0) {
+            let entry = std::str::from_utf8(entry).ok()?;
+            let (name, value) = entry.split_once('=')?;
+            if name.is_empty() || name.contains('\n') {
+                return None;
+            }
+            env.insert(name.to_string(), value.to_string());
+        }
+        Some(env)
+    })();
+    if result.is_none() {
+        // Include shell descendants so a hung startup command cannot retain stdout.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.wait();
+    result
+}
+
 /// Build the explicit environment a spawned stdio child receives (SEC-04).
 ///
 /// `parent` is the gateway's own environment, `configured` the server's `env`
 /// plus injected secrets, and `inherit_env` the per-server compatibility opt-in:
 ///
 /// * default - only the [`CHILD_ENV_ALLOWLIST`] names present in `parent`;
-/// * `inherit_env = true` - every `parent` name except the `TOOLPORT_*` /
+/// * `inherit_env = true` - every name from the selected login or fallback
+///   environment except the `TOOLPORT_*` /
 ///   `CONDUIT_*` control namespaces (the pre-SEC-04 behavior).
 ///
 /// The copied subset is passed through the AppImage bundled-env strip so the
@@ -4640,7 +4756,6 @@ impl StdioTransport {
         };
         let container_args = inject_container_env(spawn_command, spawn_args, env);
         let spawn_args = container_args.as_slice();
-        let resolved = resolve_command(spawn_command);
         // Start the child from a cleared environment (SEC-04): a downstream server
         // is third-party code that can read its own process environment, so it must
         // not inherit the client's cloud credentials or API keys. `child_environment`
@@ -4648,7 +4763,25 @@ impl StdioTransport {
         // needs (or, when the server opted in, the whole environment minus
         // Toolport's control variables), and applies the server's own `env` last so
         // anything it configured deliberately still wins.
-        let child_env = child_environment(&process_env_map(), env, inherit_env);
+        let parent_env = if inherit_env {
+            inherited_environment()
+        } else {
+            process_env_map()
+        };
+        let child_env = child_environment(&parent_env, env, inherit_env);
+        #[cfg(not(windows))]
+        let resolved = if inherit_env {
+            let path = child_env
+                .iter()
+                .find(|(name, _)| name == "PATH")
+                .map(|(_, value)| value.as_str())
+                .unwrap_or("");
+            resolve_command_in_path(spawn_command, path)
+        } else {
+            resolve_command(spawn_command)
+        };
+        #[cfg(windows)]
+        let resolved = resolve_command(spawn_command);
         let mut cmd = Command::new(&resolved);
         cmd.env_clear();
         cmd.args(spawn_args)
@@ -4665,14 +4798,24 @@ impl StdioTransport {
         }
         // Give the child the augmented PATH too, so e.g. `npx` can find `node`.
         #[cfg(not(windows))]
-        cmd.env("PATH", augmented_path());
+        if !inherit_env {
+            cmd.env("PATH", augmented_path());
+        }
         // Replacing the launcher means also replacing the PATH it set up: the
         // package's own `node_modules/.bin`. Servers that shell out to a sibling
         // binary would otherwise stop finding it. Prepend to whatever PATH the child
         // would have received anyway, so a rewrite only ever ADDS an entry and never
         // changes which PATH wins.
         if let Some(dir) = direct.as_ref().and_then(|d| d.bin_dir.as_ref()) {
-            let base = base_child_path(env);
+            let base = if inherit_env && !cfg!(windows) {
+                child_env
+                    .iter()
+                    .find(|(name, _)| name == "PATH")
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default()
+            } else {
+                base_child_path(env)
+            };
             let mut merged = dir.to_string_lossy().into_owned();
             if !base.is_empty() {
                 merged.push(if cfg!(windows) { ';' } else { ':' });
@@ -14988,5 +15131,83 @@ mod tests {
         let max_line = super::drain_stderr_bounded(reader, &buf, 1024, 8);
         assert!(max_line <= 5, "each line is 5 bytes including newline");
         assert_eq!(buf.lock().unwrap().as_str(), "bb\ncccc\n");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod login_environment_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct ShellFixture(std::path::PathBuf);
+    impl ShellFixture {
+        fn new(body: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "toolport-login-env-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("shell");
+            std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self(dir)
+        }
+        fn parent(&self) -> BTreeMap<String, String> {
+            BTreeMap::from([
+                ("SHELL".into(), self.0.join("shell").display().to_string()),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("AMBIENT_SECRET".into(), "daemon-only".into()),
+            ])
+        }
+    }
+    impl Drop for ShellFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn login_shell_is_noninteractive_and_excludes_daemon_credentials() {
+        let fixture = ShellFixture::new("[ \"$1\" = -lc ] && [ \"$2\" = 'env -0' ] || exit 1\n[ -z \"$AMBIENT_SECRET\" ] || exit 2\nprintf 'LOGIN_KEY=login\\000MULTILINE=first\\nsecond\\000TOOLPORT_SECRET_KEY=control\\000'");
+        let sourced = source_login_environment(&fixture.parent(), Duration::from_secs(1)).unwrap();
+        let env: BTreeMap<_, _> = child_environment(&sourced, &[], true).into_iter().collect();
+        assert_eq!(env.get("LOGIN_KEY").map(String::as_str), Some("login"));
+        assert_eq!(
+            env.get("MULTILINE").map(String::as_str),
+            Some("first\nsecond")
+        );
+        assert!(!env.contains_key("AMBIENT_SECRET"));
+        assert!(!env.contains_key("TOOLPORT_SECRET_KEY"));
+    }
+
+    #[test]
+    fn login_shell_timeout_falls_back_promptly() {
+        let fixture = ShellFixture::new("sleep 30 &\necho $! > \"$(dirname \"$0\")/pid\"\nwait");
+        let parent = fixture.parent();
+        let started = Instant::now();
+        assert_eq!(
+            login_environment_or_process(&parent, Duration::from_millis(100)),
+            parent
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn login_shell_failure_or_invalid_output_falls_back() {
+        for body in ["exit 1", "printf noise", "printf 'not-an-env-entry\\000'"] {
+            let fixture = ShellFixture::new(body);
+            let parent = fixture.parent();
+            assert_eq!(
+                login_environment_or_process(&parent, Duration::from_secs(1)),
+                parent
+            );
+        }
+        assert_eq!(
+            login_environment_or_process(&BTreeMap::new(), Duration::from_secs(1)),
+            BTreeMap::new()
+        );
     }
 }

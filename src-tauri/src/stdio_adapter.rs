@@ -314,7 +314,13 @@ fn spawn_daemon() -> Result<(), String> {
 fn start_private_gateway(why: &str) -> Result<(std::process::Child, DaemonDescriptor), String> {
     let exe = std::env::current_exe()
         .map_err(|error| format!("could not locate this executable: {error}"))?;
+    let parent = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
     let mut child = Command::new(exe)
+        // Use the daemon's boundary even when recovering beside a wedged daemon.
+        .env_clear()
+        .envs(daemon_environment(&parent))
         .arg(PRIVATE_GATEWAY_FLAG)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
