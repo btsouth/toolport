@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   importableServers,
+  hasLegacyBearerArgv,
   isGatewayDetected,
   isGatewayServer,
   type DetectedClient,
@@ -65,5 +66,33 @@ describe("gateway identity", () => {
     expect(isGatewayDetected(detected("toolport"))).toBe(true);
     expect(isGatewayDetected(detected("conduit"))).toBe(true);
     expect(isGatewayDetected(detected("linear"))).toBe(false);
+  });
+});
+
+describe("legacy bearer argv", () => {
+  const remote: McpServer = {
+    name: "toolport",
+    command: "npx",
+    args: [
+      "-y",
+      "mcp-remote",
+      "http://127.0.0.1/mcp",
+      "--header",
+      "Authorization: Bearer fixture-canary",
+    ],
+    transport: "stdio",
+    envKeys: [],
+    url: null,
+  };
+  it("detects literal credentials only on the preserved gateway shim", () => {
+    expect(hasLegacyBearerArgv(remote)).toBe(true);
+    expect(hasLegacyBearerArgv({ ...remote, name: "custom remote" })).toBe(false);
+    expect(
+      hasLegacyBearerArgv({
+        ...remote,
+        args: ["mcp-remote", "Authorization: Bearer ${TOKEN}"],
+      }),
+    ).toBe(false);
+    expect(hasLegacyBearerArgv({ ...remote, args: ["mcp-remote"] })).toBe(false);
   });
 });

@@ -2444,6 +2444,19 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
         });
         actions.append(&migrate);
     }
+    if client.legacy_bearer_argv {
+        let warning = gtk::Label::new(Some("This older HTTP connection exposes a bearer credential in process arguments. Review migration to stdio; it stays unchanged until you confirm."));
+        warning.set_wrap(true);
+        warning.set_xalign(0.0);
+        card.append(&warning);
+        let migrate = gtk::Button::with_label("Review migration to stdio");
+        let reviewed_client = client.clone();
+        let reviewed_page = page.clone();
+        migrate.connect_clicked(move |button| {
+            confirm_client_reset(&reviewed_client, button.clone(), reviewed_page.clone());
+        });
+        actions.append(&migrate);
+    }
     match client.gateway_state {
         state::ClientGatewayState::Disconnected => {
             let connect = gtk::Button::with_label("Connect");
@@ -2726,8 +2739,8 @@ fn confirm_client_reset(client: &state::ClientView, button: gtk::Button, page: C
     #[allow(deprecated)]
     let dialog = adw::MessageDialog::new(
         Some(&parent),
-        Some(&format!("Reset {}'s Toolport entry?", client.name)),
-        Some("This replaces only the customized Toolport gateway entry. Other client settings and MCP servers are preserved."),
+        Some(&format!("{} {}'s Toolport entry?", if client.legacy_bearer_argv { "Migrate" } else { "Reset" }, client.name)),
+        Some("Toolport backs up the config before replacing its gateway entry with the standard stdio command. Customized commands, arguments and headers will be replaced; review those changes before confirming. Other client settings and MCP servers are preserved. Restart the client afterward."),
     );
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("reset", "Reset and connect");
