@@ -1,0 +1,157 @@
+{
+  "npx:toolport-mcp-servers": {
+    "version": "0.2.0",
+    "integrity": "sha512-oCVm65Pnw+X0jY3+JrOP5gSAQfyQ4cJlwS2FOphwONrjYRfKiWmUWvv1QVnvyrumN8F6krJcCnd7XpG+/+Vz3A==",
+    "url": "https://registry.npmjs.org/toolport-mcp-servers/-/toolport-mcp-servers-0.2.0.tgz"
+  },
+  "uvx:awslabs.aws-api-mcp-server": {
+    "version": "1.5.6",
+    "integrity": "sha256-11133612071939b06bd389172b6abe7e8ada3a60de02ca31d14f7f98ddaeb357",
+    "url": "https://files.pythonhosted.org/packages/75/fd/75660ec452edf80b95a9736d33792bbde10cfa071b1706b21ebd1737cbb0/awslabs_aws_api_mcp_server-1.5.6-py3-none-any.whl"
+  },
+  "npx:mcp-server-kubernetes": {
+    "version": "4.1.9",
+    "integrity": "sha512-9TPqmLKUZwdodozHzWsgZQrRtXbkQUTT424CJxCfZOeGhuIuq7CRij9A+vQbIdAnl6gG1ejqRLqpdqfR4cimtw==",
+    "url": "https://registry.npmjs.org/mcp-server-kubernetes/-/mcp-server-kubernetes-4.1.9.tgz"
+  },
+  "npx:@takashito/linode-mcp-server": {
+    "version": "0.4.0",
+    "integrity": "sha512-K9/BUGwVp0+iXYOzdLV28wFWM0UMMmpoYvSucH2GU0c4miFUKVoAbEfcvHV7NnGay03Noqm2tg6I7mZ6Elbh9w==",
+    "url": "https://registry.npmjs.org/@takashito/linode-mcp-server/-/linode-mcp-server-0.4.0.tgz"
+  },
+  "npx:chrome-devtools-mcp": {
+    "version": "1.10.1",
+    "integrity": "sha512-Klw6HWDqHC/XS1JwZldd2r49aUhbUJN9m9Mvcx4SEueIPXtzuQX+QelxAViobv8YUkDZ7HWDrmViR6LeYK0wAw==",
+    "url": "https://registry.npmjs.org/chrome-devtools-mcp/-/chrome-devtools-mcp-1.10.1.tgz"
+  },
+  "npx:@modelcontextprotocol/server-postgres": {
+    "version": "0.6.2",
+    "integrity": "sha512-ukbVmVxLAsdZ5pTVWbhf9fc7lqkSf7XqizNH8XAotI21GnRPtkqO+WLWpeBFU+/2Fyv63uXS7/9NnR8Y8wOP1Q==",
+    "url": "https://registry.npmjs.org/@modelcontextprotocol/server-postgres/-/server-postgres-0.6.2.tgz"
+  },
+  "npx:mongodb-mcp-server": {
+    "version": "3.0.5",
+    "integrity": "sha512-tB9HfyrVHr7if8JMB3/+uWr4Rz9oJ9XsMzRUX+uGPAqTfpqUVz4IeRZ6c9NkKiVLMFSGXsJtnBVEwW2NtUIEAQ==",
+    "url": "https://registry.npmjs.org/mongodb-mcp-server/-/mongodb-mcp-server-3.0.5.tgz"
+  },
+  "npx:@elastic/mcp-server-elasticsearch": {
+    "version": "0.3.1",
+    "integrity": "sha512-zeANoblVkez9Mn2JDyUC0p5UVOY/uWnEbn2C0X2wGpX0C/wa6/8KHu2VbpQe4Y0zL4noPjVjsxKvSsIUpr2NjA==",
+    "url": "https://registry.npmjs.org/@elastic/mcp-server-elasticsearch/-/mcp-server-elasticsearch-0.3.1.tgz"
+  },
+  "uvx:mcp-server-qdrant": {
+    "version": "0.8.1",
+    "integrity": "sha256-eb7b36105021b431989f5a0f794591e52d48d3a6afb1a033d65fd8a08a68991c",
+    "url": "https://files.pythonhosted.org/packages/6d/15/690f32c0e702825c22772a571df75c2bfb0156daa98ef93d61b384c0254c/mcp_server_qdrant-0.8.1-py3-none-any.whl"
+  },
+  "uvx:redis-mcp-server": {
+    "version": "0.5.1",
+    "integrity": "sha256-335d9089d4c87a055b362effa7fd718334ccd88b2545d93c4ed9bc2b738b3ed8",
+    "url": "https://files.pythonhosted.org/packages/d6/e7/7c7c375285e480d693d240c4adc92012f8dabdfcaf0b09f5e1e385dec383/redis_mcp_server-0.5.1-py3-none-any.whl"
+  },
+  "npx:airtable-mcp-server": {
+    "version": "1.14.0",
+    "integrity": "sha512-OYUwkrIhXsYRqx39wQ5R7OAM5R0RdDWJRb8CBMLFU8OGPAB1Jmm4oOrLtaH3Qmtd+UG2IAT+nFlFrqfs//2klA==",
+    "url": "https://registry.npmjs.org/airtable-mcp-server/-/airtable-mcp-server-1.14.0.tgz"
+  },
+  "npx:@abhiz123/todoist-mcp-server": {
+    "version": "0.1.0",
+    "integrity": "sha512-jCagjv05QV2Y0ZBw9H2Szf4046AeXGjWzxKrDbG4T21XpRgjBArFqV2hykHAtwXhRNufNauFuH+YL5f+TwfZ2w==",
+    "url": "https://registry.npmjs.org/@abhiz123/todoist-mcp-server/-/todoist-mcp-server-0.1.0.tgz"
+  },
+  "npx:@modelcontextprotocol/server-slack": {
+    "version": "2025.4.25",
+    "integrity": "sha512-9WBjnxl4OgYZ1kKBqUmHbd2XVoqtnO9u8kaxSaGb4NAWf2Q4D/LV6FoJUAHPPcvKcB7AQLNJa8KO3yNOcU6fvQ==",
+    "url": "https://registry.npmjs.org/@modelcontextprotocol/server-slack/-/server-slack-2025.4.25.tgz"
+  },
+  "npx:@twilio-alpha/mcp": {
+    "version": "0.7.0",
+    "integrity": "sha512-YsUde1pMXwqHm8Cvq9JdtsyvclVCC/f/V+FmxTNN04u5Qt5aapkbQgcfqBYQ0xcmvATBNswgPDo3MPVaCtZK8Q==",
+    "url": "https://registry.npmjs.org/@twilio-alpha/mcp/-/mcp-0.7.0.tgz"
+  },
+  "npx:@brave/brave-search-mcp-server": {
+    "version": "2.1.4",
+    "integrity": "sha512-a34HBs6os4Ilp0yHPV/j3UrgBQH1uTDLsNA9y5IlO30RCYUFm9QPfC0coh2c7WEDxKcHuWjVsrfuXIJNheu9YA==",
+    "url": "https://registry.npmjs.org/@brave/brave-search-mcp-server/-/brave-search-mcp-server-2.1.4.tgz"
+  },
+  "npx:exa-mcp-server": {
+    "version": "3.4.2",
+    "integrity": "sha512-2pqkOuXnABXrwVkB6VyMYA9ywr1aqjBGKlLtcgTBMkWtIn74yY+pMPn8Km2SAGfLeENfWaIHv1L7/kF0b+E5BQ==",
+    "url": "https://registry.npmjs.org/exa-mcp-server/-/exa-mcp-server-3.4.2.tgz"
+  },
+  "npx:tavily-mcp": {
+    "version": "0.2.22",
+    "integrity": "sha512-w2pmmmn/JKcNavylDoiNtNPflWt6SK2G1SVUvg0VvdvFJQUaOzEdanAm1VUWBOhUCqmVoBYVPstGcOoWvh8RQQ==",
+    "url": "https://registry.npmjs.org/tavily-mcp/-/tavily-mcp-0.2.22.tgz"
+  },
+  "npx:@perplexity-ai/mcp-server": {
+    "version": "1.3.0",
+    "integrity": "sha512-rPeGlp63861F3ZyMUg6joIqBiQgji3acf6wFwMrTFrO2Zd0kKVV8Pwri5pznDjgJIgjiqOo58E1PDliilcmN8w==",
+    "url": "https://registry.npmjs.org/@perplexity-ai/mcp-server/-/mcp-server-1.3.0.tgz"
+  },
+  "npx:dataforseo-mcp-server": {
+    "version": "3.1.3",
+    "integrity": "sha512-bzYbgJ9pfVFkHDeViwbMhn3jl1EH0ULdpBn7xTuot0pewsA75LJX3s2HRg3xjGWZBSFyWhqVNFykNHG3lwqkCw==",
+    "url": "https://registry.npmjs.org/dataforseo-mcp-server/-/dataforseo-mcp-server-3.1.3.tgz"
+  },
+  "npx:firecrawl-mcp": {
+    "version": "3.28.2",
+    "integrity": "sha512-uF44mMgxoI+6RacXIDnQeHg345VYOcfWQ9bIFJ04jP0g5uSK8FP6NaNX9aeF8ugJXRh2SghOxgNgIzlB7rI4gg==",
+    "url": "https://registry.npmjs.org/firecrawl-mcp/-/firecrawl-mcp-3.28.2.tgz"
+  },
+  "npx:@apify/actors-mcp-server": {
+    "version": "0.17.4",
+    "integrity": "sha512-EOzzBSTA3/o/QM1EptJO+ZyoooZ/dlbb8uvI7qjf7MWzcQE+U6kQcFybjQaeCeOBYy+5epxV1jvuPW1CottTsA==",
+    "url": "https://registry.npmjs.org/@apify/actors-mcp-server/-/actors-mcp-server-0.17.4.tgz"
+  },
+  "npx:@browserbasehq/mcp": {
+    "version": "3.0.0",
+    "integrity": "sha512-BX07Le9/K56/vcWyCUsfuytHNrbuqeCRhFb4c5R8BZVa6L5b8xMDRYqGlflqAg7grwiwV+MOR9bCf5vPigrJhw==",
+    "url": "https://registry.npmjs.org/@browserbasehq/mcp/-/mcp-3.0.0.tgz"
+  },
+  "npx:figma-developer-mcp": {
+    "version": "0.13.2",
+    "integrity": "sha512-7Flx0S/3gI7dIm+9G6BCogwne0o9LdYaCxtDLappiZZUZgqoNiXws/T1kn2R2tqr1iRzFPStqlwf+bPrcscQ0Q==",
+    "url": "https://registry.npmjs.org/figma-developer-mcp/-/figma-developer-mcp-0.13.2.tgz"
+  },
+  "npx:resend-mcp": {
+    "version": "2.25.0",
+    "integrity": "sha512-NyJYWEPRYqTj2O0nhlGvDR6hqJd3+lPEviJnrmCoMh1UbQiZ0ErKDyjwPsaucTOpxgIW+CmBl3I0R4nrZ2NVpg==",
+    "url": "https://registry.npmjs.org/resend-mcp/-/resend-mcp-2.25.0.tgz"
+  },
+  "npx:@modelcontextprotocol/server-filesystem": {
+    "version": "2026.8.31",
+    "integrity": "sha512-kKaFkyAh6oipvc9+EAbJ552JafnMnOq5nzmzWkp1jJdBhTAAGpmIpWihUG1+rfNhmEFM98gUZDdCHCDD4v6a7Q==",
+    "url": "https://registry.npmjs.org/@modelcontextprotocol/server-filesystem/-/server-filesystem-2026.8.31.tgz"
+  },
+  "uvx:mcp-server-fetch": {
+    "version": "2026.8.18",
+    "integrity": "sha256-6642df733a1032e7f37d0f13849af8a944d46c02420d2c070cc14e0948f8fcc2",
+    "url": "https://files.pythonhosted.org/packages/5a/2d/c8d2e50796d6e3c77fa1932b9b010df36168edb5f5387c98a524ef77f110/mcp_server_fetch-2026.8.18-py3-none-any.whl"
+  },
+  "uvx:mcp-server-git": {
+    "version": "2026.8.18",
+    "integrity": "sha256-6c32a8e771564122a9bafac373cf871fb3ab540ddc1ba0ee8e9c8c6e9878aef7",
+    "url": "https://files.pythonhosted.org/packages/64/6b/2c03a87808ab787d568f4405ad79f27ea7b0498d9eea5086f01c25b153bc/mcp_server_git-2026.8.18-py3-none-any.whl"
+  },
+  "npx:@playwright/mcp": {
+    "version": "0.0.83",
+    "integrity": "sha512-oNcl+Ae2/IAjhfPeP46BfIkSakfmprY+aOtkv5MjrQ4lPav4/yNtPhL0iq8SlIM90oApWgBDUxaNKvktazUKOg==",
+    "url": "https://registry.npmjs.org/@playwright/mcp/-/mcp-0.0.83.tgz"
+  },
+  "npx:@modelcontextprotocol/server-sequential-thinking": {
+    "version": "2026.8.31",
+    "integrity": "sha512-/EMH++1j2e+VmHwpibw1IUPHxA0tcQY09Yo5/OIPwW/8irEKLAufJNGSZQhCK18n8TUvV6WwZyQOuaDKxe/CeQ==",
+    "url": "https://registry.npmjs.org/@modelcontextprotocol/server-sequential-thinking/-/server-sequential-thinking-2026.8.31.tgz"
+  },
+  "npx:@modelcontextprotocol/server-memory": {
+    "version": "2026.8.31",
+    "integrity": "sha512-ljj/3S4aGjxdNSQWw6gucKKGnTLdBPWxzapyY/MT2tOVyZwvxChvevXSLPwx59nKJAlVpUVW+cOlnVRXRwiqMQ==",
+    "url": "https://registry.npmjs.org/@modelcontextprotocol/server-memory/-/server-memory-2026.8.31.tgz"
+  },
+  "uvx:mcp-server-time": {
+    "version": "2026.8.18",
+    "integrity": "sha256-1407583af42dc0163909d855c9ef20114a12b4981c3975033721a7906cdd212a",
+    "url": "https://files.pythonhosted.org/packages/ad/d9/fcc7f85f0cdcfa8da9c650439128dd72be21855a126b745f17cf43f24b11/mcp_server_time-2026.8.18-py3-none-any.whl"
+  }
+}
