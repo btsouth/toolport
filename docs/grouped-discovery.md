@@ -92,6 +92,12 @@ recorded by `record_discovery` is subtracted; a full-mode session does not incur
 lazy discovery costs. Tool-result retrieval is ordinary task output rather than
 catalog discovery and is not treated as avoided definitions.
 
+Prometheus exposes the headline as the signed `toolport_tokens_saved` gauge,
+with `tokenizer="cl100k_base"` and `method="net_of_discovery"` labels. Its
+component token counters are separate. The existing `toolport_tokens_saved_total`
+and `toolport_tool_definition_tokens_estimated_avoided_total` retain historical
+estimates; neither includes new tokenizer measurements.
+
 ## Enabling it
 
 Per client, set the env in that client's MCP server config:
