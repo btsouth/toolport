@@ -9704,6 +9704,7 @@ fn watch_tick(
                 };
             }
         };
+        conduit_lib::downstream::invalidate_login_environment();
         state.last_mtime = current;
         // Publish the new registry and how far it can be trusted as one step, under
         // the registry lock. The HTTP auth path reads the flag while holding that
