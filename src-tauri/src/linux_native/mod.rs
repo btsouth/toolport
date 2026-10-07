@@ -2475,7 +2475,7 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             });
             actions.append(&connect);
         }
-        state::ClientGatewayState::Customized => {
+        state::ClientGatewayState::Customized if client_needs_reset_action(client) => {
             let reset = gtk::Button::with_label("Reset");
             reset.add_css_class("toolport-secondary-action");
             let client_for_reset = client.clone();
@@ -2485,6 +2485,7 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             });
             actions.append(&reset);
         }
+        state::ClientGatewayState::Customized => {}
         state::ClientGatewayState::Connected => {
             actions.append(&client_scope_menu(client.clone(), page.clone()));
             actions.append(&connected_client_actions_menu(client.clone(), page));
@@ -2732,6 +2733,22 @@ fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuBu
     menu
 }
 
+fn client_needs_reset_action(client: &state::ClientView) -> bool {
+    !client.legacy_bearer_argv
+}
+
+fn client_reset_scope(client: &state::ClientView) -> Option<String> {
+    client.scope_id.clone()
+}
+
+fn client_reset_label(client: &state::ClientView) -> &'static str {
+    if client.legacy_bearer_argv {
+        "Migrate to stdio"
+    } else {
+        "Reset and connect"
+    }
+}
+
 fn confirm_client_reset(client: &state::ClientView, button: gtk::Button, page: ClientPage) {
     let Some(parent) = page.app.active_window() else {
         return;
@@ -2743,14 +2760,21 @@ fn confirm_client_reset(client: &state::ClientView, button: gtk::Button, page: C
         Some("Toolport backs up the config before replacing its gateway entry with the standard stdio command. Customized commands, arguments and headers will be replaced; review those changes before confirming. Other client settings and MCP servers are preserved. Restart the client afterward."),
     );
     dialog.add_response("cancel", "Cancel");
-    dialog.add_response("reset", "Reset and connect");
+    dialog.add_response("reset", client_reset_label(client));
     dialog.set_close_response("cancel");
     dialog.set_default_response(Some("cancel"));
     dialog.set_response_appearance("reset", adw::ResponseAppearance::Suggested);
     let client = client.clone();
     dialog.connect_response(None, move |dialog, response| {
         if response == "reset" {
-            run_client_mutation(&client, true, true, None, &button, page.clone());
+            run_client_mutation(
+                &client,
+                true,
+                true,
+                client_reset_scope(&client),
+                &button,
+                page.clone(),
+            );
         }
         dialog.close();
     });
@@ -9003,6 +9027,54 @@ fn state_card(icon_name: &str, title: &str, body: &str, error: bool) -> gtk::Box
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gtk_legacy_reset_preserves_scope_and_uses_one_migration_action() {
+        use super::*;
+        let mut client = state::ClientView {
+            id: "cursor".into(),
+            name: "Cursor".into(),
+            app_present: true,
+            config_exists: true,
+            uses_connectors: false,
+            server_count: 1,
+            movable_server_count: 0,
+            gateway_state: state::ClientGatewayState::Customized,
+            shared_http: true,
+            legacy_bearer_argv: true,
+            scope_id: Some("work".into()),
+            scope_name: Some("Work".into()),
+            discovery_mode: None,
+            config_error: false,
+        };
+        let mut registry = crate::registry::Registry::default();
+        registry.set_client_scope(&client.id, client.scope_id.as_deref());
+        let scope = client_reset_scope(&client);
+        crate::registry_controller::apply_client_stdio_update(
+            &mut registry,
+            &client.id,
+            scope.as_deref(),
+            None,
+        );
+        assert_eq!(
+            registry.client_scopes.get(&client.id),
+            Some(&"work".to_string())
+        );
+        assert!(!client_needs_reset_action(&client));
+        assert_eq!(client_reset_label(&client), "Migrate to stdio");
+        client.legacy_bearer_argv = false;
+        assert!(client_needs_reset_action(&client));
+        assert_eq!(client_reset_label(&client), "Reset and connect");
+        client.scope_id = Some(String::new());
+        let scope = client_reset_scope(&client);
+        crate::registry_controller::apply_client_stdio_update(
+            &mut registry,
+            &client.id,
+            scope.as_deref(),
+            None,
+        );
+        assert_eq!(registry.client_scopes.get(&client.id), Some(&String::new()));
+    }
+
     /// The 2.0 sidebar is the four fixed views in order, with Team appended only
     /// on a paired install. Catalog is no longer a row even though
     /// their pages and actions stay reachable.

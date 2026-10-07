@@ -191,8 +191,12 @@ pub fn has_legacy_bearer_argv(server: &McpServer) -> bool {
                 .is_some_and(|(_, value)| {
                     value
                         .trim_start()
-                        .strip_prefix("bearer ")
-                        .is_some_and(|token| !token.trim().is_empty() && !token.contains("${"))
+                        .strip_prefix("bearer")
+                        .is_some_and(|token| {
+                            token.starts_with(char::is_whitespace)
+                                && !token.trim().is_empty()
+                                && !token.contains("${")
+                        })
                 })
         })
 }
@@ -6348,6 +6352,22 @@ impl Drop for EnvRestore {
 mod tests {
     use super::*;
     use crate::registry::EnvVar;
+
+    #[test]
+    fn legacy_bearer_detection_accepts_whitespace_and_requires_a_token_boundary() {
+        let mut server = gateway_server("toolport", "npx");
+        for separator in [" ", "\t", "\n", "\r\n", "\u{2003}"] {
+            server.args = vec![
+                "mcp-remote".into(),
+                format!("Authorization: Bearer{separator}fixture-canary"),
+            ];
+            assert!(has_legacy_bearer_argv(&server), "{separator:?}");
+        }
+        for value in ["BearerToken", "Bearer\t${TOKEN}", "Bearer\t "] {
+            server.args[1] = format!("Authorization: {value}");
+            assert!(!has_legacy_bearer_argv(&server), "{value}");
+        }
+    }
 
     #[test]
     fn legacy_bearer_detection_is_read_only() {
