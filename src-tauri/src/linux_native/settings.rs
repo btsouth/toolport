@@ -509,6 +509,10 @@ impl SettingsPage {
         let remove_clients = gtk::Button::with_label("Remove Toolport from all clients");
         remove_clients.set_halign(gtk::Align::Start);
         page.append(&remove_clients);
+        let removal_results = gtk::Label::new(None);
+        removal_results.set_xalign(0.0);
+        removal_results.set_wrap(true);
+        page.append(&removal_results);
         scroller.set_child(Some(&page));
         root.append(&scroller);
         let settings_page = Self {
@@ -558,18 +562,19 @@ impl SettingsPage {
             dialog.set_default_response(Some("cancel"));
             dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
             let page = remove_page.clone();
+            let results_label = removal_results.clone();
             let button = button.clone();
             dialog.connect_response(None, move |dialog, response| {
                 if response == "remove" {
                     button.set_sensitive(false);
                     let page = page.clone();
+                    let results_label = results_label.clone();
                     let button = button.clone();
                     gtk::glib::spawn_future_local(async move {
                         match gtk::gio::spawn_blocking(|| crate::clients::disconnect_all(false)).await {
                             Ok(Ok(results)) => {
                                 let message = if results.is_empty() { "No client connections to remove.".into() } else { results.iter().map(|result| format!("{}: {}", result.client_id, result.error.as_deref().unwrap_or("Client configuration restored"))).collect::<Vec<_>>().join("\n") };
-                                page.feedback.set_label(&message);
-                                page.feedback.set_wrap(true);
+                                results_label.set_label(&message);
                                 page.begin_mutation();
                                 page.refresh_quietly();
                             }

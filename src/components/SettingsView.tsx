@@ -544,7 +544,11 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     try {
       setRemoveResults(await disconnectAllClients());
       setRemoveOpen(false);
-      onRegistryChange(await getRegistry());
+      try {
+        onRegistryChange(await getRegistry());
+      } catch (error) {
+        toastError(`Client removal finished, but could not refresh settings: ${error}`);
+      }
     } catch (error) {
       toastError(`Could not remove client connections: ${error}`);
     } finally {

@@ -531,6 +531,29 @@ it("shows the expand affordance for an empty access set", async () => {
 });
 
 describe("Remove Toolport from all clients", () => {
+  it("keeps removal results when refreshing the registry fails", async () => {
+    const user = userEvent.setup();
+    vi.mocked(disconnectAllClients).mockResolvedValue([
+      { clientId: "codex", path: "/fixture/config.toml", dryRun: false, error: null },
+    ]);
+    vi.mocked(getRegistry).mockRejectedValue(new Error("refresh failed"));
+    renderSettings();
+    await user.click(
+      screen.getByRole("button", { name: "Remove Toolport from all clients" }),
+    );
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: "Remove from all clients",
+      }),
+    );
+    await screen.findByText("codex: Client configuration restored");
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "Client removal finished, but could not refresh settings: Error: refresh failed",
+      ),
+    );
+  });
+
   it("requires confirmation and reports a partial failure per client", async () => {
     const user = userEvent.setup();
     vi.mocked(disconnectAllClients).mockResolvedValue([

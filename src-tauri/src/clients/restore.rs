@@ -675,9 +675,9 @@ pub(super) fn finish(client_id: &str, path: &Path, expected: Option<&str>) -> Re
                     ))
                 }
             }
-        } // Nonempty native directories are preserved.
-          // Keep immutable original provenance and a completed-removal marker.
-          // A later uninstaller/retry must not claim the restored native entries.
+        }
+        // Keep immutable original provenance and a completed-removal marker.
+        // A later uninstaller/retry must not claim the restored native entries.
         record.disconnected = true;
         record.disconnect_before = None;
         crate::registry::atomic_write(
