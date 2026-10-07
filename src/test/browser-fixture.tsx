@@ -175,6 +175,7 @@ mockIPC(
           content: [{ type: "text", text: `Fixture result: ${JSON.stringify(payload)}` }],
           isError: false,
         };
+      case "is_launch_at_login_enabled":
       case "plugin:autostart|is_enabled":
         return false;
       case "http_bridge_status":

@@ -24687,15 +24687,16 @@ mod tests {
                 unknown_fields: serde_json::Map::new(),
             });
         }
-        // alpha is in the active (default) profile; bravo only in a separate one.
+        // The migrated default is pinned to alpha; Billing can see bravo.
         reg.set_server_enabled("default", "alpha", true).unwrap();
         let billing = reg.add_profile("Billing");
         reg.set_server_enabled(&billing, "bravo", true).unwrap();
+        reg.default_access_profile_id = Some("default".into());
         let cached = vec![json!({ "name": "alpha__x" }), json!({ "name": "bravo__y" })];
-        // Unscoped (legacy/stdio): the active profile -> alpha only.
+        // Unscoped stdio keeps the pinned default access: alpha only.
         let full = enabled_summary(&host, &reg, &cached, None, None);
         assert!(full.contains("alpha"));
-        assert!(!full.contains("bravo")); // not in the active profile
+        assert!(!full.contains("bravo")); // outside the pinned default access
         assert!(full.contains("tokens saved"));
         // Scoped to bravo: shows bravo (its real scope) even though bravo isn't in
         // the active profile, and never leaks alpha's name/command/tool count.
@@ -26698,6 +26699,9 @@ mod tests {
         let mut reg = Registry::default();
         reg.servers.push(stub_server("a", "A"));
         reg.servers.push(stub_server("x", "X"));
+        for server in &mut reg.servers {
+            server.enabled = true;
+        }
         reg.profiles.clear();
         for (id, servers) in [("p", vec!["a", "x"]), ("q", vec!["x"])] {
             reg.profiles.push(registry::Profile {
