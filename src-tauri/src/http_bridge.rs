@@ -80,42 +80,6 @@ pub fn identity_ready(port: u16, token: &str) -> bool {
         && body.starts_with("Toolport gateway (HTTP mode).")
 }
 
-fn proxy_selected(
-    override_value: Option<&str>,
-    topology: Option<crate::registry::GatewayTopology>,
-) -> bool {
-    match override_value.map(str::trim) {
-        Some(value) if value.eq_ignore_ascii_case("legacy") => false,
-        Some(value) if value.eq_ignore_ascii_case("daemon") => true,
-        _ => topology == Some(crate::registry::GatewayTopology::Daemon),
-    }
-}
-
-fn bridge_uses_daemon() -> bool {
-    let topology = crate::registry::load_resolved_with_source()
-        .ok()
-        .filter(|(_, source)| source.is_authoritative())
-        .map(|(registry, _)| registry.gateway_topology_effective());
-    let override_value =
-        crate::brand::env_var("TOOLPORT_GATEWAY_TOPOLOGY", "CONDUIT_GATEWAY_TOPOLOGY");
-    proxy_selected(override_value.as_deref(), topology)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::proxy_selected;
-    use crate::registry::GatewayTopology::{Daemon, Legacy};
-
-    #[test]
-    fn desktop_proxy_selection_keeps_the_legacy_rollback() {
-        assert!(proxy_selected(None, Some(Daemon)));
-        assert!(!proxy_selected(None, Some(Legacy)));
-        assert!(!proxy_selected(None, None));
-        assert!(!proxy_selected(Some("legacy"), Some(Daemon)));
-        assert!(proxy_selected(Some("daemon"), Some(Legacy)));
-    }
-}
-
 pub fn start_with_token_at(
     state: &HttpBridgeState,
     port: Option<u16>,
@@ -144,19 +108,14 @@ pub fn start_with_token_at(
             bytes.iter().map(|byte| format!("{byte:02x}")).collect()
         }
     };
-    let proxy_mode = bridge_uses_daemon();
     let mut command = std::process::Command::new(&bin);
     command
-        .arg(if proxy_mode { "--http-proxy" } else { "--http" })
+        .arg("--http-proxy")
         .arg(port.to_string())
         .env("TOOLPORT_HTTP_TOKEN", &token)
         .env("CONDUIT_HTTP_TOKEN", &token)
         // The proxy treats stdin EOF as the app's service lease ending.
-        .stdin(if proxy_mode {
-            std::process::Stdio::piped()
-        } else {
-            std::process::Stdio::null()
-        })
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     #[cfg(windows)]
@@ -167,8 +126,7 @@ pub fn start_with_token_at(
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start the HTTP bridge: {error}"))?;
-    let startup_timeout = if proxy_mode { 25 } else { 5 };
-    let deadline = std::time::Instant::now() + Duration::from_secs(startup_timeout);
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!(
@@ -190,7 +148,7 @@ pub fn start_with_token_at(
     bridge.child = Some(child);
     bridge.port = Some(port);
     bridge.token = Some(token.clone());
-    bridge.proxy_mode = proxy_mode;
+    bridge.proxy_mode = true;
     Ok(HttpBridgeStatus::new(Some(port), Some(token)))
 }
 

@@ -49,7 +49,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { TransportPill } from "@/components/TransportPill";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
 import {
@@ -96,16 +95,10 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   const [bulkImportServers, setBulkImportServers] = useState<McpServer[] | null>(null);
   // "" = follow the active profile; else scope to one.
   const [profile, setProfile] = useState("");
-  // stdio (spawn per client) or sharedHttp (one bridge, SOU-407).
-  const [transport, setTransport] = useState<"stdio" | "sharedHttp">("stdio");
   const [migrateOpen, setMigrateOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
   const installed = client.gatewayInstalled;
   const customized = client.entryState === "customized";
-  const managedTransport =
-    registry?.clientManagedEntries?.[client.id]?.transport === "sharedHttp"
-      ? "sharedHttp"
-      : "stdio";
   // Whether the client app is actually on this machine. We allow Disconnect even
   // when absent (to clean up a stale entry), but block a fresh Connect, writing a
   // config into a client that isn't installed just creates a file nothing reads.
@@ -122,9 +115,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     const match = profiles.find((p) => p.id === currentScope || p.name === currentScope);
     setProfile(match?.id ?? currentScope);
   }, [currentScope, client.id, registry?.profiles]);
-  useEffect(() => {
-    setTransport(managedTransport);
-  }, [managedTransport, client.id]);
+
 
   // SOU-317 follow-up (SBS-336): the restart advice is load-bearing — an MCP client
   // typically does not pick up a rewritten config until relaunch — but it only ever
@@ -225,8 +216,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     }
     setBusy(true);
     try {
-      // Pass live transport so Apply scope does not rewrite Shared HTTP → stdio (WS3-2).
-      await installGateway(client.id, profile || undefined, false, transport);
+      await installGateway(client.id, profile || undefined, false);
       // Rescope rewrites the client's MCP config the same way Connect does; without a
       // restart hint the change is invisible until the next cold start (SOU-317).
       const scopeName = profiles.find((p) => p.id === profile)?.name ?? profile;
@@ -249,7 +239,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   async function resetToDefault() {
     setBusy(true);
     try {
-      await installGateway(client.id, profile || undefined, true, transport);
+      await installGateway(client.id, profile || undefined, true);
       toast.success(`Reset ${client.name} to the default Toolport gateway`, {
         description: clientRestartHint(client.name),
       });
@@ -277,7 +267,6 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         client.id,
         profile || undefined,
         customized || undefined,
-        transport,
       );
       onRegistryChange(result.registry);
       toast.success(
@@ -396,15 +385,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           client.id,
           profile || undefined,
           false,
-          transport,
-        );
+          );
         // Restart is the load-bearing line (SOU-317): MCP clients typically do not
         // pick up a new gateway entry until relaunch. Scope/backup are secondary.
         toast.success(`Connected Toolport to ${client.name}`, {
           description: connectSuccessDescription(client.name, [
-            transport === "sharedHttp"
-              ? "Uses the shared HTTP bridge (one gateway process)."
-              : null,
             profile
               ? `Scoped to the "${profiles.find((p) => p.id === profile)?.name ?? profile}" profile.`
               : null,
@@ -467,7 +452,6 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               </span>{" "}
               · {scopeServerCount(currentScope)} server
               {scopeServerCount(currentScope) === 1 ? "" : "s"}
-              {managedTransport === "sharedHttp" ? " · shared HTTP" : ""}
             </p>
           )}
           {!present && !installed && (
@@ -477,22 +461,6 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          {!installed && present && (
-            <Select
-              value={transport}
-              onValueChange={(v) =>
-                setTransport(v === "sharedHttp" ? "sharedHttp" : "stdio")
-              }
-            >
-              <SelectTrigger size="sm" className="w-44">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="stdio">Spawn (stdio)</SelectItem>
-                <SelectItem value="sharedHttp">Shared HTTP</SelectItem>
-              </SelectContent>
-            </Select>
-          )}
           {profiles.length > 1 && !customized && (
             <Select
               value={profile || "__all__"}
@@ -973,7 +941,6 @@ function ServerMiniCard({
               </span>
             )}
           </div>
-          <TransportPill transport={server.transport} />
         </div>
         <code className="truncate font-mono text-xs text-muted-foreground">
           {server.command

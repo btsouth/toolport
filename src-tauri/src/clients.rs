@@ -5447,129 +5447,6 @@ fn secondary_claude_gateway_entry(profile: Option<&str>) -> Result<ServerEntry, 
     Ok(entry)
 }
 
-/// Parameters for installing a shared-HTTP gateway entry (SOU-407).
-#[derive(Debug, Clone)]
-pub struct SharedHttpSpec {
-    pub url: String,
-    pub token: String,
-}
-
-/// Whether this client needs the `npx mcp-remote` bridge instead of a native
-/// remote MCP entry. Native: formats with first-class url+headers. Bridge: most
-/// JsonMcpServers clients (Claude Desktop, etc.) that only spawn stdio.
-pub fn client_uses_mcp_remote_bridge(client_id: &str) -> bool {
-    let Some(def) = find_def(client_id) else {
-        return true;
-    };
-    // The one client whose format does not decide this. Devin Local / CLI reads
-    // the plain `mcpServers` shape, but unlike the rest of that format it takes a
-    // remote entry directly: its user config documents `url` plus an optional
-    // `headers` object, with `transport` defaulting to http, which is exactly
-    // what entry_to_json already emits for a native remote. Bridging it through
-    // `npx mcp-remote` would work but would make users install a third-party
-    // shim for a transport the client speaks natively.
-    //
-    // Devin Desktop (the `windsurf` id) is deliberately not covered: it is a
-    // separate config that has not been checked for the same support, so it
-    // keeps the format default.
-    if client_id == "devin-cli" {
-        return false;
-    }
-    match def.format {
-        // Native remote shapes already exist in our writers.
-        Format::JsonQwenMcpServers
-        | Format::JsonKimiMcpServers
-        | Format::JsonZCodeMcp
-        | Format::JsonMcp
-        | Format::JsonCopilotMcpServers
-        | Format::JsonDroidMcpServers
-        | Format::JsonOpenCodeMcp
-        | Format::JsonServers
-        | Format::YamlMcpServers
-        | Format::YamlMcpServersList => false,
-        // JsonMcpServers / TOML / Goose: bridge unless we know better later.
-        Format::JsonMcpServers
-        | Format::JsonAmpMcpServers
-        | Format::JsonContextServers
-        | Format::TomlMcpServers
-        | Format::YamlExtensions => true,
-    }
-}
-
-/// Build a shared-HTTP gateway entry: native url+headers, or `npx mcp-remote` bridge.
-pub fn gateway_entry_shared_http(
-    client_id: &str,
-    profile: Option<&str>,
-    spec: &SharedHttpSpec,
-) -> ServerEntry {
-    let auth = format!("Bearer {}", spec.token);
-    if client_uses_mcp_remote_bridge(client_id) {
-        // Bridge form (Claude Desktop, etc.): third-party mcp-remote is opt-in
-        // only when the user chooses Shared HTTP in Integrations (SOU-407).
-        ServerEntry {
-            inherit_env: false,
-            id: GATEWAY_ENTRY_NAME.to_string(),
-            name: GATEWAY_ENTRY_NAME.to_string(),
-            transport: "stdio".to_string(),
-            command: Some("npx".into()),
-            args: vec![
-                "-y".into(),
-                "mcp-remote".into(),
-                spec.url.clone(),
-                "--header".into(),
-                format!("Authorization: {auth}"),
-            ],
-            env: Vec::new(),
-            url: None,
-            source: Some("toolport".into()),
-            disabled_tools: Vec::new(),
-            cwd: None,
-            client_credentials: None,
-            request_timeout_ms: None,
-            initialize_timeout_ms: None,
-            launch: None,
-            unknown_fields: serde_json::Map::new(),
-        }
-    } else {
-        let mut env = vec![crate::registry::EnvVar {
-            key: "Authorization".into(),
-            value: Some(auth),
-            secret: true,
-        }];
-        // Keep client id for live scope resolution when the client forwards headers/env.
-        env.push(crate::registry::EnvVar {
-            key: crate::brand::CLIENT_ID.to_string(),
-            value: Some(client_id.to_string()),
-            secret: false,
-        });
-        if let Some(p) = profile.map(str::trim).filter(|p| !p.is_empty()) {
-            env.push(crate::registry::EnvVar {
-                key: crate::brand::PROFILE.to_string(),
-                value: Some(p.to_string()),
-                secret: false,
-            });
-        }
-        ServerEntry {
-            inherit_env: false,
-            id: GATEWAY_ENTRY_NAME.to_string(),
-            name: GATEWAY_ENTRY_NAME.to_string(),
-            transport: "http".to_string(),
-            command: None,
-            args: Vec::new(),
-            env,
-            url: Some(spec.url.clone()),
-            source: Some("toolport".into()),
-            disabled_tools: Vec::new(),
-            cwd: None,
-            client_credentials: None,
-            request_timeout_ms: None,
-            initialize_timeout_ms: None,
-            launch: None,
-            unknown_fields: serde_json::Map::new(),
-        }
-    }
-}
-
 fn edit_json_gateway(
     path: &Path,
     key: &str,
@@ -5839,16 +5716,6 @@ pub fn install_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOu
     install_or_remove(client_id, Some(&entry))
 }
 
-/// Add a shared-HTTP gateway entry (native remote or `npx mcp-remote` bridge). SOU-407.
-pub fn install_gateway_shared_http(
-    client_id: &str,
-    profile: Option<&str>,
-    spec: &SharedHttpSpec,
-) -> Result<WriteOutcome, String> {
-    let entry = gateway_entry_shared_http(client_id, profile, spec);
-    install_or_remove(client_id, Some(&entry))
-}
-
 /// Remove Toolport's gateway entry from a client's config, first putting back
 /// any servers "Move into gateway" took out of it (UX-03). Restoring first means
 /// a failure in between leaves the client with both, never with neither.
@@ -5881,23 +5748,9 @@ pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) {
 /// "migrate": after the client's servers are imported into Toolport, this leaves
 /// the client talking only to the gateway. Backs up first; unrelated config keys
 /// are preserved. Caller is responsible for importing first so nothing is lost.
-///
-/// When `shared` is set, write a Shared HTTP entry instead of stdio so migrate
-/// does not silently downgrade an existing Shared HTTP install (WS3-2).
+/// Explicit migration writes the stdio adapter entry.
 pub fn migrate_to_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOutcome, String> {
-    migrate_to_gateway_with_transport(client_id, profile, None)
-}
-
-/// Like [`migrate_to_gateway`], with an optional Shared HTTP spec (WS3-2).
-pub fn migrate_to_gateway_with_transport(
-    client_id: &str,
-    profile: Option<&str>,
-    shared: Option<&SharedHttpSpec>,
-) -> Result<WriteOutcome, String> {
-    let entry = match shared {
-        Some(spec) => gateway_entry_shared_http(client_id, profile, spec),
-        None => gateway_entry(profile, client_id)?,
-    };
+    let entry = gateway_entry(profile, client_id)?;
     // Keep what this rewrite drops so Disconnect can put it back (UX-03).
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
@@ -6170,7 +6023,7 @@ fn referenced_gateway_paths_in(clients: &[DetectedClient]) -> Option<Vec<PathBuf
 }
 
 pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> RepointOutcome {
-    let mut outcome = RepointOutcome::default();
+    let outcome = RepointOutcome::default();
     let Some(current) = resolve_gateway_path().map(|p| p.to_string_lossy().into_owned()) else {
         return outcome;
     };
@@ -6179,7 +6032,26 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
     if !Path::new(&current).exists() {
         return outcome;
     }
-    for client in detect_clients() {
+    let mut outcome = repoint_stale_gateways_in(&current, detect_clients(), managed);
+    repoint_other_claude_configs(&current, &mut outcome);
+    log_repoint_outcome(&current, &outcome);
+    outcome
+}
+
+fn repoint_stale_gateways_in(
+    current: &str,
+    clients: Vec<DetectedClient>,
+    managed: &HashMap<String, ManagedEntry>,
+) -> RepointOutcome {
+    let mut outcome = RepointOutcome::default();
+    for client in clients {
+        // Existing remote entries are retained until an explicit reconnect.
+        if managed
+            .get(&client.id)
+            .is_some_and(|entry| entry.transport == "sharedHttp")
+        {
+            continue;
+        }
         if !client.config_exists || client.error.is_some() {
             continue;
         }
@@ -6210,7 +6082,7 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
         let config_text = find_def(&client.id)
             .and_then(|def| resolved_definition_path(&def).ok())
             .and_then(|path| read_config_file(&path).ok());
-        if !gateway_entry_needs_rewrite(entry_name, stored, &current, config_text.as_deref()) {
+        if !gateway_entry_needs_rewrite(entry_name, stored, current, config_text.as_deref()) {
             continue;
         }
         let profile = config_text
@@ -6242,8 +6114,6 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
             }
         }
     }
-    repoint_other_claude_configs(&current, &mut outcome);
-    log_repoint_outcome(&current, &outcome);
     outcome
 }
 
@@ -8113,237 +7983,52 @@ bad = "not-a-table"
     }
 
     #[test]
-    fn shared_http_bridge_entry_for_claude_desktop() {
-        // Claude Desktop has no native remote MCP shape; Shared HTTP writes mcp-remote.
-        let spec = SharedHttpSpec {
-            url: "http://127.0.0.1:8765/mcp".into(),
-            token: "secrettok".into(),
-        };
-        let entry = gateway_entry_shared_http("claude-desktop", None, &spec);
-        assert_eq!(entry.command.as_deref(), Some("npx"));
-        assert!(entry.args.iter().any(|a| a == "mcp-remote"));
-        assert!(entry.args.iter().any(|a| a.contains("8765/mcp")));
-        assert!(entry
-            .args
-            .iter()
-            .any(|a| a.contains("Authorization: Bearer secrettok")));
-        // Ownership record must not retain the bearer.
-        let rec = ManagedEntry::from_gateway_entry(&entry);
-        assert_eq!(rec.transport, "sharedHttp");
-        assert_eq!(rec.url.as_deref(), Some("http://127.0.0.1:8765/mcp"));
-        assert!(!rec.args.iter().any(|a| a.contains("Bearer")));
-        assert!(client_uses_mcp_remote_bridge("claude-desktop"));
-        assert!(client_uses_mcp_remote_bridge("amp"));
-        assert!(!client_uses_mcp_remote_bridge("opencode"));
-        assert!(!client_uses_mcp_remote_bridge("vscode"));
-        assert!(!client_uses_mcp_remote_bridge("github-copilot-cli"));
-        assert!(!client_uses_mcp_remote_bridge("devin-cli"));
-    }
-
-    #[test]
-    fn devin_cli_shared_http_entry_uses_native_remote_schema() {
-        let path = temp_path("devin-cli-http.json");
-        let spec = SharedHttpSpec {
-            url: "http://127.0.0.1:8765/mcp".into(),
-            token: "tok".into(),
-        };
-        let entry = gateway_entry_shared_http("devin-cli", None, &spec);
-        // No mcp-remote shim: Devin Local / CLI takes the remote entry directly.
-        assert!(entry.command.is_none());
-        assert_eq!(entry.url.as_deref(), Some("http://127.0.0.1:8765/mcp"));
-
-        edit_json_gateway(&path, "mcpServers", Some(&entry), false).unwrap();
-        let root: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let gateway = &root["mcpServers"][GATEWAY_ENTRY_NAME];
-        assert_eq!(gateway["url"], "http://127.0.0.1:8765/mcp");
-        // Devin defaults `transport` to http, so the `type` hint is advisory; the
-        // credential must ride in `headers` rather than `env` to reach the wire.
-        assert_eq!(gateway["type"], "http");
-        assert_eq!(gateway["headers"]["Authorization"], "Bearer tok");
-        assert!(gateway.get("command").is_none());
-        assert!(gateway.get("env").is_none());
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn github_copilot_cli_shared_http_entry_uses_native_schema() {
-        let path = temp_path("github-copilot-cli-http.json");
-        let spec = SharedHttpSpec {
-            url: "http://127.0.0.1:8765/mcp".into(),
-            token: "tok".into(),
-        };
-        let entry = gateway_entry_shared_http("github-copilot-cli", None, &spec);
-
-        edit_copilot_json_gateway(&path, Some(&entry)).unwrap();
-        let root: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let gateway = &root["mcpServers"][GATEWAY_ENTRY_NAME];
-        assert_eq!(gateway["type"], "http");
-        assert_eq!(gateway["url"], "http://127.0.0.1:8765/mcp");
-        assert_eq!(gateway["tools"], serde_json::json!(["*"]));
-        assert_eq!(gateway["headers"]["Authorization"], "Bearer tok");
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn shared_http_native_entry_for_opencode() {
-        let spec = SharedHttpSpec {
-            url: "http://127.0.0.1:8765/mcp".into(),
-            token: "tok".into(),
-        };
-        let entry = gateway_entry_shared_http("opencode", Some("Work"), &spec);
-        assert!(entry.command.is_none());
-        assert_eq!(entry.url.as_deref(), Some("http://127.0.0.1:8765/mcp"));
-        assert_eq!(entry.transport, "http");
-        assert!(entry
-            .env
-            .iter()
-            .any(|e| e.key == "Authorization" && e.value.as_deref() == Some("Bearer tok")));
-        let rec = ManagedEntry::from_gateway_entry(&entry);
-        assert!(!rec.env.contains_key("Authorization"));
-        assert_eq!(rec.transport, "sharedHttp");
-    }
-
-    /// WS3-1 / WS3-3: write Shared HTTP to a real config file, re-detect, assert
-    /// the bearer reaches a field that is sent (env/headers), across native formats.
-    #[test]
-    fn shared_http_write_redetect_preserves_token_keys_across_formats() {
-        let spec = SharedHttpSpec {
-            url: "http://127.0.0.1:8765/mcp".into(),
-            token: "roundtrip-secret".into(),
-        };
-        let auth = "Bearer roundtrip-secret";
-
-        // Continue (YamlMcpServersList): remote bearer under requestOptions.headers
-        // (Continue's wire contract), not env (WS3-1).
-        {
-            let path = temp_path("ws3-continue.yaml");
-            std::fs::write(&path, "name: Test\nmcpServers: []\n").unwrap();
-            let entry = gateway_entry_shared_http("continue", Some("Work"), &spec);
-            edit_continue_yaml_gateway(&path, Some(&entry)).unwrap();
-            let content = std::fs::read_to_string(&path).unwrap();
-            assert!(
-                content.contains(auth),
-                "Continue config must contain the bearer: {content}"
-            );
-            let root: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
-            let slot = root
-                .get("mcpServers")
-                .and_then(|v| v.as_sequence())
-                .and_then(|seq| {
-                    seq.iter().find(|s| {
-                        s.get("name").and_then(|n| n.as_str()) == Some(GATEWAY_ENTRY_NAME)
-                    })
-                })
-                .expect("gateway entry in yaml");
-            assert_eq!(
-                slot.get("requestOptions")
-                    .and_then(|ro| ro.get("headers"))
-                    .and_then(|h| h.get("Authorization"))
-                    .and_then(|v| v.as_str()),
-                Some(auth),
-                "Continue remote must put Authorization under requestOptions.headers: {content}"
-            );
-            assert!(
-                slot.get("env").is_none(),
-                "Continue remote must not put the bearer under env: {content}"
-            );
-            let parsed = parse_continue_yaml_servers(&content).unwrap();
-            let gw = parsed
-                .iter()
-                .find(|s| s.name == GATEWAY_ENTRY_NAME)
-                .expect("gateway entry");
-            assert_eq!(gw.url.as_deref(), Some(spec.url.as_str()));
-            assert!(
-                gw.env_keys.iter().any(|k| k == "Authorization"),
-                "re-detect must see Authorization key: {:?}",
-                gw.env_keys
-            );
-            let rec = ManagedEntry::from_gateway_entry(&entry);
-            assert_eq!(
-                resolve_entry_state(&[gw.clone()], Some(&rec)),
-                GatewayEntryState::Managed
-            );
-            std::fs::remove_file(&path).ok();
+    fn startup_repoint_preserves_existing_shared_http_client_entries() {
+        let root = temp_path("shared-http-startup");
+        std::fs::create_dir_all(&root).unwrap();
+        let native = root.join("native.json");
+        let bridge = root.join("bridge.json");
+        let configs = [
+            (
+                &native,
+                r#"{"mcpServers":{"toolport":{"url":"http://127.0.0.1:8765/mcp","headers":{"Authorization":"Bearer original"}}}}"#,
+            ),
+            (
+                &bridge,
+                r#"{"mcpServers":{"toolport":{"command":"npx","args":["-y","mcp-remote","http://127.0.0.1:8765/mcp","--header","Authorization: Bearer original"]}}}"#,
+            ),
+        ];
+        let mut managed = HashMap::new();
+        let mut clients = Vec::new();
+        for (index, (path, raw)) in configs.iter().enumerate() {
+            std::fs::write(path, raw).unwrap();
+            let id = format!("existing-{index}");
+            let mut client = detected(&id);
+            client.config_path = path.display().to_string();
+            client.servers = parse_json(raw, "mcpServers").unwrap();
+            let mut record = ManagedEntry {
+                command: client.servers[0].command.clone().unwrap_or_default(),
+                args: client.servers[0].args.clone(),
+                env: Default::default(),
+                transport: "sharedHttp".into(),
+                url: Some("http://127.0.0.1:8765/mcp".into()),
+                updated_at: 1,
+            };
+            // Even an old ownership record must not authorize a startup conversion.
+            record.command = "/opt/Toolport/bin/conduit-gateway-1.0.0".into();
+            managed.insert(id, record);
+            clients.push(client);
         }
-
-        // VS Code (JsonServers): headers, not env (WS3-3).
-        {
-            let path = temp_path("ws3-vscode.json");
-            std::fs::write(&path, r#"{"servers":{}}"#).unwrap();
-            let entry = gateway_entry_shared_http("vscode", None, &spec);
-            edit_json_gateway(&path, "servers", Some(&entry), false).unwrap();
-            let root: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            let slot = &root["servers"][GATEWAY_ENTRY_NAME];
-            assert_eq!(slot["url"], spec.url);
-            assert_eq!(slot["headers"]["Authorization"], auth);
-            assert!(
-                slot.get("env").is_none(),
-                "VS Code must not put the bearer under env: {slot}"
-            );
-            let parsed = parse_json(&std::fs::read_to_string(&path).unwrap(), "servers").unwrap();
-            let gw = parsed
-                .iter()
-                .find(|s| s.name == GATEWAY_ENTRY_NAME)
-                .expect("gateway");
-            assert!(gw.env_keys.iter().any(|k| k == "Authorization"));
-            std::fs::remove_file(&path).ok();
+        let before = serde_json::to_value(&managed).unwrap();
+        let outcome =
+            repoint_stale_gateways_in("/opt/Toolport/bin/toolport-gateway", clients, &managed);
+        assert!(outcome.repointed.is_empty());
+        assert!(outcome.failed.is_empty());
+        assert_eq!(serde_json::to_value(&managed).unwrap(), before);
+        for (path, raw) in configs {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
         }
-
-        // Hermes (YamlMcpServers): headers for remote (WS3-3).
-        {
-            let path = temp_path("ws3-hermes.yaml");
-            std::fs::write(&path, "mcp_servers: {}\n").unwrap();
-            let entry = gateway_entry_shared_http("hermes", None, &spec);
-            edit_hermes_yaml_gateway(&path, Some(&entry)).unwrap();
-            let content = std::fs::read_to_string(&path).unwrap();
-            assert!(
-                content.contains(auth),
-                "Hermes must contain bearer: {content}"
-            );
-            assert!(
-                content.contains("headers:"),
-                "Hermes remote auth under headers: {content}"
-            );
-            let parsed = parse_hermes_yaml_servers(&content).unwrap();
-            let gw = parsed
-                .iter()
-                .find(|s| s.name == GATEWAY_ENTRY_NAME)
-                .expect("gateway");
-            assert!(gw.env_keys.iter().any(|k| k == "Authorization"));
-            std::fs::remove_file(&path).ok();
-        }
-
-        // OpenCode: headers on remote type.
-        {
-            let path = temp_path("ws3-opencode.json");
-            std::fs::write(&path, r#"{"mcp":{}}"#).unwrap();
-            let entry = gateway_entry_shared_http("opencode", Some("Work"), &spec);
-            edit_opencode_gateway(&path, Some(&entry)).unwrap();
-            let root: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            let slot = &root["mcp"][GATEWAY_ENTRY_NAME];
-            assert_eq!(slot["type"], "remote");
-            assert_eq!(slot["headers"]["Authorization"], auth);
-            std::fs::remove_file(&path).ok();
-        }
-
-        // Qwen: httpUrl + headers.
-        {
-            let path = temp_path("ws3-qwen.json");
-            std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
-            let entry = gateway_entry_shared_http("qwen-code", None, &spec);
-            edit_qwen_json_gateway(&path, Some(&entry)).unwrap();
-            let root: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            let slot = &root["mcpServers"][GATEWAY_ENTRY_NAME];
-            assert_eq!(slot["httpUrl"], spec.url);
-            assert_eq!(slot["headers"]["Authorization"], auth);
-            assert!(slot.get("env").is_none());
-            std::fs::remove_file(&path).ok();
-        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A detected client with no servers, no error, and a config file present.
@@ -10157,7 +9842,6 @@ command = "npx"
         assert!(matches!(legacy.format, Format::JsonMcpServers));
         assert!(matches!(current.format, Format::JsonMcpServers));
         assert_ne!((legacy.path)(), (current.path)());
-        assert!(!client_uses_mcp_remote_bridge("devin-cli"));
     }
 
     #[test]
@@ -10277,7 +9961,6 @@ command = "npx"
         assert!(matches!(definition.format, Format::JsonKimiMcpServers));
         assert!(!definition.uses_connectors);
         assert!((definition.path)().is_some());
-        assert!(!client_uses_mcp_remote_bridge("kimi-code"));
     }
 
     #[test]
@@ -10497,73 +10180,6 @@ command = "npx"
         assert!(installed.iter().any(|s| s.name == GATEWAY_ENTRY_NAME));
 
         std::fs::remove_file(&path).ok();
-    }
-
-    /// SBS-921: Shared HTTP Connect/rescope/reset for Kimi goes through
-    /// `install_gateway_shared_http` → `install_or_remove`. That used to remap
-    /// remotes via `entry_to_qwen_json` (`url` → `httpUrl`) whenever the key was
-    /// not VS Code `"servers"`. Kimi requires `url` and rejects `httpUrl`.
-    /// `type` must also stay off: Kimi ignores it, and `entry_to_kimi_json`
-    /// strips the hint `entry_to_json` would emit.
-    #[test]
-    fn kimi_shared_http_connect_writes_url_not_qwen_http_url() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _data_lock = crate::registry::data_dir_test_lock();
-        let root =
-            std::env::temp_dir().join(format!("toolport-kimi-sbs921-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let data_dir = root.join("toolport-data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let _data_dir = crate::registry::DataDirOverride::set(&data_dir);
-        let path = root.join("mcp.json");
-        std::fs::write(
-            &path,
-            r#"{"mcpServers":{"keep":{"command":"node","args":["server.js"]}}}"#,
-        )
-        .unwrap();
-        let _restore = EnvRestore::set("KIMI_CODE_HOME", &root);
-
-        let spec = SharedHttpSpec {
-            url: "http://127.0.0.1:8765/mcp".into(),
-            token: "kimi-tok".into(),
-        };
-        install_gateway_shared_http("kimi-code", Some("Work"), &spec).unwrap();
-
-        let written: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let slot = &written["mcpServers"][GATEWAY_ENTRY_NAME];
-        assert_eq!(
-            slot["url"], spec.url,
-            "Kimi Shared HTTP must write url: {slot}"
-        );
-        assert!(
-            slot.get("httpUrl").is_none(),
-            "Kimi rejects Qwen's httpUrl: {slot}"
-        );
-        assert!(
-            slot.get("type").is_none(),
-            "Kimi ignores type; entry_to_kimi_json must strip it: {slot}"
-        );
-        assert!(
-            slot.get("transport").is_none(),
-            "streamable HTTP is Kimi's default; do not emit transport: {slot}"
-        );
-        assert_eq!(slot["headers"]["Authorization"], "Bearer kimi-tok");
-        assert!(
-            written["mcpServers"].get("keep").is_some(),
-            "Connect must preserve existing servers: {written}"
-        );
-        let backups = data_dir.join("backups").join("kimi-code");
-        assert_eq!(
-            std::fs::read_dir(&backups).unwrap().count(),
-            1,
-            "the fixture backup must stay under the overridden test data dir"
-        );
-
-        drop(_data_dir);
-        drop(_restore);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

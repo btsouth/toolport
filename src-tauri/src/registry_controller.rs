@@ -1253,13 +1253,11 @@ pub(crate) fn apply_import_entry(registry: &mut Registry, entry: ServerEntry) ->
 /// Plugin servers (read-only, outside the config file) are left untouched.
 /// When the live gateway entry is user-customized, pass `force: true` after the
 /// UI confirms overwrite (SOU-406); otherwise migration is refused before any
-/// config rewrite. `shared_http_url` selects the Shared HTTP transport (WS3-2);
-/// `None` keeps stdio.
+/// config rewrite. Explicit migration connects through the stdio adapter.
 pub fn migrate_client(
     client_id: &str,
     profile: Option<&str>,
     force: bool,
-    shared_http_url: Option<&str>,
 ) -> Result<MigrateOutcome, String> {
     // Guard before import or rewrite so a hand-edited gateway entry is not wiped.
     let current = read_registry_exact()?;
@@ -1283,21 +1281,7 @@ pub fn migrate_client(
         enable_moved_servers(registry, profile, &moved)?;
         Ok((imported, moved))
     })?;
-    let outcome = match shared_http_url {
-        Some(url) => {
-            let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
-            let token = ensure_client_http_token(client_id, profile)?;
-            clients::migrate_to_gateway_with_transport(
-                client_id,
-                profile,
-                Some(&clients::SharedHttpSpec {
-                    url: url.to_string(),
-                    token,
-                }),
-            )?
-        }
-        None => clients::migrate_to_gateway(client_id, profile)?,
-    };
+    let outcome = clients::migrate_to_gateway(client_id, profile)?;
 
     // Record the scope now that the client config was rewritten to the gateway.
     // "No profile" becomes an explicit-unscoped marker (not a removal) so a live
@@ -1353,60 +1337,6 @@ fn random_token() -> Result<String, String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn ensure_client_http_token(client_id: &str, profile: Option<&str>) -> Result<String, String> {
-    let http_id = format!("client:{client_id}");
-    let desired_profile = profile.unwrap_or("").trim().to_string();
-    if let Some(existing) =
-        crate::secrets::get_secret_result(CLIENT_HTTP_VAULT_SERVER, client_id)
-            .map_err(|error| format!("Could not read the saved token for {client_id}: {error}"))?
-    {
-        let hash = registry::sha256_hex(&existing);
-        let current = read_registry_exact()?;
-        if let Some(row) = current
-            .http_clients
-            .iter()
-            .find(|row| row.id == http_id && row.token_sha256 == hash)
-        {
-            if row.profile != desired_profile {
-                registry::update(|registry| {
-                    if let Some(row) = registry
-                        .http_clients
-                        .iter_mut()
-                        .find(|row| row.id == http_id && row.token_sha256 == hash)
-                    {
-                        row.profile = desired_profile;
-                    }
-                    Ok(())
-                })?;
-            }
-            return Ok(existing);
-        }
-    }
-
-    let token = random_token()?;
-    crate::secrets::set_secret(CLIENT_HTTP_VAULT_SERVER, client_id, &token)?;
-    if let Err(registry_error) = registry::update(|registry| {
-        registry.http_clients.retain(|row| row.id != http_id);
-        registry.http_clients.push(registry::HttpClient {
-            id: http_id,
-            label: format!("Client: {client_id}"),
-            token_sha256: registry::sha256_hex(&token),
-            profile: desired_profile,
-        });
-        Ok(())
-    }) {
-        return match crate::secrets::delete_secret(CLIENT_HTTP_VAULT_SERVER, client_id) {
-            Ok(()) => Err(format!(
-                "Could not register the Shared HTTP token, so its keychain copy was removed: {registry_error}"
-            )),
-            Err(cleanup_error) => Err(format!(
-                "Could not register the Shared HTTP token, and could not remove its orphaned keychain copy: {registry_error}; cleanup: {cleanup_error}"
-            )),
-        };
-    }
-    Ok(token)
-}
-
 fn revoke_client_http_token(client_id: &str) -> Result<(), String> {
     let http_id = format!("client:{client_id}");
     registry::update(|registry| {
@@ -1414,42 +1344,6 @@ fn revoke_client_http_token(client_id: &str) -> Result<(), String> {
         Ok(())
     })?;
     crate::secrets::delete_secret(CLIENT_HTTP_VAULT_SERVER, client_id)
-}
-
-pub fn connect_client_shared_http(
-    client_id: &str,
-    profile: Option<&str>,
-    force: bool,
-    url: &str,
-) -> Result<ClientMutationResult, String> {
-    let current = read_registry_exact()?;
-    refuse_customized_client(
-        client_gateway_state(&current.client_managed_entries, client_id),
-        force,
-    )?;
-    let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
-    let token = ensure_client_http_token(client_id, profile)?;
-    let outcome = clients::install_gateway_shared_http(
-        client_id,
-        profile,
-        &clients::SharedHttpSpec {
-            url: url.to_string(),
-            token,
-        },
-    )?;
-    finish_client_config_mutation(outcome, |managed_entry| {
-        let (registry, ()) = registry::update(|registry| {
-            match profile.map(str::trim).filter(|profile| !profile.is_empty()) {
-                Some(profile) => registry.set_client_scope(client_id, Some(profile)),
-                None => registry.set_client_unscoped(client_id),
-            }
-            if let Some(managed_entry) = managed_entry {
-                registry.set_client_managed_entry(client_id, managed_entry);
-            }
-            Ok(())
-        })?;
-        Ok(registry)
-    })
 }
 
 pub fn disconnect_client(client_id: &str) -> Result<ClientMutationResult, String> {
@@ -2993,7 +2887,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = migrate_client("claude-code", None, false, None).unwrap();
+        let outcome = migrate_client("claude-code", None, false).unwrap();
         let mut moved = outcome.moved.clone();
         moved.sort();
         assert_eq!(moved, ["memory", "seq-thinking"]);
@@ -3039,7 +2933,7 @@ mod tests {
             serde_json::to_string(&serde_json::json!({ "mcpServers": servers })).unwrap(),
         )
         .unwrap();
-        migrate_client("claude-code", None, false, None).unwrap();
+        migrate_client("claude-code", None, false).unwrap();
         let moved_config = std::fs::read_to_string(fixture.claude()).unwrap();
 
         let error =
@@ -3086,7 +2980,7 @@ DOCS_TOKEN = "tok"
 "#;
         std::fs::write(fixture.codex(), original).unwrap();
 
-        let outcome = migrate_client("codex", Some("Work"), false, None).unwrap();
+        let outcome = migrate_client("codex", Some("Work"), false).unwrap();
         assert_eq!(
             enabled_names(&outcome.result.registry, "work"),
             ["docs", "memory"]
@@ -3134,7 +3028,7 @@ DOCS_TOKEN = "tok"
         let original = r#"{"mcpServers":{"memory":{"command":"npx","args":["server-memory"]}}}"#;
         std::fs::write(fixture.claude(), original).unwrap();
 
-        let error = migrate_client("claude-code", Some("missing"), false, None).unwrap_err();
+        let error = migrate_client("claude-code", Some("missing"), false).unwrap_err();
         assert!(error.contains("left unchanged"), "{error}");
         assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
         assert!(read_registry_exact().unwrap().servers.is_empty());

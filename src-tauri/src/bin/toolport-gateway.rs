@@ -17900,20 +17900,8 @@ fn daemon_requested(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--daemon")
 }
 
-fn selected_adapter_requested(
-    args: &[String],
-    stdio_peer: bool,
-    override_value: Option<&str>,
-    topology: Option<registry::GatewayTopology>,
-) -> bool {
-    if !args.is_empty() || !stdio_peer {
-        return false;
-    }
-    match override_value.map(str::trim) {
-        Some(value) if value.eq_ignore_ascii_case("legacy") => false,
-        Some(value) if value.eq_ignore_ascii_case("daemon") => true,
-        _ => topology == Some(registry::GatewayTopology::Daemon),
-    }
+fn selected_adapter_requested(args: &[String], stdio_peer: bool) -> bool {
+    args.is_empty() && stdio_peer
 }
 
 /// Startup admission policy. The escape hatch is never valid for a non-loopback bind.
@@ -19418,31 +19406,22 @@ fn main() {
         }
         return;
     }
-    // Phase 2 stdio adapter: hand stdio to the host daemon instead of starting an
-    // in-process gateway. Diverges, and deliberately runs before the session
-    // detach, registry load, and watcher: this role owns none of that state, the
-    // daemon does.
+    let legacy_registry = registry::load_resolved_with_source()
+        .ok()
+        .filter(|(_, source)| source.is_authoritative())
+        .is_some_and(|(reg, _)| reg.gateway_topology == Some(registry::GatewayTopology::Legacy));
+    let legacy_env =
+        conduit_lib::brand::env_var("TOOLPORT_GATEWAY_TOPOLOGY", "CONDUIT_GATEWAY_TOPOLOGY")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("legacy"));
+    if legacy_registry || legacy_env {
+        glog("Legacy gateway topology was retired in 2.0; using the host daemon. Existing client entries are unchanged.");
+    }
     if conduit_lib::stdio_adapter::adapter_requested(&cli_args) {
         conduit_lib::stdio_adapter::run_stdio_adapter();
     }
-    if cli_args.is_empty() {
+    {
         use std::io::IsTerminal;
-        let stdio_peer = !std::io::stdin().is_terminal();
-        let topology = if stdio_peer {
-            registry::load_resolved_with_source()
-                .ok()
-                .filter(|(_, source)| source.is_authoritative())
-                .map(|(reg, _)| reg.gateway_topology_effective())
-        } else {
-            None
-        };
-        if selected_adapter_requested(
-            &cli_args,
-            stdio_peer,
-            conduit_lib::brand::env_var("TOOLPORT_GATEWAY_TOPOLOGY", "CONDUIT_GATEWAY_TOPOLOGY")
-                .as_deref(),
-            topology,
-        ) {
+        if selected_adapter_requested(&cli_args, !std::io::stdin().is_terminal()) {
             conduit_lib::stdio_adapter::run_selected_stdio_adapter();
         }
     }
@@ -36140,35 +36119,14 @@ mod tests {
     }
 
     #[test]
-    fn registry_topology_selects_only_ordinary_client_stdio() {
-        use registry::GatewayTopology::{Daemon, Legacy};
-        assert!(!selected_adapter_requested(&[], true, None, None));
-        assert!(selected_adapter_requested(&[], true, None, Some(Daemon)));
-        assert!(!selected_adapter_requested(&[], true, None, Some(Legacy)));
-        assert!(!selected_adapter_requested(&[], false, None, Some(Daemon)));
+    fn daemon_adapter_selects_only_ordinary_client_stdio() {
+        assert!(selected_adapter_requested(&[], true));
+        assert!(!selected_adapter_requested(&[], false));
+        assert!(!selected_adapter_requested(&["--daemon".into()], true));
+        assert!(!selected_adapter_requested(&["--http".into()], true));
         assert!(!selected_adapter_requested(
-            &["--daemon".into()],
-            true,
-            None,
-            Some(Daemon)
-        ));
-        assert!(!selected_adapter_requested(
-            &["--http".into()],
-            true,
-            None,
-            Some(Daemon)
-        ));
-        assert!(!selected_adapter_requested(
-            &[],
-            true,
-            Some("legacy"),
-            Some(Daemon)
-        ));
-        assert!(selected_adapter_requested(
-            &[],
-            true,
-            Some("daemon"),
-            Some(Legacy)
+            &["--private-gateway".into()],
+            true
         ));
     }
 

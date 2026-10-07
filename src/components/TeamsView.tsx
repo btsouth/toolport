@@ -19,7 +19,6 @@ import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Callout } from "@/components/Callout";
 import { RuleStateBadge } from "@/components/RuleStateBadge";
-import { TransportPill } from "@/components/TransportPill";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -300,7 +299,6 @@ export function TeamsView({
           <span className="truncate font-medium">
             {team?.teamName ?? "Team"}-managed {s.name}
           </span>
-          <TransportPill transport={s.transport} />
           {on ? (
             <Badge variant="success" className="ml-auto shrink-0">
               <ShieldCheck className="size-3" /> on

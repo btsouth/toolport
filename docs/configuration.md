@@ -26,8 +26,8 @@ gateway entry, written for you when you connect a client:
   loopback listener; it never permits an open non-loopback bind.
 - `TOOLPORT_METRICS=1` - opt-in Prometheus `GET /metrics` on the HTTP surface.
 - `TOOLPORT_DEBUG=1` - per-request gateway trace logging.
-- `TOOLPORT_GATEWAY_TOPOLOGY=daemon|legacy` - override the local stdio topology
-  for one client launch. `legacy` is the immediate rollback setting.
+- `TOOLPORT_GATEWAY_TOPOLOGY` - retired in 2.0. A `legacy` value is ignored and
+  recorded once at gateway startup.
 - `TOOLPORT_CODE_MODE=1` - force-enable code mode (`toolport_run_script`) even if Settings
   has it off. Code mode is **off by default**; opt in under Advanced in Settings. Each
   in-script tool call still respects profile scope and human approval; code mode is not a
@@ -38,14 +38,14 @@ Every `TOOLPORT_*` name still accepts the pre-rename `CONDUIT_*` alias (for exam
 
 **One gateway per host.** Client-spawned stdio gateways use a small adapter by
 default; one host daemon owns the router and shares ordinary downstream
-connections. Existing registry files without `gatewayTopology` select this
-topology. Set `"gatewayTopology": "legacy"` in `registry.json` and restart
-connected AI clients to keep separate in-process gateways. For one client,
-`TOOLPORT_GATEWAY_TOPOLOGY=legacy` overrides the registry without editing it.
-The explicit legacy choices remain available for a release cycle. The adapter
-uses an in-process gateway only when the operating system proves daemon launch
-failed. An ambiguous startup failure or a failure after the session opens
-returns an error rather than starting or replaying against a second gateway.
+connections. `gatewayTopology: "legacy"` and the legacy environment override
+are ignored, with a notice in the gateway log. Existing Shared HTTP client entries
+and their authentication remain unchanged at startup. Connecting, resetting or
+migrating a client explicitly writes the stdio adapter entry. Settings > Integrations
+still provides the HTTP/OpenAPI bridge.
+The adapter retains its in-process fallback when daemon spawning fails and its
+private gateway fallback when the shared daemon is unhealthy. Ambiguous startup
+failures still refuse to start a competing gateway.
 
 **Discovery mode per HTTP client.** The stdio gateway resolves one discovery mode for
 the client that spawned it. The headless HTTP/OpenAPI bridge serves several clients at

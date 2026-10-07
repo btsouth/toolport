@@ -141,14 +141,11 @@ describe("ClientDetail customized entry (SOU-406)", () => {
         "claude-desktop",
         undefined,
         true,
-        "stdio",
       ),
     );
   });
 
-  it("passes live sharedHttp transport when applying scope (WS3-2)", async () => {
-    // Regression: installGateway defaults missing transport to stdio and would
-    // silently rewrite a Shared HTTP client as a stdio spawn.
+  it("keeps sharedHttp untouched on mount and uses stdio on explicit reconnect", async () => {
     installGateway.mockResolvedValue({ backup: false });
     const reg = emptyRegistry();
     // Profile picker only renders when profiles.length > 1.
@@ -181,6 +178,9 @@ describe("ClientDetail customized entry (SOU-406)", () => {
       />,
     );
 
+    expect(installGateway).not.toHaveBeenCalled();
+    expect(migrateClient).not.toHaveBeenCalled();
+
     // Change scope so Apply scope is enabled (profile !== currentScope).
     // Scope select is the first combobox in the header (w-52); discovery is lower.
     const scopeSelect = screen.getAllByRole("combobox")[0]!;
@@ -196,7 +196,6 @@ describe("ClientDetail customized entry (SOU-406)", () => {
         "claude-desktop",
         "p2",
         false,
-        "sharedHttp",
       ),
     );
   });
@@ -264,7 +263,6 @@ describe("ClientDetail customized entry (SOU-406)", () => {
         "claude-desktop",
         "p2",
         undefined,
-        "stdio",
       ),
     );
   });
@@ -291,7 +289,6 @@ describe("ClientDetail connect toast (SOU-317)", () => {
         "claude-desktop",
         undefined,
         false,
-        "stdio",
       ),
     );
     expect(toastSuccess).toHaveBeenCalledWith(

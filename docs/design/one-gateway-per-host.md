@@ -47,7 +47,7 @@ owned at the wrong boundaries:
   `resolve_http_caller`, `serve_http`). This proves that one router can safely filter
   catalogs and calls per caller.
 - Clients without a native remote-MCP configuration use `npx -y mcp-remote` in today's
-  opt-in Shared HTTP mode (`clients.rs`, `client_uses_mcp_remote_bridge`). Making that
+  existing Shared HTTP entries. Making that
   optional path the default would trade the Toolport process explosion for per-session
   Node bridge processes and a third-party runtime dependency.
 - The desktop app owns one fixed-port `toolport-gateway --http` child and kills it on app
@@ -216,7 +216,7 @@ running as the same OS user.
   may be retried only before the daemon accepted them.
 - One daemon crash affects more clients than one legacy gateway crash. Bounded startup,
   panic containment at request workers, downstream circuit breakers, and no automatic
-  write replay are required mitigations. The legacy topology flag is the rollback path.
+  write replay are required mitigations. The private gateway remains the health fallback.
 - The app updater/reaper must understand daemon compatibility domains. It may retire an old
   idle daemon, but must not kill a live shared daemon merely because the app is exiting.
 
@@ -317,7 +317,7 @@ builds.
 - Make the adapter topology default only after process/memory reduction and parity suites
   pass on Windows, macOS, and Linux.
 - Converge the desktop Shared HTTP supervisor onto a daemon service lease in a later PR.
-- Retain a documented legacy-topology kill switch for at least one release cycle.
+- In 2.0 the daemon is the only topology; legacy choices are ignored with a log notice.
 
 ## Verification matrix
 

@@ -1,7 +1,7 @@
 //! End-to-end guard for REL-03: a downstream server that fails its first connect
 //! is retried in the background and joins the catalog without a gateway restart.
 //!
-//! Drives the real gateway over stdio, in the legacy per-client topology and in the
+//! Drives the real gateway through the stdio adapter and shared host daemon, with the
 //! default daemon topology (stdio adapter in front of a host daemon), against
 //! `mock-mcp-server` started in its fail-the-first-N-starts mode. The start counter
 //! file it keeps is how these tests see each retry.
@@ -55,17 +55,14 @@ fn mock_entry(id: &str, env: &[(&str, &str)]) -> Value {
     })
 }
 
-fn write_registry(dir: &Path, servers: &[Value], enabled: &[&str], legacy: bool) {
-    let mut registry = json!({
+fn write_registry(dir: &Path, servers: &[Value], enabled: &[&str]) {
+    let registry = json!({
         "version": 1,
         "servers": servers,
         "profiles": [{ "id": "default", "name": "Default", "enabledServerIds": enabled }],
         "activeProfileId": "default",
         "lazyDiscovery": false
     });
-    if legacy {
-        registry["gatewayTopology"] = json!("legacy");
-    }
     // Write then rename, so the watcher never reads a half-written file.
     let tmp = dir.join("registry.json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&registry).unwrap()).expect("write registry");
@@ -287,7 +284,7 @@ fn kill_daemon(dir: &Path) {
 }
 
 /// `good` connects at once; `flaky` fails its first four starts, then works.
-fn failing_server_joins_without_a_restart(legacy: bool) {
+fn failing_server_joins_without_a_restart() {
     let dir = scratch_dir();
     let counter = dir.join("flaky-starts");
     let counter_path = counter.to_string_lossy().to_string();
@@ -304,17 +301,15 @@ fn failing_server_joins_without_a_restart(legacy: bool) {
             ),
         ],
         &["good", "flaky"],
-        legacy,
     );
     let mut gateway = Gateway::start(&dir);
 
     wait_for("the first build", Duration::from_secs(60), || {
         gateway.tool_names().contains(&"good__echo".to_string())
     });
-    assert_eq!(
+    assert!(
         daemon_running(&dir),
-        !legacy,
-        "wrong topology\n{}",
+        "expected shared daemon\n{}",
         gateway.diagnostics()
     );
     // The failed server is reported as retrying with its real error, not guessed at.
@@ -375,13 +370,8 @@ fn failing_server_joins_without_a_restart(legacy: bool) {
 }
 
 #[test]
-fn legacy_gateway_picks_up_a_server_that_failed_at_startup() {
-    failing_server_joins_without_a_restart(true);
-}
-
-#[test]
 fn daemon_picks_up_a_server_that_failed_at_startup() {
-    failing_server_joins_without_a_restart(false);
+    failing_server_joins_without_a_restart();
 }
 
 /// A late client of the daemon sees a server an earlier client watched fail.
@@ -403,7 +393,6 @@ fn daemon_shares_the_recovered_server_with_a_later_client() {
             ),
         ],
         &["good", "flaky"],
-        false,
     );
     let mut first = Gateway::start(&dir);
     wait_for("the first build", Duration::from_secs(60), || {
@@ -468,7 +457,6 @@ fn a_server_that_needs_sign_in_is_not_retried_in_a_loop() {
         &dir,
         &[mock_entry("good", &[]), locked],
         &["good", "locked"],
-        true,
     );
     let mut gateway = Gateway::start(&dir);
     wait_for("the first build", Duration::from_secs(60), || {
@@ -513,13 +501,13 @@ fn disabling_a_failing_server_stops_its_retries() {
             ],
         ),
     ];
-    write_registry(&dir, &servers, &["good", "broken"], true);
+    write_registry(&dir, &servers, &["good", "broken"]);
     let mut gateway = Gateway::start(&dir);
     wait_for("retries", Duration::from_secs(60), || {
         read_count(&counter) >= 3
     });
 
-    write_registry(&dir, &servers, &["good"], true);
+    write_registry(&dir, &servers, &["good"]);
     wait_for("the disable to apply", Duration::from_secs(30), || {
         !gateway.status().contains("broken")
     });
@@ -542,47 +530,44 @@ fn disabling_a_failing_server_stops_its_retries() {
 /// the failure class, never the server's own output.
 #[test]
 fn calls_do_not_respawn_servers_that_are_waiting_to_retry() {
-    for legacy in [true, false] {
-        let dir = scratch_dir();
-        let counter = dir.join("down-starts");
-        let counter_path = counter.to_string_lossy().to_string();
-        write_registry(
-            &dir,
-            &[mock_entry(
-                "down",
-                &[
-                    ("MOCK_MCP_FAIL_STARTS", "1000"),
-                    ("MOCK_MCP_START_COUNTER", &counter_path),
-                ],
-            )],
-            &["down"],
-            legacy,
+    let dir = scratch_dir();
+    let counter = dir.join("down-starts");
+    let counter_path = counter.to_string_lossy().to_string();
+    write_registry(
+        &dir,
+        &[mock_entry(
+            "down",
+            &[
+                ("MOCK_MCP_FAIL_STARTS", "1000"),
+                ("MOCK_MCP_START_COUNTER", &counter_path),
+            ],
+        )],
+        &["down"],
+    );
+    let mut gateway = Gateway::start_with_backoff(&dir, "60000");
+    wait_for("the failed first connect", Duration::from_secs(60), || {
+        gateway.status().contains("Not connected yet")
+    });
+    let after_first = read_count(&counter);
+    assert!(after_first >= 1, "the first build started the server");
+    for _ in 0..5 {
+        let status = gateway.status();
+        assert!(status.contains("down"), "{status}");
+        assert!(
+            !status.contains("failing starts"),
+            "the server's own stderr must not reach the client: {status}"
         );
-        let mut gateway = Gateway::start_with_backoff(&dir, "60000");
-        wait_for("the failed first connect", Duration::from_secs(60), || {
-            gateway.status().contains("Not connected yet")
-        });
-        let after_first = read_count(&counter);
-        assert!(after_first >= 1, "the first build started the server");
-        for _ in 0..5 {
-            let status = gateway.status();
-            assert!(status.contains("down"), "{status}");
-            assert!(
-                !status.contains("failing starts"),
-                "the server's own stderr must not reach the client: {status}"
-            );
-            let (is_error, text) = gateway.call("down__echo");
-            assert!(is_error, "{text}");
-            // The failure class depends on when the child's exit is noticed (an exit
-            // status, or a closed pipe), so only the shape is checked here.
-            assert!(text.contains("has not connected yet"), "{text}");
-            assert!(!text.contains("failing starts"), "{text}");
-        }
-        assert_eq!(
-            read_count(&counter),
-            after_first,
-            "requests must not respawn a pending server (legacy: {legacy})\n{}",
-            gateway.diagnostics()
-        );
+        let (is_error, text) = gateway.call("down__echo");
+        assert!(is_error, "{text}");
+        // The failure class depends on when the child's exit is noticed (an exit
+        // status, or a closed pipe), so only the shape is checked here.
+        assert!(text.contains("has not connected yet"), "{text}");
+        assert!(!text.contains("failing starts"), "{text}");
     }
+    assert_eq!(
+        read_count(&counter),
+        after_first,
+        "requests must not respawn a pending server\n{}",
+        gateway.diagnostics()
+    );
 }

@@ -6,7 +6,6 @@ import { toast } from "sonner";
 import type { ProbeResult, Registry, ServerEntry } from "@/lib/types";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { TransportPill } from "@/components/TransportPill";
 import { SecretsDialog } from "@/components/SecretsDialog";
 import { ServerDialog } from "@/components/ServerDialog";
 import { LaunchSetupDialog } from "@/components/LaunchSetupDialog";
@@ -197,7 +196,6 @@ export function RegistryServerRow({
             <StatusLabel status={status} label={label} error={health?.error ?? null} />
           )}
 
-          <TransportPill transport={server.transport} />
 
           <button
             type="button"

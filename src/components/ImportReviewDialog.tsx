@@ -2,7 +2,6 @@ import { useState } from "react";
 import { Check, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { TransportPill } from "@/components/TransportPill";
 import type { ImportItem, ServerEntry } from "@/lib/types";
 
 interface Props {
@@ -128,7 +127,6 @@ export function ImportRow({ item, selected }: { item: ImportItem; selected?: boo
           />
         )}
         <span className="truncate text-sm font-medium">{item.name}</span>
-        <TransportPill transport={item.transport} />
         {!item.isNew && (
           <span className="ml-auto shrink-0 text-xs text-muted-foreground">
             already added

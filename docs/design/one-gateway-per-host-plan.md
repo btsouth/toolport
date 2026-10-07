@@ -117,8 +117,8 @@ updater has automated process tests; no signed desktop update run is recorded.
   `notifications/progress` frame through the hand-off, without the `list_changed` /
   `resources/updated` check on the peer's declared era. Pre-existing, unchanged by the
   threading work, and on the list so it is not read as an oversight.
-- The registry has a `gateway_topology` choice. An absent value selects the daemon;
-  explicit `legacy` keeps the separate in-process role.
+- The daemon is the only topology in 2.0. The retained v1 `gateway_topology`
+  field is ignored; existing Shared HTTP client configs are preserved at startup.
 - Two tests resolved the data directory per call on paths `DataDirOverride` was not
   guarding, so the gateway suite wrote into the developer's real data dir: the audit writer
   (`audit::audit_path`) and the search-trace writer (`searchtrace::path`). A full run
@@ -150,8 +150,7 @@ updater has automated process tests; no signed desktop update run is recorded.
 - Reusable primitives that already exist: the approval broker's `EndpointDescriptor`
   (`approval.rs`), `registry::atomic_write`, and the registry cross-process `FileLock`.
 - Client launch: `clients.rs::gateway_entry` builds the stdio entry and sets
-  `TOOLPORT_CLIENT_ID`. With authoritative registry state it selects the stdio
-  adapter by default. Desktop Shared HTTP starts a lightweight `--http-proxy`
+  `TOOLPORT_CLIENT_ID`. It selects the stdio adapter for client launches. Desktop Shared HTTP starts a lightweight `--http-proxy`
   child, which releases its host service lease when the app closes its pipe.
 
 ## Delivery shape
@@ -167,7 +166,7 @@ updater has automated process tests; no signed desktop update run is recorded.
 | 7   | P3.1 union catalog built once, allowed-set enforced per session                                                                                                                 | opt-in only                                 | landed; profile, tool, and notification scope pass the matrix                       |
 | 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                                                                                   | opt-in only, the big win                    | landed; ordinary slots share and rooted slots shard by launch key                   |
 | 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                                                                                    | opt-in only                                 | landed (#940, #941, #942); configured-server and real-client evidence recorded      |
-| 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                                                                               | default flip                                | daemon default selected; explicit registry and launch rollback retained             |
+| 10  | P4.2 adapter topology becomes default; 2.0 retires legacy selection                                                                                                               | default flip                                | daemon is the only topology; registry and launch legacy choices ignored             |
 | 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                                                                                  | opt-in Shared HTTP                          | landed; lease, proxy, and guarded updater tests pass                                |
 
 Slices 1 through 9 were initially opt-in. P4.2 changed the default for
