@@ -1156,7 +1156,10 @@ pub fn connect_remote_with_handler(
                         },
                     )
                 }
-                Err(refresh_error) => Err(refresh_error),
+                Err(refresh_error) if is_refresh_storage_or_lock_error(&refresh_error) => {
+                    Err(refresh_error)
+                }
+                Err(_) => Err(e),
             }
         }
         Err(e) => Err(e),
