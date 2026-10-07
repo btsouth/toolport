@@ -6007,24 +6007,35 @@ mod tests {
     /// dropped guard revert the variable out from under the others.
     #[test]
     fn overlapping_lock_timeout_overrides_survive_the_first_drop() {
+        let baseline = {
+            let state = LOCK_TIMEOUT_OVERRIDES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.0 == 0 {
+                std::env::var_os("TOOLPORT_LOCK_TIMEOUT_MS")
+            } else {
+                state.1.clone()
+            }
+        };
         let outer = LockTimeoutOverride::generous();
-        {
-            let _inner = LockTimeoutOverride::generous();
-            assert_eq!(
-                std::env::var("TOOLPORT_LOCK_TIMEOUT_MS").as_deref(),
-                Ok("60000")
-            );
-        }
+        let inner = LockTimeoutOverride::generous();
+        drop(outer);
         assert_eq!(
             std::env::var("TOOLPORT_LOCK_TIMEOUT_MS").as_deref(),
             Ok("60000"),
-            "the inner guard's drop must not revert while the outer one is still held"
+            "the first guard's drop must not revert while the later one is still held"
         );
-        drop(outer);
-        assert!(
-            std::env::var_os("TOOLPORT_LOCK_TIMEOUT_MS").is_none(),
-            "the last guard out restores the baseline"
-        );
+        drop(inner);
+        // A peer test can keep the override alive after both local guards drop.
+        let state = LOCK_TIMEOUT_OVERRIDES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let expected = if state.0 == 0 {
+            baseline
+        } else {
+            Some(std::ffi::OsString::from("60000"))
+        };
+        assert_eq!(std::env::var_os("TOOLPORT_LOCK_TIMEOUT_MS"), expected);
     }
 
     struct FailingAtomicWriteOps(FailingAtomicWriteStep);
