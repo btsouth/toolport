@@ -185,6 +185,8 @@ mod tests {
             .unwrap()];
             assert!(with_atomic_failure(step, || append_records_at(&path, &lines)).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), saved);
+            assert!(with_atomic_failure(step, || acknowledge(&device, 2)).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

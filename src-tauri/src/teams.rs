@@ -1179,9 +1179,7 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
     // Best-effort showback after the config work: report today's/yesterday's per-server
     // usage rollup to the team server. Network failures retry next cycle;
     // local state-save failures must be visible after the config was applied.
-    if let Err(error) = report_activation(&conn, &token) {
-        eprintln!("Toolport: Teams activation reporting pending: {error}");
-    }
+    check_state(report_activation(&conn, &token));
     check_state(report_usage(&conn, &token));
     // Report each installed client's instructions coverage (spec W5), every cycle, deduped so an
     // unchanged receipt isn't re-sent. Independent of the config change above, so a client
@@ -1322,24 +1320,33 @@ fn report_activation(conn: &TeamConnection, token: &str) -> Result<(), String> {
         "routeConfigured": states.values().any(|s| s["routeConfigured"] == true),
         "servers": states,
     });
-    require_secure_team_url(&conn.server_url)?;
-    let response = agent(&conn.server_url)
-        .post(&format!(
-            "{}/teams/{}/activation",
-            base(&conn.server_url),
-            conn.team_id
-        ))
-        .set("authorization", &format!("Bearer {token}"))
-        .send_json(body)
-        .map_err(stringify)?;
-    let response = require_no_redirect(response)?;
-    let ack: Value = response.into_json().map_err(|e| e.to_string())?;
-    let revision = ack
-        .get("acknowledgedRevision")
-        .and_then(Value::as_u64)
-        .ok_or("Teams did not acknowledge activity revision")?;
-    if revision < journal.revision {
-        return Err("Teams acknowledged an older activity revision".into());
+    // Network reporting still retries next cycle. A local acknowledgement save
+    // failure is returned to sync, which must show partial success to its caller.
+    let reported = (|| -> Result<(), String> {
+        require_secure_team_url(&conn.server_url)?;
+        let response = agent(&conn.server_url)
+            .post(&format!(
+                "{}/teams/{}/activation",
+                base(&conn.server_url),
+                conn.team_id
+            ))
+            .set("authorization", &format!("Bearer {token}"))
+            .send_json(body)
+            .map_err(stringify)?;
+        let response = require_no_redirect(response)?;
+        let ack: Value = response.into_json().map_err(|e| e.to_string())?;
+        let revision = ack
+            .get("acknowledgedRevision")
+            .and_then(Value::as_u64)
+            .ok_or("Teams did not acknowledge activity revision")?;
+        if revision < journal.revision {
+            return Err("Teams acknowledged an older activity revision".into());
+        }
+        Ok(())
+    })();
+    if let Err(error) = reported {
+        eprintln!("Toolport: Teams activation reporting pending: {error}");
+        return Ok(());
     }
     crate::team_activity::acknowledge(&current.reporting_device_id, journal.revision)
 }
