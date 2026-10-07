@@ -729,6 +729,10 @@ impl Session {
             request
                 .set("Authorization", &format!("Bearer {}", descriptor.token))
                 .set("Content-Type", "application/json")
+                // Each POST owns a fresh agent, so this connection cannot be reused.
+                // Release the daemon's keepalive parser instead of leaving it waiting
+                // for a second request while the first call is still in flight.
+                .set("Connection", "close")
                 .set("Accept", "application/json, text/event-stream"),
         );
         for (name, value) in modern_headers(&message) {
@@ -1745,6 +1749,7 @@ mod tests {
     #[derive(Clone)]
     struct Posted {
         session: Option<String>,
+        connection: Option<String>,
         message: serde_json::Value,
     }
 
@@ -1818,6 +1823,7 @@ mod tests {
                         let mut reader = BufReader::new(stream.try_clone().unwrap());
                         let mut length = 0;
                         let mut session = None;
+                        let mut connection = None;
                         loop {
                             let mut line = String::new();
                             if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -1831,6 +1837,7 @@ mod tests {
                                 match name.to_ascii_lowercase().as_str() {
                                     "content-length" => length = value.trim().parse().unwrap(),
                                     "mcp-session-id" => session = Some(value.trim().to_string()),
+                                    "connection" => connection = Some(value.trim().to_string()),
                                     _ => {}
                                 }
                             }
@@ -1839,6 +1846,7 @@ mod tests {
                         reader.read_exact(&mut body).unwrap();
                         let posted = Posted {
                             session,
+                            connection,
                             message: serde_json::from_slice(&body).unwrap(),
                         };
                         record.lock().unwrap().push(posted.clone());
@@ -1925,6 +1933,21 @@ mod tests {
     }
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn one_shot_posts_close_the_http_connection() {
+        let (daemon, _) =
+            session_daemon(|posted| Answer::result(posted, serde_json::json!({ "ok": true })));
+        let sink = Sink::default();
+        let session = scripted_session(&daemon, &sink, Duration::from_secs(2));
+        open(&session);
+        session.exchange(&tool_call(1)).unwrap();
+        for method in ["initialize", "notifications/initialized", "tools/call"] {
+            let posted = daemon.posted(method);
+            assert_eq!(posted.len(), 1);
+            assert_eq!(posted[0].connection.as_deref(), Some("close"), "{method}");
+        }
+    }
 
     #[test]
     fn a_refused_session_is_reopened_and_the_request_sent_once_more() {
