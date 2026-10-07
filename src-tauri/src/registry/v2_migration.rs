@@ -350,9 +350,11 @@ mod tests {
     use crate::registry::{
         backup_path, data_dir_test_lock, load_from_with_migrations_for_test,
         migration_backup_files, DataDirOverride, Migration, Registry, SafetyLevel,
-        REGISTRY_ENV_LOCK, REGISTRY_VERSION,
+        REGISTRY_ENV_LOCK,
     };
     use serde_json::json;
+
+    const REGISTRY_VERSION: u32 = 2;
 
     fn load_from(path: &std::path::Path) -> Result<Registry, String> {
         load_from_with_migrations_for_test(path, &[migrate_v1_to_v2], 2)

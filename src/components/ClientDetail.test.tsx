@@ -181,10 +181,10 @@ describe("ClientDetail customized entry (SOU-406)", () => {
     // Scope select is the first combobox in the header (w-52); discovery is lower.
     const scopeSelect = screen.getAllByRole("combobox")[0]!;
     await userEvent.click(scopeSelect);
-    const home = await screen.findByRole("option", { name: /Only: Home/i });
+    const home = await screen.findByRole("option", { name: /^Home$/i });
     await userEvent.click(home);
 
-    const apply = await screen.findByRole("button", { name: /apply scope/i });
+    const apply = await screen.findByRole("button", { name: /apply access/i });
     await userEvent.click(apply);
 
     await waitFor(() =>
@@ -212,7 +212,7 @@ describe("ClientDetail customized entry (SOU-406)", () => {
         onRegistryChange={() => {}}
       />,
     );
-    expect(screen.getAllByRole("combobox")[0]).toHaveTextContent("Only: Work");
+    expect(screen.getAllByRole("combobox")[0]).toHaveTextContent("Work");
   });
 
   it("passes a stable profile id from the migrate dialog", async () => {
@@ -247,7 +247,7 @@ describe("ClientDetail customized entry (SOU-406)", () => {
     const scopeSelect = dialog.querySelector('[role="combobox"]');
     expect(scopeSelect).not.toBeNull();
     await userEvent.click(scopeSelect!);
-    await userEvent.click(await screen.findByRole("option", { name: /Only: Home/i }));
+    await userEvent.click(await screen.findByRole("option", { name: /^Home$/i }));
     await userEvent.click(screen.getByRole("button", { name: /move 1 into toolport/i }));
 
     await waitFor(() =>

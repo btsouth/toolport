@@ -1988,7 +1988,9 @@ impl Registry {
             .iter_mut()
             .find(|s| s.id == entry.id)
             .ok_or_else(|| format!("No server with id '{}'", entry.id))?;
+        let enabled = slot.enabled;
         *slot = entry;
+        slot.enabled = enabled;
         Ok(())
     }
 

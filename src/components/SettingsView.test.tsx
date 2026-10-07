@@ -117,10 +117,11 @@ describe("SettingsView tool loading", () => {
 
     renderSettings();
 
-    // Open the profile.
+    await user.click(screen.getByText("Advanced"));
+    // Open the access set.
     await user.click(
       screen.getByRole("button", {
-        name: /default active 2 servers/i,
+        name: /default 2 servers/i,
       }),
     );
 

@@ -20,10 +20,11 @@ pub(super) fn migrate_v2_to_v3(value: &mut Value, _: &MigrationContext) -> Resul
     for profile in profiles { union.extend(ids(profile)?); }
     let old_active = profiles.iter().find(|p| p.get("id").and_then(Value::as_str) == Some(&active));
     let active_set = old_active.map(ids).transpose()?.unwrap_or_default();
+    let active_missing = old_active.is_none();
     // Store the stable historical context even when the server sets match. Tool scopes,
     // instructions and integrity baselines are independent of server membership.
     document.insert("defaultAccessContextId".into(), Value::String(active.clone()));
-    if active_set != union || old_active.is_none() {
+    if active_set != union || active_missing {
         document.insert("defaultAccessProfileId".into(), Value::String(active));
     } else {
         document.remove("defaultAccessProfileId");

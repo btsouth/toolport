@@ -252,6 +252,7 @@ export function ServerDialog({
     const declared = envRows.filter((r) => r.key.trim());
     return {
       id: currentEditId ?? "",
+      enabled: initial?.enabled ?? false,
       name: form.name.trim(),
       transport: form.transport,
       command: isStdio ? form.command.trim() || null : null,

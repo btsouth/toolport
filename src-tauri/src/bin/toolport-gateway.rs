@@ -17921,10 +17921,10 @@ fn main() {
     let (loaded, registry_loaded) = match load_outcome {
         Ok((r, source)) => {
             glog(&format!(
-                "load_resolved OK ({source:?}): {} servers total, {} enabled (active={})",
+                "load_resolved OK ({source:?}): {} servers total, {} enabled (default access={})",
                 r.servers.len(),
                 r.enabled_servers().len(),
-                r.active_profile_id()
+                r.default_access_id()
             ));
             if !source.is_authoritative() {
                 eprintln!(
