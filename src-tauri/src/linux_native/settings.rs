@@ -1434,7 +1434,6 @@ impl SettingsPage {
                     match result {
                         Ok(Ok(settings)) => {
                             if page.mutation_generation.get() == generation {
-                                page.render_access_sets(access_registry);
                                 page.render_settings(settings);
                             } else {
                                 switch.set_sensitive(true);
