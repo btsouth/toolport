@@ -145,7 +145,7 @@ fn corrupt_and_future_registries_refuse_startup_without_losing_bytes() {
         .collect();
     assert_eq!(preserved.len(), 1);
     let mut future = serde_json::to_value(Registry::default()).unwrap();
-    future["version"] = serde_json::json!(registry::REGISTRY_VERSION + 1);
+    future["version"] = serde_json::json!(Registry::default().version + 1);
     let future = serde_json::to_vec(&future).unwrap();
     std::fs::write(&path, &future).unwrap();
     assert_gateway_refuses(&scratch.0, "--daemon", "Update Toolport");
