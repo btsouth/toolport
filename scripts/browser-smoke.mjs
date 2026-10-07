@@ -103,6 +103,10 @@ try {
   await page.setViewportSize({ width: 480, height: 360 });
   const longServer = "A".repeat(70);
   await expect(page.getByTitle(longServer, { exact: true })).toBeVisible();
+  const firstToggle = await page
+    .getByRole("switch", { name: `Toggle ${longServer}`, exact: true })
+    .boundingBox();
+  expect(firstToggle.y + firstToggle.height).toBeLessThanOrEqual(360);
   await page
     .getByRole("button", { name: `Show ${longServer} details`, exact: true })
     .click();

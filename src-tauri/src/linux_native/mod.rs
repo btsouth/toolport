@@ -360,6 +360,8 @@ fn build_window(
         let notice = gtk::Box::new(gtk::Orientation::Vertical, 8);
         notice.add_css_class("toolport-setting-row");
         notice.append(&gtk::Label::builder().label(
+            "Stop old Toolport gateways, then restart apps to use client access controls."
+        ).tooltip_text(
             "Old Toolport gateways may still be running from before the upgrade. Stop old gateways, then restart any apps still using them so they use the new client access controls."
         ).wrap(true).xalign(0.0).build());
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
