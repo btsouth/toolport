@@ -439,6 +439,19 @@ mod tests {
             )
             .unwrap();
             let grandchild: u32 = line.trim().parse().unwrap();
+            // `$!` is known right after fork. Until the grandchild has exec'd
+            // `sleep`, its environment can read back empty, which the reaper
+            // rightly treats as unproven. Wait for the exec under load.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !std::fs::read(format!("/proc/{grandchild}/cmdline"))
+                .is_ok_and(|cmdline| cmdline.starts_with(b"sleep"))
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the grandchild never exec'd sleep"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             let _ = shell.kill();
             let _ = shell.wait();
             (recorded, ProcessId::of(grandchild).unwrap())
