@@ -45,6 +45,9 @@
 //!   write responses in completion order, and list a `sleep` tool that waits
 //!   `ms` milliseconds. This is what lets a test see whether the gateway keeps
 //!   several requests in flight on one server.
+//! - `MOCK_MCP_ROOTS_BEFORE_LIST=1` — hold every `tools/list` response until the
+//!   client answers a `roots/list` request (with a result or an error), like a
+//!   server that scopes its tools to the client's roots.
 //!
 //! The default configuration (no env set) is byte-identical to the pre-SOU-443
 //! fixture apart from the added `echo_meta` tool, so `list_changed`,
@@ -125,6 +128,7 @@ struct Config {
     garbage_stdout: Option<std::time::Duration>,
     stderr_flood: bool,
     concurrent: bool,
+    roots_before_list: bool,
 }
 
 impl Config {
@@ -149,6 +153,7 @@ impl Config {
                 .map(std::time::Duration::from_millis),
             stderr_flood: std::env::var("MOCK_MCP_STDERR_FLOOD").as_deref() == Ok("1"),
             concurrent: std::env::var("MOCK_MCP_CONCURRENT").as_deref() == Ok("1"),
+            roots_before_list: std::env::var("MOCK_MCP_ROOTS_BEFORE_LIST").as_deref() == Ok("1"),
         }
     }
 }
@@ -162,6 +167,8 @@ struct State {
     /// Original legacy tools/call waiting for the client to answer a
     /// server-initiated elicitation request.
     pending_legacy_elicitation: Option<Value>,
+    /// `tools/list` request waiting for the client to answer `roots/list`.
+    pending_roots_list: Option<Value>,
     subscribed_resources: std::collections::HashSet<String>,
 }
 
@@ -378,6 +385,32 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
         }
     }
 
+    // The client refused the legacy elicitation: fail the call it was for.
+    if method.is_empty()
+        && req.get("id") == Some(&json!("mock-legacy-elicitation"))
+        && req.get("error").is_some()
+    {
+        if let Some(call_id) = state.pending_legacy_elicitation.take() {
+            return Some(success(
+                call_id,
+                json!({
+                    "content": [{ "type": "text", "text": "legacy refused" }],
+                    "isError": true
+                }),
+            ));
+        }
+    }
+
+    if method.is_empty()
+        && req.get("id") == Some(&json!("mock-roots"))
+        && (req.get("result").is_some() || req.get("error").is_some())
+    {
+        if let Some(list_id) = state.pending_roots_list.take() {
+            let tools = tool_list(cfg, state.grown);
+            return Some(success(list_id, decorate(cfg, "tools/list", tools)));
+        }
+    }
+
     // Notifications carry no id and get no response, but still drive state.
     let id = match req.get("id") {
         Some(id) if !id.is_null() => id.clone(),
@@ -428,6 +461,16 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
             "capabilities": capabilities(),
             "instructions": "Mock server used as a gateway test fixture.",
         }),
+        "tools/list" if cfg.roots_before_list => {
+            state.pending_roots_list = Some(id);
+            pre.push(json!({
+                "jsonrpc": "2.0",
+                "id": "mock-roots",
+                "method": "roots/list",
+                "params": {}
+            }));
+            return None;
+        }
         "tools/list" => tool_list(cfg, state.grown),
         "resources/list" => resource_list(state.grown),
         "resources/subscribe" => {
@@ -700,6 +743,7 @@ fn serve_http(cfg: &Config) {
         grown: false,
         initialized: false,
         pending_legacy_elicitation: None,
+        pending_roots_list: None,
         subscribed_resources: std::collections::HashSet::new(),
     };
     for mut request in server.incoming_requests() {
@@ -904,6 +948,7 @@ fn serve_stdio() {
         grown: false,
         initialized: false,
         pending_legacy_elicitation: None,
+        pending_roots_list: None,
         subscribed_resources: std::collections::HashSet::new(),
     };
     if cfg.concurrent {

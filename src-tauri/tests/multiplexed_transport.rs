@@ -5,14 +5,47 @@
 //! which handles each request on its own thread and answers in completion order.
 //! While one call sleeps for 20 s, a second call to the same server must come back
 //! at once, and 100 parallel 200 ms calls must overlap rather than queue.
+//!
+//! Also drives discovery and refresh, which run with no client waiting, against
+//! a server that holds its `tools/list` answer until its `roots/list` is answered.
 
-use std::sync::atomic::AtomicU8;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use conduit_lib::downstream::{CancelRegistry, DownstreamServer, StdioTransport};
+use conduit_lib::downstream::{
+    set_request_context_provider, CancelRegistry, DownstreamServer, RequestContext,
+    ServerRequestAction, ServerRequestHandler, StdioTransport, Transport,
+};
 use conduit_lib::router::Router;
-use serde_json::json;
+use serde_json::{json, Value};
+
+thread_local! {
+    /// What the gateway's provider would report for this thread. Threads that do
+    /// not set it share one client context, as with no provider at all.
+    static REQUEST_CONTEXT: RefCell<RequestContext> =
+        const { RefCell::new(RequestContext::Client(String::new())) };
+}
+
+fn install_request_context_provider() {
+    set_request_context_provider(Arc::new(|| {
+        REQUEST_CONTEXT.with(|context| context.borrow().clone())
+    }));
+}
+
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "toolport-multiplexed-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    dir
+}
 
 fn concurrent_mock_router() -> Arc<Router> {
     concurrent_mock_router_with(&[])
@@ -22,9 +55,16 @@ fn concurrent_mock_router_with(extra_env: &[(String, String)]) -> Arc<Router> {
     let mock = env!("CARGO_BIN_EXE_mock-mcp-server");
     let mut env = vec![("MOCK_MCP_CONCURRENT".to_string(), "1".to_string())];
     env.extend_from_slice(extra_env);
-    let transport =
-        StdioTransport::spawn_watched(mock, &[], &env, None, Arc::new(AtomicU8::new(0)), None)
-            .expect("spawn mock");
+    let transport = StdioTransport::spawn_watched(
+        mock,
+        &[],
+        &env,
+        None,
+        false,
+        Arc::new(AtomicU8::new(0)),
+        None,
+    )
+    .expect("spawn mock");
     let server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect mock");
     let mut router = Router::new();
@@ -55,15 +95,7 @@ fn wait_for_transcript(path: &std::path::Path, seen: impl Fn(&serde_json::Value)
 
 #[test]
 fn a_fast_call_is_not_blocked_behind_a_slow_call_to_the_same_server() {
-    let dir = std::env::temp_dir().join(format!(
-        "toolport-multiplexed-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let dir = temp_dir("rel01");
     let transcript = dir.join("transcript.jsonl");
     let router = concurrent_mock_router_with(&[(
         "MOCK_MCP_TRANSCRIPT".to_string(),
@@ -134,4 +166,104 @@ fn parallel_calls_to_one_server_overlap() {
     // Serialized, these take 20 s. The target is 200 to 400 ms; the bound
     // tolerates a loaded runner.
     assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+}
+
+/// Connect to and refresh a server that holds every `tools/list` answer until
+/// its `roots/list` is answered, on a thread no client is waiting on. Returns
+/// how the server's `roots/list` requests were answered and how many the
+/// handler took.
+fn discover_and_refresh(sole_client: bool) -> (Vec<Value>, usize) {
+    install_request_context_provider();
+    REQUEST_CONTEXT.with(|context| {
+        *context.borrow_mut() = RequestContext::Background { sole_client };
+    });
+    let dir = temp_dir("roots-before-list");
+    let transcript = dir.join("transcript.jsonl");
+    let env = [
+        ("MOCK_MCP_ROOTS_BEFORE_LIST".to_string(), "1".to_string()),
+        (
+            "MOCK_MCP_TRANSCRIPT".to_string(),
+            transcript.to_string_lossy().into_owned(),
+        ),
+    ];
+    let handled = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&handled);
+    let handler: ServerRequestHandler = Arc::new(move |request| {
+        if request["method"] != "roots/list" {
+            return None;
+        }
+        counted.fetch_add(1, Ordering::SeqCst);
+        Some(ServerRequestAction::Respond(json!({
+            "jsonrpc": "2.0",
+            "id": request["id"].clone(),
+            "result": { "roots": [{ "uri": "file:///work", "name": "work" }] }
+        })))
+    });
+    let mock = env!("CARGO_BIN_EXE_mock-mcp-server");
+    let mut transport = StdioTransport::spawn_watched(
+        mock,
+        &[],
+        &env,
+        None,
+        false,
+        Arc::new(AtomicU8::new(0)),
+        None,
+    )
+    .expect("spawn mock");
+    transport.set_server_request_handler(handler);
+
+    let started = Instant::now();
+    let mut server =
+        DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("discovery");
+    assert!(!server.tools.is_empty(), "discovery listed no tools");
+    let discovered = started.elapsed();
+    server.tools.clear();
+    let started = Instant::now();
+    server.refresh_tools();
+    let refreshed = started.elapsed();
+    assert!(!server.tools.is_empty(), "the refresh listed no tools");
+    println!("discovery took {discovered:?}, refresh {refreshed:?}");
+    // Left unanswered, each would wait out the server's read timeout.
+    assert!(
+        discovered < Duration::from_secs(5),
+        "discovery took {discovered:?}"
+    );
+    assert!(
+        refreshed < Duration::from_secs(5),
+        "refresh took {refreshed:?}"
+    );
+    drop(server);
+
+    let answers = std::fs::read_to_string(&transcript)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|message| message["id"] == "mock-roots" && message.get("method").is_none())
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    (answers, handled.load(Ordering::SeqCst))
+}
+
+#[test]
+fn discovery_and_refresh_answer_server_requests_for_the_sole_client() {
+    let (answers, handled) = discover_and_refresh(true);
+    assert_eq!(handled, 2, "{answers:?}");
+    assert_eq!(answers.len(), 2, "{answers:?}");
+    assert!(
+        answers
+            .iter()
+            .all(|answer| answer["result"]["roots"][0]["uri"] == "file:///work"),
+        "{answers:?}"
+    );
+}
+
+#[test]
+fn discovery_and_refresh_refuse_server_requests_no_client_can_answer() {
+    let (answers, handled) = discover_and_refresh(false);
+    assert_eq!(handled, 0, "no client context, so the handler must not run");
+    assert_eq!(answers.len(), 2, "{answers:?}");
+    assert!(
+        answers.iter().all(|answer| answer.get("error").is_some()),
+        "{answers:?}"
+    );
 }

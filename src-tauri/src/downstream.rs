@@ -3063,13 +3063,39 @@ pub struct StdioTransport {
     subscription_listener_id: Option<i64>,
 }
 
-/// Names the upstream request context of the calling thread. The gateway's
-/// server-request handler reads thread-locals (upstream era, capabilities, MCP
-/// session), so a stdio server's roots, sampling or elicitation request must be
-/// handled on a thread serving the same upstream client. `None` means no client
-/// is waiting on the thread (a background refresh): such a request never takes a
-/// server request. Unset means every request shares one context.
-pub type RequestContextProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+/// Whom a downstream request serves. The gateway's server-request handler reads
+/// thread-locals (upstream era, capabilities, MCP session), so a stdio server's
+/// roots, sampling or elicitation request must be handled on a thread serving the
+/// same upstream client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestContext {
+    /// An upstream client is waiting on the request. Requests with the same key
+    /// serve the same client.
+    Client(String),
+    /// Work no client is waiting on (connect, catalog refresh). It never owns a
+    /// server request and never makes the in-flight clients look mixed.
+    Background {
+        /// The handler can answer for the one upstream client without any
+        /// per-request context (the stdio gateway), so a server request that
+        /// arrives while only background work is in flight is handled on its
+        /// thread, as before multiplexing. Otherwise it is refused at once: no
+        /// client can answer it before the background request gives up.
+        sole_client: bool,
+    },
+}
+
+impl RequestContext {
+    fn client(&self) -> Option<&str> {
+        match self {
+            RequestContext::Client(key) => Some(key),
+            RequestContext::Background { .. } => None,
+        }
+    }
+}
+
+/// Names the [`RequestContext`] of the calling thread. Unset means every request
+/// shares one client context.
+pub type RequestContextProvider = Arc<dyn Fn() -> RequestContext + Send + Sync>;
 
 static REQUEST_CONTEXT_PROVIDER: OnceLock<RequestContextProvider> = OnceLock::new();
 
@@ -3078,10 +3104,10 @@ pub fn set_request_context_provider(provider: RequestContextProvider) {
     let _ = REQUEST_CONTEXT_PROVIDER.set(provider);
 }
 
-fn request_context_key() -> Option<String> {
+fn request_context() -> RequestContext {
     match REQUEST_CONTEXT_PROVIDER.get() {
         Some(provider) => provider(),
-        None => Some(String::new()),
+        None => RequestContext::Client(String::new()),
     }
 }
 
@@ -3096,6 +3122,10 @@ const MAX_SUSPENDED_LEGACY_MRTR: usize = 32;
 const SUSPENDED_LEGACY_MRTR_TTL: Duration = Duration::from_secs(15 * 60);
 /// JSON-RPC internal error, used to refuse a server request Toolport cannot route.
 const JSONRPC_INTERNAL_ERROR: i64 = -32603;
+/// Refusal for a server request that arrived during background work only.
+const NO_CLIENT_IN_FLIGHT: &str = "Toolport had no client request in flight to answer this";
+/// Refusal for a server request whose call Toolport no longer waits on.
+const CALL_ENDED: &str = "Toolport stopped waiting on the call this request belongs to";
 
 /// What the demux thread hands one waiting stdio request.
 enum Delivery {
@@ -3109,8 +3139,8 @@ enum Delivery {
 struct StdioWaiter {
     /// Registration order, so a server request goes to the oldest waiter.
     seq: u64,
-    /// [`request_context_key`] of the thread waiting on this request.
-    context: Option<String>,
+    /// [`request_context`] of the thread waiting on this request.
+    context: RequestContext,
     tx: Sender<Delivery>,
     /// False while suspended for a modern upstream round trip: no thread is
     /// waiting, so this request cannot handle a server request.
@@ -3124,6 +3154,9 @@ struct SuspendedLegacyMrtr {
     pending: PendingLegacyMrtr,
     rx: Receiver<Delivery>,
     since: Instant,
+    /// Client context of the suspended call, which owns the server requests
+    /// queued for it.
+    owner: Option<String>,
 }
 
 /// How a request relates to the suspended legacy MRTR requests.
@@ -3200,11 +3233,41 @@ struct WaiterGuard<'a> {
 impl Drop for WaiterGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.core
-                .lock_state()
-                .pending
-                .remove(&waiter_key(&self.downstream_id));
+            let orphaned = {
+                let mut state = self.core.lock_state();
+                let owner = state
+                    .pending
+                    .remove(&waiter_key(&self.downstream_id))
+                    .and_then(|waiter| waiter.context.client().map(str::to_string));
+                state.take_orphaned(owner.as_deref())
+            };
+            self.core.refuse_orphaned(orphaned);
         }
+    }
+}
+
+impl StdioCoreState {
+    /// Unclaimed server requests reserved for `owner`, once no request of that
+    /// client is pending: no call of it remains to answer them.
+    fn take_orphaned(&mut self, owner: Option<&str>) -> Vec<Value> {
+        let Some(owner) = owner else {
+            return Vec::new();
+        };
+        if self
+            .pending
+            .values()
+            .any(|waiter| waiter.context.client() == Some(owner))
+        {
+            return Vec::new();
+        }
+        let (orphaned, kept): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.unclaimed)
+            .into_iter()
+            .partition(|unclaimed| unclaimed.owner.as_deref() == Some(owner));
+        self.unclaimed = kept;
+        orphaned
+            .into_iter()
+            .map(|unclaimed| unclaimed.request)
+            .collect()
     }
 }
 
@@ -3539,29 +3602,51 @@ impl StdioCore {
     }
 
     fn register(&self, downstream_id: &Value, tx: Sender<Delivery>) -> Result<(), TransportError> {
-        let context = request_context_key();
-        let mut state = self.lock_state();
-        if let Some(closed) = &state.closed {
-            return Err(TransportError::Unavailable(closed.clone()));
-        }
-        let seq = state.next_seq;
-        state.next_seq += 1;
-        // A server request that arrived while nothing was in flight goes to the
-        // next client request, as it did when it waited in the read channel.
-        if let Some(context) = &context {
-            for request in Self::claim_unclaimed(&mut state, context) {
+        let context = request_context();
+        let refused = {
+            let mut state = self.lock_state();
+            if let Some(closed) = &state.closed {
+                return Err(TransportError::Unavailable(closed.clone()));
+            }
+            let seq = state.next_seq;
+            state.next_seq += 1;
+            // A server request that arrived while nothing was in flight goes to
+            // the next request, as it did when it waited in the read channel.
+            // Background work takes all of them: while it holds the server for a
+            // connect or refresh, no client call can claim them, and the server
+            // may be holding the background response until they are answered.
+            let (claimed, refused) = match &context {
+                RequestContext::Client(key) => (Self::claim_unclaimed(&mut state, key), Vec::new()),
+                RequestContext::Background { sole_client } => {
+                    let all: Vec<Value> = state
+                        .unclaimed
+                        .drain(..)
+                        .map(|unclaimed| unclaimed.request)
+                        .collect();
+                    if *sole_client {
+                        (all, Vec::new())
+                    } else {
+                        (Vec::new(), all)
+                    }
+                }
+            };
+            for request in claimed {
                 let _ = tx.send(Delivery::ServerRequest(request));
             }
+            state.pending.insert(
+                waiter_key(downstream_id),
+                StdioWaiter {
+                    seq,
+                    context,
+                    tx,
+                    active: true,
+                },
+            );
+            refused
+        };
+        for request in refused {
+            self.refuse(&request, NO_CLIENT_IN_FLIGHT);
         }
-        state.pending.insert(
-            waiter_key(downstream_id),
-            StdioWaiter {
-                seq,
-                context,
-                tx,
-                active: true,
-            },
-        );
         Ok(())
     }
 
@@ -3578,7 +3663,7 @@ impl StdioCore {
         };
         waiter.active = true;
         let tx = waiter.tx.clone();
-        if let Some(context) = waiter.context.clone() {
+        if let Some(context) = waiter.context.client().map(str::to_string) {
             for request in Self::claim_unclaimed(state, &context) {
                 let _ = tx.send(Delivery::ServerRequest(request));
             }
@@ -3611,11 +3696,25 @@ impl StdioCore {
             .lock_state()
             .pending
             .remove(&waiter_key(&waiter.downstream_id))
-            .and_then(|waiter| waiter.context);
+            .and_then(|waiter| waiter.context.client().map(str::to_string));
+        self.drain_deliveries(rx, owner.as_deref());
+    }
+
+    /// Pass on the server requests a call that stopped waiting was handed, then
+    /// refuse the requests queued for its client if it was that client's last.
+    fn drain_deliveries(&self, rx: &Receiver<Delivery>, owner: Option<&str>) {
         while let Ok(delivery) = rx.try_recv() {
             if let Delivery::ServerRequest(request) = delivery {
-                self.reroute_server_request(request, owner.as_deref());
+                self.reroute_server_request(request, owner);
             }
+        }
+        let orphaned = self.lock_state().take_orphaned(owner);
+        self.refuse_orphaned(orphaned);
+    }
+
+    fn refuse_orphaned(&self, orphaned: Vec<Value>) {
+        for request in orphaned {
+            self.refuse(&request, CALL_ENDED);
         }
     }
 
@@ -3628,7 +3727,7 @@ impl StdioCore {
                 state
                     .pending
                     .values()
-                    .filter(|waiter| waiter.active && waiter.context.as_deref() == Some(owner))
+                    .filter(|waiter| waiter.active && waiter.context.client() == Some(owner))
                     .min_by_key(|waiter| waiter.seq)
             });
             match next {
@@ -3643,10 +3742,7 @@ impl StdioCore {
             }
         };
         if let Some(request) = undelivered {
-            self.refuse(
-                &request,
-                "Toolport stopped waiting on the call this request belongs to",
-            );
+            self.refuse(&request, CALL_ENDED);
         }
     }
 
@@ -3659,13 +3755,16 @@ impl StdioCore {
         waiter.armed = false;
         let evicted = {
             let mut state = self.lock_state();
+            let mut owner = None;
             if let Some(entry) = state.pending.get_mut(&waiter_key(&waiter.downstream_id)) {
                 entry.active = false;
+                owner = entry.context.client().map(str::to_string);
             }
             state.suspended.push(SuspendedLegacyMrtr {
                 pending,
                 rx,
                 since: Instant::now(),
+                owner,
             });
             let overflow = state
                 .suspended
@@ -3681,20 +3780,25 @@ impl StdioCore {
         };
         for suspended in evicted {
             self.retire(
-                suspended.pending.downstream_request_id,
+                suspended,
                 Some("Toolport dropped an unanswered input request".to_string()),
             );
         }
     }
 
-    /// Cancel a suspended request downstream; nothing waits on it any more.
-    fn retire(&self, downstream_id: Value, reason: Option<String>) {
+    /// A suspended request no retry will resume; its waiter is already gone.
+    /// Cancel it downstream and answer every server request still waiting on
+    /// it: the one it was suspended for, those handed to it meanwhile, and
+    /// those queued for its client if no call of that client remains.
+    fn retire(&self, suspended: SuspendedLegacyMrtr, reason: Option<String>) {
         CancelEntry {
             stdin: Arc::clone(&self.stdin),
-            downstream_id,
+            downstream_id: suspended.pending.downstream_request_id.clone(),
             waiter: None,
         }
         .send_cancel_async(reason);
+        self.refuse(&suspended.pending.server_request, CALL_ENDED);
+        self.drain_deliveries(&suspended.rx, suspended.owner.as_deref());
     }
 
     fn expire_suspended(&self) {
@@ -3719,7 +3823,7 @@ impl StdioCore {
         };
         for suspended in expired {
             self.retire(
-                suspended.pending.downstream_request_id,
+                suspended,
                 Some("Toolport's input request expired".to_string()),
             );
         }
@@ -3746,16 +3850,25 @@ impl StdioCore {
                     .remove(&waiter_key(&suspended.pending.downstream_request_id));
                 suspended
             };
-        self.retire(suspended.pending.downstream_request_id, cancel.reason());
+        self.retire(suspended, cancel.reason());
         true
     }
 
     /// The client cancelled: stop waiting now. A late response is dropped.
     fn cancel_waiter(&self, downstream_id: &Value) {
-        let waiter = self.lock_state().pending.remove(&waiter_key(downstream_id));
+        let (waiter, orphaned) = {
+            let mut state = self.lock_state();
+            let waiter = state.pending.remove(&waiter_key(downstream_id));
+            let owner = waiter
+                .as_ref()
+                .and_then(|waiter| waiter.context.client().map(str::to_string));
+            let orphaned = state.take_orphaned(owner.as_deref());
+            (waiter, orphaned)
+        };
         if let Some(waiter) = waiter {
             let _ = waiter.tx.send(Delivery::Cancelled);
         }
+        self.refuse_orphaned(orphaned);
     }
 
     fn route_line(&self, line: &str) {
@@ -3797,7 +3910,7 @@ impl StdioCore {
             let mut contexts = state
                 .pending
                 .values()
-                .filter_map(|waiter| waiter.context.as_deref());
+                .filter_map(|waiter| waiter.context.client());
             let owner = contexts.next();
             let mixed = owner.is_some_and(|owner| !contexts.all(|context| context == owner));
             let owner = owner.map(str::to_string);
@@ -3819,15 +3932,30 @@ impl StdioCore {
             } else if let Some(oldest) = state
                 .pending
                 .values()
-                .filter(|waiter| waiter.active && waiter.context.is_some())
+                .filter(|waiter| waiter.active && waiter.context.client().is_some())
                 .min_by_key(|waiter| waiter.seq)
+                // With only background work active, it cannot finish until the
+                // server hears back, and it holds the server so no client call
+                // can start to answer. Handle the request there when that is
+                // safe for the one client, otherwise refuse it now.
+                .or_else(|| {
+                    state
+                        .pending
+                        .values()
+                        .filter(|waiter| waiter.active)
+                        .min_by_key(|waiter| waiter.seq)
+                })
             {
-                match oldest.tx.send(Delivery::ServerRequest(request)) {
-                    Ok(()) => None,
-                    Err(std::sync::mpsc::SendError(Delivery::ServerRequest(request))) => {
-                        Some((request, UNANSWERABLE))
+                if oldest.context == (RequestContext::Background { sole_client: false }) {
+                    Some((request, NO_CLIENT_IN_FLIGHT))
+                } else {
+                    match oldest.tx.send(Delivery::ServerRequest(request)) {
+                        Ok(()) => None,
+                        Err(std::sync::mpsc::SendError(Delivery::ServerRequest(request))) => {
+                            Some((request, UNANSWERABLE))
+                        }
+                        Err(_) => None,
                     }
-                    Err(_) => None,
                 }
             } else {
                 state
@@ -10365,8 +10493,8 @@ mod tests {
     }
 
     thread_local! {
-        static TEST_REQUEST_CONTEXT: std::cell::RefCell<Option<String>> =
-            const { std::cell::RefCell::new(Some(String::new())) };
+        static TEST_REQUEST_CONTEXT: std::cell::RefCell<super::RequestContext> =
+            const { std::cell::RefCell::new(super::RequestContext::Client(String::new())) };
     }
 
     /// A [`super::StdioCore`] over a recording child: requests go to the
@@ -10407,29 +10535,38 @@ mod tests {
             params: Value,
             cancel: Option<super::CancelContext>,
         ) -> std::thread::JoinHandle<Result<Value, TransportError>> {
-            self.request_as(Some(context), params, cancel)
+            self.request_as(
+                super::RequestContext::Client(context.to_string()),
+                params,
+                cancel,
+            )
         }
 
         /// Send one request no client is waiting on, like a background refresh.
+        /// `sole_client` as the stdio gateway sets it.
         fn background_request(
             &self,
+            sole_client: bool,
             params: Value,
         ) -> std::thread::JoinHandle<Result<Value, TransportError>> {
-            self.request_as(None, params, None)
+            self.request_as(
+                super::RequestContext::Background { sole_client },
+                params,
+                None,
+            )
         }
 
         fn request_as(
             &self,
-            context: Option<&str>,
+            context: super::RequestContext,
             params: Value,
             cancel: Option<super::CancelContext>,
         ) -> std::thread::JoinHandle<Result<Value, TransportError>> {
             let core = Arc::clone(&self.core);
-            let context = context.map(str::to_string);
             std::thread::Builder::new()
                 .name(format!(
                     "waiter-{}",
-                    context.as_deref().unwrap_or("background")
+                    context.client().unwrap_or("background")
                 ))
                 .spawn(move || {
                     TEST_REQUEST_CONTEXT.with(|cell| *cell.borrow_mut() = context);
@@ -10459,6 +10596,26 @@ mod tests {
             self.wait_for(&format!("{count} pending request(s)"), |core| {
                 core.lock_state().pending.len() == count
             });
+        }
+
+        /// Wait until the child's stdin received a frame matching `seen`.
+        fn wait_for_frame(&self, what: &str, seen: impl Fn(&Value) -> bool) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let written = std::fs::read_to_string(&self.recorder.output).unwrap_or_default();
+                if written
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .any(|frame| seen(&frame))
+                {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {what}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
         }
 
         fn server_says(&self, line: Value) {
@@ -10748,20 +10905,33 @@ mod tests {
         (handler, seen)
     }
 
+    fn refused(frame: &Value, id: &str) -> bool {
+        frame["id"] == id && frame.get("error").is_some()
+    }
+
     #[test]
     fn stdio_background_request_neither_mixes_nor_takes_server_requests() {
         let fixture = CoreFixture::new("background", "");
         let (handler, seen) = recording_handler();
         *fixture.core.server_handler.lock().unwrap() = Some(handler);
-        let refresh = fixture.background_request(json!({ "name": "refresh" }));
-        fixture.wait_for_pending(1);
-
-        // Only a background request is in flight: the server request waits for
-        // a client's call instead of being answered without one.
-        fixture.server_says(server_request("srv-1", "roots/list"));
+        // Queued while nothing was in flight, then taken by a refresh.
+        fixture.server_says(server_request("srv-0", "roots/list"));
         fixture.wait_for("the unclaimed server request", |core| {
             core.lock_state().unclaimed.len() == 1
         });
+        let refresh = fixture.background_request(false, json!({ "name": "refresh" }));
+        fixture.wait_for_pending(1);
+
+        // Only background work is in flight, and it may be what the server is
+        // holding until it hears back: no client can answer, so refuse at once
+        // instead of leaving the refresh to time out.
+        fixture.wait_for_frame("the queued request's refusal", |frame| {
+            refused(frame, "srv-0")
+        });
+        fixture.server_says(server_request("srv-1", "roots/list"));
+        fixture.wait_for_frame("the refusal", |frame| refused(frame, "srv-1"));
+        assert!(fixture.core.lock_state().unclaimed.is_empty());
+
         let call = fixture.request("client-a", json!({ "name": "one" }), None);
         fixture.wait_for_pending(2);
         // A client's call next to a background one is not a mix of clients.
@@ -10777,14 +10947,125 @@ mod tests {
             .load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
             *seen.lock().unwrap(),
+            vec![("waiter-client-a".to_string(), json!("srv-2"))]
+        );
+        let frames = fixture.finish();
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["id"] == "srv-2" && frame.get("result").is_some()),
+            "{frames:?}"
+        );
+    }
+
+    #[test]
+    fn stdio_background_request_of_the_sole_client_answers_server_requests() {
+        let fixture = CoreFixture::new("background-sole", "");
+        let (handler, seen) = recording_handler();
+        *fixture.core.server_handler.lock().unwrap() = Some(handler);
+        fixture.server_says(server_request("srv-0", "roots/list"));
+        fixture.wait_for("the unclaimed server request", |core| {
+            core.lock_state().unclaimed.len() == 1
+        });
+        // The stdio gateway's handler answers for its one client without a
+        // request context, as the connect thread did before multiplexing.
+        let discovery = fixture.background_request(true, json!({ "name": "discover" }));
+        fixture.wait_for_pending(1);
+        fixture.server_says(server_request("srv-1", "roots/list"));
+        fixture.wait_for_frame("the answer", |frame| {
+            frame["id"] == "srv-1" && frame.get("result").is_some()
+        });
+        fixture.server_says(response(1, json!({})));
+        discovery.join().unwrap().unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
             vec![
-                ("waiter-client-a".to_string(), json!("srv-1")),
-                ("waiter-client-a".to_string(), json!("srv-2")),
+                ("waiter-background".to_string(), json!("srv-0")),
+                ("waiter-background".to_string(), json!("srv-1")),
             ]
         );
         let frames = fixture.finish();
         assert!(
             frames.iter().all(|frame| frame.get("error").is_none()),
+            "{frames:?}"
+        );
+    }
+
+    #[test]
+    fn stdio_cancelling_a_suspended_call_answers_its_queued_server_requests() {
+        let fixture = CoreFixture::new("suspended-cancel", "");
+        let handler: ServerRequestHandler = Arc::new(|request| {
+            (request["method"] == "elicitation/create")
+                .then_some(ServerRequestAction::InputRequired)
+        });
+        *fixture.core.server_handler.lock().unwrap() = Some(handler);
+        // A sessionless call: its retry is a new upstream request, so a key
+        // like this one never comes back once the call is gone.
+        let suspended = fixture.request(
+            "client-a#7",
+            json!({ "name": "one", "arguments": {} }),
+            None,
+        );
+        fixture.wait_for_pending(1);
+        fixture.server_says(json!({
+            "jsonrpc": "2.0",
+            "id": "elicit-1",
+            "method": "elicitation/create",
+            "params": { "message": "Continue?" }
+        }));
+        let suspended = suspended.join().unwrap().unwrap();
+        assert_eq!(suspended["resultType"], "input_required");
+        // Nothing is active: this one is kept for the suspended call's client.
+        fixture.server_says(server_request("srv-q", "roots/list"));
+        fixture.wait_for("the owned server request", |core| {
+            core.lock_state().unclaimed.len() == 1
+        });
+
+        let registry = CancelRegistry::new();
+        assert!(registry.begin_client_request("c-1".to_string()));
+        assert!(registry.cancel("c-1", Some("user pressed stop")));
+        let key = suspended["inputRequests"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let retry = fixture.request(
+            "client-a#8",
+            json!({
+                "name": "one",
+                "arguments": {},
+                "requestState": suspended["requestState"].clone(),
+                "inputResponses": { key: { "action": "accept" } }
+            }),
+            Some(registry.context("c-1".to_string())),
+        );
+        assert!(matches!(
+            retry.join().unwrap(),
+            Err(TransportError::Cancelled(_))
+        ));
+        registry.finish_client_request("c-1");
+        {
+            let state = fixture.core.lock_state();
+            assert!(state.suspended.is_empty());
+            assert!(state.pending.is_empty());
+            assert!(state.unclaimed.is_empty(), "the owned request was stranded");
+        }
+
+        let frames = fixture.finish();
+        for id in ["srv-q", "elicit-1"] {
+            assert!(
+                frames.iter().any(|frame| refused(frame, id)),
+                "{id} was never answered: {frames:?}"
+            );
+        }
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["method"] == "notifications/cancelled"
+                    && frame["params"]["requestId"] == 1),
             "{frames:?}"
         );
     }

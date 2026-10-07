@@ -361,14 +361,17 @@ fn active_request_context() -> ActiveRequestContext {
 /// same key. The stdio gateway has one client; an HTTP caller is keyed by its
 /// identity, root, profile and MCP session, and a sessionless HTTP request also
 /// by its own nonce, since nothing else tells two connections of one app apart.
-/// `None` is work no client asked for (a background refresh): it never answers
-/// a server request.
-fn downstream_request_context_key() -> Option<String> {
+/// Work no client asked for (connect, catalog refresh) is background. With
+/// `sole_client` (the stdio gateway) the handler needs no request context to
+/// answer for the one client, so a server request during it is still answered.
+fn downstream_request_context(sole_client: bool) -> downstream::RequestContext {
     use std::hash::{Hash, Hasher};
     ACTIVE_REQUEST_CONTEXT.with(|cell| {
         let context = cell.borrow();
         let transport = match context.upstream_transport {
-            UpstreamTransport::Unknown => return None,
+            UpstreamTransport::Unknown => {
+                return downstream::RequestContext::Background { sole_client }
+            }
             UpstreamTransport::Stdio => "stdio",
             UpstreamTransport::Http => "http",
         };
@@ -390,7 +393,7 @@ fn downstream_request_context_key() -> Option<String> {
         if context.upstream_transport == UpstreamTransport::Http && context.mcp_session.is_none() {
             key.push_str(&format!("|#{}", context.request_nonce));
         }
-        Some(key)
+        downstream::RequestContext::Client(key)
     })
 }
 
@@ -19706,7 +19709,9 @@ fn main() {
     // Single-flight for every router build/swap (startup, watcher self-heal, and
     // ${ROOT} rebuilds). Created up front so the startup build can share it.
     let rebuild_lock = Arc::new(Mutex::new(()));
-    downstream::set_request_context_provider(Arc::new(downstream_request_context_key));
+    downstream::set_request_context_provider(Arc::new(move || {
+        downstream_request_context(!http_mode)
+    }));
     let server_handler = make_server_request_handler(
         Arc::clone(&stdio_upstream),
         Arc::clone(&mcp_sessions),
@@ -32029,9 +32034,9 @@ mod tests {
 
     #[test]
     fn downstream_context_key_never_shares_one_between_two_clients() {
-        fn key_for(context: ActiveRequestContext) -> Option<String> {
+        fn key_for(context: ActiveRequestContext) -> downstream::RequestContext {
             let _context = ActiveRequestContextGuard::enter(context);
-            downstream_request_context_key()
+            downstream_request_context(false)
         }
         // Two sessionless modern requests on the daemon that agree on everything
         // the server-request handler reads: era, capabilities, root and profile.
@@ -32076,20 +32081,34 @@ mod tests {
             ..ActiveRequestContext::default()
         };
         assert_eq!(key_for(stdio(1)), key_for(stdio(2)));
-        assert!(key_for(stdio(1)).is_some());
+        assert!(matches!(
+            key_for(stdio(1)),
+            downstream::RequestContext::Client(_)
+        ));
 
-        // Work no client is waiting on has no key at all.
-        assert_eq!(key_for(ActiveRequestContext::default()), None);
+        // Work no client is waiting on has no key at all; the stdio gateway's
+        // handler can still answer for its one client during it.
+        assert_eq!(
+            key_for(ActiveRequestContext::default()),
+            downstream::RequestContext::Background { sole_client: false }
+        );
+        {
+            let _context = ActiveRequestContextGuard::enter(ActiveRequestContext::default());
+            assert_eq!(
+                downstream_request_context(true),
+                downstream::RequestContext::Background { sole_client: true }
+            );
+        }
 
         // The request guard hands each upstream request its own nonce.
         let _http = UpstreamTransportGuard::enter(UpstreamTransport::Http);
         let first = {
             let _request = UpstreamRequestGuard::enter(Some("adapter:claude-code".to_string()));
-            downstream_request_context_key()
+            downstream_request_context(false)
         };
         let second = {
             let _request = UpstreamRequestGuard::enter(Some("adapter:claude-code".to_string()));
-            downstream_request_context_key()
+            downstream_request_context(false)
         };
         assert_ne!(first, second);
     }

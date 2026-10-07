@@ -13,7 +13,7 @@
 //! map so `tools/call` still forwards the server's real, hyphenated tool name.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -594,6 +594,10 @@ struct ServerSlot {
     /// Calls that succeeded. A failed probe re-spawns a live multiplexed
     /// connection only if no other call succeeded while it was in flight.
     successes: AtomicU64,
+    /// Calls running on a call handle. Counted while the slot lock is held to
+    /// fetch the handle, so a re-spawn that checks it under the lock sees every
+    /// call that could still be using the connection it replaces.
+    handle_calls: AtomicUsize,
     reconnect_gate: Mutex<()>,
 }
 
@@ -608,8 +612,27 @@ impl ServerSlot {
             in_flight: InFlightLimit::default(),
             generation: AtomicU64::new(0),
             successes: AtomicU64::new(0),
+            handle_calls: AtomicUsize::new(0),
             reconnect_gate: Mutex::new(()),
         }
+    }
+
+    /// Whether nothing shows a live multiplexed connection is still working:
+    /// no call succeeded since `successes` was read and no other call is
+    /// running on it. Only then may a failed probe replace it, since that ends
+    /// every call in flight. Read under the slot lock for an exact count.
+    fn quiescent_since(&self, successes: u64) -> bool {
+        self.successes.load(Ordering::Acquire) == successes
+            && self.handle_calls.load(Ordering::Acquire) == 0
+    }
+}
+
+/// Counts one call on a call handle in [`ServerSlot::handle_calls`].
+struct HandleCall<'a>(&'a AtomicUsize);
+
+impl Drop for HandleCall<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -2392,7 +2415,8 @@ impl Router {
                         // self-heal only fires when EVERY server is dead). Gated on the
                         // probe so a live server is never re-spawned on a transient blip,
                         // and a live multiplexed connection only when no other call
-                        // succeeded meanwhile: re-spawning ends every call in flight.
+                        // succeeded meanwhile or is still running on it: re-spawning
+                        // ends every call in flight. The last of them to fail does it.
                         if is_probe && Self::respawn_after_failure(slot, successes) {
                             if cancel.is_some_and(CancelContext::is_cancelled) {
                                 return Err(
@@ -2404,6 +2428,7 @@ impl Router {
                                 cancel,
                                 replay_policy.uncertain_failure(&e),
                                 generation,
+                                successes,
                                 access,
                                 &mut f,
                             ) {
@@ -2423,17 +2448,16 @@ impl Router {
 
     /// Whether a failed probe should re-spawn the connection. A connection that
     /// serves one call at a time has nothing else to interrupt; a multiplexed
-    /// one is re-spawned when it closed, or when no call succeeded since
-    /// `successes` was read (it is wedged, not just slow on one call).
+    /// one is re-spawned when it closed, or when it is quiescent (it is wedged,
+    /// not just slow on one call while others still run).
     fn respawn_after_failure(slot: &ServerSlot, successes: u64) -> bool {
-        let closed = slot
+        let server = slot
             .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .connection_closed();
-        match closed {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match server.connection_closed() {
             None | Some(true) => true,
-            Some(false) => slot.successes.load(Ordering::Acquire) == successes,
+            Some(false) => slot.quiescent_since(successes),
         }
     }
 
@@ -2451,15 +2475,20 @@ impl Router {
         F: FnMut(&mut dyn ServerDispatch) -> Result<T, TransportError>,
     {
         let handle = match access {
-            SlotAccess::Shared => slot
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .call_handle(),
+            SlotAccess::Shared => {
+                let server = slot
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                server.call_handle().map(|handle| {
+                    slot.handle_calls.fetch_add(1, Ordering::AcqRel);
+                    (handle, HandleCall(&slot.handle_calls))
+                })
+            }
             SlotAccess::Locked => None,
         };
         match handle {
-            Some(mut handle) => {
+            Some((mut handle, _counted)) => {
                 let _permit = match slot
                     .in_flight
                     .acquire(&slot.id, handle.call_timeout(), cancel)
@@ -2488,13 +2517,17 @@ impl Router {
     /// normal breaker-failure path). The spawn runs without holding the `inner` lock so
     /// a slow re-spawn doesn't wedge other callers to the same server. Concurrent
     /// probes that failed on the same connection (`generation`) re-spawn it once;
-    /// the others retry on the connection that one installed.
+    /// the others retry on the connection that one installed. A live multiplexed
+    /// connection that came back to life during the spawn (a call succeeded or
+    /// started on it since `successes` was read) is kept and the fresh one dropped.
+    #[allow(clippy::too_many_arguments)]
     fn reconnect_and_retry<T, F>(
         &self,
         slot: &Arc<ServerSlot>,
         cancel: Option<&CancelContext>,
         uncertain_failure: Option<&TransportError>,
         generation: u64,
+        successes: u64,
         access: SlotAccess,
         f: &mut F,
     ) -> Option<Result<T, String>>
@@ -2522,10 +2555,21 @@ impl Router {
                     ));
                 }
                 // Swap the live child/connection for the fresh one.
-                *slot
+                let mut server = slot
                     .inner
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if server.connection_closed() == Some(false) && !slot.quiescent_since(successes) {
+                    drop(server);
+                    drop(fresh);
+                    eprintln!(
+                        "toolport: server '{}' answered during its re-spawn; keeping it",
+                        slot.id
+                    );
+                    return None;
+                }
+                *server = fresh;
+                drop(server);
                 slot.generation.fetch_add(1, Ordering::AcqRel);
                 slot.tool_revision.fetch_add(1, Ordering::AcqRel);
             }
@@ -3725,22 +3769,27 @@ mod tests {
 
     /// A multiplexing transport: a `slow` call blocks until `gate` opens, any
     /// other call answers at once. With `slow_fails`, the slow call then times
-    /// out instead of answering.
+    /// out instead of answering. A `late` call blocks until `late` opens, then
+    /// answers.
     struct GatedTransport {
         gate: Arc<(Mutex<bool>, Condvar)>,
         slow_fails: bool,
+        late: Gate,
     }
 
     struct GatedCall {
         gate: Arc<(Mutex<bool>, Condvar)>,
         slow_fails: bool,
+        late: Gate,
     }
 
     impl Transport for GatedTransport {
         fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
             match method {
                 "initialize" => Ok(json!({ "protocolVersion": "2025-06-18", "capabilities": {} })),
-                "tools/list" => Ok(json!({ "tools": [{ "name": "slow" }, { "name": "fast" }] })),
+                "tools/list" => Ok(json!({
+                    "tools": [{ "name": "slow" }, { "name": "fast" }, { "name": "late" }]
+                })),
                 _ => Ok(json!({})),
             }
         }
@@ -3751,6 +3800,7 @@ mod tests {
             Some(Arc::new(GatedCall {
                 gate: Arc::clone(&self.gate),
                 slow_fails: self.slow_fails,
+                late: Arc::clone(&self.late),
             }))
         }
     }
@@ -3763,6 +3813,9 @@ mod tests {
             _cancel: Option<CancelContext>,
             _headers: &[(String, String)],
         ) -> Result<Value, TransportError> {
+            if params["name"] == "late" {
+                wait_for_gate(&self.late);
+            }
             if params["name"] == "slow" {
                 let (open, opened) = &*self.gate;
                 let mut open = open.lock().unwrap();
@@ -3781,10 +3834,31 @@ mod tests {
 
     type Gate = Arc<(Mutex<bool>, Condvar)>;
 
+    fn wait_for_gate(gate: &(Mutex<bool>, Condvar)) {
+        let (open, opened) = gate;
+        let mut open = open.lock().unwrap();
+        while !*open {
+            open = opened.wait(open).unwrap();
+        }
+    }
+
+    fn closed_gate() -> Gate {
+        Arc::new((Mutex::new(false), Condvar::new()))
+    }
+
     /// A router over one [`GatedTransport`] whose re-spawns are counted, and the
     /// gate that releases its slow calls.
     fn gated_router(slow_fails: bool) -> (Arc<Router>, Gate, Arc<std::sync::atomic::AtomicUsize>) {
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (router, gate, _late, spawns) = gated_router_with_late(slow_fails);
+        (router, gate, spawns)
+    }
+
+    /// [`gated_router`], plus the gate that releases its `late` calls.
+    fn gated_router_with_late(
+        slow_fails: bool,
+    ) -> (Arc<Router>, Gate, Gate, Arc<std::sync::atomic::AtomicUsize>) {
+        let gate = closed_gate();
+        let late = closed_gate();
         let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = Arc::clone(&spawns);
         let mut router = Router::new();
@@ -3794,6 +3868,7 @@ mod tests {
                 Box::new(GatedTransport {
                     gate: Arc::clone(&gate),
                     slow_fails,
+                    late: Arc::clone(&late),
                 }),
             )
             .unwrap(),
@@ -3802,7 +3877,7 @@ mod tests {
                 Some(mock_server("s"))
             })),
         );
-        (Arc::new(router), gate, spawns)
+        (Arc::new(router), gate, late, spawns)
     }
 
     fn wait_for_in_flight(slot: &ServerSlot, count: usize) {
@@ -3838,6 +3913,87 @@ mod tests {
             0,
             "one call's timeout must not re-spawn a connection other calls use"
         );
+    }
+
+    #[test]
+    fn a_probe_timeout_leaves_a_sibling_call_that_is_still_running() {
+        let (router, gate, late, spawns) = gated_router_with_late(true);
+        let slot = router.slot_for("s").unwrap();
+        slot.breaker.lock().unwrap().consecutive_failures = BREAKER_FAILURE_THRESHOLD;
+        let sibling = {
+            let router = Arc::clone(&router);
+            std::thread::spawn(move || router.route_call("s__late", json!({})))
+        };
+        wait_for_in_flight(&slot, 1);
+        let probe = {
+            let router = Arc::clone(&router);
+            std::thread::spawn(move || router.route_call("s__slow", json!({})))
+        };
+        wait_for_in_flight(&slot, 2);
+
+        // The probe times out while its sibling is still within its deadline:
+        // neither succeeded yet, but the connection is still working on one.
+        open_gate(&gate);
+        assert!(probe.join().unwrap().is_err());
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            0,
+            "a probe timeout must not replace a connection another call is running on"
+        );
+        open_gate(&late);
+        assert!(
+            sibling.join().unwrap().is_ok(),
+            "the sibling call was killed"
+        );
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        assert_eq!(slot.generation.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_server_that_answers_during_its_respawn_is_kept() {
+        let gate = closed_gate();
+        open_gate(&gate);
+        let (spawning_tx, spawning_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel::<()>();
+        let (spawning_tx, proceed_rx) = (Mutex::new(spawning_tx), Mutex::new(proceed_rx));
+        let mut router = Router::new();
+        router.add_with_reconnect(
+            DownstreamServer::connect(
+                "s".into(),
+                Box::new(GatedTransport {
+                    gate,
+                    slow_fails: true,
+                    late: closed_gate(),
+                }),
+            )
+            .unwrap(),
+            Some(Box::new(move || {
+                spawning_tx.lock().unwrap().send(()).unwrap();
+                proceed_rx.lock().unwrap().recv().unwrap();
+                Some(mock_server("s"))
+            })),
+        );
+        let router = Arc::new(router);
+        let slot = router.slot_for("s").unwrap();
+        slot.breaker.lock().unwrap().consecutive_failures = BREAKER_FAILURE_THRESHOLD;
+        // The probe fails with nothing else in flight, so it starts a re-spawn.
+        let probe = {
+            let router = Arc::clone(&router);
+            std::thread::spawn(move || router.route_call("s__slow", json!({})))
+        };
+        spawning_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the probe never started a re-spawn");
+        // The old connection answers while the fresh one starts.
+        assert!(router.route_call("s__fast", json!({})).is_ok());
+        proceed_tx.send(()).unwrap();
+        assert!(probe.join().unwrap().is_err());
+        assert_eq!(
+            slot.generation.load(Ordering::SeqCst),
+            0,
+            "a connection that answered during the re-spawn must not be replaced"
+        );
+        assert!(router.route_call("s__fast", json!({})).is_ok());
     }
 
     #[test]
@@ -3882,6 +4038,7 @@ mod tests {
                 Box::new(GatedTransport {
                     gate: Arc::clone(&gate),
                     slow_fails: false,
+                    late: closed_gate(),
                 }),
             )
             .unwrap(),
@@ -3939,9 +4096,10 @@ mod tests {
         let router = Router::new();
         // Factory hands back a healthy connection, mirroring a re-spawn that succeeds.
         let slot = dead_slot(Some(Box::new(|| Some(mock_server("s")))));
-        let out = router.reconnect_and_retry(&slot, None, None, 0, SlotAccess::Shared, &mut |ds| {
-            ds.call_with_cancel_and_mrtr("echo", json!({}), None, None, None)
-        });
+        let out =
+            router.reconnect_and_retry(&slot, None, None, 0, 0, SlotAccess::Shared, &mut |ds| {
+                ds.call_with_cancel_and_mrtr("echo", json!({}), None, None, None)
+            });
         // The probe re-spawned the server and the retried call went through.
         let value = out.expect("reconnect attempted").expect("call recovered");
         assert!(serde_json::to_string(&value).unwrap().contains("s:echo"));
@@ -3963,7 +4121,7 @@ mod tests {
         // caller must fall through to record the failure.
         let slot = dead_slot(Some(Box::new(|| None)));
         let out: Option<Result<Value, String>> =
-            router.reconnect_and_retry(&slot, None, None, 0, SlotAccess::Shared, &mut |ds| {
+            router.reconnect_and_retry(&slot, None, None, 0, 0, SlotAccess::Shared, &mut |ds| {
                 ds.call_with_cancel_and_mrtr("echo", json!({}), None, None, None)
             });
         assert!(
@@ -3991,6 +4149,7 @@ mod tests {
                 &slot,
                 Some(&cancel),
                 None,
+                0,
                 0,
                 SlotAccess::Shared,
                 &mut move |ds| {
@@ -4025,6 +4184,7 @@ mod tests {
                 Some(&cancel),
                 None,
                 0,
+                0,
                 SlotAccess::Shared,
                 &mut move |_server| {
                     assert!(cancel_from_retry.cancel("retry-cancel", Some("user pressed stop")));
@@ -4053,7 +4213,7 @@ mod tests {
         // reconnect is skipped and the breaker path handles the failure.
         let slot = dead_slot(None);
         let out: Option<Result<Value, String>> =
-            router.reconnect_and_retry(&slot, None, None, 0, SlotAccess::Shared, &mut |ds| {
+            router.reconnect_and_retry(&slot, None, None, 0, 0, SlotAccess::Shared, &mut |ds| {
                 ds.call_with_cancel_and_mrtr("echo", json!({}), None, None, None)
             });
         assert!(out.is_none());
