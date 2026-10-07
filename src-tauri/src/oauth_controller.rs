@@ -115,8 +115,12 @@ pub(crate) fn read_oauth_lock_snapshot(
     let modified = metadata
         .modified()
         .map_err(|error| format!("could not read oauth lock timestamp: {error}"))?;
-    let content = std::fs::read_to_string(path)
-        .map_err(|error| format!("could not read oauth lock file: {error}"))?;
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        // The owner finished and removed the lock between the stat and the read.
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not read oauth lock file: {error}")),
+    };
     let attempt_id = parse_lock_attempt_id(&content);
     Ok(Some(OAuthLockSnapshot {
         modified,

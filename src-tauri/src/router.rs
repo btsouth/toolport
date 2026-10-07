@@ -607,6 +607,307 @@ impl Breaker {
     }
 }
 
+/// Why connecting a server failed, as the background retry needs it.
+#[derive(Debug, Clone)]
+pub struct ConnectFailure {
+    pub message: String,
+    /// The server refused our credentials (or has none). Retrying cannot help until
+    /// they change, and a change rewrites the registry, which rebuilds the router.
+    pub needs_auth: bool,
+}
+
+/// Connect (or re-connect) one server from scratch. Supplied by the gateway, like
+/// [`Reconnect`], but keeps the failure so it can be retried and reported.
+pub type Connect = Arc<dyn Fn() -> Result<DownstreamServer, ConnectFailure> + Send + Sync>;
+
+/// Capped exponential backoff for retrying a server that never connected.
+#[derive(Debug, Clone, Copy)]
+pub struct ReconnectBackoff {
+    pub base: Duration,
+    pub cap: Duration,
+}
+
+impl Default for ReconnectBackoff {
+    fn default() -> Self {
+        ReconnectBackoff {
+            base: Duration::from_secs(2),
+            cap: Duration::from_secs(300),
+        }
+    }
+}
+
+impl ReconnectBackoff {
+    /// Delay after `failures` consecutive failures (1-based), before jitter.
+    fn delay(&self, failures: u32) -> Duration {
+        let mult = 1u32 << failures.saturating_sub(1).min(16);
+        self.base.saturating_mul(mult).min(self.cap)
+    }
+}
+
+/// A demand-driven retry (a call or search naming the server) may come sooner than
+/// the schedule, but never more often than once per backoff step, and at most this
+/// long apart.
+const KICK_MAX_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Spread retries by +/-20% so many gateways that failed together (the usual case:
+/// no network at login) do not all retry in lockstep.
+fn reconnect_jitter() -> f64 {
+    let mut byte = [0u8; 1];
+    let unit = match getrandom::getrandom(&mut byte) {
+        Ok(()) => f64::from(byte[0]) / 255.0,
+        Err(_) => 0.5,
+    };
+    0.8 + 0.4 * unit
+}
+
+/// Retry bookkeeping for one pending server. `now` and the jitter are passed in so
+/// the transitions are unit-testable without sleeping.
+struct PendingState {
+    failures: u32,
+    last_error: String,
+    needs_auth: bool,
+    last_attempt: Instant,
+    next_attempt: Instant,
+    in_flight: bool,
+    /// A retry that connected, waiting for the gateway to adopt it into the catalog.
+    ready: Option<DownstreamServer>,
+}
+
+impl PendingState {
+    fn new(failure: ConnectFailure, backoff: &ReconnectBackoff, now: Instant, jitter: f64) -> Self {
+        let mut state = PendingState {
+            failures: 0,
+            last_error: String::new(),
+            needs_auth: false,
+            last_attempt: now,
+            next_attempt: now,
+            in_flight: false,
+            ready: None,
+        };
+        state.record_failure(failure, backoff, now, jitter);
+        state
+    }
+
+    fn idle(&self) -> bool {
+        !self.needs_auth && !self.in_flight && self.ready.is_none()
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.idle() && now >= self.next_attempt
+    }
+
+    fn kickable(&self, backoff: &ReconnectBackoff, now: Instant) -> bool {
+        let floor = backoff.delay(self.failures).min(KICK_MAX_INTERVAL);
+        self.idle() && now.duration_since(self.last_attempt) >= floor
+    }
+
+    fn begin(&mut self, now: Instant) {
+        self.in_flight = true;
+        self.last_attempt = now;
+    }
+
+    fn record_failure(
+        &mut self,
+        failure: ConnectFailure,
+        backoff: &ReconnectBackoff,
+        now: Instant,
+        jitter: f64,
+    ) {
+        self.in_flight = false;
+        self.failures = self.failures.saturating_add(1);
+        self.last_error = failure.message;
+        self.needs_auth = failure.needs_auth;
+        // Cap after jitter, so the slowest retry is the cap itself.
+        let delay = backoff
+            .delay(self.failures)
+            .mul_f64(jitter)
+            .min(backoff.cap);
+        self.next_attempt = now + delay;
+    }
+}
+
+/// A server that should be in the catalog but has never connected (it failed at
+/// build time). Kept so it can be retried in the background and reported, instead
+/// of disappearing until the next full rebuild (REL-03).
+struct PendingServer {
+    id: String,
+    connect: Connect,
+    backoff: ReconnectBackoff,
+    state: Mutex<PendingState>,
+    /// Set when the router that owned this entry was replaced or the server was
+    /// adopted. Stops further attempts and discards an in-flight result.
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl PendingServer {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PendingState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn status(&self, now: Instant) -> PendingStatus {
+        let state = self.lock();
+        PendingStatus {
+            id: self.id.clone(),
+            needs_auth: state.needs_auth,
+            connecting: state.in_flight || state.ready.is_some(),
+            failures: state.failures,
+            last_error: state.last_error.clone(),
+            retry_in: (!state.needs_auth)
+                .then(|| state.next_attempt.saturating_duration_since(now)),
+        }
+    }
+
+    /// Start one connect attempt on its own thread if `ready_to_start` allows it.
+    /// The attempt never holds a router lock, so a slow server blocks nothing else.
+    fn try_start(self: &Arc<Self>, ready_to_start: impl FnOnce(&PendingState) -> bool) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
+        {
+            let mut state = self.lock();
+            if !ready_to_start(&state) {
+                return false;
+            }
+            state.begin(Instant::now());
+        }
+        let pending = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name(format!("reconnect-{}", self.id))
+            .spawn(move || {
+                let result = (pending.connect)();
+                pending.finish(result);
+            });
+        if spawned.is_err() {
+            self.lock().in_flight = false;
+            return false;
+        }
+        true
+    }
+
+    fn finish(&self, result: Result<DownstreamServer, ConnectFailure>) {
+        let mut state = self.lock();
+        if self.is_cancelled() {
+            state.in_flight = false;
+            drop(state);
+            // Dropping the connection closes it (and kills a stdio child).
+            drop(result);
+            return;
+        }
+        match result {
+            Ok(server) => {
+                state.in_flight = false;
+                state.ready = Some(server);
+            }
+            Err(failure) => {
+                let backoff = self.backoff;
+                state.record_failure(failure, &backoff, Instant::now(), reconnect_jitter());
+            }
+        }
+    }
+}
+
+/// What a pending server is doing, for status text and error messages.
+#[derive(Debug, Clone)]
+pub struct PendingStatus {
+    pub id: String,
+    pub needs_auth: bool,
+    /// An attempt is running, or one just connected and is joining the catalog.
+    pub connecting: bool,
+    pub failures: u32,
+    pub last_error: String,
+    pub retry_in: Option<Duration>,
+}
+
+impl PendingStatus {
+    /// One line describing the server's state, without its id.
+    pub fn describe(&self) -> String {
+        let error = client_safe_error(&self.last_error);
+        if self.needs_auth {
+            format!("needs sign-in in Toolport (last error: {error})")
+        } else if self.connecting {
+            format!("connecting (last error: {error})")
+        } else {
+            let secs = self.retry_in.map_or(0, |d| d.as_secs() + 1);
+            format!(
+                "retrying in {secs}s after {} failed attempt(s) (last error: {error})",
+                self.failures
+            )
+        }
+    }
+}
+
+/// What an MCP client may see about a connect failure. The raw error can carry a
+/// child's stderr or a server's response body, either of which may echo a secret
+/// the gateway injected, so only a fixed category (with an exit or HTTP status)
+/// reaches the model. The full text is already in the gateway log.
+fn client_safe_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    let code_after = |marker: &str| -> Option<String> {
+        let at = lower.find(marker)? + marker.len();
+        let code: String = lower[at..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        (!code.is_empty()).then_some(code)
+    };
+    let summary = if let Some(code) = code_after("http ") {
+        format!("the server answered HTTP {code}")
+    } else if lower.contains("exited") {
+        match code_after("status ") {
+            Some(code) => format!("the server process exited (status {code})"),
+            None => "the server process exited".to_string(),
+        }
+    } else if lower.contains("failed to spawn") {
+        "the server command could not be started".to_string()
+    } else if lower.contains("broken pipe")
+        || lower.contains("eof")
+        || lower.contains("closed")
+    {
+        "the server closed the connection".to_string()
+    } else if lower.contains("vault") || lower.contains("keychain") || lower.contains("keyring") {
+        "its stored credentials could not be read".to_string()
+    } else if lower.contains("name resolution")
+        || lower.contains("dns")
+        || lower.contains("resolve")
+    {
+        "the server's address could not be resolved".to_string()
+    } else if lower.contains("connection refused") {
+        "the connection was refused".to_string()
+    } else if lower.contains("certificate") || lower.contains("tls") {
+        "the TLS connection failed".to_string()
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "the server did not answer in time".to_string()
+    } else {
+        "the connection failed".to_string()
+    };
+    format!("{summary}; details are in the Toolport log")
+}
+
+/// Opaque handle on one pending server, so the gateway can cancel retries a
+/// replaced router still owns without keeping that router alive.
+#[derive(Clone)]
+pub struct PendingHandle(Arc<PendingServer>);
+
+impl PendingHandle {
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Stop retrying. An attempt already running finishes and is discarded.
+    pub fn cancel(&self) {
+        self.0.cancelled.store(true, Ordering::SeqCst);
+        // Drop a result that connected but was never adopted, outside the lock.
+        let ready = self.0.lock().ready.take();
+        drop(ready);
+    }
+}
+
 /// Cloneable so the dispatcher can hold the live router as a `Mutex<Arc<Router>>`,
 /// clone the `Arc` for a request, and release the lock BEFORE the (possibly
 /// long-blocking) downstream call or human-approval hold. Cloning shares the
@@ -655,6 +956,12 @@ pub struct Router {
     /// so a live router whose connects all failed is still a real prior decision
     /// and not a cold start (SBS-871).
     built: bool,
+    /// Servers that failed to connect at build time, retried in the background
+    /// and adopted into the catalog once they connect (REL-03).
+    pending: Vec<Arc<PendingServer>>,
+    /// Server ids in the order the build added or deferred them, so a server that
+    /// joins late takes the same place (and collision suffixes) a cold build would.
+    server_order: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -729,10 +1036,23 @@ impl Router {
                     .get(*candidate)
                     .is_some_and(|(server, _)| visible(server))
             });
-        match client_prefixed {
-            Some(real) => format!(
+        if let Some(real) = client_prefixed {
+            return format!(
                 "no route for tool '{exposed_name}'; that looks like a client-side alias - \
                  inside Toolport the tool is named '{real}', call that instead"
+            );
+        }
+        match self.kick_pending(exposed_name, &visible) {
+            Some(status) if status.needs_auth => format!(
+                "no route for tool '{exposed_name}': server '{}' {}. Sign in, then try again.",
+                status.id,
+                status.describe()
+            ),
+            Some(status) => format!(
+                "no route for tool '{exposed_name}': server '{}' has not connected yet and is \
+                 {}. Try again shortly.",
+                status.id,
+                status.describe()
             ),
             None => format!("no route for tool '{exposed_name}'"),
         }
@@ -928,6 +1248,9 @@ impl Router {
             route_mcp_apps,
         );
         let idx = self.servers.len();
+        if !self.server_order.contains(&id) {
+            self.server_order.push(id.clone());
+        }
         self.servers.push(Arc::new(ServerSlot {
             id: id.clone(),
             inner: Mutex::new(server),
@@ -936,6 +1259,147 @@ impl Router {
             reconnect,
         }));
         self.by_id.insert(id, idx);
+    }
+
+    /// Record a server whose first connect failed. It is retried in the background
+    /// with capped exponential backoff (auth failures wait for new credentials, which
+    /// arrive as a registry rebuild), and [`Router::adopt_ready_reconnects`] moves it
+    /// into the catalog once a retry connects.
+    pub fn add_pending(
+        &mut self,
+        id: String,
+        failure: ConnectFailure,
+        connect: Connect,
+        backoff: ReconnectBackoff,
+    ) {
+        if self.by_id.contains_key(&id) || self.pending.iter().any(|p| p.id == id) {
+            return;
+        }
+        if !self.server_order.contains(&id) {
+            self.server_order.push(id.clone());
+        }
+        let state = PendingState::new(failure, &backoff, Instant::now(), reconnect_jitter());
+        self.pending.push(Arc::new(PendingServer {
+            id,
+            connect,
+            backoff,
+            state: Mutex::new(state),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        }));
+    }
+
+    /// Whether any server is still waiting to connect in the background.
+    pub fn has_pending(&self) -> bool {
+        self.pending.iter().any(|p| !p.is_cancelled())
+    }
+
+    /// Every server still waiting to connect, with its retry state.
+    pub fn pending_statuses(&self) -> Vec<PendingStatus> {
+        let now = Instant::now();
+        self.pending.iter().map(|p| p.status(now)).collect()
+    }
+
+    pub fn pending_handles(&self) -> Vec<PendingHandle> {
+        self.pending
+            .iter()
+            .map(|p| PendingHandle(Arc::clone(p)))
+            .collect()
+    }
+
+    /// Start a background attempt for every pending server whose backoff elapsed.
+    /// Returns how many started.
+    pub fn start_due_reconnects(&self) -> usize {
+        let now = Instant::now();
+        self.pending
+            .iter()
+            .filter(|p| p.try_start(|state| state.due(now)))
+            .count()
+    }
+
+    /// Whether a retry connected and is waiting for [`Router::adopt_ready_reconnects`].
+    pub fn has_ready_reconnects(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|p| !p.is_cancelled() && p.lock().ready.is_some())
+    }
+
+    /// Move every pending server whose retry connected into a live slot, in the
+    /// position a cold build would have given it. Returns the adopted ids.
+    pub fn adopt_ready_reconnects(&mut self) -> Vec<String> {
+        let mut adopted = Vec::new();
+        let mut still_pending = Vec::new();
+        for pending in std::mem::take(&mut self.pending) {
+            let ready = if pending.is_cancelled() {
+                None
+            } else {
+                pending.lock().ready.take()
+            };
+            let Some(server) = ready else {
+                still_pending.push(pending);
+                continue;
+            };
+            // Older router snapshots share this entry; stop them from retrying it.
+            pending.cancelled.store(true, Ordering::SeqCst);
+            let connect = Arc::clone(&pending.connect);
+            let reconnect: Reconnect = Box::new(move || connect().ok());
+            self.restored_candidates
+                .retain(|candidate| candidate.server != pending.id);
+            self.servers.push(Arc::new(ServerSlot {
+                id: pending.id.clone(),
+                inner: Mutex::new(server),
+                tool_revision: AtomicU64::new(0),
+                breaker: Mutex::new(Breaker::default()),
+                reconnect: Some(reconnect),
+            }));
+            adopted.push(pending.id.clone());
+        }
+        self.pending = still_pending;
+        if adopted.is_empty() {
+            return adopted;
+        }
+        let position = |id: &str| {
+            self.server_order
+                .iter()
+                .position(|known| known == id)
+                .unwrap_or(usize::MAX)
+        };
+        let mut servers = std::mem::take(&mut self.servers);
+        servers.sort_by_key(|slot| position(&slot.id));
+        self.by_id = servers
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| (slot.id.clone(), index))
+            .collect();
+        self.servers = servers;
+        self.rebuild_preserving_restored();
+        adopted
+    }
+
+    /// The pending server a call or search names, if `visible` admits it: a server
+    /// id or prefix, or an exposed tool name under that prefix. Starts an attempt
+    /// now when the backoff allows one, so a user waiting on the server does not
+    /// wait out a long schedule.
+    pub fn kick_pending(
+        &self,
+        name: &str,
+        visible: impl Fn(&str) -> bool,
+    ) -> Option<PendingStatus> {
+        let wanted = name.trim().to_lowercase();
+        if wanted.is_empty() {
+            return None;
+        }
+        let pending = self.pending.iter().find(|p| {
+            let prefix = sanitize_segment(&p.id).to_lowercase();
+            !p.is_cancelled()
+                && visible(&p.id)
+                && (p.id.to_lowercase() == wanted
+                    || prefix == wanted
+                    || wanted.starts_with(&format!("{prefix}__")))
+        })?;
+        let now = Instant::now();
+        let backoff = pending.backoff;
+        pending.try_start(|state| state.kickable(&backoff, now));
+        Some(pending.status(Instant::now()))
     }
 
     /// Build a view with one root-specific launch added or replaced. All other
@@ -1643,7 +2107,7 @@ impl Router {
                     message,
                 }) if attempt < HTTP_MAX_RETRIES => {
                     let wait = retry_wait(retry_after, attempt);
-                    eprintln!("conduit: retrying downstream call after {wait:?}: {message}");
+                    eprintln!("toolport: retrying downstream call after {wait:?}: {message}");
                     wait_for_retry_or_cancel(wait, cancel).map_err(|error| error.to_string())?;
                     attempt += 1;
                 }
@@ -1704,10 +2168,10 @@ impl Router {
         F: FnMut(&mut DownstreamServer) -> Result<T, TransportError>,
     {
         let factory = slot.reconnect.as_ref()?;
-        eprintln!("conduit: server '{}' is down; re-spawning it", slot.id);
+        eprintln!("toolport: server '{}' is down; re-spawning it", slot.id);
         let Some(fresh) = factory() else {
             eprintln!(
-                "conduit: re-spawn of '{}' failed; leaving it fast-failed",
+                "toolport: re-spawn of '{}' failed; leaving it fast-failed",
                 slot.id
             );
             return None; // still unreachable: fall through to record_failure
@@ -1741,7 +2205,7 @@ impl Router {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Some(match retry {
             Ok(v) => {
-                eprintln!("conduit: server '{}' recovered after re-spawn", slot.id);
+                eprintln!("toolport: server '{}' recovered after re-spawn", slot.id);
                 breaker.record_success();
                 Ok(v)
             }
@@ -4929,5 +5393,239 @@ mod tests {
             "cancellation must leave the breaker closed"
         );
         cancellations.finish_client_request("cancel-retry-1");
+    }
+
+    fn failure(message: &str, needs_auth: bool) -> ConnectFailure {
+        ConnectFailure {
+            message: message.to_string(),
+            needs_auth,
+        }
+    }
+
+    /// A connect factory that fails `fail` times, then connects `mock_server(id)`.
+    fn flaky_connect(id: &'static str, fail: usize, calls: Arc<AtomicU64>) -> Connect {
+        Arc::new(move || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) as usize;
+            if n < fail {
+                Err(failure("Temporary failure in name resolution", false))
+            } else {
+                Ok(mock_server(id))
+            }
+        })
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        done()
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_from_base_and_caps() {
+        let backoff = ReconnectBackoff::default();
+        let secs: Vec<u64> = (1..=10).map(|n| backoff.delay(n).as_secs()).collect();
+        assert_eq!(secs, vec![2, 4, 8, 16, 32, 64, 128, 256, 300, 300]);
+        assert_eq!(backoff.delay(u32::MAX), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn pending_state_waits_out_its_backoff_with_jitter() {
+        let backoff = ReconnectBackoff::default();
+        let t0 = Instant::now();
+        let mut state = PendingState::new(failure("dns", false), &backoff, t0, 1.2);
+        assert!(!state.due(t0 + Duration::from_millis(2399)));
+        assert!(state.due(t0 + Duration::from_millis(2400)));
+        state.begin(t0 + Duration::from_secs(3));
+        assert!(
+            !state.due(t0 + Duration::from_secs(60)),
+            "one attempt at a time"
+        );
+        state.record_failure(
+            failure("dns", false),
+            &backoff,
+            t0 + Duration::from_secs(4),
+            0.8,
+        );
+        assert_eq!(state.failures, 2);
+        assert!(!state.due(t0 + Duration::from_millis(7199)));
+        assert!(state.due(t0 + Duration::from_millis(7200)));
+    }
+
+    #[test]
+    fn a_kick_is_rate_limited_by_the_backoff_step() {
+        let backoff = ReconnectBackoff::default();
+        let t0 = Instant::now();
+        let mut state = PendingState::new(failure("dns", false), &backoff, t0, 1.0);
+        for _ in 0..7 {
+            state.record_failure(failure("dns", false), &backoff, t0, 1.0);
+        }
+        // 8 failures: the schedule waits 256 s, a demand-driven retry only 30 s.
+        assert!(!state.kickable(&backoff, t0 + Duration::from_secs(29)));
+        assert!(state.kickable(&backoff, t0 + Duration::from_secs(30)));
+        assert!(!state.due(t0 + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn an_auth_failure_is_never_retried_on_a_schedule_or_by_demand() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&calls);
+        let connect: Connect = Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Err(failure("HTTP 401 Unauthorized", true))
+        });
+        let mut router = Router::new();
+        router.add_pending(
+            "atlassian".into(),
+            failure("HTTP 401 Unauthorized", true),
+            connect,
+            ReconnectBackoff {
+                base: Duration::ZERO,
+                cap: Duration::ZERO,
+            },
+        );
+        for _ in 0..20 {
+            assert_eq!(router.start_due_reconnects(), 0);
+            let _ = router.route_call("atlassian__search", json!({}));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let err = router
+            .route_call("atlassian__search", json!({}))
+            .unwrap_err();
+        assert!(err.contains("needs sign-in"), "{err}");
+        let status = &router.pending_statuses()[0];
+        assert!(status.needs_auth && status.retry_in.is_none());
+    }
+
+    #[test]
+    fn a_pending_server_joins_the_catalog_in_build_order_after_retries() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut router = Router::new();
+        router.add(mock_server("alpha"));
+        router.add_pending(
+            "beta".into(),
+            failure("Temporary failure in name resolution", false),
+            flaky_connect("beta", 1, Arc::clone(&calls)),
+            ReconnectBackoff {
+                base: Duration::ZERO,
+                cap: Duration::ZERO,
+            },
+        );
+        router.add(mock_server("gamma"));
+        let err = router.route_call("beta__echo", json!({})).unwrap_err();
+        assert!(err.contains("has not connected yet"), "{err}");
+        assert!(err.contains("address could not be resolved"), "{err}");
+
+        // First retry fails (call #1), the second connects (call #2).
+        assert!(wait_until(|| {
+            router.start_due_reconnects();
+            router.has_ready_reconnects()
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let snapshot = router.clone();
+        assert_eq!(router.adopt_ready_reconnects(), vec!["beta".to_string()]);
+        assert!(router.pending_statuses().is_empty());
+        let order: Vec<&str> = router.servers.iter().map(|slot| slot.id.as_str()).collect();
+        assert_eq!(order, ["alpha", "beta", "gamma"]);
+        let result = router.route_call("beta__echo", json!({})).unwrap();
+        assert_eq!(result["content"][0]["text"], "beta:echo");
+
+        // An older snapshot still holding the entry never starts another attempt.
+        assert_eq!(snapshot.start_due_reconnects(), 0);
+        let _ = snapshot.route_call("beta__echo", json!({}));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_cancelled_pending_server_stops_retrying_and_drops_its_result() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut router = Router::new();
+        router.add_pending(
+            "beta".into(),
+            failure("dns", false),
+            flaky_connect("beta", 0, Arc::clone(&calls)),
+            ReconnectBackoff {
+                base: Duration::ZERO,
+                cap: Duration::ZERO,
+            },
+        );
+        assert!(wait_until(|| {
+            router.start_due_reconnects();
+            router.has_ready_reconnects()
+        }));
+        for handle in router.pending_handles() {
+            handle.cancel();
+        }
+        assert!(!router.has_ready_reconnects());
+        assert_eq!(router.start_due_reconnects(), 0);
+        assert!(router.adopt_ready_reconnects().is_empty());
+        assert!(router.kick_pending("beta__echo", |_| true).is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_kick_respects_the_callers_scope() {
+        let mut router = Router::new();
+        router.add_pending(
+            "secret-team".into(),
+            failure("dns", false),
+            Arc::new(|| Err(failure("dns", false))),
+            ReconnectBackoff::default(),
+        );
+        assert!(router
+            .kick_pending("secret_team__x", |server| server != "secret-team")
+            .is_none());
+        let err = router.no_route_message_within("secret_team__x", |_| false);
+        assert_eq!(err, "no route for tool 'secret_team__x'");
+        assert!(router.kick_pending("secret_team__x", |_| true).is_some());
+        assert!(router.kick_pending("secret-team", |_| true).is_some());
+    }
+    #[test]
+    fn client_safe_error_never_repeats_downstream_text() {
+        for (raw, expected) in [
+            (
+                "downstream server exited (status 3): invalid token ghp_secret123",
+                "the server process exited (status 3)",
+            ),
+            (
+                "HTTP 401 (needs authentication): token refresh failed: body sk-live-1",
+                "the server answered HTTP 401",
+            ),
+            (
+                "Temporary failure in name resolution",
+                "the server's address could not be resolved",
+            ),
+            (
+                "could not read secret 'API_KEY' from the vault: locked",
+                "its stored credentials could not be read",
+            ),
+            ("failed to spawn 'npx': No such file", "the server command could not be started"),
+            ("timed out waiting for 'initialize' response", "the server did not answer in time"),
+            ("write failed: Broken pipe (os error 32)", "the server closed the connection"),
+            ("mock said: hunter2", "the connection failed"),
+        ] {
+            let shown = client_safe_error(raw);
+            assert!(shown.starts_with(expected), "{raw} -> {shown}");
+            for secret in ["ghp_secret123", "sk-live-1", "API_KEY", "hunter2", "npx"] {
+                assert!(!shown.contains(secret), "{raw} -> {shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn jitter_never_pushes_a_retry_past_the_cap() {
+        let backoff = ReconnectBackoff::default();
+        let t0 = Instant::now();
+        let mut state = PendingState::new(failure("dns", false), &backoff, t0, 1.2);
+        for _ in 0..12 {
+            state.record_failure(failure("dns", false), &backoff, t0, 1.2);
+        }
+        assert_eq!(state.next_attempt, t0 + backoff.cap);
     }
 }

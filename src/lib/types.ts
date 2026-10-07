@@ -57,6 +57,8 @@ export interface DetectedClient {
 export interface WriteOutcome {
   path: string;
   backup: string | null;
+  /** Servers Disconnect put back after an earlier "Move into gateway". */
+  restored?: string[];
 }
 
 export interface MigrateResult {

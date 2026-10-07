@@ -753,7 +753,20 @@ impl ServerEntry {
             None => false,
         }
     }
+
+    /// The one consent gate every enable path shares. A team server awaiting member review
+    /// can only be turned on by the human Teams review, which passes `reviewed`. Agent
+    /// control, Enable all and plain toggles never can.
+    pub fn check_enable_allowed(&self, reviewed: bool) -> Result<(), String> {
+        if !reviewed && self.needs_team_enable_review() {
+            return Err(TEAM_REVIEW_REQUIRED.to_string());
+        }
+        Ok(())
+    }
 }
+
+/// Why an enable of an unreviewed team server was refused.
+pub const TEAM_REVIEW_REQUIRED: &str = "this team server needs consent for its command, address or authentication; enable it from Teams after review";
 
 /// Non-secret configuration for the OAuth client-credentials flow (SBS-524).
 ///
@@ -2128,7 +2141,7 @@ impl Registry {
         let ids: Vec<String> = if enabled {
             self.servers
                 .iter()
-                .filter(|s| !s.needs_team_enable_review())
+                .filter(|s| s.check_enable_allowed(false).is_ok())
                 .filter(|s| s.launch.is_none() || crate::launch_inputs::resolve_args(s).is_ok())
                 .map(|s| s.id.clone())
                 .collect()

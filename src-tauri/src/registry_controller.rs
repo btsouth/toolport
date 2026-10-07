@@ -488,7 +488,7 @@ pub fn import_client_servers(selected: Vec<String>) -> Result<(Registry, usize),
         let servers = selected_servers_to_import(&detected, registry, Some(&selected))?;
         let added = servers.len();
         for server in servers {
-            apply_add_entry(registry, server);
+            apply_import_entry(registry, server);
         }
         Ok(added)
     })
@@ -847,7 +847,9 @@ pub fn disconnect_client_stdio_with(
     }
     let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
     let outcome = clients::uninstall_gateway(client_id)?;
-    finish_client_config_mutation(outcome, write_registry)
+    let result = finish_client_config_mutation(outcome, write_registry)?;
+    clients::finish_uninstall(client_id, &result.outcome);
+    Ok(result)
 }
 
 fn read_registry_exact() -> Result<Registry, String> {
@@ -1203,6 +1205,40 @@ pub(crate) fn import_client_servers_for_migration(
     Ok((imported, moved))
 }
 
+/// Enable each moved server (matched by name, as the import above does) in the
+/// profile the migrated client will use: the named scope, else the active profile.
+fn enable_moved_servers(
+    registry: &mut Registry,
+    profile: Option<&str>,
+    moved: &[String],
+) -> Result<(), String> {
+    let profile_id = registry.resolve_profile_id(profile.unwrap_or(""));
+    for name in moved {
+        let Some(id) = registry
+            .servers
+            .iter()
+            .find(|server| server.name.eq_ignore_ascii_case(name))
+            .map(|server| server.id.clone())
+        else {
+            continue;
+        };
+        apply_server_enabled(registry, &profile_id, &id, true, false).map_err(|error| {
+            format!("Could not turn on {name} in Toolport, so the client's config was left unchanged: {error}")
+        })?;
+    }
+    Ok(())
+}
+
+/// Add an imported server and turn it on in the active profile, so an import
+/// serves tools right away (UX-01). A server that cannot be enabled yet (a team
+/// server awaiting review, an unresolved launch input) is still imported, off.
+pub(crate) fn apply_import_entry(registry: &mut Registry, entry: ServerEntry) -> String {
+    let id = registry.add_server(entry);
+    let profile_id = registry.active_profile_id();
+    let _ = apply_server_enabled(registry, &profile_id, &id, true, false);
+    id
+}
+
 /// Migrate a client to Toolport: import its directly-configured servers into the
 /// registry, then rewrite the client's config to contain only the Toolport
 /// gateway (optionally scoped to `profile`). The client is left managing nothing
@@ -1230,11 +1266,17 @@ pub fn migrate_client(
         .find(|client| client.id == client_id)
         .ok_or_else(|| format!("Unknown client '{client_id}'"))?;
 
-    // Import the client's servers under the lock (a fresh load-modify-save).
-    let (_, (imported, moved)) =
-        registry::update(|registry| import_client_servers_for_migration(registry, &client))?;
-
     let profile = profile.map(str::trim).filter(|profile| !profile.is_empty());
+
+    // Import the client's servers and turn them on where this client looks, under
+    // the lock (a fresh load-modify-save). Any enable failure aborts the save and
+    // returns before the client's config is touched, so a move never drops a
+    // server the client was using (UX-02).
+    let (_, (imported, moved)) = registry::update(|registry| {
+        let (imported, moved) = import_client_servers_for_migration(registry, &client)?;
+        enable_moved_servers(registry, profile, &moved)?;
+        Ok((imported, moved))
+    })?;
     let outcome = match shared_http_url {
         Some(url) => {
             let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
@@ -1430,6 +1472,7 @@ pub fn disconnect_client(client_id: &str) -> Result<ClientMutationResult, String
         registry.clear_client_managed_entry(client_id);
         Ok(())
     })?;
+    clients::finish_uninstall(client_id, &outcome);
     Ok(ClientMutationResult { registry, outcome })
 }
 
@@ -1896,19 +1939,8 @@ pub fn apply_server_enabled(
             if server.launch.is_some() {
                 crate::launch_inputs::resolve_args(server)?;
             }
+            server.check_enable_allowed(reviewed)?;
         }
-    }
-    if enabled
-        && !reviewed
-        && registry
-            .servers
-            .iter()
-            .any(|server| server.id == server_id && server.needs_team_enable_review())
-    {
-        return Err(
-            "this team server needs consent for its command, address or authentication; enable it from Teams after review"
-                .into(),
-        );
     }
     registry.set_server_enabled(profile_id, server_id, enabled)
 }
@@ -2679,6 +2711,8 @@ mod tests {
             path: target.display().to_string(),
             backup: Some(backup.display().to_string()),
             managed: None,
+            restored: Vec::new(),
+            used_move_record: false,
         };
 
         let error = finish_client_config_mutation(outcome, |_| Err("registry full".into()))
@@ -2704,6 +2738,8 @@ mod tests {
             path: target.display().to_string(),
             backup: None,
             managed: None,
+            restored: Vec::new(),
+            used_move_record: false,
         };
 
         let error = finish_client_config_mutation(outcome, |_| Err("registry full".into()))
@@ -2731,6 +2767,8 @@ mod tests {
             path: target.display().to_string(),
             backup: Some(backup.display().to_string()),
             managed: None,
+            restored: Vec::new(),
+            used_move_record: false,
         };
         let target_for_write = target.clone();
 
@@ -2824,5 +2862,275 @@ mod tests {
         drop(restore_key);
         drop(override_dir);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn import_turns_imported_servers_on_in_the_active_profile() {
+        let mut registry = Registry::default();
+        let id = apply_import_entry(&mut registry, server("memory"));
+        assert!(
+            registry.is_enabled("default", &id),
+            "UX-01: an import must serve tools"
+        );
+    }
+
+    /// A scratch home for Claude Code and Codex configs plus an overridden data dir
+    /// (registry, config backups, move records). Fields drop in order, so the env
+    /// vars and data dir are put back before the locks are released.
+    struct MoveFixture {
+        root: PathBuf,
+        _vars: Vec<clients::EnvRestore>,
+        _data_dir: registry::DataDirOverride,
+        _data_lock: std::sync::MutexGuard<'static, ()>,
+        _env_lock: std::sync::MutexGuard<'static, ()>,
+        _registry_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl MoveFixture {
+        fn new(registry: &Registry) -> Self {
+            let registry_lock = registry::REGISTRY_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let env_lock = clients::env_test_lock();
+            let data_lock = registry::data_dir_test_lock();
+            let root = std::env::temp_dir().join(format!(
+                "toolport-controller-move-{}-{}",
+                std::process::id(),
+                scratch_label()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            for dir in ["data", "claude", "codex"] {
+                std::fs::create_dir_all(root.join(dir)).unwrap();
+            }
+            let data_dir = registry::DataDirOverride::set(root.join("data"));
+            let vars = vec![
+                clients::EnvRestore::set("CLAUDE_CONFIG_DIR", &root.join("claude")),
+                clients::EnvRestore::set("CODEX_HOME", &root.join("codex")),
+            ];
+            registry::save(registry).unwrap();
+            Self {
+                root,
+                _vars: vars,
+                _data_dir: data_dir,
+                _data_lock: data_lock,
+                _env_lock: env_lock,
+                _registry_lock: registry_lock,
+            }
+        }
+
+        fn claude(&self) -> PathBuf {
+            self.root.join("claude").join(".claude.json")
+        }
+
+        fn codex(&self) -> PathBuf {
+            self.root.join("codex").join("config.toml")
+        }
+
+        fn move_record(&self, client_id: &str) -> PathBuf {
+            self.root
+                .join("data")
+                .join("backups")
+                .join(client_id)
+                .join("moved-servers.json")
+        }
+    }
+
+    impl Drop for MoveFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn enabled_names(registry: &Registry, profile: &str) -> Vec<String> {
+        let mut names = registry
+            .servers
+            .iter()
+            .filter(|server| registry.is_enabled(profile, &server.id))
+            .map(|server| server.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn json_file(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// UX-02 and UX-03 for Claude Code: a move turns the servers on (including one
+    /// Toolport already had, disabled), and Disconnect puts the original entries
+    /// back, secrets and unknown fields included, without touching app state.
+    #[test]
+    fn move_enables_servers_and_disconnect_restores_claude_code() {
+        let mut existing = server("seq-thinking");
+        existing.id = "seq-thinking".into();
+        let mut registry = Registry::default();
+        registry.servers.push(existing);
+        let fixture = MoveFixture::new(&registry);
+        let servers = serde_json::json!({
+            "memory": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-memory"]},
+            "seq-thinking": {
+                "type": "stdio",
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+                "env": {"API_KEY": "kept-secret"},
+                "alwaysAllow": ["think"]
+            }
+        });
+        std::fs::write(
+            fixture.claude(),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "numStartups": 3,
+                "mcpServers": servers
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let outcome = migrate_client("claude-code", None, false, None).unwrap();
+        let mut moved = outcome.moved.clone();
+        moved.sort();
+        assert_eq!(moved, ["memory", "seq-thinking"]);
+        assert_eq!(
+            enabled_names(&outcome.result.registry, "default"),
+            ["memory", "seq-thinking"],
+            "every moved server must be served after the move"
+        );
+        let after = json_file(&fixture.claude());
+        assert_eq!(
+            after["mcpServers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            [clients::GATEWAY_ENTRY_NAME]
+        );
+        assert!(fixture.move_record("claude-code").exists());
+
+        let disconnected = disconnect_client("claude-code").unwrap();
+        let mut restored = disconnected.outcome.restored.clone();
+        restored.sort();
+        assert_eq!(restored, ["memory", "seq-thinking"]);
+        let after = json_file(&fixture.claude());
+        assert_eq!(
+            after["mcpServers"], servers,
+            "Disconnect must restore the moved entries"
+        );
+        assert_eq!(after["numStartups"], 3);
+        assert!(!fixture.move_record("claude-code").exists());
+    }
+
+    /// A Disconnect whose registry update fails rolls the config back to before the
+    /// restore, so the move record must survive for the next attempt.
+    #[test]
+    fn failed_disconnect_keeps_the_move_record() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let servers = serde_json::json!({
+            "memory": {"command": "npx", "env": {"API_KEY": "kept-secret"}}
+        });
+        std::fs::write(
+            fixture.claude(),
+            serde_json::to_string(&serde_json::json!({ "mcpServers": servers })).unwrap(),
+        )
+        .unwrap();
+        migrate_client("claude-code", None, false, None).unwrap();
+        let moved_config = std::fs::read_to_string(fixture.claude()).unwrap();
+
+        let error =
+            disconnect_client_stdio_with("claude-code", false, |_| Err("registry full".into()))
+                .unwrap_err();
+        assert!(error.contains("rolled back"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.claude()).unwrap(),
+            moved_config
+        );
+        assert!(
+            fixture.move_record("claude-code").exists(),
+            "the record is the only copy of the moved entries"
+        );
+
+        disconnect_client("claude-code").unwrap();
+        assert_eq!(json_file(&fixture.claude())["mcpServers"], servers);
+        assert!(!fixture.move_record("claude-code").exists());
+    }
+
+    /// UX-03 for Codex: the moved TOML tables come back (nested env table too) into
+    /// the profile-scoped client, and an entry the user re-added since is kept.
+    #[test]
+    fn disconnect_restores_moved_codex_servers_without_clobbering_edits() {
+        let mut registry = Registry::default();
+        let mut work = registry.profiles[0].clone();
+        work.id = "work".into();
+        work.name = "Work".into();
+        registry.profiles.push(work);
+        let fixture = MoveFixture::new(&registry);
+        let original = r#"model = "gpt-5"
+
+# my servers
+[mcp_servers.memory]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-memory"]
+
+[mcp_servers.docs]
+command = "uvx"
+args = ["docs-mcp"]
+
+[mcp_servers.docs.env]
+DOCS_TOKEN = "tok"
+"#;
+        std::fs::write(fixture.codex(), original).unwrap();
+
+        let outcome = migrate_client("codex", Some("Work"), false, None).unwrap();
+        assert_eq!(
+            enabled_names(&outcome.result.registry, "work"),
+            ["docs", "memory"]
+        );
+        assert!(enabled_names(&outcome.result.registry, "default").is_empty());
+        let migrated: toml::Value =
+            toml::from_str(&std::fs::read_to_string(fixture.codex()).unwrap()).unwrap();
+        assert_eq!(migrated["model"].as_str(), Some("gpt-5"));
+        assert_eq!(
+            migrated["mcp_servers"]
+                .as_table()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            [clients::GATEWAY_ENTRY_NAME]
+        );
+
+        // The user puts their own memory back by hand before disconnecting.
+        let edited = format!(
+            "{}\n[mcp_servers.memory]\ncommand = \"node\"\nargs = [\"mine.js\"]\n",
+            std::fs::read_to_string(fixture.codex()).unwrap()
+        );
+        std::fs::write(fixture.codex(), edited).unwrap();
+
+        let disconnected = disconnect_client("codex").unwrap();
+        assert_eq!(disconnected.outcome.restored, ["docs"]);
+        let after: toml::Value =
+            toml::from_str(&std::fs::read_to_string(fixture.codex()).unwrap()).unwrap();
+        let before: toml::Value = toml::from_str(original).unwrap();
+        assert_eq!(after["model"], before["model"]);
+        assert_eq!(after["mcp_servers"]["docs"], before["mcp_servers"]["docs"]);
+        assert_eq!(
+            after["mcp_servers"]["memory"]["command"].as_str(),
+            Some("node")
+        );
+        assert_eq!(after["mcp_servers"].as_table().unwrap().len(), 2);
+        assert!(!fixture.move_record("codex").exists());
+    }
+
+    /// UX-02: when Toolport cannot turn a moved server on, the move fails before
+    /// the client's config, the registry or the move record change.
+    #[test]
+    fn failed_enable_leaves_the_client_config_untouched() {
+        let fixture = MoveFixture::new(&Registry::default());
+        let original = r#"{"mcpServers":{"memory":{"command":"npx","args":["server-memory"]}}}"#;
+        std::fs::write(fixture.claude(), original).unwrap();
+
+        let error = migrate_client("claude-code", Some("missing"), false, None).unwrap_err();
+        assert!(error.contains("left unchanged"), "{error}");
+        assert_eq!(std::fs::read_to_string(fixture.claude()).unwrap(), original);
+        assert!(read_registry_exact().unwrap().servers.is_empty());
+        assert!(!fixture.move_record("claude-code").exists());
     }
 }

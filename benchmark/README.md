@@ -163,7 +163,7 @@ Per task and as totals, for each mode:
 - **tool calls**: how many tool invocations the agent made (lazy mode includes its search calls).
 - **completion**: whether the agent produced a final answer. Eyeball the printed answers for actual correctness; this is a coarse success flag, not a grader.
 
-And the summary line: tools exposed (flat vs 3), total-token delta as a percent, and tasks completed.
+And the summary line: tools exposed (flat vs lazy), total-token delta as a percent, and tasks completed.
 
 ## Reading the results honestly
 
@@ -177,4 +177,5 @@ And the summary line: tools exposed (flat vs 3), total-token delta as a percent,
 - Token counts depend on your runtime reporting `usage` (LM Studio and Ollama do).
 - Tasks must match servers you actually have connected; the defaults assume Resend / Neon / Vercel.
 - This measures the agent loop, not just the static tool-definition size. The static
-  size (3 schemas vs hundreds) is the upper bound; the loop shows what you actually pay.
+  size (a fixed set of meta-tools, about 2,200 tokens with Code Mode on, against the whole
+  catalog) is the upper bound; the loop shows what you actually pay.

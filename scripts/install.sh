@@ -237,7 +237,7 @@ install_arch_repo() {
   fi
 
   say "Installing toolport"
-  $sudo pacman -Sy --noconfirm toolport ||
+  $sudo pacman -Syu --noconfirm toolport ||
     err "pacman could not install toolport. Check the output above."
 
   say "Installed. Launch Toolport from your app menu, or run: toolport-gtk"

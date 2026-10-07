@@ -312,10 +312,18 @@ if grep -q -- "--lsign-key DEADBEEFDEADBEEF" "$arch_shim/pacman-key.log" 2>/dev/
 else
   echo "  FAIL: did not lsign the pinned key id"; fail=$((fail + 1))
 fi
-if grep -q -- "-Sy .*toolport" "$arch_shim/pacman.log" 2>/dev/null; then
-  echo "  ok: installed toolport with pacman"; pass=$((pass + 1))
+# A partial upgrade (`-Sy`) refreshes the sync database without upgrading the
+# rest of the system, which Arch explicitly warns against; the install must be a
+# full upgrade (`-Syu`).
+if grep -qE -- "(^| )-Syu( |$)" "$arch_shim/pacman.log" 2>/dev/null; then
+  echo "  ok: installed toolport with a full upgrade (-Syu)"; pass=$((pass + 1))
 else
-  echo "  FAIL: pacman was not asked to install toolport"; fail=$((fail + 1))
+  echo "  FAIL: pacman was not asked to install toolport with -Syu"; fail=$((fail + 1))
+fi
+if grep -qE -- "(^| )-Sy( |$)" "$arch_shim/pacman.log" 2>/dev/null; then
+  echo "  FAIL: pacman ran a partial upgrade (-Sy without -u)"; fail=$((fail + 1))
+else
+  echo "  ok: did not run a partial upgrade (-Sy)"; pass=$((pass + 1))
 fi
 if [ -z "$arch_argv" ]; then
   echo "  ok: no AUR helper was invoked"; pass=$((pass + 1))

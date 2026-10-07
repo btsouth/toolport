@@ -197,7 +197,7 @@ async fn import_servers(
         selected.map(|keys| keys.into_iter().collect());
     let (reg, _) = write_registry(state.inner(), |reg| {
         for server in selected_servers_to_import(&detected, reg, selected.as_ref())? {
-            reg.add_server(server);
+            crate::registry_controller::apply_import_entry(reg, server);
         }
         Ok(())
     })?;
@@ -694,6 +694,7 @@ async fn uninstall_gateway(
             reg.clear_client_managed_entry(&client_id);
             Ok(())
         })?;
+        clients::finish_uninstall(&client_id, &outcome);
         Ok(outcome)
     })
     .await
@@ -4297,7 +4298,7 @@ pub fn run() {
             let report = secrets::migrate_secrets_to_dpk(&keys);
             if report.migrated > 0 || report.failed > 0 {
                 eprintln!(
-                    "conduit: keychain migration complete ({} entries moved to data-protection keychain, {} failed, {} not found)",
+                    "toolport: keychain migration complete ({} entries moved to data-protection keychain, {} failed, {} not found)",
                     report.migrated, report.failed, report.not_found
                 );
             }

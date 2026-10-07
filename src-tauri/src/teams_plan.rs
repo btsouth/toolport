@@ -8,31 +8,32 @@
 //! [`tests::the_rust_and_typescript_plan_numbers_agree`] fails the build if the
 //! two ever drift apart. Change the TypeScript first, then this.
 
-/// People included before a plan is required.
-pub const FREE_SEATS: u32 = 5;
-/// Monthly price of the Team plan, flat, covering [`FREE_SEATS`] people.
-pub const BASE_PRICE: u32 = 39;
-/// Monthly price per person past [`FREE_SEATS`].
-pub const SEAT_PRICE: u32 = 12;
+/// People included on the Free plan before a plan is required.
+pub const FREE_SEATS: u32 = 2;
+/// People included in the Team plan before per-person pricing applies.
+pub const TEAM_SEATS: u32 = 10;
+/// Monthly price of the Team plan, flat, covering [`TEAM_SEATS`] people.
+pub const BASE_PRICE: u32 = 19;
+/// Monthly price per person past [`TEAM_SEATS`].
+pub const SEAT_PRICE: u32 = 4;
 /// Annual price per additional person: ten months of the monthly rate.
-pub const ANNUAL_SEAT_PRICE: u32 = 120;
+pub const ANNUAL_SEAT_PRICE: u32 = 40;
 /// Annual price of the Team plan.
-pub const ANNUAL_PRICE: u32 = 390;
+pub const ANNUAL_PRICE: u32 = 190;
 /// Length of the Team trial, in days. No card is taken for it.
 pub const TRIAL_DAYS: u32 = 14;
 
 /// The free tier, worded as the pricing page words it.
 pub fn free_line() -> String {
-    format!("Free for up to {FREE_SEATS} people. It does not expire and needs no card.")
+    format!("Free for {FREE_SEATS} people. It does not expire and needs no card.")
 }
 
 /// The paid tier. Says what the money buys, because seats alone do not explain
-/// it: Team costs the same at [`FREE_SEATS`] people as Free does, and the
-/// difference is governance.
+/// it: the plan is a flat price for a whole team, not a per-seat charge.
 pub fn paid_line() -> String {
     format!(
-        "Team is ${BASE_PRICE}/month (or ${ANNUAL_PRICE}/year) for up to {FREE_SEATS}, \
-then ${SEAT_PRICE}/month per additional person (or ${ANNUAL_SEAT_PRICE}/year on annual billing), and adds access control, rate limits, and audit. \
+        "Team is ${BASE_PRICE}/month (or ${ANNUAL_PRICE}/year) for your whole team, \
+up to {TEAM_SEATS} people, then ${SEAT_PRICE}/month per additional person (or ${ANNUAL_SEAT_PRICE}/year on annual billing), and adds access control, rate limits, and audit. \
 Same price hosted or self-hosted."
     )
 }
@@ -63,6 +64,7 @@ mod tests {
         let source = std::fs::read_to_string(path).expect("teamsPlan.ts is readable");
         for (name, ours) in [
             ("TEAMS_FREE_SEATS", FREE_SEATS),
+            ("TEAMS_TEAM_SEATS", TEAM_SEATS),
             ("TEAMS_BASE_PRICE", BASE_PRICE),
             ("TEAMS_SEAT_PRICE", SEAT_PRICE),
             ("TEAMS_ANNUAL_SEAT_PRICE", ANNUAL_SEAT_PRICE),
@@ -89,6 +91,7 @@ mod tests {
         let mut out = raw.replace('\n', " ");
         for (token, value) in [
             ("${TEAMS_FREE_SEATS}", FREE_SEATS),
+            ("${TEAMS_TEAM_SEATS}", TEAM_SEATS),
             ("${TEAMS_BASE_PRICE}", BASE_PRICE),
             ("${TEAMS_SEAT_PRICE}", SEAT_PRICE),
             ("${TEAMS_ANNUAL_SEAT_PRICE}", ANNUAL_SEAT_PRICE),

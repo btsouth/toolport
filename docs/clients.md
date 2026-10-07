@@ -1,6 +1,6 @@
 # Supported clients
 
-Toolport auto-detects these **36 AI clients**, installs the gateway into each with one
+Toolport auto-detects **30+ AI clients**, installs the gateway into each with one
 click, and can import a client's existing servers. It writes the config file shown
 below for you, so you never have to edit these by hand.
 

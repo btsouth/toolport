@@ -25,6 +25,10 @@
 //!   object per line. This is what lets a test assert exactly what bytes the
 //!   gateway sent downstream, which is the regression net for the envelope
 //!   transparency work (SOU-444).
+//! - `MOCK_MCP_FAIL_STARTS=<n>` with `MOCK_MCP_START_COUNTER=<path>` — the first
+//!   `n` starts exit before the handshake, like a server launched before the
+//!   network is up. The counter file records every start, so a test can also
+//!   count how often the gateway retried.
 //!
 //! The default configuration (no env set) is byte-identical to the pre-SOU-443
 //! fixture apart from the added `echo_meta` tool, so `list_changed`,
@@ -705,7 +709,38 @@ fn serve_http(cfg: &Config) {
     }
 }
 
+/// Count this start in `MOCK_MCP_START_COUNTER` and exit if it is one of the first
+/// `MOCK_MCP_FAIL_STARTS`.
+fn fail_start_if_configured() {
+    let Ok(path) = std::env::var("MOCK_MCP_START_COUNTER") else {
+        return;
+    };
+    // One appended line per start, so two starts at once both count.
+    {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = file.write_all(b"start\n");
+        }
+    }
+    let starts = std::fs::read_to_string(&path)
+        .map(|raw| raw.lines().count() as u64)
+        .unwrap_or(1);
+    let failing: u64 = std::env::var("MOCK_MCP_FAIL_STARTS")
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(0);
+    if starts <= failing {
+        eprintln!("mock: start {starts} of {failing} failing starts, exiting");
+        std::process::exit(3);
+    }
+}
+
 fn main() {
+    fail_start_if_configured();
     let cfg = Config::from_env();
     if std::env::var("MOCK_MCP_HTTP").as_deref() == Ok("1") {
         serve_http(&cfg);

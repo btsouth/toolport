@@ -439,7 +439,10 @@ pub fn delete_set(id: &str) -> Result<RulesView, String> {
     // project_remove: cleanup is driven by that record, so dropping it would strand the block.
     let leftovers: Vec<(String, Vec<String>)> = orphaned
         .iter()
-        .map(|p| (p.id.clone(), clean_project_targets(&p.targets, &[])))
+        .map(|p| {
+            let root = std::path::Path::new(&p.path);
+            (p.id.clone(), clean_project_targets(root, &p.targets, &[]))
+        })
         .collect();
     crate::registry::update(|reg| {
         reg.remove_rule_set(id);
@@ -698,12 +701,69 @@ pub fn project_add(path: &str) -> Result<RulesView, String> {
     view()
 }
 
+/// A registered project may be an untrusted clone, so a project file must be a real file inside
+/// it. Refuse a symlink anywhere between the project root and the target, and anything whose
+/// nearest existing ancestor resolves outside the canonical root. User-level targets keep
+/// following symlinks (SBS-886); only project writes are confined.
+fn check_project_path(root: &std::path::Path, path: &std::path::Path) -> Result<(), String> {
+    let outside = || {
+        format!(
+            "{} is outside the project folder, so Toolport did not touch it.",
+            path.display()
+        )
+    };
+    let canonical_root = std::fs::canonicalize(root).map_err(|e| {
+        format!(
+            "Could not resolve the project folder {}: {e}",
+            root.display()
+        )
+    })?;
+    let relative = path.strip_prefix(root).map_err(|_| outside())?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(outside());
+        }
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "{} is a symbolic link, so Toolport did not touch it. Project rules are only written to real files inside the project.",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(format!("Could not check {}: {e}", current.display())),
+        }
+    }
+    let existing = path
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .ok_or_else(outside)?;
+    let resolved = std::fs::canonicalize(existing).map_err(|_| outside())?;
+    if resolved.starts_with(&canonical_root) {
+        Ok(())
+    } else {
+        Err(outside())
+    }
+}
+
 /// Remove what `targets` holds of ours except the paths in `keep`. Returns the paths that could
-/// NOT be cleaned (and so must stay on record).
-fn clean_project_targets(targets: &[String], keep: &[String]) -> Vec<String> {
+/// NOT be cleaned (and so must stay on record). A recorded path that is no longer a real file in
+/// the project (swapped for a symlink since Apply) is dropped from the record untouched: what it
+/// points at was never ours to edit.
+fn clean_project_targets(
+    root: &std::path::Path,
+    targets: &[String],
+    keep: &[String],
+) -> Vec<String> {
     let mut uncleaned = Vec::new();
     for t in targets {
         if keep.contains(t) {
+            continue;
+        }
+        if check_project_path(root, std::path::Path::new(t)).is_err() {
             continue;
         }
         if !instructions::remove_recorded(std::path::Path::new(t), Scope::Personal) {
@@ -724,7 +784,8 @@ pub fn project_remove(id: &str) -> Result<RulesView, String> {
     else {
         return Err("That project is no longer registered.".to_string());
     };
-    let uncleaned = clean_project_targets(&project.targets, &[]);
+    let uncleaned =
+        clean_project_targets(std::path::Path::new(&project.path), &project.targets, &[]);
     crate::registry::update(|reg| {
         if uncleaned.is_empty() {
             reg.rules_projects.retain(|p| p.id != id);
@@ -777,7 +838,10 @@ pub fn project_set_file_enabled(id: &str, key: &str, enabled: bool) -> Result<Ru
         .to_string();
     let mut still_recorded = project.targets.clone();
     if !enabled && project.targets.contains(&path) {
-        if instructions::remove_recorded(std::path::Path::new(&path), Scope::Personal) {
+        let root = std::path::Path::new(&project.path);
+        if check_project_path(root, std::path::Path::new(&path)).is_err()
+            || instructions::remove_recorded(std::path::Path::new(&path), Scope::Personal)
+        {
             still_recorded.retain(|t| t != &path);
         } else {
             // Switching off means "Toolport's block is gone from this file". If it is not,
@@ -836,14 +900,19 @@ fn apply_project_with(id: &str, installed: &[ClientTarget]) -> Result<RulesView,
         .collect();
     let mut written = Vec::new();
     let mut refused = Vec::new();
+    let mut unsafe_paths = Vec::new();
     for (key, target) in &desired {
+        if let Err(error) = check_project_path(root, &target.path) {
+            unsafe_paths.push(error);
+            continue;
+        }
         match instructions::write_target(target, &set.id, set.revision, &set.content) {
             ApplyState::Applied => written.push(key.clone()),
             state => refused.push((key.clone(), state)),
         }
     }
     let desired_paths: Vec<String> = desired.iter().map(|(k, _)| k.clone()).collect();
-    let uncleaned = clean_project_targets(&project.targets, &desired_paths);
+    let uncleaned = clean_project_targets(root, &project.targets, &desired_paths);
     // What is ours on disk now: written, still-desired previous paths (a refused rewrite keeps
     // last-good, exactly as the global apply does), and failed cleanups.
     let mut owned = written;
@@ -859,6 +928,9 @@ fn apply_project_with(id: &str, installed: &[ClientTarget]) -> Result<RulesView,
         }
         Ok(())
     })?;
+    if let Some(error) = unsafe_paths.first() {
+        return Err(format!("{error} Everything else was applied."));
+    }
     if let Some((path, state)) = refused.first() {
         // Report, do not hide: the view shows the state, but the button was pressed and it
         // did not do what it said.
@@ -1347,6 +1419,96 @@ mod tests {
             THEIRS
         );
         assert!(crate::registry::load().unwrap().rules_projects.is_empty());
+    }
+
+    /// SEC-03: a cloned repo can ship rule targets as symlinks. Apply and cleanup must never
+    /// write through them to files outside the project.
+    #[cfg(unix)]
+    #[test]
+    fn project_apply_refuses_symlinked_targets_outside_the_project() {
+        let _dirs = crate::registry::data_dir_test_lock();
+        let s = Scratch::new();
+        let _data_dir = crate::registry::DataDirOverride::set(s.path("data"));
+        let root = registered(&s, "repo");
+        let root_path = std::path::PathBuf::from(&root);
+        let home = s.path("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        const HOME_AGENTS: &str = "# My global rules\n";
+        std::fs::write(home.join("AGENTS.md"), HOME_AGENTS).unwrap();
+        // A symlinked file and a symlinked directory, both pointing out of the project.
+        std::os::unix::fs::symlink(home.join("AGENTS.md"), root_path.join("AGENTS.md")).unwrap();
+        std::os::unix::fs::symlink(home.join(".claude"), root_path.join(".claude")).unwrap();
+        let installed = vec![
+            client("codex", Some(sentinel(s.path("AGENTS.md")))),
+            client(
+                "claude-code",
+                Some(owned(s.path("rules").join("toolport-rules.md"))),
+            ),
+        ];
+        let set_id = crate::registry::update(|reg| reg.upsert_rule_set(None, "Work", "Be brief."))
+            .unwrap()
+            .1;
+        project_add(&root).unwrap();
+        let pid = crate::registry::load().unwrap().rules_projects[0]
+            .id
+            .clone();
+        project_set_set(&pid, Some(&set_id)).unwrap();
+        project_set_file_enabled(&pid, "agents-md", true).unwrap();
+        project_set_file_enabled(&pid, "claude-rules", true).unwrap();
+
+        let err = apply_project_with(&pid, &installed).unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(
+            err.contains(&root_path.join("AGENTS.md").display().to_string()),
+            "the error names the path: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("AGENTS.md")).unwrap(),
+            HOME_AGENTS
+        );
+        assert!(
+            !home.join(".claude").join("rules").exists(),
+            "nothing is created through a symlinked directory"
+        );
+        assert!(crate::registry::load().unwrap().rules_projects[0]
+            .targets
+            .is_empty());
+
+        // With only the symlinked directory left, the error names that directory.
+        std::fs::remove_file(root_path.join("AGENTS.md")).unwrap();
+        let err = apply_project_with(&pid, &installed).unwrap_err();
+        assert!(
+            err.contains(&root_path.join(".claude").display().to_string()),
+            "{err}"
+        );
+        assert!(
+            root_path.join("AGENTS.md").exists(),
+            "the real file is written"
+        );
+
+        // A recorded file swapped for a symlink after Apply: cleanup leaves the link's target
+        // alone and drops the record, even when the target holds a Toolport block.
+        let outside = sentinel(home.join("AGENTS.md"));
+        assert_eq!(
+            instructions::write_target(&outside, &set_id, 1, "Be brief."),
+            ApplyState::Applied
+        );
+        let before = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+        std::fs::remove_file(root_path.join("AGENTS.md")).unwrap();
+        std::os::unix::fs::symlink(home.join("AGENTS.md"), root_path.join("AGENTS.md")).unwrap();
+        project_set_file_enabled(&pid, "agents-md", false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.join("AGENTS.md")).unwrap(),
+            before
+        );
+        assert!(crate::registry::load().unwrap().rules_projects[0]
+            .targets
+            .is_empty());
+        project_remove(&pid).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.join("AGENTS.md")).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -2287,6 +2449,14 @@ mod tests {
     #[test]
     fn concurrent_applies_leave_the_active_sets_bytes_on_disk() {
         let _dirs = crate::registry::data_dir_test_lock();
+        // Two writers deliberately contend on the registry lock, and each apply
+        // holds it across `save_to`'s fsyncs. The test exists to prove the
+        // invariant "the active set's bytes are the bytes on disk", not to fit a
+        // latency budget, so it takes the concurrency-test budget rather than the
+        // 5s production deadline a loaded machine can exceed (SBS-895). Measured
+        // on devbox: with six concurrent fsync writers, 27 of 30 runs hit the 5s
+        // deadline; idle, 60 of 60 passed.
+        let _lock_budget = crate::registry::LockTimeoutOverride::generous();
         let s = Scratch::new();
         let _data_dir = crate::registry::DataDirOverride::set(s.path("data"));
 

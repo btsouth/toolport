@@ -12,11 +12,10 @@ Reproduce it yourself: [`benchmark/`](benchmark/).
 
 - **Two modes**, same tasks, same model:
   - **flat**, every downstream tool exposed directly (`TOOLPORT_DISCOVERY=full`), the normal MCP setup.
-  - **lazy**, Toolport advertises 4 meta-tools (`toolport_status`, `toolport_search_tools`,
-    `toolport_call_tool`, `toolport_fetch_result`) and the agent searches/calls on demand
-    (`TOOLPORT_DISCOVERY=lazy`). (The headline reduction below was originally measured on the
-    earlier 3-meta-tool set; 886 was a historical UTF-8 bytes/4 estimate for a
-    four-tool definition set, not a current invariant or provider token count.)
+  - **lazy**, Toolport advertises a small, fixed set of meta-tools and the agent searches and
+    calls on demand (`TOOLPORT_DISCOVERY=lazy`). With Code Mode on (the default) that is seven
+    tools; the core four are `toolport_status`, `toolport_search_tools`, `toolport_call_tool`,
+    and `toolport_fetch_result`.
 - **Model:** GPT-5.5 (frontier, via the Vercel AI Gateway), so model capability is not the
   variable, both modes can actually complete every task.
 - **Tasks (5 runs each):** list Stripe products; list Neon projects; list Vercel projects
@@ -40,10 +39,10 @@ Two things stand out:
   Lazy discovery did not trade accuracy for tokens.
 - **The savings grow with your catalog.** Flat's cost more than doubled as servers went
   3 → 6 (it re-sends every tool schema on every call), while lazy's actually _dropped_
-  (47K → 40K), it pays a flat ~450-token meta-tool overhead no matter how many servers
-  you connect. Per-request tool-definition overhead: flat **19,002 → 51,533**, lazy a
-  constant **451** in those model runs. These historical values depend on that
-  tool set and harness.
+  (47K → 40K), it pays a fixed tool-definition floor no matter how many servers you
+  connect. Measured with `tiktoken o200k_base`, the lazy floor is about 2,200 tokens
+  with Code Mode on (about 940 for the core four tools) and is flat regardless of
+  server count.
 
 ## Why flat is so expensive
 
@@ -53,43 +52,27 @@ Other MCP clients may gate or cache definitions differently. Lazy mode advertise
 catalog and searched for what it needed. The
 more tools you connect and the more calls a task takes, the wider the gap.
 
-## Measured on a real 14-server catalog
+## Measured tool-definition cost
 
-The 63-tool test above is deliberately small. The historical local estimate below
-used serialized definition bytes divided by four on a 14-server, **415-tool** catalog.
-It describes MCP payload size, not model usage. To reproduce on the current gateway,
-capture `tools/list` for the same client in full and lazy modes and pass both JSON
-responses to [`benchmark/token-cost.mjs`](benchmark/token-cost.mjs).
+The 63-tool test above is deliberately small. To measure the static catalog without a
+model, capture `tools/list` and the `initialize` instructions for the same client in
+full and lazy modes and pass the JSON responses to
+[`benchmark/token-cost.mjs`](benchmark/token-cost.mjs). Measured with
+`tiktoken o200k_base` (the GPT-4o/GPT-5 family tokenizer) on a registry of up to 20
+servers, 416 tools in full mode:
 
-|                              | Per request                   |
-| ---------------------------- | ----------------------------- |
-| Full catalog (historical)    | **≈164,880 token-equivalent** |
-| Four meta-tools (historical) | **≈886 token-equivalent**     |
-| Reduction                    | **99.5%**                     |
+| Advertised set               | Tools | Tools + instructions (o200k) |
+| ---------------------------- | ----- | ---------------------------- |
+| Full catalog (20 servers)    | 416   | ≈38,800                      |
+| Lazy, Code Mode on (default) | 7     | ≈2,200                       |
+| Lazy, core four only         | 4     | ≈940                         |
 
-(≈660 token-equivalent / 99.6% for the original three-tool set. Toolport now
-measures the actual arrays for each client; there is no fixed lazy floor.)
-
-The cost is dominated by a few large servers:
-
-| Server                     | Tools | Estimated token-equivalent of definitions |
-| -------------------------- | ----- | ----------------------------------------- |
-| RevenueCat                 | 93    | 42,370                                    |
-| GitHub                     | 44    | 27,913                                    |
-| Resend                     | 83    | 26,045                                    |
-| Cloudflare (observability) | 8     | 5,948                                     |
-| Stripe                     | 11    | 5,214                                     |
-| Vercel                     | 20    | 5,029                                     |
-| Supabase                   | 29    | 4,897                                     |
-| (5 more)                   | ...   | ...                                       |
-
-At ≈165k token-equivalent of serialized definitions, this catalog is large.
-The actual model context cost depends on the MCP harness, provider serialization,
-tool gating, and caching. Toolport's local telemetry now reports exact full and
-exposed tool-array bytes per load, plus search response bytes separately.
-
-The estimated average here is ~397 token-equivalent per tool, consistent with the ~387 the
-public [calculator](https://toolport.app/calculator) uses.
+The lazy floor is flat: about 2,200 tokens whether one server or twenty are connected.
+Because the floor is fixed, lazy discovery only pays off once the catalog it replaces is
+large enough. The same sweep measured 78% fewer tool-definition tokens at 5 servers, 90%
+at 10, and 95% at 20; savings start at roughly 10 to 25 tools, and a single small server
+(fetch or time) costs slightly more with lazy mode than without it. The in-app Activity
+figure is a separate bytes/4 estimate; the table above is tokenizer output.
 
 ## Latency: the gateway is not the bottleneck
 
@@ -101,7 +84,7 @@ against an instant mock downstream so the number is purely Toolport's own overhe
 | Operation                                                    | Median        |
 | ------------------------------------------------------------ | ------------- |
 | Handshake (one-time, per gateway start)                      | ~21 ms        |
-| `tools/list` (lazy, 4 tools)                                 | ~0.2 ms       |
+| `tools/list` (lazy)                                          | ~0.2 ms       |
 | `toolport_search_tools`                                      | ~0.1 ms       |
 | A tool call through Toolport vs. calling the server directly | **+~0.75 ms** |
 
@@ -122,5 +105,6 @@ run it on yours: `node benchmark/latency.mjs`.)
   from the model's reported `usage`.
 - **Lazy adds search round-trips.** The total-token figures are already net of that. The
   trade-off only pays off past a handful of tools; for a single tiny server it's overkill.
-- **Savings scale with your tool surface**, and that's the point: 74% at 63 tools, 91% at
-  183, 99.5% definition-overhead at 415. The more you connect, the wider the gap.
+- **Savings scale with your tool surface**, and that's the point: 74% at 63 tools and 91%
+  at 183 end-to-end, and 78% at 5 servers, 90% at 10, 95% at 20 for the static tool
+  definitions. The more you connect, the wider the gap.
