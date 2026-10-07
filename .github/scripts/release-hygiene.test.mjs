@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { releaseInstaller, manifests, submit } from "./winget.mjs";
+import { releaseInstaller, manifests, submit, validateManifests } from "./winget.mjs";
 import { assertContents, listContents, appImageOffset } from "./package-contents.mjs";
 import { parse } from "yaml";
 const bytes = Buffer.from("immutable signed installer fixture");
@@ -29,6 +29,11 @@ const templates = [
 
 test("manifest versions, URLs and SHA256 come from the published release", () => {
   const files = manifests(templates, installer, bytes);
+  validateManifests(files, installer);
+  assert.equal(
+    parse(files[2].content).ReleaseNotesUrl,
+    "https://github.com/btsouth/toolport/releases/tag/v2.0.0",
+  );
   for (const file of files) assert.equal(parse(file.content).PackageVersion, "2.0.0");
   assert.deepEqual(parse(files[1].content).Installers, [
     {

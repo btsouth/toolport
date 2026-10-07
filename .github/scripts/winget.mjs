@@ -74,9 +74,15 @@ export function validateManifests(files, installer) {
       (doc.Installers?.length !== 1 ||
         doc.Installers[0].Architecture !== "x64" ||
         doc.Installers[0].InstallerUrl !== installer.url ||
-        doc.Installers[0].InstallerSha256?.toUpperCase() !== installer.sha256)
+        typeof doc.Installers[0].InstallerSha256 !== "string" ||
+        doc.Installers[0].InstallerSha256.toUpperCase() !== installer.sha256)
     )
       throw new Error("Manifest installer URL or SHA256 differs from release");
+    if (
+      doc.ManifestType === "defaultLocale" &&
+      doc.ReleaseNotesUrl !== installer.url.replace(/\/download\/([^/]+)\/.*$/, "/tag/$1")
+    )
+      throw new Error("Manifest release notes URL differs from release");
   }
 }
 
