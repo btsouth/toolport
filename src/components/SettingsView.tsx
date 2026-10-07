@@ -1025,8 +1025,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         </p>
         {teamFloor !== "off" && (
           <p className="text-xs">
-            Team minimum safety level: {teamFloor === "ask" ? "Ask" : "Strict"}. You can
-            choose a stronger level.
+            Team minimum safety level: {teamFloor === "ask" ? "Ask" : "Strict"}. Choices
+            below this floor are unavailable.
           </p>
         )}
         {(registry?.teamForcedQuarantineOnDrift ||

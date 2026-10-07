@@ -29794,8 +29794,10 @@ mod tests {
     #[test]
     fn team_quarantine_at_member_off_enforces_drift_and_survives_watcher_reconciliation() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let _data_dir = conduit_lib::registry::DataDirOverride::set(dir.path());
+        let dir = std::env::temp_dir().join(format!("toolport-team-quarantine-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
         let profile = Some("team-quarantine-off");
         let baseline = readonly_router("srv", "Read a record.");
         integrity::check_staged(profile, &baseline.aggregated_tools()).unwrap();
@@ -29821,7 +29823,7 @@ mod tests {
             .contains("srv__read"));
         // Store failures must keep enforced quarantine at Off rather than silently release it.
         std::fs::write(
-            dir.path().join(format!(
+            dir.join(format!(
                 "quarantine-v2-{}.json",
                 registry::profile_store_key("team-quarantine-off")
             )),
@@ -29830,6 +29832,7 @@ mod tests {
         .unwrap();
         assert!(effective_quarantine(&registry, profile, &read_failed).is_none());
         assert!(maybe_check_integrity(&registry, &baseline.aggregated_tools(), profile).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// SEC-01: the startup background build must run the integrity gate BEFORE it

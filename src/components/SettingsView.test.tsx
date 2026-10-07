@@ -328,7 +328,7 @@ it.each([
   expect(setSafetyLevel).not.toHaveBeenCalled();
   expect(
     screen.getByText(
-      `Team minimum safety level: ${floor === "ask" ? "Ask" : "Strict"}. You can choose a stronger level.`,
+      `Team minimum safety level: ${floor === "ask" ? "Ask" : "Strict"}. Choices below this floor are unavailable.`,
     ),
   ).toBeInTheDocument();
 });
