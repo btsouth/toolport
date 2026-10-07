@@ -241,13 +241,37 @@ fn descriptor_of(scratch: &Scratch, pid: u32) -> Value {
 fn start_serving(scratch: &Scratch, servers: usize) -> ChildGuard {
     let daemon = spawn_daemon(scratch);
     descriptor_of(scratch, daemon.0.id());
-    wait_until("the server to start", scratch, || {
+    // Demand this fixture with a scoped catalog search. The shell wrapper
+    // intentionally leaves a child behind even if its handshake is unfinished;
+    // orphan cleanup needs a live child, not a completed catalog or call approval.
+    wait_until("the server to start on discovery", scratch, || {
+        let _ = mcp_request(
+            scratch,
+            &daemon,
+            "tools/call",
+            json!({
+                "name":"toolport_search_tools","arguments":{"query":"","server":"mock"}
+            }),
+        );
         scratch.server_pids().len() >= servers
     });
     daemon
 }
 
 fn status_text(scratch: &Scratch, daemon: &ChildGuard) -> String {
+    let message = mcp_request(
+        scratch,
+        daemon,
+        "tools/call",
+        json!({"name":"toolport_status","arguments":{}}),
+    );
+    message["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn mcp_request(scratch: &Scratch, daemon: &ChildGuard, method: &str, params: Value) -> Value {
     let descriptor = descriptor_of(scratch, daemon.0.id());
     let endpoint = descriptor["endpoint"].as_str().unwrap().to_string();
     let token = descriptor["token"].as_str().unwrap().to_string();
@@ -270,8 +294,7 @@ fn status_text(scratch: &Scratch, daemon: &ChildGuard) -> String {
     );
     let session = initialize.header("Mcp-Session-Id").unwrap().to_string();
     let reply = post(
-        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
-               "params":{"name":"toolport_status","arguments":{}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}),
         Some(&session),
     );
     let sse = reply
@@ -288,10 +311,7 @@ fn status_text(scratch: &Scratch, daemon: &ChildGuard) -> String {
     } else {
         serde_json::from_str(&body).unwrap()
     };
-    message["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string()
+    message
 }
 
 #[cfg(target_os = "linux")]

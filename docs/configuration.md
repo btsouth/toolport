@@ -115,3 +115,25 @@ servers ("GitHub (work)", "GitHub (personal)"), authenticate each with its own
 account, and enable one in each profile. A client scoped to the work profile
 (`TOOLPORT_PROFILE`) then only ever sees the work account. Tool names are
 namespaced per server, so the two never collide even in the same profile.
+
+### Downstream lifecycle
+
+Toolport starts downstream servers when a client first uses them. A saved tool
+catalog answers discovery without starting the server. If no catalog exists,
+the first discovery request starts the visible servers to learn their tools.
+The first call to a stopped server waits up to 30 seconds for startup and its
+fresh catalog before applying the call gates. Calls during failure recovery
+report the backoff state without waiting or replaying an uncertain operation.
+
+A server stays warm for five minutes after its last completed use. Active calls
+and suspended requests keep it running. After that idle period, Toolport stops
+the connection and keeps its catalog; the next use starts it again. The idle
+period is a constant, not a setting. An idle connection loses process-local
+sessions and remote subscriptions; a new connection restores subscriptions.
+
+A connection failure retries in the background with exponential backoff from
+two seconds to five minutes, with jitter. Sign-in failures wait for credentials
+to change. Registry edits reuse servers whose effective connection spec is
+unchanged, preserving their processes and calls in flight. Changed servers get
+a new supervisor and start on their next use; policy-only edits do not restart
+connections. Fresh catalogs pass the integrity gate before calls can use them.
