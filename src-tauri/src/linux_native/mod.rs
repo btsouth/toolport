@@ -408,13 +408,11 @@ fn build_window(
         message.set_hexpand(true);
         notice.append(&message);
         let settings = gtk::Button::with_label("Settings");
-        let stack_for_notice = stack.clone();
-        let split_for_notice = split.clone();
-        let page_for_notice = settings_page.clone();
+        let app_for_notice = app.clone();
         settings.connect_clicked(move |_| {
-            stack_for_notice.set_visible_child_name("settings");
-            split_for_notice.set_show_content(true);
-            page_for_notice.refresh();
+            if let Some(action) = app_for_notice.lookup_action("show-settings") {
+                action.activate(None);
+            }
         });
         notice.append(&settings);
         let dismiss = gtk::Button::with_label("Dismiss");
