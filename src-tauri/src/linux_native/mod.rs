@@ -5950,13 +5950,9 @@ fn open_shared_setup(url: &str, page: ServerPage) {
             open_url: Box::new(|url| { let _ = crate::oauth::open_web_url(url); }),
         };
         let pair_origin = origin.clone();
-        pairing::request(
-            hooks,
-            &origin,
-            Box::new(move |cancel, show| {
-                crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
-            }),
-        );
+        pairing::request(hooks, &origin, Box::new(move |cancel, show| {
+            crate::teams::pair_device(&pair_origin, &team, cancel, show).map(|_| ())
+        }));
         return;
     }
     let Some(id) = crate::sharing_controller::parse_share_url(url) else {

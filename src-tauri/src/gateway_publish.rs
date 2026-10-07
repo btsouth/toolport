@@ -201,6 +201,21 @@ fn publish_from(
     Ok(dest)
 }
 
+/// Client configs have already changed when this runs. Failure is partial success,
+/// not permission to forget their previous saved ownership records.
+pub fn persist_repointed_ownership(
+    repointed: &[(String, crate::registry::ManagedEntry)],
+) -> Result<(), String> {
+    crate::registry::update(|reg| {
+        for (id, entry) in repointed {
+            reg.set_client_managed_entry(id, entry.clone());
+        }
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(|error| format!("Client configs updated, but ownership state was not saved: {error}"))
+}
+
 /// Published client gateway path from the manifest, when it matches this build.
 pub fn published_gateway_path() -> Option<PathBuf> {
     if !should_publish_client_gateway() {
@@ -1988,12 +2003,11 @@ mod tests {
         let manifest = root.join("manifest.json");
         std::fs::write(&src, "gateway image").unwrap();
         std::fs::write(&manifest, "previous manifest").unwrap();
-        for error in [
-            "Permission denied",
-            "No space left on device",
-            "rename failed",
-        ] {
-            let result = super::publish_from(&src, &dest, &manifest, |_, _| Err(error.into()));
+        use crate::registry::tests::{with_atomic_failure, FailingAtomicWriteStep::*};
+        for step in [Permissions, Write, Rename] {
+            let result = with_atomic_failure(step, || {
+                super::publish_from(&src, &dest, &manifest, crate::registry::atomic_write)
+            });
             assert!(result.unwrap_err().contains("manifest was not saved"));
             assert_eq!(
                 std::fs::read_to_string(&manifest).unwrap(),
@@ -2008,6 +2022,35 @@ mod tests {
         let saved: super::GatewayManifest =
             serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
         assert_eq!(saved.path, dest.to_string_lossy());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ownership_save_failures_preserve_saved_state_and_report_partial_success() {
+        use crate::registry::tests::{with_atomic_failure, FailingAtomicWriteStep::*};
+        let _lock = crate::registry::data_dir_test_lock();
+        let root =
+            std::env::temp_dir().join(format!("toolport-ownership-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&root);
+        crate::registry::save(&crate::registry::Registry::default()).unwrap();
+        let path = crate::registry::resolved_path().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let entry = serde_json::from_value(serde_json::json!({"command":"new-gateway"})).unwrap();
+        let repointed = vec![("claude".to_string(), entry)];
+        for step in [Permissions, Write, Rename] {
+            let result =
+                with_atomic_failure(step, || super::persist_repointed_ownership(&repointed));
+            assert!(result
+                .unwrap_err()
+                .contains("ownership state was not saved"));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        super::persist_repointed_ownership(&repointed).unwrap();
+        assert!(crate::registry::load()
+            .unwrap()
+            .client_managed_entries
+            .contains_key("claude"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

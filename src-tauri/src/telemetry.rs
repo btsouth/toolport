@@ -461,7 +461,11 @@ mod tests {
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), THREADS * PER_THREAD, "one line per record");
         let unique: std::collections::HashSet<&str> = lines.iter().copied().collect();
-        assert_eq!(unique.len(), lines.len(), "no duplicate or interleaved line");
+        assert_eq!(
+            unique.len(),
+            lines.len(),
+            "no duplicate or interleaved line"
+        );
         for line in &lines {
             serde_json::from_str::<serde_json::Value>(line).expect("each line is whole JSON");
         }

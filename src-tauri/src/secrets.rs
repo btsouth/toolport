@@ -223,7 +223,7 @@ mod platform {
         let app_path = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut trusted_apps: Vec<CFType> = Vec::with_capacity(2);
         trusted_apps.push(trusted_app(&app_path)?);
-        match crate::clients::resolve_gateway_path() {
+        match crate::clients::resolve_gateway_path()? {
             Some(gw_path) => match trusted_app(&gw_path) {
                 Ok(t) => trusted_apps.push(t),
                 Err(e) => eprintln!("toolport: gateway not added to keychain ACL ({e}); app-only"),

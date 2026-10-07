@@ -77,7 +77,7 @@ impl BridgeController {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = crate::http_bridge::status(&self.state);
-        let extra_keep = crate::clients::resolve_gateway_path()
+        let extra_keep = crate::clients::resolve_gateway_path_readonly()
             .into_iter()
             .collect::<Vec<_>>();
         let report = crate::gateway_publish::reap_stale(&extra_keep);

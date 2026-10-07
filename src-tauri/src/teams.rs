@@ -780,10 +780,8 @@ fn stringify(e: ureq::Error) -> String {
 /// A portal link for this installation's existing Team opens it without replacing
 /// the connection or resetting local review/authentication. This is not a health check.
 pub fn pair_target_is_current(reg: &Registry, origin: &str, team: &str) -> bool {
-    reg.team.as_ref().is_some_and(|current| {
-        current.team_id == team
-            && current.server_url.trim_end_matches('/') == origin.trim_end_matches('/')
-    })
+    reg.team.as_ref().is_some_and(|current| current.team_id == team
+        && current.server_url.trim_end_matches('/') == origin.trim_end_matches('/'))
 }
 
 pub fn parse_pair_link(raw: &str) -> Option<(String, String)> {
@@ -1162,8 +1160,8 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         Some(applied) => applied,
     };
     // Write/refresh the org instructions to each installed client's rules file (skips unless the
-    // content actually changed, or a target moved). Outside the lock, best-effort, never fails
-    // the sync.
+    // content actually changed, or a target moved). Config is already durable;
+    // subsequent state-save failures return explicit partial success.
     let mut state_errors = Vec::new();
     let mut check_state = |result: Result<(), String>| {
         if let Err(error) = result {
@@ -1179,8 +1177,8 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         None => relocate_stored_instructions(&conn.team_id),
     });
     // Best-effort showback after the config work: report today's/yesterday's per-server
-    // usage rollup to the team server. Any failure here must never affect the sync
-    // result — the member's config is already applied and saved.
+    // usage rollup to the team server. Network failures retry next cycle;
+    // local state-save failures must be visible after the config was applied.
     if let Err(error) = report_activation(&conn, &token) {
         eprintln!("Toolport: Teams activation reporting pending: {error}");
     }
@@ -1467,7 +1465,7 @@ fn report_usage(conn: &TeamConnection, token: &str) -> Result<(), String> {
             }
             // Old server without the endpoint: nothing to persist, don't retry the
             // other day either.
-            Ok(false) => return,
+            Ok(false) => return Ok(()),
             // Transient failure: keep the previous watermark for this day so the next
             // sync re-sends the full daily total.
             Err(_) => {
@@ -1998,7 +1996,7 @@ fn report_call_events(conn: &TeamConnection, token: &str) -> Result<(), String> 
             "server": server,
             "tool": tool,
             "ok": line.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
-        })?;
+        });
         if let Some(ms) = line.get("durationMs").and_then(|v| v.as_u64()) {
             ev["durationMs"] = json!(ms);
         }
@@ -2537,9 +2535,7 @@ pub fn personal_share_hint(reg: &Registry, personal: &ServerEntry) -> Option<&'s
     reg.servers
         .iter()
         .any(|s| is_team_server(s, &tag) && same_display_name(&s.name, &personal.name))
-        .then_some(
-            "The team has a different server with this name. Sharing adds a separate definition.",
-        )
+        .then_some("The team has a different server with this name. Sharing adds a separate definition.")
 }
 
 /// The preview's explanation for each selection, including a dry run of the local
@@ -2654,11 +2650,9 @@ pub fn push_selected(
     let servers = additive_server_set(remote, &selected)?;
     // Re-sharing definitions the Team already has unchanged only runs the local step.
     let before = server_index(remote)?;
-    let published = server_index(&servers)?.iter().any(|(id, server)| {
-        before
-            .get(id)
-            .is_none_or(|current| !same_definition(current, server))
-    });
+    let published = server_index(&servers)?
+        .iter()
+        .any(|(id, server)| before.get(id).is_none_or(|current| !same_definition(current, server)));
     let version = if published {
         let config = replace_server_set(config, servers)?;
         push_config(&conn.server_url, &conn.team_id, &token, &config, version)?
@@ -3097,10 +3091,7 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
                         review_ids.push(entry.id.clone());
                         review_fingerprints.insert(entry.id.clone(), fingerprint);
                     } else {
-                        if !reg.servers.iter().any(|s| {
-                            s.id == shared_id
-                                && !s.source.as_deref().unwrap_or("").starts_with("team:")
-                        }) {
+                        if !reg.servers.iter().any(|s| s.id == shared_id && !s.source.as_deref().unwrap_or("").starts_with("team:")) {
                             auto_enable.push(entry.id.clone());
                         }
                     }
@@ -3131,11 +3122,7 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     // Only rows that exist keep a mapping. A definition deleted from the Team and
     // shared again later can get a new local id; its old mapping must not linger
     // beside the new one for the same original.
-    managed_server_ids.retain(|id, _| {
-        reg.servers
-            .iter()
-            .any(|s| &s.id == id && is_team_server(s, &tag))
-    });
+    managed_server_ids.retain(|id, _| reg.servers.iter().any(|s| &s.id == id && is_team_server(s, &tag)));
     if let Some(conn) = reg.team.as_mut().filter(|c| c.team_id == team_id) {
         conn.managed_server_ids = managed_server_ids;
     }
@@ -3500,13 +3487,12 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
     let transport = str_field("transport").unwrap_or("stdio").to_string();
     let command = str_field("command").map(String::from);
     let launch = match s.get("launch").filter(|value| !value.is_null()) {
-        Some(value) => {
-            match serde_json::from_value::<crate::registry::LaunchConfig>(team_launch_value(value))
-            {
-                Ok(launch) => Some(launch.without_values()),
-                Err(_) => return TeamClass::Blocked,
-            }
-        }
+        Some(value) => match serde_json::from_value::<crate::registry::LaunchConfig>(
+            team_launch_value(value),
+        ) {
+            Ok(launch) => Some(launch.without_values()),
+            Err(_) => return TeamClass::Blocked,
+        },
         None => None,
     };
     let mut entry = ServerEntry {
@@ -3919,6 +3905,30 @@ mod tests {
             Ok(())
         })
         .expect("seed the registry");
+    }
+
+    #[test]
+    fn instructions_state_save_failure_is_reported_without_deleting_previous_data() {
+        use crate::registry::tests::{with_atomic_failure, FailingAtomicWriteStep::*};
+        let _lock = crate::registry::data_dir_test_lock();
+        let root = std::env::temp_dir().join(format!("toolport-teams-state-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _data = crate::registry::DataDirOverride::set(&root);
+        let rules = root.join("rules.md");
+        seed_applied_instructions("team_test", 1, "previous instructions", &rules);
+        let registry = crate::registry::resolved_path().unwrap();
+        let before = std::fs::read(&registry).unwrap();
+        let rules_before = std::fs::read(&rules).unwrap();
+        let key = rules.to_string_lossy().to_string();
+        for step in [Permissions, Write, Rename] {
+            let result = with_atomic_failure(step, || record_applied_instructions("team_test", Some("next instructions".into()), 2, vec![key.clone()], &[key.clone()]));
+            assert!(result.is_err(), "a failed save must not be complete success");
+            assert_eq!(std::fs::read(&registry).unwrap(), before);
+            assert_eq!(std::fs::read(&rules).unwrap(), rules_before);
+        }
+        record_applied_instructions("team_test", Some("next instructions".into()), 2, vec![key.clone()], &[key]).unwrap();
+        assert_eq!(loaded_instructions().1, 2);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn loaded_instructions() -> (Option<String>, i64, Vec<String>) {
@@ -4474,24 +4484,15 @@ mod tests {
     fn publisher_changed_scope_or_target_fails_without_partial_handoff() {
         crate::secrets::tests::with_isolated_vault(|| {
             let before = publisher_registry();
-            for field in [
-                "team", "origin", "device", "role", "profile", "target", "version",
-            ] {
+            for field in ["team", "origin", "device", "role", "profile", "target", "version"] {
                 let mut r = sync_publisher(&before);
                 let id = member_id(&r, "mine");
                 match field {
                     "team" => r.team.as_mut().unwrap().team_id = "other".into(),
-                    "origin" => {
-                        r.team.as_mut().unwrap().server_url = "https://other.example.test".into()
-                    }
+                    "origin" => r.team.as_mut().unwrap().server_url = "https://other.example.test".into(),
                     "device" => r.team.as_mut().unwrap().reporting_device_id = "other".into(),
                     "role" => r.team.as_mut().unwrap().role = "member".into(),
-                    "profile" => {
-                        let mut other = r.profiles[0].clone();
-                        other.id = "other".into();
-                        r.profiles.push(other);
-                        r.active_profile_id = Some("other".into());
-                    }
+                    "profile" => { let mut other = r.profiles[0].clone(); other.id = "other".into(); r.profiles.push(other); r.active_profile_id = Some("other".into()); },
                     "version" => r.team.as_mut().unwrap().last_version = 3,
                     _ => {
                         r.servers.iter_mut().find(|s| s.id == id).unwrap().command =
@@ -6874,11 +6875,7 @@ mod tests {
         }
 
         /// Publish, sync and hand off. Returns the registry and the published set.
-        fn share(
-            before: &Registry,
-            remote: &Value,
-            ids: &[&str],
-        ) -> (Registry, Value, Vec<LocalHandoff>) {
+        fn share(before: &Registry, remote: &Value, ids: &[&str]) -> (Registry, Value, Vec<LocalHandoff>) {
             let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
             let merged = additive_server_set(remote, &selected_export(before, &ids).unwrap()).unwrap();
             let mut r = synced(before, &merged, 2);
@@ -6989,12 +6986,7 @@ mod tests {
                 let before = synced(&personal, &remote, 1);
                 let managed = team_copy(&before, "mine");
                 crate::registry::save(&before).unwrap();
-                crate::secrets::set_secret(
-                    &managed,
-                    crate::secrets::HTTP_AUTH_KEY,
-                    "independent-synthetic",
-                )
-                .unwrap();
+                crate::secrets::set_secret(&managed, crate::secrets::HTTP_AUTH_KEY, "independent-synthetic").unwrap();
 
                 let predicted = preview(&before, &remote, &["mine"]);
                 assert_eq!(predicted[0].local.outcome, HandoffOutcome::Attention);
@@ -7024,12 +7016,7 @@ mod tests {
                 let before = synced(&two, &remote, 1);
                 let other = team_copy(&before, "other");
                 crate::registry::save(&before).unwrap();
-                crate::secrets::set_secret(
-                    &other,
-                    crate::secrets::HTTP_AUTH_KEY,
-                    "independent-synthetic",
-                )
-                .unwrap();
+                crate::secrets::set_secret(&other, crate::secrets::HTTP_AUTH_KEY, "independent-synthetic").unwrap();
 
                 let (r, _, handoffs) = share(&before, &remote, &["mine", "other"]);
 
@@ -7098,11 +7085,7 @@ mod tests {
 
                 // The next sync keeps the owner's local value and binding.
                 let mut again = r.clone();
-                apply_team_config(
-                    &mut again,
-                    "publisher-test",
-                    &stored_definition(&json!({"servers": published})),
-                );
+                apply_team_config(&mut again, "publisher-test", &stored_definition(&json!({"servers": published})));
                 let owner_copy = again.servers.iter().find(|s| s.id == copy).unwrap();
                 assert_eq!(local_value(owner_copy).as_deref(), Some("/work"));
                 assert!(again.is_enabled(&profile, &copy));
@@ -7111,11 +7094,7 @@ mod tests {
                 // A member receives a Team copy to set up, with the input vaulted.
                 let mut member = base_registry();
                 member.servers.clear();
-                let outcome = apply_team_config(
-                    &mut member,
-                    "publisher-test",
-                    &stored_definition(&json!({"servers": published})),
-                );
+                let outcome = apply_team_config(&mut member, "publisher-test", &stored_definition(&json!({"servers": published})));
                 assert_eq!((outcome.blocked, outcome.review), (0, 1));
                 let input = &member.servers[0].launch.as_ref().unwrap().inputs[0];
                 assert!(input.secret && input.value.is_none());
@@ -7188,8 +7167,10 @@ mod tests {
         fn definitions_compare_in_the_form_the_service_stores() {
             crate::secrets::tests::with_isolated_vault(|| {
                 let mut personal = publisher_registry();
-                personal.servers[0].env =
-                    vec![serde_json::from_value(json!({"key":"API_TOKEN","secret":true})).unwrap()];
+                personal.servers[0].env = vec![serde_json::from_value(
+                    json!({"key":"API_TOKEN","secret":true}),
+                )
+                .unwrap()];
                 // The service drops every `secret` flag and `value` before saving.
                 let stored = stored_definition(&team_server_export(&personal));
                 assert!(!stored.to_string().contains("\"secret\""));
@@ -7249,11 +7230,7 @@ mod tests {
                 version: 5,
                 published: true,
                 local_setup_error: None,
-                handoffs: vec![handoff(
-                    "Vercel",
-                    HandoffOutcome::Attention,
-                    "Needs setup. Your personal server stays on in this profile.",
-                )],
+                handoffs: vec![handoff("Vercel", HandoffOutcome::Attention, "Needs setup. Your personal server stays on in this profile.")],
                 summary: String::new(),
             };
             assert!(result.needs_attention());

@@ -488,6 +488,8 @@ fn resolve_atomic_write_dest(path: &Path) -> Result<PathBuf, String> {
 /// If `path` is a symlink, the temp and rename target the resolved file so the
 /// link inode is left in place (SBS-886).
 pub fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(result) = tests::injected_atomic_write(path, contents) { return result; }
     atomic_write_with_ops(path, contents, &FsAtomicWriteOps)
 }
 
@@ -4595,7 +4597,7 @@ pub(crate) fn redact_url_userinfo(url: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::approval::fingerprint_allow_key;
 
@@ -5878,10 +5880,28 @@ mod tests {
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum FailingAtomicWriteStep {
+    pub(crate) enum FailingAtomicWriteStep {
         Permissions,
         Write,
         Sync,
+        Rename,
+    }
+
+    thread_local! {
+        static ATOMIC_FAILURE: std::cell::Cell<Option<FailingAtomicWriteStep>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(crate) fn with_atomic_failure<T>(step: FailingAtomicWriteStep, operation: impl FnOnce() -> T) -> T {
+        struct Restore(Option<FailingAtomicWriteStep>);
+        impl Drop for Restore {
+            fn drop(&mut self) { ATOMIC_FAILURE.set(self.0); }
+        }
+        let _restore = Restore(ATOMIC_FAILURE.replace(Some(step)));
+        operation()
+    }
+
+    pub(super) fn injected_atomic_write(path: &Path, contents: &str) -> Option<Result<(), String>> {
+        ATOMIC_FAILURE.get().map(|step| atomic_write_with_ops(path, contents, &FailingAtomicWriteOps(step)))
     }
 
     /// Fails the publish rename `fail_times` times, then lets it through.
@@ -6059,6 +6079,13 @@ mod tests {
             }
             file.sync_all()
         }
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if self.0 == FailingAtomicWriteStep::Rename {
+                return Err(std::io::Error::other("injected rename failure"));
+            }
+            std::fs::rename(from, to)
+        }
+
     }
 
     fn atomic_temp_files(path: &Path) -> Vec<PathBuf> {
@@ -6092,6 +6119,7 @@ mod tests {
             ("permissions", FailingAtomicWriteStep::Permissions),
             ("write", FailingAtomicWriteStep::Write),
             ("sync", FailingAtomicWriteStep::Sync),
+            ("rename", FailingAtomicWriteStep::Rename),
         ] {
             let path = dir.join(format!("{label}.json"));
             std::fs::write(&path, "original").unwrap();

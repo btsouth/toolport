@@ -1843,12 +1843,8 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
                         if stop.load(std::sync::atomic::Ordering::Acquire) { break; }
                         let state = handle.state::<RegistryState>();
                         match finish_sync(&handle, state.inner(), result) {
-                            Ok(fresh) => {
-                                let _ = handle.emit("team-sync-registry", &fresh);
-                            }
-                            Err(error) => {
-                                eprintln!("Toolport: Teams registry refresh failed: {error}")
-                            }
+                            Ok(fresh) => { let _ = handle.emit("team-sync-registry", &fresh); }
+                            Err(error) => eprintln!("Toolport: Teams registry refresh failed: {error}"),
                         }
                         teams::retry_delay_seconds(0)
                     }
@@ -1945,14 +1941,8 @@ fn team_disconnect(state: State<RegistryState>) -> Result<Registry, String> {
 }
 
 #[tauri::command]
-async fn team_use_managed(
-    app: tauri::AppHandle,
-    state: State<'_, RegistryState>,
-    server_id: String,
-) -> Result<Registry, String> {
-    tauri::async_runtime::spawn_blocking(move || teams::use_managed_server(&server_id))
-        .await
-        .map_err(|e| e.to_string())??;
+async fn team_use_managed(app: tauri::AppHandle, state: State<'_, RegistryState>, server_id: String) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || teams::use_managed_server(&server_id)).await.map_err(|e| e.to_string())??;
     let fresh = reload_into_state(state.inner())?;
     let _ = app.emit("team-sync-registry", &fresh);
     Ok(fresh)
@@ -1962,17 +1952,11 @@ async fn team_use_managed(
 /// only, secret values never sent). Remote instructions and policy fields are preserved, and
 /// an optimistic-concurrency conflict is returned rather than overwriting another admin.
 #[tauri::command]
-async fn team_push_preview(
-    state: State<'_, RegistryState>,
-    selected_ids: Option<Vec<String>>,
-) -> Result<teams::PushPreview, String> {
+async fn team_push_preview(state: State<'_, RegistryState>, selected_ids: Option<Vec<String>>) -> Result<teams::PushPreview, String> {
     refresh_from_disk(state.inner())?;
-    tauri::async_runtime::spawn_blocking(move || match selected_ids {
-        Some(ids) => teams::preview_push_selected(&ids),
-        None => teams::preview_push_current(),
-    })
-    .await
-    .map_err(|e| format!("push preview task join failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || match selected_ids { Some(ids) => teams::preview_push_selected(&ids), None => teams::preview_push_current() })
+        .await
+        .map_err(|e| format!("push preview task join failed: {e}"))?
 }
 
 #[tauri::command]
@@ -1984,10 +1968,8 @@ async fn team_push(
 ) -> Result<teams::PublishResult, String> {
     refresh_from_disk(state.inner())?;
     // push_current does a blocking GET + PUT to the team server; keep it off the main thread.
-    tauri::async_runtime::spawn_blocking(move || match selected_ids {
-        Some(ids) => teams::push_selected(&ids, base_version, &local_fingerprint),
-        None => teams::push_current(base_version, &local_fingerprint)
-            .map(teams::PublishResult::whole_set),
+    tauri::async_runtime::spawn_blocking(move || {
+        match selected_ids { Some(ids) => teams::push_selected(&ids, base_version, &local_fingerprint), None => teams::push_current(base_version, &local_fingerprint).map(teams::PublishResult::whole_set) }
     })
     .await
     .map_err(|e| format!("push task join failed: {e}"))?
@@ -2941,7 +2923,7 @@ fn reap_stale_and_restore_bridge(bridge: &HttpBridgeState, advice: &RestartAdvic
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut extra_keep = Vec::new();
-    if let Some(p) = clients::resolve_gateway_path() {
+    if let Some(p) = clients::resolve_gateway_path_readonly() {
         extra_keep.push(p);
     }
     // Port of a bridge that is alive *before* the reap; None means there is nothing
@@ -3429,21 +3411,12 @@ fn deliver_team_pair(app: &AppHandle, origin: String, team: String) {
         if let Some(current) = pairing.as_ref() {
             // A repeated link brings the waiting prompt back instead of pairing twice.
             if let Some(check) = &current.check {
-                let _ = app.emit(
-                    "team-pair",
-                    TeamPairEvent {
-                        check: Some(check.clone()),
-                        ..TeamPairEvent::new("pending")
-                    },
-                );
+                let _ = app.emit("team-pair", TeamPairEvent { check: Some(check.clone()), ..TeamPairEvent::new("pending") });
             }
             return;
         }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        *pairing = Some(TeamPairing {
-            cancel: std::sync::Arc::clone(&cancel),
-            check: None,
-        });
+        *pairing = Some(TeamPairing { cancel: std::sync::Arc::clone(&cancel), check: None });
         cancel
     };
     let pending = TeamPairGuard(std::sync::Arc::clone(&cancel));
@@ -4052,12 +4025,7 @@ pub fn run() {
                             ids.join(", ")
                         );
                         // Refresh ownership records for everything we rewrote (SOU-406).
-                        if let Err(error) = registry::update(|reg| {
-                            for (id, entry) in &repoint.repointed {
-                                reg.set_client_managed_entry(id, entry.clone());
-                            }
-                            Ok(())
-                        }) {
+                        if let Err(error) = crate::gateway_publish::persist_repointed_ownership(&repoint.repointed) {
                             crate::daemon::add_status_note("Client configs updated, but ownership state was not saved. Retry after fixing registry access.");
                             eprintln!("toolport: client configs updated, but ownership state was not saved: {error}");
                             let _ = migrate_handle.notification().builder().title("Client update incomplete")
