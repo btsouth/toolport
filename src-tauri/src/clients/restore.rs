@@ -111,7 +111,7 @@ pub(super) fn remember(
                 created_parents.push(dir.into());
                 parent = dir.parent();
             }
-            let preexisting_gateways = original_gateways(client_id, format, before)?;
+            let preexisting_gateways = original_gateways(client_id, format, path, before)?;
             Snapshot {
                 version: 1,
                 format,
@@ -267,9 +267,17 @@ fn key(format: Format) -> &'static str {
 fn original_gateways(
     client_id: &str,
     format: Format,
+    path: &Path,
     text: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    let mut names = gateway_names(format, &mutation::value(format, text)?);
+    // An existing legacy move record proves the first captured gateway was
+    // already installed by Toolport. Unowned customized gateway definitions
+    // are part of the original and must round-trip just like other entries.
+    let mut names = if moved::missing_names(client_id, format, path)?.is_empty() {
+        Vec::new()
+    } else {
+        gateway_names(format, &mutation::value(format, text)?)
+    };
     let registry = crate::registry_controller::registry_for_disconnect()?;
     if let (Some(record), Some(text)) = (registry.client_managed_entries.get(client_id), text) {
         for server in parse_client_content(format, text)? {
@@ -363,7 +371,7 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
     // A preview/1.x install can already have our gateway at first capture.
     // Its real pre-install bytes are unknown, so remove that owned entry and
     // restore the legacy moved record rather than resurrecting a dead gateway.
-    let mut owned = gateway_names(format, &before);
+    let mut owned = Vec::new();
     let original = mutation::value(format, record.original.as_deref())?;
     for name in &record.preexisting_gateways {
         let key = key(format);
@@ -1058,6 +1066,44 @@ mod tests {
         })
         .unwrap();
         assert_eq!(read_config_file(&path).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn unowned_custom_gateway_round_trips_and_survives_unrelated_edits() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-original-gateway-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let original = r#"{ "mcpServers": {"toolport":{"command":"/custom/toolport-gateway","args":["--profile","custom"],"env":{"EXTRA":"keep"}}}, "session":1 }"#;
+        for edited in [false, true] {
+            let path = dir.join(format!("custom-{edited}.json"));
+            std::fs::write(&path, original).unwrap();
+            mutation::run("fixture", &path, Format::JsonMcpServers, || {
+                edit_format(Format::JsonMcpServers, &path, Some(&entry()), true)
+            })
+            .unwrap();
+            if edited {
+                let mut root = parse_json_value(&read_config_file(&path).unwrap()).unwrap();
+                root["session"] = serde_json::json!(2);
+                std::fs::write(&path, serde_json::to_string(&root).unwrap()).unwrap();
+            }
+            disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
+            let restored = read_config_file(&path).unwrap();
+            if edited {
+                let root = parse_json_value(&restored).unwrap();
+                assert_eq!(root["session"], 2);
+                assert_eq!(
+                    root["mcpServers"],
+                    parse_json_value(original).unwrap()["mcpServers"]
+                );
+            } else {
+                assert_eq!(restored, original);
+            }
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
