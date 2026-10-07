@@ -23,7 +23,7 @@ use std::io::{BufRead, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -12189,12 +12189,20 @@ struct ProfileToolView {
     catalog: Arc<CatalogSnapshot>,
 }
 
+#[cfg(test)]
+type RootPlacementTestHook = Arc<dyn Fn(&str) -> Option<DownstreamServer> + Send + Sync>;
+
 #[derive(Default)]
 struct RootLaunchPool {
     base: Option<Arc<Router>>,
     specs: Vec<ServerEntry>,
     secrets_generation: u64,
     launches: BTreeMap<LaunchKey, RootLaunch>,
+    /// Weak entries keep the same gate for overlapping placements, including
+    /// invalidation, without retaining idle keys after their callers finish.
+    launch_locks: BTreeMap<LaunchKey, Weak<Mutex<()>>>,
+    #[cfg(test)]
+    placement_test_hook: Option<RootPlacementTestHook>,
     /// Subscription identity is stable across secret and command changes that
     /// replace a child at the same rooted cwd.
     subscriptions: BTreeMap<(String, String), Arc<Mutex<ResourceSubscriptionTable>>>,
@@ -12954,6 +12962,49 @@ impl HostState {
             return base;
         }
         let keys = root_launch_keys(&specs, root, reg.secrets_generation);
+        let gates = {
+            let mut pool = self
+                .root_launch_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pool.launch_locks.retain(|_, gate| gate.strong_count() > 0);
+            // Profiles can overlap or list servers in different orders. Acquire
+            // each distinct launch key in a stable order to avoid lock cycles.
+            keys.iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|key| {
+                    let entry = pool.launch_locks.entry(key.clone()).or_default();
+                    entry.upgrade().unwrap_or_else(|| {
+                        let gate = Arc::new(Mutex::new(()));
+                        *entry = Arc::downgrade(&gate);
+                        gate
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        #[cfg(test)]
+        let observer = self
+            .root_launch_pool
+            .lock()
+            .unwrap()
+            .placement_test_hook
+            .clone();
+        let _placements = gates
+            .iter()
+            .map(|gate| {
+                #[cfg(test)]
+                if matches!(gate.try_lock(), Err(std::sync::TryLockError::WouldBlock)) {
+                    if let Some(observer) = &observer {
+                        observer("waiting");
+                    }
+                }
+                gate.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+            .collect::<Vec<_>>();
+        // Recheck the live base, cached view and missing slots after waiting.
+        // Only equal keys wait; the pool mutex is never held during a handshake.
         let live = self
             .router
             .lock()
@@ -13045,6 +13096,10 @@ impl HostState {
         // Keep every other root and adapter free to use the pool during that wait.
         let mut connected = Vec::new();
         for (server, key, subscription_key, subscriptions) in missing {
+            #[cfg(test)]
+            let fixture = observer.as_ref().and_then(|hook| hook("connecting"));
+            #[cfg(not(test))]
+            let fixture: Option<DownstreamServer> = None;
             let dirty = Arc::clone(&self.downstream_dirty);
             let handler = Arc::clone(&self.server_handler);
             let active = Arc::new(AtomicBool::new(true));
@@ -13059,7 +13114,8 @@ impl HostState {
                     dispatch(producer, uri);
                 }
             }));
-            let Some(mut ds) = connect_one(&server, &dirty, handler, Some(root), sink.clone())
+            let Some(mut ds) =
+                fixture.or_else(|| connect_one(&server, &dirty, handler, Some(root), sink.clone()))
             else {
                 active.store(false, Ordering::SeqCst);
                 connected.push((key, None));
@@ -13109,12 +13165,12 @@ impl HostState {
             .root_launch_pool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A rooted child belongs to its LaunchKey, independently of the
+        // ordinary router. Reaping an empty pool or swapping that base while
+        // initialize is in flight must not discard a still-compatible child.
+        // View composition below separately checks the current base and slots.
         if pool.specs != daemon_root_servers(reg)
             || pool.secrets_generation != reg.secrets_generation
-            || !pool
-                .base
-                .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, &base))
         {
             drop(pool);
             for (_, launch) in &connected {
@@ -29863,6 +29919,129 @@ mod tests {
             0,
             "a completed gate returns immediately without consuming a waiter slot"
         );
+    }
+
+    fn rooted_placement_fixture() -> DownstreamServer {
+        DownstreamServer::connect(
+            "rooted".into(),
+            Box::new(MockRoute {
+                tools: vec![json!({
+                    "name": "read",
+                    "inputSchema": { "type": "object" },
+                    "annotations": { "readOnlyHint": true }
+                })],
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rooted_placement_single_flights_a_missing_launch() {
+        let _env = DataDirTestEnv::new("root-placement-single-flight");
+        let state = http_state(false);
+        let mut reg = Registry::default();
+        let mut server = stub_server("rooted", "Rooted");
+        server.cwd = Some("${ROOT}".into());
+        // The hook supplies an initialized downstream after pausing placement.
+        server.command = Some(_env.dir.join("absent-server").display().to_string());
+        reg.servers.push(server);
+        reg.set_server_enabled("default", "rooted", true).unwrap();
+        *state.registry.lock().unwrap() = reg.clone();
+        let base = state.router.lock().unwrap().clone();
+        let root_a = _env.dir.join("project-a");
+        let root_b = _env.dir.join("project-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let root_a = root_a.to_str().unwrap();
+        let root_b = root_b.to_str().unwrap();
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observer = {
+            let release = Arc::clone(&release);
+            let attempts = Arc::clone(&attempts);
+            Arc::new(move |event: &str| {
+                let first = event == "connecting" && attempts.fetch_add(1, Ordering::SeqCst) == 0;
+                events_tx.send(event.to_string()).unwrap();
+                if first {
+                    let (lock, cv) = &*release;
+                    let (released, _) = cv
+                        .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(10), |v| !*v)
+                        .unwrap();
+                    assert!(*released, "test did not release the first placement");
+                }
+                (event == "connecting").then(rooted_placement_fixture)
+            }) as RootPlacementTestHook
+        };
+        state.root_launch_pool.lock().unwrap().placement_test_hook = Some(observer);
+        std::thread::scope(|scope| {
+            let first =
+                scope.spawn(|| state.router_for_root(Arc::clone(&base), &reg, Some(root_a), None));
+            assert_eq!(
+                events_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                "connecting"
+            );
+            let second =
+                scope.spawn(|| state.router_for_root(Arc::clone(&base), &reg, Some(root_a), None));
+            // Before the fix the follower reaches "connecting" while the first
+            // placement is paused. With single-flight it reaches "waiting".
+            // Either event releases the leader, so the unfixed code fails the
+            // attempt count rather than hanging on a barrier.
+            let follower = events_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            // An unrelated root must finish while project A is still paused.
+            state.router_for_root(Arc::clone(&base), &reg, Some(root_b), None);
+            assert_eq!(
+                events_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                "connecting"
+            );
+            let (lock, cv) = &*release;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+            let a = first.join().unwrap();
+            let shared_a = second.join().unwrap();
+            assert_eq!(attempts.load(Ordering::SeqCst), 2, "one attempt per root");
+            assert_eq!(follower, "waiting");
+            assert!(Arc::ptr_eq(&a, &shared_a), "same root must share its view");
+        });
+    }
+
+    #[test]
+    fn rooted_placement_keeps_its_result_when_the_empty_pool_is_reaped() {
+        let env = DataDirTestEnv::new("root-placement-reap");
+        let state = http_state(false);
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        let mut reg = Registry::default();
+        let mut server = stub_server("rooted", "Rooted");
+        server.cwd = Some("${ROOT}".into());
+        server.command = Some(env.dir.join("absent-server").display().to_string());
+        reg.servers.push(server);
+        reg.set_server_enabled("default", "rooted", true).unwrap();
+        *state.registry.lock().unwrap() = reg.clone();
+        let base = state.router.lock().unwrap().clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observer = {
+            let host = Arc::downgrade(&state.host);
+            let attempts = Arc::clone(&attempts);
+            Arc::new(move |event: &str| {
+                if event == "connecting" {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    // The watcher can reap after missing-key selection and
+                    // before connect returns, while both pool maps are empty.
+                    host.upgrade().unwrap().reap_root_launches();
+                }
+                (event == "connecting").then(rooted_placement_fixture)
+            }) as RootPlacementTestHook
+        };
+        state.root_launch_pool.lock().unwrap().placement_test_hook = Some(observer);
+        let root = env.dir.to_str().unwrap();
+        state.router_for_root(Arc::clone(&base), &reg, Some(root), None);
+        state.router_for_root(Arc::clone(&base), &reg, Some(root), None);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "reaping must preserve the initialized child"
+        );
+        assert_eq!(state.root_launch_pool.lock().unwrap().launches.len(), 1);
     }
 
     #[test]
