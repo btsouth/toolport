@@ -3427,6 +3427,11 @@ pub(crate) const CHILD_ENV_ALLOWLIST_WINDOWS: &[&str] = &[
     // PowerShell shim or launcher fails on its own cmdlets. The parent's value is
     // the same module path list the pre-SEC-04 child inherited.
     "PSModulePath",
+    // Where a pre-built module analysis cache lives. Without it a child
+    // PowerShell re-analyzes every module on PSModulePath before its first
+    // command lookup, which takes tens of seconds on a machine with large
+    // module sets (CI images set it for exactly this reason).
+    "PSModuleAnalysisCachePath",
 ];
 
 /// Whether `name` may be copied from the gateway's environment into a spawned
@@ -7920,6 +7925,7 @@ mod tests {
     fn windows_system_and_powershell_locators_are_allowlisted() {
         for name in [
             "PSModulePath",
+            "PSModuleAnalysisCachePath",
             "ALLUSERSPROFILE",
             "COMPUTERNAME",
             "PROCESSOR_IDENTIFIER",
