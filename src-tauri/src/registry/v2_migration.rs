@@ -57,7 +57,10 @@ const DROPPED_KEYS: &[&str] = &[
     "integrityCheck",
 ];
 
-pub(super) fn migrate_v1_to_v2(value: &mut Value, context: &MigrationContext) -> Result<(), String> {
+pub(super) fn migrate_v1_to_v2(
+    value: &mut Value,
+    context: &MigrationContext,
+) -> Result<(), String> {
     let registry = value
         .as_object_mut()
         .ok_or_else(|| "the registry is not a JSON object".to_string())?;
@@ -117,7 +120,11 @@ fn export_rules(registry: &Map<String, Value>, context: &MigrationContext) -> Re
         .collect();
     for project in projects {
         let project_targets = project.get("targets").and_then(Value::as_array);
-        for target in project_targets.into_iter().flatten().filter_map(Value::as_str) {
+        for target in project_targets
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
             if !targets.iter().any(|known| known == target) {
                 targets.push(target.to_string());
             }
@@ -216,8 +223,8 @@ fn rules_in_file(path: &Path) -> Result<String, String> {
     if metadata.len() > MAX_RULES_FILE_BYTES {
         return Err("The file is larger than 1 MiB; skipped.".to_string());
     }
-    let content =
-        std::fs::read_to_string(path).map_err(|error| format!("Could not read the file: {error}."))?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| format!("Could not read the file: {error}."))?;
     if let Some(start) = content.find(RULES_START_PREFIX) {
         let after_marker = content[start..]
             .find('\n')
@@ -366,14 +373,20 @@ mod tests {
     const CLAUDE_MD: &str = "# My notes\n\nKeep this.\n\n<!-- toolport:rules:start set=personal v=3 -->\nAlways run the tests.\nNever push to main.\n<!-- toolport:rules:end -->\n\nAfter the block.\n";
     const OWNED_RULES: &str = "<!-- Toolport personal rules: set personal, v3. Edits are overwritten on the next apply; change them in Toolport. -->\n\nAlways run the tests.\nNever push to main.\n";
     const PROJECT_AGENTS_MD: &str = "<!-- toolport:rules:start set=work v=1 -->\nUse `cargo test`.\n<!-- toolport:rules:end -->\n";
-    const ROUTINES: &str = "{\n  \"routines\": [{\"name\": \"triage\", \"script\": \"return 1\"}]\n}\n";
+    const ROUTINES: &str =
+        "{\n  \"routines\": [{\"name\": \"triage\", \"script\": \"return 1\"}]\n}\n";
+
+    /// `rel` under the scratch dir, spelled the way the fixture spells it.
+    fn under(dir: &Path, rel: &str) -> String {
+        format!("{}/{rel}", dir.display())
+    }
 
     /// Client files 1.x wrote rules into, plus a saved routines file, the way a
     /// daily 1.24 install leaves them.
     fn seed_user_files(dir: &Path) -> Vec<PathBuf> {
-        let claude_md = dir.join("home/.claude/CLAUDE.md");
-        let owned = dir.join("home/.cursor/rules/toolport-rules.md");
-        let project = dir.join("proj/AGENTS.md");
+        let claude_md = PathBuf::from(under(dir, "home/.claude/CLAUDE.md"));
+        let owned = PathBuf::from(under(dir, "home/.cursor/rules/toolport-rules.md"));
+        let project = PathBuf::from(under(dir, "proj/AGENTS.md"));
         for (path, content) in [
             (&claude_md, CLAUDE_MD),
             (&owned, OWNED_RULES),
@@ -388,120 +401,123 @@ mod tests {
 
     /// A Brandon-like 1.24 registry: every safety flag off, Code Mode on, two rule
     /// sets applied to clients and a project, routines, hooks and the guard on, a
-    /// shared-HTTP client entry and a joined team.
+    /// shared-HTTP client entry and a joined team. `@DIR@` is the scratch dir.
+    const BRANDON_V1: &str = r#"{
+    "version": 1,
+    "servers": [
+        {
+            "id": "github",
+            "name": "GitHub",
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-github"],
+            "env": [{"key": "GITHUB_TOKEN", "secret": true}],
+            "source": "manual",
+            "disabledTools": ["delete_repository"]
+        },
+        {
+            "id": "linear",
+            "name": "Linear",
+            "transport": "http",
+            "url": "https://mcp.linear.app/mcp",
+            "args": [],
+            "env": [],
+            "source": "team:t1"
+        }
+    ],
+    "profiles": [
+        {
+            "id": "default",
+            "name": "Default",
+            "enabledServerIds": ["github", "linear"],
+            "toolScope": {"github": ["search_code", "get_issue"]}
+        },
+        {"id": "work", "name": "Work", "enabledServerIds": ["linear"]}
+    ],
+    "activeProfileId": "default",
+    "gatewayTopology": "legacy",
+    "denyDestructive": false,
+    "confirmDestructive": false,
+    "humanApproval": false,
+    "humanApprovalAllow": ["github/search_code"],
+    "teamForcedHumanApproval": true,
+    "teamForcedDenyDestructive": false,
+    "teamForcedContentDefense": true,
+    "teamForcedQuarantineOnDrift": false,
+    "teamForcedBlockOnInjection": false,
+    "teamForcedPiiRedaction": false,
+    "toolOverrides": {"github": {"create_issue": {"description": "Open an issue"}}},
+    "pinnedTools": {"github": ["get_me"]},
+    "quarantineOnDrift": false,
+    "lazyDiscovery": true,
+    "discoveryMode": "grouped",
+    "codeMode": true,
+    "allowRoutineWrites": true,
+    "allowAgentControl": true,
+    "integrityCheck": true,
+    "contentDefense": true,
+    "piiRedaction": false,
+    "blockOnInjection": false,
+    "liveInspect": true,
+    "team": {
+        "serverUrl": "https://teams.toolport.dev",
+        "teamId": "t1",
+        "role": "member",
+        "lastVersion": 12,
+        "managedServerIds": {"linear": "srv_1"},
+        "reportingDeviceId": "dev-1",
+        "teamName": "Acme",
+        "teamInstructionsVersion": 2,
+        "teamInstructionsTargets": ["@DIR@/home/.claude/rules/toolport-team-rules.md"]
+    },
+    "clientScopes": {"cursor": "work"},
+    "folderProfiles": [{"path": "@DIR@/proj", "profile": "work"}],
+    "clientDiscovery": {"cursor": "lazy"},
+    "clientManagedEntries": {
+        "claude-desktop": {
+            "command": "toolport-gateway",
+            "args": [],
+            "env": {"TOOLPORT_CLIENT_ID": "claude-desktop"},
+            "transport": "sharedHttp",
+            "url": "http://127.0.0.1:8765/mcp"
+        }
+    },
+    "ruleSets": [
+        {"id": "personal", "name": "Personal", "content": "Always run the tests.\nNever push to main.\n", "revision": 3},
+        {"id": "work", "name": "Work", "content": "Use `cargo test`.\n```bash\ncargo test\n```\n", "revision": 1}
+    ],
+    "activeRuleSetId": "personal",
+    "rulesClients": {"claude-code": true, "cursor": true},
+    "rulesTargets": [
+        "@DIR@/home/.claude/CLAUDE.md",
+        "@DIR@/home/.cursor/rules/toolport-rules.md",
+        "@DIR@/home/.gemini/GEMINI.md"
+    ],
+    "rulesProjects": [{
+        "id": "proj",
+        "path": "@DIR@/proj",
+        "name": "proj",
+        "setId": "work",
+        "files": {"agents-md": true, "gemini-md": false},
+        "targets": ["@DIR@/proj/AGENTS.md"]
+    }],
+    "guardCursorMode": "enforce",
+    "guardClaudeMode": "observe",
+    "guardTargets": ["@DIR@/home/.cursor/hooks.json"],
+    "agentPermissionsEnabled": true,
+    "agentPermissionRules": [{"pattern": "Bash(rm -rf *)", "action": "deny"}],
+    "agentPermissionTargets": {
+        "@DIR@/home/.claude/settings.json": [{"pattern": "Bash(rm -rf *)", "action": "deny"}]
+    },
+    "hooksEnabled": true,
+    "hookTargets": ["@DIR@/home/.claude/settings.json"],
+    "secretsGeneration": 4
+})"#;
+
     fn brandon_v1(dir: &Path) -> Value {
-        let path = |rel: &str| dir.join(rel).to_string_lossy().into_owned();
-        json!({
-            "version": 1,
-            "servers": [
-                {
-                    "id": "github",
-                    "name": "GitHub",
-                    "transport": "stdio",
-                    "command": "npx",
-                    "args": ["-y", "@modelcontextprotocol/server-github"],
-                    "env": [{"key": "GITHUB_TOKEN", "secret": true}],
-                    "source": "manual",
-                    "disabledTools": ["delete_repository"]
-                },
-                {
-                    "id": "linear",
-                    "name": "Linear",
-                    "transport": "http",
-                    "url": "https://mcp.linear.app/mcp",
-                    "args": [],
-                    "env": [],
-                    "source": "team:t1"
-                }
-            ],
-            "profiles": [
-                {
-                    "id": "default",
-                    "name": "Default",
-                    "enabledServerIds": ["github", "linear"],
-                    "toolScope": {"github": ["search_code", "get_issue"]}
-                },
-                {"id": "work", "name": "Work", "enabledServerIds": ["linear"]}
-            ],
-            "activeProfileId": "default",
-            "gatewayTopology": "legacy",
-            "denyDestructive": false,
-            "confirmDestructive": false,
-            "humanApproval": false,
-            "humanApprovalAllow": ["github/search_code"],
-            "teamForcedHumanApproval": true,
-            "teamForcedDenyDestructive": false,
-            "teamForcedContentDefense": true,
-            "teamForcedQuarantineOnDrift": false,
-            "teamForcedBlockOnInjection": false,
-            "teamForcedPiiRedaction": false,
-            "toolOverrides": {"github": {"create_issue": {"description": "Open an issue"}}},
-            "pinnedTools": {"github": ["get_me"]},
-            "quarantineOnDrift": false,
-            "lazyDiscovery": true,
-            "discoveryMode": "grouped",
-            "codeMode": true,
-            "allowRoutineWrites": true,
-            "allowAgentControl": true,
-            "integrityCheck": true,
-            "contentDefense": true,
-            "piiRedaction": false,
-            "blockOnInjection": false,
-            "liveInspect": true,
-            "team": {
-                "serverUrl": "https://teams.toolport.dev",
-                "teamId": "t1",
-                "role": "member",
-                "lastVersion": 12,
-                "managedServerIds": {"linear": "srv_1"},
-                "reportingDeviceId": "dev-1",
-                "teamName": "Acme",
-                "teamInstructionsVersion": 2,
-                "teamInstructionsTargets": [path("home/.claude/rules/toolport-team-rules.md")]
-            },
-            "clientScopes": {"cursor": "work"},
-            "folderProfiles": [{"path": path("proj"), "profile": "work"}],
-            "clientDiscovery": {"cursor": "lazy"},
-            "clientManagedEntries": {
-                "claude-desktop": {
-                    "command": "toolport-gateway",
-                    "args": [],
-                    "env": {"TOOLPORT_CLIENT_ID": "claude-desktop"},
-                    "transport": "sharedHttp",
-                    "url": "http://127.0.0.1:8765/mcp"
-                }
-            },
-            "ruleSets": [
-                {"id": "personal", "name": "Personal", "content": "Always run the tests.\nNever push to main.\n", "revision": 3},
-                {"id": "work", "name": "Work", "content": "Use `cargo test`.\n```bash\ncargo test\n```\n", "revision": 1}
-            ],
-            "activeRuleSetId": "personal",
-            "rulesClients": {"claude-code": true, "cursor": true},
-            "rulesTargets": [
-                path("home/.claude/CLAUDE.md"),
-                path("home/.cursor/rules/toolport-rules.md"),
-                path("home/.gemini/GEMINI.md")
-            ],
-            "rulesProjects": [{
-                "id": "proj",
-                "path": path("proj"),
-                "name": "proj",
-                "setId": "work",
-                "files": {"agents-md": true, "gemini-md": false},
-                "targets": [path("proj/AGENTS.md")]
-            }],
-            "guardCursorMode": "enforce",
-            "guardClaudeMode": "observe",
-            "guardTargets": [path("home/.cursor/hooks.json")],
-            "agentPermissionsEnabled": true,
-            "agentPermissionRules": [{"pattern": "Bash(rm -rf *)", "action": "deny"}],
-            "agentPermissionTargets": {
-                path("home/.claude/settings.json"): [{"pattern": "Bash(rm -rf *)", "action": "deny"}]
-            },
-            "hooksEnabled": true,
-            "hookTargets": [path("home/.claude/settings.json")],
-            "secretsGeneration": 4
-        })
+        let escaped = serde_json::to_string(&dir.display().to_string()).unwrap();
+        let dir_json = &escaped[1..escaped.len() - 1];
+        serde_json::from_str(&BRANDON_V1.replace("@DIR@", dir_json)).unwrap()
     }
 
     fn write_json(path: &Path, value: &Value) -> String {
@@ -547,7 +563,11 @@ mod tests {
         // The pre-migration snapshot holds the exact v1 bytes.
         let backups = migration_backup_files(&path);
         assert_eq!(backups.len(), 1);
-        let name = backups[0].file_name().unwrap().to_string_lossy().into_owned();
+        let name = backups[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert!(name.starts_with("registry.json.v1-"), "{name}");
         assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), original);
 
@@ -603,7 +623,10 @@ mod tests {
         ] {
             assert_eq!(v2[key], v1[key], "{key} changed");
         }
-        assert_eq!(v2["profiles"][0]["toolScope"], v1["profiles"][0]["toolScope"]);
+        assert_eq!(
+            v2["profiles"][0]["toolScope"],
+            v1["profiles"][0]["toolScope"]
+        );
         assert_eq!(v2["profiles"][1], v1["profiles"][1]);
         for (key, value) in v1["team"].as_object().unwrap() {
             assert_eq!(&v2["team"][key], value, "team.{key} changed");
@@ -612,7 +635,10 @@ mod tests {
             v2["clientManagedEntries"]["claude-desktop"]["transport"],
             "sharedHttp"
         );
-        assert_eq!(registry.servers[0].disabled_tools, vec!["delete_repository"]);
+        assert_eq!(
+            registry.servers[0].disabled_tools,
+            vec!["delete_repository"]
+        );
         // The team lock still applies on top of the member's own level.
         assert_eq!(registry.safety_level_effective(), SafetyLevel::Ask);
 
@@ -629,15 +655,37 @@ mod tests {
         let rules = std::fs::read_to_string(dir.join(format!("exports/rules-{date}.md"))).unwrap();
         assert!(rules.contains("### Personal (active)"), "{rules}");
         assert!(rules.contains("### Work\n"), "{rules}");
-        assert!(rules.contains("Always run the tests.\nNever push to main."), "{rules}");
-        assert!(rules.contains("````markdown\nUse `cargo test`.\n```bash"), "{rules}");
-        assert!(rules.contains(&format!("- `{}`, rule set \"Work\", files: agents-md", dir.join("proj").display())), "{rules}");
-        assert!(rules.contains(&format!("### `{}`", client_files[0].display())), "{rules}");
-        assert!(rules.contains(&format!("### `{}`", client_files[2].display())), "{rules}");
+        assert!(
+            rules.contains("Always run the tests.\nNever push to main."),
+            "{rules}"
+        );
+        assert!(
+            rules.contains("````markdown\nUse `cargo test`.\n```bash"),
+            "{rules}"
+        );
+        let project_line = format!(
+            "- `{}`, rule set \"Work\", files: agents-md",
+            under(&dir, "proj")
+        );
+        assert!(rules.contains(&project_line), "{rules}");
+        assert!(
+            rules.contains(&format!("### `{}`", client_files[0].display())),
+            "{rules}"
+        );
+        assert!(
+            rules.contains(&format!("### `{}`", client_files[2].display())),
+            "{rules}"
+        );
         assert!(rules.contains("The file no longer exists."), "{rules}");
-        assert!(!rules.contains("toolport:rules:"), "markers must not be exported: {rules}");
+        assert!(
+            !rules.contains("toolport:rules:"),
+            "markers must not be exported: {rules}"
+        );
         assert!(!rules.contains("Toolport personal rules:"), "{rules}");
-        assert!(!rules.contains("After the block."), "only the Toolport block is copied: {rules}");
+        assert!(
+            !rules.contains("After the block."),
+            "only the Toolport block is copied: {rules}"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join(format!("exports/routines-{date}.json"))).unwrap(),
             ROUTINES
@@ -647,9 +695,17 @@ mod tests {
         assert_eq!(permissions["addedToFiles"], v1["agentPermissionTargets"]);
 
         // Nothing outside the data dir's exports was touched.
-        assert_eq!(std::fs::read_to_string(dir.join("routines.json")).unwrap(), ROUTINES);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("routines.json")).unwrap(),
+            ROUTINES
+        );
         for (path, before) in client_files.iter().zip(&client_bytes) {
-            assert_eq!(&std::fs::read_to_string(path).unwrap(), before, "{}", path.display());
+            assert_eq!(
+                &std::fs::read_to_string(path).unwrap(),
+                before,
+                "{}",
+                path.display()
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -667,8 +723,14 @@ mod tests {
             // Team locks are not the member's choice and stay as they were.
             (json!({"teamForcedDenyDestructive": true}), "ask"),
             // A level picked in a 2.0 preview wins over the old flags.
-            (json!({"safetyLevel": "off", "denyDestructive": true}), "off"),
-            (json!({"safetyLevel": "bogus", "blockOnInjection": true}), "strict"),
+            (
+                json!({"safetyLevel": "off", "denyDestructive": true}),
+                "off",
+            ),
+            (
+                json!({"safetyLevel": "bogus", "blockOnInjection": true}),
+                "strict",
+            ),
         ];
         for (flags, expected) in cases {
             let mut value = json!({"version": 1, "servers": [], "profiles": []});
@@ -681,7 +743,10 @@ mod tests {
                 assert_eq!(value["teamForcedDenyDestructive"], true);
             }
         }
-        assert!(exports(&dir).is_empty(), "nothing to export, nothing written");
+        assert!(
+            exports(&dir).is_empty(),
+            "nothing to export, nothing written"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -727,7 +792,11 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), original);
         assert!(exports(&context.data_dir).is_empty());
         migrate_v1_to_v2(value, context)?;
-        assert_eq!(exports(&context.data_dir).len(), 3, "exports land in the step");
+        assert_eq!(
+            exports(&context.data_dir).len(),
+            3,
+            "exports land in the step"
+        );
         assert_eq!(
             std::fs::read(&path).unwrap(),
             original,
@@ -770,7 +839,10 @@ mod tests {
         // A later step fails after the v2 step ran and exported.
         let pipeline: &[Migration] = &[migrate_v1_to_v2, failing_v2_to_v3];
         let error = load_from_with_migrations_for_test(&path, pipeline, 3).unwrap_err();
-        assert!(error.contains("v2 to v3") && error.contains("boom"), "{error}");
+        assert!(
+            error.contains("v2 to v3") && error.contains("boom"),
+            "{error}"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         assert!(!backup_path(&path).exists());
         assert_eq!(migration_backup_files(&path).len(), 1);
@@ -813,13 +885,17 @@ mod tests {
         let dir = scratch_dir("rollback-fixture");
         let _override = DataDirOverride::set(&dir);
         let path = dir.join("registry.json");
-        std::fs::write(&path, include_str!("../../tests/fixtures/registry-v1-to-v2/v1.json"))
-            .unwrap();
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/registry-v1-to-v2/v1.json"),
+        )
+        .unwrap();
         load_from(&path).unwrap();
         let actual = read_json(&path);
-        let expected: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/registry-v1-to-v2/v2.json"))
-                .unwrap();
+        let expected: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/registry-v1-to-v2/v2.json"
+        ))
+        .unwrap();
         assert_eq!(
             actual,
             expected,

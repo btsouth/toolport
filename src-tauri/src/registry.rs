@@ -4745,10 +4745,7 @@ mod tests {
         })
         .unwrap();
         assert!(out.deny_destructive, "our change applied");
-        assert!(
-            out.live_inspect,
-            "the concurrent write was NOT reverted"
-        );
+        assert!(out.live_inspect, "the concurrent write was NOT reverted");
 
         let reloaded = load_from(&path).unwrap();
         assert!(reloaded.deny_destructive && reloaded.live_inspect);
@@ -7379,7 +7376,11 @@ mod registry_version_tests {
         std::fs::write(&path, MISSING_VERSION).unwrap();
 
         let value: serde_json::Value = serde_json::from_str(MISSING_VERSION).unwrap();
-        assert_eq!(document_version(&value), 1, "a missing version is read as v1");
+        assert_eq!(
+            document_version(&value),
+            1,
+            "a missing version is read as v1"
+        );
         let registry = load().unwrap();
         assert_eq!(registry.version, REGISTRY_VERSION, "and migrated from v1");
         let backups = migration_backup_files(&path);
@@ -7603,7 +7604,10 @@ mod registry_version_tests {
         for (label, document) in fixtures {
             std::fs::write(&path, document).unwrap();
             let registry = load().unwrap_or_else(|error| panic!("{label} failed to load: {error}"));
-            assert_eq!(registry.version, REGISTRY_VERSION, "{label} migrates from v1");
+            assert_eq!(
+                registry.version, REGISTRY_VERSION,
+                "{label} migrates from v1"
+            );
             assert!(!registry.servers.is_empty(), "{label} has a server");
             assert!(
                 registry
