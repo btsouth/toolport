@@ -63,9 +63,9 @@ The independent **Require human approval** setting takes precedence over agent
 confirmation for gated tools. Legacy clients and scripts use the authenticated
 app approval broker. If no broker is published, they immediately fail closed with
 an `unreachable` decision and an error asking whether the Toolport app is running.
-Stale endpoints have bounded connection/authentication timeouts; a prompt that
-reaches the app auto-denies after 120 seconds. Modern clients use MCP elicitation
-and receive a capability error when they cannot show that approval request.
+Stale or unresponsive brokers fail closed; authentication and decision reads
+use timeouts. A prompt that reaches the app auto-denies after 120 seconds.
+Modern clients use MCP elicitation and receive a capability error when they cannot show that approval request.
 Team-forced human approval or destructive-tool blocking still takes precedence;
 changing the member's confirmation setting does not release those team locks.
 
