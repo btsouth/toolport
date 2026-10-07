@@ -1744,9 +1744,7 @@ export function ActivityView({
     }
   }
 
-  const liveSecurity = dedupeSecurity(security).filter(
-    (e) => !isDismissed(e, dismissed),
-  );
+  const liveSecurity = dedupeSecurity(security).filter((e) => !isDismissed(e, dismissed));
   // Split loud/actionable signal from benign churn so vendor revisions don't bury a real
   // poison or privilege-escalation flag (the failure this whole surface exists to avoid).
   //
