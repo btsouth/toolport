@@ -618,7 +618,8 @@ export function activeProfile(registry: Registry): Profile | undefined {
 }
 
 export function isEnabled(registry: Registry, serverId: string): boolean {
-  if (registry.version < 3) return activeProfile(registry)?.enabledServerIds.includes(serverId) ?? false;
+  if (registry.version < 3)
+    return activeProfile(registry)?.enabledServerIds.includes(serverId) ?? false;
   return registry.servers.find((s) => s.id === serverId)?.enabled ?? false;
 }
 

@@ -549,8 +549,6 @@ export function AppSidebar({
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
-
-
         <nav aria-label="Views" className="flex flex-col gap-0.5 px-3 pt-2">
           {navItem(Layers, "Servers", view === "servers", () => onSelectView("servers"))}
           {navItem(MonitorCog, "Clients", view === "clients", () =>

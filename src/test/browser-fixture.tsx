@@ -75,18 +75,27 @@ mockIPC(
         return registry;
       case "set_access_server": {
         const profile = registry.profiles.find((p) => p.id === payload?.profileId)!;
-        profile.enabledServerIds = profile.enabledServerIds.filter((id) => id !== payload?.serverId);
+        profile.enabledServerIds = profile.enabledServerIds.filter(
+          (id) => id !== payload?.serverId,
+        );
         if (payload?.included) profile.enabledServerIds.push(payload.serverId as string);
         return registry;
       }
       case "create_profile":
-        registry.profiles.push({ id: String(payload?.name).toLowerCase(), name: String(payload?.name), enabledServerIds: [] });
+        registry.profiles.push({
+          id: String(payload?.name).toLowerCase(),
+          name: String(payload?.name),
+          enabledServerIds: [],
+        });
         return registry;
       case "delete_profile":
         registry.profiles = registry.profiles.filter((p) => p.id !== payload?.id);
         return registry;
       case "install_gateway":
-        registry.clientScopes = { ...registry.clientScopes, [String(payload?.clientId)]: String(payload?.profile || "") };
+        registry.clientScopes = {
+          ...registry.clientScopes,
+          [String(payload?.clientId)]: String(payload?.profile || ""),
+        };
         return registry;
       case "get_registry":
         return registry;

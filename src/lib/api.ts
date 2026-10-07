@@ -890,7 +890,11 @@ export function setDefaultAccess(profile: string | null): Promise<Registry> {
   return invoke<Registry>("set_default_access", { profile });
 }
 
-export function setAccessServer(profileId: string, serverId: string, included: boolean): Promise<Registry> {
+export function setAccessServer(
+  profileId: string,
+  serverId: string,
+  included: boolean,
+): Promise<Registry> {
   return invoke<Registry>("set_access_server", { profileId, serverId, included });
 }
 

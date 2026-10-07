@@ -7405,9 +7405,7 @@ fn router_servers<'a>(
         // not start the daemon. The per-request allowed set narrows this union.
         reg.servers
             .iter()
-            .filter(|server| {
-                reg.server_enabled(&server.id)
-            })
+            .filter(|server| reg.server_enabled(&server.id))
             .collect()
     } else if http_mode {
         reg.bridge_enabled_servers(profile)
@@ -20594,7 +20592,7 @@ mod tests {
         let env_profile = Some("Default".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            Some(reg.default_access_id())
+            Some("default".into())
         );
     }
 
@@ -20621,7 +20619,7 @@ mod tests {
         let env_profile = Some("Default".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            Some(reg.default_access_id())
+            Some("default".into())
         );
     }
 

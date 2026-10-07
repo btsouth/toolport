@@ -2987,7 +2987,11 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
         .filter(|server| saved_team_original_id(server).is_none())
         .map(|server| (server.id.clone(), plain_launch_values(server)))
         .collect();
-    let previous_global: HashMap<String, bool> = reg.servers.iter().map(|s| (s.id.clone(), s.enabled)).collect();
+    let previous_global: HashMap<String, bool> = reg
+        .servers
+        .iter()
+        .map(|s| (s.id.clone(), s.enabled))
+        .collect();
     let prev_enabled_by_profile: std::collections::HashMap<
         String,
         std::collections::HashSet<String>,
@@ -3148,8 +3152,12 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     }
     if reg.version >= 3 {
         for server in reg.servers.iter_mut().filter(|s| is_team_server(s, &tag)) {
-            let in_access_set = reg.profiles.iter().any(|p| p.enabled_server_ids.contains(&server.id));
-            server.enabled = in_access_set && previous_global.get(&server.id).copied().unwrap_or(true);
+            let in_access_set = reg
+                .profiles
+                .iter()
+                .any(|p| p.enabled_server_ids.contains(&server.id));
+            server.enabled =
+                in_access_set && previous_global.get(&server.id).copied().unwrap_or(true);
         }
     }
     // What the member still has to look at: review servers that are OFF in the active

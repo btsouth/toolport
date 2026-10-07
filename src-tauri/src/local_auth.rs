@@ -205,16 +205,18 @@ pub(crate) fn restore_personal_routes(reg: &mut Registry, team_id: &str) {
         }
         let managed_on = reg.server_enabled(managed);
         for profile in &mut reg.profiles {
-            if managed_on && profile.enabled_server_ids.contains(managed)
+            if managed_on
+                && profile.enabled_server_ids.contains(managed)
                 && !profile.enabled_server_ids.contains(&binding.personal_id)
             {
                 profile.enabled_server_ids.push(binding.personal_id.clone());
             }
         }
         if managed_on {
-            if let Some(personal) = reg.servers.iter_mut().find(|s| s.id == binding.personal_id) { personal.enabled = true; }
+            if let Some(personal) = reg.servers.iter_mut().find(|s| s.id == binding.personal_id) {
+                personal.enabled = true;
+            }
         }
-
     }
     entries.retain(|_, binding| binding.team_id != team_id);
     if let Ok(value) = serde_json::to_value(entries) {

@@ -292,14 +292,41 @@ function FolderRouting({
   );
 }
 
-function AccessSetCreator({ onRegistryChange }: { onRegistryChange: (r: Registry) => void }) {
+function AccessSetCreator({
+  onRegistryChange,
+}: {
+  onRegistryChange: (r: Registry) => void;
+}) {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
-  return <form className="flex gap-2" onSubmit={async (event) => {
-    event.preventDefault(); setBusy(true);
-    try { onRegistryChange(await createProfile(name)); setName(""); } catch (e) { toastError(`${e}`); } finally { setBusy(false); }
-  }}><input aria-label="Access set name" placeholder="Access set name" value={name} onChange={(e) => setName(e.target.value)} className="rounded border px-2" />
-    <button disabled={busy || !name.trim()} type="submit">Create access set</button></form>;
+  return (
+    <form
+      className="flex gap-2"
+      onSubmit={async (event) => {
+        event.preventDefault();
+        setBusy(true);
+        try {
+          onRegistryChange(await createProfile(name));
+          setName("");
+        } catch (e) {
+          toastError(`${e}`);
+        } finally {
+          setBusy(false);
+        }
+      }}
+    >
+      <input
+        aria-label="Access set name"
+        placeholder="Access set name"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        className="rounded border px-2"
+      />
+      <button disabled={busy || !name.trim()} type="submit">
+        Create access set
+      </button>
+    </form>
+  );
 }
 
 interface Props {
@@ -1012,93 +1039,152 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         )}
         <details>
           <summary>Advanced</summary>
-      {profiles.length > 0 && (
-        <section className="flex flex-col gap-2">
-          <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-            Access sets
-          </h2>
-          <p className="text-xs text-muted-foreground">Access sets narrow the enabled servers and tools a client can use. Servers that are off stay hidden from every client.</p>
-          <label className="text-sm">Default access</label>
-          <Select value={registry?.defaultAccessProfileId || "@all-enabled"} onValueChange={async (id) => {
-            try { onRegistryChange(await setDefaultAccess(id === "@all-enabled" ? null : id)); } catch (e) { toastError(`${e}`); }
-          }}>
-            <SelectTrigger aria-label="Default access"><SelectValue /></SelectTrigger>
-            <SelectContent><SelectItem value="@all-enabled">All enabled servers</SelectItem>{profiles.map((p) => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)}</SelectContent>
-          </Select>
-          <AccessSetCreator onRegistryChange={onRegistryChange} />
-          <div className="flex flex-col divide-y rounded-lg border">
-            {profiles.map((p) => {
-              const names = p.enabledServerIds
-                .map((id) => serverName.get(id))
-                .filter((n): n is string => !!n)
-                .sort((a, b) => a.localeCompare(b));
-              const active = p.id === registry?.defaultAccessProfileId;
-              const isOpen = openProfiles.has(p.id);
-              const toggle = () =>
-                setOpenProfiles((prev) => {
-                  const next = new Set(prev);
-                  if (next.has(p.id)) next.delete(p.id);
-                  else next.add(p.id);
-                  return next;
-                });
-              return (
-                <div key={p.id} className="flex flex-col gap-1 px-3 py-2.5">
-                  <button
-                    type="button"
-                    onClick={toggle}
-                    aria-expanded={isOpen}
-                    
-                    className="flex items-center gap-2 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-border disabled:cursor-default"
-                  >
-                    <ChevronRight
-                      className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${
-                        isOpen ? "rotate-90" : ""
-                      } ${names.length === 0 ? "invisible" : ""}`}
-                    />
-                    <span className="text-sm font-medium">{p.name}</span>
-                    {active && (
-                      <span className="rounded-full bg-info/15 px-1.5 py-0.5 text-[10px] font-medium text-info">
-                        default
-                      </span>
-                    )}
-                    <span className="ml-auto text-xs text-muted-foreground">
-                      {names.length} {names.length === 1 ? "server" : "servers"}
-                    </span>
-                  </button>
-                  {isOpen && registry && <div className="flex flex-col gap-2 pl-5">
-                    {registry.servers.filter((server) => !isGatewayServer(server)).map((server) => <label key={server.id} className="flex items-center gap-2 text-xs">
-                      <input type="checkbox" checked={p.enabledServerIds.includes(server.id)} onChange={async (e) => {
-                        try { onRegistryChange(await setAccessServer(p.id, server.id, e.target.checked)); } catch (error) { toastError(`${error}`); }
-                      }} />{server.name}{!server.enabled && " (off)"}
-                    </label>)}
-                    <button disabled={profiles.length <= 1 || p.id === registry.defaultAccessProfileId || p.id === registry.defaultAccessContextId} onClick={async () => {
-                      try { onRegistryChange(await deleteProfile(p.id)); } catch (e) { toastError(`${e}`); }
-                    }}>Delete access set</button>
-                  </div>}
-                  {names.length === 0 ? (
-                    <p className="pl-5 text-xs text-muted-foreground italic">
-                      No servers in this access set.
-                    </p>
-                  ) : isOpen ? (
-                    registry && (
-                      <ProfileToolScope
-                        profile={p}
-                        registry={registry}
-                        onRegistryChange={onRegistryChange}
-                      />
-                    )
-                  ) : (
-                    <p className="truncate pl-5 text-xs text-muted-foreground">
-                      {names.join(", ")}
-                    </p>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-          <FolderRouting registry={registry} onRegistryChange={onRegistryChange} />
-        </section>
-      )}
+          {profiles.length > 0 && (
+            <section className="flex flex-col gap-2">
+              <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+                Access sets
+              </h2>
+              <p className="text-xs text-muted-foreground">
+                Access sets narrow the enabled servers and tools a client can use. Servers
+                that are off stay hidden from every client.
+              </p>
+              <label className="text-sm">Default access</label>
+              <Select
+                value={registry?.defaultAccessProfileId || "@all-enabled"}
+                onValueChange={async (id) => {
+                  try {
+                    onRegistryChange(
+                      await setDefaultAccess(id === "@all-enabled" ? null : id),
+                    );
+                  } catch (e) {
+                    toastError(`${e}`);
+                  }
+                }}
+              >
+                <SelectTrigger aria-label="Default access">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="@all-enabled">All enabled servers</SelectItem>
+                  {profiles.map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <AccessSetCreator onRegistryChange={onRegistryChange} />
+              <div className="flex flex-col divide-y rounded-lg border">
+                {profiles.map((p) => {
+                  const names = p.enabledServerIds
+                    .map((id) => serverName.get(id))
+                    .filter((n): n is string => !!n)
+                    .sort((a, b) => a.localeCompare(b));
+                  const active = p.id === registry?.defaultAccessProfileId;
+                  const isOpen = openProfiles.has(p.id);
+                  const toggle = () =>
+                    setOpenProfiles((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(p.id)) next.delete(p.id);
+                      else next.add(p.id);
+                      return next;
+                    });
+                  return (
+                    <div key={p.id} className="flex flex-col gap-1 px-3 py-2.5">
+                      <button
+                        type="button"
+                        onClick={toggle}
+                        aria-expanded={isOpen}
+
+                        className="flex items-center gap-2 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-border disabled:cursor-default"
+                      >
+                        <ChevronRight
+                          className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${
+                            isOpen ? "rotate-90" : ""
+                          } ${names.length === 0 ? "invisible" : ""}`}
+                        />
+                        <span className="text-sm font-medium">{p.name}</span>
+                        {active && (
+                          <span className="rounded-full bg-info/15 px-1.5 py-0.5 text-[10px] font-medium text-info">
+                            default
+                          </span>
+                        )}
+                        <span className="ml-auto text-xs text-muted-foreground">
+                          {names.length} {names.length === 1 ? "server" : "servers"}
+                        </span>
+                      </button>
+                      {isOpen && registry && (
+                        <div className="flex flex-col gap-2 pl-5">
+                          {registry.servers
+                            .filter((server) => !isGatewayServer(server))
+                            .map((server) => (
+                              <label
+                                key={server.id}
+                                className="flex items-center gap-2 text-xs"
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={p.enabledServerIds.includes(server.id)}
+                                  onChange={async (e) => {
+                                    try {
+                                      onRegistryChange(
+                                        await setAccessServer(
+                                          p.id,
+                                          server.id,
+                                          e.target.checked,
+                                        ),
+                                      );
+                                    } catch (error) {
+                                      toastError(`${error}`);
+                                    }
+                                  }}
+                                />
+                                {server.name}
+                                {!server.enabled && " (off)"}
+                              </label>
+                            ))}
+                          <button
+                            disabled={
+                              profiles.length <= 1 ||
+                              p.id === registry.defaultAccessProfileId ||
+                              p.id === registry.defaultAccessContextId
+                            }
+                            onClick={async () => {
+                              try {
+                                onRegistryChange(await deleteProfile(p.id));
+                              } catch (e) {
+                                toastError(`${e}`);
+                              }
+                            }}
+                          >
+                            Delete access set
+                          </button>
+                        </div>
+                      )}
+                      {names.length === 0 ? (
+                        <p className="pl-5 text-xs text-muted-foreground italic">
+                          No servers in this access set.
+                        </p>
+                      ) : isOpen ? (
+                        registry && (
+                          <ProfileToolScope
+                            profile={p}
+                            registry={registry}
+                            onRegistryChange={onRegistryChange}
+                          />
+                        )
+                      ) : (
+                        <p className="truncate pl-5 text-xs text-muted-foreground">
+                          {names.join(", ")}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              <FolderRouting registry={registry} onRegistryChange={onRegistryChange} />
+            </section>
+          )}
           {toggle(
             Braces,
             codeMode,

@@ -66,7 +66,10 @@ impl MigrationContext {
 /// The shipped `vN -> vN+1` pipeline, in order. Its length must stay
 /// `REGISTRY_VERSION - 1` (asserted by a test), so a step can neither be
 /// silently skipped nor applied twice.
-const MIGRATIONS: &[Migration] = &[v2_migration::migrate_v1_to_v2, v3_migration::migrate_v2_to_v3];
+const MIGRATIONS: &[Migration] = &[
+    v2_migration::migrate_v1_to_v2,
+    v3_migration::migrate_v2_to_v3,
+];
 
 /// A registry that could not be loaded or safely written because of its schema
 /// version. Kept distinct from the generic corruption error so version skew (an
@@ -1084,6 +1087,9 @@ pub struct Registry {
     /// Stable legacy policy and integrity context for unscoped clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_access_context_id: Option<String>,
+    /// Retain the legacy default tool policy until the user explicitly chooses All.
+    #[serde(default)]
+    pub default_access_legacy_policy: bool,
     /// The 1.x safety toggles (`denyDestructive`, `confirmDestructive`, `humanApproval`,
     /// `quarantineOnDrift`, `blockOnInjection`). In a v1 registry they select the safety
     /// level (see [`Registry::safety_level_selected`]). From v2 on they are a write-only
@@ -1513,6 +1519,7 @@ impl Default for Registry {
             active_profile_id: Some(DEFAULT_PROFILE_ID.to_string()),
             default_access_profile_id: None,
             default_access_context_id: None,
+            default_access_legacy_policy: false,
             safety_level: Some(SafetyLevel::Ask),
             deny_destructive: false,
             confirm_destructive: false,
@@ -1571,7 +1578,9 @@ pub(crate) fn slugify(s: &str) -> String {
 /// Every id uses the same SHA-256 domain so no readable/non-readable branch can
 /// collide with another id's literal text (SBS-715).
 pub fn access_integrity_id(id: &str) -> &str {
-    id.strip_prefix("@default-access:").or_else(|| id.strip_prefix("@all-enabled:")).unwrap_or(id)
+    id.strip_prefix("@default-access:")
+        .or_else(|| id.strip_prefix("@all-enabled:"))
+        .unwrap_or(id)
 }
 
 pub fn profile_store_key(profile_id: &str) -> String {
@@ -1912,7 +1921,9 @@ impl Registry {
     /// Resolve a user/API supplied profile reference to a stable id, rejecting
     /// stale and ambiguous names instead of creating another name-keyed binding.
     pub fn canonical_profile_id(&self, profile_ref: &str) -> Result<String, String> {
-        if profile_ref == ALL_ENABLED_ACCESS { return Ok(ALL_ENABLED_ACCESS.to_string()); }
+        if profile_ref == ALL_ENABLED_ACCESS {
+            return Ok(ALL_ENABLED_ACCESS.to_string());
+        }
         self.profile_id_for_ref(profile_ref)
             .ok_or_else(|| format!("No unique profile matches '{profile_ref}'"))
     }
@@ -1927,7 +1938,9 @@ impl Registry {
             if profile_ref.is_empty() {
                 return None;
             }
-            if profile_ref == ALL_ENABLED_ACCESS { return Some(ALL_ENABLED_ACCESS.to_string()); }
+            if profile_ref == ALL_ENABLED_ACCESS {
+                return Some(ALL_ENABLED_ACCESS.to_string());
+            }
             if let Some(profile) = profiles.iter().find(|p| p.id == profile_ref) {
                 return Some(profile.id.clone());
             }
@@ -2029,51 +2042,103 @@ impl Registry {
 
     /// The default server access and its legacy tool/integrity policy are separate.
     pub fn default_access_id(&self) -> String {
-        if self.version < 3 { return self.active_profile_id(); }
+        if self.version < 3 {
+            return self.active_profile_id();
+        }
         self.default_access_profile_id.clone().unwrap_or_else(|| {
-            format!("@default-access:{}", self.default_access_context_id.as_deref().unwrap_or(""))
+            format!(
+                "@default-access:{}",
+                self.default_access_context_id.as_deref().unwrap_or("")
+            )
         })
     }
 
     pub fn all_access_id(&self) -> String {
-        format!("@all-enabled:{}", self.default_access_context_id.as_deref().unwrap_or(""))
+        format!(
+            "@all-enabled:{}",
+            self.default_access_context_id.as_deref().unwrap_or("")
+        )
     }
 
     pub fn access_profile(&self, id: &str) -> Option<&Profile> {
-        let id = id.strip_prefix("@default-access:").unwrap_or(id);
+        let id = if id == self.default_access_id() && self.default_access_profile_id.is_none() && self.default_access_legacy_policy {
+            self.default_access_context_id.as_deref().unwrap_or("")
+        } else {
+            id
+        };
         self.profiles.iter().find(|p| p.id == id)
     }
 
     pub fn server_enabled(&self, server_id: &str) -> bool {
+        if self.version < 3 {
+            return self
+                .profiles
+                .iter()
+                .any(|p| p.enabled_server_ids.iter().any(|id| id == server_id));
+        }
         self.servers.iter().any(|s| s.id == server_id && s.enabled)
     }
 
-    pub fn set_global_server_enabled(&mut self, server_id: &str, enabled: bool) -> Result<(), String> {
-        let server = self.servers.iter_mut().find(|s| s.id == server_id)
+    pub fn set_global_server_enabled(
+        &mut self,
+        server_id: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let server = self
+            .servers
+            .iter_mut()
+            .find(|s| s.id == server_id)
             .ok_or_else(|| format!("No server with id '{server_id}'"))?;
-        if enabled && server.launch.is_some() { crate::launch_inputs::resolve_args(server)?; }
+        if enabled && server.launch.is_some() {
+            crate::launch_inputs::resolve_args(server)?;
+        }
         server.enabled = enabled;
         Ok(())
     }
 
-    pub fn set_access_server(&mut self, profile: &str, server: &str, included: bool) -> Result<(), String> {
-        if !self.servers.iter().any(|s| s.id == server) { return Err(format!("No server with id '{server}'")); }
-        let profile = self.profiles.iter_mut().find(|p| p.id == profile).ok_or("Access set not found")?;
-        if included && !profile.enabled_server_ids.iter().any(|id| id == server) { profile.enabled_server_ids.push(server.to_string()); }
-        if !included { profile.enabled_server_ids.retain(|id| id != server); }
+    pub fn set_access_server(
+        &mut self,
+        profile: &str,
+        server: &str,
+        included: bool,
+    ) -> Result<(), String> {
+        if !self.servers.iter().any(|s| s.id == server) {
+            return Err(format!("No server with id '{server}'"));
+        }
+        let profile = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == profile)
+            .ok_or("Access set not found")?;
+        if included && !profile.enabled_server_ids.iter().any(|id| id == server) {
+            profile.enabled_server_ids.push(server.to_string());
+        }
+        if !included {
+            profile.enabled_server_ids.retain(|id| id != server);
+        }
         Ok(())
     }
 
     pub fn set_default_access(&mut self, profile: Option<&str>) -> Result<(), String> {
-        self.default_access_profile_id = profile.filter(|p| !p.is_empty())
-            .map(|p| self.canonical_profile_id(p)).transpose()?;
+        self.default_access_profile_id = profile
+            .filter(|p| !p.is_empty())
+            .map(|p| self.canonical_profile_id(p))
+            .transpose()?;
+        self.default_access_legacy_policy = false;
         Ok(())
     }
 
     pub fn is_enabled(&self, profile_id: &str, server_id: &str) -> bool {
         if self.version >= 3 {
-            if !self.server_enabled(server_id) { return false; }
-            if profile_id.starts_with("@default-access:") || profile_id.starts_with("@all-enabled:") || profile_id == ALL_ENABLED_ACCESS { return true; }
+            if !self.server_enabled(server_id) {
+                return false;
+            }
+            if profile_id == self.default_access_id() && self.default_access_profile_id.is_none()
+                || profile_id == self.all_access_id()
+                || profile_id == ALL_ENABLED_ACCESS
+            {
+                return true;
+            }
         }
         self.profiles
             .iter()
@@ -2109,7 +2174,10 @@ impl Registry {
             profile.enabled_server_ids.retain(|s| s != server_id);
         }
         if self.version >= 3 {
-            let globally_enabled = self.profiles.iter().any(|p| p.enabled_server_ids.iter().any(|id| id == server_id));
+            let globally_enabled = self
+                .profiles
+                .iter()
+                .any(|p| p.enabled_server_ids.iter().any(|id| id == server_id));
             self.set_global_server_enabled(server_id, globally_enabled)?;
         }
         Ok(())
@@ -2133,14 +2201,25 @@ impl Registry {
         };
         if self.version >= 3 {
             for server in &mut self.servers {
-                if !enabled || ids.contains(&server.id) { server.enabled = enabled; }
+                if !enabled || ids.contains(&server.id) {
+                    server.enabled = enabled;
+                }
             }
         } else {
-            let profile = self.profiles.iter_mut().find(|p| p.id == profile_id)
+            let profile = self
+                .profiles
+                .iter_mut()
+                .find(|p| p.id == profile_id)
                 .ok_or_else(|| format!("No profile with id '{profile_id}'"))?;
             if enabled {
-                for id in ids { if !profile.enabled_server_ids.contains(&id) { profile.enabled_server_ids.push(id); } }
-            } else { profile.enabled_server_ids.clear(); }
+                for id in ids {
+                    if !profile.enabled_server_ids.contains(&id) {
+                        profile.enabled_server_ids.push(id);
+                    }
+                }
+            } else {
+                profile.enabled_server_ids.clear();
+            }
         }
         Ok(())
     }
@@ -2483,8 +2562,12 @@ impl Registry {
         if profile_ref.trim().is_empty() {
             return self.default_access_id();
         }
-        if profile_ref == ALL_ENABLED_ACCESS { return self.all_access_id(); }
-        if profile_ref == self.default_access_id() || profile_ref == self.all_access_id() { return profile_ref.to_string(); }
+        if profile_ref == ALL_ENABLED_ACCESS {
+            return self.all_access_id();
+        }
+        if profile_ref == self.default_access_id() || profile_ref == self.all_access_id() {
+            return profile_ref.to_string();
+        }
         self.profile_id_for_ref(profile_ref)
             .unwrap_or_else(|| profile_ref.to_string())
     }
@@ -5109,24 +5192,24 @@ mod tests {
         let team_public_id = r.add_server(team_public);
 
         r.set_all_enabled("default", true).unwrap();
-        assert!(r.is_enabled("default", &own));
-        assert!(r.is_enabled("default", &team_public_id));
+        assert!(r.server_enabled(&own));
+        assert!(r.server_enabled(&team_public_id));
         assert!(
-            !r.is_enabled("default", &team_cmd_id),
+            !r.server_enabled(&team_cmd_id),
             "team stdio stays off until explicit enable"
         );
         assert!(
-            !r.is_enabled("default", &team_lan_id),
+            !r.server_enabled(&team_lan_id),
             "team LAN URL stays off until explicit enable"
         );
 
         r.set_server_enabled("default", &team_cmd_id, true).unwrap();
         r.set_all_enabled("default", true).unwrap();
         assert!(
-            r.is_enabled("default", &team_cmd_id),
+            r.server_enabled(&team_cmd_id),
             "consented review server stays on"
         );
-        assert!(!r.is_enabled("default", &team_lan_id));
+        assert!(!r.server_enabled(&team_lan_id));
     }
 
     #[test]
@@ -5137,7 +5220,7 @@ mod tests {
         r.set_server_enabled("default", &id, true).unwrap();
         assert!(r.is_enabled("default", &id));
         assert!(!r.is_enabled(&work, &id));
-        r.set_active_profile(&work).unwrap();
+        r.set_default_access(Some(&work)).unwrap();
         assert!(r.enabled_servers().is_empty());
     }
 
@@ -5205,7 +5288,7 @@ mod tests {
             "a dangling reference gets the registry default"
         );
 
-        r.active_profile_id = Some(postgres.clone());
+        r.set_default_access(Some(&postgres)).unwrap();
         assert_eq!(r.configured_instructions(None), Some(""));
     }
 
@@ -5404,8 +5487,8 @@ mod tests {
         assert_eq!(r.resolve_profile_id("deleted-profile"), "deleted-profile");
 
         // An empty/whitespace ref is the *unscoped* case and still follows active.
-        assert_eq!(r.resolve_profile_id(""), r.active_profile_id());
-        assert_eq!(r.resolve_profile_id("   "), r.active_profile_id());
+        assert_eq!(r.resolve_profile_id(""), r.default_access_id());
+        assert_eq!(r.resolve_profile_id("   "), r.default_access_id());
         assert_eq!(r.enabled_servers_for("").len(), 1);
     }
 
@@ -5518,6 +5601,7 @@ mod tests {
         r.set_server_enabled("default", &a, true).unwrap();
         r.set_server_enabled(&billing, &b, true).unwrap();
         r.set_server_enabled(&support, &c, true).unwrap();
+        r.set_default_access(Some("default")).unwrap();
         // Base alone (no clients) connects only the active profile's server.
         assert_eq!(
             r.bridge_enabled_servers(None)

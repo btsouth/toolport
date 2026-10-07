@@ -756,7 +756,11 @@ pub fn set_default_access(profile: Option<&str>) -> Result<Registry, String> {
     registry::update(|r| r.set_default_access(profile)).map(|(r, ())| r)
 }
 
-pub fn set_access_server(profile_id: &str, server_id: &str, included: bool) -> Result<Registry, String> {
+pub fn set_access_server(
+    profile_id: &str,
+    server_id: &str,
+    included: bool,
+) -> Result<Registry, String> {
     registry::update(|r| r.set_access_server(profile_id, server_id, included)).map(|(r, ())| r)
 }
 
@@ -1254,6 +1258,15 @@ fn enable_moved_servers(
     moved: &[String],
 ) -> Result<(), String> {
     let profile_id = registry.resolve_profile_id(profile.unwrap_or(""));
+    let access_set = registry.access_profile(&profile_id).map(|p| p.id.clone());
+    let all = profile_id == registry.all_access_id()
+        || (profile_id == registry.default_access_id()
+            && registry.default_access_profile_id.is_none());
+    if access_set.is_none() && !all {
+        return Err(
+            "The access set no longer exists, so the client's config was left unchanged".into(),
+        );
+    }
     for name in moved {
         let Some(id) = registry
             .servers
@@ -1266,6 +1279,9 @@ fn enable_moved_servers(
         apply_server_enabled(registry, &profile_id, &id, true, false).map_err(|error| {
             format!("Could not turn on {name} in Toolport, so the client's config was left unchanged: {error}")
         })?;
+        if let Some(profile) = &access_set {
+            registry.set_access_server(profile, &id, true)?;
+        }
     }
     Ok(())
 }
@@ -1276,7 +1292,9 @@ fn enable_moved_servers(
 pub(crate) fn apply_import_entry(registry: &mut Registry, entry: ServerEntry) -> String {
     let id = registry.add_server(entry);
     let profile_id = registry.active_profile_id();
-    let _ = apply_server_enabled(registry, &profile_id, &id, true, false);
+    if apply_server_enabled(registry, &profile_id, &id, true, false).is_ok() {
+        let _ = registry.set_access_server(&profile_id, &id, true);
+    }
     id
 }
 
@@ -1872,8 +1890,11 @@ pub fn apply_server_enabled(
             server.check_enable_allowed(reviewed)?;
         }
     }
-    if registry.version >= 3 { registry.set_global_server_enabled(server_id, enabled) }
-    else { registry.set_server_enabled(profile_id, server_id, enabled) }
+    if registry.version >= 3 {
+        registry.set_global_server_enabled(server_id, enabled)
+    } else {
+        registry.set_server_enabled(profile_id, server_id, enabled)
+    }
 }
 
 pub fn set_server_enabled(
@@ -2326,7 +2347,7 @@ mod tests {
         registry::save_to(&path, &external).unwrap();
 
         let updated = set_server_enabled_at(&path, "default", "one", true, false).unwrap();
-        assert!(updated.is_enabled("default", "one"));
+        assert!(updated.server_enabled("one"));
         assert!(updated.servers.iter().any(|server| server.id == "two"));
         cleanup(&path);
     }
@@ -2355,8 +2376,8 @@ mod tests {
         }
 
         let updated = registry::load_from(&path).unwrap();
-        assert!(updated.is_enabled("default", "one"));
-        assert!(updated.is_enabled("default", "two"));
+        assert!(updated.server_enabled("one"));
+        assert!(updated.server_enabled("two"));
         cleanup(&path);
     }
 

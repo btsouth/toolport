@@ -1535,8 +1535,7 @@ impl ServerPage {
     fn render_server_list(&self, snapshot: &state::RegistrySnapshot) {
         self.clear_server_list();
         self.health_rows.borrow_mut().clear();
-        self.section_title
-            .set_label("Servers");
+        self.section_title.set_label("Servers");
         if snapshot.servers.is_empty() {
             self.posture.set_visible(false);
             self.list.append(&state_card(
@@ -1563,12 +1562,7 @@ impl ServerPage {
         }
         let mut rows = Vec::with_capacity(servers.len());
         for server in servers {
-            let card = server_card(
-                server,
-                &snapshot.active_profile_id,
-                None,
-                self.clone(),
-            );
+            let card = server_card(server, &snapshot.active_profile_id, None, self.clone());
             self.list.append(&card);
             rows.push((server.clone(), card));
         }
@@ -2688,7 +2682,14 @@ fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuBu
     let all_menu = menu.clone();
     all.connect_clicked(move |button| {
         all_menu.popdown();
-        run_client_mutation(&all_client, true, false, Some(crate::registry::ALL_ENABLED_ACCESS.into()), button, all_page.clone());
+        run_client_mutation(
+            &all_client,
+            true,
+            false,
+            Some(crate::registry::ALL_ENABLED_ACCESS.into()),
+            button,
+            all_page.clone(),
+        );
     });
     content.append(&all);
     for profile in page.profiles.borrow().iter().cloned() {

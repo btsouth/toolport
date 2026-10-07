@@ -174,18 +174,27 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
 
   function scopeServers(scopeRef: string): { id: string; name: string }[] {
     const ref = scopeRef || registry?.defaultAccessProfileId || "@all-enabled";
-    const target = profiles.find((p) => p.id === ref || p.name.toLowerCase() === ref.toLowerCase());
+    const target = profiles.find(
+      (p) => p.id === ref || p.name.toLowerCase() === ref.toLowerCase(),
+    );
     return (registry?.servers ?? [])
-      .filter((s) => s.enabled && !isGatewayServer(s) &&
-        (ref === "@all-enabled" || target?.enabledServerIds.includes(s.id)))
+      .filter(
+        (s) =>
+          s.enabled &&
+          !isGatewayServer(s) &&
+          (ref === "@all-enabled" || target?.enabledServerIds.includes(s.id)),
+      )
       .map((s) => ({ id: s.id, name: s.name }));
   }
 
-  function scopeServerCount(scopeRef: string): number { return scopeServers(scopeRef).length; }
+  function scopeServerCount(scopeRef: string): number {
+    return scopeServers(scopeRef).length;
+  }
   function accessLabel(scopeRef: string): string {
     const ref = scopeRef || registry?.defaultAccessProfileId;
-    return !ref || ref === "@all-enabled" ? "All enabled servers" :
-      profiles.find((p) => p.id === ref || p.name === ref)?.name ?? ref;
+    return !ref || ref === "@all-enabled"
+      ? "All enabled servers"
+      : (profiles.find((p) => p.id === ref || p.name === ref)?.name ?? ref);
   }
 
   /** Re-apply a scope to an already-connected client (overwrites its gateway
@@ -801,8 +810,10 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="__default__">Default: {accessLabel("")}</SelectItem>
-                <SelectItem value="@all-enabled">All enabled servers</SelectItem>
+                    <SelectItem value="__default__">
+                      Default: {accessLabel("")}
+                    </SelectItem>
+                    <SelectItem value="@all-enabled">All enabled servers</SelectItem>
                     {profiles.map((p) => (
                       <SelectItem key={p.id} value={p.id}>
                         {p.name}

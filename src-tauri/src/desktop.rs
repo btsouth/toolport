@@ -347,13 +347,24 @@ fn set_all_enabled(
 }
 
 #[tauri::command]
-fn set_default_access(state: State<RegistryState>, profile: Option<String>) -> Result<Registry, String> {
+fn set_default_access(
+    state: State<RegistryState>,
+    profile: Option<String>,
+) -> Result<Registry, String> {
     write_registry(state.inner(), |r| r.set_default_access(profile.as_deref())).map(|(r, ())| r)
 }
 
 #[tauri::command]
-fn set_access_server(state: State<RegistryState>, profile_id: String, server_id: String, included: bool) -> Result<Registry, String> {
-    write_registry(state.inner(), |r| r.set_access_server(&profile_id, &server_id, included)).map(|(r, ())| r)
+fn set_access_server(
+    state: State<RegistryState>,
+    profile_id: String,
+    server_id: String,
+    included: bool,
+) -> Result<Registry, String> {
+    write_registry(state.inner(), |r| {
+        r.set_access_server(&profile_id, &server_id, included)
+    })
+    .map(|(r, ())| r)
 }
 
 #[tauri::command]

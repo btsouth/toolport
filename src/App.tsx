@@ -222,7 +222,8 @@ function App() {
         value?.defaultAccessProfileId ?? value?.defaultAccessContextId;
       const enabledIds = (value: Registry | null) =>
         new Set(
-          value?.servers.filter((server) => server.enabled).map((server) => server.id) ?? [],
+          value?.servers.filter((server) => server.enabled).map((server) => server.id) ??
+            [],
         );
       const previous = registryRef.current;
       const previousProfileId = activeId(previous);
