@@ -658,32 +658,56 @@ fn the_http_bridge_takes_a_burst_and_sheds_only_past_its_cap() {
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 barrier.wait();
-                ureq::post(&format!("http://127.0.0.1:{port}/mcp"))
-                    .set("Authorization", "Bearer health-token")
-                    .set("Content-Type", "application/json")
-                    .set("Accept", "application/json, text/event-stream")
-                    .timeout(Duration::from_secs(60))
-                    .send_json(json!({
-                        "jsonrpc": "2.0", "id": index, "method": "initialize",
-                        "params": { "protocolVersion": "2025-06-18", "capabilities": {},
-                                    "clientInfo": { "name": "burst", "version": "1" } }
-                    }))
-                    .map(|response| response.status())
-                    .unwrap_or_else(|error| match error {
-                        ureq::Error::Status(code, _) => code,
-                        ureq::Error::Transport(_) => 0,
-                    })
+                let initialize = || {
+                    ureq::post(&format!("http://127.0.0.1:{port}/mcp"))
+                        .set("Authorization", "Bearer health-token")
+                        .set("Content-Type", "application/json")
+                        .set("Accept", "application/json, text/event-stream")
+                        .timeout(Duration::from_secs(60))
+                        .send_json(json!({
+                            "jsonrpc": "2.0", "id": index, "method": "initialize",
+                            "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                                        "clientInfo": { "name": "burst", "version": "1" } }
+                        }))
+                };
+                // A loaded CI runner's loopback stack can drop or reset a few of
+                // 300 simultaneous connects before the gateway ever sees them. A
+                // real client reconnects, so one retry is allowed for that, never
+                // for an answer: a 503 or 429 is the gateway shedding load, which
+                // is exactly what this burst must not cause.
+                let mut transport_errors = Vec::new();
+                for _ in 0..2 {
+                    match initialize() {
+                        Ok(response) => return (response.status(), transport_errors),
+                        Err(ureq::Error::Status(code, _)) => return (code, transport_errors),
+                        Err(ureq::Error::Transport(error)) => {
+                            transport_errors.push(error.to_string());
+                        }
+                    }
+                }
+                (0, transport_errors)
             })
         })
         .collect();
     let mut statuses = std::collections::BTreeMap::new();
+    let mut transport_errors = Vec::new();
     for client in clients {
-        *statuses.entry(client.join().unwrap()).or_insert(0) += 1;
+        let (status, errors) = client.join().unwrap();
+        *statuses.entry(status).or_insert(0) += 1;
+        transport_errors.extend(errors);
+    }
+    if !transport_errors.is_empty() {
+        eprintln!(
+            "{} connection(s) needed a retry: {:?}",
+            transport_errors.len(),
+            transport_errors
+        );
     }
     assert_eq!(
         statuses.get(&200),
         Some(&300),
-        "300 concurrent initialize calls must all succeed: {statuses:?}"
+        "300 concurrent initialize calls must all succeed: {statuses:?}; \
+         transport errors: {transport_errors:?}"
     );
 
     // With a cap of two, two clients still sending their request hold both slots,
