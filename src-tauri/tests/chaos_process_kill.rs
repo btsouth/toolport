@@ -105,11 +105,10 @@ fn a_killed_downstream_child_is_respawned() {
 }
 
 /// REL-07: a killed daemon must not leave an EOF-immune downstream server
-/// running. `#1021` gives each spawned server a parent-death signal and a child
-/// ledger; before it, the orphan survives.
+/// running. #1021 gives each spawned server a parent-death signal and a child
+/// ledger.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "needs #1021"]
 fn a_killed_daemon_does_not_leave_its_servers_running() {
     let scratch = Scratch::new("orphan");
     let pid_file = scratch.join("child.pid");
@@ -155,7 +154,8 @@ fn a_killed_daemon_does_not_leave_its_servers_running() {
 
     let daemon = daemon_pid(scratch.path()).expect("daemon pid");
     signal(daemon, "-KILL");
+    // A zombie awaiting its reaper is gone for this purpose.
     wait_for("the orphan to be reaped", Duration::from_secs(15), || {
-        !pid_alive(child)
+        !chaos_support::pid_running(child)
     });
 }
