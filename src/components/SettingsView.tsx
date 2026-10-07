@@ -1294,7 +1294,9 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               <ShieldX className="size-4 shrink-0 text-destructive" />
               <span className="text-sm font-medium">Quarantined tools</span>
               <span className="text-xs text-muted-foreground">
-                {quarantineError ? "status may be stale" : "blocked in Strict until you re-approve"}
+                {quarantineError
+                  ? "status may be stale"
+                  : "blocked in Strict until you re-approve"}
               </span>
             </div>
             <ul className="flex flex-col gap-1.5">
