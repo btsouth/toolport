@@ -13381,7 +13381,7 @@ impl HostState {
 
     /// Gate for server-side "code mode" (the `toolport_run_script` meta-tool).
     ///
-    /// Policy (SOU-397): **on by default** via the registry's `code_mode` field (Settings
+    /// Policy: off by default via the registry's `code_mode` field (Advanced Settings
     /// switch, synced into this host's flag). Kill switch: turn Settings off. Code mode runs
     /// agent-supplied JS and is not a security boundary; each host call still passes the same
     /// scope / human-approval gates as `toolport_call_tool`. `TOOLPORT_CODE_MODE=1` (or legacy
@@ -23965,20 +23965,22 @@ mod tests {
     }
 
     #[test]
-    fn code_mode_defaults_on_in_registry() {
-        // SOU-397: new registries and missing serde field default on. Explicit
-        // false remains the kill switch (camelCase field name in JSON).
-        assert!(Registry::default().code_mode);
+    fn code_mode_defaults_off_and_preserves_explicit_v1_values() {
+        // Keep explicit v1 values until the v2 migration. Only absent values
+        // and newly created registries default off.
+        assert!(!Registry::default().code_mode);
         let minimal = r#"{"version":1,"servers":[],"profiles":[]}"#;
         let parsed: Registry = serde_json::from_str(minimal).unwrap();
         assert!(
-            parsed.code_mode,
-            "missing codeMode field should default true"
+            !parsed.code_mode,
+            "missing codeMode field should default false"
         );
         let explicit_off: Registry =
             serde_json::from_str(r#"{"version":1,"servers":[],"profiles":[],"codeMode":false}"#)
                 .unwrap();
         assert!(!explicit_off.code_mode);
+        let explicit_on: Registry = serde_json::from_str(r#"{"version":1,"servers":[],"profiles":[],"codeMode":true}"#).unwrap();
+        assert!(explicit_on.code_mode);
     }
 
     #[test]

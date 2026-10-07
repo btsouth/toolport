@@ -181,14 +181,14 @@ impl SettingsPage {
         capabilities.append(&lazy_row);
         let (code_row, code_mode) = setting_switch_row(
             "Code mode",
-            "Let agents combine multiple scoped tool calls in one sandboxed server-side script.",
+            "Off by default. Enable agents to combine scoped tool calls in one sandboxed server-side script.",
         );
-        capabilities.append(&code_row);
+
         let (routine_row, allow_routine_writes) = setting_switch_row(
             "Allow routine writes",
             "Let agents suggest persistent routines. Saving one still requires your approval.",
         );
-        capabilities.append(&routine_row);
+
         page.append(&capabilities);
 
         let pinned_section = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -237,6 +237,8 @@ impl SettingsPage {
         ));
         let protection = gtk::Box::new(gtk::Orientation::Vertical, 0);
         protection.add_css_class("toolport-settings-group");
+        protection.append(&code_row);
+        protection.append(&routine_row);
         let (pii_row, pii_redaction) = setting_switch_row(
             "Pseudonymize PII",
             "Replace detected personal values before results reach the model.",

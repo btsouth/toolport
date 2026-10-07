@@ -192,6 +192,7 @@ describe("SettingsView routine writes", () => {
         <SettingsView registry={registry} onRegistryChange={onRegistryChange} />
       </ThemeProvider>,
     );
+    await user.click(screen.getByText("Advanced"));
 
     const routineControl = screen.getByRole("switch", {
       name: /allow routine writes/i,
@@ -239,6 +240,7 @@ describe("SettingsView routine writes", () => {
         <SettingsView registry={registry} onRegistryChange={onRegistryChange} />
       </ThemeProvider>,
     );
+    await user.click(screen.getByText("Advanced"));
 
     const control = screen.getByRole("switch", { name: /allow routine writes/i });
     expect(control).not.toBeChecked();
@@ -258,6 +260,7 @@ describe("SettingsView routine writes", () => {
         <SettingsView registry={registry} onRegistryChange={onRegistryChange} />
       </ThemeProvider>,
     );
+    await user.click(screen.getByText("Advanced"));
 
     const control = screen.getByRole("switch", { name: /allow routine writes/i });
     await user.click(control);
@@ -672,4 +675,19 @@ it("selects and persists one safety level", async () => {
   expect(
     screen.queryByRole("switch", { name: /block destructive tools/i }),
   ).not.toBeInTheDocument();
+});
+
+it("keeps Code Mode off by default under Advanced and persists opt-in", async () => {
+  const user = userEvent.setup();
+  const onRegistryChange = vi.fn();
+  const absent = { ...registry, codeMode: undefined };
+  vi.mocked(setCodeMode).mockResolvedValueOnce({ ...absent, codeMode: true });
+  render(<ThemeProvider><SettingsView registry={absent} onRegistryChange={onRegistryChange} /></ThemeProvider>);
+  expect(screen.queryByRole("switch", { name: /code mode/i })).not.toBeInTheDocument();
+  await user.click(screen.getByText("Advanced"));
+  const control = screen.getByRole("switch", { name: /code mode/i });
+  expect(control).not.toBeChecked();
+  await user.click(control);
+  expect(setCodeMode).toHaveBeenCalledWith(true);
+  await waitFor(() => expect(onRegistryChange).toHaveBeenCalledWith({ ...absent, codeMode: true }));
 });

@@ -1208,13 +1208,13 @@ pub struct Registry {
     pub discovery_mode: Option<String>,
     /// Server-side "code mode": advertise the `toolport_run_script` meta-tool so an
     /// agent can orchestrate many downstream tool calls in one sandboxed JS script (a single
-    /// round-trip). **On by default** (SOU-397): each in-script call still hits the same
+    /// round-trip). Off by default: each in-script call still hits the same
     /// scope / approval gates as `toolport_call_tool`, and Settings is the kill switch.
     /// Code mode is not a security boundary (agent-supplied JS). Shared/HTTP multi-tenant
     /// operators who do not want the surface can turn it off in Settings or set
     /// `"codeMode": false` in the registry. `TOOLPORT_CODE_MODE=1` (legacy
     /// `CONDUIT_CODE_MODE`) still force-enables regardless of the toggle.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub code_mode: bool,
     /// Opt-in permission for agents to request persistence of Code Mode routines. Off by
     /// default. This only exposes the save surface; each save still requires a separate,
@@ -1662,7 +1662,7 @@ impl Default for Registry {
             lazy_discovery: true,
             gateway_instructions: None,
             discovery_mode: None,
-            code_mode: true,
+            code_mode: false,
             allow_routine_writes: false,
             allow_agent_control: false,
             integrity_check: true,

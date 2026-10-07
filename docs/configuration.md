@@ -29,7 +29,7 @@ gateway entry, written for you when you connect a client:
 - `TOOLPORT_GATEWAY_TOPOLOGY=daemon|legacy` - override the local stdio topology
   for one client launch. `legacy` is the immediate rollback setting.
 - `TOOLPORT_CODE_MODE=1` - force-enable code mode (`toolport_run_script`) even if Settings
-  has it off. Code mode is **on by default** (Settings kill switch turns it off). Each
+  has it off. Code mode is **off by default**; opt in under Advanced in Settings. Each
   in-script tool call still respects profile scope and human approval; code mode is not a
   security boundary.
 

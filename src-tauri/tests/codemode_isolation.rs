@@ -30,6 +30,14 @@ impl Gateway {
     }
 
     fn configured(configure: impl FnOnce(&mut Registry, &Path), http_token: Option<&str>) -> Self {
+        Self::configured_with_code_mode(configure, http_token, true)
+    }
+
+    fn configured_with_code_mode(
+        configure: impl FnOnce(&mut Registry, &Path),
+        http_token: Option<&str>,
+        force_code_mode: bool,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "toolport-759-{}-{}",
             std::process::id(),
@@ -51,7 +59,8 @@ impl Gateway {
             .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
             .env("TOOLPORT_DATA_DIR", &dir)
             .env("TOOLPORT_CLIENT_ID", "code-mode-isolation-test")
-            .env("TOOLPORT_CODE_MODE", "1")
+            .env_remove("TOOLPORT_CODE_MODE")
+            .env_remove("CONDUIT_CODE_MODE")
             .env("TOOLPORT_RESULT_BUDGET", "49152")
             .env_remove("TOOLPORT_HTTP")
             .env_remove("CONDUIT_HTTP")
@@ -62,6 +71,7 @@ impl Gateway {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        if force_code_mode { command.env("TOOLPORT_CODE_MODE", "1"); }
         let http_port = http_token.map(|_| {
             let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             socket.local_addr().unwrap().port()
@@ -702,4 +712,24 @@ fn http_client_memory_failure_does_not_stop_other_clients_and_scope_stays_enforc
         }),
     );
     assert!(normal.to_string().contains("allowed"), "{normal}");
+}
+
+#[test]
+fn code_mode_default_is_hidden_and_refused_without_override() {
+    let mut gateway = Gateway::configured_with_code_mode(|_, _| {}, None, false);
+    let listed = gateway.request("tools/list", json!({}));
+    assert!(!listed["result"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "toolport_run_script"));
+    let refused = gateway.run(json!({"script": "return 42;"}));
+    assert_eq!(refused["isError"], true);
+    assert!(refused.to_string().contains("code mode is disabled"));
+}
+
+#[test]
+fn code_mode_env_override_lists_and_executes_with_registry_off() {
+    let mut gateway = Gateway::configured(|reg, _| reg.code_mode = false, None);
+    let listed = gateway.request("tools/list", json!({}));
+    assert!(listed["result"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "toolport_run_script"));
+    let allowed = gateway.run(json!({"script": "return 42;"}));
+    assert_eq!(allowed["isError"], false);
+    assert_eq!(allowed["structuredContent"]["result"], 42);
 }
