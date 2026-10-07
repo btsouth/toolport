@@ -143,6 +143,24 @@ try {
   await expect(dialog.getByRole("button", { name: "Cancel", exact: true })).toBeVisible();
   await page.screenshot({ path: path.join(output, "short-add-server.png") });
   await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("button", { name: "Help", exact: true }).click();
+  await page.getByRole("button", { name: "Run setup again", exact: true }).click();
+  await expect(
+    dialog.getByRole("button", { name: "Skip setup", exact: true }),
+  ).toBeVisible();
+  await page.evaluate(() =>
+    Promise.all(
+      document.getAnimations().map((animation) => animation.finished.catch(() => {})),
+    ),
+  );
+  const setupFooterBefore = await footer.boundingBox();
+  await dialog.locator('[data-slot="dialog-body"]').evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  expect(await footer.boundingBox()).toEqual(setupFooterBefore);
+  expect(setupFooterBefore.y + setupFooterBefore.height).toBeLessThanOrEqual(360);
+  await page.screenshot({ path: path.join(output, "short-onboarding.png") });
+  await dialog.getByRole("button", { name: "Skip setup", exact: true }).click();
   const fixture = await page.evaluate(() => window.toolportFixture);
   expect(fixture.missing).toEqual([]);
   expect(errors).toEqual([]);
