@@ -27129,6 +27129,11 @@ mod tests {
         );
         let cached = router.aggregated_tools();
         let guard = SearchGuard::default();
+        // A unique label lets this test pick its own catalog row out of the log.
+        // Other tests still run their own `tools/list` through `dispatch` without a
+        // data-dir override, so their rows land in whichever override is active -
+        // ours - and are queued ahead of this request's row.
+        let client = format!("apps-measure-{}", new_correlation_id());
 
         let discovered = handle_request(
             &host,
@@ -27158,7 +27163,7 @@ mod tests {
             None,
             &guard,
             None,
-            None,
+            Some(client.as_str()),
         )
         .unwrap();
         let names = apps["result"]["tools"]
@@ -27193,7 +27198,13 @@ mod tests {
             None,
         )
         .unwrap();
-        let measured = savings::entries().into_iter().next().unwrap();
+        // Select this request's row by its unique client label. Assuming the first
+        // line is ours made the test fail whenever a concurrent test queued a
+        // catalog row into the same (active) override directory first.
+        let measured = savings::entries()
+            .into_iter()
+            .find(|row| row["kind"] == "catalog_exposure" && row["client"] == client)
+            .expect("catalog row for the apps list");
         assert_eq!(
             measured["exposedSurfaceBytes"],
             savings::surface_bytes(apps["result"]["tools"].as_array().unwrap())
