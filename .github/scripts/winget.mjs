@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -111,7 +112,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     tag,
     repo,
   );
-  const response = await fetch(installer.url, { signal: AbortSignal.timeout(120000) });
+  const response = await globalThis.fetch(installer.url, {
+    signal: globalThis.AbortSignal.timeout(120000),
+  });
   if (!response.ok) throw new Error(`Installer download failed: ${response.status}`);
   const bytes = Buffer.from(await response.arrayBuffer());
   const files = manifests(
