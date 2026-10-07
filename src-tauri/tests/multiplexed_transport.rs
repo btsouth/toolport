@@ -15,8 +15,13 @@ use conduit_lib::router::Router;
 use serde_json::json;
 
 fn concurrent_mock_router() -> Arc<Router> {
+    concurrent_mock_router_with(&[])
+}
+
+fn concurrent_mock_router_with(extra_env: &[(String, String)]) -> Arc<Router> {
     let mock = env!("CARGO_BIN_EXE_mock-mcp-server");
-    let env = [("MOCK_MCP_CONCURRENT".to_string(), "1".to_string())];
+    let mut env = vec![("MOCK_MCP_CONCURRENT".to_string(), "1".to_string())];
+    env.extend_from_slice(extra_env);
     let transport =
         StdioTransport::spawn_watched(mock, &[], &env, None, Arc::new(AtomicU8::new(0)), None)
             .expect("spawn mock");
@@ -27,9 +32,43 @@ fn concurrent_mock_router() -> Arc<Router> {
     Arc::new(router)
 }
 
+/// Wait until the mock's transcript shows a request matching `seen`.
+fn wait_for_transcript(path: &std::path::Path, seen: impl Fn(&serde_json::Value) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reached = std::fs::read_to_string(path).is_ok_and(|transcript| {
+            transcript
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .any(|request| seen(&request))
+        });
+        if reached {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the request never reached the server"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 #[test]
 fn a_fast_call_is_not_blocked_behind_a_slow_call_to_the_same_server() {
-    let router = concurrent_mock_router();
+    let dir = std::env::temp_dir().join(format!(
+        "toolport-multiplexed-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let transcript = dir.join("transcript.jsonl");
+    let router = concurrent_mock_router_with(&[(
+        "MOCK_MCP_TRANSCRIPT".to_string(),
+        transcript.to_string_lossy().into_owned(),
+    )]);
     let cancellations = CancelRegistry::new();
     assert!(cancellations.begin_client_request("slow".to_string()));
     let slow = {
@@ -44,8 +83,9 @@ fn a_fast_call_is_not_blocked_behind_a_slow_call_to_the_same_server() {
             )
         })
     };
-    // Give the slow call time to reach the server.
-    std::thread::sleep(Duration::from_millis(200));
+    wait_for_transcript(&transcript, |request| {
+        request["params"]["name"] == "sleep" && request["params"]["arguments"]["ms"] == 20_000
+    });
 
     let started = Instant::now();
     let fast = router
@@ -72,6 +112,7 @@ fn a_fast_call_is_not_blocked_behind_a_slow_call_to_the_same_server() {
     assert!(result.is_err(), "the cancelled call must not succeed");
     assert!(started.elapsed() < Duration::from_secs(5));
     cancellations.finish_client_request("slow");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

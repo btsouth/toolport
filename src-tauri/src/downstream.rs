@@ -2179,6 +2179,11 @@ pub trait ConcurrentTransport: Send + Sync {
     ) -> Result<Value, TransportError> {
         self.request_with_cancel_and_headers(method, params, cancel, &[])
     }
+    /// True once the connection is gone for good (the child exited). A call
+    /// that only timed out leaves it open for the calls still in flight.
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
 
 fn downstream_trace(msg: &str) {
@@ -3061,9 +3066,10 @@ pub struct StdioTransport {
 /// Names the upstream request context of the calling thread. The gateway's
 /// server-request handler reads thread-locals (upstream era, capabilities, MCP
 /// session), so a stdio server's roots, sampling or elicitation request must be
-/// handled on a thread serving the same upstream client. Unset means every
-/// request shares one context.
-pub type RequestContextProvider = Arc<dyn Fn() -> String + Send + Sync>;
+/// handled on a thread serving the same upstream client. `None` means no client
+/// is waiting on the thread (a background refresh): such a request never takes a
+/// server request. Unset means every request shares one context.
+pub type RequestContextProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 static REQUEST_CONTEXT_PROVIDER: OnceLock<RequestContextProvider> = OnceLock::new();
 
@@ -3072,11 +3078,11 @@ pub fn set_request_context_provider(provider: RequestContextProvider) {
     let _ = REQUEST_CONTEXT_PROVIDER.set(provider);
 }
 
-fn request_context_key() -> String {
-    REQUEST_CONTEXT_PROVIDER
-        .get()
-        .map(|provider| provider())
-        .unwrap_or_default()
+fn request_context_key() -> Option<String> {
+    match REQUEST_CONTEXT_PROVIDER.get() {
+        Some(provider) => provider(),
+        None => Some(String::new()),
+    }
 }
 
 /// Server requests a stdio server may send while nothing is in flight. They go to
@@ -3104,7 +3110,7 @@ struct StdioWaiter {
     /// Registration order, so a server request goes to the oldest waiter.
     seq: u64,
     /// [`request_context_key`] of the thread waiting on this request.
-    context: String,
+    context: Option<String>,
     tx: Sender<Delivery>,
     /// False while suspended for a modern upstream round trip: no thread is
     /// waiting, so this request cannot handle a server request.
@@ -3407,11 +3413,14 @@ impl StdioCore {
                     return Ok(value.get("result").cloned().unwrap_or(Value::Null));
                 }
                 Ok(Delivery::ServerRequest(mut value)) => {
-                    screen_url_elicitation_request(&mut value).map_err(|message| {
-                        TransportError::Fatal(format!(
-                            "Toolport refused unsafe URL elicitation: {message}"
-                        ))
-                    })?;
+                    // Every early exit refuses this request and abandons the
+                    // waiter, so the server is never left without an answer.
+                    if let Err(message) = screen_url_elicitation_request(&mut value) {
+                        let message = format!("Toolport refused unsafe URL elicitation: {message}");
+                        self.refuse(&value, &message);
+                        self.abandon(&mut waiter, &rx);
+                        return Err(TransportError::Fatal(message));
+                    }
                     let handler = self
                         .server_handler
                         .lock()
@@ -3419,16 +3428,25 @@ impl StdioCore {
                         .clone();
                     match handler.and_then(|handler| handler(&value)) {
                         Some(ServerRequestAction::Respond(response)) => {
-                            self.write_line(&response)
-                                .map_err(|e| TransportError::Unavailable(e.to_string()))?;
+                            if let Err(e) = self.write_line(&response) {
+                                self.abandon(&mut waiter, &rx);
+                                return Err(TransportError::Unavailable(e.to_string()));
+                            }
                         }
                         Some(ServerRequestAction::InputRequired) => {
-                            let pending = PendingLegacyMrtr::new(
-                                value,
+                            let pending = match PendingLegacyMrtr::new(
+                                value.clone(),
                                 waiter.downstream_id.clone(),
                                 method,
                                 params,
-                            )?;
+                            ) {
+                                Ok(pending) => pending,
+                                Err(e) => {
+                                    self.refuse(&value, &e.to_string());
+                                    self.abandon(&mut waiter, &rx);
+                                    return Err(e);
+                                }
+                            };
                             let result = pending.input_required();
                             self.suspend(&mut waiter, pending, rx);
                             return Ok(result);
@@ -3496,7 +3514,8 @@ impl StdioCore {
             if legacy {
                 return Err(TransportError::Rpc(json!({
                     "code": -32602,
-                    "message": "unknown or expired requestState"
+                    "message": "unknown or expired requestState; start the call again \
+                                without requestState"
                 })));
             }
             return Ok(Continuation::Fresh);
@@ -3528,9 +3547,11 @@ impl StdioCore {
         let seq = state.next_seq;
         state.next_seq += 1;
         // A server request that arrived while nothing was in flight goes to the
-        // next request, as it did when it waited in the read channel.
-        for request in Self::claim_unclaimed(&mut state, &context) {
-            let _ = tx.send(Delivery::ServerRequest(request));
+        // next client request, as it did when it waited in the read channel.
+        if let Some(context) = &context {
+            for request in Self::claim_unclaimed(&mut state, context) {
+                let _ = tx.send(Delivery::ServerRequest(request));
+            }
         }
         state.pending.insert(
             waiter_key(downstream_id),
@@ -3544,9 +3565,11 @@ impl StdioCore {
         Ok(())
     }
 
-    /// A retry resumed a suspended request: this thread now waits on it.
+    /// A retry resumed a suspended request: this thread now waits on it. The
+    /// waiter keeps the context it was registered with: the retry proved it
+    /// continues that call by presenting its requestState, but a sessionless
+    /// retry is a new upstream request with a new key.
     fn resume(&self, downstream_id: &Value) {
-        let context = request_context_key();
         let mut state = self.lock_state();
         let state = &mut *state;
         let Some(waiter) = state.pending.get_mut(&waiter_key(downstream_id)) else {
@@ -3554,10 +3577,11 @@ impl StdioCore {
             return;
         };
         waiter.active = true;
-        waiter.context = context.clone();
         let tx = waiter.tx.clone();
-        for request in Self::claim_unclaimed(state, &context) {
-            let _ = tx.send(Delivery::ServerRequest(request));
+        if let Some(context) = waiter.context.clone() {
+            for request in Self::claim_unclaimed(state, &context) {
+                let _ = tx.send(Delivery::ServerRequest(request));
+            }
         }
     }
 
@@ -3578,16 +3602,51 @@ impl StdioCore {
     }
 
     /// Stop waiting: drop this waiter, and pass any server request it was handed
-    /// but did not handle to whoever can still answer it.
+    /// but did not handle to another call from the same client. With none
+    /// waiting, the request is refused: it belonged to this client, so no other
+    /// client may answer it.
     fn abandon(&self, waiter: &mut WaiterGuard<'_>, rx: &Receiver<Delivery>) {
         waiter.armed = false;
-        self.lock_state()
+        let owner = self
+            .lock_state()
             .pending
-            .remove(&waiter_key(&waiter.downstream_id));
+            .remove(&waiter_key(&waiter.downstream_id))
+            .and_then(|waiter| waiter.context);
         while let Ok(delivery) = rx.try_recv() {
             if let Delivery::ServerRequest(request) = delivery {
-                self.route_server_request(request);
+                self.reroute_server_request(request, owner.as_deref());
             }
+        }
+    }
+
+    /// Hand a server request whose call ended to the oldest active call with the
+    /// same owner, or refuse it.
+    fn reroute_server_request(&self, request: Value, owner: Option<&str>) {
+        let undelivered = {
+            let state = self.lock_state();
+            let next = owner.and_then(|owner| {
+                state
+                    .pending
+                    .values()
+                    .filter(|waiter| waiter.active && waiter.context.as_deref() == Some(owner))
+                    .min_by_key(|waiter| waiter.seq)
+            });
+            match next {
+                Some(waiter) => match waiter.tx.send(Delivery::ServerRequest(request)) {
+                    Ok(()) => None,
+                    Err(std::sync::mpsc::SendError(Delivery::ServerRequest(request))) => {
+                        Some(request)
+                    }
+                    Err(_) => None,
+                },
+                None => Some(request),
+            }
+        };
+        if let Some(request) = undelivered {
+            self.refuse(
+                &request,
+                "Toolport stopped waiting on the call this request belongs to",
+            );
         }
     }
 
@@ -3733,7 +3792,12 @@ impl StdioCore {
         const UNANSWERABLE: &str = "Toolport had no request in flight to answer this";
         let refused = {
             let mut state = self.lock_state();
-            let mut contexts = state.pending.values().map(|waiter| waiter.context.as_str());
+            // A request no client is waiting on (a background refresh) cannot
+            // answer for anyone, so it neither owns nor mixes.
+            let mut contexts = state
+                .pending
+                .values()
+                .filter_map(|waiter| waiter.context.as_deref());
             let owner = contexts.next();
             let mixed = owner.is_some_and(|owner| !contexts.all(|context| context == owner));
             let owner = owner.map(str::to_string);
@@ -3755,7 +3819,7 @@ impl StdioCore {
             } else if let Some(oldest) = state
                 .pending
                 .values()
-                .filter(|waiter| waiter.active)
+                .filter(|waiter| waiter.active && waiter.context.is_some())
                 .min_by_key(|waiter| waiter.seq)
             {
                 match oldest.tx.send(Delivery::ServerRequest(request)) {
@@ -3807,6 +3871,16 @@ impl StdioCore {
         });
     }
 
+    fn is_closed(&self) -> bool {
+        self.lock_state().closed.is_some()
+            || self
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .try_wait()
+                .is_ok_and(|status| status.is_some())
+    }
+
     /// The child's stdout closed: fail every waiter, and every later request,
     /// with the exit status and stderr tail.
     fn close(&self) {
@@ -3843,6 +3917,10 @@ impl ConcurrentTransport for StdioCall {
             self.protocol_meta.as_ref(),
             self.read_timeout,
         )
+    }
+
+    fn is_closed(&self) -> bool {
+        self.core.is_closed()
     }
 }
 
@@ -6705,6 +6783,14 @@ impl DownstreamServer {
     /// An owned handle for one call that need not hold this server's lock, when
     /// the transport supports concurrent requests. State-changing operations
     /// (catalog refresh, subscriptions, reconnect) keep using `&mut self`.
+    /// Whether a multiplexed connection has closed; `None` when calls to this
+    /// server run one at a time.
+    pub fn connection_closed(&self) -> Option<bool> {
+        self.transport
+            .concurrent()
+            .map(|transport| transport.is_closed())
+    }
+
     pub fn call_handle(&self) -> Option<CallHandle> {
         let transport = self.transport.concurrent()?;
         Some(CallHandle {
@@ -10279,8 +10365,8 @@ mod tests {
     }
 
     thread_local! {
-        static TEST_REQUEST_CONTEXT: std::cell::RefCell<String> =
-            const { std::cell::RefCell::new(String::new()) };
+        static TEST_REQUEST_CONTEXT: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(Some(String::new())) };
     }
 
     /// A [`super::StdioCore`] over a recording child: requests go to the
@@ -10321,10 +10407,30 @@ mod tests {
             params: Value,
             cancel: Option<super::CancelContext>,
         ) -> std::thread::JoinHandle<Result<Value, TransportError>> {
+            self.request_as(Some(context), params, cancel)
+        }
+
+        /// Send one request no client is waiting on, like a background refresh.
+        fn background_request(
+            &self,
+            params: Value,
+        ) -> std::thread::JoinHandle<Result<Value, TransportError>> {
+            self.request_as(None, params, None)
+        }
+
+        fn request_as(
+            &self,
+            context: Option<&str>,
+            params: Value,
+            cancel: Option<super::CancelContext>,
+        ) -> std::thread::JoinHandle<Result<Value, TransportError>> {
             let core = Arc::clone(&self.core);
-            let context = context.to_string();
+            let context = context.map(str::to_string);
             std::thread::Builder::new()
-                .name(format!("waiter-{context}"))
+                .name(format!(
+                    "waiter-{}",
+                    context.as_deref().unwrap_or("background")
+                ))
                 .spawn(move || {
                     TEST_REQUEST_CONTEXT.with(|cell| *cell.borrow_mut() = context);
                     core.request(
@@ -10603,6 +10709,172 @@ mod tests {
             other => panic!("a request after the exit must fail at once, got {other:?}"),
         }
         fixture.finish();
+    }
+
+    fn server_request(id: &str, method: &str) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": {} })
+    }
+
+    /// A URL elicitation Toolport refuses before any handler sees it.
+    fn unsafe_url_elicitation(id: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "elicitation/create",
+            "params": { "mode": "url", "url": "http://example.com/login", "message": "Sign in" }
+        })
+    }
+
+    /// Thread name and request id of each server request a handler took.
+    type SeenRequests = Arc<Mutex<Vec<(String, Value)>>>;
+
+    /// A handler that records which thread handled which server request, and
+    /// answers each with an empty result.
+    fn recording_handler() -> (ServerRequestHandler, SeenRequests) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let handler: ServerRequestHandler = Arc::new(move |request| {
+            let thread = std::thread::current()
+                .name()
+                .unwrap_or_default()
+                .to_string();
+            record.lock().unwrap().push((thread, request["id"].clone()));
+            Some(ServerRequestAction::Respond(json!({
+                "jsonrpc": "2.0",
+                "id": request["id"].clone(),
+                "result": {}
+            })))
+        });
+        (handler, seen)
+    }
+
+    #[test]
+    fn stdio_background_request_neither_mixes_nor_takes_server_requests() {
+        let fixture = CoreFixture::new("background", "");
+        let (handler, seen) = recording_handler();
+        *fixture.core.server_handler.lock().unwrap() = Some(handler);
+        let refresh = fixture.background_request(json!({ "name": "refresh" }));
+        fixture.wait_for_pending(1);
+
+        // Only a background request is in flight: the server request waits for
+        // a client's call instead of being answered without one.
+        fixture.server_says(server_request("srv-1", "roots/list"));
+        fixture.wait_for("the unclaimed server request", |core| {
+            core.lock_state().unclaimed.len() == 1
+        });
+        let call = fixture.request("client-a", json!({ "name": "one" }), None);
+        fixture.wait_for_pending(2);
+        // A client's call next to a background one is not a mix of clients.
+        fixture.server_says(server_request("srv-2", "roots/list"));
+        fixture.server_says(response(1, json!({})));
+        fixture.server_says(response(2, json!({})));
+        refresh.join().unwrap().unwrap();
+        call.join().unwrap().unwrap();
+
+        assert!(!fixture
+            .core
+            .exclusive
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ("waiter-client-a".to_string(), json!("srv-1")),
+                ("waiter-client-a".to_string(), json!("srv-2")),
+            ]
+        );
+        let frames = fixture.finish();
+        assert!(
+            frames.iter().all(|frame| frame.get("error").is_none()),
+            "{frames:?}"
+        );
+    }
+
+    #[test]
+    fn stdio_refused_url_elicitation_still_answers_queued_server_requests() {
+        let fixture = CoreFixture::new("refused-url", "");
+        let (handler, seen) = recording_handler();
+        *fixture.core.server_handler.lock().unwrap() = Some(handler);
+        fixture.server_says(unsafe_url_elicitation("bad"));
+        fixture.server_says(server_request("srv-2", "roots/list"));
+        fixture.wait_for("two unclaimed server requests", |core| {
+            core.lock_state().unclaimed.len() == 2
+        });
+
+        let call = fixture.request("client-a", json!({ "name": "one" }), None);
+        match call.join().unwrap() {
+            Err(TransportError::Fatal(message)) => assert!(message.contains("HTTPS"), "{message}"),
+            other => panic!("expected the unsafe URL to fail the call, got {other:?}"),
+        }
+        assert!(fixture.core.lock_state().pending.is_empty());
+        assert!(seen.lock().unwrap().is_empty());
+
+        let frames = fixture.finish();
+        for id in ["bad", "srv-2"] {
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| frame["id"] == id && frame.get("error").is_some()),
+                "{id} was never answered: {frames:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stdio_server_request_of_an_abandoned_call_never_reaches_another_client() {
+        let fixture = CoreFixture::new("abandon-owner", "");
+        let (recording, seen) = recording_handler();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, release_rx) = (Mutex::new(entered_tx), Mutex::new(release_rx));
+        // The first server request holds client A's call until the test lets go.
+        let handler: ServerRequestHandler = Arc::new(move |request| {
+            if request["id"] == "srv-0" {
+                entered_tx.lock().unwrap().send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+            recording(request)
+        });
+        *fixture.core.server_handler.lock().unwrap() = Some(handler);
+        let first = fixture.request("client-a", json!({ "name": "one" }), None);
+        fixture.wait_for_pending(1);
+        let sibling = fixture.request("client-a", json!({ "name": "zero" }), None);
+        fixture.wait_for_pending(2);
+
+        fixture.server_says(server_request("srv-0", "roots/list"));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        // Both queue behind srv-0 on client A's first call.
+        fixture.server_says(unsafe_url_elicitation("bad"));
+        fixture.server_says(server_request("srv-2", "sampling/createMessage"));
+        // Once the sibling's answer is through, so are the two requests above.
+        fixture.server_says(response(2, json!({})));
+        sibling.join().unwrap().unwrap();
+        let other = fixture.request("client-b", json!({ "name": "two" }), None);
+        fixture.wait_for_pending(2);
+
+        // Client A's call ends on the unsafe URL with srv-2 still queued.
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            first.join().unwrap(),
+            Err(TransportError::Fatal(_))
+        ));
+        fixture.server_says(response(3, json!({})));
+        other.join().unwrap().unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .all(|(thread, _)| thread.as_str() != "waiter-client-b"),
+            "client B answered client A's server request: {seen:?}"
+        );
+        let frames = fixture.finish();
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["id"] == "srv-2" && frame.get("error").is_some()),
+            "{frames:?}"
+        );
     }
 
     #[test]

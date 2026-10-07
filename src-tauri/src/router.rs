@@ -591,6 +591,9 @@ struct ServerSlot {
     /// Bumped each time `reconnect` replaces the connection, so concurrent calls
     /// that failed on the same dead connection re-spawn it only once.
     generation: AtomicU64,
+    /// Calls that succeeded. A failed probe re-spawns a live multiplexed
+    /// connection only if no other call succeeded while it was in flight.
+    successes: AtomicU64,
     reconnect_gate: Mutex<()>,
 }
 
@@ -604,6 +607,7 @@ impl ServerSlot {
             reconnect,
             in_flight: InFlightLimit::default(),
             generation: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
             reconnect_gate: Mutex::new(()),
         }
     }
@@ -742,6 +746,8 @@ const BREAKER_COOLDOWN: Duration = Duration::from_secs(20);
 struct Breaker {
     consecutive_failures: u32,
     open_until: Option<Instant>,
+    /// When the last counted failure was recorded.
+    last_failure: Option<Instant>,
 }
 
 impl Breaker {
@@ -763,14 +769,26 @@ impl Breaker {
     fn record_success(&mut self) {
         self.consecutive_failures = 0;
         self.open_until = None;
+        self.last_failure = None;
     }
 
     /// A health failure; opens the circuit once the streak hits the threshold.
     fn record_failure(&mut self, now: Instant) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.last_failure = Some(now);
         if self.consecutive_failures >= BREAKER_FAILURE_THRESHOLD {
             self.open_until = Some(now + BREAKER_COOLDOWN);
         }
+    }
+
+    /// A health failure of a concurrent call that began at `started`. Calls that
+    /// were in flight together when the connection failed are one failure, so
+    /// several concurrent timeouts do not trip the breaker at once.
+    fn record_concurrent_failure(&mut self, started: Option<Instant>, now: Instant) {
+        if started.is_some_and(|started| self.last_failure.is_some_and(|last| started < last)) {
+            return;
+        }
+        self.record_failure(now);
     }
 }
 
@@ -2340,9 +2358,11 @@ impl Router {
                 return Err("request cancelled before downstream attempt".to_string());
             }
             let generation = slot.generation.load(Ordering::Acquire);
-            let result = Self::attempt(slot, access, cancel, &mut f);
+            let successes = slot.successes.load(Ordering::Acquire);
+            let (result, started) = Self::attempt(slot, access, cancel, &mut f);
             match result {
                 Ok(v) => {
+                    slot.successes.fetch_add(1, Ordering::AcqRel);
                     slot.breaker
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2370,8 +2390,10 @@ impl Router {
                         // This recovers a crashed stdio child or a dropped remote
                         // that the plain breaker would otherwise fast-fail forever (its
                         // self-heal only fires when EVERY server is dead). Gated on the
-                        // probe so a live server is never re-spawned on a transient blip.
-                        if is_probe {
+                        // probe so a live server is never re-spawned on a transient blip,
+                        // and a live multiplexed connection only when no other call
+                        // succeeded meanwhile: re-spawning ends every call in flight.
+                        if is_probe && Self::respawn_after_failure(slot, successes) {
                             if cancel.is_some_and(CancelContext::is_cancelled) {
                                 return Err(
                                     "request cancelled before downstream reconnect".to_string()
@@ -2391,7 +2413,7 @@ impl Router {
                         slot.breaker
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .record_failure(Instant::now());
+                            .record_concurrent_failure(started, Instant::now());
                     }
                     return Err(e.to_string());
                 }
@@ -2399,15 +2421,32 @@ impl Router {
         }
     }
 
+    /// Whether a failed probe should re-spawn the connection. A connection that
+    /// serves one call at a time has nothing else to interrupt; a multiplexed
+    /// one is re-spawned when it closed, or when no call succeeded since
+    /// `successes` was read (it is wedged, not just slow on one call).
+    fn respawn_after_failure(slot: &ServerSlot, successes: u64) -> bool {
+        let closed = slot
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connection_closed();
+        match closed {
+            None | Some(true) => true,
+            Some(false) => slot.successes.load(Ordering::Acquire) == successes,
+        }
+    }
+
     /// Run one dispatch attempt. The slot lock is held only to fetch a call
     /// handle; without one (a transport that cannot multiplex, or a state
-    /// change) the closure runs under the lock as before.
+    /// change) the closure runs under the lock as before. Also returns when a
+    /// call on a handle began, for [`Breaker::record_concurrent_failure`].
     fn attempt<T, F>(
         slot: &ServerSlot,
         access: SlotAccess,
         cancel: Option<&CancelContext>,
         f: &mut F,
-    ) -> Result<T, TransportError>
+    ) -> (Result<T, TransportError>, Option<Instant>)
     where
         F: FnMut(&mut dyn ServerDispatch) -> Result<T, TransportError>,
     {
@@ -2421,17 +2460,22 @@ impl Router {
         };
         match handle {
             Some(mut handle) => {
-                let _permit = slot
+                let _permit = match slot
                     .in_flight
-                    .acquire(&slot.id, handle.call_timeout(), cancel)?;
-                f(&mut handle)
+                    .acquire(&slot.id, handle.call_timeout(), cancel)
+                {
+                    Ok(permit) => permit,
+                    Err(error) => return (Err(error), None),
+                };
+                let started = Instant::now();
+                (f(&mut handle), Some(started))
             }
             None => {
                 let mut server = slot
                     .inner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                f(&mut *server)
+                (f(&mut *server), None)
             }
         }
     }
@@ -2500,7 +2544,10 @@ impl Router {
                 "request cancelled before retrying the reconnected downstream".to_string(),
             ));
         }
-        let retry = Self::attempt(slot, access, cancel, f);
+        let (retry, started) = Self::attempt(slot, access, cancel, f);
+        if retry.is_ok() {
+            slot.successes.fetch_add(1, Ordering::AcqRel);
+        }
         let mut breaker = slot
             .breaker
             .lock()
@@ -2513,7 +2560,7 @@ impl Router {
             }
             Err(e) => {
                 if e.is_health_failure() {
-                    breaker.record_failure(Instant::now());
+                    breaker.record_concurrent_failure(started, Instant::now());
                 }
                 Err(e.to_string())
             }
@@ -3677,13 +3724,16 @@ mod tests {
     }
 
     /// A multiplexing transport: a `slow` call blocks until `gate` opens, any
-    /// other call answers at once.
+    /// other call answers at once. With `slow_fails`, the slow call then times
+    /// out instead of answering.
     struct GatedTransport {
         gate: Arc<(Mutex<bool>, Condvar)>,
+        slow_fails: bool,
     }
 
     struct GatedCall {
         gate: Arc<(Mutex<bool>, Condvar)>,
+        slow_fails: bool,
     }
 
     impl Transport for GatedTransport {
@@ -3700,6 +3750,7 @@ mod tests {
         fn concurrent(&self) -> Option<Arc<dyn crate::downstream::ConcurrentTransport>> {
             Some(Arc::new(GatedCall {
                 gate: Arc::clone(&self.gate),
+                slow_fails: self.slow_fails,
             }))
         }
     }
@@ -3718,9 +3769,107 @@ mod tests {
                 while !*open {
                     open = opened.wait(open).unwrap();
                 }
+                if self.slow_fails {
+                    return Err(TransportError::Unavailable(
+                        "timed out waiting for 'tools/call' response".to_string(),
+                    ));
+                }
             }
             Ok(json!({ "content": [{ "type": "text", "text": params["name"].clone() }] }))
         }
+    }
+
+    type Gate = Arc<(Mutex<bool>, Condvar)>;
+
+    /// A router over one [`GatedTransport`] whose re-spawns are counted, and the
+    /// gate that releases its slow calls.
+    fn gated_router(slow_fails: bool) -> (Arc<Router>, Gate, Arc<std::sync::atomic::AtomicUsize>) {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&spawns);
+        let mut router = Router::new();
+        router.add_with_reconnect(
+            DownstreamServer::connect(
+                "s".into(),
+                Box::new(GatedTransport {
+                    gate: Arc::clone(&gate),
+                    slow_fails,
+                }),
+            )
+            .unwrap(),
+            Some(Box::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Some(mock_server("s"))
+            })),
+        );
+        (Arc::new(router), gate, spawns)
+    }
+
+    fn wait_for_in_flight(slot: &ServerSlot, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while *slot.in_flight.count.lock().unwrap() != count {
+            assert!(Instant::now() < deadline, "{count} call(s) never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn open_gate(gate: &(Mutex<bool>, Condvar)) {
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+
+    #[test]
+    fn a_probe_timeout_does_not_respawn_while_other_calls_succeed() {
+        let (router, gate, spawns) = gated_router(true);
+        let slot = router.slot_for("s").unwrap();
+        // The breaker's cooldown has elapsed: the next calls are half-open probes.
+        slot.breaker.lock().unwrap().consecutive_failures = BREAKER_FAILURE_THRESHOLD;
+        let slow = {
+            let router = Arc::clone(&router);
+            std::thread::spawn(move || router.route_call("s__slow", json!({})))
+        };
+        wait_for_in_flight(&slot, 1);
+        assert!(router.route_call("s__fast", json!({})).is_ok());
+
+        open_gate(&gate);
+        assert!(slow.join().unwrap().is_err());
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            0,
+            "one call's timeout must not re-spawn a connection other calls use"
+        );
+    }
+
+    #[test]
+    fn a_probe_timeout_respawns_a_connection_nothing_got_through() {
+        let (router, gate, spawns) = gated_router(true);
+        let slot = router.slot_for("s").unwrap();
+        slot.breaker.lock().unwrap().consecutive_failures = BREAKER_FAILURE_THRESHOLD;
+        open_gate(&gate);
+        // The re-spawned server answers the replayed read-only call.
+        let _ = router.route_call("s__slow", json!({}));
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_timeouts_count_as_one_breaker_failure() {
+        let (router, gate, spawns) = gated_router(true);
+        let slot = router.slot_for("s").unwrap();
+        let calls: Vec<_> = (0..BREAKER_FAILURE_THRESHOLD)
+            .map(|_| {
+                let router = Arc::clone(&router);
+                std::thread::spawn(move || router.route_call("s__slow", json!({})))
+            })
+            .collect();
+        wait_for_in_flight(&slot, BREAKER_FAILURE_THRESHOLD as usize);
+        open_gate(&gate);
+        for call in calls {
+            assert!(call.join().unwrap().is_err());
+        }
+        let breaker = slot.breaker.lock().unwrap();
+        assert_eq!(breaker.consecutive_failures, 1);
+        assert!(breaker.open_until.is_none(), "one event must not trip it");
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -3732,6 +3881,7 @@ mod tests {
                 "s".into(),
                 Box::new(GatedTransport {
                     gate: Arc::clone(&gate),
+                    slow_fails: false,
                 }),
             )
             .unwrap(),
