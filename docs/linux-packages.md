@@ -38,6 +38,9 @@ desktop metadata and library resolution, and run `toolport-gateway --version`.
 Containers and image aliases are task-owned and cleaned after testing.
 If the build host blocks Docker bridge DNS, set
 `TOOLPORT_PACKAGE_TEST_NETWORK=host` for the test command. Tests expose no ports.
+An optional fourth argument selects `ubuntu`, `debian` or `fedora` when rerunning
+one install test. CI always runs all three. Fedora installs `diffutils` solely
+for the binary comparison check.
 
 These are package installation and headless smoke checks, not GTK display or
 live Secret Service acceptance. Credential fixtures prove byte preservation;

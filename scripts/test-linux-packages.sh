@@ -35,6 +35,8 @@ if [ "${1:-}" = --container ]; then
   mode=${2:?}
   expected_version=${3:?}
   if [ "$mode" = fedora ]; then
+    # The Fedora base image omits cmp; this is a test helper, not an app dependency.
+    dnf install -y diffutils
     dnf install -y /packages/new.rpm
     rpm -qlp /packages/new.rpm
     test "$(rpm -q --qf '%{NAME}' toolport)" = toolport
@@ -90,9 +92,14 @@ REGISTRY
 fi
 
 cd "$(dirname "$0")/.."
-deb=${1:?usage: test-linux-packages.sh NEW.deb NEW.rpm OLD.deb}
+deb=${1:?usage: test-linux-packages.sh NEW.deb NEW.rpm OLD.deb [ubuntu|debian|fedora]}
 rpm=${2:?}
 old_deb=${3:?}
+selected=${4:-all}
+case "$selected" in
+  all|ubuntu|debian|fedora) ;;
+  *) echo "error: unknown test distribution: $selected" >&2; exit 2 ;;
+esac
 version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -1)
 for path in "$deb" "$rpm" "$old_deb" src-tauri/target/release/toolport-gtk; do
   test -f "$path"
@@ -115,6 +122,7 @@ cp src-tauri/target/release/toolport-gtk "$tmp/toolport-gtk"
 cp scripts/test-linux-packages.sh "$tmp/test.sh"
 chmod 755 "$tmp"
 for mode in ubuntu debian fedora; do
+  if [ "$selected" != all ] && [ "$selected" != "$mode" ]; then continue; fi
   case "$mode" in
     ubuntu) image=ubuntu:24.04 ;;
     debian) image=debian:13 ;;
