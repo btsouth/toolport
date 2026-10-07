@@ -13652,9 +13652,10 @@ fn adapter_live_view(
     LiveRouterResolver { stale, resolve }
 }
 
-/// First prompt and resource lists answer with what has loaded by then. A
-/// server that is slower, or hangs in initialize, announces its catalog later
-/// with list_changed instead of holding every list for the full startup wait.
+/// First prompt and resource lists stop waiting for servers still connecting
+/// after this long. A server that is slower, or hangs in initialize, announces
+/// its catalog later with list_changed. One that already connected is still
+/// awaited while the gateway publishes it.
 const FIRST_CATALOG_WAIT: Duration = Duration::from_secs(2);
 
 /// One request in, one response out: wait for a cold cache / live router when
@@ -13784,20 +13785,19 @@ fn process_request(
             .tools
             .is_empty())
     {
-        let deadline = if catalog_list {
-            catalog_deadline
-        } else {
-            Instant::now() + Duration::from_secs(30)
-        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let visible = |id: &str| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope));
         while Instant::now() < deadline {
             let live = state
                 .router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            if !live.any_discovering(|id| {
-                allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
-            }) {
+            if !live.any_discovering(visible)
+                || catalog_list
+                    && Instant::now() >= catalog_deadline
+                    && !live.any_publishing_first_catalog(visible)
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -13933,13 +13933,12 @@ fn process_request(
     if daemon_adapter
         && (rooted_list || method == "tools/list" && rooted_router.aggregated_tools().is_empty())
     {
-        let deadline = if rooted_list {
-            catalog_deadline
-        } else {
-            Instant::now() + Duration::from_secs(30)
-        };
-        while rooted_router
-            .any_discovering(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let visible = |id: &str| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope));
+        while rooted_router.any_discovering(visible)
+            && (!rooted_list
+                || Instant::now() < catalog_deadline
+                || rooted_router.any_publishing_first_catalog(visible))
             && Instant::now() < deadline
         {
             if cancel
@@ -19743,6 +19742,42 @@ mod tests {
         }
         assert!(state.router.lock().unwrap().lazy_starting("hang"));
         drop(release);
+    }
+
+    #[test]
+    fn supervisor_first_lists_still_wait_for_a_connected_server_being_published() {
+        let _env = DataDirTestEnv::new("supervisor-slow-publication");
+        let state = http_state(false);
+        let router = cached_supervisor();
+        router.prepare_lazy_use("cache");
+        wait_for_supervisor_result(&router);
+        *state.router.lock().unwrap() = Arc::new(router);
+        std::thread::scope(|scope| {
+            // Publication (integrity gate, cache writes) outlasts the bound.
+            let adopter = scope.spawn(|| {
+                std::thread::sleep(FIRST_CATALOG_WAIT + Duration::from_millis(500));
+                adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
+            });
+            let reply = process_request(
+                &state,
+                &json!({"jsonrpc":"2.0","id":1,"method":"prompts/list"}),
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .unwrap();
+            adopter.join().unwrap();
+            assert_eq!(
+                reply["result"]["prompts"].as_array().unwrap().len(),
+                1,
+                "a connected server lost its first list to the bound"
+            );
+        });
     }
 
     #[test]

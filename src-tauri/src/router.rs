@@ -2075,6 +2075,18 @@ impl Router {
         })
     }
 
+    /// Whether a visible server connected for its first catalog and now only
+    /// waits for the gateway to publish it.
+    pub fn any_publishing_first_catalog(&self, visible: impl Fn(&str) -> bool) -> bool {
+        self.servers.iter().any(|slot| {
+            visible(&slot.id)
+                && slot.supervisor.as_ref().is_some_and(|s| {
+                    let state = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    !state.ever_ready && (state.ready.is_some() || state.publishing)
+                })
+        })
+    }
+
     pub fn discover_uncached(&self, visible: impl Fn(&str) -> bool) {
         for slot in &self.servers {
             if visible(&slot.id)
