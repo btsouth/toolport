@@ -1,68 +1,351 @@
 [
-{"query": "read the contents of a local file from disk", "expected": "filesystem__read_text_file", "server": "filesystem"},
-{"query": "write text to a file on my computer", "expected": "filesystem__write_file", "server": "filesystem"},
-{"query": "search for files by name in a directory", "expected": "filesystem__search_files", "server": "filesystem", "ambiguous": true},
-{"query": "list the files in a directory", "expected": "filesystem__list_directory", "server": "filesystem", "ambiguous": true},
-{"query": "show the directory tree", "expected": "filesystem__directory_tree", "server": "filesystem"},
-{"query": "move or rename a file", "expected": "filesystem__move_file", "server": "filesystem"},
-{"query": "fetch a web page and return its content as markdown", "expected": "fetch__fetch", "server": "fetch"},
-{"query": "get the current time in a timezone", "expected": "time__get_current_time", "server": "time"},
-{"query": "convert a timestamp from one timezone to another", "expected": "time__convert_time", "server": "time"},
-{"query": "check the git status of my working tree", "expected": "git__git_status", "server": "git"},
-{"query": "show my unstaged changes as a diff", "expected": "git__git_diff_unstaged", "server": "git"},
-{"query": "commit staged changes with a message", "expected": "git__git_commit", "server": "git"},
-{"query": "show the commit history log", "expected": "git__git_log", "server": "git"},
-{"query": "create a new git branch", "expected": "git__git_create_branch", "server": "git", "ambiguous": true},
-{"query": "store entities in my knowledge graph memory", "expected": "memory__create_entities", "server": "memory"},
-{"query": "search my saved memory nodes", "expected": "memory__search_nodes", "server": "memory", "ambiguous": true},
-{"query": "read the whole knowledge graph", "expected": "memory__read_graph", "server": "memory"},
-{"query": "add an observation to an existing entity", "expected": "memory__add_observations", "server": "memory"},
-{"query": "think through a complex problem step by step", "expected": "sequentialthinking__sequentialthinking", "server": "sequentialthinking"},
-{"query": "add two numbers together", "expected": "everything__get_sum", "server": "everything"},
-{"query": "show me the environment variables", "expected": "everything__get_env", "server": "everything"},
-{"query": "return a tiny sample image", "expected": "everything__get_tiny_image", "server": "everything"},
-{"query": "open a new pull request for my branch", "expected": "github__create_pull_request", "server": "github"},
-{"query": "list the open pull requests", "expected": "github__list_pull_requests", "server": "github", "ambiguous": true},
-{"query": "merge an approved pull request", "expected": "github__merge_pull_request", "server": "github"},
-{"query": "create a bug report issue", "expected": "github__create_issue", "server": "github"},
-{"query": "search code across repositories for a function name", "expected": "github__search_code", "server": "github", "ambiguous": true},
-{"query": "find repositories about a topic", "expected": "github__search_repositories", "server": "github"},
-{"query": "read a file from a repository on GitHub", "expected": "github__get_file_contents", "server": "github", "ambiguous": true},
-{"query": "trigger a GitHub Actions workflow", "expected": "github__run_workflow", "server": "github"},
-{"query": "send a message to a Slack channel", "expected": "slack__post_message", "server": "slack", "ambiguous": true},
-{"query": "list the Slack channels in my workspace", "expected": "slack__list_channels", "server": "slack"},
-{"query": "search Slack messages for a keyword", "expected": "slack__search_messages", "server": "slack", "ambiguous": true},
-{"query": "send a direct message to a coworker", "expected": "slack__send_dm", "server": "slack"},
-{"query": "list the members of the Slack workspace", "expected": "slack__list_users", "server": "slack", "ambiguous": true},
-{"query": "create a new Linear issue for a bug", "expected": "linear__create_issue", "server": "linear", "ambiguous": true},
-{"query": "list the issues assigned to me in Linear", "expected": "linear__list_issues", "server": "linear", "ambiguous": true},
-{"query": "search Linear issues by text", "expected": "linear__search_issues", "server": "linear", "ambiguous": true},
-{"query": "list the sprints in Linear", "expected": "linear__list_cycles", "server": "linear"},
-{"query": "add a comment to a Linear issue", "expected": "linear__create_comment", "server": "linear"},
-{"query": "refund a customer payment in Stripe", "expected": "stripe__create_refund", "server": "stripe"},
-{"query": "create a Stripe customer record", "expected": "stripe__create_customer", "server": "stripe"},
-{"query": "list recent payments in Stripe", "expected": "stripe__list_payment", "server": "stripe"},
-{"query": "show my deployed Vercel projects", "expected": "vercel__list_project", "server": "vercel", "ambiguous": true},
-{"query": "get the details of a Vercel deployment", "expected": "vercel__get_deployment", "server": "vercel"},
-{"query": "add a custom domain to Vercel", "expected": "vercel__create_domain", "server": "vercel"},
-{"query": "run a SQL query against my Postgres database", "expected": "postgres__run_query", "server": "postgres"},
-{"query": "explain the query plan for a SQL statement", "expected": "postgres__explain_query", "server": "postgres", "ambiguous": true},
-{"query": "list the tables in my database", "expected": "postgres__list_table", "server": "postgres", "ambiguous": true},
-{"query": "list my Supabase projects", "expected": "supabase__list_project", "server": "supabase", "ambiguous": true},
-{"query": "query rows from a Supabase table", "expected": "supabase__query_table", "server": "supabase"},
-{"query": "list recent application errors from Sentry", "expected": "sentry__list_issue", "server": "sentry"},
-{"query": "resolve a Sentry error issue", "expected": "sentry__resolve_issue", "server": "sentry"},
-{"query": "purge the CDN cache for my website on Cloudflare", "expected": "cloudflare__purge_zone", "server": "cloudflare"},
-{"query": "list the DNS records for a Cloudflare zone", "expected": "cloudflare__list_dns_record", "server": "cloudflare"},
-{"query": "search my Notion pages", "expected": "notion__search_page", "server": "notion", "ambiguous": true},
-{"query": "create a new page in Notion", "expected": "notion__create_page", "server": "notion"},
-{"query": "send a transactional email with Resend", "expected": "resend__send_email", "server": "resend"},
-{"query": "list my Neon database projects", "expected": "neon__list_project", "server": "neon", "ambiguous": true},
-{"query": "create a Neon database branch", "expected": "neon__create_branch", "server": "neon", "ambiguous": true},
-{"query": "list my S3 buckets on AWS", "expected": "aws__list_bucket", "server": "aws"},
-{"query": "describe my EC2 instances", "expected": "aws__describe_instance", "server": "aws"},
-{"query": "start a stopped EC2 instance", "expected": "aws__start_instance", "server": "aws"},
-{"query": "post an update in our team chat", "expected": "slack__post_message", "server": "slack", "ambiguous": true},
-{"query": "what changed in the repository recently", "expected": "git__git_log", "server": "git", "ambiguous": true},
-{"query": "save this fact for later", "expected": "memory__create_entities", "server": "memory", "ambiguous": true}
+  {
+    "query": "read the contents of a local file from disk",
+    "expected": "filesystem__read_text_file",
+    "server": "filesystem"
+  },
+  {
+    "query": "write text to a file on my computer",
+    "expected": "filesystem__write_file",
+    "server": "filesystem"
+  },
+  {
+    "query": "search for files by name in a directory",
+    "expected": "filesystem__search_files",
+    "server": "filesystem",
+    "ambiguous": true
+  },
+  {
+    "query": "list the files in a directory",
+    "expected": "filesystem__list_directory",
+    "server": "filesystem",
+    "ambiguous": true
+  },
+  {
+    "query": "show the directory tree",
+    "expected": "filesystem__directory_tree",
+    "server": "filesystem"
+  },
+  {
+    "query": "move or rename a file",
+    "expected": "filesystem__move_file",
+    "server": "filesystem"
+  },
+  {
+    "query": "fetch a web page and return its content as markdown",
+    "expected": "fetch__fetch",
+    "server": "fetch"
+  },
+  {
+    "query": "get the current time in a timezone",
+    "expected": "time__get_current_time",
+    "server": "time"
+  },
+  {
+    "query": "convert a timestamp from one timezone to another",
+    "expected": "time__convert_time",
+    "server": "time"
+  },
+  {
+    "query": "check the git status of my working tree",
+    "expected": "git__git_status",
+    "server": "git"
+  },
+  {
+    "query": "show my unstaged changes as a diff",
+    "expected": "git__git_diff_unstaged",
+    "server": "git"
+  },
+  {
+    "query": "commit staged changes with a message",
+    "expected": "git__git_commit",
+    "server": "git"
+  },
+  { "query": "show the commit history log", "expected": "git__git_log", "server": "git" },
+  {
+    "query": "create a new git branch",
+    "expected": "git__git_create_branch",
+    "server": "git",
+    "ambiguous": true
+  },
+  {
+    "query": "store entities in my knowledge graph memory",
+    "expected": "memory__create_entities",
+    "server": "memory"
+  },
+  {
+    "query": "search my saved memory nodes",
+    "expected": "memory__search_nodes",
+    "server": "memory",
+    "ambiguous": true
+  },
+  {
+    "query": "read the whole knowledge graph",
+    "expected": "memory__read_graph",
+    "server": "memory"
+  },
+  {
+    "query": "add an observation to an existing entity",
+    "expected": "memory__add_observations",
+    "server": "memory"
+  },
+  {
+    "query": "think through a complex problem step by step",
+    "expected": "sequentialthinking__sequentialthinking",
+    "server": "sequentialthinking"
+  },
+  {
+    "query": "add two numbers together",
+    "expected": "everything__get_sum",
+    "server": "everything"
+  },
+  {
+    "query": "show me the environment variables",
+    "expected": "everything__get_env",
+    "server": "everything"
+  },
+  {
+    "query": "return a tiny sample image",
+    "expected": "everything__get_tiny_image",
+    "server": "everything"
+  },
+  {
+    "query": "open a new pull request for my branch",
+    "expected": "github__create_pull_request",
+    "server": "github"
+  },
+  {
+    "query": "list the open pull requests",
+    "expected": "github__list_pull_requests",
+    "server": "github",
+    "ambiguous": true
+  },
+  {
+    "query": "merge an approved pull request",
+    "expected": "github__merge_pull_request",
+    "server": "github"
+  },
+  {
+    "query": "create a bug report issue",
+    "expected": "github__create_issue",
+    "server": "github"
+  },
+  {
+    "query": "search code across repositories for a function name",
+    "expected": "github__search_code",
+    "server": "github",
+    "ambiguous": true
+  },
+  {
+    "query": "find repositories about a topic",
+    "expected": "github__search_repositories",
+    "server": "github"
+  },
+  {
+    "query": "read a file from a repository on GitHub",
+    "expected": "github__get_file_contents",
+    "server": "github",
+    "ambiguous": true
+  },
+  {
+    "query": "trigger a GitHub Actions workflow",
+    "expected": "github__run_workflow",
+    "server": "github"
+  },
+  {
+    "query": "send a message to a Slack channel",
+    "expected": "slack__post_message",
+    "server": "slack",
+    "ambiguous": true
+  },
+  {
+    "query": "list the Slack channels in my workspace",
+    "expected": "slack__list_channels",
+    "server": "slack"
+  },
+  {
+    "query": "search Slack messages for a keyword",
+    "expected": "slack__search_messages",
+    "server": "slack",
+    "ambiguous": true
+  },
+  {
+    "query": "send a direct message to a coworker",
+    "expected": "slack__send_dm",
+    "server": "slack"
+  },
+  {
+    "query": "list the members of the Slack workspace",
+    "expected": "slack__list_users",
+    "server": "slack",
+    "ambiguous": true
+  },
+  {
+    "query": "create a new Linear issue for a bug",
+    "expected": "linear__create_issue",
+    "server": "linear",
+    "ambiguous": true
+  },
+  {
+    "query": "list the issues assigned to me in Linear",
+    "expected": "linear__list_issues",
+    "server": "linear",
+    "ambiguous": true
+  },
+  {
+    "query": "search Linear issues by text",
+    "expected": "linear__search_issues",
+    "server": "linear",
+    "ambiguous": true
+  },
+  {
+    "query": "list the sprints in Linear",
+    "expected": "linear__list_cycles",
+    "server": "linear"
+  },
+  {
+    "query": "add a comment to a Linear issue",
+    "expected": "linear__create_comment",
+    "server": "linear"
+  },
+  {
+    "query": "refund a customer payment in Stripe",
+    "expected": "stripe__create_refund",
+    "server": "stripe"
+  },
+  {
+    "query": "create a Stripe customer record",
+    "expected": "stripe__create_customer",
+    "server": "stripe"
+  },
+  {
+    "query": "list recent payments in Stripe",
+    "expected": "stripe__list_payment",
+    "server": "stripe"
+  },
+  {
+    "query": "show my deployed Vercel projects",
+    "expected": "vercel__list_project",
+    "server": "vercel",
+    "ambiguous": true
+  },
+  {
+    "query": "get the details of a Vercel deployment",
+    "expected": "vercel__get_deployment",
+    "server": "vercel"
+  },
+  {
+    "query": "add a custom domain to Vercel",
+    "expected": "vercel__create_domain",
+    "server": "vercel"
+  },
+  {
+    "query": "run a SQL query against my Postgres database",
+    "expected": "postgres__run_query",
+    "server": "postgres"
+  },
+  {
+    "query": "explain the query plan for a SQL statement",
+    "expected": "postgres__explain_query",
+    "server": "postgres",
+    "ambiguous": true
+  },
+  {
+    "query": "list the tables in my database",
+    "expected": "postgres__list_table",
+    "server": "postgres",
+    "ambiguous": true
+  },
+  {
+    "query": "list my Supabase projects",
+    "expected": "supabase__list_project",
+    "server": "supabase",
+    "ambiguous": true
+  },
+  {
+    "query": "query rows from a Supabase table",
+    "expected": "supabase__query_table",
+    "server": "supabase"
+  },
+  {
+    "query": "list recent application errors from Sentry",
+    "expected": "sentry__list_issue",
+    "server": "sentry"
+  },
+  {
+    "query": "resolve a Sentry error issue",
+    "expected": "sentry__resolve_issue",
+    "server": "sentry"
+  },
+  {
+    "query": "purge the CDN cache for my website on Cloudflare",
+    "expected": "cloudflare__purge_zone",
+    "server": "cloudflare"
+  },
+  {
+    "query": "list the DNS records for a Cloudflare zone",
+    "expected": "cloudflare__list_dns_record",
+    "server": "cloudflare"
+  },
+  {
+    "query": "search my Notion pages",
+    "expected": "notion__search_page",
+    "server": "notion",
+    "ambiguous": true
+  },
+  {
+    "query": "create a new page in Notion",
+    "expected": "notion__create_page",
+    "server": "notion"
+  },
+  {
+    "query": "send a transactional email with Resend",
+    "expected": "resend__send_email",
+    "server": "resend"
+  },
+  {
+    "query": "list my Neon database projects",
+    "expected": "neon__list_project",
+    "server": "neon",
+    "ambiguous": true
+  },
+  {
+    "query": "create a Neon database branch",
+    "expected": "neon__create_branch",
+    "server": "neon",
+    "ambiguous": true
+  },
+  {
+    "query": "list my S3 buckets on AWS",
+    "expected": "aws__list_bucket",
+    "server": "aws"
+  },
+  {
+    "query": "describe my EC2 instances",
+    "expected": "aws__describe_instance",
+    "server": "aws"
+  },
+  {
+    "query": "start a stopped EC2 instance",
+    "expected": "aws__start_instance",
+    "server": "aws"
+  },
+  {
+    "query": "post an update in our team chat",
+    "expected": "slack__post_message",
+    "server": "slack",
+    "ambiguous": true
+  },
+  {
+    "query": "what changed in the repository recently",
+    "expected": "git__git_log",
+    "server": "git",
+    "ambiguous": true
+  },
+  {
+    "query": "save this fact for later",
+    "expected": "memory__create_entities",
+    "server": "memory",
+    "ambiguous": true
+  }
 ]
