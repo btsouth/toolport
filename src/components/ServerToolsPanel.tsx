@@ -618,6 +618,8 @@ export function ServerToolsPanel({
 }: ServerToolsProps) {
   const servers = registry?.servers ?? [];
   const denyDestructive = registry?.denyDestructive ?? false;
+  const activeProfileId = registry?.activeProfileId;
+  const overrideVersion = JSON.stringify(registry?.toolOverrides?.[serverId] ?? {});
 
   const [tab, setTab] = useState<"tools" | "resources" | "prompts">("tools");
   const [policyBusy, setPolicyBusy] = useState(false);
@@ -688,7 +690,7 @@ export function ServerToolsPanel({
     return () => {
       alive = false;
     };
-  }, [serverId]);
+  }, [serverId, activeProfileId, overrideVersion]);
 
   const tool = useMemo(
     () => tools?.find((t) => t.name === selectedTool) ?? null,

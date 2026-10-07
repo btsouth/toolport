@@ -80,6 +80,31 @@ describe("server Tools panel", () => {
     expect(await screen.findByText("Record found")).toBeVisible();
   });
 
+  it("refreshes quarantine state when the active profile changes", async () => {
+    const view = render(
+      <ServerToolsPanel
+        serverId="alpha"
+        registry={registry}
+        onRegistryChange={vi.fn()}
+      />,
+    );
+    await screen.findByText("Quarantined");
+    api.listServerTools.mockResolvedValue(
+      tools.map((tool) => ({ ...tool, toolportQuarantine: "clear" })),
+    );
+    view.rerender(
+      <ServerToolsPanel
+        serverId="alpha"
+        registry={{ ...registry, activeProfileId: "other" }}
+        onRegistryChange={vi.fn()}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.queryByText("Quarantined")).not.toBeInTheDocument(),
+    );
+    expect(screen.getAllByText("Not quarantined")).toHaveLength(2);
+  });
+
   it("reports unknown quarantine when the retained state cannot be read", async () => {
     api.listServerTools.mockResolvedValue(
       tools.map((tool) => ({ ...tool, toolportQuarantine: "unknown" })),

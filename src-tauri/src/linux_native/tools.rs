@@ -392,7 +392,8 @@ fn tool_row(
             title.append(&state_badge(label));
         }
     }
-    title.append(&state_badge(if enabled { "Enabled" } else { "Disabled" }));
+    let enabled_badge = state_badge(if enabled { "Enabled" } else { "Disabled" });
+    title.append(&enabled_badge);
     title.append(&state_badge(
         match tool
             .get("toolportQuarantine")
@@ -449,6 +450,7 @@ fn tool_row(
     let page_for_visibility = page.clone();
     let name_for_visibility = name.clone();
     let run_for_visibility = run.clone();
+    let badge_for_visibility = enabled_badge.clone();
     visibility.connect_toggled(move |button| {
         if reverting.get() {
             return;
@@ -462,6 +464,7 @@ fn tool_row(
         let name = name_for_visibility.clone();
         let button = button.clone();
         let run = run_for_visibility.clone();
+        let badge = badge_for_visibility.clone();
         let reverting = reverting.clone();
         gtk::glib::spawn_future_local(async move {
             let result = {
@@ -477,6 +480,7 @@ fn tool_row(
                     page.remember_tool_enabled(&name, enabled);
                     set_visibility_look(&button, enabled);
                     run.set_sensitive(enabled);
+                    badge.set_label(if enabled { "Enabled" } else { "Disabled" });
                 }
                 Ok(Err(error)) => {
                     // The registry rejected the change, so the control must not
