@@ -14,6 +14,15 @@
 //! before dispatch (a profile, enabled-set or tool-scope change rebinds the
 //! session): it reopens the session and sends that request once more.
 //!
+//! A daemon that accepts connections but stops answering its identity probe for
+//! [`crate::daemon::SILENT_RETRY_TIMEOUT`] is wedged, not busy: the probe is
+//! served outside its request workers. Then the adapter never elects a second
+//! shared daemon beside it. At startup a registry-selected adapter falls back to
+//! the in-process gateway; an explicit adapter, or one already in a session,
+//! starts a private gateway process of its own, replays the client's handshake
+//! there and sends later requests to it. Calls already waiting on the wedged
+//! daemon are left to finish or time out there; none is sent twice.
+//!
 //! Requests run on bounded worker threads, so a client that pipelines a slow call
 //! and a fast one is answered in completion order rather than arrival order. The
 //! first request runs inline, so `initialize` establishes the session before
@@ -33,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 
-use crate::daemon::{DaemonDescriptor, Rendezvous};
+use crate::daemon::{DaemonDescriptor, EnsureError, Rendezvous};
 use crate::registry;
 use crate::topology::CompatKey;
 
@@ -48,6 +57,18 @@ pub const ADAPTER_PROFILE_HEADER: &str = "Toolport-Adapter-Profile";
 pub const ADAPTER_CWD_HEADER: &str = "Toolport-Adapter-Cwd";
 pub const ADAPTER_ROOT_OVERRIDE_HEADER: &str = "Toolport-Adapter-Root-Override";
 pub const ADAPTER_DECLARED_ROOT_HEADER: &str = "Toolport-Adapter-Declared-Root";
+/// The internal role an adapter starts for itself when the shared daemon is
+/// wedged: a daemon-shaped gateway that is never advertised, announces its
+/// descriptor on stdout, and exits when the adapter closes its stdin.
+pub const PRIVATE_GATEWAY_FLAG: &str = "--private-gateway";
+/// What `toolport_status` says on a private gateway.
+pub const PRIVATE_GATEWAY_NOTE: &str = "The shared host daemon stopped answering, so this client \
+     runs on a private gateway with its own copies of its servers. Restart the client once the \
+     daemon is healthy to share them again.";
+/// What `toolport_status` says after the startup fallback to the in-process gateway.
+pub const IN_PROCESS_FALLBACK_NOTE: &str = "The shared host daemon was not answering when this \
+     client started, so it runs its own in-process gateway with its own copies of its servers. \
+     Restart the client once the daemon is healthy to share them again.";
 /// Same per-frame bound the in-process stdio gateway applies to one client frame.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// A single request may legitimately run long (a slow downstream call), so the
@@ -57,8 +78,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// no overall deadline. The daemon sends a keepalive every 30 seconds; three
 /// missed ones mean it is gone.
 const SUBSCRIPTION_READ_TIMEOUT: Duration = Duration::from_secs(90);
-/// Budget for one idle check-in with the daemon.
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the adapter checks that its daemon still answers. Also the check-in
+/// that keeps an attached daemon from idling out.
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
+/// A private gateway boots a whole router before it announces itself; a cold
+/// daemon on a loaded runner has taken tens of seconds to do the same.
+const PRIVATE_GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for the daemon to publish a session id before opening the
 /// server-initiated listen stream.
 const LISTEN_POLL: Duration = Duration::from_millis(100);
@@ -85,12 +110,16 @@ struct PreparationFailure {
     detail: String,
     /// Only a failed OS spawn proves no daemon was launched by this attempt.
     safe_to_fallback: bool,
+    /// A daemon owns the pointer but did not answer. Never replaced, so a
+    /// gateway of this client's own does not compete with it for the pointer.
+    unresponsive: bool,
 }
 
 fn prepare_stdio_adapter() -> Result<(Rendezvous, DaemonDescriptor), PreparationFailure> {
     let dir = registry::conduit_dir().ok_or_else(|| PreparationFailure {
         detail: "no data directory could be resolved".to_string(),
         safe_to_fallback: false,
+        unresponsive: false,
     })?;
     let compat = CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string());
     let rendezvous = Rendezvous::new(&dir, compat);
@@ -101,9 +130,10 @@ fn prepare_stdio_adapter() -> Result<(Rendezvous, DaemonDescriptor), Preparation
             spawn_failed = result.is_err();
             result
         })
-        .map_err(|detail| PreparationFailure {
-            detail,
+        .map_err(|error| PreparationFailure {
+            detail: error.to_string(),
             safe_to_fallback: spawn_failed,
+            unresponsive: matches!(error, EnsureError::Unresponsive(_)),
         })?;
     Ok((rendezvous, descriptor))
 }
@@ -116,8 +146,12 @@ pub fn ensure_host_daemon() -> Result<DaemonDescriptor, String> {
         .map_err(|failure| failure.detail)
 }
 
-fn finish_stdio_adapter(rendezvous: Rendezvous, descriptor: DaemonDescriptor) -> ! {
-    match proxy_stdio(rendezvous, descriptor) {
+fn finish_stdio_adapter(
+    rendezvous: Rendezvous,
+    descriptor: DaemonDescriptor,
+    private: Option<std::process::Child>,
+) -> ! {
+    match proxy_stdio(rendezvous, descriptor, private) {
         Ok(()) => std::process::exit(0),
         Err(error) => {
             eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: {error}");
@@ -126,10 +160,32 @@ fn finish_stdio_adapter(rendezvous: Rendezvous, descriptor: DaemonDescriptor) ->
     }
 }
 
-/// Run an explicit stdio adapter; an unavailable daemon ends this process.
+/// Run an explicit stdio adapter; an unavailable daemon ends this process, and
+/// a wedged one gets this client a private gateway.
 pub fn run_stdio_adapter() -> ! {
     match prepare_stdio_adapter() {
-        Ok((rendezvous, descriptor)) => finish_stdio_adapter(rendezvous, descriptor),
+        Ok((rendezvous, descriptor)) => finish_stdio_adapter(rendezvous, descriptor, None),
+        Err(error) if error.unresponsive => {
+            let rendezvous = match registry::conduit_dir() {
+                Some(dir) => Rendezvous::new(
+                    &dir,
+                    CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string()),
+                ),
+                None => std::process::exit(1),
+            };
+            match start_private_gateway(&error.detail) {
+                Ok((child, descriptor)) => {
+                    finish_stdio_adapter(rendezvous, descriptor, Some(child))
+                }
+                Err(detail) => {
+                    eprintln!(
+                        "toolport-gateway {STDIO_ADAPTER_FLAG}: {}; {detail}",
+                        error.detail
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
         Err(error) => {
             eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: {}", error.detail);
             std::process::exit(1);
@@ -144,11 +200,24 @@ pub fn run_selected_stdio_adapter() {
     match prepare_stdio_adapter() {
         Ok((rendezvous, descriptor)) => {
             crate::gatewaylog::append("topology: role=stdio-adapter source=stdio-topology");
-            finish_stdio_adapter(rendezvous, descriptor)
+            finish_stdio_adapter(rendezvous, descriptor, None)
+        }
+        Err(PreparationFailure {
+            detail,
+            unresponsive: true,
+            ..
+        }) => {
+            crate::gatewaylog::append("topology: role=standalone reason=daemon-unresponsive");
+            crate::daemon::add_status_note(IN_PROCESS_FALLBACK_NOTE);
+            eprintln!(
+                "toolport-gateway: the host daemon is not answering ({detail}); \
+                 this client is using its own in-process gateway"
+            );
         }
         Err(PreparationFailure {
             detail,
             safe_to_fallback: true,
+            ..
         }) => {
             crate::gatewaylog::append("topology: role=standalone reason=daemon-startup-fallback");
             eprintln!(
@@ -190,6 +259,62 @@ fn spawn_daemon() -> Result<(), String> {
         .map_err(|error| format!("could not start the host daemon: {error}"))
 }
 
+/// Start this client's own gateway beside a wedged shared daemon. It is never
+/// advertised, so no other client can elect it, and it lives exactly as long as
+/// the returned child's stdin stays open. `why` is logged with it.
+fn start_private_gateway(why: &str) -> Result<(std::process::Child, DaemonDescriptor), String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("could not locate this executable: {error}"))?;
+    let mut child = Command::new(exe)
+        .arg(PRIVATE_GATEWAY_FLAG)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("could not start a private gateway: {error}"))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (sender, announced) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        let _ = sender.send(line);
+        // Keep draining so the gateway can never block on a full pipe.
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    });
+    let ready = announced
+        .recv_timeout(PRIVATE_GATEWAY_READY_TIMEOUT)
+        .map_err(|_| "the private gateway did not announce itself in time".to_string())
+        .and_then(|line| {
+            serde_json::from_str::<DaemonDescriptor>(line.trim())
+                .map_err(|error| format!("the private gateway's announcement was invalid: {error}"))
+        })
+        .and_then(|descriptor| {
+            crate::daemon::probe_identity(&descriptor)
+                .map(|_| descriptor)
+                .map_err(|error| format!("the private gateway did not answer: {error}"))
+        });
+    match ready {
+        Ok(descriptor) => {
+            crate::gatewaylog::append(&format!(
+                "topology: role=private-gateway pid={} reason=daemon-unresponsive",
+                descriptor.pid
+            ));
+            eprintln!(
+                "toolport-gateway: the host daemon stopped answering ({why}); \
+                 this client now uses a private gateway (pid {})",
+                descriptor.pid
+            );
+            Ok((child, descriptor))
+        }
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
+    }
+}
+
 /// The exact error the daemon sends when it refuses a session id. Missing,
 /// expired, rescoped and foreign sessions all get it, before any dispatch. The
 /// daemon uses this constant too, so the adapter's match cannot drift from it.
@@ -202,6 +327,9 @@ const HEALTHY: u8 = 0;
 const SESSION_REFUSED: u8 = 1;
 /// The daemon could not be reached: re-rendezvous, then replay the handshake.
 const DAEMON_LOST: u8 = 2;
+/// The daemon stopped answering while alive: move to a private gateway, then
+/// replay the handshake.
+const DAEMON_WEDGED: u8 = 3;
 
 /// Why an exchange produced no answer for the client.
 #[derive(Debug)]
@@ -232,7 +360,16 @@ struct Session {
     stale: AtomicU8,
     /// Shared by healthy exchanges; taken exclusively while one caller recovers, so
     /// no request runs against the old descriptor or ahead of the replayed handshake.
-    gate: RwLock<()>,
+    /// Replaced when the daemon wedges: calls stuck on it keep the old gate, so
+    /// they cannot hold up the move to a private gateway.
+    gate: Mutex<Arc<RwLock<()>>>,
+    /// Serializes recoveries, which can overlap across a replaced gate.
+    recovery: Mutex<()>,
+    /// The endpoint the liveness check found wedged, until a recovery moves off it.
+    wedged_endpoint: Mutex<Option<String>>,
+    /// This client's own gateway, once the shared daemon wedged. Dropping it
+    /// closes its stdin, which is what ends it.
+    private_gateway: Mutex<Option<std::process::Child>>,
     session_id: Mutex<Option<String>>,
     /// The client's `initialize` and its `notifications/initialized`, kept so a
     /// replacement daemon can be given an equivalent session.
@@ -282,7 +419,11 @@ impl Drop for SubscriptionGuard<'_> {
 }
 
 impl Session {
-    fn new(rendezvous: Rendezvous, descriptor: DaemonDescriptor) -> Self {
+    fn new(
+        rendezvous: Rendezvous,
+        descriptor: DaemonDescriptor,
+        private: Option<std::process::Child>,
+    ) -> Self {
         let client_id =
             crate::brand::env_var(crate::brand::CLIENT_ID, crate::brand::CLIENT_ID_LEGACY)
                 .filter(|id| !id.trim().is_empty())
@@ -300,7 +441,10 @@ impl Session {
             rendezvous,
             descriptor: Mutex::new(descriptor),
             stale: AtomicU8::new(HEALTHY),
-            gate: RwLock::new(()),
+            gate: Mutex::new(Arc::new(RwLock::new(()))),
+            recovery: Mutex::new(()),
+            wedged_endpoint: Mutex::new(None),
+            private_gateway: Mutex::new(private),
             session_id: Mutex::new(None),
             handshake_initialize: Mutex::new(None),
             handshake_initialized: Mutex::new(None),
@@ -617,17 +761,86 @@ impl Session {
         Ok(())
     }
 
+    /// The gate in effect now. See [`Session::mark_wedged`] for why it changes.
+    fn current_gate(&self) -> Arc<RwLock<()>> {
+        Arc::clone(
+            &self
+                .gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Called by the liveness check when the daemon at `endpoint` stays silent.
+    /// The next request moves this client to a private gateway. Calls already
+    /// waiting on the wedged daemon hold the current gate, so a fresh one lets
+    /// that move start without waiting for them.
+    fn mark_wedged(&self, endpoint: &str) {
+        let mut gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.descriptor().endpoint != endpoint {
+            return;
+        }
+        *self
+            .wedged_endpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(endpoint.to_string());
+        self.stale.fetch_max(DAEMON_WEDGED, Ordering::SeqCst);
+        *gate = Arc::new(RwLock::new(()));
+    }
+
+    /// Start a private gateway and point this session at it.
+    fn use_private_gateway(&self, wedged: &DaemonDescriptor) -> Result<(), String> {
+        let (child, descriptor) = start_private_gateway(&format!(
+            "the daemon at {} (pid {}) did not answer its identity probe",
+            wedged.endpoint, wedged.pid
+        ))?;
+        *self
+            .private_gateway
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child);
+        if let Ok(mut guard) = self.descriptor.lock() {
+            *guard = descriptor;
+        }
+        Ok(())
+    }
+
     /// Open a replacement session by replaying the client's handshake. After a
-    /// daemon failure, re-rendezvous first; after a refused session the daemon is
-    /// alive and keeps its descriptor. The caller holds the write gate.
+    /// daemon failure, re-rendezvous first, or start a private gateway when the
+    /// daemon is wedged; after a refused session the daemon is alive and keeps
+    /// its descriptor. The caller holds the write gate.
     fn recover(&self, stale: u8) -> Result<(), String> {
-        if stale >= DAEMON_LOST {
-            let descriptor = self
-                .rendezvous
-                .ensure(spawn_daemon)
-                .map_err(|error| format!("the host daemon could not be reached again: {error}"))?;
-            if let Ok(mut guard) = self.descriptor.lock() {
-                *guard = descriptor;
+        let _serial = self
+            .recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if stale >= DAEMON_WEDGED {
+            let wedged = self
+                .wedged_endpoint
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let current = self.descriptor();
+            if wedged.as_deref() != Some(current.endpoint.as_str()) {
+                // An overlapping recovery already moved this client.
+                return Ok(());
+            }
+            self.use_private_gateway(&current)?;
+        } else if stale >= DAEMON_LOST {
+            match self.rendezvous.ensure(spawn_daemon) {
+                Ok(descriptor) => {
+                    if let Ok(mut guard) = self.descriptor.lock() {
+                        *guard = descriptor;
+                    }
+                }
+                Err(EnsureError::Unresponsive(wedged)) => self.use_private_gateway(&wedged)?,
+                Err(error) => {
+                    return Err(format!(
+                        "the host daemon could not be reached again: {error}"
+                    ))
+                }
             }
         }
         // The old session is gone either way, and `initialize` must not send it.
@@ -689,8 +902,8 @@ impl Session {
     /// the replayed handshake.
     fn exchange_once(&self, body: &str) -> Result<(), ExchangeError> {
         if self.stale.load(Ordering::SeqCst) == HEALTHY {
-            let _healthy = self
-                .gate
+            let gate = self.current_gate();
+            let _healthy = gate
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if self.stale.load(Ordering::SeqCst) == HEALTHY {
@@ -698,8 +911,8 @@ impl Session {
                 return self.post(body, true);
             }
         }
-        let _recovering = self
-            .gate
+        let gate = self.current_gate();
+        let _recovering = gate
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stale = self.stale.swap(HEALTHY, Ordering::SeqCst);
@@ -960,8 +1173,12 @@ impl Dispatcher {
 /// the requests around it. A failed exchange becomes a JSON-RPC error for that
 /// request rather than a silent drop or a fallback, and a daemon that went away is
 /// re-found before the next request.
-fn proxy_stdio(rendezvous: Rendezvous, descriptor: DaemonDescriptor) -> Result<(), String> {
-    let session = Arc::new(Session::new(rendezvous, descriptor));
+fn proxy_stdio(
+    rendezvous: Rendezvous,
+    descriptor: DaemonDescriptor,
+    private: Option<std::process::Child>,
+) -> Result<(), String> {
+    let session = Arc::new(Session::new(rendezvous, descriptor, private));
     spawn_listen_stream(Arc::clone(&session));
     spawn_heartbeat(Arc::clone(&session));
 
@@ -1037,7 +1254,9 @@ fn report_request_error(session: &Session, request: &serde_json::Value, error: &
 /// Open the daemon's long-lived `GET /mcp` SSE stream and forward server-initiated
 /// messages to the client, reconnecting if it drops. Frames are POSTed back by the
 /// client through the normal stdin path, so no correlation table is needed here:
-/// the daemon matches the response to its own outstanding request id.
+/// the daemon matches the response to its own outstanding request id. The daemon
+/// sends a keepalive every 30 seconds, so a stream silent for three of them, or
+/// one whose daemon this session has moved off, is reopened.
 fn spawn_listen_stream(session: Arc<Session>) {
     std::thread::spawn(move || loop {
         let Some(session_id) = session.session_id() else {
@@ -1048,11 +1267,13 @@ fn spawn_listen_stream(session: Arc<Session>) {
         let url = format!("http://{}/mcp", descriptor.endpoint);
         let response = session
             .with_identity(
-                ureq::get(&url)
+                ureq::AgentBuilder::new()
+                    .timeout_read(SUBSCRIPTION_READ_TIMEOUT)
+                    .build()
+                    .get(&url)
                     .set("Authorization", &format!("Bearer {}", descriptor.token))
                     .set("Accept", "text/event-stream")
-                    .set("Mcp-Session-Id", &session_id)
-                    .timeout(Duration::from_secs(3600)),
+                    .set("Mcp-Session-Id", &session_id),
             )
             .call();
         match response {
@@ -1061,6 +1282,9 @@ fn spawn_listen_stream(session: Arc<Session>) {
                 while let Ok(Some(ClientFrame::Line(line))) =
                     read_bounded_line(&mut reader, MAX_FRAME_BYTES)
                 {
+                    if session.descriptor().endpoint != descriptor.endpoint {
+                        break;
+                    }
                     if let Some(data) = line.strip_prefix("data:") {
                         let data = data.trim();
                         if !data.is_empty() {
@@ -1083,19 +1307,42 @@ fn spawn_listen_stream(session: Arc<Session>) {
 /// session holds its listen stream open, but a modern client has no standing
 /// connection, so the adapter checks in well inside the grace for as long as its
 /// client is attached.
+///
+/// The same check is the liveness test. The daemon answers it outside its
+/// request workers, so silence for [`crate::daemon::SILENT_RETRY_TIMEOUT`]
+/// means it is wedged, and the next request moves to a private gateway. A
+/// daemon that is gone is left to the request path, which re-finds it.
 fn spawn_heartbeat(session: Arc<Session>) {
-    let interval = (crate::daemon::idle_grace() / 5).max(Duration::from_millis(100));
-    std::thread::spawn(move || loop {
-        std::thread::sleep(interval);
-        let descriptor = session.descriptor();
-        let _ = ureq::get(&format!(
-            "http://{}{}",
-            descriptor.endpoint,
-            crate::daemon::IDENTITY_PATH
-        ))
-        .set("Authorization", &format!("Bearer {}", descriptor.token))
-        .timeout(HEARTBEAT_TIMEOUT)
-        .call();
+    let interval =
+        (crate::daemon::idle_grace() / 5).clamp(Duration::from_millis(100), LIVENESS_INTERVAL);
+    std::thread::spawn(move || {
+        let mut answered = Instant::now();
+        let mut watched = session.descriptor().endpoint;
+        loop {
+            std::thread::sleep(interval);
+            let descriptor = session.descriptor();
+            if descriptor.endpoint != watched {
+                watched = descriptor.endpoint.clone();
+                answered = Instant::now();
+            }
+            match crate::daemon::probe_health(&descriptor) {
+                crate::daemon::Health::Silent
+                    if answered.elapsed() >= crate::daemon::SILENT_RETRY_TIMEOUT =>
+                {
+                    crate::gatewaylog::append(&format!(
+                        "adapter: daemon pid {} silent for {}s, moving to a private gateway",
+                        descriptor.pid,
+                        answered.elapsed().as_secs()
+                    ));
+                    session.mark_wedged(&descriptor.endpoint);
+                    answered = Instant::now();
+                }
+                crate::daemon::Health::Silent => {}
+                crate::daemon::Health::Answering | crate::daemon::Health::Gone => {
+                    answered = Instant::now();
+                }
+            }
+        }
     });
 }
 
@@ -1307,6 +1554,7 @@ mod tests {
         let session = Session::new(
             Rendezvous::new(&data_dir, compat.clone()),
             DaemonDescriptor::new("127.0.0.1:1", "test-token", &compat),
+            None,
         );
         let project = data_dir.join("toolport-roots-collision");
         let uri = url::Url::from_file_path(&project)
@@ -1334,6 +1582,7 @@ mod tests {
         let session = Session::new(
             Rendezvous::new(&data_dir, compat.clone()),
             DaemonDescriptor::new("127.0.0.1:1", "test-token", &compat),
+            None,
         );
         let first = session.open_subscription(&serde_json::json!(1));
         let second = session.open_subscription(&serde_json::json!("two"));
@@ -1521,6 +1770,7 @@ mod tests {
         let mut session = Session::new(
             Rendezvous::new(&data_dir, compat.clone()),
             DaemonDescriptor::new(daemon.endpoint.as_str(), "test-token", &compat),
+            None,
         );
         session.stdout = Mutex::new(Box::new(sink.clone()));
         session.request_timeout = timeout;

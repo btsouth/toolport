@@ -3037,6 +3037,21 @@ fn project_budgeted(tools: &[&Value]) -> Vec<Value> {
         .collect()
 }
 
+/// Append this process's health notes, such as a client moved to a private
+/// gateway, so an agent sees why its gateway behaves differently.
+fn with_status_notes(summary: String) -> String {
+    let notes = conduit_lib::daemon::status_notes();
+    if notes.is_empty() {
+        return summary;
+    }
+    let mut out = summary.trim_end().to_string();
+    out.push_str("\n\nGateway health:\n");
+    for note in notes {
+        out.push_str(&format!("- {note}\n"));
+    }
+    out
+}
+
 fn enabled_summary(
     host: &HostState,
     reg: &Registry,
@@ -8222,7 +8237,7 @@ fn handle_request_with_cancel(
                 return Some(success(
                     id,
                     json!({
-                        "content": [{ "type": "text", "text": enabled_summary(host, reg, cached, profile, allowed) }],
+                        "content": [{ "type": "text", "text": with_status_notes(enabled_summary(host, reg, cached, profile, allowed)) }],
                         "isError": false
                     }),
                 ));
@@ -17054,7 +17069,6 @@ const MAX_DAEMON_HTTP_BODY: u64 = conduit_lib::stdio_adapter::MAX_FRAME_BYTES as
 /// yielding a request. Headers and bodies each get an absolute deadline, so a
 /// client cannot keep a connection alive forever by dripping one byte at a time.
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
-const MAX_HTTP_PENDING_READS: usize = 64;
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -17399,8 +17413,14 @@ fn write_ingress_response(stream: &mut TcpStream, status: u16, reason: &str, mes
     // stops reading must not be able to stall new connections indefinitely.
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let body = serde_json::json!({ "error": message }).to_string();
+    // Every 503 here is load or a momentary gap, so say when to come back.
+    let retry = if status == 503 {
+        "Retry-After: 1\r\n"
+    } else {
+        ""
+    };
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{retry}Connection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(response.as_bytes());
@@ -17505,7 +17525,7 @@ fn bind_deadline_http_server<A: ToSocketAddrs>(
                         );
                         continue;
                     }
-                    let Some(guard) = try_acquire_inflight(&connections, MAX_HTTP_PENDING_READS)
+                    let Some(guard) = try_acquire_inflight(&connections, http_max_connections())
                     else {
                         write_ingress_response(
                             &mut client,
@@ -17540,12 +17560,35 @@ fn bind_deadline_http_server<A: ToSocketAddrs>(
     ))
 }
 
-/// Cap on concurrently-handled HTTP gateway requests. Requests above the cap are
-/// rejected immediately so a slow request can never block the listener's accept
-/// loop. Sized well above any realistic local concurrency: the approval broker
-/// caps simultaneous holds at 64, and non-held calls finish in milliseconds, so
-/// this backstop is only ever a flood guard.
-const MAX_HTTP_INFLIGHT: usize = 256;
+/// Default cap on concurrently-handled HTTP gateway requests, and separately on
+/// connections still sending their request. Requests above it get a 503 with
+/// `Retry-After` at once, so a slow request can never block the listener's accept
+/// loop. Each slot is one worker thread, so the cap is what bounds the pool. A
+/// burst of a few hundred clients starting at once fits; past this the gateway is
+/// a flood guard, not a queue. `TOOLPORT_HTTP_MAX_CONNECTIONS` overrides it.
+const DEFAULT_HTTP_MAX_CONNECTIONS: usize = 1024;
+
+/// The HTTP connection cap in effect, read once.
+fn http_max_connections() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_http_max_connections(
+            conduit_lib::brand::env_var(
+                "TOOLPORT_HTTP_MAX_CONNECTIONS",
+                "CONDUIT_HTTP_MAX_CONNECTIONS",
+            )
+            .as_deref(),
+        )
+    })
+}
+
+/// A positive integer, or the default for anything else.
+fn parse_http_max_connections(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_HTTP_MAX_CONNECTIONS)
+}
 
 /// Stdio keeps its historical inline fallback once its worker cap is reached.
 /// Unlike HTTP, this cannot stall a socket accept loop, and it keeps stdin
@@ -17772,7 +17815,11 @@ fn spawn_daemon_idle_watchdog(
 /// endpoint with a random bearer and advertised through the rendezvous
 /// descriptor. Reachable by an adapter or a manual probe, and exits on its own
 /// once it has been idle past the grace period.
-fn serve_daemon(state: GatewayState) -> ! {
+///
+/// `private` serves one adapter whose shared daemon stopped answering. It is
+/// never advertised: the descriptor goes to the adapter on stdout, so no other
+/// client can elect it, and it exits when the adapter closes its stdin.
+fn serve_daemon(state: GatewayState, private: bool) -> ! {
     let Some(dir) = registry::conduit_dir() else {
         eprintln!("toolport-gateway --daemon: no data directory could be resolved");
         std::process::exit(1);
@@ -17813,6 +17860,44 @@ fn serve_daemon(state: GatewayState) -> ! {
         token.clone(),
         &compat,
     );
+    if private {
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        conduit_lib::daemon::add_status_note(conduit_lib::stdio_adapter::PRIVATE_GATEWAY_NOTE);
+        let announced = serde_json::to_string(&descriptor)
+            .map_err(|error| error.to_string())
+            .and_then(|line| {
+                let mut stdout = std::io::stdout().lock();
+                writeln!(stdout, "{line}")
+                    .and_then(|()| stdout.flush())
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = announced {
+            eprintln!(
+                "toolport-gateway --private-gateway: could not announce the endpoint: {error}"
+            );
+            std::process::exit(1);
+        }
+        std::thread::spawn(|| {
+            let mut stdin = std::io::stdin().lock();
+            let mut bytes = [0u8; 64];
+            while stdin.read(&mut bytes).unwrap_or(0) > 0 {}
+            glog("private gateway: adapter closed its pipe, exiting");
+            std::process::exit(0);
+        });
+        glog(&format!(
+            "private gateway: serving one adapter on http://127.0.0.1:{port}"
+        ));
+        serve_http_loop_with_inflight(
+            server,
+            state,
+            Some(token),
+            Arc::new(SearchGuard::default()),
+            Arc::new(ConfirmGuard::new()),
+            false,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        std::process::exit(0);
+    }
     // Set the mode before publishing, so the first adapter to probe the
     // descriptor already sees the identity route.
     state.daemon_mode.store(true, Ordering::SeqCst);
@@ -18046,7 +18131,7 @@ fn proxy_public_http_connection(
         }
     };
     drop(pending_read);
-    let Some(_active) = try_acquire_inflight(active, MAX_HTTP_INFLIGHT) else {
+    let Some(_active) = try_acquire_inflight(active, http_max_connections()) else {
         write_ingress_response(&mut client, 503, "Service Unavailable", "gateway busy; retry later");
         return;
     };
@@ -18150,7 +18235,7 @@ fn serve_http_proxy(port: u16) -> Result<(), String> {
                         continue;
                     }
                     let Some(pending) =
-                        try_acquire_inflight(&pending_reads, MAX_HTTP_PENDING_READS)
+                        try_acquire_inflight(&pending_reads, http_max_connections())
                     else {
                         write_ingress_response(&mut client, 503, "Service Unavailable", "gateway busy; retry later");
                         continue;
@@ -18353,9 +18438,26 @@ fn serve_http_loop_with_inflight(
     allow_insecure_open: bool,
     inflight: Arc<AtomicUsize>,
 ) {
+    let identity = state
+        .daemon_mode
+        .load(Ordering::SeqCst)
+        .then(|| spawn_daemon_identity_responder(token.clone()));
     for request in server.incoming_requests() {
         state.touch_activity();
-        let Some(guard) = try_acquire_inflight(&inflight, MAX_HTTP_INFLIGHT) else {
+        let request = match &identity {
+            Some(identity) if is_daemon_identity_probe(&request) => {
+                if let Err(
+                    std::sync::mpsc::TrySendError::Full(request)
+                    | std::sync::mpsc::TrySendError::Disconnected(request),
+                ) = identity.try_send(request)
+                {
+                    respond_http_overloaded(request);
+                }
+                continue;
+            }
+            _ => request,
+        };
+        let Some(guard) = try_acquire_inflight(&inflight, http_max_connections()) else {
             respond_http_overloaded(request);
             continue;
         };
@@ -18380,6 +18482,45 @@ fn serve_http_loop_with_inflight(
             state.touch_activity();
         });
     }
+}
+
+fn is_daemon_identity_probe(request: &tiny_http::Request) -> bool {
+    request.method() == &tiny_http::Method::Get
+        && request.url().split('?').next() == Some(conduit_lib::daemon::IDENTITY_PATH)
+}
+
+/// Answer the daemon's identity probe on its own thread, before the request
+/// worker cap. Adapters decide from this probe whether a daemon is alive, so a
+/// daemon saturated with slow calls must still answer it, or the next client
+/// would elect a second daemon beside it. The answer takes no shared lock.
+fn spawn_daemon_identity_responder(
+    token: Option<String>,
+) -> std::sync::mpsc::SyncSender<tiny_http::Request> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<tiny_http::Request>(64);
+    std::thread::spawn(move || {
+        for request in receiver {
+            let authorized = request
+                .headers()
+                .iter()
+                .find(|header| header.field.equiv("Authorization"))
+                .and_then(|header| parse_bearer(header.value.as_str()))
+                .zip(token.as_deref())
+                .is_some_and(|(actual, expected)| ct_eq(expected.as_bytes(), actual.as_bytes()));
+            let (status, body) = if authorized {
+                (200, daemon_identity_json())
+            } else {
+                (401, json!({ "error": "unauthorized" }).to_string())
+            };
+            let mut response = tiny_http::Response::from_string(body).with_status_code(status);
+            if let Ok(header) =
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+            {
+                response = response.with_header(header);
+            }
+            let _ = request.respond(response);
+        }
+    });
+    sender
 }
 
 fn respond_http_overloaded(request: tiny_http::Request) {
@@ -18764,6 +18905,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "--http-proxy",
     INSECURE_LOOPBACK_FLAG,
     "--daemon",
+    conduit_lib::stdio_adapter::PRIVATE_GATEWAY_FLAG,
     "--selftest-secrets",
     conduit_lib::stdio_adapter::STDIO_ADAPTER_FLAG,
 ];
@@ -18877,6 +19019,8 @@ fn usage() -> String {
          \x20                        surface)\n\
          \x20   --stdio-adapter      Proxy stdio to the host daemon instead of running\n\
          \x20                        the in-process gateway (Phase 2; opt-in)\n\
+         \x20   --private-gateway    One adapter's own gateway while the host daemon is\n\
+         \x20                        unresponsive (internal)\n\
          \x20   --selftest-secrets    Diagnostic: read every vaulted secret and report\n\
          \x20   --toolport-hook EVENT Record one agent lifecycle event and exit (installed\n\
          \x20                         into an agent's settings by Toolport; always exits 0)\n\
@@ -19131,7 +19275,10 @@ fn main() {
     if let Some(msg) = warning {
         eprintln!("{msg}");
     }
-    let daemon_mode = daemon_requested(&cli_args);
+    let private_gateway = cli_args
+        .iter()
+        .any(|arg| arg == conduit_lib::stdio_adapter::PRIVATE_GATEWAY_FLAG);
+    let daemon_mode = daemon_requested(&cli_args) || private_gateway;
     let http_mode = http_port_opt.is_some() || daemon_mode;
     glog("=== gateway start ===");
     glog(&format!(
@@ -19478,7 +19625,7 @@ fn main() {
     // Host daemon transport: one runtime for this host, on an internal loopback
     // endpoint advertised through the rendezvous descriptor. Explicit flag only.
     if daemon_mode {
-        serve_daemon(state);
+        serve_daemon(state, private_gateway);
     }
 
     if let Some(port) = http_port_opt {
@@ -25627,8 +25774,10 @@ mod tests {
 
         // Hold every permit without creating 256 slow OS threads. The listener
         // sees exactly the same saturated counter it would see under real load.
-        let mut guards: Vec<_> = (0..MAX_HTTP_INFLIGHT)
-            .map(|_| try_acquire_inflight(&inflight, MAX_HTTP_INFLIGHT).expect("permit under cap"))
+        let mut guards: Vec<_> = (0..http_max_connections())
+            .map(|_| {
+                try_acquire_inflight(&inflight, http_max_connections()).expect("permit under cap")
+            })
             .collect();
 
         let listener_inflight = Arc::clone(&inflight);
@@ -25672,16 +25821,90 @@ mod tests {
     }
 
     #[test]
+    fn a_saturated_daemon_still_answers_its_identity_probe() {
+        use std::io::{Read, Write};
+        let state = http_state(false);
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let inflight = Arc::new(AtomicUsize::new(0));
+        // Every request worker slot is taken, as by a queue of slow calls.
+        let guards: Vec<_> = (0..http_max_connections())
+            .map(|_| {
+                try_acquire_inflight(&inflight, http_max_connections()).expect("permit under cap")
+            })
+            .collect();
+        let listener_inflight = Arc::clone(&inflight);
+        std::thread::spawn(move || {
+            serve_http_loop_with_inflight(
+                server,
+                state,
+                Some("daemon-bearer".to_string()),
+                Arc::new(SearchGuard::default()),
+                Arc::new(ConfirmGuard::new()),
+                false,
+                listener_inflight,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(50));
+
+        let probe = |bearer: &str| {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write!(
+                stream,
+                "GET {} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n\r\n",
+                conduit_lib::daemon::IDENTITY_PATH
+            )
+            .unwrap();
+            let mut answer = String::new();
+            let _ = stream.read_to_string(&mut answer);
+            answer
+        };
+        let answer = probe("daemon-bearer");
+        assert!(
+            answer.starts_with("HTTP/1.1 200") && answer.contains("\"protocol\""),
+            "a saturated daemon must still prove it is alive: {answer}"
+        );
+        assert!(probe("wrong").starts_with("HTTP/1.1 401"));
+        // Ordinary requests still meet the cap.
+        assert!(http_get(port, "/").contains("503 Service Unavailable"));
+        drop(guards);
+    }
+
+    #[test]
     fn inflight_guard_caps_and_releases_workers() {
         let inflight = Arc::new(AtomicUsize::new(0));
-        let guards: Vec<_> = (0..MAX_HTTP_INFLIGHT)
-            .map(|_| try_acquire_inflight(&inflight, MAX_HTTP_INFLIGHT).expect("permit under cap"))
+        let guards: Vec<_> = (0..http_max_connections())
+            .map(|_| {
+                try_acquire_inflight(&inflight, http_max_connections()).expect("permit under cap")
+            })
             .collect();
 
-        assert!(try_acquire_inflight(&inflight, MAX_HTTP_INFLIGHT).is_none());
+        assert!(try_acquire_inflight(&inflight, http_max_connections()).is_none());
         drop(guards);
         assert_eq!(inflight.load(Ordering::SeqCst), 0);
-        assert!(try_acquire_inflight(&inflight, MAX_HTTP_INFLIGHT).is_some());
+        assert!(try_acquire_inflight(&inflight, http_max_connections()).is_some());
+    }
+
+    #[test]
+    fn http_connection_cap_is_configurable_and_never_zero() {
+        assert_eq!(
+            parse_http_max_connections(None),
+            DEFAULT_HTTP_MAX_CONNECTIONS
+        );
+        assert_eq!(parse_http_max_connections(Some(" 32 ")), 32);
+        assert_eq!(
+            parse_http_max_connections(Some("0")),
+            DEFAULT_HTTP_MAX_CONNECTIONS
+        );
+        assert_eq!(
+            parse_http_max_connections(Some("lots")),
+            DEFAULT_HTTP_MAX_CONNECTIONS
+        );
+        assert!(DEFAULT_HTTP_MAX_CONNECTIONS >= 1024);
     }
 
     #[test]
