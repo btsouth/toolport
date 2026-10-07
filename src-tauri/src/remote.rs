@@ -448,40 +448,31 @@ fn uses_client_credentials(server: &ServerEntry) -> bool {
 /// added to prevent, reached by another route (SBS-479). The app's existing OAuth lock
 /// covers only the interactive browser flow.
 ///
-/// Best-effort by design: with no resolvable data dir there is nowhere to put a lock, and
-/// refusing to refresh at all would be worse than the race it prevents. Contention waits long
-/// enough to cover the OAuth client's 30-second request timeout and metadata refresh before
-/// failing open visibly rather than silently dropping back to the original race (SBS-705).
+/// The bounded wait does not have to cover every metadata request: on timeout we
+/// reread the winner's saved token, or fail without exchanging. The OS releases
+/// this advisory lock on process death; never unlink its file to recover a holder.
 const OAUTH_REFRESH_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(65);
+const OAUTH_REFRESH_LOCK_ERROR: &str =
+    "OAuth refresh is busy or its cross-process lock is unavailable; try again.";
+const OAUTH_REFRESH_SAVE_ERROR: &str = "OAuth refresh succeeded but could not save";
 
 fn lock_oauth_refresh_for(
     server_id: &str,
     timeout: std::time::Duration,
-) -> Result<Option<crate::registry::FileLock>, String> {
-    let Some(dir) = crate::registry::conduit_dir() else {
-        return Ok(None);
-    };
+) -> Result<crate::registry::FileLock, String> {
+    let dir = crate::registry::conduit_dir().ok_or(OAUTH_REFRESH_LOCK_ERROR)?;
     let leaf = format!(
         "oauth-refresh-{}.lock",
         crate::router::sanitize_segment(&crate::local_auth::owner(server_id)?)
     );
-    crate::registry::lock_at_for(&dir.join(leaf), timeout).map(Some)
+    crate::registry::lock_at_for(&dir.join(leaf), timeout)
 }
 
-fn lock_oauth_refresh(server_id: &str) -> Option<crate::registry::FileLock> {
-    match lock_oauth_refresh_for(server_id, OAUTH_REFRESH_LOCK_TIMEOUT) {
-        Ok(lock) => lock,
-        Err(error) => {
-            eprintln!(
-                "toolport: OAuth refresh for {server_id:?} is proceeding without the cross-process lock after waiting {}s: {error}",
-                OAUTH_REFRESH_LOCK_TIMEOUT.as_secs()
-            );
-            None
-        }
-    }
+fn lock_oauth_refresh(server_id: &str) -> Result<crate::registry::FileLock, String> {
+    lock_oauth_refresh_for(server_id, OAUTH_REFRESH_LOCK_TIMEOUT)
 }
 
-/// After winning the refresh lock, decide whether another process already did the work.
+/// After waiting for the refresh lock, decide whether another process already did the work.
 ///
 /// Compares the vaulted access token against the snapshot taken BEFORE the lock. Unchanged
 /// means the refresh is still ours to do. Changed means someone rotated it while we were
@@ -565,6 +556,13 @@ fn reuse_racing_refresh(
 }
 
 fn refresh_token_with_expiry(server_id: &str) -> Result<RefreshedToken, String> {
+    refresh_token_with_lock(server_id, || lock_oauth_refresh(server_id))
+}
+
+fn refresh_token_with_lock(
+    server_id: &str,
+    lock: impl FnOnce() -> Result<crate::registry::FileLock, String>,
+) -> Result<RefreshedToken, String> {
     // Snapshot before locking: the comparison after we win is what tells us whether a
     // racing process rotated the credential while we waited.
     // A vault read failure is not "no token" (SBS-840).
@@ -574,10 +572,13 @@ fn refresh_token_with_expiry(server_id: &str) -> Result<RefreshedToken, String> 
     };
     // Held for the whole function, including the client-credentials branch, so two
     // processes cannot mint two tokens for the same server.
-    let _refresh_lock = lock_oauth_refresh(server_id);
+    let refresh_lock = lock();
     if let Some(winner) = refreshed_while_waiting(server_id, before_access.as_deref())? {
         return Ok(winner);
     }
+    // Even on timeout, a peer may have saved a usable winner just before our
+    // reread. Otherwise no exchange is allowed without a held lock.
+    let _refresh_lock = refresh_lock.map_err(|_| OAUTH_REFRESH_LOCK_ERROR.to_string())?;
     // Client-credentials servers have no refresh token by construction, so they
     // reacquire instead. Checked first because this is the seam BOTH the proactive
     // pre-expiry path and the reactive 401/403 retry go through; branching here
@@ -643,8 +644,12 @@ fn refresh_token_with_expiry(server_id: &str) -> Result<RefreshedToken, String> 
         expires_at: tokens.expires_at,
     };
     let json = serde_json::to_string(&new_state).map_err(|e| e.to_string())?;
-    secrets::set_secret(server_id, STATE_KEY, &json)?;
-    secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, &tokens.access_token)?;
+    secrets::set_secret(server_id, STATE_KEY, &json).map_err(|_| {
+        format!("{OAUTH_REFRESH_SAVE_ERROR} the rotated refresh token; the previous refresh token may no longer be valid. Restore secret storage before trying again.")
+    })?;
+    secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, &tokens.access_token).map_err(|_| {
+        format!("{OAUTH_REFRESH_SAVE_ERROR} the access token; the rotated refresh token was saved. Restore secret storage and try again.")
+    })?;
     Ok(RefreshedToken {
         access_token: tokens.access_token,
         expires_at: tokens.expires_at,
@@ -710,7 +715,7 @@ fn refresh_token_if_needed(server_id: &str) -> Result<Option<String>, String> {
             // straight from here left the proactive headless path as the one arm of the
             // call graph still able to mint concurrently (SBS-479). Matches the shape of
             // the refresh-token arm below.
-            return Ok(refresh_token(server_id).ok());
+            return refresh_token(server_id).map(Some);
         }
         return Ok(None);
     }
@@ -721,9 +726,9 @@ fn refresh_token_if_needed(server_id: &str) -> Result<Option<String>, String> {
     };
     match refresh_decision(&state, now_epoch_seconds()) {
         RefreshDecision::NotNeeded => Ok(None),
-        // The token may still be valid throughout the safety window. A transient
-        // refresh failure falls back to it; a real 401/403 forces another refresh.
-        RefreshDecision::Refresh => Ok(refresh_token(server_id).ok()),
+        // Report contention and persistence failures rather than silently using
+        // an old credential and immediately attempting another exchange on 401.
+        RefreshDecision::Refresh => refresh_token(server_id).map(Some),
         RefreshDecision::Reauthenticate => Err(
             "OAuth access token expires soon and no refresh token is available; needs authentication"
                 .to_string(),
@@ -742,6 +747,10 @@ fn mentions_status(s: &str, code: &str) -> bool {
         let after = s[i + code.len()..].chars().next();
         !before.is_some_and(|c| c.is_ascii_digit()) && !after.is_some_and(|c| c.is_ascii_digit())
     })
+}
+
+pub(crate) fn is_retriable_refresh_error(e: &str) -> bool {
+    e == OAUTH_REFRESH_LOCK_ERROR || e.starts_with(OAUTH_REFRESH_SAVE_ERROR)
 }
 
 pub fn is_auth_error(e: &str) -> bool {
@@ -830,7 +839,8 @@ fn authed_transport(
                             Some(now_epoch_seconds().saturating_add(PROACTIVE_REFRESH_RETRY_SECS));
                     }
                     // A locked keychain is not "please sign in again" (SBS-840).
-                    if e.contains("could not read the vaulted")
+                    if is_retriable_refresh_error(&e)
+                        || e.contains("could not read the vaulted")
                         || e.contains("could not parse the vaulted")
                     {
                         return Err(e);
@@ -1135,7 +1145,7 @@ pub fn connect_remote_with_handler(
                         },
                     )
                 }
-                Err(_) => Err(e),
+                Err(refresh_error) => Err(refresh_error),
             }
         }
         Err(e) => Err(e),
@@ -1290,11 +1300,318 @@ mod tests {
         drop((a, b));
 
         assert!(
-            lock_oauth_refresh("server-a").is_some(),
+            lock_oauth_refresh("server-a").is_ok(),
             "the lock must be reacquirable once released"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct RotatingEndpoint {
+        url: String,
+        exchanges: Arc<std::sync::atomic::AtomicUsize>,
+        started: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::SyncSender<()>,
+        server: Arc<tiny_http::Server>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl RotatingEndpoint {
+        fn new() -> Self {
+            let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+            let url = format!("http://{}/token", server.server_addr());
+            let exchanges = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (started_tx, started) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+            let endpoint = Arc::clone(&server);
+            let count = Arc::clone(&exchanges);
+            let worker = std::thread::spawn(move || {
+                while let Ok(mut request) = endpoint.recv() {
+                    let mut form = String::new();
+                    request.as_reader().read_to_string(&mut form).unwrap();
+                    let index = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let response = if index == 0 {
+                        assert!(form.contains("refresh_token=rt-0"));
+                        started_tx.send(()).unwrap();
+                        // The test controls completion, not elapsed wall time.
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        tiny_http::Response::from_string(
+                            r#"{"access_token":"token-1","refresh_token":"rt-1","expires_in":3600,"token_type":"Bearer"}"#,
+                        )
+                    } else {
+                        tiny_http::Response::from_string(r#"{"error":"invalid_grant"}"#)
+                            .with_status_code(400)
+                    };
+                    request.respond(response).unwrap();
+                }
+            });
+            Self {
+                url,
+                exchanges,
+                started,
+                release,
+                server,
+                worker: Some(worker),
+            }
+        }
+
+        fn seed(&self) {
+            let state = OAuthState {
+                issuer: None,
+                token_endpoint: self.url.clone(),
+                client_id: "client".into(),
+                refresh_token: Some("rt-0".into()),
+                resource: None,
+                scope: None,
+                issued_at: Some(1),
+                expires_at: Some(2),
+            };
+            secrets::set_secret(
+                "rotation",
+                STATE_KEY,
+                &serde_json::to_string(&state).unwrap(),
+            )
+            .unwrap();
+            secrets::set_secret("rotation", secrets::HTTP_AUTH_KEY, "token-0").unwrap();
+        }
+
+        fn count(&self) -> usize {
+            self.exchanges.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for RotatingEndpoint {
+        fn drop(&mut self) {
+            let _ = self.release.try_send(());
+            self.server.unblock();
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+
+    #[test]
+    fn oauth_refresh_long_holder_never_allows_an_unlocked_exchange() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            let holder = std::thread::spawn(|| refresh_token("rotation"));
+            endpoint
+                .started
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            // Inject the wait deadline while the first exchange is still blocked.
+            // This is the old >65s race without a 65s wall-clock sleep.
+            let error = refresh_token_with_lock("rotation", || {
+                lock_oauth_refresh_for("rotation", Duration::ZERO)
+            })
+            .err()
+            .unwrap();
+            assert_eq!(error, OAUTH_REFRESH_LOCK_ERROR);
+            assert!(!is_auth_error(&error));
+            assert_eq!(endpoint.count(), 1);
+            endpoint.release.send(()).unwrap();
+            assert_eq!(holder.join().unwrap().unwrap(), "token-1");
+            assert_eq!(
+                load_state("rotation")
+                    .unwrap()
+                    .unwrap()
+                    .refresh_token
+                    .as_deref(),
+                Some("rt-1")
+            );
+        });
+    }
+
+    #[test]
+    fn oauth_refresh_independent_waiter_uses_the_saved_winner() {
+        for timeout_after_save in [false, true] {
+            secrets::tests::with_isolated_vault(|| {
+                let endpoint = RotatingEndpoint::new();
+                endpoint.seed();
+                let holder = std::thread::spawn(|| refresh_token("rotation"));
+                endpoint
+                    .started
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+                let (saved_tx, saved_rx) = std::sync::mpsc::channel();
+                let waiter = std::thread::spawn(move || {
+                    refresh_token_with_lock("rotation", || {
+                        // This seam runs after the pre-lock vault snapshot. Try the
+                        // real lock while the peer holds it, then let it save.
+                        let contended = lock_oauth_refresh_for("rotation", Duration::ZERO);
+                        assert!(contended.is_err());
+                        snapshot_tx.send(()).unwrap();
+                        saved_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        if timeout_after_save {
+                            contended
+                        } else {
+                            lock_oauth_refresh_for("rotation", Duration::ZERO)
+                        }
+                    })
+                });
+                snapshot_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                endpoint.release.send(()).unwrap();
+                assert_eq!(holder.join().unwrap().unwrap(), "token-1");
+                saved_tx.send(()).unwrap();
+                let winner = waiter.join().unwrap().unwrap();
+                assert_eq!(winner.access_token, "token-1");
+                assert!(winner.expires_at.unwrap() > now_epoch_seconds());
+                assert_eq!(endpoint.count(), 1);
+            });
+        }
+    }
+
+    #[test]
+    fn oauth_refresh_persistence_failures_are_explicit_and_preserve_write_order() {
+        for key in [STATE_KEY, secrets::HTTP_AUTH_KEY] {
+            secrets::tests::with_isolated_vault(|| {
+                let endpoint = RotatingEndpoint::new();
+                endpoint.seed();
+                let worker = std::thread::spawn(move || {
+                    secrets::tests::with_failed_write(key, || refresh_token_if_needed("rotation"))
+                });
+                endpoint
+                    .started
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                endpoint.release.send(()).unwrap();
+                let error = worker.join().unwrap().unwrap_err();
+                assert!(is_retriable_refresh_error(&error), "{error}");
+                assert!(!is_auth_error(&error), "{error}");
+                assert!(!error.contains("rt-1"));
+                assert_eq!(endpoint.count(), 1);
+                let saved = load_state("rotation").unwrap().unwrap();
+                if key == STATE_KEY {
+                    assert!(error.contains("previous refresh token may no longer be valid"));
+                    assert_eq!(saved.refresh_token.as_deref(), Some("rt-0"));
+                } else {
+                    assert!(error.contains("rotated refresh token was saved"));
+                    assert_eq!(saved.refresh_token.as_deref(), Some("rt-1"));
+                }
+                assert_eq!(
+                    secrets::get_secret("rotation", secrets::HTTP_AUTH_KEY).as_deref(),
+                    Some("token-0")
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn oauth_refresh_unavailable_lock_is_a_retriable_failure() {
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            let error = refresh_token_with_lock("rotation", || Err("cannot create lock".into()))
+                .err()
+                .unwrap();
+            assert_eq!(error, OAUTH_REFRESH_LOCK_ERROR);
+            assert!(!is_auth_error(&error));
+            assert_eq!(endpoint.count(), 0);
+        });
+    }
+
+    #[test]
+    fn oauth_refresh_errors_surface_through_proactive_and_forced_http_calls() {
+        use crate::downstream::Transport;
+        for proactive in [true, false] {
+            for error in [
+                OAUTH_REFRESH_LOCK_ERROR.to_string(),
+                format!("{OAUTH_REFRESH_SAVE_ERROR} the rotated refresh token"),
+            ] {
+                let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+                let url = format!("http://{}/mcp", server.server_addr());
+                let callback_error = error.clone();
+                let mut transport = HttpTransport::with_auth_refresh(
+                    &url,
+                    Some("old-token".into()),
+                    Some(Box::new(move |force| {
+                        if proactive || force {
+                            Err(callback_error.clone())
+                        } else {
+                            Ok(None)
+                        }
+                    })),
+                );
+                let worker = std::thread::spawn(move || {
+                    if !proactive {
+                        let request = server
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap()
+                            .unwrap();
+                        request.respond(tiny_http::Response::empty(401)).unwrap();
+                    }
+                });
+                let surfaced = transport
+                    .request("tools/list", serde_json::json!({}))
+                    .unwrap_err();
+                worker.join().unwrap();
+                assert_eq!(surfaced.to_string(), error);
+                assert!(!is_auth_error(&surfaced.to_string()));
+            }
+        }
+    }
+
+    // Spawn this exact headless test as a lock holder; the parent kills it rather
+    // than dropping the guard, proving OS recovery with the lock file retained.
+    #[test]
+    fn oauth_refresh_dead_holder_child() {
+        let Some(dir) = std::env::var_os("TOOLPORT_REFRESH_LOCK_CHILD") else {
+            return;
+        };
+        let _override = crate::registry::DataDirOverride::set(std::path::PathBuf::from(dir));
+        let _lock = lock_oauth_refresh("dead-holder").unwrap();
+        use std::io::Write;
+        println!("LOCKED");
+        std::io::stdout().flush().unwrap();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+    }
+
+    #[test]
+    fn oauth_refresh_recovers_the_lock_of_a_dead_process() {
+        secrets::tests::with_isolated_vault(|| {
+            use std::io::BufRead;
+            struct Holder(std::process::Child);
+            impl Drop for Holder {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let dir = crate::registry::conduit_dir().unwrap();
+            let mut child = Holder(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "remote::tests::oauth_refresh_dead_holder_child",
+                        "--nocapture",
+                    ])
+                    .env("TOOLPORT_REFRESH_LOCK_CHILD", &dir)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let stdout = child.0.stdout.take().unwrap();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if line.unwrap() == "LOCKED" {
+                        ready_tx.send(()).unwrap();
+                        break;
+                    }
+                }
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            reader.join().unwrap();
+            assert!(lock_oauth_refresh_for("dead-holder", Duration::ZERO).is_err());
+            let lock_file = dir.join("oauth-refresh-dead_holder.lock.lock");
+            assert!(lock_file.exists());
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+            let _recovered = lock_oauth_refresh_for("dead-holder", Duration::ZERO).unwrap();
+            assert!(lock_file.exists());
+        });
     }
 
     #[test]

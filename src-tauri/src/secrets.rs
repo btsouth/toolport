@@ -1196,6 +1196,10 @@ fn set_secret_raw(server_id: &str, key: &str, value: &str) -> Result<(), String>
 }
 
 pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if tests::write_is_injected_failure(key) {
+        return Err("injected secret persistence failure".into());
+    }
     if server_id == INTERNAL_SERVER_ID {
         return Err("reserved Toolport secret namespace".to_string());
     }
@@ -1572,6 +1576,25 @@ pub(crate) mod tests {
     /// races with a sibling that assumes the keychain path, causing spurious
     /// failures under the default multi-threaded test runner.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        static FAILED_WRITE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(crate) fn write_is_injected_failure(key: &str) -> bool {
+        FAILED_WRITE.with(|failed| failed.get() == Some(key))
+    }
+
+    pub(crate) fn with_failed_write<T>(key: &'static str, test: impl FnOnce() -> T) -> T {
+        struct Restore(Option<&'static str>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FAILED_WRITE.with(|failed| failed.set(self.0));
+            }
+        }
+        let _restore = Restore(FAILED_WRITE.with(|failed| failed.replace(Some(key))));
+        test()
+    }
 
     pub(crate) fn with_isolated_vault(test: impl FnOnce()) {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
