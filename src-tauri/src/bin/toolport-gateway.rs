@@ -1372,17 +1372,15 @@ fn status_tool_def() -> Value {
 fn search_tool_def() -> Value {
     json!({
         "name": "toolport_search_tools",
-        "description": "Your gateway to every connected MCP server's tools. Use it first for any \
-            external action or data the user asks for. Each match carries its exact name, its \
-            description, and its input schema when it fits; call one with toolport_call_tool. If a \
-            schema is omitted (schemaOmitted), search that tool's exact name to get it. Pass `server` \
-            to scope to one server, or an empty `query` with `server` to list all of its tools. Raise \
-            `limit` when more tools matched than were shown.",
+        "description": "Your gateway to every connected MCP server's tools; use it first for any \
+            external action or data. Each match carries its exact name, description, and input \
+            schema when it fits. Call one with toolport_call_tool. If a schema is omitted \
+            (schemaOmitted), search that tool's exact name to get it.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": { "type": "string", "maxLength": MAX_SEARCH_QUERY_CHARS, "description": "Keywords for the capability you need, e.g. \"list emails\". Empty lists tools (use with `server`)." },
-                "server": { "type": "string", "description": "Optional: limit to this server by name/prefix, e.g. \"resend\"." },
+                "query": { "type": "string", "maxLength": MAX_SEARCH_QUERY_CHARS, "description": "Keywords for the capability you need, e.g. \"list emails\". An empty value with `server` lists that server's tools." },
+                "server": { "type": "string", "description": "Optional: limit to this server by name/prefix." },
                 "limit": { "type": "integer", "description": "Max results (default 25, up to 200).", "default": 25 }
             },
             "required": ["query"],
@@ -1489,15 +1487,15 @@ fn run_script_tool_def() -> Value {
 fn fetch_result_tool_def() -> Value {
     json!({
         "name": "toolport_fetch_result",
-        "description": "Continue a large tool result that Toolport truncated. It returns the head \
-            plus a `[Toolport shaped this result]` marker holding a `cursor`; call this with that \
-            cursor and the marker's `offset` to page through the rest. Nothing was lost.",
+        "description": "Continue a large tool result Toolport truncated at its `[Toolport shaped \
+            this result]` marker. Call this with the marker's `cursor` and `offset` to page \
+            through the rest.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "cursor": { "type": "string", "description": "The cursor from the marker." },
-                "offset": { "type": "integer", "minimum": 0, "description": "Character offset to read from. Ignored when `projection` is set." },
-                "projection": { "type": "string", "description": "Optional dot-separated path into structuredContent, e.g. data.items.0.name." }
+                "offset": { "type": "integer", "minimum": 0, "description": "Character offset to read from." },
+                "projection": { "type": "string", "description": "Optional dot-separated path into `structuredContent`." }
             },
             "required": ["cursor"],
             "additionalProperties": false
