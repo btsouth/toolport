@@ -352,7 +352,9 @@ function UpdateNotes({
             </p>
           )}
           {systemPackage && (
-            <p className="text-sm text-muted-foreground">{systemPackageUpdateAdvice()}</p>
+            <p className="text-sm text-muted-foreground">
+              {systemPackageUpdateAdvice(systemPackage)}
+            </p>
           )}
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={() => onOpenChange(false)}>
@@ -365,7 +367,7 @@ function UpdateNotes({
                   void openExternal(releasePageUrl(update.version));
                 }}
               >
-                <ExternalLink className="size-4" /> View release notes
+                <ExternalLink className="size-4" /> Open release page
               </Button>
             ) : (
               <Button onClick={onInstall} disabled={installing}>

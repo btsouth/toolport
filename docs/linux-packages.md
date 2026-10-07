@@ -14,7 +14,14 @@ against itself. dpkg removes the old `Toolport.desktop` and `conduit.png` files.
 `/usr/bin/toolport` and `/usr/bin/conduit` become symlinks to `toolport-gtk` to
 preserve CLI and launch-at-login paths. Both shells use `~/.config/Toolport`;
 there are no maintainer scripts that rewrite user data or access a keyring.
-Update system installs through apt, dnf or pacman.
+For a `.deb` update, download the new file from the release page and run
+`sudo apt install ./<file>.deb`; for an `.rpm`, run
+`sudo dnf install ./<file>.rpm`. There is no Toolport apt or dnf repository.
+Arch users update from the pacman repository with `sudo pacman -Syu`.
+React uses Tauri's bundle type for package guidance. GTK queries dpkg, rpm and
+pacman for ownership of its running executable, so installing a manager on a
+different distro does not select its advice. GTK does not check for new releases;
+Settings links to the release page. Development builds get generic instructions.
 
 ## Build and test
 

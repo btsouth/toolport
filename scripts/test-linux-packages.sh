@@ -43,7 +43,7 @@ if [ "${1:-}" = --container ]; then
     dnf install -y diffutils
     dnf install -y /packages/new.rpm
     rpm -qlp /packages/new.rpm
-    test "$(rpm -q --qf '%{NAME}' toolport)" = toolport
+    test "$(rpm -qf --qf '%{NAME}' /usr/bin/toolport-gtk)" = toolport
   else
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
@@ -77,6 +77,7 @@ REGISTRY
     apt install -y /packages/new.deb
     dpkg-deb -c /packages/new.deb
     test "$(dpkg-query -W -f='${Version}' toolport)" = "$(dpkg-deb -f /packages/new.deb Version)"
+    dpkg-query --search /usr/bin/toolport-gtk | grep -Ex 'toolport(:amd64)?: /usr/bin/toolport-gtk'
     test -s /usr/share/doc/toolport/copyright
     dpkg-deb -f /packages/new.deb Description | grep -q 'Manage MCP servers'
     if [ "$mode" = ubuntu ]; then

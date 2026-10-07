@@ -9,6 +9,7 @@ mod health;
 mod http_bridge;
 mod notify;
 mod onboarding;
+mod package_updates;
 mod pairing;
 mod settings;
 mod state;

@@ -13,7 +13,7 @@ license: MIT
 description: |
   One local MCP gateway for every AI client, with a native GTK shell
   Manage MCP servers once and share them across AI clients, with approvals,
-  audit history, rules, and local credential storage.
+  audit history and local credential storage.
 contents:
   - src: src-tauri/target/release/toolport-gtk
     dst: /usr/bin/toolport-gtk

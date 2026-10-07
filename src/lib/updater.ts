@@ -11,7 +11,7 @@ export type UpdateCheck =
   | { kind: "error"; message: string };
 
 /** A system package format whose files the package manager owns. */
-export type SystemPackage = "deb" | "rpm";
+export type SystemPackage = "deb" | "rpm" | "pacman";
 
 export type UpdateProgress =
   | { phase: "downloading"; downloadedBytes: number; totalBytes?: number }
@@ -169,8 +169,10 @@ async function systemPackage(): Promise<SystemPackage | null> {
 }
 
 /** System packages update through the manager that installed them. */
-export function systemPackageUpdateAdvice(): string {
-  return "Update Toolport through your package manager (apt, dnf, or pacman). If you use a package repository, refresh it before upgrading.";
+export function systemPackageUpdateAdvice(packageType: SystemPackage): string {
+  if (packageType === "pacman") return "Update Toolport with sudo pacman -Syu.";
+  const manager = packageType === "deb" ? "apt" : "dnf";
+  return `Download the new .${packageType} from the release page, then run sudo ${manager} install ./<file>.${packageType}.`;
 }
 
 /** Release notes for a version, including system-managed installs. */

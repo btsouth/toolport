@@ -304,19 +304,26 @@ impl SettingsPage {
         updates_copy.set_hexpand(true);
         updates_copy.append(
             &gtk::Label::builder()
-                .label("System-managed updates")
+                .label("Updates")
                 .halign(gtk::Align::Start)
                 .css_classes(["heading"])
                 .build(),
         );
         updates_copy.append(
             &gtk::Label::builder()
-                .label("Update Toolport through your package manager: apt on Debian or Ubuntu, dnf on Fedora, or pacman on Arch and Omarchy.")
+                .label(super::package_updates::update_advice())
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
             .hexpand(true)
                 .css_classes(["toolport-muted"])
+                .build(),
+        );
+        updates_copy.append(
+            &gtk::LinkButton::builder()
+                .label("Open release page")
+                .uri(super::package_updates::RELEASE_PAGE)
+                .halign(gtk::Align::Start)
                 .build(),
         );
         updates.append(&updates_copy);
