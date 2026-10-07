@@ -181,7 +181,7 @@ impl SettingsPage {
         capabilities.append(&lazy_row);
         let (code_row, code_mode) = setting_switch_row(
             "Code mode",
-            "Off by default. Enable agents to combine scoped tool calls in one sandboxed server-side script.",
+            "Off by default. Enable agents to combine scoped tool calls in one sandboxed server-side script. TOOLPORT_CODE_MODE=1 forces it on.",
         );
 
         let (routine_row, allow_routine_writes) = setting_switch_row(

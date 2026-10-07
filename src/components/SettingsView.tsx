@@ -1309,7 +1309,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             codeMode,
             "text-info",
             "Code mode",
-            "Off by default: enable agents to run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary; turn off to hide toolport_run_script.",
+            "Off by default: enable agents to run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary; turn off to hide toolport_run_script. TOOLPORT_CODE_MODE=1 still forces it on.",
             apply("code-mode", setCodeMode),
             "code-mode",
           )}
