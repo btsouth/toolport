@@ -123,7 +123,7 @@ export function expectedChecks(parsed) {
           path.join(root, "packaging/homebrew/toolport.rb"),
           "utf8",
         );
-        return /^  version "([^"]+)"/m.exec(text)?.[1];
+        return /^ {2}version "([^"]+)"/m.exec(text)?.[1];
       },
     },
     {
