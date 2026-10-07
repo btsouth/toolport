@@ -10,9 +10,9 @@
 //    LD_LIBRARY_PATH, so the HOST's Mesa - which is deliberately not bundled -
 //    resolves against it, and libEGL_mesa fails to load with
 //    `undefined symbol: wl_fixes_interface`. The window then never paints.
-// 3. Arch also gets a native package (`toolport-bin`), now as a preference
-//    rather than a workaround.
+// GTK system packages replace the Tauri .deb; the AppImage remains a fallback.
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -41,6 +41,8 @@ function read(...parts: string[]): string {
 function workflow(name: string): Workflow {
   return parse(read(".github", "workflows", name)) as Workflow;
 }
+
+const AUR_ED25519_FINGERPRINT = "SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4";
 
 const PATCH_SCRIPT = "scripts/patch-appimage.sh";
 const patchScript = read(...PATCH_SCRIPT.split("/"));
@@ -222,12 +224,77 @@ describe("release.yml runs the AppImage patch and re-signs", () => {
   });
 });
 
-// Published at https://aur.archlinux.org/ under "SSH Fingerprints". Duplicated
-// here on purpose: the workflow's copy is what runs, and this is the second
-// witness that catches an edit to it.
-const AUR_ED25519_FINGERPRINT = "SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4";
-
 describe("the AUR package ships to Arch", () => {
+  it.skipIf(!bashTools)(
+    "renders the GTK deb with matching checksums and Arch metadata",
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), "toolport-aur-render-"));
+      try {
+        const deb = join(dir, "Toolport_2.0.0_amd64.deb");
+        const license = join(dir, "LICENSE");
+        writeFileSync(deb, "GTK deb fixture");
+        writeFileSync(license, "license fixture");
+        const out = join(dir, "aur");
+        execFileSync("bash", ["scripts/render-aur.sh", "v2.0.0", out], {
+          env: {
+            ...process.env,
+            AUR_DEB_FILE: deb,
+            AUR_LICENSE_FILE: license,
+            AUR_PKGREL: "2",
+          },
+          stdio: "pipe",
+        });
+        const pkg = readFileSync(join(out, "PKGBUILD"), "utf8");
+        const info = readFileSync(join(out, ".SRCINFO"), "utf8");
+        expect(pkg).toContain("pkgname=toolport-bin");
+        expect(pkg).toContain("pkgver=2.0.0");
+        expect(pkg).toContain("pkgrel=2");
+        expect(pkg).toContain("Toolport_2.0.0_amd64.deb");
+        for (const dep of [
+          "gtk4>=4.14",
+          "libadwaita>=1.5",
+          "glib2>=2.80",
+          "glibc>=2.39",
+          "gcc-libs",
+          "dbus",
+          "hicolor-icon-theme",
+        ]) {
+          expect(pkg).toContain(`'${dep}'`);
+          expect(info).toContain(`depends = ${dep}\n`);
+        }
+        expect(pkg).not.toMatch(/webkit2gtk|gtk3|xdotool|libayatana/);
+        expect(pkg).toContain("provides=('toolport')");
+        expect(pkg).toContain("conflicts=('toolport')");
+        expect(pkg).toContain('bsdtar -xf "$srcdir"/data.tar.* -C "$pkgdir"');
+        for (const file of [deb, license]) {
+          const sha = createHash("sha256").update(readFileSync(file)).digest("hex");
+          expect(pkg).toContain(sha);
+          expect(info).toContain(`sha256sums = ${sha}`);
+        }
+        expect(() =>
+          execFileSync("bash", ["scripts/render-aur.sh", "2.0.0-preview.1", out], {
+            stdio: "pipe",
+          }),
+        ).toThrow();
+        expect(() =>
+          execFileSync("bash", ["scripts/render-aur.sh", "2.0.0", out], {
+            env: { ...process.env, AUR_PKGREL: "0" },
+            stdio: "pipe",
+          }),
+        ).toThrow();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("keeps dry runs from publishing", () => {
+    const push = workflow("aur.yml").jobs?.publish?.steps?.find(
+      (s) => s.name === "Publish to the AUR",
+    );
+    expect(push?.if).toContain("inputs.dry_run != true");
+  });
+
   const aur = workflow("aur.yml");
   const publish = aur.jobs?.publish;
   const steps = publish?.steps ?? [];

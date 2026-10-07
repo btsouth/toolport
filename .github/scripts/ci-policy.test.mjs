@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { needsRust, requireResults } from "./ci-policy.mjs";
+import { needsLinuxPackages, needsRust, requireResults } from "./ci-policy.mjs";
 
 test("frontend-only PRs skip unchanged native code", () => {
   for (const files of [
@@ -46,11 +46,12 @@ test("native, shared, unknown, empty diffs and main pushes run native checks", (
   assert.equal(needsRust("push", ["src/App.tsx"]), true);
 });
 
-function results(selected) {
+function results(selected, packages = "true") {
   return Object.fromEntries(
     [
       "changes",
       "frontend",
+      "linux-packages",
       "installer-script",
       "installer-script-bash",
       "pinned-install-urls",
@@ -62,40 +63,79 @@ function results(selected) {
       job,
       {
         result:
-          selected === "false" &&
-          ["build-test", "cross-platform-rust", "linux-native", "chaos"].includes(job)
+          job === "linux-packages" && packages === "false"
             ? "skipped"
-            : "success",
-        outputs: job === "changes" ? { rust: selected } : {},
+            : selected === "false" &&
+                ["build-test", "cross-platform-rust", "linux-native", "chaos"].includes(
+                  job,
+                )
+              ? "skipped"
+              : "success",
+        outputs: job === "changes" ? { rust: selected, linux_packages: packages } : {},
       },
     ]),
   );
 }
 
-test("gate accepts successful selected checks and only intentional native skips", () => {
-  requireResults(results("true"));
-  requireResults(results("false"));
+test("Linux packages only run for relevant PR and push changes", () => {
+  for (const event of ["pull_request", "push"]) {
+    for (const file of ["README.md", "docs/design.md", "src/App.tsx", "public/logo.svg"])
+      assert.equal(needsLinuxPackages(event, [file]), false, `${event}: ${file}`);
+    for (const file of [
+      "src-tauri/src/linux_native/settings.rs",
+      "src-tauri/build.rs",
+      "src-tauri/Cargo.toml",
+      "src-tauri/Cargo.lock",
+      "Cargo.toml",
+      "packaging/linux/native/nfpm.yaml",
+      "packaging/agent-plugin/toolport/a.txt",
+      "scripts/build-linux-packages.sh",
+      "scripts/test-linux-packages.sh",
+      "scripts/install-nfpm.sh",
+      "scripts/render-aur.sh",
+      "scripts/ci-apt-install.sh",
+      "scripts/toolport-preview-rollback.sh",
+      ".github/workflows/ci.yml",
+      ".github/workflows/linux-packages.yml",
+      ".github/workflows/release.yml",
+      ".github/workflows/aur.yml",
+      ".github/scripts/ci-policy.mjs",
+      ".github/scripts/ci-policy.test.mjs",
+      "src/test/linux-packaging.test.ts",
+    ])
+      assert.equal(
+        needsLinuxPackages(event, ["README.md", file]),
+        true,
+        `${event}: ${file}`,
+      );
+    assert.equal(needsLinuxPackages(event, []), true);
+  }
+  assert.equal(needsLinuxPackages("release", ["README.md"]), true);
+});
+
+test("gate accepts successful selected checks and intentional skips", () => {
+  for (const rust of ["true", "false"])
+    for (const packages of ["true", "false"]) requireResults(results(rust, packages));
 });
 
 test("any failed, canceled, missing or unexpectedly skipped required check blocks", () => {
   for (const selected of ["true", "false"]) {
-    for (const job of Object.keys(results(selected))) {
-      for (const result of ["failure", "cancelled", undefined, "skipped"]) {
-        if (
-          selected === "false" &&
-          ["build-test", "cross-platform-rust", "linux-native", "chaos"].includes(job) &&
-          result === "skipped"
-        )
-          continue;
-        const needs = results(selected);
-        needs[job].result = result;
-        assert.throws(() => requireResults(needs));
+    for (const packages of ["true", "false"]) {
+      for (const job of Object.keys(results(selected, packages))) {
+        const expected = results(selected, packages)[job].result;
+        for (const result of ["success", "failure", "cancelled", undefined, "skipped"]) {
+          if (result === expected) continue;
+          const needs = results(selected, packages);
+          needs[job].result = result;
+          assert.throws(() => requireResults(needs));
+        }
       }
     }
   }
-  assert.throws(() => requireResults(results(undefined)));
-  assert.throws(() => requireResults(results("maybe")));
-  const needs = results("false");
-  needs["build-test"].result = "success";
-  assert.throws(() => requireResults(needs));
+  for (const invalid of [undefined, "maybe"]) {
+    assert.throws(() => requireResults(results(invalid)));
+    const needs = results("true");
+    needs.changes.outputs.linux_packages = invalid;
+    assert.throws(() => requireResults(needs));
+  }
 });

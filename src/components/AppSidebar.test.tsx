@@ -50,7 +50,8 @@ vi.mock("@tauri-apps/api/event", () => ({
   }),
 }));
 
-vi.mock("@/lib/updater", () => ({
+vi.mock("@/lib/updater", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/updater")>()),
   checkForUpdate: (...args: unknown[]) => checkForUpdate(...args),
   installUpdate: (...args: unknown[]) => installUpdate(...args),
   releasePageUrl: (version: string) =>
@@ -249,9 +250,13 @@ describe("AppSidebar accessibility", () => {
     expect((await screen.findAllByText("Downloading 50%")).length).toBeGreaterThan(0);
   });
 
-  it("sends a .deb install to the release page instead of installing", async () => {
+  it.each([
+    ["deb", "sudo apt install ./<file>.deb"],
+    ["rpm", "sudo dnf install ./<file>.rpm"],
+    ["pacman", "sudo pacman -Syu"],
+  ])("directs a .%s install to its package manager", async (systemPackage, command) => {
     const update = fakeUpdate();
-    checkForUpdate.mockResolvedValue({ kind: "update", update, systemPackage: "deb" });
+    checkForUpdate.mockResolvedValue({ kind: "update", update, systemPackage });
 
     render(
       <TooltipProvider>
@@ -268,12 +273,15 @@ describe("AppSidebar accessibility", () => {
     await userEvent.click(
       await screen.findByRole("button", { name: /update to v1.1.0/i }),
     );
-    expect(screen.getByText(/installed from a \.deb package/i)).toBeInTheDocument();
+    expect(screen.getByText((text) => text.includes(command))).toBeInTheDocument();
+    if (systemPackage !== "pacman") {
+      expect(screen.getByText(/download the new/i)).toBeInTheDocument();
+    }
     expect(
       screen.queryByRole("button", { name: /install and restart/i }),
     ).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: /open download page/i }));
+    await userEvent.click(screen.getByRole("button", { name: /open release page/i }));
 
     expect(openExternal).toHaveBeenCalledWith(
       "https://github.com/btsouth/toolport/releases/tag/v1.1.0",

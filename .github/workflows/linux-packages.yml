@@ -1,0 +1,49 @@
+name: GTK Linux packages
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  packages:
+    name: Build GTK packages and test installs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - name: Install native build dependencies
+        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev libgtk-4-dev libadwaita-1-dev zip
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+          key: gtk-packages
+          cache-bin: "false"
+          save-if: ${{ github.event_name == 'push' }}
+      - name: Install pinned nFPM
+        run: scripts/install-nfpm.sh .verify/nfpm
+      - name: Build one GTK binary into deb and rpm
+        run: scripts/build-linux-packages.sh
+        env:
+          NFPM_BIN: .verify/nfpm/nfpm
+          TOOLPORT_RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+      - name: Download the published 1.x upgrade fixture
+        run: gh release download v1.24.0 -R btsouth/toolport -p '*.deb' -D .verify/native-packages/old
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Ubuntu upgrade, Debian and Fedora fresh installs
+        run: scripts/test-linux-packages.sh .verify/native-packages/*.deb .verify/native-packages/*.rpm .verify/native-packages/old/*.deb
+      - name: Keep tested packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gtk-linux-packages
+          path: |
+            .verify/native-packages/*.deb
+            .verify/native-packages/*.rpm
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 7

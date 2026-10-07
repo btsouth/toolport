@@ -23,6 +23,7 @@ vi.mock("@tauri-apps/plugin-process", () => ({
 import {
   checkForUpdate,
   installUpdate,
+  systemPackageUpdateAdvice,
   UpdateInstallError,
   type UpdateProgress,
 } from "./updater";
@@ -44,6 +45,21 @@ beforeEach(() => {
   relaunch.mockReset().mockResolvedValue(undefined);
   check.mockReset();
   getBundleType.mockReset();
+});
+
+describe("systemPackageUpdateAdvice", () => {
+  it.each([
+    ["deb", "sudo apt install ./<file>.deb"],
+    ["rpm", "sudo dnf install ./<file>.rpm"],
+    ["pacman", "sudo pacman -Syu"],
+  ] as const)("gives the update command for %s", (packageType, command) => {
+    const advice = systemPackageUpdateAdvice(packageType);
+    expect(advice).toContain(command);
+    if (packageType !== "pacman") {
+      expect(advice).toContain(`Download the new .${packageType}`);
+      expect(advice).toContain("release page");
+    }
+  });
 });
 
 describe("checkForUpdate", () => {

@@ -114,14 +114,6 @@ src-tauri/rate_limit_counters.test.json
 /vite.config.js
 /vite.config.d.ts
 
-# Rendered per-release AUR package (scripts/render-aur.sh). PKGBUILD/.SRCINFO
-# carry the sha256 of ONE release's .deb, so a checked-in copy would either be
-# stale or be a checksum nobody verified. CI renders them on release; only
-# packaging/linux/aur/README.md is tracked.
-/packaging/linux/aur/PKGBUILD
-/packaging/linux/aur/.SRCINFO
-/aur/
-
 # makepkg downloads the versioned source archive named in the PKGBUILD into this
 # directory. The PKGBUILD fetches it from the GitHub tag, so a committed copy is
 # dead weight that goes stale with every release.
@@ -129,3 +121,7 @@ src-tauri/rate_limit_counters.test.json
 
 # Local verification logs and screenshots
 /.verify/
+
+# AUR metadata pins one published release and is rendered on demand.
+/packaging/linux/aur/PKGBUILD
+/packaging/linux/aur/.SRCINFO

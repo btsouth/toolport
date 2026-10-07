@@ -11,7 +11,7 @@ export type UpdateCheck =
   | { kind: "error"; message: string };
 
 /** A system package format whose files the package manager owns. */
-export type SystemPackage = "deb" | "rpm";
+export type SystemPackage = "deb" | "rpm" | "pacman";
 
 export type UpdateProgress =
   | { phase: "downloading"; downloadedBytes: number; totalBytes?: number }
@@ -168,7 +168,14 @@ async function systemPackage(): Promise<SystemPackage | null> {
   return null;
 }
 
-/** Release page for a version, where package installs download the new build. */
+/** System packages update through the manager that installed them. */
+export function systemPackageUpdateAdvice(packageType: SystemPackage): string {
+  if (packageType === "pacman") return "Update Toolport with sudo pacman -Syu.";
+  const manager = packageType === "deb" ? "apt" : "dnf";
+  return `Download the new .${packageType} from the release page, then run sudo ${manager} install ./<file>.${packageType}.`;
+}
+
+/** Release notes for a version, including system-managed installs. */
 export function releasePageUrl(version: string): string {
   return `https://github.com/btsouth/toolport/releases/tag/v${version}`;
 }

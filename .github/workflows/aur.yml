@@ -2,15 +2,8 @@ name: aur
 
 # Publishes the `toolport-bin` AUR package after a release is PUBLISHED.
 #
-# Why this exists: the AppImage bundles Ubuntu 22.04's libwebkit2gtk-4.1, which
-# has no WebKitGPUProcess and cannot initialise EGL against a current Mesa. On
-# Arch that is a window that opens grey and empty while WebKitWebProcess aborts
-# on EGL_BAD_PARAMETER every launch. It is the bundle, not the machine - the same
-# session renders fine through the system WebKitGTK - and no WEBKIT_* variable
-# avoids it. A bundled browser engine and a rolling-release GPU stack cannot be
-# kept in agreement, so Arch gets a package that links the host WebKitGTK, the
-# same thing the .deb already does for Debian/Ubuntu. The fat AppImage is
-# untouched and still correct there.
+# Preserve upgrades for existing toolport-bin users with the official GTK .deb.
+# It links host GTK4 and libadwaita and keeps the native package's file layout.
 #
 # Not on the version tag, deliberately: release.yml builds into a DRAFT release
 # and PKGBUILD's sha256sums must be computed from the assets people will actually
@@ -113,7 +106,7 @@ jobs:
       # Actually build the package rather than hoping the PKGBUILD is right. This
       # verifies the checksums against the published .deb, that the ar/tar
       # unwrapping works, and that the binaries land where the .desktop file
-      # expects. `--nodeps` skips installing webkit2gtk et al: those are runtime
+      # expects. `--nodeps` skips installing GTK4 et al: those are runtime
       # dependencies this container never has to satisfy to prove packaging works.
       #
       # The container REPORTS, it does not produce. `aur/` is mounted read-only
@@ -145,7 +138,7 @@ jobs:
             pkg=$(ls -1 *.pkg.tar.*)
             echo "built $pkg"
             bsdtar -tf "$pkg" > contents.txt
-            for want in usr/bin/toolport usr/bin/conduit usr/share/licenses/toolport-bin/LICENSE; do
+            for want in usr/bin/toolport-gtk usr/bin/toolport-gateway usr/bin/toolport usr/bin/conduit usr/share/applications/com.tsout.Toolport.desktop usr/share/metainfo/com.tsout.Toolport.metainfo.xml usr/share/toolport/agent-plugin/toolport-agent-plugin.zip usr/share/toolport/toolport-preview-rollback.sh usr/share/licenses/toolport/LICENSE usr/share/licenses/toolport-bin/LICENSE; do
               grep -qx "$want" contents.txt || { echo "::error::$want missing from $pkg"; exit 1; }
             done
             grep -q "^usr/share/applications/" contents.txt || { echo "::error::no .desktop file in $pkg"; exit 1; }
