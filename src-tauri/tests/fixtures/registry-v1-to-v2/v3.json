@@ -22,26 +22,18 @@
   "defaultAccessLegacyPolicy": true,
   "denyDestructive": false,
   "humanApproval": true,
-  "humanApprovalAllow": [
-    "github/search_code"
-  ],
+  "humanApprovalAllow": ["github/search_code"],
   "lazyDiscovery": true,
   "pinnedTools": {
-    "github": [
-      "get_me"
-    ]
+    "github": ["get_me"]
   },
   "profiles": [
     {
-      "enabledServerIds": [
-        "github"
-      ],
+      "enabledServerIds": ["github"],
       "id": "default",
       "name": "Default",
       "toolScope": {
-        "github": [
-          "search_code"
-        ]
+        "github": ["search_code"]
       }
     }
   ],
@@ -49,14 +41,9 @@
   "safetyLevel": "ask",
   "servers": [
     {
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-github"
-      ],
+      "args": ["-y", "@modelcontextprotocol/server-github"],
       "command": "npx",
-      "disabledTools": [
-        "delete_repository"
-      ],
+      "disabledTools": ["delete_repository"],
       "enabled": true,
       "env": [
         {
