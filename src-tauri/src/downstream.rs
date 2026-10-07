@@ -5873,7 +5873,9 @@ impl HttpTransport {
             Ok(None) => Err(TransportError::Fatal(format!(
                 "HTTP {code} (needs authentication): token refresh returned no token"
             ))),
-            Err(e) if crate::remote::is_refresh_storage_or_lock_error(&e) => Err(TransportError::Fatal(e)),
+            Err(e) if crate::remote::is_refresh_storage_or_lock_error(&e) => {
+                Err(TransportError::Fatal(e))
+            }
             Err(e) => Err(TransportError::Fatal(format!(
                 "HTTP {code} (needs authentication): token refresh failed: {e}"
             ))),
