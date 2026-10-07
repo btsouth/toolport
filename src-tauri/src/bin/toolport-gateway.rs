@@ -104,6 +104,12 @@ struct ActiveRequestContext {
     /// registered HTTP client's profile, or the stdio gateway's own. Selects the
     /// per-profile server instructions (#971). `None` = the dispatch `profile` argument.
     connection_profile: Option<String>,
+    /// Stable principal of an HTTP caller (`adapter:{id}`, `client:{id}`, ...).
+    /// Several connections can share it, e.g. two windows of one app.
+    connection_identity: Option<String>,
+    /// Unique per upstream request, so two sessionless requests are never taken
+    /// for one client. Nested work for the same request keeps it.
+    request_nonce: u64,
 }
 
 thread_local! {
@@ -115,6 +121,8 @@ thread_local! {
             adapter_root: None,
             upstream_transport: UpstreamTransport::Unknown,
             connection_profile: None,
+            connection_identity: None,
+            request_nonce: 0,
         }) };
 }
 
@@ -296,6 +304,34 @@ fn active_connection_profile() -> Option<String> {
     ACTIVE_REQUEST_CONTEXT.with(|cell| cell.borrow().connection_profile.clone())
 }
 
+/// Installs the caller's identity and a fresh request nonce for one upstream
+/// request and restores the previous values on drop.
+struct UpstreamRequestGuard(Option<String>, u64);
+
+impl UpstreamRequestGuard {
+    fn enter(identity: Option<String>) -> Self {
+        static NEXT_NONCE: AtomicU64 = AtomicU64::new(1);
+        let nonce = NEXT_NONCE.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_REQUEST_CONTEXT.with(|cell| {
+            let mut context = cell.borrow_mut();
+            Self(
+                std::mem::replace(&mut context.connection_identity, identity),
+                std::mem::replace(&mut context.request_nonce, nonce),
+            )
+        })
+    }
+}
+
+impl Drop for UpstreamRequestGuard {
+    fn drop(&mut self) {
+        ACTIVE_REQUEST_CONTEXT.with(|cell| {
+            let mut context = cell.borrow_mut();
+            context.connection_identity = self.0.take();
+            context.request_nonce = self.1;
+        });
+    }
+}
+
 /// Installs a complete request context on a worker that continues work for a
 /// request started on another thread (currently code-mode `callAsync`). Copying
 /// only the session id is insufficient: modern server-initiated RPC also needs
@@ -318,6 +354,47 @@ impl Drop for ActiveRequestContextGuard {
 
 fn active_request_context() -> ActiveRequestContext {
     ACTIVE_REQUEST_CONTEXT.with(|cell| cell.borrow().clone())
+}
+
+/// Which upstream client a downstream request serves. A stdio server's roots,
+/// sampling or elicitation request is only handed to a waiting call with the
+/// same key. The stdio gateway has one client; an HTTP caller is keyed by its
+/// identity, root, profile and MCP session, and a sessionless HTTP request also
+/// by its own nonce, since nothing else tells two connections of one app apart.
+/// Work no client asked for (connect, catalog refresh) is background. With
+/// `sole_client` (the stdio gateway) the handler needs no request context to
+/// answer for the one client, so a server request during it is still answered.
+fn downstream_request_context(sole_client: bool) -> downstream::RequestContext {
+    use std::hash::{Hash, Hasher};
+    ACTIVE_REQUEST_CONTEXT.with(|cell| {
+        let context = cell.borrow();
+        let transport = match context.upstream_transport {
+            UpstreamTransport::Unknown => {
+                return downstream::RequestContext::Background { sole_client }
+            }
+            UpstreamTransport::Stdio => "stdio",
+            UpstreamTransport::Http => "http",
+        };
+        let mut capabilities = std::collections::hash_map::DefaultHasher::new();
+        context
+            .upstream_capabilities
+            .as_deref()
+            .map(Value::to_string)
+            .hash(&mut capabilities);
+        let mut key = format!(
+            "{transport}|{}|{}|{:x}|{}|{}|{}",
+            context.upstream_version.as_deref().unwrap_or("-"),
+            context.mcp_session.as_deref().unwrap_or("-"),
+            capabilities.finish(),
+            context.connection_identity.as_deref().unwrap_or("-"),
+            context.adapter_root.as_deref().unwrap_or("-"),
+            context.connection_profile.as_deref().unwrap_or("-"),
+        );
+        if context.upstream_transport == UpstreamTransport::Http && context.mcp_session.is_none() {
+            key.push_str(&format!("|#{}", context.request_nonce));
+        }
+        downstream::RequestContext::Client(key)
+    })
 }
 
 fn modern_client_supports_server_rpc(method: &str) -> bool {
@@ -15527,6 +15604,7 @@ fn process_request(
     } else {
         UpstreamTransport::Stdio
     });
+    let _request = UpstreamRequestGuard::enter(client.map(str::to_string));
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     if !state.http && upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
         state.stdio_upstream.mark_modern_upstream();
@@ -19631,6 +19709,9 @@ fn main() {
     // Single-flight for every router build/swap (startup, watcher self-heal, and
     // ${ROOT} rebuilds). Created up front so the startup build can share it.
     let rebuild_lock = Arc::new(Mutex::new(()));
+    downstream::set_request_context_provider(Arc::new(move || {
+        downstream_request_context(!http_mode)
+    }));
     let server_handler = make_server_request_handler(
         Arc::clone(&stdio_upstream),
         Arc::clone(&mcp_sessions),
@@ -31954,6 +32035,87 @@ mod tests {
         assert_eq!(active_mcp_session().as_deref(), Some("parent-session"));
         assert!(serving_modern_client());
         assert!(modern_client_supports_server_rpc("roots/list"));
+    }
+
+    #[test]
+    fn downstream_context_key_never_shares_one_between_two_clients() {
+        fn key_for(context: ActiveRequestContext) -> downstream::RequestContext {
+            let _context = ActiveRequestContextGuard::enter(context);
+            downstream_request_context(false)
+        }
+        // Two sessionless modern requests on the daemon that agree on everything
+        // the server-request handler reads: era, capabilities, root and profile.
+        let modern = |identity: &str, nonce: u64| ActiveRequestContext {
+            upstream_version: Some(MODERN_PROTOCOL_VERSION.to_string()),
+            upstream_capabilities: Some(Arc::new(json!({ "elicitation": {}, "roots": {} }))),
+            mcp_session: None,
+            adapter_root: Some("/work/app".to_string()),
+            upstream_transport: UpstreamTransport::Http,
+            connection_profile: Some("default".to_string()),
+            connection_identity: Some(identity.to_string()),
+            request_nonce: nonce,
+        };
+        assert_ne!(
+            key_for(modern("adapter:claude-code", 7)),
+            key_for(modern("adapter:codex", 7)),
+            "two clients must not share a key"
+        );
+        // Two windows of one app look the same, so each request stands alone,
+        // while nested work for one request keeps its key.
+        assert_ne!(
+            key_for(modern("adapter:claude-code", 7)),
+            key_for(modern("adapter:claude-code", 8))
+        );
+        assert_eq!(
+            key_for(modern("adapter:claude-code", 7)),
+            key_for(modern("adapter:claude-code", 7))
+        );
+
+        // A legacy MCP session is one connection: its requests share a key.
+        let session = |nonce: u64| ActiveRequestContext {
+            mcp_session: Some("session-a".to_string()),
+            upstream_transport: UpstreamTransport::Http,
+            connection_identity: Some("client:a".to_string()),
+            request_nonce: nonce,
+            ..ActiveRequestContext::default()
+        };
+        assert_eq!(key_for(session(1)), key_for(session(2)));
+        let stdio = |nonce: u64| ActiveRequestContext {
+            upstream_transport: UpstreamTransport::Stdio,
+            request_nonce: nonce,
+            ..ActiveRequestContext::default()
+        };
+        assert_eq!(key_for(stdio(1)), key_for(stdio(2)));
+        assert!(matches!(
+            key_for(stdio(1)),
+            downstream::RequestContext::Client(_)
+        ));
+
+        // Work no client is waiting on has no key at all; the stdio gateway's
+        // handler can still answer for its one client during it.
+        assert_eq!(
+            key_for(ActiveRequestContext::default()),
+            downstream::RequestContext::Background { sole_client: false }
+        );
+        {
+            let _context = ActiveRequestContextGuard::enter(ActiveRequestContext::default());
+            assert_eq!(
+                downstream_request_context(true),
+                downstream::RequestContext::Background { sole_client: true }
+            );
+        }
+
+        // The request guard hands each upstream request its own nonce.
+        let _http = UpstreamTransportGuard::enter(UpstreamTransport::Http);
+        let first = {
+            let _request = UpstreamRequestGuard::enter(Some("adapter:claude-code".to_string()));
+            downstream_request_context(false)
+        };
+        let second = {
+            let _request = UpstreamRequestGuard::enter(Some("adapter:claude-code".to_string()));
+            downstream_request_context(false)
+        };
+        assert_ne!(first, second);
     }
 
     #[test]

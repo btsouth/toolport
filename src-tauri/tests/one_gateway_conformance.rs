@@ -3583,3 +3583,53 @@ fn matrix_routing_server_request_reaches_only_the_originating_adapter() {
     assert_eq!(other.elicitation_queries.load(Ordering::Relaxed), 0);
     assert_eq!(transcript_initialize_count(&transcript), 1);
 }
+
+#[test]
+fn matrix_routing_server_request_is_refused_while_another_client_has_a_call_in_flight() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("concurrent-server-request");
+    let transcript = dir.join("shared.jsonl");
+    // Concurrent mode keeps both calls in flight on the one child at once.
+    let mut server = mock_server_entry("shared", &transcript, None);
+    server.env.push(EnvVar {
+        key: "MOCK_MCP_CONCURRENT".to_string(),
+        value: Some("1".to_string()),
+        secret: false,
+    });
+    write_registry(&dir, vec![server], vec![]);
+    let options = AdapterOptions {
+        elicitation: true,
+        ..AdapterOptions::default()
+    };
+    let mut origin = spawn_adapter(&dir, &options);
+    let mut other = spawn_adapter(&dir, &options);
+    origin.initialize("matrix-concurrent-origin");
+    other.initialize("matrix-concurrent-other");
+    let tool = origin.wait_for_tool("__legacy_elicitation", Duration::from_secs(30));
+    let sleep = other.wait_for_tool("__sleep", Duration::from_secs(30));
+    let other = std::thread::spawn(move || {
+        let result = other.call_tool(&sleep, json!({ "ms": 3000 }));
+        (other, result)
+    });
+    wait_until(
+        || transcript_method_count(&transcript, "tools/call") == 1,
+        "the other client's call to reach the server",
+        Duration::from_secs(10),
+    );
+
+    // JSON-RPC does not say which call the elicitation belongs to, and two
+    // clients have calls in flight: neither may be asked, so it is refused.
+    let started = Instant::now();
+    let result = origin.call_tool(&tool, json!({}));
+    assert!(
+        text_of(&result).contains("legacy refused"),
+        "the server request was not refused: {result}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let (other, slept) = other.join().unwrap();
+    assert_eq!(text_of(&slept), "slept 3000 ms");
+    assert_eq!(origin.elicitation_queries.load(Ordering::Relaxed), 0);
+    assert_eq!(other.elicitation_queries.load(Ordering::Relaxed), 0);
+}

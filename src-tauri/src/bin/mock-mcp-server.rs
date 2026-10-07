@@ -41,6 +41,13 @@
 //!   framing has to tolerate it.
 //! - `MOCK_MCP_STDERR_FLOOD=1` — write to stderr in a tight loop, so a test can
 //!   check that a chatty server's stderr neither blocks it nor breaks the gateway.
+//! - `MOCK_MCP_CONCURRENT=1` — handle each stdio request on its own thread and
+//!   write responses in completion order, and list a `sleep` tool that waits
+//!   `ms` milliseconds. This is what lets a test see whether the gateway keeps
+//!   several requests in flight on one server.
+//! - `MOCK_MCP_ROOTS_BEFORE_LIST=1` — hold every `tools/list` response until the
+//!   client answers a `roots/list` request (with a result or an error), like a
+//!   server that scopes its tools to the client's roots.
 //!
 //! The default configuration (no env set) is byte-identical to the pre-SOU-443
 //! fixture apart from the added `echo_meta` tool, so `list_changed`,
@@ -120,6 +127,8 @@ struct Config {
     start_delay: Option<std::time::Duration>,
     garbage_stdout: Option<std::time::Duration>,
     stderr_flood: bool,
+    concurrent: bool,
+    roots_before_list: bool,
 }
 
 impl Config {
@@ -143,6 +152,8 @@ impl Config {
                 .and_then(|raw| raw.trim().parse().ok())
                 .map(std::time::Duration::from_millis),
             stderr_flood: std::env::var("MOCK_MCP_STDERR_FLOOD").as_deref() == Ok("1"),
+            concurrent: std::env::var("MOCK_MCP_CONCURRENT").as_deref() == Ok("1"),
+            roots_before_list: std::env::var("MOCK_MCP_ROOTS_BEFORE_LIST").as_deref() == Ok("1"),
         }
     }
 }
@@ -156,6 +167,8 @@ struct State {
     /// Original legacy tools/call waiting for the client to answer a
     /// server-initiated elicitation request.
     pending_legacy_elicitation: Option<Value>,
+    /// `tools/list` request waiting for the client to answer `roots/list`.
+    pending_roots_list: Option<Value>,
     subscribed_resources: std::collections::HashSet<String>,
 }
 
@@ -250,6 +263,10 @@ fn tool_list(cfg: &Config, grown: bool) -> Value {
             pwd["inputSchema"]["properties"]["project"] =
                 json!({ "type": "string", "const": marker.trim() });
         }
+    }
+    if cfg.concurrent {
+        tools.push(json!({ "name": "sleep", "description": "Wait ms milliseconds, then reply.",
+                "inputSchema": { "type": "object", "properties": { "ms": { "type": "number" } } } }));
     }
     if grown {
         tools.push(json!({ "name": "greet", "description": "Greet someone by name.",
@@ -368,6 +385,32 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
         }
     }
 
+    // The client refused the legacy elicitation: fail the call it was for.
+    if method.is_empty()
+        && req.get("id") == Some(&json!("mock-legacy-elicitation"))
+        && req.get("error").is_some()
+    {
+        if let Some(call_id) = state.pending_legacy_elicitation.take() {
+            return Some(success(
+                call_id,
+                json!({
+                    "content": [{ "type": "text", "text": "legacy refused" }],
+                    "isError": true
+                }),
+            ));
+        }
+    }
+
+    if method.is_empty()
+        && req.get("id") == Some(&json!("mock-roots"))
+        && (req.get("result").is_some() || req.get("error").is_some())
+    {
+        if let Some(list_id) = state.pending_roots_list.take() {
+            let tools = tool_list(cfg, state.grown);
+            return Some(success(list_id, decorate(cfg, "tools/list", tools)));
+        }
+    }
+
     // Notifications carry no id and get no response, but still drive state.
     let id = match req.get("id") {
         Some(id) if !id.is_null() => id.clone(),
@@ -418,6 +461,16 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
             "capabilities": capabilities(),
             "instructions": "Mock server used as a gateway test fixture.",
         }),
+        "tools/list" if cfg.roots_before_list => {
+            state.pending_roots_list = Some(id);
+            pre.push(json!({
+                "jsonrpc": "2.0",
+                "id": "mock-roots",
+                "method": "roots/list",
+                "params": {}
+            }));
+            return None;
+        }
         "tools/list" => tool_list(cfg, state.grown),
         "resources/list" => resource_list(state.grown),
         "resources/subscribe" => {
@@ -560,6 +613,14 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
                     // (used to exercise the circuit breaker).
                     std::process::exit(0);
                 }
+                "sleep" => {
+                    let ms = sleep_ms(req).unwrap_or(0);
+                    // Concurrent mode sleeps before taking the state lock.
+                    if !cfg.concurrent {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                    }
+                    format!("slept {ms} ms")
+                }
                 "greet" => {
                     let who = args.get("name").and_then(|t| t.as_str()).unwrap_or("there");
                     format!("hello {who}")
@@ -682,6 +743,7 @@ fn serve_http(cfg: &Config) {
         grown: false,
         initialized: false,
         pending_legacy_elicitation: None,
+        pending_roots_list: None,
         subscribed_resources: std::collections::HashSet::new(),
     };
     for mut request in server.incoming_requests() {
@@ -771,6 +833,51 @@ fn fail_start_if_configured() {
     }
 }
 
+/// The `ms` argument of a `sleep` tool call, or `None` for any other request.
+fn sleep_ms(req: &Value) -> Option<u64> {
+    if req.get("method").and_then(Value::as_str) != Some("tools/call")
+        || req["params"]["name"].as_str() != Some("sleep")
+    {
+        return None;
+    }
+    Some(req["params"]["arguments"]["ms"].as_u64().unwrap_or(0))
+}
+
+/// `MOCK_MCP_CONCURRENT=1`: one thread per request, responses in completion order.
+fn serve_concurrent(cfg: Config, state: State) {
+    use std::sync::{Arc, Mutex};
+    let cfg = Arc::new(cfg);
+    let state = Arc::new(Mutex::new(state));
+    let out = Arc::new(Mutex::new(std::io::stdout()));
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        let Ok(req) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        record(&cfg, &req);
+        let (cfg, state, out) = (Arc::clone(&cfg), Arc::clone(&state), Arc::clone(&out));
+        std::thread::spawn(move || {
+            if let Some(ms) = sleep_ms(&req) {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+            let mut pre = Vec::new();
+            let resp = handle(
+                &cfg,
+                &mut state.lock().unwrap_or_else(|e| e.into_inner()),
+                &req,
+                &mut pre,
+            );
+            let mut out = out.lock().unwrap_or_else(|e| e.into_inner());
+            for message in pre.iter().chain(resp.as_ref()) {
+                let _ = writeln!(out, "{message}");
+            }
+            let _ = out.flush();
+        });
+    }
+}
+
 fn main() {
     if let Ok(path) = std::env::var("MOCK_MCP_PID_FILE") {
         use std::io::Write;
@@ -841,8 +948,14 @@ fn serve_stdio() {
         grown: false,
         initialized: false,
         pending_legacy_elicitation: None,
+        pending_roots_list: None,
         subscribed_resources: std::collections::HashSet::new(),
     };
+    if cfg.concurrent {
+        drop(out);
+        serve_concurrent(cfg, state);
+        return;
+    }
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
