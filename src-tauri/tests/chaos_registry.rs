@@ -24,7 +24,6 @@ fn a_corrupt_registry_does_not_take_down_a_running_gateway() {
         scratch.path(),
         &[mock_entry("x", &[])],
         &["x"],
-        false,
     );
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "a");
@@ -78,7 +77,6 @@ fn rapid_registry_toggles_do_not_break_a_stable_server() {
         scratch.path(),
         &[mock_entry("x", &[]), mock_entry("y", &[])],
         &["x", "y"],
-        false,
     );
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "a");

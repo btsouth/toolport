@@ -116,7 +116,6 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     setProfile(match?.id ?? currentScope);
   }, [currentScope, client.id, registry?.profiles]);
 
-
   // SOU-317 follow-up (SBS-336): the restart advice is load-bearing — an MCP client
   // typically does not pick up a rewritten config until relaunch — but it only ever
   // appeared in a toast, which fades after a few seconds and is gone if the user was
@@ -381,11 +380,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         );
         noteRestartNeeded("removed");
       } else {
-        const outcome = await installGateway(
-          client.id,
-          profile || undefined,
-          false,
-          );
+        const outcome = await installGateway(client.id, profile || undefined, false);
         // Restart is the load-bearing line (SOU-317): MCP clients typically do not
         // pick up a new gateway entry until relaunch. Scope/backup are secondary.
         toast.success(`Connected Toolport to ${client.name}`, {

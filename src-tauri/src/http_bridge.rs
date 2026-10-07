@@ -126,7 +126,8 @@ pub fn start_with_token_at(
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start the HTTP bridge: {error}"))?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    let startup_timeout = 25;
+    let deadline = std::time::Instant::now() + Duration::from_secs(startup_timeout);
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!(

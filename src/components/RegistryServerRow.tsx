@@ -196,7 +196,6 @@ export function RegistryServerRow({
             <StatusLabel status={status} label={label} error={health?.error ?? null} />
           )}
 
-
           <button
             type="button"
             onClick={(e) => {

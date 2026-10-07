@@ -1,8 +1,7 @@
 //! End-to-end guard for REL-03: a downstream server that fails its first connect
 //! is retried in the background and joins the catalog without a gateway restart.
 //!
-//! Drives the real gateway through the stdio adapter and shared host daemon, with the
-//! default daemon topology (stdio adapter in front of a host daemon), against
+//! Drives the real gateway through the stdio adapter and shared host daemon against
 //! `mock-mcp-server` started in its fail-the-first-N-starts mode. The start counter
 //! file it keeps is how these tests see each retry.
 //!

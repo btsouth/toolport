@@ -37,7 +37,6 @@ fn a_hung_server_does_not_stall_another_server() {
             mock_entry("bad", &[("MOCK_MCP_CALL_DELAY_MS", "60000")]),
         ],
         &["good", "bad"],
-        false,
     );
     let _daemon = start_daemon(scratch.path());
     let mut victim = Client::start(scratch.path(), "victim");
@@ -77,7 +76,6 @@ fn a_server_that_crashes_mid_call_is_brought_back() {
         scratch.path(),
         &[mock_entry("good", &[]), mock_entry("bad", &[])],
         &["good", "bad"],
-        false,
     );
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "a");
@@ -124,7 +122,6 @@ fn a_slow_starting_server_does_not_hold_back_the_catalog() {
             mock_entry("slow", &[("MOCK_MCP_START_DELAY_MS", "3000")]),
         ],
         &["good", "slow"],
-        false,
     );
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "a");
@@ -166,7 +163,6 @@ fn garbage_on_a_servers_stdout_does_not_break_it() {
             mock_entry("noisy", &[("MOCK_MCP_GARBAGE_STDOUT_MS", "20")]),
         ],
         &["good", "noisy"],
-        false,
     );
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "a");
@@ -210,7 +206,6 @@ fn a_stderr_flood_does_not_wedge_the_server_or_the_gateway() {
             mock_entry("chatty", &[("MOCK_MCP_STDERR_FLOOD", "1")]),
         ],
         &["good", "chatty"],
-        false,
     );
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "a");
@@ -280,7 +275,6 @@ fn an_auth_required_server_waits_for_sign_in_without_taking_the_gateway_down() {
         scratch.path(),
         &[mock_entry("good", &[]), http_entry("locked", &url)],
         &["good", "locked"],
-        false,
     );
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "a");

@@ -25,7 +25,6 @@ fn a_killed_daemon_is_replaced_and_the_client_recovers() {
         scratch.path(),
         &[mock_entry("x", &[])],
         &["x"],
-        false,
     );
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "a");
@@ -79,7 +78,7 @@ fn a_killed_downstream_child_is_respawned() {
     use chaos_support::find_child;
 
     let scratch = Scratch::new("child-kill");
-    write_registry(scratch.path(), &[mock_entry("x", &[])], &["x"], false);
+    write_registry(scratch.path(), &[mock_entry("x", &[])], &["x"]);
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "a");
     assert!(
@@ -123,7 +122,6 @@ fn a_killed_daemon_does_not_leave_its_servers_running() {
             ],
         )],
         &["x"],
-        false,
     );
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "a");
