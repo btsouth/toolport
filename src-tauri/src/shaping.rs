@@ -205,6 +205,22 @@ pub fn shape_result_preserving_prefix(
     if budget == 0 {
         return false;
     }
+    let server = result
+        .pointer("/_meta/app.toolport~1provenance/server")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // Callers add the notice after caching, so reserve its exact serialized cost.
+    let budget = if let Some(server) = &server {
+        let mut notice = serde_json::json!({"content":[]});
+        crate::integrity::label_untrusted_result(server, &mut notice);
+        let reserve = value_size(&notice["content"][0]) + 1;
+        budget.saturating_sub(reserve)
+    } else {
+        budget
+    };
+    if budget == 0 {
+        return false;
+    }
     let size = serde_json::to_string(result).map(|s| s.len()).unwrap_or(0);
     if size <= budget {
         return false;
@@ -294,6 +310,9 @@ pub fn shape_result_preserving_prefix(
                 }
                 dst.insert(key.clone(), value.clone());
             }
+        }
+        if let Some(server) = &server {
+            crate::integrity::label_untrusted_result_with_notice(server, &mut shaped, false);
         }
         shaped
     };
