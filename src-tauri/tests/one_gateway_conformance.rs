@@ -3051,12 +3051,12 @@ fn matrix_routing_approved_call_rebinds_to_its_profile_view() {
         .tool_scope
         .insert("shared".to_string(), vec!["add".to_string()]);
     let mut server = mock_server_entry("shared", &transcript, None);
-    // Imported servers require human approval even for a non-destructive tool.
+    // Strict asks before non-destructive calls to untrusted servers.
     server.source = Some("shared".to_string());
     write_registry(&dir, vec![server], vec![echo_only, add_only]);
     let registry_path = dir.join("registry.json");
     let mut reg = registry::load_from(&registry_path).expect("load registry");
-    reg.set_human_approval(true);
+    reg.set_safety_level(registry::SafetyLevel::Strict);
     registry::save_to(&registry_path, &reg).expect("enable approval");
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("approval listener");
@@ -3175,7 +3175,7 @@ fn matrix_pooling_approved_rooted_call_rebinds_to_its_root_view() {
     );
     let registry_path = dir.join("registry.json");
     let mut reg = registry::load_from(&registry_path).expect("load registry");
-    reg.set_human_approval(true);
+    reg.set_safety_level(registry::SafetyLevel::Strict);
     registry::save_to(&registry_path, &reg).expect("enable approval");
     let broker = approval_broker(&dir, "rooted", "pwd");
 
