@@ -281,6 +281,7 @@ impl Client {
         let result = done_rx.recv_timeout(Duration::from_secs(10));
         if result.is_err() {
             signal(u64::from(pid), "-KILL");
+            panic!("adapter shutdown timed out");
         }
         worker.join().unwrap();
         assert!(result
