@@ -2382,7 +2382,10 @@ fn search_catalog_indexed(
         let q_tokens = query_tokens(query, |token| df.contains_key(token));
         let q_set: HashSet<&str> = q_tokens.iter().map(String::as_str).collect();
         let plurals = plural_query_tokens(query);
-        let initialisms = query_initialisms(&q_tokens);
+        let initialisms: Vec<String> = query_initialisms(&q_tokens)
+            .into_iter()
+            .filter(|initials| df.contains_key(initials))
+            .collect();
         // Per server: its prefix tokens, and whether the query names it.
         let mut servers: HashMap<&str, (Vec<String>, bool)> = HashMap::new();
         // Lexical score for EVERY doc (0 if no hit), kept so optional semantic
@@ -2458,7 +2461,11 @@ fn search_catalog_indexed(
                     if doc.description_tokens.contains("deprecated") {
                         score *= DEPRECATED_PENALTY;
                     }
-                    if !plurals.is_empty() && doc.name_tokens.contains("list") {
+                    if doc.name_tokens.contains("list")
+                        && plurals
+                            .iter()
+                            .any(|plural| doc.name_tokens.contains(plural))
+                    {
                         let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
                         let action = name.split_once("__").map_or(name, |(_, rest)| rest);
                         let mut words = search_tokens(action)
