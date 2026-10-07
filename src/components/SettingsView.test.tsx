@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
@@ -531,6 +531,12 @@ it("shows the expand affordance for an empty access set", async () => {
 });
 
 describe("Remove Toolport from all clients", () => {
+  beforeEach(() => {
+    vi.mocked(disconnectAllClients).mockReset();
+    vi.mocked(getRegistry).mockReset();
+    vi.mocked(toastError).mockClear();
+  });
+
   it("keeps removal results when refreshing the registry fails", async () => {
     const user = userEvent.setup();
     vi.mocked(disconnectAllClients).mockResolvedValue([
