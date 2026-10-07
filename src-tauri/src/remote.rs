@@ -8,7 +8,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -929,7 +929,7 @@ fn authed_transport(
     server_id: &str,
     block_private: bool,
     request_timeout: Duration,
-) -> Result<HttpTransport, String> {
+) -> Result<(HttpTransport, Arc<AtomicBool>), String> {
     if token.is_some() {
         require_secure_for_auth(url)?;
     }
@@ -946,12 +946,14 @@ fn authed_transport(
     // step up concurrently. Serialize credential-changing flows so an older
     // refresh result cannot overwrite a newer interactive authorization state.
     let credential_update = credential_update(server_id);
+    let refreshed_during_connect = Arc::new(AtomicBool::new(false));
     let refresh: Option<RefreshFn> = if token.is_some() {
         let sid = server_id.to_string();
         // Keep the proactive deadline in memory. This avoids a keychain read on
         // every tool call while still updating the deadline after each refresh.
         let next_refresh_at = Arc::clone(&next_refresh_at);
         let credential_update = Arc::clone(&credential_update);
+        let refreshed_during_connect = Arc::clone(&refreshed_during_connect);
         Some(Box::new(move |force| {
             let mut update = credential_update
                 .lock()
@@ -983,6 +985,7 @@ fn authed_transport(
                     return Err(e);
                 }
             };
+            refreshed_during_connect.store(true, Ordering::SeqCst);
             let deadline = refreshed
                 .expires_at
                 .map(|expires_at| expires_at.saturating_sub(PROACTIVE_REFRESH_SKEW_SECS));
@@ -1039,7 +1042,7 @@ fn authed_transport(
             serde_json::json!({}),
         );
     }
-    Ok(transport)
+    Ok((transport, refreshed_during_connect))
 }
 
 /// Provenance Toolport doesn't trust to point at the user's private network. Shared
@@ -1208,7 +1211,8 @@ pub fn connect_remote_with_handler(
     // differs from this afterwards, an exchange already happened during this
     // connect (SOU-474).
     let sent_auth = auth.clone();
-    let mut transport = authed_transport(url, auth, server_id, block_private, request_timeout)?;
+    let (mut transport, refreshed_during_connect) =
+        authed_transport(url, auth, server_id, block_private, request_timeout)?;
     transport.set_connect_timeout(initialize_timeout);
     if let Some(ref handler) = server_handler {
         transport.set_server_request_handler(handler.clone());
@@ -1235,7 +1239,11 @@ pub fn connect_remote_with_handler(
             // described in words rather than quoted, because its text would make
             // `is_auth_error` classify a keychain fault as needs-sign-in and push the
             // user into a sign-in the same vault could not store.
-            let already_refreshed =
+            // A successful refresh can live only in memory after a vault write
+            // fails. Count it directly instead of relying solely on saved tokens.
+            let already_refreshed = if refreshed_during_connect.load(Ordering::SeqCst) {
+                true
+            } else {
                 match transport_refreshed_during_connect(server_id, sent_auth.as_deref()) {
                     Ok(refreshed) => refreshed,
                     Err(vault_error) => {
@@ -1252,13 +1260,14 @@ pub fn connect_remote_with_handler(
                              renewed, so no further token exchange was attempted)"
                         ));
                     }
-                };
+                }
+            };
             if already_refreshed {
                 return Err(e);
             }
             match refresh_token(server_id) {
                 Ok(fresh) => {
-                    let mut transport = authed_transport(
+                    let (mut transport, _) = authed_transport(
                         url,
                         Some(fresh),
                         server_id,
@@ -1455,6 +1464,7 @@ mod tests {
     struct RotatingEndpoint {
         url: String,
         exchanges: Arc<std::sync::atomic::AtomicUsize>,
+        reject_access: Arc<AtomicBool>,
         started: std::sync::mpsc::Receiver<()>,
         release: std::sync::mpsc::SyncSender<()>,
         server: Arc<tiny_http::Server>,
@@ -1470,6 +1480,8 @@ mod tests {
             let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
             let url = format!("http://{}/token", server.server_addr());
             let exchanges = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let reject_access = Arc::new(AtomicBool::new(false));
+            let reject = Arc::clone(&reject_access);
             let (started_tx, started) = std::sync::mpsc::channel();
             let (release, release_rx) = std::sync::mpsc::sync_channel(1);
             let endpoint = Arc::clone(&server);
@@ -1481,6 +1493,10 @@ mod tests {
                     let mut body = String::new();
                     request.as_reader().read_to_string(&mut body).unwrap();
                     if !body.contains("grant_type=refresh_token") {
+                        if reject.load(Ordering::SeqCst) {
+                            request.respond(tiny_http::Response::empty(401)).unwrap();
+                            continue;
+                        }
                         let message: serde_json::Value = serde_json::from_str(&body).unwrap();
                         let auth = request
                             .headers()
@@ -1543,6 +1559,7 @@ mod tests {
             Self {
                 url,
                 exchanges,
+                reject_access,
                 started,
                 release,
                 server,
@@ -1703,6 +1720,37 @@ mod tests {
     }
 
     #[test]
+    fn oauth_connect_does_not_refresh_twice_after_a_failed_token_save() {
+        for key in [STATE_KEY, secrets::HTTP_AUTH_KEY] {
+            secrets::tests::with_isolated_vault(|| {
+                let endpoint = RotatingEndpoint::new();
+                endpoint.seed();
+                let mut state = load_state("rotation").unwrap().unwrap();
+                state.expires_at = Some(now_epoch_seconds() + 3600);
+                secrets::set_secret(
+                    "rotation",
+                    STATE_KEY,
+                    &serde_json::to_string(&state).unwrap(),
+                )
+                .unwrap();
+                endpoint.reject_access.store(true, Ordering::SeqCst);
+                endpoint.release.send(()).unwrap();
+                let mut server = remote_server(&endpoint.url, None);
+                server.id = "rotation".into();
+                let error = secrets::tests::with_failed_write(key, || {
+                    connect_remote(&server).err().unwrap()
+                });
+                assert!(is_auth_error(&error), "{error}");
+                assert_eq!(
+                    endpoint.count(),
+                    1,
+                    "connect must not perform another recovery exchange"
+                );
+            });
+        }
+    }
+
+    #[test]
     fn oauth_refresh_unavailable_lock_is_a_retriable_failure() {
         secrets::tests::with_isolated_vault(|| {
             let endpoint = RotatingEndpoint::new();
@@ -1725,6 +1773,7 @@ mod tests {
             Duration::from_secs(5),
         )
         .unwrap()
+        .0
     }
 
     fn request_auth(transport: &mut HttpTransport) -> String {
