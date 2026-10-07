@@ -18,6 +18,7 @@ pub(super) struct SettingsPage {
     broker: crate::approval_broker::ApprovalBroker,
     feedback: gtk::Label,
     posture: gtk::Label,
+    safety_level: gtk::DropDown,
     lazy_discovery: gtk::Switch,
     pinned_section: gtk::Box,
     pinned_list: gtk::Box,
@@ -25,12 +26,6 @@ pub(super) struct SettingsPage {
     allow_routine_writes: gtk::Switch,
     allow_agent_control: gtk::Switch,
     live_inspect: gtk::Switch,
-    deny_destructive: gtk::Switch,
-    confirm_destructive: gtk::Switch,
-    human_approval: gtk::Switch,
-    content_defense: gtk::Switch,
-    quarantine_on_drift: gtk::Switch,
-    block_on_injection: gtk::Switch,
     pii_redaction: gtk::Switch,
     launch_at_login: gtk::Switch,
     endpoint_status: gtk::Label,
@@ -232,44 +227,16 @@ impl SettingsPage {
         ));
         let safety = gtk::Box::new(gtk::Orientation::Vertical, 0);
         safety.add_css_class("toolport-settings-group");
-        let (deny_row, deny_destructive) = setting_switch_row(
-            "Block destructive tools",
-            "Hide and reject tools marked destructive across every server. Replaces agent confirmation.",
-        );
-        safety.append(&deny_row);
-        let (confirm_row, confirm_destructive) = setting_switch_row(
-            "Agent confirmation",
-            "Require the AI client to replay a one-time confirmation token. Replaces blocking.",
-        );
-        safety.append(&confirm_row);
-        let (approval_row, human_approval) = setting_switch_row(
-            "Human approval",
-            "Hold gated calls until you approve or deny them in Toolport.",
-        );
-        safety.append(&approval_row);
+        let safety_level = gtk::DropDown::from_strings(&["Off", "Ask", "Strict"]);
+        safety_level.set_tooltip_text(Some("Ask holds destructive calls. Strict also blocks destructive tools, risky drift and high-confidence injection, and asks before untrusted calls. Labeling and integrity recording stay on."));
+        safety.append(&safety_level);
         page.append(&safety);
-
         page.append(&settings_heading(
-            "Content protection",
-            "Local defenses for server definitions, tool results, and sensitive values.",
+            "Advanced",
+            "Personal data, inspection and remembered approvals.",
         ));
         let protection = gtk::Box::new(gtk::Orientation::Vertical, 0);
         protection.add_css_class("toolport-settings-group");
-        let (content_row, content_defense) = setting_switch_row(
-            "Content defense",
-            "Detect and label prompt injection in untrusted tool results.",
-        );
-        protection.append(&content_row);
-        let (block_row, block_on_injection) = setting_switch_row(
-            "Block high-confidence injection",
-            "Fail closed instead of returning a result with a high-confidence hit.",
-        );
-        protection.append(&block_row);
-        let (drift_row, quarantine_on_drift) = setting_switch_row(
-            "Quarantine risky tool drift",
-            "Hide high-risk tools whose definitions changed until reviewed.",
-        );
-        protection.append(&drift_row);
         let (pii_row, pii_redaction) = setting_switch_row(
             "Pseudonymize PII",
             "Replace detected personal values before results reach the model.",
@@ -285,6 +252,21 @@ impl SettingsPage {
             "Capture the last 50 tool calls locally for Activity. Turning this off clears the buffer.",
         );
         protection.append(&inspect_row);
+        protection.append(&settings_heading(
+            "Remembered approvals",
+            "Fingerprint-bound exceptions that can skip the human approval prompt.",
+        ));
+        let allowed_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        allowed_list.add_css_class("toolport-settings-group");
+        allowed_list.append(
+            &gtk::Label::builder()
+                .label("Checking remembered approvals…")
+                .halign(gtk::Align::Start)
+                .css_classes(["toolport-muted"])
+                .build(),
+        );
+        protection.append(&allowed_list);
+
         page.append(&protection);
 
         page.append(&settings_heading(
@@ -510,13 +492,13 @@ impl SettingsPage {
 
         page.append(&settings_heading(
             "Quarantined tools",
-            "High-risk definition changes stay blocked until you explicitly re-approve them.",
+            "Strict blocks retained high-risk definition changes until you explicitly re-approve them.",
         ));
         let quarantine_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         quarantine_list.add_css_class("toolport-settings-group");
         quarantine_list.append(
             &gtk::Label::builder()
-                .label("Checking for blocked tools…")
+                .label("Checking retained quarantines…")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
@@ -526,20 +508,6 @@ impl SettingsPage {
         );
         page.append(&quarantine_list);
 
-        page.append(&settings_heading(
-            "Remembered approvals",
-            "Fingerprint-bound exceptions that can skip the human approval prompt.",
-        ));
-        let allowed_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        allowed_list.add_css_class("toolport-settings-group");
-        allowed_list.append(
-            &gtk::Label::builder()
-                .label("Checking remembered approvals…")
-                .halign(gtk::Align::Start)
-                .css_classes(["toolport-muted"])
-                .build(),
-        );
-        page.append(&allowed_list);
 
         scroller.set_child(Some(&page));
         root.append(&scroller);
@@ -549,6 +517,7 @@ impl SettingsPage {
             broker,
             feedback,
             posture,
+            safety_level,
             lazy_discovery,
             pinned_section,
             pinned_list,
@@ -556,12 +525,6 @@ impl SettingsPage {
             allow_routine_writes,
             allow_agent_control,
             live_inspect,
-            deny_destructive,
-            confirm_destructive,
-            human_approval,
-            content_defense,
-            quarantine_on_drift,
-            block_on_injection,
             pii_redaction,
             launch_at_login,
             endpoint_status,
@@ -1266,6 +1229,34 @@ impl SettingsPage {
     }
 
     fn connect_switches(&self) {
+        let page = self.clone();
+        self.safety_level.connect_selected_notify(move |control| {
+            if page.updating.get() {
+                return;
+            }
+            let level = match control.selected() {
+                0 => crate::registry::SafetyLevel::Off,
+                1 => crate::registry::SafetyLevel::Ask,
+                _ => crate::registry::SafetyLevel::Strict,
+            };
+            page.begin_mutation();
+            control.set_sensitive(false);
+            let page = page.clone();
+            gtk::glib::spawn_future_local(async move {
+                let result = gtk::gio::spawn_blocking(move || {
+                    crate::registry_controller::set_safety_level(level)
+                })
+                .await;
+                page.begin_mutation();
+                match result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => page.show_error(&error),
+                    Err(_) => page.show_error("the safety update stopped unexpectedly"),
+                }
+                page.safety_level.set_sensitive(true);
+                page.refresh();
+            });
+        });
         for (switch, setting, label) in [
             (
                 self.lazy_discovery.clone(),
@@ -1293,36 +1284,6 @@ impl SettingsPage {
                 "live inspection",
             ),
             (
-                self.deny_destructive.clone(),
-                crate::registry_controller::EssentialSetting::DenyDestructive,
-                "destructive-tool blocking",
-            ),
-            (
-                self.confirm_destructive.clone(),
-                crate::registry_controller::EssentialSetting::ConfirmDestructive,
-                "agent confirmation",
-            ),
-            (
-                self.human_approval.clone(),
-                crate::registry_controller::EssentialSetting::HumanApproval,
-                "human approval",
-            ),
-            (
-                self.content_defense.clone(),
-                crate::registry_controller::EssentialSetting::ContentDefense,
-                "content defense",
-            ),
-            (
-                self.quarantine_on_drift.clone(),
-                crate::registry_controller::EssentialSetting::QuarantineOnDrift,
-                "drift quarantine",
-            ),
-            (
-                self.block_on_injection.clone(),
-                crate::registry_controller::EssentialSetting::BlockOnInjection,
-                "injection blocking",
-            ),
-            (
                 self.pii_redaction.clone(),
                 crate::registry_controller::EssentialSetting::PiiRedaction,
                 "PII pseudonymization",
@@ -1339,8 +1300,6 @@ impl SettingsPage {
                 // one is in flight makes this completion skip its render rather
                 // than putting the other switch back from a stale snapshot.
                 let generation = page.mutation_generation.get();
-                let confirm_was_on = page.confirm_destructive.is_active();
-                let deny_was_on = page.deny_destructive.is_active();
                 let switch = switch.clone();
                 let page = page.clone();
                 gtk::glib::spawn_future_local(async move {
@@ -1353,23 +1312,6 @@ impl SettingsPage {
                     page.begin_mutation();
                     match result {
                         Ok(Ok(settings)) => {
-                            // Blocking and confirmation are mutually exclusive in
-                            // the registry: blocking hides the tool, so there is
-                            // nothing left for the agent to confirm. Silently
-                            // flipping the other switch read as a bug, so say it.
-                            let displaced = match setting {
-                                crate::registry_controller::EssentialSetting::DenyDestructive
-                                    if enabled && !settings.confirm_destructive && confirm_was_on =>
-                                {
-                                    Some("Agent confirmation")
-                                }
-                                crate::registry_controller::EssentialSetting::ConfirmDestructive
-                                    if enabled && !settings.deny_destructive && deny_was_on =>
-                                {
-                                    Some("Destructive-tool blocking")
-                                }
-                                _ => None,
-                            };
                             if page.mutation_generation.get() == generation {
                                 page.render_settings(settings);
                             } else {
@@ -1377,12 +1319,7 @@ impl SettingsPage {
                             }
                             let outcome =
                                 format!("{} {label}", if enabled { "Enabled" } else { "Disabled" });
-                            page.feedback.set_label(&match displaced {
-                                Some(other) => format!(
-                                    "{outcome}. {other} turned off, the two cannot both be on."
-                                ),
-                                None => outcome,
-                            });
+                            page.feedback.set_label(&outcome);
                             page.feedback.remove_css_class("error");
                             page.feedback.add_css_class("success");
                         }
@@ -1575,21 +1512,12 @@ impl SettingsPage {
         self.allow_agent_control.set_sensitive(true);
         set_switch(&self.live_inspect, settings.live_inspect);
         self.live_inspect.set_sensitive(true);
-        set_switch(&self.deny_destructive, settings.deny_destructive);
-        set_team_managed(&self.deny_destructive, settings.deny_destructive_forced);
-        set_switch(&self.confirm_destructive, settings.confirm_destructive);
-        set_team_managed(&self.confirm_destructive, false);
-        set_switch(&self.human_approval, settings.human_approval);
-        set_team_managed(&self.human_approval, settings.human_approval_forced);
-        set_switch(&self.content_defense, settings.content_defense);
-        set_team_managed(&self.content_defense, settings.content_defense_forced);
-        set_switch(&self.quarantine_on_drift, settings.quarantine_on_drift);
-        set_team_managed(
-            &self.quarantine_on_drift,
-            settings.quarantine_on_drift_forced,
-        );
-        set_switch(&self.block_on_injection, settings.block_on_injection);
-        set_team_managed(&self.block_on_injection, settings.block_on_injection_forced);
+        self.safety_level.set_selected(match settings.safety_level {
+            crate::registry::SafetyLevel::Off => 0,
+            crate::registry::SafetyLevel::Ask => 1,
+            crate::registry::SafetyLevel::Strict => 2,
+        });
+        self.safety_level.set_sensitive(true);
         set_switch(&self.pii_redaction, settings.pii_redaction);
         set_team_managed(&self.pii_redaction, settings.pii_redaction_forced);
         self.updating.set(false);

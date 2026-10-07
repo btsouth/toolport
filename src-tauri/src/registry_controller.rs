@@ -183,6 +183,7 @@ pub struct PinnedPrerequisite {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EssentialSettings {
+    pub safety_level: registry::SafetyLevel,
     pub lazy_discovery: bool,
     pub code_mode: bool,
     pub allow_routine_writes: bool,
@@ -224,6 +225,7 @@ pub struct AddedHttpClient {
 impl EssentialSettings {
     fn from_registry(registry: &Registry) -> Self {
         Self {
+            safety_level: registry.safety_level_selected(),
             lazy_discovery: registry.lazy_discovery,
             code_mode: registry.code_mode,
             allow_routine_writes: registry.allow_routine_writes,
@@ -3138,4 +3140,13 @@ DOCS_TOKEN = "tok"
         assert!(read_registry_exact().unwrap().servers.is_empty());
         assert!(!fixture.move_record("claude-code").exists());
     }
+}
+
+/// Update the member's safety choice without changing releasable team policy.
+pub fn set_safety_level(level: registry::SafetyLevel) -> Result<Registry, String> {
+    let (registry, _) = registry::update(|registry| {
+        registry.set_safety_level(level);
+        Ok(())
+    })?;
+    Ok(registry)
 }

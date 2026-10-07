@@ -993,3 +993,7 @@ export function disableAutostart(): Promise<void> {
 export function teamUseManaged(serverId: string): Promise<Registry> {
   return invoke<Registry>("team_use_managed", { serverId });
 }
+
+export function setSafetyLevel(level: "off" | "ask" | "strict"): Promise<Registry> {
+  return invoke<Registry>("set_safety_level", { level });
+}

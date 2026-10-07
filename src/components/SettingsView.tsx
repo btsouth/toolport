@@ -17,8 +17,6 @@ import {
   Pin,
   Power,
   RefreshCw,
-  ShieldAlert,
-  ShieldCheck,
   ShieldX,
   Sun,
   Trash2,
@@ -48,16 +46,12 @@ import {
   removeHttpClient,
   setAllowAgentControl,
   setAllowRoutineWrites,
-  setConfirmDestructive,
-  setDenyDestructive,
   setCodeMode,
-  setHumanApproval,
+  setSafetyLevel,
   setLazyDiscovery,
   setFolderProfiles,
   setLiveInspect,
-  setBlockOnInjection,
   setPiiRedaction,
-  setQuarantineOnDrift,
   setToolPinned,
   startHttpBridge,
   stopHttpBridge,
@@ -565,67 +559,6 @@ const REGISTRY_FIELD_BY_SETTING = {
   "live-inspect": "liveInspect",
 } as const satisfies Record<RegistrySettingKey, keyof Registry>;
 
-/** A one-line security posture readout at the top of the Security section, so the user can
- * tell at a glance whether they're protected instead of mentally AND-ing every toggle. */
-function PostureSummary({
-  denyDestructive,
-  confirmDestructive,
-  humanApproval,
-  quarantineOnDrift,
-  blockOnInjection,
-}: {
-  denyDestructive: boolean;
-  confirmDestructive: boolean;
-  humanApproval: boolean;
-  quarantineOnDrift: boolean;
-  blockOnInjection: boolean;
-}) {
-  const active = [
-    humanApproval && "human approval on",
-    denyDestructive && "destructive tools denied",
-    confirmDestructive && "destructive calls ask first",
-    quarantineOnDrift && "changed tools paused",
-    blockOnInjection && "injection-like output blocked",
-  ].filter(Boolean) as string[];
-  // A hard gate (block or human-approval) = guarded; softer measures alone = partial.
-  const gated = humanApproval || denyDestructive || blockOnInjection;
-  const state = gated ? "guarded" : active.length > 0 ? "partial" : "open";
-  const meta = {
-    guarded: {
-      Icon: ShieldCheck,
-      ring: "border-success/30 bg-success/5",
-      tint: "text-success",
-      label: "Guardrails active",
-    },
-    partial: {
-      Icon: ShieldAlert,
-      ring: "border-warning/35 bg-warning/5",
-      tint: "text-warning",
-      label: "Some guardrails active",
-    },
-    open: {
-      Icon: ShieldAlert,
-      ring: "border-warning/35 bg-warning/5",
-      tint: "text-warning",
-      label: "Approval gates are off",
-    },
-  }[state];
-  const { Icon } = meta;
-  return (
-    <div className={`flex items-start gap-3 rounded-lg border p-3 ${meta.ring}`}>
-      <Icon className={`mt-0.5 size-4 shrink-0 ${meta.tint}`} />
-      <p className="text-sm">
-        <span className={`font-medium ${meta.tint}`}>{meta.label}.</span>{" "}
-        <span className="text-muted-foreground">
-          {state === "open"
-            ? "Tool calls run without a Toolport approval or blocking gate."
-            : `Active: ${active.join(", ")}.`}
-        </span>
-      </p>
-    </div>
-  );
-}
-
 /** Tool-granular scope for one profile (SOU-189): per enabled server, expand to pick exactly
  * which tools the profile exposes. All-checked = the whole server (no narrowing); unchecking
  * writes an allow-list that tools/list, search, and the call guard all honor. Tools load
@@ -810,14 +743,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   // during a partial load, match the registry serde default.
   const codeMode = registry?.codeMode ?? true;
   const allowRoutineWrites = registry?.allowRoutineWrites ?? false;
-  const denyDestructive = registry?.denyDestructive ?? false;
-  const confirmDestructive = registry?.confirmDestructive ?? false;
-  const humanApproval = registry?.humanApproval ?? false;
   const allowAgentControl = registry?.allowAgentControl ?? false;
-  const quarantineOnDrift = registry?.quarantineOnDrift ?? false;
-  const blockOnInjection = registry?.blockOnInjection ?? false;
   const piiRedaction = registry?.piiRedaction ?? false;
   const liveInspect = registry?.liveInspect ?? false;
+  const [safetyBusy, setSafetyBusy] = useState(false);
   const [busySettings, setBusySettings] = useState<ReadonlySet<SettingKey>>(
     () => new Set(),
   );
@@ -1303,84 +1232,55 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
           Security
         </h2>
-        <PostureSummary
-          denyDestructive={denyDestructive}
-          confirmDestructive={confirmDestructive}
-          humanApproval={humanApproval}
-          quarantineOnDrift={quarantineOnDrift}
-          blockOnInjection={blockOnInjection}
-        />
-        {toggle(
-          ShieldAlert,
-          denyDestructive,
-          "text-warning",
-          "Block destructive tools",
-          "Hide any tool the server marks as able to delete or change data, from every client",
-          apply("deny-destructive", setDenyDestructive),
-          "deny-destructive",
-        )}
-        {toggle(
-          ShieldCheck,
-          confirmDestructive,
-          "text-info",
-          "Confirm destructive tools",
-          "Hold each destructive call for the agent to confirm before it runs",
-          apply("confirm-destructive", setConfirmDestructive),
-          "confirm-destructive",
-        )}
-        {toggle(
-          UserCheck,
-          humanApproval,
-          "text-info",
-          "Require human approval",
-          "Hold destructive or untrusted-server calls until you approve them in the app",
-          apply("human-approval", setHumanApproval),
-          "human-approval",
-        )}
-        {toggle(
-          ShieldX,
-          quarantineOnDrift,
-          "text-destructive",
-          "Quarantine changed high-risk tools",
-          "Block a destructive or poisoned tool that changes from its approved version, until you re-approve it",
-          apply("quarantine-on-drift", setQuarantineOnDrift),
-          "quarantine-on-drift",
-        )}
-        {toggle(
-          ShieldAlert,
-          blockOnInjection,
-          "text-destructive",
-          "Block high-confidence injection",
-          "Fail a tool call when content defense finds a high-confidence prompt-injection hit, instead of only labeling the text. Off by default; medium-confidence hits still label only",
-          apply("block-on-injection", setBlockOnInjection),
-          "block-on-injection",
-        )}
-        {toggle(
-          EyeOff,
-          piiRedaction,
-          "text-info",
-          "Hide personal data from the model",
-          "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. A value only goes back to the server it came from, so a call that would send one server's data to another is refused. Real data stays on this machine and is forgotten when the conversation ends. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
-          apply("pii-redaction", setPiiRedaction),
-          "pii-redaction",
-        )}
-        {toggle(
-          Bot,
-          allowAgentControl,
-          "text-success",
-          "Allow agent control",
-          "Let an agent turn servers on/off; your destructive-tool block always stays yours",
-          apply("allow-agent-control", setAllowAgentControl),
-          "allow-agent-control",
-        )}
-        {toggle(
-          Activity,
-          liveInspect,
-          "text-info",
-          "Live request/response inspection",
-          "Off by default. While on, Toolport captures each tool call's arguments and results to a small local, ephemeral buffer (the last 50 calls) so you can inspect them in Activity. This is separate from the audit log, never leaves your machine, and is cleared when you turn it off or restart the gateway.",
-          applyLiveInspect,
-          "live-inspect",
+        <label className="flex items-center gap-3 text-sm">
+          Safety
+          <select
+            aria-label="Safety"
+            disabled={safetyBusy}
+            value={
+              registry?.safetyLevel ??
+              (registry?.denyDestructive ||
+              registry?.quarantineOnDrift ||
+              registry?.blockOnInjection
+                ? "strict"
+                : registry?.humanApproval || registry?.confirmDestructive
+                  ? "ask"
+                  : "off")
+            }
+            onChange={async (event) => {
+              setSafetyBusy(true);
+              try {
+                const updated = await setSafetyLevel(
+                  event.target.value as "off" | "ask" | "strict",
+                );
+                const reconciled = latestRegistry.current
+                  ? { ...latestRegistry.current, safetyLevel: updated.safetyLevel }
+                  : updated;
+                latestRegistry.current = reconciled;
+                onRegistryChange(reconciled);
+              } catch (error) {
+                toastError(`Couldn't update safety: ${error}`);
+              } finally {
+                setSafetyBusy(false);
+              }
+            }}
+          >
+            <option value="off">Off</option>
+            <option value="ask">Ask</option>
+            <option value="strict">Strict</option>
+          </select>
+        </label>
+        <p className="text-xs text-muted-foreground">
+          Off runs without approval or blocking. Ask holds destructive calls for human
+          approval. Strict hides destructive tools, quarantines risky drift, blocks
+          high-confidence injection and asks before untrusted calls. Labeling and
+          integrity recording stay on.
+        </p>
+        {(registry?.teamForcedHumanApproval ||
+          registry?.teamForcedDenyDestructive ||
+          registry?.teamForcedQuarantineOnDrift ||
+          registry?.teamForcedBlockOnInjection) && (
+          <p className="text-xs">Team policy raises the effective safety level.</p>
         )}
         {quarantined.length === 0 && quarantineError && (
           <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
@@ -1394,7 +1294,9 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               <ShieldX className="size-4 shrink-0 text-destructive" />
               <span className="text-sm font-medium">Quarantined tools</span>
               <span className="text-xs text-muted-foreground">
-                {quarantineError ? "status may be stale" : "blocked until you re-approve"}
+                {quarantineError
+                  ? "status may be stale"
+                  : "blocked in Strict until you re-approve"}
               </span>
             </div>
             <ul className="flex flex-col gap-1.5">
@@ -1422,42 +1324,72 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             </ul>
           </div>
         )}
-        {allowedTools.length === 0 && allowedError && (
-          <div className="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-            <UserCheck className="size-4 shrink-0 text-info" />
-            <span>Couldn&apos;t read the allowed-tools list. Retrying every 10s.</span>
-          </div>
-        )}
-        {allowedTools.length > 0 && (
-          <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/20 px-3 py-2.5">
-            <div className="flex items-center gap-2">
+        <details>
+          <summary>Advanced</summary>
+          {toggle(
+            EyeOff,
+            piiRedaction,
+            "text-info",
+            "Hide personal data from the model",
+            "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. A value only goes back to the server it came from, so a call that would send one server's data to another is refused. Real data stays on this machine and is forgotten when the conversation ends. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
+            apply("pii-redaction", setPiiRedaction),
+            "pii-redaction",
+          )}
+          {toggle(
+            Bot,
+            allowAgentControl,
+            "text-success",
+            "Allow agent control",
+            "Let an agent turn servers on/off; your destructive-tool block always stays yours",
+            apply("allow-agent-control", setAllowAgentControl),
+            "allow-agent-control",
+          )}
+          {toggle(
+            Activity,
+            liveInspect,
+            "text-info",
+            "Live request/response inspection",
+            "Off by default. While on, Toolport captures each tool call's arguments and results to a small local, ephemeral buffer (the last 50 calls) so you can inspect them in Activity. This is separate from the audit log, never leaves your machine, and is cleared when you turn it off or restart the gateway.",
+            applyLiveInspect,
+            "live-inspect",
+          )}
+          {allowedTools.length === 0 && allowedError && (
+            <div className="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
               <UserCheck className="size-4 shrink-0 text-info" />
-              <span className="text-sm font-medium">Allowed tools</span>
-              <span className="text-xs text-muted-foreground">
-                {allowedError ? "list may be stale" : "skip human approval"}
-              </span>
+              <span>Couldn&apos;t read the allowed-tools list. Retrying every 10s.</span>
             </div>
-            <ul className="flex flex-col gap-1.5">
-              {allowedTools.map((t) => (
-                <li key={t.key} className="flex items-center gap-2 text-xs">
-                  <span className="min-w-0 truncate font-mono">
-                    {t.server}/{t.tool}
-                  </span>
-                  <span className="shrink-0 text-muted-foreground">
-                    {t.persistent ? "always" : "this session"}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => void revokeAllowed(t.key)}
-                    className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
-                  >
-                    Revoke
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
+          )}
+          {allowedTools.length > 0 && (
+            <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/20 px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <UserCheck className="size-4 shrink-0 text-info" />
+                <span className="text-sm font-medium">Allowed tools</span>
+                <span className="text-xs text-muted-foreground">
+                  {allowedError ? "list may be stale" : "skip human approval"}
+                </span>
+              </div>
+              <ul className="flex flex-col gap-1.5">
+                {allowedTools.map((t) => (
+                  <li key={t.key} className="flex items-center gap-2 text-xs">
+                    <span className="min-w-0 truncate font-mono">
+                      {t.server}/{t.tool}
+                    </span>
+                    <span className="shrink-0 text-muted-foreground">
+                      {t.persistent ? "always" : "this session"}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void revokeAllowed(t.key)}
+                      className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
+                    >
+                      Revoke
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </details>
       </section>
       <section className="flex flex-col gap-2">
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
