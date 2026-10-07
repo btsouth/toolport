@@ -368,6 +368,7 @@ describe("server list stability and automatic prompts", () => {
   it("keeps adjacent toggle targets in place when enabled state changes", async () => {
     const servers = ["Zulu", "Alpha", "Beta"].map((name) => ({
       id: name,
+      enabled: false,
       name,
       transport: "stdio",
       command: "fixture",
@@ -377,7 +378,7 @@ describe("server list stability and automatic prompts", () => {
       source: "manual",
     }));
     const registry = {
-      version: 1,
+      version: 3,
       servers,
       profiles: [{ id: "p", name: "Default", enabledServerIds: [] as string[] }],
       activeProfileId: "p",
@@ -387,7 +388,9 @@ describe("server list stability and automatic prompts", () => {
     setServerEnabled.mockImplementation((_profile, id, enabled) =>
       Promise.resolve({
         ...registry,
-        profiles: [{ ...registry.profiles[0], enabledServerIds: enabled ? [id] : [] }],
+        servers: servers.map((server) =>
+          server.id === id ? { ...server, enabled } : server,
+        ),
       }),
     );
     render(<App />);
@@ -397,6 +400,9 @@ describe("server list stability and automatic prompts", () => {
     const before = order();
     await userEvent.click(screen.getByRole("switch", { name: "Toggle Alpha" }));
     await waitFor(() => expect(setServerEnabled).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "Toggle Alpha" })).toBeChecked(),
+    );
     expect(order()).toEqual(before);
     expect(before).toEqual(["Toggle Alpha", "Toggle Beta", "Toggle Zulu"]);
   });
