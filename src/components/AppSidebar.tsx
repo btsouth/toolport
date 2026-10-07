@@ -232,7 +232,6 @@ function VersionFooter({
 
   const progressLabel = updateProgressLabel(installProgress);
 
-  if (!version) return null;
   return (
     <div className="sidebar-footer mt-auto flex shrink-0 flex-wrap items-center justify-between gap-2 border-t px-4 py-3 text-xs">
       <div className="sidebar-version min-w-0">
@@ -251,7 +250,7 @@ function VersionFooter({
               {installing ? progressLabel : `Update to v${update.version}`}
             </span>
           </button>
-        ) : (
+        ) : version ? (
           <button
             onClick={manualCheck}
             disabled={checking}
@@ -260,7 +259,7 @@ function VersionFooter({
           >
             {checking ? "Checking…" : `Toolport v${version}`}
           </button>
-        )}
+        ) : null}
       </div>
       <UpdateNotes
         open={showNotes}
@@ -274,6 +273,7 @@ function VersionFooter({
       <Popover.Root>
         <Popover.Trigger asChild>
           <button
+            aria-label="Help"
             className={`flex items-center gap-1 rounded ${FOCUS_RING}`}
             title="Help and keyboard shortcuts (?)"
           >
