@@ -377,6 +377,26 @@ pub(super) struct ClientSnapshot {
     pub(super) profiles: Vec<ProfileView>,
 }
 
+fn client_access_label(registry: &Registry, scope: Option<&str>) -> String {
+    let reference = scope.or(registry.default_access_profile_id.as_deref());
+    match reference {
+        None | Some(crate::registry::ALL_ENABLED_ACCESS) => "All enabled servers".into(),
+        Some(reference) => {
+            let name = registry
+                .profiles
+                .iter()
+                .find(|p| p.id == reference || p.name == reference)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| format!("{reference} (unavailable)"));
+            if scope.is_none() {
+                format!("Default: {name}")
+            } else {
+                name
+            }
+        }
+    }
+}
+
 pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
     let path = registry::resolved_path().ok_or_else(|| "registry path unavailable".to_string())?;
     let registry = match std::fs::read_to_string(&path) {
@@ -402,33 +422,7 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
             .get(&client.id)
             .filter(|scope| !scope.is_empty())
             .cloned();
-        client.scope_name = client.scope_id.as_ref().and_then(|scope| {
-            if scope == crate::registry::ALL_ENABLED_ACCESS {
-                return Some("All enabled servers".into());
-            }
-            registry
-                .profiles
-                .iter()
-                .find(|profile| profile.id == *scope || profile.name == *scope)
-                .map(|profile| profile.name.clone())
-        });
-        if client.scope_id.is_none() {
-            client.scope_name = Some(
-                registry
-                    .default_access_profile_id
-                    .as_ref()
-                    .map(|id| {
-                        registry
-                            .profiles
-                            .iter()
-                            .find(|p| &p.id == id)
-                            .map(|p| format!("Default: {}", p.name))
-                            .unwrap_or_else(|| format!("Default: {id} (unavailable)"))
-                    })
-                    .unwrap_or_else(|| "All enabled servers".into()),
-            );
-        }
-
+        client.scope_name = Some(client_access_label(&registry, client.scope_id.as_deref()));
         client.discovery_mode = registry.client_discovery.get(&client.id).cloned();
     }
     clients.sort_by(|left, right| {
@@ -810,6 +804,23 @@ mod tests {
     }
 
     #[test]
+    fn client_access_labels_show_migrated_default_all_and_missing_sets() {
+        let mut registry = Registry::default();
+        assert_eq!(client_access_label(&registry, None), "All enabled servers");
+        registry.default_access_profile_id = Some("default".into());
+        assert_eq!(client_access_label(&registry, None), "Default: Default");
+        assert_eq!(
+            client_access_label(&registry, Some(crate::registry::ALL_ENABLED_ACCESS)),
+            "All enabled servers"
+        );
+        assert_eq!(client_access_label(&registry, Some("default")), "Default");
+        assert_eq!(
+            client_access_label(&registry, Some("missing")),
+            "missing (unavailable)"
+        );
+    }
+
+    #[test]
     fn maps_only_non_secret_server_fields() {
         let mut registry = Registry::default();
         let mut local = server("local", "Files", "stdio");
@@ -821,9 +832,7 @@ mod tests {
         });
         registry.servers.push(local);
         registry.servers.push(server("remote", "GitHub", "http"));
-        registry.profiles[0]
-            .enabled_server_ids
-            .push("remote".into());
+        registry.set_global_server_enabled("remote", true).unwrap();
 
         let fingerprints = registry
             .servers

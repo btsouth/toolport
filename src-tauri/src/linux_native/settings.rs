@@ -761,6 +761,17 @@ impl SettingsPage {
             });
         });
         self.access_list.append(&default);
+        if registry.default_access_legacy_policy && registry.default_access_profile_id.is_none() {
+            let clear = gtk::Button::with_label(
+                "Use All enabled servers without the retained tool restrictions",
+            );
+            let page = self.clone();
+            clear.connect_clicked(move |_| {
+                page.mutate_access(|| crate::registry_controller::set_default_access(None))
+            });
+            self.access_list.append(&clear);
+        }
+
         let creator = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let name = gtk::Entry::builder()
             .placeholder_text("Access set name")

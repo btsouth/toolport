@@ -1073,6 +1073,27 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   ))}
                 </SelectContent>
               </Select>
+              {registry?.defaultAccessLegacyPolicy &&
+                !registry.defaultAccessProfileId && (
+                  <div className="flex flex-col gap-2 text-xs text-muted-foreground">
+                    <p>
+                      The upgrade retained the default access set&apos;s tool restrictions
+                      and instructions.
+                    </p>
+                    <button
+                      className="w-fit rounded border px-2 py-1"
+                      onClick={async () => {
+                        try {
+                          onRegistryChange(await setDefaultAccess(null));
+                        } catch (e) {
+                          toastError(`${e}`);
+                        }
+                      }}
+                    >
+                      Use All enabled servers
+                    </button>
+                  </div>
+                )}
               <AccessSetCreator onRegistryChange={onRegistryChange} />
               <div className="flex flex-col divide-y rounded-lg border">
                 {profiles.map((p) => {

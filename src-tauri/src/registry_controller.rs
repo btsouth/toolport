@@ -1891,6 +1891,20 @@ pub fn apply_server_enabled(
         }
     }
     if registry.version >= 3 {
+        // Teams restores consent by access-set membership during definition sync.
+        // Record a reviewed enable in its existing local context without changing
+        // any other access set; a global off keeps that consent but stays off.
+        if enabled
+            && registry.servers.iter().any(|s| {
+                s.id == server_id
+                    && s.source
+                        .as_deref()
+                        .is_some_and(|source| source.starts_with("team:"))
+            })
+        {
+            let context = registry.active_profile_id();
+            registry.set_access_server(&context, server_id, true)?;
+        }
         registry.set_global_server_enabled(server_id, enabled)
     } else {
         registry.set_server_enabled(profile_id, server_id, enabled)
@@ -3048,7 +3062,7 @@ mod tests {
         moved.sort();
         assert_eq!(moved, ["memory", "seq-thinking"]);
         assert_eq!(
-            enabled_names(&outcome.result.registry, "default"),
+            enabled_names(&outcome.result.registry, ""),
             ["memory", "seq-thinking"],
             "every moved server must be served after the move"
         );
