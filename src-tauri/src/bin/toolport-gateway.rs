@@ -1352,7 +1352,7 @@ fn validate_search_query(query: &str) -> Result<(), String> {
 fn status_tool_def() -> Value {
     json!({
         "name": "toolport_status",
-        "description": "Report enabled MCP servers, their tool counts, and discovery mode. Unscoped callers may also see an estimate of the MCP tool definitions kept out of context.",
+        "description": "Report enabled MCP servers, their tool counts, and the discovery mode.",
         "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
     })
 }
@@ -1363,39 +1363,26 @@ fn status_tool_def() -> Value {
 /// the model discovers the real tool on demand and dispatches through
 /// `toolport_call_tool`.
 ///
-/// The description leads with a directive plus GENERIC capability examples (email,
-/// payments, deployments, ...) so the model treats Toolport as the front door for any
-/// external action rather than grabbing a loosely-matched competitor tool or giving
-/// up. We intentionally do NOT list the user's specific connected servers here: that
-/// would scale the description with server count, go stale, and leak the user's stack
-/// into a (possibly remote) model's context on every request. The generic examples
-/// carry the routing without any of that; `toolport_status` names the actual servers
-/// on demand if the model needs them.
+/// The search description stays capability-agnostic and short: it points at the
+/// search-first path and names the schemaOmitted recovery, but deliberately does NOT
+/// list the user's connected servers (that would scale with server count, go stale,
+/// and leak the user's stack into a possibly remote model's context on every request)
+/// and does not claim every result is already callable. `toolport_status` names the
+/// actual servers on demand if the model needs them.
 fn search_tool_def() -> Value {
     json!({
         "name": "toolport_search_tools",
-        "description": "Your single gateway to every connected MCP server and ALL their tools. \
-            Try this FIRST for ANY external action or data the user asks for - sending or listing \
-            email, deployments, payments, databases, repos, issues, files, web search, etc. Do NOT \
-            reach for an unrelated tool or tell the user a capability is unavailable until you have \
-            searched here; if the service is connected, its tool is here. Returns matching tools with \
-            their exact name, description, and input schema; call one with toolport_call_tool. Once a \
-            result matches what you need, call it - do NOT keep searching for a better one (the first \
-            result includes its full schema and is ready to call). Pass `server` (a name/prefix like \
-            \"resend\") to scope to one server, and pass an EMPTY `query` with `server` to list ALL of \
-            that server's tools. If the result says more tools matched than were shown, narrow with \
-            `server` or raise `limit` before concluding a capability is missing - many servers expose \
-            a generic API bridge (a single write/create tool), so search by capability, not just an \
-            exact operation name. toolport_status lists every server prefix and its tool count. \
-            Low-confidence searches automatically include a bounded set of fallback candidates; if \
-            nothing matches directly, the response explains how to enumerate a known server. Large \
-            input schemas may be omitted from broad results (flagged schemaOmitted) to keep responses \
-            small - search a tool's exact name to get its full schema.",
+        "description": "Your gateway to every connected MCP server's tools. Use it first for any \
+            external action or data the user asks for. Each match carries its exact name, its \
+            description, and its input schema when it fits; call one with toolport_call_tool. If a \
+            schema is omitted (schemaOmitted), search that tool's exact name to get it. Pass `server` \
+            to scope to one server, or an empty `query` with `server` to list all of its tools. Raise \
+            `limit` when more tools matched than were shown.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": { "type": "string", "maxLength": MAX_SEARCH_QUERY_CHARS, "description": "Keywords describing the capability you need (e.g. \"list emails\", \"create payment\", \"recent deployments\"). Empty lists tools (use with `server`). Maximum 512 characters / 64 whitespace-separated tokens." },
-                "server": { "type": "string", "description": "Optional: limit to this server, by name/prefix (e.g. \"resend\")." },
+                "query": { "type": "string", "maxLength": MAX_SEARCH_QUERY_CHARS, "description": "Keywords for the capability you need, e.g. \"list emails\". Empty lists tools (use with `server`)." },
+                "server": { "type": "string", "description": "Optional: limit to this server by name/prefix, e.g. \"resend\"." },
                 "limit": { "type": "integer", "description": "Max results (default 25, up to 200).", "default": 25 }
             },
             "required": ["query"],
@@ -1407,12 +1394,9 @@ fn search_tool_def() -> Value {
 fn call_tool_def() -> Value {
     json!({
         "name": "toolport_call_tool",
-        "description": "Invoke a tool discovered via toolport_search_tools. Pass the tool's exact \
-            `name` (as returned by the search) and put ALL of that tool's parameters INSIDE the \
-            `arguments` object (matching its input schema) - not at the top level next to `name`. \
-            Never invent or guess an identifier (teamId, accountId, projectId, etc.): if a required \
-            value isn't known, first call a list or get tool on the SAME server to obtain it, then \
-            call this with the real value.",
+        "description": "Run a tool found with toolport_search_tools. Pass its exact `name` and put \
+            all of its parameters inside `arguments`, matching its input schema. If a required value \
+            is unknown, get it first with a list or get tool on the same server.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1435,7 +1419,7 @@ fn call_tool_def() -> Value {
 }
 
 /// What `server/discover` puts in its built-in instruction text.
-const DISCOVER_INSTRUCTIONS_PREAMBLE: &str = "Toolport aggregates every configured MCP server behind one endpoint. In lazy discovery mode the catalog is reached through toolport_search_tools / toolport_call_tool rather than a full tools/list.";
+const DISCOVER_INSTRUCTIONS_PREAMBLE: &str = "Toolport aggregates every configured MCP server behind one endpoint. In lazy discovery mode the catalog is reached with toolport_search_tools and toolport_call_tool.";
 
 /// The `instructions` for an `initialize` or `server/discover` result, or `None` to omit
 /// the field (#971). The requesting connection's profile (see
@@ -1461,30 +1445,21 @@ fn server_instructions(
 fn run_script_tool_def() -> Value {
     json!({
         "name": "toolport_run_script",
-        "description": "Run ONE JavaScript orchestration script server-side instead of making \
-            many separate tool calls. Prefer the typed surface when you know the server: \
-            `servers.stripe.create_refund({...})` (sync) or `servers.stripe.createRefund.async({...})` \
-            (Promise; fan out with Promise.all / await). Also: `toolport.call`, `callAsync`, \
-            `callAll`, `fetchResult({cursor, offset, projection})`, `listTools()`, `listServers()`. \
-            Intermediate tool results are full-sized inside the script (not context-budget shaped); \
-            only your returned aggregate is shaped for the model. Loop, branch, project, then \
-            `return` one value. Top-level await works. Gates match toolport_call_tool (scope, human \
-            approval). For reusable orchestration, pass mutually exclusive `input` + `inputSchema`; \
-            Toolport deeply freezes `input` and validates it before any call. If the script fails partway, \
-            `structuredContent.toolportScript.progress` lists \
-            the calls that already ran, in order, as {index, name, ok} - those side effects are \
-            committed. Resume by INDEX (entries 0..n ran, n onward did not); never skip by tool name, \
-            since the same tool appears once per call. Call `toolport.checkpoint(value)` to record \
-            your own resume state (e.g. the last id you processed) as you go; on failure it's \
-            returned as `structuredContent.toolportScript.checkpoint`, letting a retry pick up from \
-            where it actually left off instead of guessing from the index alone. Best when you \
-            already know the steps; explore with toolport_search_tools first.",
+        "description": "Run one JavaScript script server-side instead of many separate tool calls. \
+            Prefer it when you already know the steps; explore with toolport_search_tools first. \
+            Call tools as servers.<server>.<tool>(args), or toolport.call / callAsync / callAll / \
+            fetchResult. Loop, branch, project, then `return` one value; intermediate results are \
+            full-sized in the script and only the returned value is shaped for context. On failure, \
+            structuredContent.toolportScript.progress lists the calls that already ran in order; \
+            resume by index, and use toolport.checkpoint(value) to record your own resume state. For \
+            a reusable orchestration, pass immutable `input` plus `inputSchema`. Gates match \
+            toolport_call_tool.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "script": {
                     "type": "string",
-                    "description": "JavaScript body. Prefer servers.<server>.<tool>(args) or toolport.call / callAsync / callAll / fetchResult; `return` the final value (top-level await ok). Intermediate results are full-sized in-script. Global `data` is the optional payload below."
+                    "description": "JavaScript body. Prefer servers.<server>.<tool>(args) or toolport.call / callAsync / callAll / fetchResult; `return` the final value."
                 },
                 "data": {
                     "type": "object",
@@ -1494,15 +1469,15 @@ fn run_script_tool_def() -> Value {
                 "input": {
                     "type": "object",
                     "additionalProperties": true,
-                    "description": "Immutable input exposed only as deeply immutable global `input`. Mutually exclusive with `data`; requires `inputSchema`."
+                    "description": "Deeply immutable input exposed as the global `input`. Mutually exclusive with `data`; requires `inputSchema`."
                 },
                 "inputSchema": {
                     "type": "object",
-                    "description": "JSON Schema Draft 2020-12 object schema used to validate `input` before any downstream call. Required with `input`."
+                    "description": "JSON Schema validating `input` before any downstream call. Required with `input`."
                 },
                 "validate": {
                     "type": "boolean",
-                    "description": "Dry run: compile the script, resolve every tool name against your scope, and return the plan of calls it WOULD make, executing NONE of them. Cheap way to check a draft before it commits side effects. Two limits worth knowing: arguments are NOT checked against each tool's inputSchema, and calls return an empty result envelope, so a script that branches on a result takes the stub's branch. `finished: true` means the run reached the end of the script, NOT that the plan is exhaustive."
+                    "description": "Dry run: resolve every tool name against your scope and return the plan of calls it would make, executing none. Arguments are not checked against each tool's schema, and a script that branches on a result takes the stub branch."
                 }
             },
             "required": ["script"],
@@ -1514,16 +1489,15 @@ fn run_script_tool_def() -> Value {
 fn fetch_result_tool_def() -> Value {
     json!({
         "name": "toolport_fetch_result",
-        "description": "Read more of a large tool result that Toolport truncated. When a \
-            result is too big for context, Toolport returns the head plus a cursor in a \
-            `[Toolport shaped this result]` marker; call this with that `cursor` and the \
-            `offset` shown in the marker to page through the rest. Nothing was lost.",
+        "description": "Continue a large tool result that Toolport truncated. It returns the head \
+            plus a `[Toolport shaped this result]` marker holding a `cursor`; call this with that \
+            cursor and the marker's `offset` to page through the rest. Nothing was lost.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "cursor": { "type": "string", "description": "The cursor from the marker." },
-                "offset": { "type": "integer", "minimum": 0, "description": "Character offset to read from (shown in the marker). Ignored when `projection` is set." },
-                "projection": { "type": "string", "description": "Optional dot-separated path into structuredContent (for example: data.items.0.name). When set, returns just that field instead of a text page." }
+                "offset": { "type": "integer", "minimum": 0, "description": "Character offset to read from. Ignored when `projection` is set." },
+                "projection": { "type": "string", "description": "Optional dot-separated path into structuredContent, e.g. data.items.0.name." }
             },
             "required": ["cursor"],
             "additionalProperties": false
