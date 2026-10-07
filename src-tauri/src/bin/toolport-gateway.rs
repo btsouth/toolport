@@ -35009,10 +35009,17 @@ mod tests {
     }
 
     #[test]
-    fn confirm_destructive_intercepts_destructive_call() {
-        let _data_env = DataDirTestEnv::new("confirm_destructive_intercepts_destructive_call");
+    fn confirm_destructive_default_intercepts_destructive_call_without_ui() {
+        let _data_env = DataDirTestEnv::new(
+            "confirm_destructive_default_intercepts_destructive_call_without_ui",
+        );
         let host = dispatch_host(false);
-        let reg = registry_with_confirm();
+        let reg = Registry::default();
+        assert!(
+            read_endpoint_descriptor().is_none(),
+            "no approval UI in this fixture"
+        );
+        let started = Instant::now();
         let req = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": "stripe__delete_customer", "arguments": { "id": "cus_123" } }
@@ -35040,6 +35047,86 @@ mod tests {
         assert!(text.contains("cus_123"));
         assert!(text.contains("toolport_confirm"));
         assert_eq!(resp["result"]["isError"], true);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "no UI must never park a call"
+        );
+    }
+
+    #[test]
+    fn confirm_destructive_default_noninteractive_call_fails_fast() {
+        let _data_env =
+            DataDirTestEnv::new("confirm_destructive_default_noninteractive_call_fails_fast");
+        let router = routed_router("s", "delete");
+        let mut cached = router.aggregated_tools();
+        cached[0]["annotations"] = json!({ "destructiveHint": true });
+        let started = Instant::now();
+        let result = execute_call(
+            &Registry::default(),
+            &router,
+            &cached,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "s__delete",
+            json!({ "id": 7 }),
+            None,
+            None,
+            CallOpts {
+                confirmed: false,
+                shape: true,
+                allow_app_only: false,
+            },
+            None,
+        );
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("not available inside a code-mode script"),
+            "{text}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn confirm_destructive_default_with_human_approval_and_no_ui_fails_fast() {
+        let _data_env = DataDirTestEnv::new(
+            "confirm_destructive_default_with_human_approval_and_no_ui_fails_fast",
+        );
+        let mut registry = Registry::default();
+        registry.set_human_approval(true);
+        let router = routed_router("s", "delete");
+        let mut cached = router.aggregated_tools();
+        cached[0]["annotations"] = json!({ "destructiveHint": true });
+        assert!(read_endpoint_descriptor().is_none());
+        let started = Instant::now();
+        let result = execute_call(
+            &registry,
+            &router,
+            &cached,
+            None,
+            None,
+            None,
+            None,
+            Some(&ConfirmGuard::new()),
+            "s__delete",
+            json!({ "id": 7 }),
+            None,
+            None,
+            CallOpts {
+                confirmed: false,
+                shape: true,
+                allow_app_only: false,
+            },
+            None,
+        );
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["toolportDecision"], "unreachable");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("unreachable"), "{text}");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -35078,7 +35165,8 @@ mod tests {
     fn confirm_destructive_off_does_not_intercept() {
         let _data_env = DataDirTestEnv::new("confirm_destructive_off_does_not_intercept");
         let host = dispatch_host(false);
-        let reg = Registry::default(); // confirm_destructive = false
+        let mut reg = Registry::default();
+        reg.set_confirm_destructive(false);
         let req = json!({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": { "name": "stripe__delete_customer", "arguments": { "id": "cus_123" } }
@@ -35238,7 +35326,8 @@ mod tests {
     #[test]
     fn confirm_destructive_tools_list_excludes_toolport_confirm_when_off() {
         let host = dispatch_host(false);
-        let reg = Registry::default(); // confirm_destructive = false
+        let mut reg = Registry::default();
+        reg.set_confirm_destructive(false);
         let req = json!({ "jsonrpc": "2.0", "id": 8, "method": "tools/list" });
         let resp = handle_request(
             &host,

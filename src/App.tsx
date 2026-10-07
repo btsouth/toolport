@@ -57,6 +57,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AppSidebar } from "@/components/AppSidebar";
 import { ClientLogo } from "@/components/ClientLogo";
+import { DestructiveConfirmationNotice } from "@/components/DestructiveConfirmationNotice";
 import { PendingApprovals } from "@/components/PendingApprovals";
 import { TeamPairingDialog } from "@/components/TeamPairingDialog";
 import { QuarantineAlert } from "@/components/QuarantineAlert";
@@ -957,6 +958,11 @@ function App() {
           )}
 
           <ScrollArea className="min-h-0 flex-1">
+            <DestructiveConfirmationNotice
+              registry={registry}
+              onRegistryChange={applyRegistryChange}
+              onSettings={() => setView("settings")}
+            />
             <div className="p-6">
               <ErrorBoundary
                 resetKey={`${view}:${selectedClient?.id ?? ""}`}

@@ -392,7 +392,48 @@ fn build_window(
     app.add_action(&show_approvals);
 
     let alerts = gtk::Overlay::new();
-    alerts.set_child(Some(&split));
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    if crate::registry::load().is_ok_and(|registry| !registry.destructive_confirmation_notice_seen)
+    {
+        let notice = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        notice.set_margin_top(8);
+        notice.set_margin_bottom(8);
+        notice.set_margin_start(12);
+        notice.set_margin_end(12);
+        let message = gtk::Label::new(Some(
+            "New Toolport installs ask the agent to confirm before a tool marked destructive runs. Your setting has not changed. You can turn this on in Settings.",
+        ));
+        message.set_wrap(true);
+        message.set_xalign(0.0);
+        message.set_hexpand(true);
+        notice.append(&message);
+        let settings = gtk::Button::with_label("Settings");
+        let stack_for_notice = stack.clone();
+        let split_for_notice = split.clone();
+        let page_for_notice = settings_page.clone();
+        settings.connect_clicked(move |_| {
+            stack_for_notice.set_visible_child_name("settings");
+            split_for_notice.set_show_content(true);
+            page_for_notice.refresh();
+        });
+        notice.append(&settings);
+        let dismiss = gtk::Button::with_label("Dismiss");
+        let notice_for_dismiss = notice.clone();
+        let message_for_dismiss = message.clone();
+        dismiss.connect_clicked(move |_| {
+            match crate::registry_controller::dismiss_destructive_confirmation_notice() {
+                Ok(_) => notice_for_dismiss.set_visible(false),
+                Err(error) => {
+                    message_for_dismiss.set_text(&format!("Could not dismiss the notice: {error}"))
+                }
+            }
+        });
+        notice.append(&dismiss);
+        body.append(&notice);
+    }
+    split.set_vexpand(true);
+    body.append(&split);
+    alerts.set_child(Some(&body));
     let approval_host = adw::Clamp::builder()
         .maximum_size(720)
         .tightening_threshold(560)

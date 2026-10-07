@@ -1343,6 +1343,17 @@ fn set_deny_destructive(state: State<RegistryState>, deny: bool) -> Result<Regis
     Ok(reg)
 }
 
+#[tauri::command]
+fn dismiss_destructive_confirmation_notice(
+    state: State<RegistryState>,
+) -> Result<Registry, String> {
+    let (reg, _) = write_registry(state.inner(), |reg| {
+        reg.destructive_confirmation_notice_seen = true;
+        Ok(())
+    })?;
+    Ok(reg)
+}
+
 /// Toggle per-call confirmation for destructive tools. When enabled, the gateway
 /// intercepts each destructive tool call, returns a preview with a token, and
 /// requires `conduit_confirm { token }` to proceed. Mutually exclusive with
@@ -4399,6 +4410,7 @@ pub fn run() {
             set_tool_pinned,
             set_deny_destructive,
             set_confirm_destructive,
+            dismiss_destructive_confirmation_notice,
             set_human_approval,
             list_pending_approvals,
             decide_approval,

@@ -36,6 +36,39 @@ gateway entry, written for you when you connect a client:
 Every `TOOLPORT_*` name still accepts the pre-rename `CONDUIT_*` alias (for example
 `CONDUIT_HTTP_TOKEN` continues to work). Prefer `TOOLPORT_*` in new configs.
 
+**Destructive-call confirmation.** New installs enable `confirmDestructive` by
+default. When a server marks a tool with `destructiveHint: true`, Toolport
+returns an error result containing the arguments and a one-use, client-scoped
+token. The agent must call `toolport_confirm` within 60 seconds to replay those
+exact arguments. This is agent confirmation, not a human approval prompt.
+Both desktop shells expose it in Settings. Tools without the destructive
+annotation are not guaranteed to be caught.
+
+Existing registries keep their previous confirmation setting. The bool was
+serialized on every save, with no record of who chose it; neither a saved false
+nor an absent field proves the user left the default untouched. Older registries
+therefore deserialize with their old false default and an unacknowledged upgrade
+notice. The app offers to turn confirmation on in Settings. Dismissing the notice
+or choosing the confirmation setting persists `destructiveConfirmationNoticeSeen`
+so the offer does not recur, including when switching desktop shells. New installs
+start with this notice acknowledged. No 2.0 safety setting is introduced.
+
+**Headless and non-interactive calls.** Agent confirmation does not wait for the
+app or a prompt: it immediately returns the preview/error above. A headless agent
+can replay the token; a client that cannot do so receives the error and the tool
+never runs. Code-mode scripts cannot replay a token, so a destructive call fails
+immediately with instructions to call it directly or enable human approval.
+
+The independent **Require human approval** setting takes precedence over agent
+confirmation for gated tools. Legacy clients and scripts use the authenticated
+app approval broker. If no broker is published, they immediately fail closed with
+an `unreachable` decision and an error asking whether the Toolport app is running.
+Stale endpoints have bounded connection/authentication timeouts; a prompt that
+reaches the app auto-denies after 120 seconds. Modern clients use MCP elicitation
+and receive a capability error when they cannot show that approval request.
+Team-forced human approval or destructive-tool blocking still takes precedence;
+changing the member's confirmation setting does not release those team locks.
+
 **One gateway per host.** Client-spawned stdio gateways use a small adapter by
 default; one host daemon owns the router and shares ordinary downstream
 connections. Existing registry files without `gatewayTopology` select this
