@@ -37,6 +37,8 @@ install -Dm644 "$repo_root/src-tauri/icons/128x128.png" \
   "$stage_root/usr/share/icons/hicolor/128x128/apps/toolport.png"
 install -Dm644 "$repo_root/src-tauri/icons/128x128@2x.png" \
   "$stage_root/usr/share/icons/hicolor/256x256/apps/toolport.png"
+install -Dm755 "$repo_root/scripts/toolport-preview-rollback.sh" \
+  "$stage_root/usr/share/toolport/toolport-preview-rollback.sh"
 install -d "$stage_root/usr/share/toolport/agent-plugin"
 (
   cd "$repo_root/packaging/agent-plugin"
