@@ -21,28 +21,20 @@
   "denyDestructive": false,
   "httpBridgeEnabled": false,
   "humanApproval": false,
-  "humanApprovalAllow": [
-    "github/search_code"
-  ],
+  "humanApprovalAllow": ["github/search_code"],
   "lazyDiscovery": true,
   "liveInspect": false,
   "piiRedaction": false,
   "pinnedTools": {
-    "github": [
-      "get_me"
-    ]
+    "github": ["get_me"]
   },
   "profiles": [
     {
-      "enabledServerIds": [
-        "github"
-      ],
+      "enabledServerIds": ["github"],
       "id": "default",
       "name": "Default",
       "toolScope": {
-        "github": [
-          "search_code"
-        ]
+        "github": ["search_code"]
       }
     }
   ],
@@ -57,14 +49,9 @@
   },
   "servers": [
     {
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-github"
-      ],
+      "args": ["-y", "@modelcontextprotocol/server-github"],
       "command": "npx",
-      "disabledTools": [
-        "delete_repository"
-      ],
+      "disabledTools": ["delete_repository"],
       "env": [
         {
           "key": "GITHUB_TOKEN",
