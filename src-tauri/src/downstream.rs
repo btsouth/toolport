@@ -4807,7 +4807,7 @@ impl StdioTransport {
         // would have received anyway, so a rewrite only ever ADDS an entry and never
         // changes which PATH wins.
         if let Some(dir) = direct.as_ref().and_then(|d| d.bin_dir.as_ref()) {
-            let base = if inherit_env {
+            let base = if inherit_env && !cfg!(windows) {
                 child_env
                     .iter()
                     .find(|(name, _)| name == "PATH")
