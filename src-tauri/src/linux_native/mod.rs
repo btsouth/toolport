@@ -6679,6 +6679,7 @@ fn bounded_title(name: &str) -> gtk::Label {
 }
 
 fn open_server_details(server: &state::ServerView, page: &ServerPage, show_tools: bool) {
+    let parent = page.app.active_window();
     let window = adw::Window::builder()
         .application(&page.app)
         .title(&server.name)
@@ -6686,7 +6687,7 @@ fn open_server_details(server: &state::ServerView, page: &ServerPage, show_tools
         .default_height(760)
         .modal(true)
         .build();
-    window.set_transient_for(page.app.active_window().as_ref());
+    window.set_transient_for(parent.as_ref());
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&bounded_title(&server.name)));
