@@ -712,12 +712,13 @@ impl ServerSlot {
             let mut state = supervisor
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.publishing || !(demand && state.state == SupervisorState::Stopped
-                || state.state == SupervisorState::Backoff
-                    && (now >= state.next_attempt
-                        || demand
-                            && now.saturating_duration_since(state.last_attempt)
-                                >= Duration::from_secs(15)))
+            if state.publishing
+                || !(demand && state.state == SupervisorState::Stopped
+                    || state.state == SupervisorState::Backoff
+                        && (now >= state.next_attempt
+                            || demand
+                                && now.saturating_duration_since(state.last_attempt)
+                                    >= Duration::from_secs(15)))
             {
                 return false;
             }
@@ -786,6 +787,9 @@ impl ServerSlot {
         let Some(supervisor) = &self.supervisor else {
             return Ok(());
         };
+        if !continuation && cancel.is_some_and(CancelContext::is_cancelled) {
+            return Err("request cancelled while the server was starting".to_string());
+        }
         self.start(true);
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -1918,8 +1922,14 @@ impl Router {
         self.lazy_starting(id)
     }
 
-    pub fn wait_for_server(&self, id: &str, cancel: Option<&CancelContext>) -> Result<(), String> {
-        self.authorized_slot(id)?.wait_for_start(cancel, false)
+    pub fn wait_for_server(
+        &self,
+        id: &str,
+        cancel: Option<&CancelContext>,
+        continuation: bool,
+    ) -> Result<(), String> {
+        self.authorized_slot(id)?
+            .wait_for_start(cancel, continuation)
     }
 
     pub fn lazy_starting(&self, id: &str) -> bool {
@@ -2220,7 +2230,11 @@ impl Router {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = server;
         {
-            let mut state = slot.supervisor.as_ref().unwrap().lock()
+            let mut state = slot
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.publishing = true;
             state.state = SupervisorState::Starting;

@@ -3746,6 +3746,25 @@ fn recheck_live_policy(
     }
 }
 
+/// Startup may outlast a policy edit, so check on both sides of the wait.
+fn prepare_dispatch(
+    router: &Router,
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+    target: DispatchTarget<'_>,
+    cancel: Option<&downstream::CancelContext>,
+    continuation: bool,
+) -> Result<(), String> {
+    recheck_live_policy(router, live_router, target)?;
+    let owner = match target {
+        DispatchTarget::Tool(name) => router.route_of(name).map(|(owner, _)| owner),
+        DispatchTarget::Server(owner) => Some(owner),
+    };
+    if let Some(owner) = owner {
+        router.wait_for_server(owner, cancel, continuation)?;
+    }
+    recheck_live_policy(router, live_router, target)
+}
+
 const STALE_LIVE_VIEW: &str =
     "this connection's profile changed during the request; send the request again";
 
@@ -3950,7 +3969,7 @@ fn execute_call(
                     "Toolport: '{}' is not available to this client.", sanitize_segment(&owner)
                 )}], "isError": true});
             }
-            if let Err(message) = view.wait_for_server(&owner, cancel.as_ref()) {
+            if let Err(message) = view.wait_for_server(&owner, cancel.as_ref(), false) {
                 return json!({"content": [{"type": "text", "text": format!("Toolport: {message}")}], "isError": true});
             }
             fresh = clone_live_router(live_router);
@@ -4401,7 +4420,13 @@ fn execute_call(
     // This request kept the router it arrived with. If a newer one has gone live
     // since (a registry policy change, quarantine, or a rebuild), its policy has
     // the last word before anything is sent (P1.3).
-    let live_policy = recheck_live_policy(exec_router, live_router, DispatchTarget::Tool(name));
+    let live_policy = prepare_dispatch(
+        exec_router,
+        live_router,
+        DispatchTarget::Tool(name),
+        cancel.as_ref(),
+        effective_mrtr.is_some_and(|request| !request.is_empty()),
+    );
     match live_policy.and_then(|()| {
         exec_router.route_call_with_cancel_and_mrtr(
             name,
@@ -6731,9 +6756,13 @@ fn handle_request_with_cancel(
             };
             let client_meta = relay_owned.or(client_meta);
             let live_policy = match router.resource_server(uri) {
-                Some(owner) => {
-                    recheck_live_policy(router, live_router, DispatchTarget::Server(owner))
-                }
+                Some(owner) => prepare_dispatch(
+                    router,
+                    live_router,
+                    DispatchTarget::Server(owner),
+                    cancel.as_ref(),
+                    !mrtr.is_empty(),
+                ),
                 None => Ok(()),
             };
             match live_policy.and_then(|()| {
@@ -6879,9 +6908,13 @@ fn handle_request_with_cancel(
             };
             let client_meta = relay_owned.or(client_meta);
             let live_policy = match router.prompt_server(name) {
-                Some(owner) => {
-                    recheck_live_policy(router, live_router, DispatchTarget::Server(owner))
-                }
+                Some(owner) => prepare_dispatch(
+                    router,
+                    live_router,
+                    DispatchTarget::Server(owner),
+                    cancel.as_ref(),
+                    !mrtr.is_empty(),
+                ),
                 None => Ok(()),
             };
             match live_policy.and_then(|()| {
@@ -6937,10 +6970,12 @@ fn handle_request_with_cancel(
                             ));
                         }
                     }
-                    match recheck_live_policy(
+                    match prepare_dispatch(
                         router,
                         live_router,
                         DispatchTarget::Server(&server_id),
+                        cancel.as_ref(),
+                        false,
                     )
                     .and_then(|()| router.complete_with_cancel(params, cancel.clone()))
                     {
@@ -6996,7 +7031,13 @@ fn handle_request_with_cancel(
             let live_policy = if method == "tasks/cancel" {
                 Ok(())
             } else {
-                recheck_live_policy(router, live_router, DispatchTarget::Server(&owner))
+                prepare_dispatch(
+                    router,
+                    live_router,
+                    DispatchTarget::Server(&owner),
+                    cancel.as_ref(),
+                    false,
+                )
             };
             match live_policy.and_then(|()| {
                 router.route_task(method, params, cancel.clone(), client_meta.as_ref())
@@ -8494,6 +8535,15 @@ fn handle_resource_subscription(
     let session = active_resource_session_id();
     match method {
         "resources/subscribe" => {
+            if let Err(message) = prepare_dispatch(
+                router,
+                Some(&state.router),
+                DispatchTarget::Server(&owner),
+                cancel,
+                false,
+            ) {
+                return Some(error(id, -32602, &format!("Toolport: {message}")));
+            }
             // Single-flight: the first caller opens downstream, the rest wait on the
             // gate and then either join the open subscription or inherit the leader's
             // error. Deliberately fail-closed -- a waiter does NOT retry as a new leader,
@@ -9702,9 +9752,12 @@ fn adopt_reconnected_servers(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let resources_changed =
-        !next.aggregated_resources().is_empty() || !next.aggregated_resource_templates().is_empty();
-    let prompts_changed = !next.aggregated_prompts().is_empty();
+    let resources_changed = !next.aggregated_resources().is_empty()
+        || !next.aggregated_resource_templates().is_empty()
+        || !previous_router.aggregated_resources().is_empty()
+        || !previous_router.aggregated_resource_templates().is_empty();
+    let prompts_changed =
+        !next.aggregated_prompts().is_empty() || !previous_router.aggregated_prompts().is_empty();
     let tools = publish_built_router(&host.registry, &host.router, next, resolved.as_deref());
     let current = host
         .router
@@ -19257,6 +19310,36 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_dispatch_rechecks_policy_after_waiting_for_startup() {
+        let _env = DataDirTestEnv::new("supervisor-wait-policy");
+        let state = http_state(false);
+        let snapshot = Arc::new(cached_supervisor());
+        *state.router.lock().unwrap() = Arc::clone(&snapshot);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                prepare_dispatch(
+                    &snapshot,
+                    Some(&state.router),
+                    DispatchTarget::Server("cache"),
+                    None,
+                    false,
+                )
+            });
+            wait_for_supervisor_result(&snapshot);
+            let mut published = (*snapshot).clone();
+            published.adopt_ready_reconnects();
+            published.apply_registry_policy(RegistryPolicy {
+                servers: Some(HashSet::new()),
+                ..RegistryPolicy::default()
+            });
+            *state.router.lock().unwrap() = Arc::new(published);
+            snapshot.activate_supervisors();
+            let error = worker.join().unwrap().unwrap_err();
+            assert!(error.contains("turned off"), "{error}");
+        });
+    }
+
+    #[test]
     fn supervisor_adoption_announces_prompts_and_resources_to_existing_clients() {
         let _env = DataDirTestEnv::new("supervisor-notifications");
         let state = http_state(false);
@@ -19290,8 +19373,10 @@ mod tests {
         {
             let mut pool = state.root_launch_pool.lock().unwrap();
             pool.views.insert(keys.clone(), Arc::clone(&cached));
-            pool.root_scopes
-                .insert(keys.clone(), format!("root:{}", registry::sha256_hex("/project")));
+            pool.root_scopes.insert(
+                keys.clone(),
+                format!("root:{}", registry::sha256_hex("/project")),
+            );
         }
         let host = Arc::clone(&state.host);
         let hook_keys = keys.clone();
