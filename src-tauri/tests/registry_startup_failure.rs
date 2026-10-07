@@ -81,7 +81,14 @@ fn assert_gateway_refuses(dir: &Path, role: &str, expected: &str) {
         "{role}: {error}"
     );
     assert!(output.stdout.is_empty(), "no MCP response may be served");
-    assert!(!dir.join("daemon.json").exists());
+    assert!(
+        std::fs::read_dir(dir).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            !(name.starts_with("daemon-") && name.ends_with(".json"))
+        }),
+        "a failed load must not publish a daemon descriptor"
+    );
 }
 
 #[test]
