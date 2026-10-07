@@ -15,10 +15,7 @@ first.
    and leaves your other servers and the rest of the file untouched.
 3. If you turned on **Agent rules**, switch every client off in that tab, or delete
    the applied set, so Toolport removes the block or file it wrote.
-4. If you turned on **Agent permissions** or the Cursor guard hook, set those modes
-   back to **Off** so Toolport removes the `permissions` entries and the
-   `--toolport-guard` hook it added.
-5. Turn off **Launch at login** in Settings.
+4. Turn off **Launch at login** in Settings.
 
 ## 2. Remove the app
 

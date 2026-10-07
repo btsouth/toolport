@@ -11,7 +11,6 @@ mod http_bridge;
 mod notify;
 mod onboarding;
 mod pairing;
-mod permissions;
 mod playground;
 mod settings;
 mod state;
@@ -23,7 +22,6 @@ use adw::prelude::*;
 use catalog::CatalogPage;
 use gtk::glib::prelude::ToValue;
 use hooks::HooksPage;
-use permissions::PermissionsPage;
 use playground::PlaygroundPage;
 use settings::SettingsPage;
 use teams::TeamsPage;
@@ -303,7 +301,6 @@ fn build_window(
     let teams_page = TeamsPage::new(app);
     let rules_page = RulesPage::new(app);
     let hooks_page = HooksPage::new(app);
-    let permissions_page = PermissionsPage::new(app);
     let settings_page = SettingsPage::new(bridge, broker);
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
@@ -319,7 +316,6 @@ fn build_window(
     stack.add_named(&teams_page.root, Some("teams"));
     stack.add_named(&rules_page.root, Some("rules"));
     stack.add_named(&hooks_page.root, Some("hooks"));
-    stack.add_named(&permissions_page.root, Some("permissions"));
     stack.add_named(&settings_page.root, Some("settings"));
     let (sidebar, quarantine_badge) = build_sidebar(
         app,
@@ -333,7 +329,6 @@ fn build_window(
         teams_page.clone(),
         rules_page.clone(),
         hooks_page.clone(),
-        permissions_page.clone(),
         settings_page.clone(),
     );
     // The Settings tab must not go stale while open: quarantine, remembered
@@ -592,8 +587,8 @@ fn run_startup_maintenance() {
     }
     crate::rules::apply_on_startup();
     crate::hooks::apply_on_startup();
-    crate::agent_permissions::apply_on_startup();
-    crate::agent_guard::apply_on_startup();
+    // One-time removal of the retired agent guard hook entries (see `guard_cleanup`).
+    crate::guard_cleanup::run_once();
 }
 
 fn run_registry_startup_failure(app: &adw::Application, args: &[String], error: String) {
@@ -666,7 +661,6 @@ fn build_sidebar(
     teams_page: TeamsPage,
     rules_page: RulesPage,
     hooks_page: HooksPage,
-    permissions_page: PermissionsPage,
     settings_page: SettingsPage,
 ) -> (gtk::Box, gtk::Label) {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -710,11 +704,6 @@ fn build_sidebar(
         ("teams", "Teams", "system-users-symbolic"),
         ("rules", "Rules", "security-high-symbolic"),
         ("hooks", "Agent activity", "media-record-symbolic"),
-        (
-            "permissions",
-            "Agent permissions",
-            "changes-prevent-symbolic",
-        ),
         ("settings", "Settings", "emblem-system-symbolic"),
     ] {
         let button = gtk::Button::new();
@@ -753,7 +742,6 @@ fn build_sidebar(
         let teams_page = teams_page.clone();
         let rules_page = rules_page.clone();
         let hooks_page = hooks_page.clone();
-        let permissions_page = permissions_page.clone();
         let settings_page = settings_page.clone();
         button.connect_clicked(move |_| {
             show_native_page(
@@ -769,7 +757,6 @@ fn build_sidebar(
                 &teams_page,
                 &rules_page,
                 &hooks_page,
-                &permissions_page,
                 &settings_page,
             );
         });
@@ -789,7 +776,6 @@ fn build_sidebar(
         let teams_page = teams_page.clone();
         let rules_page = rules_page.clone();
         let hooks_page = hooks_page.clone();
-        let permissions_page = permissions_page.clone();
         let settings_page = settings_page.clone();
         action.connect_activate(move |_, _| {
             show_native_page(
@@ -805,7 +791,6 @@ fn build_sidebar(
                 &teams_page,
                 &rules_page,
                 &hooks_page,
-                &permissions_page,
                 &settings_page,
             );
         });
@@ -1349,7 +1334,6 @@ fn show_native_page(
     teams_page: &TeamsPage,
     rules_page: &RulesPage,
     hooks_page: &HooksPage,
-    permissions_page: &PermissionsPage,
     settings_page: &SettingsPage,
 ) {
     stack.set_visible_child_name(target);
@@ -1377,8 +1361,6 @@ fn show_native_page(
         rules_page.refresh();
     } else if target == "hooks" {
         hooks_page.refresh();
-    } else if target == "permissions" {
-        permissions_page.refresh();
     } else if target == "settings" {
         settings_page.refresh();
     }
@@ -7195,18 +7177,6 @@ fn approval_card(
             .build(),
     );
 
-    if let Some(rule) = &view.agent_rule {
-        card.append(
-            &gtk::Label::builder()
-                .label(format!("Your permission rule: {rule}"))
-                .halign(gtk::Align::Start)
-                .xalign(0.0)
-                .wrap(true)
-                .selectable(true)
-                .build(),
-        );
-    }
-
     if let Some(url) = &view.url_elicitation {
         card.append(
             &gtk::Label::builder()
@@ -7365,7 +7335,6 @@ fn approval_reason(reason: crate::approval::ApprovalReason) -> &'static str {
         }
         crate::approval::ApprovalReason::PersistentCodeWrite => "persistent routine write",
         crate::approval::ApprovalReason::PiiCrossServer => "cross-server data release",
-        crate::approval::ApprovalReason::AgentPermission => "ask-first permission rule",
     }
 }
 
@@ -8562,15 +8531,6 @@ fn approval_notification(view: &crate::approval_broker::PendingView) -> (String,
             format!(
                 "{} requested an external browser interaction. Review it in Toolport.",
                 elicitation.origin
-            ),
-        );
-    }
-    if let Some(rule) = &view.agent_rule {
-        return (
-            "Toolport: approval required".to_string(),
-            format!(
-                "{} asks before {}: your rule {rule}. Approve or deny it in Toolport.",
-                view.server, view.tool
             ),
         );
     }
@@ -11488,7 +11448,6 @@ mod tests {
             arguments: serde_json::json!({}),
             url_elicitation: None,
             pii_release: None,
-            agent_rule: None,
             deadline_ms: 0,
         };
         assert_eq!(

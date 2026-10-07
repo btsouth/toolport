@@ -92,30 +92,6 @@ describe("PendingApprovals PII release", () => {
   });
 });
 
-describe("PendingApprovals agent permission ask", () => {
-  const ask = approval({
-    id: "ask-1",
-    client: "cursor",
-    server: "cursor",
-    tool: "Bash",
-    reason: "agent_permission",
-    arguments: { command: "git push origin main" },
-    agentRule: "Bash(git push*)",
-  });
-
-  it("names the rule that asked and never offers to skip it", async () => {
-    // SBS-1059: the "tool" is a class of calls, so a skip would be a blanket grant;
-    // the rule itself is where the user stops asking.
-    listPendingApprovals.mockResolvedValue([ask]);
-    render(<PendingApprovals />);
-    await act(async () => {});
-
-    expect(screen.getByText("Bash(git push*)")).toBeInTheDocument();
-    expect(screen.getByText("Ask first")).toBeInTheDocument();
-    expect(screen.queryByText("Skip next time?")).not.toBeInTheDocument();
-  });
-});
-
 const routineSave = (argumentsOver: Record<string, unknown> = {}) =>
   approval({
     id: "routine-save-1",

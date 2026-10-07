@@ -9,7 +9,6 @@ export type View =
   | "playground"
   | "rules"
   | "hooks"
-  | "permissions"
   | "teams"
   | "settings";
 
@@ -448,8 +447,7 @@ export interface PendingApproval {
     | "untrusted_source"
     | "destructive_and_untrusted"
     | "persistent_code_write"
-    | "pii_cross_server"
-    | "agent_permission";
+    | "pii_cross_server";
   arguments: unknown;
   /** A screened URL-mode elicitation brokered by the desktop because the MCP host
    * did not declare URL elicitation support. */
@@ -468,9 +466,6 @@ export interface PendingApproval {
     server: string;
     values: { token: string; value: string; origins: string[] }[];
   } | null;
-  /** The "ask first" permission rule behind an `agent_permission` ask, e.g.
-   * `Bash(git push*)`. `server` is the agent and `tool` the call kind. */
-  agentRule?: string | null;
   /** Wall-clock epoch-ms when this call auto-denies; the overlay counts down to it. */
   deadlineMs: number;
 }
@@ -817,44 +812,6 @@ export interface HooksView {
   binary?: string;
 }
 
-// ---- Native permission policy for Claude Code (SBS-1058) ----
-
-export type PermissionAction = "allow" | "ask" | "deny";
-
-/** One rule in Claude Code's own syntax (`Bash(rm -rf *)`, `Read(./.env)`, `mcp__server__tool`). */
-export interface PermissionRule {
-  pattern: string;
-  action: PermissionAction;
-}
-
-export interface PermissionProfileStatus {
-  path: string;
-  /** applied | stale | off | error */
-  state: string;
-  /** How many of the policy's rules Toolport itself added to this file. */
-  added: number;
-  error?: string;
-}
-
-export interface PermissionPreset {
-  label: string;
-  rules: PermissionRule[];
-}
-
-export interface PermissionsView {
-  enabled: boolean;
-  rules: PermissionRule[];
-  profiles: PermissionProfileStatus[];
-  presets: PermissionPreset[];
-}
-
-export interface PermissionsPreview {
-  path: string;
-  before: string;
-  after: string;
-  error?: string;
-}
-
 /** A dry run of one profile's write. Nothing is written to produce it. */
 export interface HooksPreview {
   path: string;
@@ -890,28 +847,4 @@ export interface HookEvent {
   mode?: string;
   /** In observe mode: what the answer WOULD have been. */
   wouldBe?: string | null;
-}
-
-// ---- Guard hook for Cursor (SBS-1059) ----
-
-export type GuardMode = "off" | "observe" | "enforce";
-
-export interface GuardProfile {
-  path: string;
-  installed: boolean;
-  error?: string;
-}
-
-export interface GuardView {
-  cursorMode: GuardMode;
-  cursor?: GuardProfile;
-  events: string[];
-  binary?: string;
-}
-
-export interface GuardPreview {
-  path: string;
-  before: string;
-  after: string;
-  error?: string;
 }
