@@ -3766,16 +3766,6 @@ impl StdioTransport {
         self.connect_timeout = timeout;
     }
 
-    /// Test-only: the tail of the child's stderr, so a failed spawn or startup
-    /// can be reported instead of only the symptom.
-    #[cfg(all(test, windows))]
-    pub(crate) fn stderr_tail_for_test(&self) -> String {
-        self.stderr
-            .lock()
-            .map(|b| b.trim().to_string())
-            .unwrap_or_default()
-    }
-
     /// Build a useful error for when the child's stdout closed (it exited or
     /// crashed). Includes the exit status and the tail of stderr when available -
     /// that is where "package not found" or "missing API key" actually shows up.
@@ -7559,7 +7549,7 @@ mod tests {
             "-File".to_string(),
             script_file.to_string_lossy().into_owned(),
         ];
-        let transport = StdioTransport::spawn("powershell.exe", &args, &[], None, false)
+        let mut transport = StdioTransport::spawn("powershell.exe", &args, &[], None, false)
             .expect("spawn Job Object-owned launcher");
 
         // Poll for parsable CONTENT, not mere existence - the same fix the Unix sibling
@@ -7577,10 +7567,21 @@ mod tests {
             }
             assert!(
                 Instant::now() < created_deadline,
-                "launcher should record its grandchild pid; diag: {}; launcher stderr: {}",
+                "launcher should record its grandchild pid; diag: {}; launcher stderr: {}; \
+                 launcher exited: {:?}; child env: {}",
                 std::fs::read_to_string(&diag_file)
                     .unwrap_or_else(|e| format!("<no diag file: {e}>")),
-                transport.stderr_tail_for_test()
+                transport
+                    .stderr
+                    .lock()
+                    .map(|b| b.trim().to_string())
+                    .unwrap_or_default(),
+                transport.child.try_wait().ok().flatten(),
+                super::child_environment(&super::process_env_map(), &[], false)
+                    .into_iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
             );
             std::thread::sleep(Duration::from_millis(25));
         };
