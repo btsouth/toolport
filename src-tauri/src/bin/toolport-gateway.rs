@@ -44,9 +44,11 @@ use conduit_lib::integrity;
 use conduit_lib::pii;
 use conduit_lib::registry::{self, Registry, ServerEntry};
 use conduit_lib::remote;
+#[cfg(test)]
+use conduit_lib::router::ToolPolicy;
 use conduit_lib::router::{
-    is_destructive, sanitize_segment, Connect, ConnectFailure, PendingHandle, Reconnect,
-    ReconnectBackoff, Router, SharedServerSlot, ToolPolicy,
+    is_destructive, sanitize_segment, Connect, ConnectFailure, DispatchTarget, PendingHandle,
+    Reconnect, ReconnectBackoff, RegistryPolicy, Router, SharedServerSlot,
 };
 use conduit_lib::routine_advisor::{self, AdvisorLedger, HintSlot};
 use conduit_lib::routine_candidates::{
@@ -116,7 +118,17 @@ thread_local! {
         }) };
 }
 
-type LiveRouterResolver = Arc<dyn Fn() -> Arc<Router> + Send + Sync>;
+/// A daemon adapter's view of the live router, for checks that run after its
+/// request took a snapshot.
+#[derive(Clone)]
+struct LiveRouterResolver {
+    /// Cheap: whether the registry or root has moved this adapter's view on since
+    /// the request started. Checked on every dispatch.
+    stale: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// The full live view, rebuilt from the registry. Only post-HITL revalidation
+    /// pays for it; a stale view resolves to [`stale_live_view`].
+    resolve: Arc<dyn Fn() -> Arc<Router> + Send + Sync>,
+}
 
 thread_local! {
     static ACTIVE_LIVE_ROUTER_RESOLVER: std::cell::RefCell<Option<LiveRouterResolver>> =
@@ -4195,11 +4207,57 @@ fn post_hitl_revalidation(
     None
 }
 
+/// Recheck a dispatch `router` is about to make against the live router's policy,
+/// when a newer router has gone live since this request took its snapshot (P1.3).
+///
+/// This runs on every dispatch, so it reads only the base live router, whose policy
+/// the registry watcher republishes (servers, disabled tools, deny-destructive,
+/// quarantine). A daemon adapter's own profile scope is not in that policy, so its
+/// view is checked for staleness instead, and a stale view refuses everything.
+fn recheck_live_policy(
+    router: &Router,
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+    target: DispatchTarget<'_>,
+) -> Result<(), String> {
+    if active_live_router_resolver().is_some_and(|view| (view.stale)()) {
+        return Err(STALE_LIVE_VIEW.to_string());
+    }
+    let live = live_router.map(|slot| {
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    });
+    match live {
+        Some(live) if !std::ptr::eq(router, Arc::as_ptr(&live)) => {
+            router.recheck_live_policy(&live, target)
+        }
+        _ => Ok(()),
+    }
+}
+
+const STALE_LIVE_VIEW: &str =
+    "this connection's profile changed during the request; send the request again";
+
+/// What a daemon adapter's live view resolves to once the registry has moved it on.
+/// It routes nothing, so post-HITL revalidation sees the tool gone (`StaleState`),
+/// and its policy allows no server, so any other check against it refuses too.
+fn stale_live_view() -> Arc<Router> {
+    Arc::new(Router::with_policy(
+        RegistryPolicy {
+            servers: Some(HashSet::new()),
+            ..RegistryPolicy::default()
+        }
+        .with_quarantine(BTreeSet::new(), false),
+    ))
+}
+
 /// Clone the current live `Arc<Router>` from the swappable slot, releasing the mutex
 /// immediately. Returns `None` only if `live_router` itself is `None` (test harnesses).
+/// A daemon adapter gets its full live view, which is costly; per-dispatch checks
+/// use [`recheck_live_policy`] instead.
 fn clone_live_router(live_router: Option<&Arc<Mutex<Arc<Router>>>>) -> Option<Arc<Router>> {
-    if let Some(resolve) = active_live_router_resolver() {
-        return Some(resolve());
+    if let Some(view) = active_live_router_resolver() {
+        return Some((view.resolve)());
     }
     live_router.map(|slot| {
         slot.lock()
@@ -4861,13 +4919,19 @@ fn execute_call(
         }
     };
     let effective_mrtr = rehydrated_mrtr.as_ref().or(effective_mrtr);
-    match exec_router.route_call_with_cancel_and_mrtr(
-        name,
-        arguments,
-        cancel.clone(),
-        client_meta,
-        effective_mrtr,
-    ) {
+    // This request kept the router it arrived with. If a newer one has gone live
+    // since (a registry policy change, quarantine, or a rebuild), its policy has
+    // the last word before anything is sent (P1.3).
+    let live_policy = recheck_live_policy(exec_router, live_router, DispatchTarget::Tool(name));
+    match live_policy.and_then(|()| {
+        exec_router.route_call_with_cancel_and_mrtr(
+            name,
+            arguments,
+            cancel.clone(),
+            client_meta,
+            effective_mrtr,
+        )
+    }) {
         Ok(mut result) => {
             if let Some(profiler) = &mut call_profiler {
                 profiler.mark_downstream();
@@ -8794,12 +8858,20 @@ fn handle_request_with_cancel(
                 None => (None, None),
             };
             let client_meta = relay_owned.or(client_meta);
-            match router.read_resource_with_cancel_and_mrtr(
-                uri,
-                cancel.clone(),
-                client_meta.as_ref(),
-                (!mrtr.is_empty()).then_some(&mrtr),
-            ) {
+            let live_policy = match router.resource_server(uri) {
+                Some(owner) => {
+                    recheck_live_policy(router, live_router, DispatchTarget::Server(owner))
+                }
+                None => Ok(()),
+            };
+            match live_policy.and_then(|()| {
+                router.read_resource_with_cancel_and_mrtr(
+                    uri,
+                    cancel.clone(),
+                    client_meta.as_ref(),
+                    (!mrtr.is_empty()).then_some(&mrtr),
+                )
+            }) {
                 Ok(mut result) => {
                     // MCP App HTML is executable UI payload for the host's
                     // sandbox, not model-facing resource text. The Apps spec
@@ -8931,13 +9003,21 @@ fn handle_request_with_cancel(
                 None => (None, None),
             };
             let client_meta = relay_owned.or(client_meta);
-            match router.get_prompt_with_cancel_and_mrtr(
-                name,
-                arguments,
-                cancel.clone(),
-                client_meta.as_ref(),
-                (!mrtr.is_empty()).then_some(&mrtr),
-            ) {
+            let live_policy = match router.prompt_server(name) {
+                Some(owner) => {
+                    recheck_live_policy(router, live_router, DispatchTarget::Server(owner))
+                }
+                None => Ok(()),
+            };
+            match live_policy.and_then(|()| {
+                router.get_prompt_with_cancel_and_mrtr(
+                    name,
+                    arguments,
+                    cancel.clone(),
+                    client_meta.as_ref(),
+                    (!mrtr.is_empty()).then_some(&mrtr),
+                )
+            }) {
                 Ok(mut result) => {
                     // Content defense: a prompt's messages are attacker-controllable too;
                     // scan for injection and label any flagged text as data.
@@ -8982,7 +9062,13 @@ fn handle_request_with_cancel(
                             ));
                         }
                     }
-                    match router.complete_with_cancel(params, cancel.clone()) {
+                    match recheck_live_policy(
+                        router,
+                        live_router,
+                        DispatchTarget::Server(&server_id),
+                    )
+                    .and_then(|()| router.complete_with_cancel(params, cancel.clone()))
+                    {
                         Ok(result) => Some(success(id, result)),
                         Err(e) => Some(error(
                             id,
@@ -9031,7 +9117,15 @@ fn handle_request_with_cancel(
                 }
             }
             let client_meta = params.get("_meta").cloned();
-            match router.route_task(method, params, cancel.clone(), client_meta.as_ref()) {
+            // A cancel still reaches a server turned off since (see `route_task`).
+            let live_policy = if method == "tasks/cancel" {
+                Ok(())
+            } else {
+                recheck_live_policy(router, live_router, DispatchTarget::Server(&owner))
+            };
+            match live_policy.and_then(|()| {
+                router.route_task(method, params, cancel.clone(), client_meta.as_ref())
+            }) {
                 Ok(result) => Some(success(id, result)),
                 Err(e) => Some(error(
                     id,
@@ -9255,30 +9349,18 @@ fn root_subscription_key(server: &ServerEntry, root: &str) -> (String, String) {
     (server.id.clone(), resolved_cwd)
 }
 
-#[allow(clippy::too_many_arguments)] // SBS-871 adds the pre-rebuild quarantine set.
-fn build_router(
-    reg: &Registry,
+/// The servers a router built for this view of the registry connects.
+///
+/// In HTTP mode one process serves every registered client, so connect the
+/// union of all their profiles (per-request filtering scopes each one down).
+/// In stdio mode the process serves a single client, so connect only its
+/// profile - that's what keeps stdio per-client scoping intact.
+fn router_servers<'a>(
+    reg: &'a Registry,
     profile: Option<&str>,
     http_mode: bool,
     daemon_mode: bool,
-    dirty: &Arc<AtomicU8>,
-    server_handler: ServerRequestHandler,
-    // The upstream client's project root for the ${ROOT} cwd token (issue #239),
-    // already decoded to a filesystem path. `None` in HTTP mode and before the
-    // client's roots are known; `${ROOT}` servers then fall back to the gateway cwd.
-    root: Option<&str>,
-    // Optional dispatch for downstream `notifications/resources/updated`
-    // (SOU-394); bound per server with producer id (SOU-398).
-    resource_updated: Option<ResourceUpdatedDispatch>,
-    // Live subscription table so reconnect factories re-issue resources/subscribe.
-    resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
-    // Pre-rebuild live quarantine set. `None` is a genuine cold start (SBS-871).
-    previous_quarantine: Option<PriorQuarantine>,
-) -> Router {
-    // In HTTP mode one process serves every registered client, so connect the
-    // union of all their profiles (per-request filtering scopes each one down).
-    // In stdio mode the process serves a single client, so connect only its
-    // profile - that's what keeps stdio per-client scoping intact.
+) -> Vec<&'a ServerEntry> {
     let enabled = if daemon_mode {
         // Adapters may belong to any stdio profile, including one that did
         // not start the daemon. The per-request allowed set narrows this union.
@@ -9298,27 +9380,29 @@ fn build_router(
             None => reg.enabled_servers(),
         }
     };
-    let all_servers: Vec<ServerEntry> = enabled
+    enabled
         .into_iter()
         .filter(|s| !clients::is_gateway_server(s)) // never proxy ourselves
-        .cloned()
-        .collect();
+        .collect()
+}
 
-    // Build the policy from the same server set: per-tool disables + the global
-    // destructive switch. The router enforces it as servers are added.
+/// The registry-derived policy for a router built with the same arguments. Both
+/// `build_router` and the registry watcher use it, so a policy republished on a
+/// live router before a rebuild is exactly the one the rebuild installs (P1.3).
+fn registry_policy(
+    reg: &Registry,
+    profile: Option<&str>,
+    http_mode: bool,
+    daemon_mode: bool,
+) -> RegistryPolicy {
+    let servers = router_servers(reg, profile, http_mode, daemon_mode);
+    // Per-tool disables + the global destructive switch, from the same server set.
     let mut disabled = std::collections::HashMap::new();
-    for s in &all_servers {
+    for s in &servers {
         if !s.disabled_tools.is_empty() {
             disabled.insert(s.id.clone(), s.disabled_tools.iter().cloned().collect());
         }
     }
-    // A daemon learns each adapter's project root only after that adapter's
-    // handshake. Delay these launches until a session has a resolved root;
-    // starting them here would create an extra child in the daemon's own cwd.
-    let servers: Vec<ServerEntry> = all_servers
-        .into_iter()
-        .filter(|server| !daemon_mode || !server_uses_project_root(server))
-        .collect();
     // Tool-granular profile scope (SOU-189 / SOU-167): per-server ORIGINAL tool allow-lists.
     // Stdio: bake the single active (or requested) profile's tool_scope.
     // HTTP: one shared router serves every registered client/profile. Bake a fail-closed
@@ -9339,6 +9423,43 @@ fn build_router(
         }
         allow
     };
+    RegistryPolicy {
+        servers: Some(servers.iter().map(|s| s.id.clone()).collect()),
+        disabled,
+        allow,
+        deny_destructive: reg.deny_destructive_effective(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // SBS-871 adds the pre-rebuild quarantine set.
+fn build_router(
+    reg: &Registry,
+    profile: Option<&str>,
+    http_mode: bool,
+    daemon_mode: bool,
+    dirty: &Arc<AtomicU8>,
+    server_handler: ServerRequestHandler,
+    // The upstream client's project root for the ${ROOT} cwd token (issue #239),
+    // already decoded to a filesystem path. `None` in HTTP mode and before the
+    // client's roots are known; `${ROOT}` servers then fall back to the gateway cwd.
+    root: Option<&str>,
+    // Optional dispatch for downstream `notifications/resources/updated`
+    // (SOU-394); bound per server with producer id (SOU-398).
+    resource_updated: Option<ResourceUpdatedDispatch>,
+    // Live subscription table so reconnect factories re-issue resources/subscribe.
+    resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
+    // Pre-rebuild live quarantine set. `None` is a genuine cold start (SBS-871).
+    previous_quarantine: Option<PriorQuarantine>,
+) -> Router {
+    let registry_policy = registry_policy(reg, profile, http_mode, daemon_mode);
+    // A daemon learns each adapter's project root only after that adapter's
+    // handshake. Delay these launches until a session has a resolved root;
+    // starting them here would create an extra child in the daemon's own cwd.
+    let servers: Vec<ServerEntry> = router_servers(reg, profile, http_mode, daemon_mode)
+        .into_iter()
+        .filter(|server| !daemon_mode || !server_uses_project_root(server))
+        .cloned()
+        .collect();
     // Historical installs have pins without quarantine.json. Materialize `{}`
     // under the store lock so a later missing-while-pins-exist read is a real
     // rename-window error, not every boot (SBS-871).
@@ -9379,18 +9500,12 @@ fn build_router(
         QuarantineBootstrap::KeepFailClosed(set) => (set, true),
         QuarantineBootstrap::FailClosedCatalog => (BTreeSet::new(), true),
     };
-    let policy = ToolPolicy {
-        disabled,
-        allow,
-        deny_destructive: reg.deny_destructive_effective(),
-        // Hide already-quarantined tools from the first build (the set persists across
-        // restarts); newly detected drift is added during the integrity check below.
-        // On store Err, keep the pre-rebuild live set or hide the catalog (SBS-871).
-        // We deliberately do NOT rename/clear a corrupt file: that would make the
-        // next reconcile install a permanent empty set (SOU-320).
-        quarantined,
-        fail_closed_catalog,
-    };
+    // Hide already-quarantined tools from the first build (the set persists across
+    // restarts); newly detected drift is added during the integrity check below.
+    // On store Err, keep the pre-rebuild live set or hide the catalog (SBS-871).
+    // We deliberately do NOT rename/clear a corrupt file: that would make the
+    // next reconcile install a permanent empty set (SOU-320).
+    let policy = registry_policy.with_quarantine(quarantined, fail_closed_catalog);
 
     // Connect concurrently so total time is the slowest server, not the sum. Each
     // thread hands back the server spec + dirty flag alongside the connection so we can
@@ -10989,6 +11104,60 @@ fn reconcile_quarantine(
     }
 }
 
+/// Install a registry-derived policy on the live router copy-on-write, the same
+/// way quarantine is applied: a request still holding the old `Arc` keeps it, and
+/// `execute_call` rechecks every dispatch against the live router, so nothing the
+/// new policy blocks goes out. Returns whether the policy changed.
+fn republish_registry_policy(router: &Arc<Mutex<Arc<Router>>>, policy: RegistryPolicy) -> bool {
+    edit_live_router(router, |live| {
+        (live.registry_policy() != policy).then(|| {
+            let mut next = live.clone();
+            next.apply_registry_policy(policy.clone());
+            next
+        })
+    })
+}
+
+/// How many times [`edit_live_router`] redoes an edit that lost a race with
+/// another writer before it falls back to editing under the lock.
+const LIVE_ROUTER_EDIT_ATTEMPTS: usize = 3;
+
+/// Swap in an edited copy of the live router without holding its lock while the
+/// edit runs. Re-filtering the aggregation locks every server slot, and an
+/// in-flight downstream call holds its slot for as long as it runs, so editing
+/// under the router lock would stall every new request behind one slow call.
+/// `edit` returns `None` when nothing changes. If another writer swaps the router
+/// first, the edit is redone on the newer one. Returns whether a router was swapped.
+fn edit_live_router(
+    router: &Arc<Mutex<Arc<Router>>>,
+    edit: impl Fn(&Router) -> Option<Router>,
+) -> bool {
+    let lock = || {
+        router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    for _ in 0..LIVE_ROUTER_EDIT_ATTEMPTS {
+        let current = lock().clone();
+        let Some(next) = edit(&current) else {
+            return false;
+        };
+        let mut guard = lock();
+        if Arc::ptr_eq(&guard, &current) {
+            *guard = Arc::new(next);
+            return true;
+        }
+    }
+    let mut guard = lock();
+    match edit(&guard) {
+        Some(next) => {
+            *guard = Arc::new(next);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Apply a target quarantine set to the live router, re-filtering (and telling the client)
 /// only if it actually differs. Split out from the disk read so the decision logic is
 /// testable without touching `conduit_dir()`, which memoizes per process and so can't be
@@ -11003,24 +11172,18 @@ fn reconcile_to(
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
     want: BTreeSet<String>,
 ) -> bool {
-    let changed = {
-        let mut guard = router
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The set alone is not the enforcement state: a fail-closed router hides
-        // everything while reporting an empty set, so comparing sets only would make a
-        // successful read of an empty store a no-op and leave the gateway dark until
-        // the process restarted (SBS-871).
-        if guard.quarantined() == &want && !guard.catalog_fail_closed() {
-            false
-        } else {
-            // make_mut clones only if an in-flight request still holds the old Arc, so a
-            // request mid-flight keeps serving its snapshot until it finishes.
-            let r = Arc::make_mut(&mut guard);
-            r.requarantine_from_store(want);
-            true
-        }
-    };
+    // The set alone is not the enforcement state: a fail-closed router hides
+    // everything while reporting an empty set, so comparing sets only would make a
+    // successful read of an empty store a no-op and leave the gateway dark until
+    // the process restarted (SBS-871). A request mid-flight keeps serving its
+    // snapshot until it finishes.
+    let changed = edit_live_router(router, |live| {
+        (live.quarantined() != &want || live.catalog_fail_closed()).then(|| {
+            let mut next = live.clone();
+            next.requarantine_from_store(want.clone());
+            next
+        })
+    });
     // Notify outside the router lock so a slow client write can't stall a request.
     if changed {
         // To the gateway log, not just stderr: MCP clients swallow a gateway's stderr, so a
@@ -11699,25 +11862,6 @@ fn watch_tick(
         // copy but skip the rebuild, so a routine sync never re-spawns every stdio server
         // (the leak that exhausted a user's RAM). Still rebuild when a downstream server
         // also signaled a change, so that path is never dropped.
-        let new_relevant = router_relevant(&new_reg);
-        if downstream_changed == 0 && new_relevant == state.last_relevant {
-            publish_registry(new_reg);
-            if routine_surface_changed || routine_catalog_changed {
-                notify_tools_changed(stdio, mcp_sessions);
-                eprintln!(
-                    "toolport: routine tool surface changed; notified clients without rebuilding downstream servers"
-                );
-            } else {
-                eprintln!(
-                    "toolport: registry changed (team metadata or instructions only); skipped rebuild"
-                );
-            }
-            return TickOutcome {
-                quarantine_changed,
-                idle_after_quarantine: false,
-            };
-        }
-        state.last_relevant = new_relevant;
         // The client's reported project root, read first so folder routing (SOU-188) can
         // fold into the profile resolution below AND place ${ROOT} servers in the rebuild.
         let root = client_root
@@ -11735,6 +11879,43 @@ fn watch_tick(
         } else {
             effective_profile(&new_reg, client_id, &env_owned, root.as_deref())
         };
+        // Enforce the new registry's policy on the live connections now (P1.3). A full
+        // rebuild below reconnects every server and can take seconds, and until it swaps
+        // in, calls would otherwise keep running under the old policy (REL-02). The
+        // router goes first so a request never pairs the new registry with old policy.
+        let policy = registry_policy(
+            &new_reg,
+            resolved.as_deref(),
+            http_mode,
+            host.daemon_mode.load(Ordering::SeqCst),
+        );
+        let policy_changed = republish_registry_policy(router, policy);
+        publish_registry(new_reg.clone());
+        if policy_changed {
+            host.invalidate_root_views();
+            host.invalidate_tool_scope_views();
+            notify_tools_changed(stdio, mcp_sessions);
+            glog("registry policy changed; enforcing it on live connections");
+            eprintln!("toolport: registry policy changed; enforcing it on live connections");
+        }
+        let new_relevant = router_relevant(&new_reg);
+        if downstream_changed == 0 && new_relevant == state.last_relevant {
+            if routine_surface_changed || routine_catalog_changed {
+                notify_tools_changed(stdio, mcp_sessions);
+                eprintln!(
+                    "toolport: routine tool surface changed; notified clients without rebuilding downstream servers"
+                );
+            } else {
+                eprintln!(
+                    "toolport: registry changed (team metadata or instructions only); skipped rebuild"
+                );
+            }
+            return TickOutcome {
+                quarantine_changed,
+                idle_after_quarantine: false,
+            };
+        }
+        state.last_relevant = new_relevant;
         // Capture the profile we were serving before this reload so the log can
         // show the transition - the single most useful line when diagnosing
         // "why can't this client see server X": it pins down which profile is
@@ -11782,10 +11963,8 @@ fn watch_tick(
         }
         let server_count = new_router.server_count();
         let tools = new_router.aggregated_tools();
-        // `previous_router` is snapshotted before `build_router` above (SBS-871),
-        // so it is already in scope here. Publish through `publish_registry` so
-        // the registry and its trust verdict land under one lock (SBS-900).
-        publish_registry(new_reg);
+        // The registry and its trust verdict were already published together,
+        // through `publish_registry`, before the rebuild (SBS-900).
         *router
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(new_router);
@@ -15012,6 +15191,74 @@ fn handle_client_notification(
     }
 }
 
+/// The live view of a daemon adapter's request on `profile`, which started on the
+/// registry `reg` with server scope `allowed` and project root `root`. The view is
+/// stale once any of those three no longer match the host.
+fn adapter_live_view(
+    host: &Arc<HostState>,
+    reg: &Registry,
+    profile: &str,
+    allowed: Option<&HashSet<String>>,
+    root: Option<String>,
+) -> LiveRouterResolver {
+    let expected = Arc::new((
+        profile.to_string(),
+        allowed.cloned(),
+        adapter_tool_scope(reg, profile),
+        root,
+    ));
+    // The root is read before the registry lock is taken, never under it.
+    let is_stale = {
+        let expected = Arc::clone(&expected);
+        move |current: &Registry, current_root: Option<String>| {
+            let (profile, scope, tool_scope, root) = &*expected;
+            let current_scope: HashSet<String> = current
+                .enabled_servers_for(profile)
+                .iter()
+                .map(|server| server.id.clone())
+                .collect();
+            scope.as_ref() != Some(&current_scope)
+                || *tool_scope != adapter_tool_scope(current, profile)
+                || current_root != *root
+        }
+    };
+    let is_stale = Arc::new(is_stale);
+    let stale = {
+        let host = Arc::clone(host);
+        let is_stale = Arc::clone(&is_stale);
+        Arc::new(move || {
+            let root = host.active_adapter_root();
+            is_stale(
+                &host
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                root,
+            )
+        })
+    };
+    let host = Arc::clone(host);
+    let resolve = Arc::new(move || {
+        let current = host
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if is_stale(&current, host.active_adapter_root()) {
+            return stale_live_view();
+        }
+        let (profile, scope, _, root) = &*expected;
+        let base = host
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let rooted = host.router_for_root(base, &current, root.as_deref(), scope.as_ref());
+        host.router_for_adapter_profile(rooted, &current, profile).0
+    });
+    LiveRouterResolver { stale, resolve }
+}
+
 /// One request in, one response out: wait for a cold cache / live router when
 /// the method needs it, self-heal an empty router on a call, then dispatch.
 /// Shared by the stdio loop and the HTTP server so they can't diverge.
@@ -15314,42 +15561,7 @@ fn process_request(
     }
     let live_view: Option<LiveRouterResolver> = if state.daemon_mode.load(Ordering::SeqCst) {
         adapter_profile.map(|profile| {
-            let host = Arc::clone(&state.host);
-            let profile = profile.to_string();
-            let expected_scope = allowed.cloned();
-            let expected_tool_scope = adapter_tool_scope(&reg, &profile);
-            let expected_root = adapter_root.clone();
-            Arc::new(move || {
-                let current = host
-                    .registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                let current_scope: HashSet<String> = current
-                    .enabled_servers_for(&profile)
-                    .iter()
-                    .map(|server| server.id.clone())
-                    .collect();
-                if expected_scope.as_ref() != Some(&current_scope)
-                    || expected_tool_scope != adapter_tool_scope(&current, &profile)
-                    || host.active_adapter_root() != expected_root
-                {
-                    return Arc::new(Router::new());
-                }
-                let base = host
-                    .router
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                let rooted = host.router_for_root(
-                    base,
-                    &current,
-                    expected_root.as_deref(),
-                    expected_scope.as_ref(),
-                );
-                host.router_for_adapter_profile(rooted, &current, &profile)
-                    .0
-            }) as LiveRouterResolver
+            adapter_live_view(&state.host, &reg, profile, allowed, adapter_root.clone())
         })
     } else {
         None
@@ -28233,6 +28445,284 @@ mod tests {
         );
     }
 
+    /// P1.3 / REL-02: a call holding the router it arrived with is refused at
+    /// dispatch once deny-destructive is republished on the live router, before the
+    /// rebuild lands, and never reaches the downstream server.
+    #[test]
+    fn execute_call_rechecks_a_republished_policy_before_dispatch() {
+        let _data_env = DataDirTestEnv::new("execute_call_rechecks_republished_policy");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::with_policy(ToolPolicy::default());
+        for (id, destructive) in [("db", true), ("ro", false)] {
+            router.add(
+                DownstreamServer::connect(
+                    id.to_string(),
+                    Box::new(CountingRoute {
+                        calls: Arc::clone(&calls),
+                        destructive,
+                    }),
+                )
+                .unwrap(),
+            );
+        }
+        let snapshot = Arc::new(router);
+        let cached = snapshot.aggregated_tools();
+        let live = Arc::new(Mutex::new(Arc::clone(&snapshot)));
+        let mut policy = snapshot.registry_policy();
+        policy.deny_destructive = true;
+        assert!(republish_registry_policy(&live, policy.clone()));
+        assert!(
+            !republish_registry_policy(&live, policy),
+            "an identical policy is not a change"
+        );
+        let call = |name: &str| {
+            execute_call(
+                &Registry::default(),
+                &snapshot,
+                &cached,
+                Some("test"),
+                None,
+                None,
+                None,
+                Some(&ConfirmGuard::new()),
+                name,
+                json!({}),
+                None,
+                None,
+                CallOpts {
+                    confirmed: true,
+                    shape: false,
+                    allow_app_only: true,
+                },
+                Some(&live),
+            )
+        };
+
+        let denied = call("db__work");
+        assert_eq!(denied["isError"], true, "got {denied}");
+        assert!(
+            denied.to_string().contains("destructive-tool policy"),
+            "got {denied}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "nothing may reach downstream"
+        );
+
+        let allowed = call("ro__work");
+        assert_ne!(allowed["isError"], true, "got {allowed}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// P1.3: a daemon adapter's request keeps its view of the profile it started on.
+    /// Turning a server off in that profile (while another profile keeps it, so the
+    /// base router still connects it) refuses every later dispatch of the request.
+    /// The stale view used to resolve to an empty router with no server limit, which
+    /// the per-dispatch recheck read as "allow everything".
+    #[test]
+    fn daemon_recheck_refuses_dispatch_once_the_adapter_profile_changes() {
+        let _data_env = DataDirTestEnv::new("daemon_recheck_refuses_stale_profile");
+        let mut reg = Registry::default();
+        reg.servers.push(stub_server("a", "A"));
+        reg.servers.push(stub_server("x", "X"));
+        reg.profiles.clear();
+        for (id, servers) in [("p", vec!["a", "x"]), ("q", vec!["x"])] {
+            reg.profiles.push(registry::Profile {
+                id: id.into(),
+                name: id.to_uppercase(),
+                enabled_server_ids: servers.into_iter().map(String::from).collect(),
+                tool_scope: HashMap::new(),
+                instructions: None,
+            });
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::with_policy(
+            registry_policy(&reg, None, false, true).with_quarantine(BTreeSet::new(), false),
+        );
+        for id in ["a", "x"] {
+            router.add(
+                DownstreamServer::connect(
+                    id.to_string(),
+                    Box::new(CountingRoute {
+                        calls: Arc::clone(&calls),
+                        destructive: false,
+                    }),
+                )
+                .unwrap(),
+            );
+        }
+        let host = Arc::new(host_from_parts(
+            Arc::new(Mutex::new(reg.clone())),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(Mutex::new(Arc::new(router))),
+            Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(|_| None),
+            Arc::new(Mutex::new(())),
+            None,
+            None,
+        ));
+        host.daemon_mode.store(true, Ordering::SeqCst);
+        let allowed: HashSet<String> = reg
+            .enabled_servers_for("p")
+            .iter()
+            .map(|server| server.id.clone())
+            .collect();
+        let _live_view = LiveRouterResolverGuard::enter(Some(adapter_live_view(
+            &host,
+            &reg,
+            "p",
+            Some(&allowed),
+            None,
+        )));
+        let snapshot = host.router.lock().unwrap().clone();
+        let cached = snapshot.aggregated_tools();
+        let call = |name: &str| {
+            execute_call(
+                &reg,
+                &snapshot,
+                &cached,
+                Some("test"),
+                None,
+                Some(&allowed),
+                None,
+                Some(&ConfirmGuard::new()),
+                name,
+                json!({}),
+                None,
+                None,
+                CallOpts {
+                    confirmed: true,
+                    shape: false,
+                    allow_app_only: true,
+                },
+                Some(&host.router),
+            )
+        };
+
+        let allowed_call = call("x__work");
+        assert_ne!(allowed_call["isError"], true, "got {allowed_call}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        host.registry.lock().unwrap().profiles[0].enabled_server_ids = vec!["a".to_string()];
+        let denied = call("x__work");
+        assert_eq!(denied["isError"], true, "got {denied}");
+        assert!(
+            denied.to_string().contains("profile changed"),
+            "got {denied}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "nothing may reach downstream"
+        );
+        assert!(
+            recheck_live_policy(&snapshot, Some(&host.router), DispatchTarget::Server("x"))
+                .is_err()
+        );
+
+        // Post-HITL revalidation still sees the stale view as routing nothing.
+        let live = clone_live_router(Some(&host.router)).unwrap();
+        assert!(live.route_of("x__work").is_none());
+        assert!(live.authorize(DispatchTarget::Server("a")).is_err());
+    }
+
+    struct BlockingRoute {
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl conduit_lib::downstream::Transport for BlockingRoute {
+        fn request(
+            &mut self,
+            method: &str,
+            _params: Value,
+        ) -> Result<Value, conduit_lib::downstream::TransportError> {
+            match method {
+                "initialize" => Ok(json!({ "protocolVersion": "2025-06-18" })),
+                "tools/list" => Ok(json!({
+                    "tools": [{
+                        "name": "work",
+                        "description": "fixture",
+                        "inputSchema": { "type": "object" }
+                    }]
+                })),
+                "tools/call" => {
+                    self.started.send(()).ok();
+                    self.release.recv().ok();
+                    Ok(json!({ "content": [], "isError": false }))
+                }
+                other => Err(conduit_lib::downstream::TransportError::Fatal(format!(
+                    "unexpected {other}"
+                ))),
+            }
+        }
+
+        fn notify(
+            &mut self,
+            _method: &str,
+            _params: Value,
+        ) -> Result<(), conduit_lib::downstream::TransportError> {
+            Ok(())
+        }
+    }
+
+    /// P1.3: republishing a policy re-filters the aggregation, which waits for every
+    /// server slot. A long downstream call holds its slot, so the republish must not
+    /// hold the router lock meanwhile, or every new request would wait on that call.
+    #[test]
+    fn policy_republish_does_not_hold_the_router_lock_while_a_call_runs() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut router = Router::with_policy(ToolPolicy::default());
+        router.add(
+            DownstreamServer::connect(
+                "slow".to_string(),
+                Box::new(BlockingRoute {
+                    started: started_tx,
+                    release: release_rx,
+                }),
+            )
+            .unwrap(),
+        );
+        let live = Arc::new(Mutex::new(Arc::new(router)));
+        let snapshot = live.lock().unwrap().clone();
+        let call = std::thread::spawn(move || snapshot.route_call("slow__work", json!({})));
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the slow call started");
+
+        let mut policy = live.lock().unwrap().registry_policy();
+        policy.deny_destructive = true;
+        let republish = {
+            let live = Arc::clone(&live);
+            std::thread::spawn(move || republish_registry_policy(&live, policy))
+        };
+        // Give the republish time to reach the slot the call holds.
+        std::thread::sleep(Duration::from_millis(200));
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        {
+            let live = Arc::clone(&live);
+            std::thread::spawn(move || {
+                drop(
+                    live.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                locked_tx.send(()).ok();
+            });
+        }
+        let new_request = locked_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        assert!(
+            new_request.is_ok(),
+            "a new request must not wait on the slow call"
+        );
+        assert!(republish.join().unwrap());
+        assert!(call.join().unwrap().is_ok());
+        assert!(live.lock().unwrap().registry_policy().deny_destructive);
+    }
+
     #[test]
     fn execute_call_reports_an_unknown_tool_the_same_with_or_without_scope() {
         let _data_env = DataDirTestEnv::new("execute_call_reports_an_unknown_tool");
@@ -32964,10 +33454,11 @@ mod tests {
             last_routines_mtime: None,
         };
         let server_handler: ServerRequestHandler = Arc::new(|_| None);
+        let router = router_with_registry_policy(&live);
         let host = host_from_parts(
             Arc::new(Mutex::new(live)),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(Mutex::new(Arc::new(Router::new()))),
+            Arc::new(Mutex::new(Arc::new(router))),
             Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
             Arc::new(AtomicU8::new(0)),
             server_handler,
@@ -33372,6 +33863,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// An empty router carrying the policy `build_router` installs for `reg`, so a
+    /// watcher tick that changes no policy leaves the live router alone.
+    fn router_with_registry_policy(reg: &Registry) -> Router {
+        Router::with_policy(
+            registry_policy(reg, None, false, false).with_quarantine(BTreeSet::new(), false),
+        )
+    }
+
     #[test]
     fn routine_write_toggle_refreshes_tools_without_rebuilding_the_router() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
@@ -33384,7 +33883,7 @@ mod tests {
 
         let registry = Arc::new(Mutex::new(Registry::default()));
         let registry_trusted = Arc::new(AtomicBool::new(true));
-        let original_router = Arc::new(Router::new());
+        let original_router = Arc::new(router_with_registry_policy(&Registry::default()));
         let router = Arc::new(Mutex::new(Arc::clone(&original_router)));
         let stdio = test_stdio_session();
         let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default())));

@@ -442,6 +442,11 @@ fn split_camel_lower(word: &str) -> Vec<String> {
 /// per-tool toggle and the global destructive-tool deny switch.
 #[derive(Default, Clone)]
 pub struct ToolPolicy {
+    /// Server ids this router may dispatch to. `None` sets no limit (tests and the
+    /// startup placeholder). A server that drops out of the registry's enabled set
+    /// is refused as soon as the policy is republished, even though its connection
+    /// stays up until the next rebuild.
+    pub servers: Option<HashSet<String>>,
     /// server id -> original tool names the user switched off.
     pub disabled: HashMap<String, HashSet<String>>,
     /// server id -> the ONLY original tool names the active profile exposes (tool-granular
@@ -463,6 +468,13 @@ pub struct ToolPolicy {
 }
 
 impl ToolPolicy {
+    /// Whether this policy lets a request reach `server_id` at all.
+    pub fn allows_server(&self, server_id: &str) -> bool {
+        self.servers
+            .as_ref()
+            .is_none_or(|servers| servers.contains(server_id))
+    }
+
     /// Reason this tool is blocked, or `None` if it may be exposed. `exposed` is the
     /// namespaced client-facing name (what quarantine is keyed by).
     fn blocked_reason(
@@ -472,13 +484,6 @@ impl ToolPolicy {
         orig: &str,
         tool: &Value,
     ) -> Option<&'static str> {
-        if self
-            .disabled
-            .get(server_id)
-            .is_some_and(|set| set.contains(orig))
-        {
-            return Some("disabled");
-        }
         // Tool-granular profile scope: if this server is narrowed to an allow-list, a tool
         // not on it is outside the active profile's scope (hidden + blocked, same as disabled).
         if self
@@ -487,6 +492,29 @@ impl ToolPolicy {
             .is_some_and(|set| !set.contains(orig))
         {
             return Some("outside the active profile's tool scope");
+        }
+        self.blocked_reason_unscoped(exposed, server_id, orig, tool)
+    }
+
+    /// [`Self::blocked_reason`] without the tool-granular profile scope. Daemon
+    /// adapter views replace the base router's scope with their own, so a recheck
+    /// against the live base router must not apply the base's scope to them.
+    fn blocked_reason_unscoped(
+        &self,
+        exposed: &str,
+        server_id: &str,
+        orig: &str,
+        tool: &Value,
+    ) -> Option<&'static str> {
+        if !self.allows_server(server_id) {
+            return Some("on a server that is turned off");
+        }
+        if self
+            .disabled
+            .get(server_id)
+            .is_some_and(|set| set.contains(orig))
+        {
+            return Some("disabled");
         }
         if self.deny_destructive && is_destructive(tool) {
             return Some("blocked by the destructive-tool policy");
@@ -499,6 +527,43 @@ impl ToolPolicy {
         }
         None
     }
+}
+
+/// The part of [`ToolPolicy`] that comes from the registry alone. Quarantine has its
+/// own store and reconcile path, so republishing this leaves quarantine untouched.
+#[derive(Default, Clone, PartialEq, Debug)]
+pub struct RegistryPolicy {
+    pub servers: Option<HashSet<String>>,
+    pub disabled: HashMap<String, HashSet<String>>,
+    pub allow: HashMap<String, HashSet<String>>,
+    pub deny_destructive: bool,
+}
+
+impl RegistryPolicy {
+    /// The full policy, with the quarantine state supplied separately.
+    pub fn with_quarantine(
+        self,
+        quarantined: BTreeSet<String>,
+        fail_closed_catalog: bool,
+    ) -> ToolPolicy {
+        ToolPolicy {
+            servers: self.servers,
+            disabled: self.disabled,
+            allow: self.allow,
+            deny_destructive: self.deny_destructive,
+            quarantined,
+            fail_closed_catalog,
+        }
+    }
+}
+
+/// What a downstream dispatch is about to touch, for [`Router::authorize`].
+#[derive(Clone, Copy, Debug)]
+pub enum DispatchTarget<'a> {
+    /// A tool, by its exposed (client-facing) name.
+    Tool(&'a str),
+    /// A resource, subscription, prompt, completion or task request to a server.
+    Server(&'a str),
 }
 
 /// One connected downstream server behind its own lock. A call to it only blocks
@@ -865,10 +930,7 @@ fn client_safe_error(error: &str) -> String {
         }
     } else if lower.contains("failed to spawn") {
         "the server command could not be started".to_string()
-    } else if lower.contains("broken pipe")
-        || lower.contains("eof")
-        || lower.contains("closed")
-    {
+    } else if lower.contains("broken pipe") || lower.contains("eof") || lower.contains("closed") {
         "the server closed the connection".to_string()
     } else if lower.contains("vault") || lower.contains("keychain") || lower.contains("keyring") {
         "its stored credentials could not be read".to_string()
@@ -1066,6 +1128,97 @@ impl Router {
         view.policy.allow = allow;
         view.rebuild_preserving_restored();
         view
+    }
+
+    /// The registry-derived half of the policy this router enforces.
+    pub fn registry_policy(&self) -> RegistryPolicy {
+        RegistryPolicy {
+            servers: self.policy.servers.clone(),
+            disabled: self.policy.disabled.clone(),
+            allow: self.policy.allow.clone(),
+            deny_destructive: self.policy.deny_destructive,
+        }
+    }
+
+    /// Enforce a new registry-derived policy on the connections this router
+    /// already holds, without reconnecting anything. The gateway calls this as soon
+    /// as it reads a changed registry, so a switch like deny-destructive takes
+    /// effect before a rebuild that can take seconds. Returns false when nothing
+    /// changed. Quarantine state is left as it is.
+    pub fn apply_registry_policy(&mut self, policy: RegistryPolicy) -> bool {
+        if self.registry_policy() == policy {
+            return false;
+        }
+        let ToolPolicy {
+            quarantined,
+            fail_closed_catalog,
+            ..
+        } = std::mem::take(&mut self.policy);
+        self.policy = policy.with_quarantine(quarantined, fail_closed_catalog);
+        self.rebuild_preserving_restored();
+        true
+    }
+
+    /// The one policy decision every downstream dispatch goes through. It reads
+    /// only the policy installed on this router, which the gateway republishes on
+    /// every registry change. A name this router does not know is not a policy
+    /// denial; routing reports it.
+    pub fn authorize(&self, target: DispatchTarget<'_>) -> Result<(), String> {
+        match target {
+            DispatchTarget::Tool(exposed) => {
+                if let Some(reason) = self.blocked.get(exposed) {
+                    return Err(format!("tool '{exposed}' is {reason}"));
+                }
+                match self.routes.get(exposed) {
+                    Some((server_id, _)) => self.authorize(DispatchTarget::Server(server_id)),
+                    None => Ok(()),
+                }
+            }
+            DispatchTarget::Server(server_id) => {
+                if self.policy.allows_server(server_id) {
+                    Ok(())
+                } else {
+                    Err(format!("server '{server_id}' is turned off"))
+                }
+            }
+        }
+    }
+
+    /// Recheck a dispatch this router is about to make against the policy of a
+    /// newer `live` router. A request keeps the router it started with, so without
+    /// this a call admitted just before a policy change would still go out under
+    /// the old policy. Tool-granular scope is skipped: daemon adapter views carry
+    /// their own scope, which the live base router does not know.
+    pub fn recheck_live_policy(
+        &self,
+        live: &Router,
+        target: DispatchTarget<'_>,
+    ) -> Result<(), String> {
+        match target {
+            DispatchTarget::Tool(exposed) => {
+                let Some((server_id, orig)) = self.routes.get(exposed) else {
+                    return Ok(());
+                };
+                // Only the destructive switch reads the definition; skip the scan
+                // on the common path.
+                let definition = if live.policy.deny_destructive {
+                    self.tools
+                        .iter()
+                        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(exposed))
+                        .unwrap_or(&Value::Null)
+                } else {
+                    &Value::Null
+                };
+                match live
+                    .policy
+                    .blocked_reason_unscoped(exposed, server_id, orig, definition)
+                {
+                    Some(reason) => Err(format!("tool '{exposed}' is {reason}")),
+                    None => Ok(()),
+                }
+            }
+            DispatchTarget::Server(_) => live.authorize(target),
+        }
     }
 
     /// Index one server's advertised tools/resources/templates/prompts into the
@@ -2032,6 +2185,14 @@ impl Router {
         }
     }
 
+    /// [`Self::slot_for`] behind [`Self::authorize`], for every dispatch except
+    /// cleanup (unsubscribe, task cancel), which must still reach a server that was
+    /// turned off.
+    fn authorized_slot(&self, server_id: &str) -> Result<Arc<ServerSlot>, String> {
+        self.authorize(DispatchTarget::Server(server_id))?;
+        self.slot_for(server_id)
+    }
+
     /// The slot owning `server_id`, as a cloned `Arc` so the caller can lock and
     /// use it after dropping any borrow of the router (this is what lets the
     /// downstream call run without holding the router lock).
@@ -2247,14 +2408,12 @@ impl Router {
         meta: Option<&Value>,
         mrtr: Option<&MrtrRequest>,
     ) -> Result<Value, String> {
-        if let Some(reason) = self.blocked.get(exposed_name) {
-            return Err(format!("tool '{exposed_name}' is {reason}"));
-        }
+        self.authorize(DispatchTarget::Tool(exposed_name))?;
         let (server_id, tool) = self
             .routes
             .get(exposed_name)
             .ok_or_else(|| self.no_route_message(exposed_name))?;
-        let slot = self.slot_for(server_id)?;
+        let slot = self.authorized_slot(server_id)?;
         let (result, downstream_supports_tasks) = self.call_with_retry(
             &slot,
             cancel.as_ref(),
@@ -2316,7 +2475,13 @@ impl Router {
             .ok_or_else(|| format!("{method} requires params.taskId"))?
             .to_string();
         let (server_id, native_task_id) = decode_task_id(&exposed)?;
-        let slot = self.slot_for(&server_id)?;
+        // Cancelling stops work the server already took on, so like unsubscribe
+        // cleanup it still reaches a server that was turned off since.
+        let slot = if method == "tasks/cancel" {
+            self.slot_for(&server_id)?
+        } else {
+            self.authorized_slot(&server_id)?
+        };
         let mut forwarded = params;
         forwarded["taskId"] = json!(native_task_id);
         let result = self.call_with_retry(
@@ -2478,7 +2643,7 @@ impl Router {
             .resource_server(uri)
             .ok_or_else(|| format!("no server owns resource '{uri}'"))?
             .to_string();
-        let slot = self.slot_for(&server_id)?;
+        let slot = self.authorized_slot(&server_id)?;
         self.call_with_retry(
             &slot,
             cancel.as_ref(),
@@ -2496,7 +2661,7 @@ impl Router {
             .resource_server(uri)
             .ok_or_else(|| format!("no server owns resource '{uri}'"))?
             .to_string();
-        let slot = self.slot_for(&server_id)?;
+        let slot = self.authorized_slot(&server_id)?;
         self.call_with_retry(
             &slot,
             None,
@@ -2566,7 +2731,7 @@ impl Router {
             .get(exposed_name)
             .cloned()
             .ok_or_else(|| format!("no route for prompt '{exposed_name}'"))?;
-        let slot = self.slot_for(&server_id)?;
+        let slot = self.authorized_slot(&server_id)?;
         self.call_with_retry(
             &slot,
             cancel.as_ref(),
@@ -2596,7 +2761,7 @@ impl Router {
         cancel: Option<CancelContext>,
     ) -> Result<Value, String> {
         let (server_id, forwarded) = self.resolve_completion(&params)?;
-        let slot = self.slot_for(&server_id)?;
+        let slot = self.authorized_slot(&server_id)?;
         self.call_with_retry(
             &slot,
             cancel.as_ref(),
@@ -5605,9 +5770,18 @@ mod tests {
                 "could not read secret 'API_KEY' from the vault: locked",
                 "its stored credentials could not be read",
             ),
-            ("failed to spawn 'npx': No such file", "the server command could not be started"),
-            ("timed out waiting for 'initialize' response", "the server did not answer in time"),
-            ("write failed: Broken pipe (os error 32)", "the server closed the connection"),
+            (
+                "failed to spawn 'npx': No such file",
+                "the server command could not be started",
+            ),
+            (
+                "timed out waiting for 'initialize' response",
+                "the server did not answer in time",
+            ),
+            (
+                "write failed: Broken pipe (os error 32)",
+                "the server closed the connection",
+            ),
             ("mock said: hunter2", "the connection failed"),
         ] {
             let shown = client_safe_error(raw);
@@ -5627,5 +5801,197 @@ mod tests {
             state.record_failure(failure("dns", false), &backoff, t0, 1.2);
         }
         assert_eq!(state.next_attempt, t0 + backoff.cap);
+    }
+
+    fn destructive_db() -> DownstreamServer {
+        DownstreamServer::connect("db".to_string(), Box::new(DestructiveMock)).unwrap()
+    }
+
+    fn exposed_names(router: &Router) -> Vec<String> {
+        router
+            .aggregated_tools()
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(String::from))
+            .collect()
+    }
+
+    /// P1.3: every dispatch path goes through `authorize`, so a server outside the
+    /// policy's server set is refused for tools, resources, subscriptions, prompts
+    /// and completions alike. Unsubscribe cleanup still reaches it.
+    #[test]
+    fn authorize_refuses_every_dispatch_to_a_server_outside_the_policy() {
+        let mut router = Router::with_policy(ToolPolicy {
+            servers: Some(HashSet::from(["a".to_string()])),
+            ..Default::default()
+        });
+        router.add(mock_server("a"));
+        router.add(mock_server("b"));
+
+        assert!(router.route_call("a__echo", json!({})).is_ok());
+        let tool = router.route_call("b__echo", json!({})).unwrap_err();
+        assert!(tool.contains("turned off"), "{tool}");
+        assert!(!exposed_names(&router).contains(&"b__echo".to_string()));
+
+        assert!(router.read_resource("a://readme").is_ok());
+        let read = router.read_resource("b://readme").unwrap_err();
+        assert!(read.contains("server 'b' is turned off"), "{read}");
+        let sub = router.subscribe_resource("b://readme").unwrap_err();
+        assert!(sub.contains("server 'b' is turned off"), "{sub}");
+        assert!(router
+            .unsubscribe_resource_on_server("b", "b://readme")
+            .is_ok());
+
+        assert!(router.get_prompt("a__greet", json!({})).is_ok());
+        let prompt = router.get_prompt("b__greet", json!({})).unwrap_err();
+        assert!(prompt.contains("server 'b' is turned off"), "{prompt}");
+
+        let complete = |name: &str| {
+            router.complete(json!({
+                "ref": { "type": "ref/prompt", "name": name },
+                "argument": { "name": "x", "value": "y" }
+            }))
+        };
+        assert!(complete("a__greet").is_ok());
+        let completion = complete("b__greet").unwrap_err();
+        assert!(
+            completion.contains("server 'b' is turned off"),
+            "{completion}"
+        );
+    }
+
+    /// P1.3 / REL-02: a registry policy republished on a live router takes effect on
+    /// the connections it already holds, with no rebuild, and leaves quarantine alone.
+    #[test]
+    fn republished_registry_policy_applies_without_reconnecting() {
+        let mut router = Router::with_policy(ToolPolicy {
+            servers: Some(HashSet::from(["db".to_string()])),
+            ..Default::default()
+        });
+        router.add(destructive_db());
+        router.requarantine_from_store(BTreeSet::from(["db__list_tables".to_string()]));
+        assert!(router.route_call("db__drop_table", json!({})).is_ok());
+
+        let mut policy = router.registry_policy();
+        policy.deny_destructive = true;
+        assert!(router.apply_registry_policy(policy.clone()));
+        assert!(
+            !router.apply_registry_policy(policy),
+            "an identical policy is not a change"
+        );
+
+        let err = router.route_call("db__drop_table", json!({})).unwrap_err();
+        assert!(err.contains("destructive-tool policy"), "{err}");
+        assert!(!exposed_names(&router).contains(&"db__drop_table".to_string()));
+        assert!(
+            router.route_call("db__list_tables", json!({})).is_err(),
+            "quarantine must survive a registry policy republish"
+        );
+        assert_eq!(
+            router.quarantined(),
+            &BTreeSet::from(["db__list_tables".to_string()])
+        );
+
+        // Turning the switch back off restores the tool on the same connection.
+        let mut policy = router.registry_policy();
+        policy.deny_destructive = false;
+        assert!(router.apply_registry_policy(policy));
+        assert!(router.route_call("db__drop_table", json!({})).is_ok());
+    }
+
+    /// P1.3: a request keeps the router it arrived with. Rechecking against the live
+    /// router refuses what the newer policy blocks, but ignores tool-granular scope,
+    /// which daemon adapter views set for themselves.
+    #[test]
+    fn recheck_live_policy_applies_newer_policy_to_an_older_snapshot() {
+        let mut snapshot = Router::with_policy(ToolPolicy {
+            servers: Some(HashSet::from(["db".to_string()])),
+            ..Default::default()
+        });
+        snapshot.add(destructive_db());
+
+        let mut live = snapshot.clone();
+        let mut policy = live.registry_policy();
+        policy.deny_destructive = true;
+        live.apply_registry_policy(policy);
+        let err = snapshot
+            .recheck_live_policy(&live, DispatchTarget::Tool("db__drop_table"))
+            .unwrap_err();
+        assert!(err.contains("destructive-tool policy"), "{err}");
+        assert!(snapshot
+            .recheck_live_policy(&live, DispatchTarget::Tool("db__list_tables"))
+            .is_ok());
+
+        let mut scoped = snapshot.clone();
+        let mut policy = scoped.registry_policy();
+        policy.allow =
+            HashMap::from([("db".to_string(), HashSet::from(["list_tables".to_string()]))]);
+        scoped.apply_registry_policy(policy);
+        assert!(
+            snapshot
+                .recheck_live_policy(&scoped, DispatchTarget::Tool("db__drop_table"))
+                .is_ok(),
+            "the live base router's tool scope must not narrow an adapter view"
+        );
+
+        let mut off = snapshot.clone();
+        let mut policy = off.registry_policy();
+        policy.servers = Some(HashSet::new());
+        off.apply_registry_policy(policy);
+        assert!(snapshot
+            .recheck_live_policy(&off, DispatchTarget::Tool("db__list_tables"))
+            .unwrap_err()
+            .contains("turned off"));
+        assert!(snapshot
+            .recheck_live_policy(&off, DispatchTarget::Server("db"))
+            .is_err());
+    }
+
+    /// P1.3: a task on a server that was just turned off can no longer be polled or
+    /// updated, but it can still be cancelled, like unsubscribe cleanup.
+    #[test]
+    fn task_cancel_still_reaches_a_server_that_was_turned_off() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut router = Router::with_policy(ToolPolicy {
+            servers: Some(HashSet::from(["alpha".to_string()])),
+            ..Default::default()
+        });
+        router.add(task_server("alpha", Arc::clone(&seen)));
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": crate::downstream::MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": { "io.modelcontextprotocol/tasks": {} }
+            }
+        });
+        let started = router
+            .route_call_with_cancel("alpha__job", json!({}), None, Some(&meta))
+            .unwrap();
+        let task_id = started["taskId"].as_str().unwrap();
+
+        let mut policy = router.registry_policy();
+        policy.servers = Some(HashSet::new());
+        assert!(router.apply_registry_policy(policy));
+        for method in ["tasks/get", "tasks/update"] {
+            let err = router
+                .route_task(method, json!({ "taskId": task_id }), None, Some(&meta))
+                .unwrap_err();
+            assert!(
+                err.contains("server 'alpha' is turned off"),
+                "{method}: {err}"
+            );
+        }
+        let cancelled = router
+            .route_task(
+                "tasks/cancel",
+                json!({ "taskId": task_id }),
+                None,
+                Some(&meta),
+            )
+            .unwrap();
+        assert_eq!(cancelled["taskId"], task_id);
+        assert!(seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, _)| method == "tasks/cancel"));
     }
 }
