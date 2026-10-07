@@ -273,27 +273,19 @@ impl ClientConfigReceipt {
     }
 
     fn rollback(&self) -> Result<(), String> {
-        let current = std::fs::read(&self.target)
-            .map_err(|error| format!("could not read the client config for rollback: {error}"))?;
-        if current != self.written {
-            return Err(
-                "the client config changed again, so Toolport left the newer file untouched".into(),
-            );
-        }
+        let dir = registry::conduit_dir().ok_or("Could not resolve data dir")?;
+        let _lock = registry::lock_at(&dir.join("client-config-mutation"))?;
+        let check = || {
+            let current = std::fs::read(&self.target).map_err(|e| e.to_string())?;
+            if current != self.written { return Err("the client config changed again, so Toolport left the newer file untouched".into()); }
+            Ok(())
+        };
         match &self.backup {
             Some(backup) => {
-                let original = std::fs::read_to_string(backup)
-                    .map_err(|error| format!("could not read the client config backup: {error}"))?;
-                registry::atomic_write(&self.target, &original)
-                    .map_err(|error| format!("could not restore the client config backup: {error}"))
+                let original = std::fs::read_to_string(backup).map_err(|e| e.to_string())?;
+                registry::atomic_write_checked(&self.target, &original, check)
             }
-            None => match std::fs::remove_file(&self.target) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(format!(
-                    "could not remove the newly created client config: {error}"
-                )),
-            },
+            None => registry::remove_file_checked(&self.target, check),
         }
     }
 }
@@ -2715,6 +2707,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let _data_lock = registry::data_dir_test_lock();
+        let _data_dir = registry::DataDirOverride::set(dir.join("data"));
         let target = dir.join("client.json");
         let backup = dir.join("backup.json");
         std::fs::write(&backup, "original config").unwrap();
@@ -2744,6 +2738,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let _data_lock = registry::data_dir_test_lock();
+        let _data_dir = registry::DataDirOverride::set(dir.join("data"));
         let target = dir.join("client.json");
         std::fs::write(&target, "connected config").unwrap();
         let outcome = WriteOutcome {
@@ -2771,6 +2767,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let _data_lock = registry::data_dir_test_lock();
+        let _data_dir = registry::DataDirOverride::set(dir.join("data"));
         let target = dir.join("client.json");
         let backup = dir.join("backup.json");
         std::fs::write(&backup, "original config").unwrap();

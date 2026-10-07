@@ -40,6 +40,12 @@ fn root_from_content(content: &str) -> Result<Value, String> {
 }
 
 fn read_root(path: &Path) -> Result<(Value, Option<String>), String> {
+    if let Some(staged) = mutation::read(path) {
+        return match staged {
+            Some(content) => Ok((root_from_content(&content)?, Some(content))),
+            None => Ok((serde_json::json!({}), None)),
+        };
+    }
     match std::fs::metadata(path) {
         Ok(_) => {
             let content = read_config_file(path)?;

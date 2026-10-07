@@ -1,0 +1,370 @@
+//! One cross-process Toolport lock and optimistic revisions for client writers.
+//! Native clients do not take our lock. Re-render on unrelated edits, refuse
+//! overlapping edits, and check again immediately before each rename.
+use super::*;
+use serde_json::Value;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+#[derive(Default)]
+struct Pending {
+    path: PathBuf,
+    original: Option<String>,
+    output: Option<String>,
+    auxiliary: BTreeMap<PathBuf, String>,
+    strict_json: bool,
+}
+
+thread_local! {
+    static PENDING: RefCell<Option<Pending>> = const { RefCell::new(None) };
+}
+
+struct Clear;
+impl Drop for Clear {
+    fn drop(&mut self) {
+        PENDING.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+pub(super) fn read(path: &Path) -> Option<Option<String>> {
+    PENDING.with(|slot| {
+        let slot = slot.borrow();
+        let pending = slot.as_ref()?;
+        if path == pending.path {
+            Some(pending.output.clone().or_else(|| pending.original.clone()))
+        } else {
+            pending.auxiliary.get(path).cloned().map(Some)
+        }
+    })
+}
+
+pub(super) fn exists(path: &Path) -> bool {
+    read(path).map_or_else(|| path.exists(), |text| text.is_some())
+}
+
+pub(super) fn strict_json(path: &Path) -> bool {
+    PENDING.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|p| p.path == path && p.strict_json)
+    }) || path.file_name().is_some_and(|name| name == ".claude.json")
+}
+
+pub(super) fn write(path: &Path, contents: &str) -> Result<(), String> {
+    let staged = PENDING.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(pending) = slot.as_mut() else {
+            return false;
+        };
+        if path == pending.path {
+            pending.output = Some(contents.into());
+        } else {
+            pending.auxiliary.insert(path.into(), contents.into());
+        }
+        true
+    });
+    if staged {
+        Ok(())
+    } else {
+        crate::registry::atomic_write(path, contents)
+    }
+}
+
+fn disk(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::metadata(path) {
+        Ok(_) => super::read_config_file_disk(path).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "could not stat {} before editing: {e}",
+            path.display()
+        )),
+    }
+}
+
+pub(super) fn value(format: Format, text: Option<&str>) -> Result<Value, String> {
+    let Some(text) = text.filter(|text| !text.trim().is_empty()) else {
+        return Ok(serde_json::json!({}));
+    };
+    match format {
+        Format::TomlMcpServers => {
+            serde_json::to_value(read_existing_toml(text)?).map_err(|e| e.to_string())
+        }
+        Format::YamlExtensions | Format::YamlMcpServers | Format::YamlMcpServersList => {
+            serde_json::to_value(parse_existing_yaml_content(text)?).map_err(|e| e.to_string())
+        }
+        _ => parse_json_value(text),
+    }
+}
+
+pub(super) fn changes(
+    before: Option<&Value>,
+    after: Option<&Value>,
+    path: &mut Vec<String>,
+    out: &mut Vec<Vec<String>>,
+) {
+    if before == after {
+        return;
+    }
+    if let (Some(Value::Object(before)), Some(Value::Object(after))) = (before, after) {
+        let keys: std::collections::BTreeSet<_> = before.keys().chain(after.keys()).collect();
+        for key in keys {
+            path.push(key.clone());
+            changes(before.get(key), after.get(key), path, out);
+            path.pop();
+        }
+    } else {
+        out.push(path.clone());
+    }
+}
+
+fn unrelated(
+    format: Format,
+    original: Option<&str>,
+    output: Option<&str>,
+    current: Option<&str>,
+) -> Result<bool, String> {
+    // File deletion/creation is consequential even when its parsed value is {}.
+    if original.is_some() != current.is_some() {
+        return Ok(false);
+    }
+    let before = value(format, original)?;
+    let after = value(format, output)?;
+    let native = value(format, current)?;
+    let mut ours = Vec::new();
+    let mut theirs = Vec::new();
+    changes(Some(&before), Some(&after), &mut Vec::new(), &mut ours);
+    changes(Some(&before), Some(&native), &mut Vec::new(), &mut theirs);
+    Ok(!ours
+        .iter()
+        .any(|a| theirs.iter().any(|b| a.starts_with(b) || b.starts_with(a))))
+}
+
+struct AuxiliaryReceipt {
+    path: PathBuf,
+    previous: Option<String>,
+}
+fn checkpoint(path: &Path) -> Result<AuxiliaryReceipt, String> {
+    let previous = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    Ok(AuxiliaryReceipt {
+        path: path.into(),
+        previous,
+    })
+}
+impl AuxiliaryReceipt {
+    fn rollback(self) -> Result<(), String> {
+        match self.previous {
+            Some(text) => crate::registry::atomic_write(&self.path, &text),
+            None => std::fs::remove_file(self.path).map_err(|e| e.to_string()),
+        }
+    }
+}
+
+pub(super) fn run<T>(
+    client_id: &str,
+    path: &Path,
+    format: Format,
+    edit: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    run_inner(client_id, path, format, false, edit)
+}
+
+pub(super) fn settings<T>(
+    client_id: &str,
+    path: &Path,
+    mut edit: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    run_inner(client_id, path, Format::JsonMcpServers, true, &mut edit)
+}
+
+fn run_inner<T>(
+    client_id: &str,
+    path: &Path,
+    format: Format,
+    jsonc_settings: bool,
+    mut edit: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    // Nested calls (move -> write_servers, disconnect -> install_or_remove) share
+    // the outer operation. No writer can commit half of a migration.
+    if PENDING.with(|slot| slot.borrow().is_some()) {
+        return edit();
+    }
+    let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
+    let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
+    let mut original = disk(path)?;
+    let strict_json = !jsonc_settings
+        && !matches!(
+            format,
+            Format::TomlMcpServers
+                | Format::YamlExtensions
+                | Format::YamlMcpServers
+                | Format::YamlMcpServersList
+        )
+        && !matches!(client_id, "vscode" | "zed" | "opencode" | "kilo-code");
+    for _ in 0..3 {
+        if !value(format, original.as_deref())?.is_object() {
+            return Err("Client config root must be an object; leaving it untouched".into());
+        }
+        if strict_json {
+            if let Some(text) = original.as_deref().filter(|text| !text.trim().is_empty()) {
+                serde_json::from_str::<Value>(text).map_err(|_| format!("{} requires strict JSON; remove comments or trailing commas before connecting. Config unchanged.", path.display()))?;
+            }
+        }
+        PENDING.with(|slot| {
+            *slot.borrow_mut() = Some(Pending {
+                path: path.into(),
+                original: original.clone(),
+                strict_json,
+                ..Pending::default()
+            })
+        });
+        let clear = Clear;
+        let result = edit()?;
+        let pending = PENDING.with(|slot| slot.borrow_mut().take().unwrap());
+        drop(clear);
+        let Some(output) = pending.output else {
+            return Ok(result);
+        };
+        #[cfg(test)]
+        before_commit(path);
+        let current = disk(path)?;
+        if current != original {
+            if !unrelated(
+                format,
+                original.as_deref(),
+                Some(output.as_str()),
+                current.as_deref(),
+            )? {
+                return Err(format!("Client config conflict at {}: native edits overlap this operation. Config unchanged.", path.display()));
+            }
+            original = current;
+            continue;
+        }
+        // Recovery records must land before the config they protect. Roll them
+        // back too if the final revision check refuses the client write.
+        let mut auxiliary_recovery = Vec::new();
+        let commit = (|| {
+            for (auxiliary, text) in pending.auxiliary {
+                auxiliary_recovery.push(checkpoint(&auxiliary)?);
+                crate::registry::atomic_write(&auxiliary, &text)?;
+            }
+            let check = || {
+                if disk(path)? == original {
+                    Ok(())
+                } else {
+                    Err("Client config revision changed before rename".into())
+                }
+            };
+            crate::registry::atomic_write_checked(path, &output, check)
+        })();
+        if commit.is_err() {
+            for receipt in auxiliary_recovery.into_iter().rev() {
+                receipt.rollback()?;
+            }
+        }
+        match commit {
+            Ok(()) => return Ok(result),
+            Err(e) if e == "Client config revision changed before rename" => {
+                let current = disk(path)?;
+                if !unrelated(
+                    format,
+                    original.as_deref(),
+                    Some(output.as_str()),
+                    current.as_deref(),
+                )? {
+                    return Err(format!(
+                        "Client config conflict at {}. Config unchanged.",
+                        path.display()
+                    ));
+                }
+                original = current;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(format!("Client config {} keeps changing; retry after the client finishes saving. Config unchanged.", path.display()))
+}
+
+#[cfg(test)]
+thread_local! { pub(super) static BEFORE_COMMIT: RefCell<Option<Box<dyn FnOnce(&Path)>>> = const { RefCell::new(None) }; }
+#[cfg(test)]
+pub(super) fn before_commit(path: &Path) {
+    let hook = BEFORE_COMMIT.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture() -> (PathBuf, crate::registry::DataDirOverride) {
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-mutation-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = crate::registry::DataDirOverride::set(dir.join("data"));
+        (dir, data)
+    }
+    fn connect(path: &Path) -> Result<(), String> {
+        run("cursor", path, Format::JsonMcpServers, || {
+            let source = read_config_file(path)?;
+            let mut root = parse_json_value(&source)?;
+            root["mcpServers"]["toolport"] = serde_json::json!({"command":"toolport-gateway"});
+            atomic_write_json_config(path, Some(&source), &root, "mcpServers")
+        })
+    }
+    #[test]
+    fn native_unrelated_connect_edit_is_reapplied_without_sleeps() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (dir, _data) = fixture();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"session":1,"mcpServers":{}}"#).unwrap();
+        BEFORE_COMMIT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|path| {
+                std::fs::write(path, r#"{"session":2,"mcpServers":{}}"#).unwrap();
+            }))
+        });
+        connect(&path).unwrap();
+        let root = parse_json_value(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["session"], 2);
+        assert!(root["mcpServers"]["toolport"].is_object());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn native_overlapping_connect_edit_refuses_every_staged_write() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (dir, _data) = fixture();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        let native = r#"{"mcpServers":{"toolport":{"command":"custom"}}}"#;
+        BEFORE_COMMIT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                std::fs::write(path, native).unwrap();
+            }))
+        });
+        assert!(connect(&path).unwrap_err().contains("conflict"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), native);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn strict_json_client_refuses_jsonc_without_writing() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let (dir, _data) = fixture();
+        let path = dir.join(".claude.json");
+        let original = "{ // comment\n \"mcpServers\": {},\n}";
+        std::fs::write(&path, original).unwrap();
+        assert!(run("claude-code", &path, Format::JsonMcpServers, || {
+            atomic_write(&path, "{}")
+        })
+        .unwrap_err()
+        .contains("strict JSON"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

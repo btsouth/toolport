@@ -16,6 +16,7 @@ use serde::Serialize;
 use crate::registry::{ManagedEntry, ServerEntry};
 
 mod moved;
+mod mutation;
 mod zcode;
 
 /// One MCP server, normalized across every client format.
@@ -699,10 +700,34 @@ pub(crate) fn write_settings_key_for(
     root: &serde_json::Value,
     key: &str,
 ) -> Result<(), String> {
-    if original.is_some() {
-        backup_file_named(client_id, path, &claude_settings_backup_name(path))?;
-    }
-    atomic_write(path, &render_settings_key(original, root, key)?)
+    mutation::settings(client_id, path, || {
+        let (mut latest, source) = read_settings_json(path)?;
+        let before = original
+            .map(parse_json_value)
+            .transpose()?
+            .unwrap_or_else(|| serde_json::json!({}));
+        if latest.get(key) != before.get(key) {
+            return Err(format!(
+                "Client config conflict at {}: '{key}' changed. Config unchanged.",
+                path.display()
+            ));
+        }
+        let object = latest
+            .as_object_mut()
+            .ok_or("Client settings must be an object")?;
+        match root.get(key) {
+            Some(value) => {
+                object.insert(key.into(), value.clone());
+            }
+            None => {
+                object.remove(key);
+            }
+        }
+        if source.is_some() {
+            backup_file_named(client_id, path, &claude_settings_backup_name(path))?;
+        }
+        atomic_write(path, &render_settings_key(source.as_deref(), &latest, key)?)
+    })
 }
 
 /// The exact bytes [`write_settings_json`] would put on disk.
@@ -2154,7 +2179,9 @@ fn parse_json_snippet(
                 .get("command")
                 .is_some_and(|command| command.is_string() || command.is_array())
                 && !servers.get("url").is_some_and(serde_json::Value::is_string)
-                && !servers.get("type").is_some_and(serde_json::Value::is_string)
+                && !servers
+                    .get("type")
+                    .is_some_and(serde_json::Value::is_string)
                 && !servers
                     .get("enabled")
                     .is_some_and(serde_json::Value::is_boolean)
@@ -2927,7 +2954,9 @@ fn read_client(def: &ClientDef) -> DetectedClient {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default();
-            let config_exists = fallback.as_ref().is_some_and(|path| path.exists());
+            let config_exists = fallback
+                .as_ref()
+                .is_some_and(|path| mutation::exists(&path));
             return build(config_path, config_exists, Vec::new(), Some(error));
         }
     };
@@ -2936,11 +2965,16 @@ fn read_client(def: &ClientDef) -> DetectedClient {
     if matches!(def.format, Format::JsonZCodeMcp) {
         return match zcode::detect(&path) {
             Ok((servers, exists)) => build(config_path, exists, servers, None),
-            Err(error) => build(config_path, path.exists(), Vec::new(), Some(error)),
+            Err(error) => build(
+                config_path,
+                mutation::exists(&path),
+                Vec::new(),
+                Some(error),
+            ),
         };
     }
 
-    if !path.exists() {
+    if !mutation::exists(&path) {
         return build(config_path, false, Vec::new(), None);
     }
 
@@ -3188,8 +3222,15 @@ const MAX_CONFIG_BYTES: u64 = 64 * 1024 * 1024;
 /// link to a device/FIFO/directory does not) and capping the size. Returns the
 /// same `Result<String, String>` shape as a plain read, so callers are otherwise
 /// unchanged. A missing file is an error here; callers that tolerate that already
-/// guard with `path.exists()` or treat the `Err` arm as "no config".
+/// guard with `mutation::exists(&path)` or treat the `Err` arm as "no config".
 fn read_config_file(path: &Path) -> Result<String, String> {
+    if let Some(text) = mutation::read(path) {
+        return text.ok_or_else(|| format!("{} does not exist", path.display()));
+    }
+    read_config_file_disk(path)
+}
+
+fn read_config_file_disk(path: &Path) -> Result<String, String> {
     // `metadata` follows symlinks, so this reflects the real target's type/size.
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if !meta.is_file() {
@@ -3511,7 +3552,7 @@ fn entry_to_toml(entry: &ServerEntry) -> toml::Value {
 /// [`registry::atomic_write`], which uses a unique temp name so two writers to
 /// the same config can't clobber each other.
 fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
-    crate::registry::atomic_write(path, contents)
+    mutation::write(path, contents)
 }
 
 /// Convert a `serde_json::Value` into a `jsonc-parser` CST input so we can splice
@@ -3594,13 +3635,50 @@ fn rewrite_json_key_preserving(
             "malformed config: top-level key '{key}' appears {n} times; refusing to write"
         ));
     }
-    let input = serde_to_cst_input(new_value);
+    let before = parse_json_value(original)?;
     if let Some(prop) = obj.get(key) {
-        prop.set_value(input);
-    } else {
-        obj.append(key, input);
-    }
+        if let (Some(child), Some(before), Some(after)) = (prop.object_value(), before.get(key).and_then(serde_json::Value::as_object), new_value.as_object()) {
+            patch_json_object(&child, before, after)?;
+        } else { prop.set_value(serde_to_cst_input(new_value)); }
+    } else { obj.append(key, serde_to_cst_input(new_value)); }
     Ok(root.to_string())
+}
+
+fn patch_json_object(
+    object: &jsonc_parser::cst::CstObject,
+    before: &serde_json::Map<String, serde_json::Value>,
+    after: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let keys: std::collections::BTreeSet<_> = before.keys().chain(after.keys()).collect();
+    for key in keys {
+        if before.get(key) == after.get(key) {
+            continue;
+        }
+        if count_top_level_key(object, key) > 1 {
+            return Err("Duplicate client config key; leaving it untouched".into());
+        }
+        match (object.get(key), after.get(key)) {
+            (Some(property), None) => {
+                property.remove();
+            }
+            (None, Some(value)) => {
+                object.append(key, serde_to_cst_input(value));
+            }
+            (Some(property), Some(value)) => {
+                if let (Some(child), Some(before), Some(after)) = (
+                    property.object_value(),
+                    before.get(key).and_then(serde_json::Value::as_object),
+                    value.as_object(),
+                ) {
+                    patch_json_object(&child, before, after)?;
+                } else {
+                    property.set_value(serde_to_cst_input(value));
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Delete a single top-level property from `original` JSON/JSONC text, preserving
@@ -3646,7 +3724,21 @@ fn atomic_write_json_config(
     root: &serde_json::Value,
     changed_key: &str,
 ) -> Result<(), String> {
-    atomic_write(path, &render_json_config(original, root, changed_key)?)
+    if mutation::strict_json(path) {
+        if let Some(text) = original.filter(|text| !text.trim().is_empty()) {
+            serde_json::from_str::<serde_json::Value>(text).map_err(|_| {
+                "Strict JSON config contains comments or trailing commas; leaving it untouched."
+                    .to_string()
+            })?;
+        }
+    }
+    let output = render_json_config(original, root, changed_key)?;
+    if mutation::strict_json(path) {
+        serde_json::from_str::<serde_json::Value>(&output).map_err(|_| {
+            "Client writer produced non-strict JSON; leaving config untouched".to_string()
+        })?;
+    }
+    atomic_write(path, &output)
 }
 
 /// The rendering half of [`atomic_write_json_config`], so a dry run can show the exact
@@ -3665,11 +3757,7 @@ fn render_json_config(
             // Pre-check (not error-string matching) so jsonc-parser message rewords
             // cannot silently re-enable the pretty fallback (#592 review).
             reject_duplicate_top_level_key(src, changed_key)?;
-            match rewrite_json_key_preserving(src, changed_key, val) {
-                Ok(text) => text,
-                // rewrite may still fail for non-object roots / CST issues → pretty
-                Err(_) => pretty()?,
-            }
+            rewrite_json_key_preserving(src, changed_key, val)?
         }
         _ => pretty()?,
     };
@@ -3728,7 +3816,7 @@ fn toml_value_to_edit_value(value: &toml::Value) -> toml_edit::Value {
 /// non-empty file is an error (same fail-closed contract as `read_existing_toml`)
 /// so we never replace Codex/Grok `config.toml` with a pretty-printed stub.
 fn load_toml_document(path: &Path) -> Result<toml_edit::DocumentMut, String> {
-    if !path.exists() {
+    if !mutation::exists(&path) {
         return Ok(toml_edit::DocumentMut::new());
     }
     let content = read_config_file(path)?;
@@ -4238,6 +4326,75 @@ fn format_yaml_key_block(
     }
 }
 
+// Keep unchanged server nodes verbatim, including comments inside their maps.
+fn patch_yaml_map(
+    span: &str,
+    before: &serde_yaml::Mapping,
+    after: &serde_yaml::Mapping,
+) -> Result<Option<String>, String> {
+    if after.is_empty() {
+        return Ok(None);
+    }
+    let Some((header, body)) = span.split_once('\n') else {
+        return Ok(None);
+    };
+    let Some((_, rest)) = split_yaml_mapping_key(header.trim_end_matches('\r')) else {
+        return Ok(None);
+    };
+    if !rest.trim().is_empty() && !rest.trim().starts_with('#') && !rest.trim().starts_with('&') {
+        return Ok(None);
+    }
+    let indent = yaml_child_indent(span);
+    let mut body = body
+        .split_inclusive('\n')
+        .map(|line| line.strip_prefix(&indent).unwrap_or(line))
+        .collect::<String>();
+    let spans = top_level_yaml_key_spans(&body);
+    if spans.len() != before.len() {
+        return Ok(None);
+    }
+    for (name, start, end) in spans.into_iter().rev() {
+        let key = serde_yaml::Value::String(name);
+        if before.get(&key) == after.get(&key) {
+            continue;
+        }
+        let replacement = match after.get(&key) {
+            Some(value) => serde_yaml::to_string(&serde_yaml::Value::Mapping(
+                [(key, value.clone())].into_iter().collect(),
+            ))
+            .map_err(|e| e.to_string())?,
+            None => String::new(),
+        };
+        body.replace_range(start..end, &replacement);
+    }
+    for (key, value) in after {
+        if before.contains_key(key) {
+            continue;
+        }
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(
+            &serde_yaml::to_string(&serde_yaml::Value::Mapping(
+                [(key.clone(), value.clone())].into_iter().collect(),
+            ))
+            .map_err(|e| e.to_string())?,
+        );
+    }
+    let mut output = format!("{header}\n");
+    if after.is_empty() {
+        output = format!("{} {{}}\n", header.trim_end_matches('\r'));
+    } else {
+        for line in body.split_inclusive('\n') {
+            if !line.trim().is_empty() {
+                output.push_str(&indent);
+            }
+            output.push_str(line);
+        }
+    }
+    Ok(Some(output))
+}
+
 /// Rewrite a single top-level mapping key in `original` YAML text, preserving
 /// comments, anchors, aliases, and formatting of everything else. Used so
 /// Goose/Hermes/Continue Connect no longer strips user annotations (SBS-884).
@@ -4265,7 +4422,12 @@ fn rewrite_yaml_key_preserving(
         // are replacing, not the new one.
         let anchor = split_yaml_mapping_key(span.lines().next().unwrap_or_default())
             .and_then(|(_, rest)| yaml_value_anchor(rest));
-        let block = format_yaml_key_block(key, new_value, anchor, &yaml_child_indent(span))?;
+        let before = parse_existing_yaml_content(original)?;
+        let patched = match (before.get(key).and_then(serde_yaml::Value::as_mapping), new_value.as_mapping()) {
+            (Some(before), Some(after)) => patch_yaml_map(span, before, after)?,
+            _ => None,
+        };
+        let block = match patched { Some(block) => block, None => format_yaml_key_block(key, new_value, anchor, &yaml_child_indent(span))? };
         let mut out = String::with_capacity(original.len() + block.len());
         out.push_str(&original[..*start]);
         out.push_str(&block);
@@ -4304,6 +4466,7 @@ fn atomic_write_yaml_config(
         }
         _ => pretty()?,
     };
+    parse_existing_yaml_content(&out)?;
     atomic_write(path, &out)
 }
 
@@ -4321,7 +4484,7 @@ fn parse_existing_yaml_content(content: &str) -> Result<serde_yaml::Value, Strin
 fn read_existing_yaml_with_source(
     path: &Path,
 ) -> Result<(Option<String>, serde_yaml::Value), String> {
-    if !path.exists() {
+    if !mutation::exists(&path) {
         return Ok((None, serde_yaml::Value::Mapping(serde_yaml::Mapping::new())));
     }
     let content = read_config_file(path)?;
@@ -4416,7 +4579,7 @@ fn write_json_with(
     validate_crush_shape: bool,
     include_tools: bool,
 ) -> Result<(), String> {
-    let (mut root, original) = if path.exists() {
+    let (mut root, original) = if mutation::exists(&path) {
         let content = read_config_file(path)?;
         let root = read_existing_json(&content, lenient)?;
         (root, Some(content))
@@ -4479,7 +4642,7 @@ fn write_json_with_body(
 }
 
 fn write_qwen_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    let (mut root, original) = if path.exists() {
+    let (mut root, original) = if mutation::exists(&path) {
         let content = read_config_file(path)?;
         let root = read_existing_json(&content, true)?;
         (root, Some(content))
@@ -4536,7 +4699,7 @@ fn opencode_entry_is_override_only(definition: &serde_json::Value) -> bool {
 }
 
 fn write_opencode_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    let original = if path.exists() {
+    let original = if mutation::exists(&path) {
         Some(read_config_file(path)?)
     } else {
         None
@@ -5128,6 +5291,14 @@ fn edit_hermes_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<
 pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOutcome, String> {
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
+    mutation::run(client_id, &path, def.format, || {
+        write_servers_inner(client_id, servers)
+    })
+}
+
+fn write_servers_inner(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOutcome, String> {
+    let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
+    let path = resolved_definition_path(&def)?;
     let backup = backup_file(client_id, &path)?;
     let lenient = config_is_whole_app_state(client_id);
     match def.format {
@@ -5577,7 +5748,7 @@ fn edit_json_gateway_with(
     validate_crush_shape: bool,
     include_tools: bool,
 ) -> Result<(), String> {
-    let (mut root, original) = if path.exists() {
+    let (mut root, original) = if mutation::exists(&path) {
         let content = read_config_file(path)?;
         let root = read_existing_json(&content, lenient)?;
         (root, Some(content))
@@ -5656,7 +5827,7 @@ fn edit_json_gateway_body(
 }
 
 fn edit_opencode_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    let original = if path.exists() {
+    let original = if mutation::exists(&path) {
         Some(read_config_file(path)?)
     } else {
         None
@@ -5735,6 +5906,17 @@ fn config_is_whole_app_state(client_id: &str) -> bool {
 fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<WriteOutcome, String> {
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
+    mutation::run(client_id, &path, def.format, || {
+        install_or_remove_inner(client_id, entry)
+    })
+}
+
+fn install_or_remove_inner(
+    client_id: &str,
+    entry: Option<&ServerEntry>,
+) -> Result<WriteOutcome, String> {
+    let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
+    let path = resolved_definition_path(&def)?;
     let backup = backup_file(client_id, &path)?;
     let lenient = config_is_whole_app_state(client_id);
     // Build the snapshot before writing so the ownership record matches the bytes
@@ -5779,6 +5961,14 @@ pub fn install_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOu
 pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
+    mutation::run(client_id, &path, def.format, || {
+        uninstall_gateway_inner(client_id)
+    })
+}
+
+fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
+    let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
+    let path = resolved_definition_path(&def)?;
     let restored = moved::restore(client_id, def.format, &path)?;
     let mut outcome = install_or_remove(client_id, None)?;
     if let Some(restored) = restored {
@@ -5807,12 +5997,23 @@ pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) {
 /// are preserved. Caller is responsible for importing first so nothing is lost.
 /// Explicit migration writes the stdio adapter entry.
 pub fn migrate_to_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOutcome, String> {
+    let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
+    let path = resolved_definition_path(&def)?;
+    mutation::run(client_id, &path, def.format, || {
+        migrate_to_gateway_inner(client_id, profile)
+    })
+}
+
+fn migrate_to_gateway_inner(
+    client_id: &str,
+    profile: Option<&str>,
+) -> Result<WriteOutcome, String> {
     let entry = gateway_entry(profile, client_id)?;
     // Keep what this rewrite drops so Disconnect can put it back (UX-03).
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
-    let previous = moved::record(client_id, def.format, &path)?;
-    write_servers(client_id, &[entry]).inspect_err(|_| previous.revert())
+    moved::record(client_id, def.format, &path)?;
+    write_servers(client_id, &[entry])
 }
 
 /// Whether a stored client-config command is recognizably one of *our* gateway
@@ -6153,7 +6354,28 @@ fn repoint_stale_gateways_in(
             .as_deref()
             .and_then(profile_from_config_text)
             .or_else(|| read_gateway_profile(&client.id));
-        match install_gateway(&client.id, profile.as_deref()) {
+        let rewrite = find_def(&client.id)
+            .ok_or("Unknown client".to_string())
+            .and_then(|def| {
+                let path = resolved_definition_path(&def)?;
+                mutation::run(&client.id, &path, def.format, || {
+                    let fresh = read_client(&def);
+                    if resolve_entry_state(&fresh.servers, managed.get(&client.id))
+                        != GatewayEntryState::Managed
+                    {
+                        return Err(
+                            "Client gateway changed during repoint; leaving it untouched".into(),
+                        );
+                    }
+                    let fresh_profile = read_config_file(&path)
+                        .ok()
+                        .as_deref()
+                        .and_then(profile_from_config_text)
+                        .or_else(|| profile.clone());
+                    install_gateway(&client.id, fresh_profile.as_deref())
+                })
+            });
+        match rewrite {
             Ok(write) => match write.managed {
                 Some(m) => outcome.repointed.push((client.id.clone(), m)),
                 // Written, but no ownership snapshot came back, so the registry
@@ -6208,9 +6430,11 @@ fn repoint_other_claude_configs(current: &str, outcome: &mut RepointOutcome) {
             profile,
             stored,
         } = repair;
-        let write = secondary_claude_gateway_entry(profile.as_deref()).and_then(|entry| {
-            backup_secondary_claude_file(&path)?;
-            edit_json_gateway(&path, "mcpServers", Some(&entry), true)
+        let write = mutation::run("claude-code", &path, Format::JsonMcpServers, || {
+            secondary_claude_gateway_entry(profile.as_deref()).and_then(|entry| {
+                backup_secondary_claude_file(&path)?;
+                edit_json_gateway(&path, "mcpServers", Some(&entry), true)
+            })
         });
         match write {
             Ok(()) => {
