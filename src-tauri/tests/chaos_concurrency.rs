@@ -183,7 +183,7 @@ fn a_slow_call_does_not_block_a_fast_call_to_the_same_server() {
     let _ = slow;
 }
 
-/// REL-01: at least four calls must overlap, and all one hundred calls must succeed.
+/// REL-01: all 100 calls must be in flight at once, proven deterministically without timing.
 #[test]
 fn one_hundred_parallel_calls_to_one_server_overlap() {
     let scratch = Scratch::new("load-one");
@@ -193,7 +193,7 @@ fn one_hundred_parallel_calls_to_one_server_overlap() {
             "x",
             &[
                 ("MOCK_MCP_CONCURRENT", "1"),
-                ("MOCK_MCP_SLEEP_BARRIER", "4"),
+                ("MOCK_MCP_SLEEP_BARRIER", "100"),
             ],
         )],
         &["x"],
@@ -226,7 +226,7 @@ fn one_hundred_parallel_calls_to_one_server_overlap() {
         for result in worker.join().expect("worker") {
             match result {
                 Ok(reply) => {
-                    assert_eq!(reply, "slept 200 ms after 4 arrivals");
+                    assert_eq!(reply, "slept 200 ms after 100 arrivals");
                     total += 1;
                 }
                 Err(error) => panic!("a parallel call failed: {error}"),
