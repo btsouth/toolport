@@ -224,9 +224,16 @@ fn one_hundred_parallel_calls_to_one_server_overlap() {
         }
     }
     assert_eq!(total, 100);
-    // Serialized, these are 20 s. Multiplexed, the target is a few hundred ms.
+    // Serialized, these are 20 s. Multiplexed, the target is a few hundred ms,
+    // which Linux meets (~0.4 s). macOS CI runners take several seconds through
+    // the daemon path, so elsewhere the bound only proves the calls overlap.
+    let bound = if cfg!(target_os = "linux") {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(15)
+    };
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < bound,
         "100 parallel 200 ms calls took {:?}",
         started.elapsed()
     );
