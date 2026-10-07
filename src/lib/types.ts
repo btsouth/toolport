@@ -490,6 +490,7 @@ export interface Registry {
   pinnedTools?: Record<string, string[]>;
   /** Member safety choice. Absent values derive from retained legacy fields. */
   safetyLevel?: "off" | "ask" | "strict";
+  teamMinSafetyLevel?: "off" | "ask" | "strict";
   teamForcedHumanApproval?: boolean;
   teamForcedDenyDestructive?: boolean;
   teamForcedQuarantineOnDrift?: boolean;

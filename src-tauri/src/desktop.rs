@@ -1140,6 +1140,7 @@ fn set_safety_level(
     level: registry::SafetyLevel,
 ) -> Result<Registry, String> {
     let (reg, _) = write_registry(state.inner(), |reg| {
+        reg.validate_safety_level(level)?;
         reg.set_safety_level(level);
         Ok(())
     })?;

@@ -503,6 +503,27 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   const codeMode = registry?.codeMode ?? false;
   const piiRedaction = registry?.piiRedaction ?? false;
   const liveInspect = registry?.liveInspect ?? false;
+  const safetyLevels = ["off", "ask", "strict"] as const;
+  const teamFloor =
+    safetyLevels[
+      Math.max(
+        safetyLevels.indexOf(registry?.teamMinSafetyLevel ?? "off"),
+        registry?.teamForcedHumanApproval ? 1 : 0,
+      )
+    ];
+  const memberLevel =
+    registry?.safetyLevel ??
+    (registry?.denyDestructive ||
+    registry?.quarantineOnDrift ||
+    registry?.blockOnInjection
+      ? "strict"
+      : registry?.humanApproval || registry?.confirmDestructive
+        ? "ask"
+        : "off");
+  const effectiveLevel =
+    safetyLevels[
+      Math.max(safetyLevels.indexOf(memberLevel), safetyLevels.indexOf(teamFloor))
+    ];
   const [safetyBusy, setSafetyBusy] = useState(false);
   const [busySettings, setBusySettings] = useState<ReadonlySet<SettingKey>>(
     () => new Set(),
@@ -968,16 +989,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           <select
             aria-label="Safety"
             disabled={safetyBusy}
-            value={
-              registry?.safetyLevel ??
-              (registry?.denyDestructive ||
-              registry?.quarantineOnDrift ||
-              registry?.blockOnInjection
-                ? "strict"
-                : registry?.humanApproval || registry?.confirmDestructive
-                  ? "ask"
-                  : "off")
-            }
+            value={effectiveLevel}
             onChange={async (event) => {
               setSafetyBusy(true);
               try {
@@ -996,8 +1008,12 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               }
             }}
           >
-            <option value="off">Off</option>
-            <option value="ask">Ask</option>
+            <option value="off" disabled={teamFloor !== "off"}>
+              Off
+            </option>
+            <option value="ask" disabled={teamFloor === "strict"}>
+              Ask
+            </option>
             <option value="strict">Strict</option>
           </select>
         </label>
@@ -1007,11 +1023,24 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           high-confidence injection and asks before untrusted calls. Labeling and
           integrity recording stay on.
         </p>
-        {(registry?.teamForcedHumanApproval ||
-          registry?.teamForcedDenyDestructive ||
-          registry?.teamForcedQuarantineOnDrift ||
+        {teamFloor !== "off" && (
+          <p className="text-xs">
+            Team minimum safety level: {teamFloor === "ask" ? "Ask" : "Strict"}. Choices
+            below this floor are unavailable.
+          </p>
+        )}
+        {(registry?.teamForcedQuarantineOnDrift ||
           registry?.teamForcedBlockOnInjection) && (
-          <p className="text-xs">Team policy raises the effective safety level.</p>
+          <p className="text-xs">
+            Team also enforces:{" "}
+            {[
+              registry.teamForcedQuarantineOnDrift && "quarantine on drift",
+              registry.teamForcedBlockOnInjection && "block on injection",
+            ]
+              .filter(Boolean)
+              .join(", ")}
+            . These protections do not raise your safety level.
+          </p>
         )}
         {quarantined.length === 0 && quarantineError && (
           <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
