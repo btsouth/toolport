@@ -50,7 +50,8 @@ vi.mock("@tauri-apps/api/event", () => ({
   }),
 }));
 
-vi.mock("@/lib/updater", () => ({
+vi.mock("@/lib/updater", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/updater")>()),
   checkForUpdate: (...args: unknown[]) => checkForUpdate(...args),
   installUpdate: (...args: unknown[]) => installUpdate(...args),
   releasePageUrl: (version: string) =>
@@ -249,37 +250,43 @@ describe("AppSidebar accessibility", () => {
     expect((await screen.findAllByText("Downloading 50%")).length).toBeGreaterThan(0);
   });
 
-  it("sends a .deb install to the release page instead of installing", async () => {
-    const update = fakeUpdate();
-    checkForUpdate.mockResolvedValue({ kind: "update", update, systemPackage: "deb" });
+  it.each(["deb", "rpm"])(
+    "directs a .%s install to its package manager",
+    async (systemPackage) => {
+      const update = fakeUpdate();
+      checkForUpdate.mockResolvedValue({ kind: "update", update, systemPackage });
 
-    render(
-      <TooltipProvider>
-        <AppSidebar
-          registry={null}
-          onRegistryChange={vi.fn()}
-          view="servers"
-          onSelectView={vi.fn()}
-          onReplayOnboarding={vi.fn()}
-        />
-      </TooltipProvider>,
-    );
+      render(
+        <TooltipProvider>
+          <AppSidebar
+            registry={null}
+            onRegistryChange={vi.fn()}
+            view="servers"
+            onSelectView={vi.fn()}
+            onReplayOnboarding={vi.fn()}
+          />
+        </TooltipProvider>,
+      );
 
-    await userEvent.click(
-      await screen.findByRole("button", { name: /update to v1.1.0/i }),
-    );
-    expect(screen.getByText(/installed from a \.deb package/i)).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: /install and restart/i }),
-    ).not.toBeInTheDocument();
+      await userEvent.click(
+        await screen.findByRole("button", { name: /update to v1.1.0/i }),
+      );
+      expect(
+        screen.getByText(/update Toolport through your package manager/i),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/download the new/i)).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: /install and restart/i }),
+      ).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: /open download page/i }));
+      await userEvent.click(screen.getByRole("button", { name: /view release notes/i }));
 
-    expect(openExternal).toHaveBeenCalledWith(
-      "https://github.com/btsouth/toolport/releases/tag/v1.1.0",
-    );
-    expect(installUpdate).not.toHaveBeenCalled();
-  });
+      expect(openExternal).toHaveBeenCalledWith(
+        "https://github.com/btsouth/toolport/releases/tag/v1.1.0",
+      );
+      expect(installUpdate).not.toHaveBeenCalled();
+    },
+  );
 
   it("releases an update once a newer check or unmount replaces it", async () => {
     const first = fakeUpdate("1.1.0");

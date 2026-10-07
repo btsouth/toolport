@@ -20,12 +20,12 @@ smoke() {
   test -x /usr/share/toolport/toolport-preview-rollback.sh
   test -f /usr/share/licenses/toolport/LICENSE
   ldd /usr/bin/toolport-gtk | tee /tmp/gtk-ldd.txt
-  ! grep -q 'not found' /tmp/gtk-ldd.txt
+  if grep -q 'not found' /tmp/gtk-ldd.txt; then exit 1; fi
   grep -q 'libgtk-4.so' /tmp/gtk-ldd.txt
   grep -q 'libadwaita-1.so' /tmp/gtk-ldd.txt
-  ! grep -q 'libwebkit' /tmp/gtk-ldd.txt
+  if grep -q 'libwebkit' /tmp/gtk-ldd.txt; then exit 1; fi
   ldd /usr/bin/toolport-gateway | tee /tmp/gateway-ldd.txt
-  ! grep -q 'not found' /tmp/gateway-ldd.txt
+  if grep -q 'not found' /tmp/gateway-ldd.txt; then exit 1; fi
   test "$(toolport-gateway --version)" = "toolport-gateway $expected_version"
   echo "PASS: GTK binary matches build, package contents and all libraries resolve"
   echo "PASS: $(toolport-gateway --version)"

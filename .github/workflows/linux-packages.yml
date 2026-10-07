@@ -45,4 +45,5 @@ jobs:
             .verify/native-packages/*.deb
             .verify/native-packages/*.rpm
           if-no-files-found: error
+          include-hidden-files: true
           retention-days: 7
