@@ -436,21 +436,14 @@ async fn install_gateway(
             force.unwrap_or(false),
             &managed,
             |managed_entry| {
-                let (registry, ()) = write_registry(state.inner(), |registry| {
-                    match profile
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|profile| !profile.is_empty())
-                    {
-                        Some(profile) => registry.set_client_scope(&client_id, Some(profile)),
-                        None => registry.set_client_unscoped(&client_id),
-                    }
-                    if let Some(managed_entry) = managed_entry {
-                        registry.set_client_managed_entry(&client_id, managed_entry);
-                    }
-                    Ok(())
-                })?;
-                Ok(registry)
+                write_registry(state.inner(), |registry| {
+                    Ok(crate::registry_controller::apply_client_stdio_update(
+                        registry,
+                        &client_id,
+                        profile.as_deref(),
+                        managed_entry,
+                    ))
+                })
             },
         )
         .map(|result| result.outcome)

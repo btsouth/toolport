@@ -7988,6 +7988,7 @@ bad = "not-a-table"
         std::fs::create_dir_all(&root).unwrap();
         let native = root.join("native.json");
         let bridge = root.join("bridge.json");
+        let stale = root.join("stale.json");
         let configs = [
             (
                 &native,
@@ -7996,6 +7997,10 @@ bad = "not-a-table"
             (
                 &bridge,
                 r#"{"mcpServers":{"toolport":{"command":"npx","args":["-y","mcp-remote","http://127.0.0.1:8765/mcp","--header","Authorization: Bearer original"]}}}"#,
+            ),
+            (
+                &stale,
+                r#"{"mcpServers":{"toolport":{"command":"/opt/Toolport/bin/conduit-gateway-1.0.0","args":["--client","existing-2"]}}}"#,
             ),
         ];
         let mut managed = HashMap::new();
@@ -8024,6 +8029,7 @@ bad = "not-a-table"
             repoint_stale_gateways_in("/opt/Toolport/bin/toolport-gateway", clients, &managed);
         assert!(outcome.repointed.is_empty());
         assert!(outcome.failed.is_empty());
+        assert!(outcome.customized.is_empty());
         assert_eq!(serde_json::to_value(&managed).unwrap(), before);
         for (path, raw) in configs {
             assert_eq!(std::fs::read_to_string(path).unwrap(), raw);

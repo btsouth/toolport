@@ -600,7 +600,6 @@ function CatalogCard({
             </button>
           )}
         </div>
-        <div className="flex shrink-0 items-center gap-1"></div>
       </div>
       <p className="line-clamp-2 min-h-8 text-xs text-muted-foreground">
         {entry.description}

@@ -19389,16 +19389,6 @@ fn main() {
         }
         ArgAction::Run => {}
     }
-    let legacy_registry = registry::load_resolved_with_source()
-        .ok()
-        .filter(|(_, source)| source.is_authoritative())
-        .is_some_and(|(reg, _)| reg.gateway_topology == Some(registry::GatewayTopology::Legacy));
-    let legacy_env =
-        conduit_lib::brand::env_var("TOOLPORT_GATEWAY_TOPOLOGY", "CONDUIT_GATEWAY_TOPOLOGY")
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("legacy"));
-    if legacy_registry || legacy_env {
-        glog("Legacy gateway topology was retired in 2.0; using the host daemon. Existing client entries are unchanged.");
-    }
     if let Some(index) = cli_args.iter().position(|arg| arg == "--http-proxy") {
         let port = match cli_args.get(index + 1) {
             Some(value) => match value.parse::<u16>() {
@@ -19424,6 +19414,25 @@ fn main() {
         if selected_adapter_requested(&cli_args, !std::io::stdin().is_terminal()) {
             conduit_lib::stdio_adapter::run_selected_stdio_adapter();
         }
+    }
+    let legacy_registry = registry::load_resolved_with_source()
+        .ok()
+        .filter(|(_, source)| source.is_authoritative())
+        .is_some_and(|(reg, _)| reg.gateway_topology == Some(registry::GatewayTopology::Legacy));
+    let legacy_env =
+        conduit_lib::brand::env_var("TOOLPORT_GATEWAY_TOPOLOGY", "CONDUIT_GATEWAY_TOPOLOGY")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("legacy"));
+    if (legacy_registry || legacy_env)
+        && registry::conduit_dir().is_some_and(|dir| {
+            std::fs::create_dir_all(&dir).is_ok()
+                && std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(dir.join("legacy-topology-retired.notice"))
+                    .is_ok()
+        })
+    {
+        glog("Legacy gateway topology was retired in 2.0; using the host daemon. Existing client entries are unchanged.");
     }
     let selftest_secrets = cli_args.first().map(String::as_str) == Some("--selftest-secrets");
     if !selftest_secrets {
