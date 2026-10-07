@@ -225,7 +225,10 @@ fn one_hundred_parallel_calls_to_one_server_overlap() {
     for worker in workers {
         for result in worker.join().expect("worker") {
             match result {
-                Ok(_) => total += 1,
+                Ok(reply) => {
+                    assert_eq!(reply, "slept 200 ms after 100 arrivals");
+                    total += 1;
+                }
                 Err(error) => panic!("a parallel call failed: {error}"),
             }
         }

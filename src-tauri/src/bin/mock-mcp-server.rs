@@ -624,7 +624,10 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
                     if !cfg.concurrent {
                         std::thread::sleep(std::time::Duration::from_millis(ms));
                     }
-                    format!("slept {ms} ms")
+                    match cfg.sleep_barrier.filter(|_| cfg.concurrent) {
+                        Some(count) => format!("slept {ms} ms after {count} arrivals"),
+                        None => format!("slept {ms} ms"),
+                    }
                 }
                 "greet" => {
                     let who = args.get("name").and_then(|t| t.as_str()).unwrap_or("there");
