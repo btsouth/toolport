@@ -2167,6 +2167,13 @@ pub trait Transport: Send {
     fn concurrent(&self) -> Option<Arc<dyn ConcurrentTransport>> {
         None
     }
+    /// Inspect shared state without constructing a per-call transport snapshot.
+    fn connection_closed(&self) -> Option<bool> {
+        None
+    }
+    fn suspended_calls(&self) -> usize {
+        0
+    }
 }
 
 /// The part of a [`Transport`] that is safe to call from several threads at once,
@@ -5045,6 +5052,14 @@ impl Transport for StdioTransport {
         Ok(())
     }
 
+    fn connection_closed(&self) -> Option<bool> {
+        Some(self.core.is_closed())
+    }
+
+    fn suspended_calls(&self) -> usize {
+        self.core.lock_state().suspended.len()
+    }
+
     fn concurrent(&self) -> Option<Arc<dyn ConcurrentTransport>> {
         Some(Arc::new(StdioCall {
             core: Arc::clone(&self.core),
@@ -5340,6 +5355,8 @@ pub struct HttpTransport {
     /// `None` or error keeps the current token; a forced refresh must return a new
     /// raw token or the authentication failure is surfaced.
     refresh: Option<Arc<RefreshFn>>,
+    /// Read only after a bearer rejection, to adopt another process's credential.
+    stored_auth: Option<Arc<StoredAuthFn>>,
     /// Separate from token refresh: `insufficient_scope` requires interactive
     /// consent and a new authorization, not another token from the old grant.
     scope_reauthorize: Option<Arc<ScopeReauthorizeFn>>,
@@ -5404,7 +5421,10 @@ pub struct HttpTransport {
     draining: Option<Receiver<HttpAttemptOutcome>>,
 }
 
+type StoredAuthFn = dyn Fn() -> Result<Option<String>, String> + Send + Sync;
+
 struct HttpRefreshFailure {
+    recorded_at: Instant,
     token: Option<String>,
     error: String,
 }
@@ -5446,7 +5466,7 @@ enum HttpDelivery {
         Value,
         std::sync::mpsc::SyncSender<Option<ServerRequestAction>>,
     ),
-    Done(Box<HttpAttemptOutcome>),
+    Done(Box<HttpCallOutcome>),
 }
 
 struct HttpWorkerGuard(Arc<HttpConcurrency>);
@@ -5560,6 +5580,19 @@ impl ConcurrentTransport for HttpCallTransport {
                 }
             }
         }
+        if !retired.is_empty() {
+            let mut shell = owned.request_shell();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + HTTP_CANCEL_FORWARD_TIMEOUT;
+                for pending in retired {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    shell.pending_mrtr = Some(pending);
+                    shell.retire_http_pending();
+                }
+            });
+        }
         // Reserve exactly one id before the worker starts. A continuation keeps
         // the id of its original POST; new calls use the shared atomic allocator.
         let downstream_id = if let Some(pending) = &owned.pending_mrtr {
@@ -5598,14 +5631,6 @@ impl ConcurrentTransport for HttpCallTransport {
         let headers = headers.to_vec();
         std::thread::spawn(move || {
             let _guard = guard;
-            for pending in retired {
-                if Instant::now() >= deadline {
-                    break;
-                }
-                let mut shell = owned.request_shell();
-                shell.pending_mrtr = Some(pending);
-                shell.retire_http_pending();
-            }
             let result = match continuation_error {
                 Some(error) => Err(error),
                 None => owned.request_inner_with_cancel(
@@ -5623,7 +5648,7 @@ impl ConcurrentTransport for HttpCallTransport {
             {
                 owned.retire_http_pending();
             }
-            if let Err(error) = sender.send(HttpDelivery::Done(Box::new(HttpAttemptOutcome {
+            if let Err(error) = sender.send(HttpDelivery::Done(Box::new(HttpCallOutcome {
                 transport: owned,
                 result,
             }))) {
@@ -5643,6 +5668,7 @@ impl ConcurrentTransport for HttpCallTransport {
                             .forward_cancel_async(downstream_id, cancel.as_ref().unwrap());
                     }
                 }
+                retire_http_deliveries(&receiver);
                 return if shared.closed.load(Ordering::SeqCst) {
                     Err(TransportError::Unavailable(
                         "HTTP transport closed while waiting".into(),
@@ -5676,9 +5702,8 @@ impl ConcurrentTransport for HttpCallTransport {
                             cancellation_shell
                                 .forward_cancel_async(downstream_id, cancel.as_ref().unwrap());
                         }
-                        if outcome.transport.pending_mrtr.is_some() {
-                            std::thread::spawn(move || outcome.transport.retire_http_pending());
-                        }
+                        drop(outcome);
+                        retire_http_deliveries(&receiver);
                         return Err(TransportError::Cancelled(
                             "HTTP request cancelled by upstream client".into(),
                         ));
@@ -5693,7 +5718,8 @@ impl ConcurrentTransport for HttpCallTransport {
                         {
                             drop(pending);
                             outcome.transport.pending_mrtr = Some(request);
-                            outcome.transport.retire_http_pending();
+                            drop(outcome);
+                            retire_http_deliveries(&receiver);
                             return Err(TransportError::Busy(
                                 "HTTP suspended call limit reached".into(),
                             ));
@@ -5703,13 +5729,14 @@ impl ConcurrentTransport for HttpCallTransport {
                             (suspended_since.unwrap_or_else(Instant::now), request),
                         );
                     }
-                    return outcome.result;
+                    return std::mem::replace(&mut outcome.result, Ok(Value::Null));
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
+                    retire_http_deliveries(&receiver);
                     return Err(TransportError::Fatal(
                         "HTTP worker exited without a response".into(),
-                    ))
+                    ));
                 }
             }
         }
@@ -5719,6 +5746,35 @@ impl ConcurrentTransport for HttpCallTransport {
 struct HttpAttemptOutcome {
     transport: HttpTransport,
     result: Result<Value, TransportError>,
+}
+
+// A result can be queued just as its caller exits. Ownership of a suspended
+// reader must retire with the outcome even when nobody receives the channel item.
+struct HttpCallOutcome {
+    transport: HttpTransport,
+    result: Result<Value, TransportError>,
+}
+
+impl Drop for HttpCallOutcome {
+    fn drop(&mut self) {
+        if let Some(pending) = self.transport.pending_mrtr.take() {
+            let mut shell = self.transport.request_shell();
+            shell.pending_mrtr = Some(pending);
+            std::thread::spawn(move || shell.retire_http_pending());
+        }
+    }
+}
+
+fn retire_http_deliveries(receiver: &Receiver<HttpDelivery>) {
+    while let Ok(delivery) = receiver.try_recv() {
+        if let HttpDelivery::ServerRequest(request, reply) = delivery {
+            let _ = reply.send(Some(ServerRequestAction::Respond(json!({
+                "jsonrpc":"2.0", "id":request["id"],
+                "error":{"code":JSONRPC_INTERNAL_ERROR,"message":CALL_ENDED}
+            }))));
+        }
+        // Done outcomes retire any suspended reader through Drop.
+    }
 }
 
 /// Per-wire-attempt cancellation state. Unlike CancelRegistry, this survives the
@@ -5787,6 +5843,13 @@ struct PendingHttpMrtr {
 }
 
 impl HttpTransport {
+    pub(crate) fn set_stored_auth_reader(
+        &mut self,
+        reader: impl Fn() -> Result<Option<String>, String> + Send + Sync + 'static,
+    ) {
+        self.stored_auth = Some(Arc::new(reader));
+    }
+
     pub fn new(url: &str) -> Self {
         Self::with_auth(url, None)
     }
@@ -5847,6 +5910,7 @@ impl HttpTransport {
             next_id: Arc::new(AtomicI64::new(1)),
             auth: Arc::new(Mutex::new(auth)),
             refresh: refresh.map(Arc::new),
+            stored_auth: None,
             scope_reauthorize: None,
             scope_upgrade_attempts: Arc::new(Mutex::new(HashSet::new())),
             forced_refresh_token: Arc::new(Mutex::new(None)),
@@ -5958,6 +6022,7 @@ impl HttpTransport {
             next_id: Arc::clone(&self.next_id),
             auth: Arc::clone(&self.auth),
             refresh: self.refresh.clone(),
+            stored_auth: self.stored_auth.clone(),
             scope_reauthorize: self.scope_reauthorize.clone(),
             scope_upgrade_attempts: Arc::clone(&self.scope_upgrade_attempts),
             forced_refresh_token: Arc::clone(&self.forced_refresh_token),
@@ -6171,9 +6236,17 @@ impl HttpTransport {
     /// Persistence failures reach the caller without an unlocked exchange.
     fn refresh_before_send(&mut self) -> Result<(), TransportError> {
         if let Some(refresh) = &self.refresh {
-            let Ok(_gate) = self.auth_gate_lock() else {
-                return;
+            let mut busy = match self.auth_gate.busy.try_lock() {
+                Ok(busy) => busy,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return,
             };
+            if *busy {
+                return;
+            }
+            *busy = true;
+            drop(busy);
+            let _gate = HttpAuthGuard(&self.auth_gate);
             if let Ok(Some(token)) = refresh(false) {
                 *self
                     .auth
@@ -6219,6 +6292,7 @@ impl HttpTransport {
                 "HTTP {code} (needs authentication): no refresh callback configured"
             )));
         };
+        let rejected_at = Instant::now();
         // Lock order: auth gate, auth, budget/failure. Recheck after taking
         // the callback gate: siblings rejected with the old bearer share its result.
         let _gate = self.auth_gate_lock()?;
@@ -6236,8 +6310,19 @@ impl HttpTransport {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
         {
-            if failure.token == rejected {
+            if failure.token == rejected && rejected_at <= failure.recorded_at {
                 return Err(TransportError::Fatal(failure.error.clone()));
+            }
+        }
+        if let Some(read) = &self.stored_auth {
+            let stored = read().map_err(|error| {
+                TransportError::Fatal(format!(
+                    "HTTP {code}: could not read the vaulted auth token: {error}"
+                ))
+            })?;
+            if stored.is_some() && stored != rejected {
+                self.publish_refreshed_auth(stored.unwrap());
+                return Ok(());
             }
         }
         if self.forced_refresh_spent() {
@@ -6259,6 +6344,7 @@ impl HttpTransport {
             .refresh_failure
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HttpRefreshFailure {
+            recorded_at: Instant::now(),
             token: rejected,
             error: result.clone(),
         });
@@ -6605,7 +6691,7 @@ impl HttpTransport {
                     }
                     None => {}
                 }
-                if ids_match(v.get("id"), Some(&wanted)) {
+                if http_response_id_matches(&v, Some(&wanted)) {
                     return Ok(Some(v));
                 }
             }
@@ -6782,7 +6868,7 @@ impl HttpTransport {
                     if code == 400 && self.is_modern() && expect_response {
                         if let Ok(response) = serde_json::from_str::<Value>(&detail) {
                             let request_id = body.get("id");
-                            if ids_match(response.get("id"), request_id) {
+                            if http_response_id_matches(&response, request_id) {
                                 if let Some(error) = response.get("error") {
                                     return Err(TransportError::Rpc(error.clone()));
                                 }
@@ -6838,7 +6924,7 @@ impl HttpTransport {
         let text = read_capped(resp, MAX_RESPONSE_BYTES);
         let response: Value = serde_json::from_str(&text)
             .map_err(|e| TransportError::Fatal(format!("bad JSON response: {e}")))?;
-        if !ids_match(response.get("id"), body.get("id")) {
+        if !http_response_id_matches(&response, body.get("id")) {
             return Err(TransportError::Fatal(
                 "HTTP response id did not match its request".into(),
             ));
@@ -6847,7 +6933,24 @@ impl HttpTransport {
     }
 }
 
+fn http_response_id_matches(response: &Value, request_id: Option<&Value>) -> bool {
+    ids_match(response.get("id"), request_id)
+        || (response.get("id").is_some_and(Value::is_null) && response.get("error").is_some())
+}
+
 impl Transport for HttpTransport {
+    fn connection_closed(&self) -> Option<bool> {
+        Some(self.concurrency.closed.load(Ordering::SeqCst))
+    }
+
+    fn suspended_calls(&self) -> usize {
+        self.concurrency
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
     fn concurrent(&self) -> Option<Arc<dyn ConcurrentTransport>> {
         Some(Arc::new(HttpCallTransport {
             template: Mutex::new(self.request_shell()),
@@ -7623,16 +7726,12 @@ impl DownstreamServer {
     /// Whether a multiplexed connection has closed; `None` when calls to this
     /// server run one at a time.
     pub fn connection_closed(&self) -> Option<bool> {
-        self.transport
-            .concurrent()
-            .map(|transport| transport.is_closed())
+        self.transport.connection_closed()
     }
 
     /// Calls on a multiplexed connection that wait for the client's input.
     pub fn suspended_calls(&self) -> usize {
-        self.transport
-            .concurrent()
-            .map_or(0, |transport| transport.suspended_calls())
+        self.transport.suspended_calls()
     }
 
     pub fn call_handle(&self) -> Option<CallHandle> {
@@ -14434,7 +14533,7 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         sender
             .send(super::HttpDelivery::Done(Box::new(
-                super::HttpAttemptOutcome {
+                super::HttpCallOutcome {
                     transport: owned,
                     result: Ok(json!({})),
                 },

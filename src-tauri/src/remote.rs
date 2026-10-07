@@ -1206,6 +1206,9 @@ fn authed_transport(
     // blocked only for untrusted-provenance servers.
     let mut transport =
         HttpTransport::guarded_with_timeout(url, token, refresh, block_private, request_timeout);
+    let sid = server_id.to_string();
+    transport
+        .set_stored_auth_reader(move || secrets::get_secret_result(&sid, secrets::HTTP_AUTH_KEY));
     transport.set_scope_reauthorize(scope_reauthorize);
     // Declared per request only while the flow is actually in use, which is what
     // the extension requires. Keyed off vaulted state rather than registry config
