@@ -2184,6 +2184,11 @@ pub trait ConcurrentTransport: Send + Sync {
     fn is_closed(&self) -> bool {
         false
     }
+    /// Calls suspended for a modern upstream round trip: the server is still
+    /// working on them, though no thread is waiting.
+    fn suspended_calls(&self) -> usize {
+        0
+    }
 }
 
 fn downstream_trace(msg: &str) {
@@ -3890,10 +3895,22 @@ impl StdioCore {
         let Some(key) = value.get("id").and_then(id_key) else {
             return;
         };
-        let waiter = self.lock_state().pending.remove(&key);
+        // The waiter's guard can no longer find it to clean up after its client,
+        // so release that client's queued server requests here if this was its
+        // last call.
+        let (waiter, orphaned) = {
+            let mut state = self.lock_state();
+            let waiter = state.pending.remove(&key);
+            let owner = waiter
+                .as_ref()
+                .and_then(|waiter| waiter.context.client().map(str::to_string));
+            let orphaned = state.take_orphaned(owner.as_deref());
+            (waiter, orphaned)
+        };
         if let Some(waiter) = waiter {
             let _ = waiter.tx.send(Delivery::Response(value));
         }
+        self.refuse_orphaned(orphaned);
     }
 
     /// Hand a server request to the thread whose client it belongs to. JSON-RPC
@@ -4049,6 +4066,10 @@ impl ConcurrentTransport for StdioCall {
 
     fn is_closed(&self) -> bool {
         self.core.is_closed()
+    }
+
+    fn suspended_calls(&self) -> usize {
+        self.core.lock_state().suspended.len()
     }
 }
 
@@ -6917,6 +6938,13 @@ impl DownstreamServer {
         self.transport
             .concurrent()
             .map(|transport| transport.is_closed())
+    }
+
+    /// Calls on a multiplexed connection that wait for the client's input.
+    pub fn suspended_calls(&self) -> usize {
+        self.transport
+            .concurrent()
+            .map_or(0, |transport| transport.suspended_calls())
     }
 
     pub fn call_handle(&self) -> Option<CallHandle> {
@@ -11074,6 +11102,64 @@ mod tests {
                     && frame["params"]["requestId"] == 1),
             "{frames:?}"
         );
+    }
+
+    #[test]
+    fn stdio_a_suspended_call_that_ends_answers_its_queued_server_requests() {
+        let fixture = CoreFixture::new("suspended-ends", "");
+        let handler: ServerRequestHandler = Arc::new(|request| {
+            (request["method"] == "elicitation/create")
+                .then_some(ServerRequestAction::InputRequired)
+        });
+        *fixture.core.server_handler.lock().unwrap() = Some(handler);
+        let suspended = fixture.request(
+            "client-a#7",
+            json!({ "name": "one", "arguments": {} }),
+            None,
+        );
+        fixture.wait_for_pending(1);
+        fixture.server_says(json!({
+            "jsonrpc": "2.0",
+            "id": "elicit-1",
+            "method": "elicitation/create",
+            "params": { "message": "Continue?" }
+        }));
+        let suspended = suspended.join().unwrap().unwrap();
+        assert_eq!(suspended["resultType"], "input_required");
+        fixture.server_says(server_request("srv-q", "roots/list"));
+        fixture.wait_for("the owned server request", |core| {
+            core.lock_state().unclaimed.len() == 1
+        });
+
+        // The server ends the call without waiting for the input. No call of
+        // its client remains to answer the request queued for it.
+        fixture.server_says(response(1, json!({ "content": [] })));
+        fixture.wait_for("the queued request to be released", |core| {
+            let state = core.lock_state();
+            state.pending.is_empty() && state.unclaimed.is_empty()
+        });
+        fixture.wait_for_frame("the refusal", |frame| refused(frame, "srv-q"));
+
+        // The client's retry still collects the result.
+        let key = suspended["inputRequests"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let retry = fixture.request(
+            "client-a#8",
+            json!({
+                "name": "one",
+                "arguments": {},
+                "requestState": suspended["requestState"].clone(),
+                "inputResponses": { key: { "action": "accept" } }
+            }),
+            None,
+        );
+        assert_eq!(retry.join().unwrap().unwrap(), json!({ "content": [] }));
+        fixture.finish();
     }
 
     #[test]

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use conduit_lib::downstream::{
-    set_request_context_provider, CancelRegistry, DownstreamServer, RequestContext,
+    set_request_context_provider, CancelRegistry, DownstreamServer, MrtrRequest, RequestContext,
     ServerRequestAction, ServerRequestHandler, StdioTransport, Transport,
 };
 use conduit_lib::router::Router;
@@ -266,4 +266,102 @@ fn discovery_and_refresh_refuse_server_requests_no_client_can_answer() {
         answers.iter().all(|answer| answer.get("error").is_some()),
         "{answers:?}"
     );
+}
+
+/// A legacy server call suspended on an elicitation, for a modern client, is
+/// still running downstream. Timeouts of other calls that trip the breaker,
+/// and a failed probe after the cooldown, must not replace the server under
+/// it: the client's retry has to reach the same child to finish the call.
+/// Waits out the breaker's cooldown twice.
+#[test]
+fn a_failed_probe_keeps_a_call_suspended_on_client_input() {
+    let mock = env!("CARGO_BIN_EXE_mock-mcp-server");
+    let env = vec![
+        ("MOCK_MCP_CONCURRENT".to_string(), "1".to_string()),
+        ("MOCK_MCP_REVISION".to_string(), "2025-11-25".to_string()),
+        ("MOCK_MCP_STRICT".to_string(), "1".to_string()),
+    ];
+    let connect = move || {
+        let transport = StdioTransport::spawn_watched(
+            mock,
+            &[],
+            &env,
+            None,
+            false,
+            Arc::new(AtomicU8::new(0)),
+            None,
+        )
+        .expect("spawn mock");
+        let mut server = DownstreamServer::connect("mock".to_string(), Box::new(transport))
+            .expect("connect mock");
+        server.set_server_request_handler(Arc::new(|request| {
+            (request["method"] == "elicitation/create")
+                .then_some(ServerRequestAction::InputRequired)
+        }));
+        server.set_call_timeout(Duration::from_millis(300));
+        server
+    };
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&spawns);
+    let mut router = Router::new();
+    router.add_with_reconnect(
+        connect(),
+        Some(Box::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Some(connect())
+        })),
+    );
+    let meta = json!({ "io.modelcontextprotocol/protocolVersion": "2026-07-28" });
+
+    let incomplete = router
+        .route_call_with_cancel_and_mrtr(
+            "mock__legacy_elicitation",
+            json!({}),
+            None,
+            Some(&meta),
+            None,
+        )
+        .expect("the elicitation should suspend the call");
+    assert_eq!(incomplete["resultType"], "input_required");
+    let key = incomplete["inputRequests"]
+        .as_object()
+        .and_then(|requests| requests.keys().next().cloned())
+        .expect("one input request");
+
+    // Three timeouts open the breaker; after its cooldown the next call is the
+    // probe, and it times out too.
+    for _ in 0..3 {
+        assert!(router
+            .route_call("mock__sleep", json!({ "ms": 2_000 }))
+            .is_err());
+    }
+    std::thread::sleep(Duration::from_secs(21));
+    assert!(router
+        .route_call("mock__sleep", json!({ "ms": 2_000 }))
+        .is_err());
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        0,
+        "a failed probe replaced the server a suspended call is running on"
+    );
+
+    // The failed probe reopened the breaker; the client retries after it.
+    std::thread::sleep(Duration::from_secs(21));
+
+    let retry = MrtrRequest {
+        input_responses: Some(json!({
+            key: { "action": "accept", "content": { "approved": true } }
+        })),
+        request_state: Some(incomplete["requestState"].clone()),
+    };
+    let complete = router
+        .route_call_with_cancel_and_mrtr(
+            "mock__legacy_elicitation",
+            json!({}),
+            None,
+            Some(&meta),
+            Some(&retry),
+        )
+        .expect("the retry should resume the suspended call");
+    assert_eq!(complete["content"][0]["text"], "legacy confirmed");
 }

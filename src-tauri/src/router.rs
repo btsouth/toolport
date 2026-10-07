@@ -618,12 +618,14 @@ impl ServerSlot {
     }
 
     /// Whether nothing shows a live multiplexed connection is still working:
-    /// no call succeeded since `successes` was read and no other call is
-    /// running on it. Only then may a failed probe replace it, since that ends
-    /// every call in flight. Read under the slot lock for an exact count.
-    fn quiescent_since(&self, successes: u64) -> bool {
+    /// no call succeeded since `successes` was read, no other call is running
+    /// on it, and none is suspended waiting for the client's input. Only then
+    /// may a failed probe replace it, since that ends every call in flight.
+    /// Read under the slot lock (`server` is its guard) for an exact count.
+    fn quiescent_since(&self, server: &DownstreamServer, successes: u64) -> bool {
         self.successes.load(Ordering::Acquire) == successes
             && self.handle_calls.load(Ordering::Acquire) == 0
+            && server.suspended_calls() == 0
     }
 }
 
@@ -2457,7 +2459,7 @@ impl Router {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match server.connection_closed() {
             None | Some(true) => true,
-            Some(false) => slot.quiescent_since(successes),
+            Some(false) => slot.quiescent_since(&server, successes),
         }
     }
 
@@ -2559,7 +2561,9 @@ impl Router {
                     .inner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if server.connection_closed() == Some(false) && !slot.quiescent_since(successes) {
+                if server.connection_closed() == Some(false)
+                    && !slot.quiescent_since(&server, successes)
+                {
                     drop(server);
                     drop(fresh);
                     eprintln!(
