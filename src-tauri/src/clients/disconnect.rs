@@ -123,4 +123,74 @@ mod tests {
         assert!(results[2].error.is_none());
         run(targets, true, |_| panic!("dry run must not mutate"));
     }
+    #[test]
+    fn bulk_restore_reports_bad_config_and_restores_the_remaining_files() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-bulk-restore-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let fixtures = [
+            ("first", Format::JsonMcpServers, "{ \"mcpServers\": {} }"),
+            ("broken", Format::JsonMcpServers, "{\"mcpServers\":{}}"),
+            (
+                "last",
+                Format::TomlMcpServers,
+                "# user's config\nmodel = 'custom'",
+            ),
+        ];
+        let entry: ServerEntry = serde_json::from_value(serde_json::json!({"id":"toolport", "name":"toolport", "transport":"stdio", "command":"/fixture/toolport-gateway"})).unwrap();
+        let mut targets = Vec::new();
+        for (id, format, original) in &fixtures {
+            let path = dir.join(id);
+            std::fs::write(&path, original).unwrap();
+            mutation::run(id, &path, *format, || {
+                edit_format(*format, &path, Some(&entry), true)
+            })
+            .unwrap();
+            targets.push((id.to_string(), path.to_string_lossy().into_owned()));
+        }
+        let broken = "{ native write interrupted";
+        std::fs::write(dir.join("broken"), broken).unwrap();
+        let before: Vec<_> = targets
+            .iter()
+            .map(|(_, path)| std::fs::read(path).unwrap())
+            .collect();
+        run(targets.clone(), true, |_| {
+            panic!("dry run mutated a client")
+        });
+        assert_eq!(
+            targets
+                .iter()
+                .map(|(_, path)| std::fs::read(path).unwrap())
+                .collect::<Vec<_>>(),
+            before
+        );
+        let results = run(targets, false, |id| {
+            let (_, format, _) = fixtures
+                .iter()
+                .find(|(client, _, _)| *client == id)
+                .unwrap();
+            let path = dir.join(id);
+            mutation::run(id, &path, *format, || {
+                restore::apply(id, *format, &path).map(|_| ())
+            })
+        });
+        assert!(results[0].error.is_none());
+        assert!(results[1].error.is_some());
+        assert!(results[2].error.is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("first")).unwrap(),
+            fixtures[0].2
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("broken")).unwrap(), broken);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("last")).unwrap(),
+            fixtures[2].2
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
