@@ -1405,33 +1405,34 @@ mod tests {
     #[test]
     fn oauth_refresh_long_holder_never_allows_an_unlocked_exchange() {
         secrets::tests::with_isolated_vault(|| {
-            let endpoint = RotatingEndpoint::new();
-            endpoint.seed();
-            let holder = std::thread::spawn(|| refresh_token("rotation"));
-            endpoint
-                .started
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap();
-            // Inject the wait deadline while the first exchange is still blocked.
-            // This is the old >65s race without a 65s wall-clock sleep.
-            let error = refresh_token_with_lock("rotation", || {
-                lock_oauth_refresh_for("rotation", Duration::ZERO)
+            std::thread::scope(|scope| {
+                let endpoint = RotatingEndpoint::new();
+                endpoint.seed();
+                let holder = scope.spawn(|| refresh_token("rotation"));
+                endpoint
+                    .started
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                // Inject the wait deadline while the first exchange is still blocked.
+                // This is the old >65s race without a 65s wall-clock sleep.
+                let waited = refresh_token_with_lock("rotation", || {
+                    lock_oauth_refresh_for("rotation", Duration::ZERO)
+                });
+                endpoint.release.send(()).unwrap();
+                assert_eq!(holder.join().unwrap().unwrap(), "token-1");
+                let error = waited.err().unwrap();
+                assert_eq!(error, OAUTH_REFRESH_LOCK_ERROR);
+                assert!(!is_auth_error(&error));
+                assert_eq!(endpoint.count(), 1);
+                assert_eq!(
+                    load_state("rotation")
+                        .unwrap()
+                        .unwrap()
+                        .refresh_token
+                        .as_deref(),
+                    Some("rt-1")
+                );
             })
-            .err()
-            .unwrap();
-            assert_eq!(error, OAUTH_REFRESH_LOCK_ERROR);
-            assert!(!is_auth_error(&error));
-            assert_eq!(endpoint.count(), 1);
-            endpoint.release.send(()).unwrap();
-            assert_eq!(holder.join().unwrap().unwrap(), "token-1");
-            assert_eq!(
-                load_state("rotation")
-                    .unwrap()
-                    .unwrap()
-                    .refresh_token
-                    .as_deref(),
-                Some("rt-1")
-            );
         });
     }
 
@@ -1439,38 +1440,40 @@ mod tests {
     fn oauth_refresh_independent_waiter_uses_the_saved_winner() {
         for timeout_after_save in [false, true] {
             secrets::tests::with_isolated_vault(|| {
-                let endpoint = RotatingEndpoint::new();
-                endpoint.seed();
-                let holder = std::thread::spawn(|| refresh_token("rotation"));
-                endpoint
-                    .started
-                    .recv_timeout(Duration::from_secs(5))
-                    .unwrap();
-                let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
-                let (saved_tx, saved_rx) = std::sync::mpsc::channel();
-                let waiter = std::thread::spawn(move || {
-                    refresh_token_with_lock("rotation", || {
-                        // This seam runs after the pre-lock vault snapshot. Try the
-                        // real lock while the peer holds it, then let it save.
-                        let contended = lock_oauth_refresh_for("rotation", Duration::ZERO);
-                        assert!(contended.is_err());
-                        snapshot_tx.send(()).unwrap();
-                        saved_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                        if timeout_after_save {
-                            contended
-                        } else {
-                            lock_oauth_refresh_for("rotation", Duration::ZERO)
-                        }
-                    })
-                });
-                snapshot_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                endpoint.release.send(()).unwrap();
-                assert_eq!(holder.join().unwrap().unwrap(), "token-1");
-                saved_tx.send(()).unwrap();
-                let winner = waiter.join().unwrap().unwrap();
-                assert_eq!(winner.access_token, "token-1");
-                assert!(winner.expires_at.unwrap() > now_epoch_seconds());
-                assert_eq!(endpoint.count(), 1);
+                std::thread::scope(|scope| {
+                    let endpoint = RotatingEndpoint::new();
+                    endpoint.seed();
+                    let holder = scope.spawn(|| refresh_token("rotation"));
+                    endpoint
+                        .started
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+                    let (saved_tx, saved_rx) = std::sync::mpsc::channel();
+                    let waiter = scope.spawn(move || {
+                        refresh_token_with_lock("rotation", || {
+                            // This seam runs after the pre-lock vault snapshot. Try the
+                            // real lock while the peer holds it, then let it save.
+                            let contended = lock_oauth_refresh_for("rotation", Duration::ZERO);
+                            assert!(contended.is_err());
+                            snapshot_tx.send(()).unwrap();
+                            saved_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                            if timeout_after_save {
+                                contended
+                            } else {
+                                lock_oauth_refresh_for("rotation", Duration::ZERO)
+                            }
+                        })
+                    });
+                    snapshot_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    endpoint.release.send(()).unwrap();
+                    assert_eq!(holder.join().unwrap().unwrap(), "token-1");
+                    saved_tx.send(()).unwrap();
+                    let winner = waiter.join().unwrap().unwrap();
+                    assert_eq!(winner.access_token, "token-1");
+                    assert!(winner.expires_at.unwrap() > now_epoch_seconds());
+                    assert_eq!(endpoint.count(), 1);
+                })
             });
         }
     }
@@ -1479,33 +1482,37 @@ mod tests {
     fn oauth_refresh_persistence_failures_are_explicit_and_preserve_write_order() {
         for key in [STATE_KEY, secrets::HTTP_AUTH_KEY] {
             secrets::tests::with_isolated_vault(|| {
-                let endpoint = RotatingEndpoint::new();
-                endpoint.seed();
-                let worker = std::thread::spawn(move || {
-                    secrets::tests::with_failed_write(key, || refresh_token_if_needed("rotation"))
-                });
-                endpoint
-                    .started
-                    .recv_timeout(Duration::from_secs(5))
-                    .unwrap();
-                endpoint.release.send(()).unwrap();
-                let error = worker.join().unwrap().unwrap_err();
-                assert!(is_retriable_refresh_error(&error), "{error}");
-                assert!(!is_auth_error(&error), "{error}");
-                assert!(!error.contains("rt-1"));
-                assert_eq!(endpoint.count(), 1);
-                let saved = load_state("rotation").unwrap().unwrap();
-                if key == STATE_KEY {
-                    assert!(error.contains("previous refresh token may no longer be valid"));
-                    assert_eq!(saved.refresh_token.as_deref(), Some("rt-0"));
-                } else {
-                    assert!(error.contains("rotated refresh token was saved"));
-                    assert_eq!(saved.refresh_token.as_deref(), Some("rt-1"));
-                }
-                assert_eq!(
-                    secrets::get_secret("rotation", secrets::HTTP_AUTH_KEY).as_deref(),
-                    Some("token-0")
-                );
+                std::thread::scope(|scope| {
+                    let endpoint = RotatingEndpoint::new();
+                    endpoint.seed();
+                    let worker = scope.spawn(move || {
+                        secrets::tests::with_failed_write(key, || {
+                            refresh_token_if_needed("rotation")
+                        })
+                    });
+                    endpoint
+                        .started
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    endpoint.release.send(()).unwrap();
+                    let error = worker.join().unwrap().unwrap_err();
+                    assert!(is_retriable_refresh_error(&error), "{error}");
+                    assert!(!is_auth_error(&error), "{error}");
+                    assert!(!error.contains("rt-1"));
+                    assert_eq!(endpoint.count(), 1);
+                    let saved = load_state("rotation").unwrap().unwrap();
+                    if key == STATE_KEY {
+                        assert!(error.contains("previous refresh token may no longer be valid"));
+                        assert_eq!(saved.refresh_token.as_deref(), Some("rt-0"));
+                    } else {
+                        assert!(error.contains("rotated refresh token was saved"));
+                        assert_eq!(saved.refresh_token.as_deref(), Some("rt-1"));
+                    }
+                    assert_eq!(
+                        secrets::get_secret("rotation", secrets::HTTP_AUTH_KEY).as_deref(),
+                        Some("token-0")
+                    );
+                })
             });
         }
     }
