@@ -176,7 +176,7 @@ impl SettingsPage {
         capabilities.add_css_class("toolport-settings-group");
         let (lazy_row, lazy_discovery) = setting_switch_row(
             "Lazy discovery",
-            "Expose a small discovery toolkit instead of loading the full tool catalog up front.",
+            "Default for anonymous connections. Choose Auto or an override in Clients.",
         );
         capabilities.append(&lazy_row);
         let (code_row, code_mode) = setting_switch_row(

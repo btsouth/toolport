@@ -532,8 +532,8 @@ function ProfileToolScope({
   );
 }
 
-/** Global discovery + security policy. These apply to every client uniformly, so
- * they live here rather than in each server’s Tools tab. */
+/** Anonymous discovery defaults and global security policy. Identified clients
+ * choose discovery in Clients. */
 export function SettingsView({ registry, onRegistryChange }: Props) {
   const { theme, setTheme } = useTheme();
   const [removeOpen, setRemoveOpen] = useState(false);
@@ -1012,7 +1012,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           lazyDiscovery,
           "text-info",
           "Lazy discovery",
-          "Expose 4 meta-tools, not the full catalog (all clients)",
+          "Default for anonymous connections. Choose Auto or an override in Clients.",
           apply("lazy-discovery", setLazyDiscovery),
           "lazy-discovery",
         )}
