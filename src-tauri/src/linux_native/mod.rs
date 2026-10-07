@@ -9064,6 +9064,12 @@ mod tests {
         client.legacy_bearer_argv = false;
         assert!(client_needs_reset_action(&client));
         assert_eq!(client_reset_label(&client), "Reset and connect");
+        client.scope_id = Some(crate::registry::ALL_ENABLED_ACCESS.into());
+        let scope = client_reset_scope(&client);
+        crate::registry_controller::apply_client_stdio_update(
+            &mut registry, &client.id, scope.as_deref(), None,
+        );
+        assert_eq!(registry.client_scopes.get(&client.id).map(String::as_str), Some(crate::registry::ALL_ENABLED_ACCESS));
         client.scope_id = Some(String::new());
         let scope = client_reset_scope(&client);
         crate::registry_controller::apply_client_stdio_update(
@@ -9073,6 +9079,9 @@ mod tests {
             None,
         );
         assert_eq!(registry.client_scopes.get(&client.id), Some(&String::new()));
+        let access = registry.resolve_profile_id(registry.client_scopes.get(&client.id).unwrap());
+        assert_eq!(access, registry.default_access_id());
+        assert_ne!(access, registry.all_access_id());
     }
 
     /// The 2.0 sidebar is the four fixed views in order, with Team appended only
