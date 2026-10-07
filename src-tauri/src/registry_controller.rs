@@ -249,11 +249,6 @@ pub enum EssentialSetting {
     LazyDiscovery,
     CodeMode,
     LiveInspect,
-    DenyDestructive,
-    ConfirmDestructive,
-    HumanApproval,
-    QuarantineOnDrift,
-    BlockOnInjection,
     PiiRedaction,
 }
 
@@ -1050,11 +1045,6 @@ pub fn set_essential_setting(
             EssentialSetting::LazyDiscovery => registry.set_lazy_discovery(enabled),
             EssentialSetting::CodeMode => registry.code_mode = enabled,
             EssentialSetting::LiveInspect => registry.set_live_inspect(enabled),
-            EssentialSetting::DenyDestructive => registry.set_deny_destructive(enabled),
-            EssentialSetting::ConfirmDestructive => registry.set_confirm_destructive(enabled),
-            EssentialSetting::HumanApproval => registry.set_human_approval(enabled),
-            EssentialSetting::QuarantineOnDrift => registry.quarantine_on_drift = enabled,
-            EssentialSetting::BlockOnInjection => registry.block_on_injection = enabled,
             EssentialSetting::PiiRedaction => registry.pii_redaction = enabled,
         }
         Ok(())

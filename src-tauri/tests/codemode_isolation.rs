@@ -476,8 +476,7 @@ fn isolated_host_calls_preserve_confirmation_pii_and_rate_limits() {
     let mut gateway = Gateway::configured(
         |reg, dir| {
             mock_registry(reg, dir);
-            reg.safety_level = None;
-            reg.confirm_destructive = true;
+            reg.set_safety_level(conduit_lib::registry::SafetyLevel::Ask);
             reg.pii_redaction = true;
             reg.team = Some(serde_json::from_value(json!({
             "serverUrl": "https://example.invalid", "teamId": "test", "role": "member",

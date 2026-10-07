@@ -53,7 +53,11 @@ pub(crate) fn registry_summary(registry: &Registry) -> String {
         overrides.sort();
         let _ = writeln!(output, "  per-client discovery: {}", overrides.join(", "));
     }
-    let _ = writeln!(output, "  deny destructive: {}", registry.deny_destructive);
+    let _ = writeln!(
+        output,
+        "  deny destructive: {}",
+        registry.deny_destructive_effective()
+    );
     let _ = writeln!(
         output,
         "  HTTP endpoint: {}{}",

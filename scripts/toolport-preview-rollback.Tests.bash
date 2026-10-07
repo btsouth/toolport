@@ -88,7 +88,21 @@ cmp -s "$fixtures/v1.json" "$TOOLPORT_DATA_DIR/registry.json" && pass "migrated 
 aside="$(find "$TOOLPORT_DATA_DIR" -name 'registry.json.v2-rollback-*')"
 [ -n "$aside" ] && cmp -s "$fixtures/v2.json" "$aside" && pass "migrated registry kept aside" || fail "no exact v2 copy kept"
 [ -f "$TOOLPORT_DATA_DIR/exports/rules-2026-10-07.md" ] && pass "exports left in place" || fail "exports removed"
-echo "$out" | grep -q "Registry: version 2 moved to" && pass "migrated version reported" || fail "output: $out"
+echo "$out" | grep -q "Registry: version 2 copied to" && pass "migrated version reported" || fail "output: $out"
+[ -z "$(find "$TOOLPORT_DATA_DIR" -name '.registry.json.rollback-*')" ] && pass "no restore temp file left" || fail "temp file left behind"
+
+# Re-entry after a run stopped before its restore finished: no primary, the v2
+# copy aside and the v1 backups still there. The newest v1 backup is restored.
+setup missing-primary
+cp "$fixtures/v2.json" "$TOOLPORT_DATA_DIR/registry.json.v2-rollback-20261007-120000"
+printf '{"version": 1, "servers": [{"id": "old"}]}\n' > "$TOOLPORT_DATA_DIR/registry.json.v1-1790000000000.bak"
+cp "$fixtures/v1.json" "$TOOLPORT_DATA_DIR/registry.json.v1-1791000000000.bak"
+touch "$TOOLPORT_ROLLBACK_PKG_CACHE/toolport-1.24.0-1-x86_64.pkg.tar.zst"
+out="$(rollback)"
+cmp -s "$fixtures/v1.json" "$TOOLPORT_DATA_DIR/registry.json" && pass "missing primary restored from the newest v1 backup" || fail "registry: $(cat "$TOOLPORT_DATA_DIR/registry.json" 2>&1 | head -c 200)"
+echo "$out" | grep -q "none at .*; restored registry.json.v1-1791000000000.bak" && pass "re-entry restore reported" || fail "output: $out"
+grep -qx -- "-U $TOOLPORT_ROLLBACK_PKG_CACHE/toolport-1.24.0-1-x86_64.pkg.tar.zst" "$PACMAN_LOG" \
+  && pass "1.x reinstalled after the restore" || fail "pacman got: $(cat "$PACMAN_LOG")"
 
 # v2 registry with no v1 backup: refuses and changes nothing.
 setup v2-no-backup

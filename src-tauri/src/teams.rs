@@ -4307,7 +4307,9 @@ mod tests {
 
     fn base_registry() -> Registry {
         let mut r = Registry::default();
-        r.safety_level = None; // Exercise retained v1 fields and releasable team overlays.
+        // Exercise retained v1 fields and releasable team overlays.
+        r.version = 1;
+        r.safety_level = None;
         r.servers.push(ServerEntry {
             inherit_env: false,
             id: "mine".into(),

@@ -17742,6 +17742,7 @@ mod tests {
         let router = Router::new();
         let mut on = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         on.deny_destructive = true;
@@ -17774,6 +17775,7 @@ mod tests {
 
         let mut off = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         off.deny_destructive = false;
@@ -17785,6 +17787,7 @@ mod tests {
 
         let mut on = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         on.deny_destructive = true;
@@ -18887,6 +18890,7 @@ mod tests {
     fn block_on_injection_withholds_high_confidence_payload() {
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         reg.block_on_injection = true;
@@ -18936,6 +18940,7 @@ mod tests {
         // Default (block off): still labels, never withholds.
         let reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         let result = json!({
@@ -18954,6 +18959,7 @@ mod tests {
         // forceBlockOnInjection alone would be a no-op).
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         reg.team_forced_content_defense = false;
@@ -19292,7 +19298,7 @@ mod tests {
         let _era = UpstreamEraGuard::enter(Some(MODERN_PROTOCOL_VERSION.to_string()));
         let _capabilities = UpstreamCapabilitiesGuard::enter(&request);
         let mut reg = Registry::default();
-        reg.set_human_approval(true);
+        reg.set_safety_level(registry::SafetyLevel::Ask);
         let router = routed_router("s", "delete");
         let cached = router.aggregated_tools();
 
@@ -20121,6 +20127,7 @@ mod tests {
         let _data_env = DataDirTestEnv::new("run_script_final_aggregate_is_screened_for_injection");
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         reg.block_on_injection = false;
@@ -20186,6 +20193,7 @@ mod tests {
         let _data_env = DataDirTestEnv::new("run_script_blocked_failure_keeps_the_recovery_ledger");
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         reg.block_on_injection = true;
@@ -26721,6 +26729,7 @@ mod tests {
     fn instructions_registry() -> Registry {
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         for (name, instructions) in [
@@ -28691,6 +28700,7 @@ mod tests {
         );
         let reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         let host = dispatch_host(false);
@@ -28840,6 +28850,7 @@ mod tests {
         let host = dispatch_host(false);
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         let guard = SearchGuard::default();
@@ -30348,6 +30359,7 @@ mod tests {
 
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         reg.quarantine_on_drift = true;
@@ -30881,6 +30893,7 @@ mod tests {
 
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         reg.quarantine_on_drift = true;
@@ -31023,6 +31036,7 @@ mod tests {
 
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         reg.quarantine_on_drift = true;
@@ -32529,25 +32543,6 @@ mod tests {
     }
 
     #[test]
-    fn confirm_and_deny_destructive_are_mutually_exclusive() {
-        let mut reg = Registry::default();
-
-        // Enabling confirm turns off deny.
-        reg.set_deny_destructive(true);
-        reg.set_confirm_destructive(true);
-        assert!(reg.confirm_destructive);
-        assert!(!reg.deny_destructive, "enabling confirm must turn off deny");
-
-        // Enabling deny turns off confirm.
-        reg.set_deny_destructive(true);
-        assert!(reg.deny_destructive);
-        assert!(
-            !reg.confirm_destructive,
-            "enabling deny must turn off confirm"
-        );
-    }
-
-    #[test]
     fn legacy_confirm_destructive_requires_human_approval_on_direct_call() {
         // A registry written by 1.x can carry confirm_destructive with no explicit safety
         // level. The gateway must read the legacy flag live and derive Ask, so a direct
@@ -32560,6 +32555,7 @@ mod tests {
         // No explicit level and a legacy confirm flag: the derived level must be Ask.
         let reg = Registry {
             safety_level: None,
+            version: 1,
             confirm_destructive: true,
             ..Registry::default()
         };

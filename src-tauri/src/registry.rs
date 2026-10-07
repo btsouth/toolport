@@ -1036,21 +1036,15 @@ pub struct Registry {
     pub profiles: Vec<Profile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_profile_id: Option<String>,
-    /// Global safety switch: when true, the gateway hides and blocks any tool a
-    /// server annotates with `destructiveHint: true` (deletes, drops, writes).
-    /// One toggle to keep agents read-only across every connected server.
+    /// The 1.x safety toggles (`denyDestructive`, `confirmDestructive`, `humanApproval`,
+    /// `quarantineOnDrift`, `blockOnInjection`). In a v1 registry they select the safety
+    /// level (see [`Registry::safety_level_selected`]). From v2 on they are a write-only
+    /// mirror of `safety_level`, kept in sync on every save so a 1.x process still running
+    /// across the upgrade enforces the equivalent policy; 2.0 never reads them there.
     #[serde(default)]
     pub deny_destructive: bool,
-    /// Legacy per-call confirmation for destructive tools. Toolport 2.0 removed the
-    /// agent-token confirm flow, so no confirmation step reads it. It is still read
-    /// live to derive the safety level: with no explicit level and no blocking gate,
-    /// a true value selects Ask (see `safety_level_selected`).
     #[serde(default)]
     pub confirm_destructive: bool,
-    /// Human-in-the-loop approval: when true, a *gated* tool call (destructive-hinted, or
-    /// from an untrusted-provenance server) is held and surfaced to the Toolport app for a
-    /// person to approve or deny before it runs. The call blocks until a decision or a
-    /// fail-closed timeout. Off by default.
     #[serde(default)]
     pub human_approval: bool,
     /// Tools the user chose to "always allow" past human approval, so the HITL gate skips
@@ -2127,39 +2121,12 @@ impl Registry {
             .unwrap_or(false)
     }
 
-    /// Set the global destructive-tool deny switch. Mutually exclusive with
-    /// `confirm_destructive`: enabling deny clears confirm.
-    pub fn set_deny_destructive(&mut self, deny: bool) {
-        self.safety_level = None;
-        self.deny_destructive = deny;
-        if deny {
-            self.confirm_destructive = false;
-        }
-    }
-
-    /// Set the legacy per-call confirmation flag for destructive tools. Toolport 2.0
-    /// removed the agent-token confirm flow, so this only feeds `safety_level_selected`:
-    /// it clears the explicit level, and a true value then derives Ask when no blocking
-    /// gate is on. Mutually exclusive with `deny_destructive`, which hides gated tools.
-    pub fn set_confirm_destructive(&mut self, confirm: bool) {
-        self.safety_level = None;
-        self.confirm_destructive = confirm;
-        if confirm {
-            self.deny_destructive = false;
-        }
-    }
-
-    /// Turn human-in-the-loop approval on or off. Clears the explicit `safety_level` so
-    /// the derived level follows: like a legacy `confirm_destructive`, a true value maps
-    /// to Ask, which holds a gated call for a person. Independent of `deny_destructive`,
-    /// which hides gated tools entirely.
-    pub fn set_human_approval(&mut self, on: bool) {
-        self.safety_level = None;
-        self.human_approval = on;
-    }
-
-    /// Member choice, derived from legacy gates when the additive field is absent.
+    /// The member's own level. From v2 on an absent level means the 2.0 default,
+    /// Ask. Only a v1 registry derives it from the 1.x toggles.
     pub fn safety_level_selected(&self) -> SafetyLevel {
+        if self.version >= 2 {
+            return self.safety_level.unwrap_or_default();
+        }
         // Legacy blocking flags map to Strict, approval/confirmation to Ask,
         // and no blocking gates to Off. Labeling and recording never block.
         self.safety_level.unwrap_or_else(|| {
@@ -2189,6 +2156,24 @@ impl Registry {
 
     pub fn set_safety_level(&mut self, level: SafetyLevel) {
         self.safety_level = Some(level);
+        self.sync_legacy_safety_mirror();
+    }
+
+    /// Rewrite the 1.x toggles from the selected level in a v2+ registry, so a 1.x
+    /// reader enforces the same policy: Strict blocks destructive tools, drift and
+    /// injection and holds calls for approval, Ask holds calls for approval, Off sets
+    /// nothing. Read by 1.x's rules this derives the same level back.
+    pub fn sync_legacy_safety_mirror(&mut self) {
+        if self.version < 2 {
+            return;
+        }
+        let level = self.safety_level_selected();
+        let strict = level == SafetyLevel::Strict;
+        self.deny_destructive = strict;
+        self.quarantine_on_drift = strict;
+        self.block_on_injection = strict;
+        self.human_approval = level >= SafetyLevel::Ask;
+        self.confirm_destructive = false;
     }
 
     pub fn requires_human_approval(&self, destructive: bool, untrusted: bool) -> bool {
@@ -3377,12 +3362,17 @@ fn load_from_inner_with(
                         // a failed step leaves the primary untouched.
                         migrate_document(path, &mut value, &content, migrations, target_version)?;
                     }
-                    match serde_json::from_value::<Registry>(value) {
+                    match serde_json::from_value::<Registry>(value.clone()) {
                         Ok(reg) => {
                             // Publish the migrated document atomically, only
-                            // after it deserialized into a Registry.
+                            // after it deserialized into a Registry. The raw
+                            // document is written, not the struct, so nested
+                            // fields this build does not model survive.
                             if needs_migration {
-                                save_to(path, &reg)?;
+                                validate_server_launches(&reg)?;
+                                let json = serde_json::to_string_pretty(&value)
+                                    .map_err(|e| e.to_string())?;
+                                write_registry_document(path, &json, &value)?;
                             }
                             Ok((reg, LoadSource::File))
                         }
@@ -3406,6 +3396,7 @@ fn load_from_inner_with(
         }
     }?;
     registry.normalize_profile_references();
+    registry.sync_legacy_safety_mirror();
     // This path is reached only under the registry file lock. Save an exact
     // legacy-template migration here so a concurrent older writer cannot race
     // between detection and the atomic backup-preserving write.
@@ -3798,7 +3789,10 @@ pub fn parse_registry_contents(contents: &str) -> Result<Registry, String> {
     if found > REGISTRY_VERSION {
         return Err(newer_version_error(found, REGISTRY_VERSION));
     }
-    serde_json::from_value(value).map_err(|error| format!("Corrupt registry: {error}"))
+    let mut registry: Registry =
+        serde_json::from_value(value).map_err(|error| format!("Corrupt registry: {error}"))?;
+    registry.sync_legacy_safety_mirror();
+    Ok(registry)
 }
 
 /// Run [`load_from_inner_with`] holding the registry lock, so a test can prove
@@ -3814,6 +3808,15 @@ fn load_from_with_migrations_for_test(
 }
 
 pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
+    validate_server_launches(registry)?;
+    let mut registry = registry.clone();
+    registry.sync_legacy_safety_mirror();
+    let json = serde_json::to_string_pretty(&registry).map_err(|e| e.to_string())?;
+    let value = serde_json::to_value(&registry).map_err(|e| e.to_string())?;
+    write_registry_document(path, &json, &value)
+}
+
+fn validate_server_launches(registry: &Registry) -> Result<(), String> {
     for server in &registry.servers {
         if let Some(launch) = &server.launch {
             launch.validate(&server.args, true)?;
@@ -3823,18 +3826,27 @@ pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
             // Structural validation above is enough for saving.
         }
     }
+    Ok(())
+}
+
+/// Write `json` (the serialized form of `value`) as the primary, with the
+/// newer-version guard, the no-op guard and the backup journal.
+fn write_registry_document(
+    path: &Path,
+    json: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let json = serde_json::to_string_pretty(registry).map_err(|e| e.to_string())?;
     let existing = std::fs::read_to_string(path).ok();
     // An older binary must never overwrite a registry a newer build wrote: this
     // is the write half of the mixed-version guard (the read half is in
     // `load_from_inner_with`). Check BEFORE the no-op comparison and before any
     // backup/quarantine work, so the newer file is left byte-for-byte as it was.
     if let Some(cur) = existing.as_deref() {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(cur) {
-            let found = document_version(&value);
+        if let Ok(on_disk) = serde_json::from_str::<serde_json::Value>(cur) {
+            let found = document_version(&on_disk);
             if found > REGISTRY_VERSION {
                 return Err(newer_version_error(found, REGISTRY_VERSION));
             }
@@ -3850,10 +3862,7 @@ pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
     // HashMap key-order jitter across a load->save round-trip can't masquerade as a change.
     if let Some(cur) = existing.as_deref() {
         if let Ok(cur_val) = serde_json::from_str::<serde_json::Value>(cur) {
-            if serde_json::to_value(registry)
-                .map(|v| v == cur_val)
-                .unwrap_or(false)
-            {
+            if *value == cur_val {
                 return Ok(());
             }
         }
@@ -3888,7 +3897,7 @@ pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
     }
     // The registry is the single source of truth for every server, so a crash,
     // power loss, or full disk mid-write must not be able to truncate it.
-    atomic_write(path, &json)
+    atomic_write(path, json)
 }
 
 pub fn load() -> Result<Registry, String> {
@@ -4740,15 +4749,15 @@ mod tests {
 
         // Our update touches a different field. Loading fresh must keep the concurrent change.
         let (out, ()) = update_at(&path, |r| {
-            r.deny_destructive = true;
+            r.pii_redaction = true;
             Ok(())
         })
         .unwrap();
-        assert!(out.deny_destructive, "our change applied");
+        assert!(out.pii_redaction, "our change applied");
         assert!(out.live_inspect, "the concurrent write was NOT reverted");
 
         let reloaded = load_from(&path).unwrap();
-        assert!(reloaded.deny_destructive && reloaded.live_inspect);
+        assert!(reloaded.pii_redaction && reloaded.live_inspect);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5447,11 +5456,11 @@ mod tests {
     }
 
     #[test]
-    fn deny_destructive_round_trips_through_disk() {
+    fn strict_safety_round_trips_through_disk() {
         let mut r = Registry::default();
         let id = r.add_server(sample_server("postgres"));
         r.set_tool_enabled(&id, "drop_table", false).unwrap();
-        r.set_deny_destructive(true);
+        r.set_safety_level(SafetyLevel::Strict);
 
         let mut path = std::env::temp_dir();
         path.push(format!("conduit-policy-test-{}.json", std::process::id()));
@@ -5459,7 +5468,8 @@ mod tests {
         let loaded = load_from(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert!(loaded.deny_destructive);
+        assert_eq!(loaded.safety_level_selected(), SafetyLevel::Strict);
+        assert!(loaded.deny_destructive, "the 1.x mirror is written");
         assert!(!loaded.is_tool_enabled(&id, "drop_table"));
     }
 
@@ -5704,14 +5714,14 @@ mod tests {
         std::env::set_var("TOOLPORT_REGISTRY", &locked_path);
 
         update(|registry| {
-            registry.deny_destructive = true;
+            registry.pii_redaction = true;
             std::env::set_var("TOOLPORT_REGISTRY", &redirected_path);
             Ok(())
         })
         .unwrap();
 
         let persisted = load_from(&locked_path).unwrap();
-        assert!(persisted.deny_destructive);
+        assert!(persisted.pii_redaction);
         assert!(
             !redirected_path.exists(),
             "update wrote to a path whose lock it never held"

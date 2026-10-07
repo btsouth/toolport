@@ -176,22 +176,6 @@ export function setToolPinned(
   return invoke<Registry>("set_tool_pinned", { serverId, tool, pinned });
 }
 
-/** Toggle the global destructive-tool deny switch. */
-export function setDenyDestructive(deny: boolean): Promise<Registry> {
-  return invoke<Registry>("set_deny_destructive", { deny });
-}
-
-/** Toggle per-call confirmation for destructive tools (intercept + preview + token). */
-export function setConfirmDestructive(confirm: boolean): Promise<Registry> {
-  return invoke<Registry>("set_confirm_destructive", { confirm });
-}
-
-/** Toggle human-in-the-loop approval: hold a gated tool call (destructive, or from an
- * untrusted-provenance server) until a person approves or denies it in the app. */
-export function setHumanApproval(on: boolean): Promise<Registry> {
-  return invoke<Registry>("set_human_approval", { on });
-}
-
 /** Tool calls currently held awaiting a human decision (the approval queue). */
 export function listPendingApprovals(): Promise<PendingApproval[]> {
   return invoke<PendingApproval[]>("list_pending_approvals");
@@ -277,16 +261,6 @@ export function clearActivityLogs(): Promise<void> {
  * first-seen/last-changed) for the active profile. Empty until a baseline is pinned. */
 export function getToolIdentities(): Promise<ToolIdentity[]> {
   return invoke<ToolIdentity[]>("list_tool_identities");
-}
-
-/** Toggle quarantine-on-drift: block a high-risk tool that drifted until re-approved. */
-export function setQuarantineOnDrift(on: boolean): Promise<Registry> {
-  return invoke<Registry>("set_quarantine_on_drift", { on });
-}
-
-/** Toggle opt-in block-on-injection: fail high-confidence injection hits instead of only labeling. */
-export function setBlockOnInjection(on: boolean): Promise<Registry> {
-  return invoke<Registry>("set_block_on_injection", { on });
 }
 
 /** Toggle PII pseudonymization: replace emails, cards and keys in tool results with

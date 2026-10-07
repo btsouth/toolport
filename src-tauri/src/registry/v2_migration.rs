@@ -2,9 +2,12 @@
 //!
 //! 2.0 cut agent rules, agent activity hooks, agent permissions and the guard hook,
 //! routines, agent control and the legacy gateway topology, and folded the separate
-//! safety toggles into one `safetyLevel`. This step drops those fields. Anything the
+//! safety toggles into one `safetyLevel`. This step drops the cut fields. Anything the
 //! user wrote that only lived there is exported to `<data dir>/exports/` first, so
 //! nothing they authored is lost with the field. Client files are never edited.
+//!
+//! The 1.x safety toggles stay as a mirror of the level, because released 1.x builds
+//! have no schema check and a 1.x process can still be running across the upgrade.
 
 use std::path::{Path, PathBuf};
 
@@ -46,12 +49,6 @@ const DROPPED_KEYS: &[&str] = &[
     "allowAgentControl",
     // Legacy per-client gateway topology.
     "gatewayTopology",
-    // Separate safety toggles, folded into `safetyLevel`.
-    "denyDestructive",
-    "confirmDestructive",
-    "humanApproval",
-    "quarantineOnDrift",
-    "blockOnInjection",
     // Always on in 2.0.
     "contentDefense",
     "integrityCheck",
@@ -71,6 +68,13 @@ pub(super) fn migrate_v1_to_v2(
 
     let level = safety_level(registry);
     registry.insert("safetyLevel".to_string(), Value::from(level));
+    // The 1.x mirror of the level; see `Registry::sync_legacy_safety_mirror`.
+    let strict = level == "strict";
+    for key in ["denyDestructive", "quarantineOnDrift", "blockOnInjection"] {
+        registry.insert(key.to_string(), Value::Bool(strict));
+    }
+    registry.insert("humanApproval".to_string(), Value::Bool(level != "off"));
+    registry.insert("confirmDestructive".to_string(), Value::Bool(false));
     // Code Mode is opt-in in 2.0, including for existing users.
     // TOOLPORT_CODE_MODE=1 still forces it on.
     registry.insert("codeMode".to_string(), Value::Bool(false));
@@ -344,9 +348,9 @@ fn matching_export(dir: &Path, stem: &str, extension: &str, content: &str) -> Op
 mod tests {
     use super::*;
     use crate::registry::{
-        backup_path, data_dir_test_lock, is_newer_version_error, load_from,
-        load_from_with_migrations_for_test, migration_backup_files, DataDirOverride, Migration,
-        SafetyLevel, REGISTRY_ENV_LOCK, REGISTRY_VERSION,
+        backup_path, data_dir_test_lock, load_from, load_from_with_migrations_for_test,
+        migration_backup_files, DataDirOverride, Migration, Registry, SafetyLevel,
+        REGISTRY_ENV_LOCK, REGISTRY_VERSION,
     };
     use serde_json::json;
 
@@ -411,7 +415,7 @@ mod tests {
             "transport": "stdio",
             "command": "npx",
             "args": ["-y", "@modelcontextprotocol/server-github"],
-            "env": [{"key": "GITHUB_TOKEN", "secret": true}],
+            "env": [{"key": "GITHUB_TOKEN", "secret": true, "futureEnvField": "keep-env"}],
             "source": "manual",
             "disabledTools": ["delete_repository"]
         },
@@ -467,6 +471,7 @@ mod tests {
         "managedServerIds": {"linear": "srv_1"},
         "reportingDeviceId": "dev-1",
         "teamName": "Acme",
+        "futureTeamField": {"keep": ["team"]},
         "teamInstructionsVersion": 2,
         "teamInstructionsTargets": ["@DIR@/home/.claude/rules/toolport-team-rules.md"]
     },
@@ -480,7 +485,8 @@ mod tests {
             "env": {"TOOLPORT_CLIENT_ID": "claude-desktop"},
             "transport": "sharedHttp",
             "url": "http://127.0.0.1:8765/mcp",
-            "updatedAt": 1790000000000
+            "updatedAt": 1790000000000,
+            "futureEntryField": "keep-entry"
         }
     },
     "ruleSets": [
@@ -583,23 +589,26 @@ mod tests {
         assert_eq!(v2["codeMode"], false);
         assert!(!registry.code_mode);
         for key in DROPPED_KEYS {
-            let kept_as_default = matches!(
-                *key,
-                "denyDestructive"
-                    | "confirmDestructive"
-                    | "humanApproval"
-                    | "quarantineOnDrift"
-                    | "blockOnInjection"
-            );
-            if kept_as_default {
-                // Still in the struct for the legacy setters; only ever false after
-                // the migration, and ignored while safetyLevel is set.
-                assert_eq!(v2[*key], false, "{key}");
-            } else {
-                assert!(v2.get(*key).is_none(), "{key} survived the migration");
-            }
+            assert!(v2.get(*key).is_none(), "{key} survived the migration");
             assert!(!registry.unknown_fields.contains_key(*key), "{key}");
         }
+        // The 1.x mirror of Ask: approval on, nothing blocked.
+        assert_eq!(v2["humanApproval"], true);
+        for key in [
+            "denyDestructive",
+            "quarantineOnDrift",
+            "blockOnInjection",
+            "confirmDestructive",
+        ] {
+            assert_eq!(v2[key], false, "{key}");
+        }
+        // Fields this build does not model survive at every depth.
+        assert_eq!(v2["servers"][0]["env"][0]["futureEnvField"], "keep-env");
+        assert_eq!(v2["team"]["futureTeamField"], json!({"keep": ["team"]}));
+        assert_eq!(
+            v2["clientManagedEntries"]["claude-desktop"]["futureEntryField"],
+            "keep-entry"
+        );
 
         // Kept exactly as they were.
         for key in [
@@ -742,6 +751,7 @@ mod tests {
             }
             migrate_v1_to_v2(&mut value, &context(&dir)).unwrap();
             assert_eq!(value["safetyLevel"], expected, "{flags}");
+            assert_eq!(level_name(as_1x_reader(&value)), expected, "{flags}");
             if flags.get("teamForcedDenyDestructive").is_some() {
                 assert_eq!(value["teamForcedDenyDestructive"], true);
             }
@@ -866,25 +876,102 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// What a released 1.x build sees: no `version` field and no `safetyLevel`, so it
+    /// derives the level from the toggles alone.
+    fn as_1x_reader(document: &Value) -> Registry {
+        let mut document = document.clone();
+        let fields = document.as_object_mut().unwrap();
+        fields.remove("version");
+        fields.remove("safetyLevel");
+        let registry: Registry = serde_json::from_value(document).unwrap();
+        assert_eq!(registry.version, 1);
+        registry
+    }
+
+    fn level_name(registry: Registry) -> &'static str {
+        match registry.safety_level_selected() {
+            SafetyLevel::Off => "off",
+            SafetyLevel::Ask => "ask",
+            SafetyLevel::Strict => "strict",
+        }
+    }
+
     #[test]
-    fn a_migrated_registry_is_refused_by_a_v1_build() {
+    fn a_1x_reader_derives_the_same_level_from_a_migrated_registry() {
         let _env = REGISTRY_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
-        let dir = scratch_dir("refused");
+        let dir = scratch_dir("1x-reader");
         let _override = DataDirOverride::set(&dir);
         let path = dir.join("registry.json");
-        write_json(&path, &brandon_v1(&dir));
-        load_from(&path).unwrap();
-        let migrated = std::fs::read(&path).unwrap();
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/registry-v1-to-v2/v2.json"
+        ))
+        .unwrap();
+        assert_eq!(level_name(as_1x_reader(&fixture)), "ask");
 
-        // 1.24 knows schema v1 and no migrations.
-        let error = load_from_with_migrations_for_test(&path, &[], 1).unwrap_err();
-        assert!(is_newer_version_error(&error), "{error}");
-        assert!(error.contains("schema v2"), "{error}");
-        assert_eq!(std::fs::read(&path).unwrap(), migrated);
+        for (flags, level) in [
+            (json!({"denyDestructive": true}), "strict"),
+            (json!({}), "ask"),
+            (json!({"safetyLevel": "off"}), "off"),
+        ] {
+            let mut v1 = brandon_v1(&dir);
+            for (key, flag) in flags.as_object().unwrap() {
+                v1[key] = flag.clone();
+            }
+            write_json(&path, &v1);
+            let migrated = load_from(&path).unwrap();
+            assert_eq!(level_name(migrated), level);
+            let on_disk = read_json(&path);
+            let reader = as_1x_reader(&on_disk);
+            assert_eq!(level_name(reader.clone()), level, "{flags}");
+            // 1.x enforces the matching gates.
+            assert_eq!(reader.deny_destructive, level == "strict");
+            assert_eq!(reader.human_approval, level != "off");
+
+            // 1.24 reads `version` without checking it and keeps unknown fields, so its
+            // rewrite still says v2 and keeps `safetyLevel`: 2.0 reads the same level.
+            let mut rewritten = serde_json::to_value(&reader).unwrap();
+            rewritten["version"] = on_disk["version"].clone();
+            rewritten["safetyLevel"] = on_disk["safetyLevel"].clone();
+            write_json(&path, &rewritten);
+            assert_eq!(level_name(load_from(&path).unwrap()), level, "{flags}");
+            // Marked v1 again, it migrates a second time to the same level.
+            rewritten["version"] = json!(1);
+            write_json(&path, &rewritten);
+            assert_eq!(level_name(load_from(&path).unwrap()), level, "{flags}");
+        }
+
+        // Saves from 2.0 keep the mirror in step with the level.
+        let mut registry = load_from(&path).unwrap();
+        registry.set_safety_level(SafetyLevel::Strict);
+        crate::registry::save_to(&path, &registry).unwrap();
+        let on_disk = read_json(&path);
+        assert_eq!(on_disk["denyDestructive"], true);
+        assert_eq!(level_name(as_1x_reader(&on_disk)), "strict");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_v2_registry_without_a_level_is_ask() {
+        let mut registry: Registry = serde_json::from_value(json!({
+            "version": 2,
+            "servers": [],
+            "profiles": [],
+            "denyDestructive": false,
+            "humanApproval": false
+        }))
+        .unwrap();
+        assert_eq!(registry.safety_level_selected(), SafetyLevel::Ask);
+        // The mirror is never read from v2 on, even when a 1.x process changed it.
+        registry.deny_destructive = true;
+        assert_eq!(registry.safety_level_selected(), SafetyLevel::Ask);
+        // A v1 registry still derives its level from the toggles.
+        registry.version = 1;
+        assert_eq!(registry.safety_level_selected(), SafetyLevel::Strict);
+        registry.deny_destructive = false;
+        assert_eq!(registry.safety_level_selected(), SafetyLevel::Off);
     }
 
     /// The preview rollback test restores `v1.json` over `v2.json`. This keeps

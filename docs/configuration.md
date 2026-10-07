@@ -124,4 +124,6 @@ rules as `rules-<date>.md`, saved routines as `routines-<date>.json` (the origin
 `routines.json` stays), and agent permission rules as `agent-permissions-<date>.json`.
 Client files are not edited. The upgrade sets one safety level (Strict if you blocked
 destructive tools, quarantined drift or blocked injection, otherwise Ask) and turns
-Code Mode off. 1.x refuses a v2 registry; restore the `.bak` file to go back.
+Code Mode off. Released 1.x builds do not check the schema version, so 2.0 keeps the
+1.x safety toggles in step with the level: a 1.x process still running during the
+upgrade enforces the same policy. To go back to 1.x, restore the `.bak` file.
