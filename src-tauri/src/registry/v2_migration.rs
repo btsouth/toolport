@@ -512,7 +512,7 @@ mod tests {
     "hooksEnabled": true,
     "hookTargets": ["@DIR@/home/.claude/settings.json"],
     "secretsGeneration": 4
-})"#;
+}"#;
 
     fn brandon_v1(dir: &Path) -> Value {
         let escaped = serde_json::to_string(&dir.display().to_string()).unwrap();
