@@ -1326,23 +1326,37 @@ mod tests {
             let endpoint = Arc::clone(&server);
             let count = Arc::clone(&exchanges);
             let worker = std::thread::spawn(move || {
+                let mut release_rx = Some(release_rx);
+                let mut handlers = Vec::new();
                 while let Ok(mut request) = endpoint.recv() {
-                    let mut form = String::new();
-                    request.as_reader().read_to_string(&mut form).unwrap();
                     let index = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let response = if index == 0 {
-                        assert!(form.contains("refresh_token=rt-0"));
-                        started_tx.send(()).unwrap();
-                        // The test controls completion, not elapsed wall time.
-                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                        tiny_http::Response::from_string(
-                            r#"{"access_token":"token-1","refresh_token":"rt-1","expires_in":3600,"token_type":"Bearer"}"#,
-                        )
+                    if index == 0 {
+                        let release_rx = release_rx.take().unwrap();
+                        let started_tx = started_tx.clone();
+                        handlers.push(std::thread::spawn(move || {
+                            let mut form = String::new();
+                            request.as_reader().read_to_string(&mut form).unwrap();
+                            assert!(form.contains("refresh_token=rt-0"));
+                            started_tx.send(()).unwrap();
+                            // The test controls completion, not elapsed wall time.
+                            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                            request.respond(tiny_http::Response::from_string(
+                                r#"{"access_token":"token-1","refresh_token":"rt-1","expires_in":3600,"token_type":"Bearer"}"#,
+                            )).unwrap();
+                        }));
                     } else {
-                        tiny_http::Response::from_string(r#"{"error":"invalid_grant"}"#)
-                            .with_status_code(400)
-                    };
-                    request.respond(response).unwrap();
+                        // Serve reuse detection while the first exchange is still
+                        // blocked, so failing open fails the test immediately.
+                        request
+                            .respond(
+                                tiny_http::Response::from_string(r#"{"error":"invalid_grant"}"#)
+                                    .with_status_code(400),
+                            )
+                            .unwrap();
+                    }
+                }
+                for handler in handlers {
+                    handler.join().unwrap();
                 }
             });
             Self {
