@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 
 use crate::downstream::{
     backoff_delay, is_implausible_shrink, CacheHint, CancelContext, DownstreamServer, MrtrRequest,
-    TransportError, HTTP_MAX_RETRIES, HTTP_RETRY_CAP,
+    ServerDispatch, TransportError, HTTP_MAX_RETRIES, HTTP_RETRY_CAP,
 };
 use crate::registry::ToolOverride;
 
@@ -566,11 +566,13 @@ pub enum DispatchTarget<'a> {
     Server(&'a str),
 }
 
-/// One connected downstream server behind its own lock. A call to it only blocks
-/// other calls to the SAME server (a single stdio pipe is one-in-flight by
-/// design), never calls to other servers. Held as an `Arc` so an in-flight call
-/// can keep the slot (and its live child process) alive across the downstream I/O
-/// without holding the router lock, and survive a concurrent router replacement.
+/// One connected downstream server behind its own lock. Calls on a transport
+/// that multiplexes requests (stdio) take the lock only to fetch a
+/// [`crate::downstream::CallHandle`], so one slow call never blocks other calls to
+/// the same server; other transports still serialize on the lock. Held as an
+/// `Arc` so an in-flight call can keep the slot (and its live child process)
+/// alive across the downstream I/O without holding the router lock, and survive
+/// a concurrent router replacement.
 struct ServerSlot {
     id: String,
     inner: Mutex<DownstreamServer>,
@@ -584,8 +586,108 @@ struct ServerSlot {
     /// needlessly re-spawned on a transient blip. `None` = not reconnectable (e.g. a
     /// test fixture), in which case a dead server just stays fast-failed as before.
     reconnect: Option<Reconnect>,
+    /// Bounds concurrent calls to this server.
+    in_flight: InFlightLimit,
+    /// Bumped each time `reconnect` replaces the connection, so concurrent calls
+    /// that failed on the same dead connection re-spawn it only once.
+    generation: AtomicU64,
+    reconnect_gate: Mutex<()>,
 }
 
+impl ServerSlot {
+    fn new(id: String, server: DownstreamServer, reconnect: Option<Reconnect>) -> Self {
+        ServerSlot {
+            id,
+            inner: Mutex::new(server),
+            tool_revision: AtomicU64::new(0),
+            breaker: Mutex::new(Breaker::default()),
+            reconnect,
+            in_flight: InFlightLimit::default(),
+            generation: AtomicU64::new(0),
+            reconnect_gate: Mutex::new(()),
+        }
+    }
+}
+
+/// Concurrent calls allowed per server. Further calls wait for a free slot up to
+/// their own deadline, then fail as busy, so a flood of calls cannot grow
+/// without bound.
+const MAX_IN_FLIGHT_PER_SERVER: usize = 64;
+
+#[derive(Default)]
+struct InFlightLimit {
+    count: Mutex<usize>,
+    freed: Condvar,
+}
+
+struct InFlightPermit<'a>(&'a InFlightLimit);
+
+impl InFlightLimit {
+    fn acquire(
+        &self,
+        server: &str,
+        wait: Duration,
+        cancel: Option<&CancelContext>,
+    ) -> Result<InFlightPermit<'_>, TransportError> {
+        let deadline = Instant::now() + wait;
+        let mut count = self
+            .count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *count >= MAX_IN_FLIGHT_PER_SERVER {
+            if cancel.is_some_and(CancelContext::is_cancelled) {
+                return Err(TransportError::Cancelled(
+                    "request cancelled while waiting for a free slot on the server".to_string(),
+                ));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(TransportError::Busy(format!(
+                    "server '{server}' is busy: {MAX_IN_FLIGHT_PER_SERVER} calls are already \
+                     in flight. Try again shortly."
+                )));
+            }
+            // Wake periodically so a cancelled caller stops waiting promptly.
+            let slice = (deadline - now).min(Duration::from_millis(250));
+            count = self
+                .freed
+                .wait_timeout(count, slice)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        *count += 1;
+        Ok(InFlightPermit(self))
+    }
+}
+
+impl Drop for InFlightPermit<'_> {
+    fn drop(&mut self) {
+        let mut count = self
+            .0
+            .count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *count -= 1;
+        self.0.freed.notify_one();
+    }
+}
+
+/// How a dispatch reaches its server.
+#[derive(Clone, Copy)]
+enum SlotAccess {
+    /// Through a call handle when the transport multiplexes requests, without
+    /// holding the slot lock across the round trip.
+    Shared,
+    /// Under the slot lock: the operation changes connection state.
+    Locked,
+}
+
+/// The locked server behind a [`SlotAccess::Locked`] dispatch.
+fn locked_server(server: &mut dyn ServerDispatch) -> Result<&mut DownstreamServer, TransportError> {
+    server.locked_server().ok_or_else(|| {
+        TransportError::Fatal("internal error: state change without the server lock".to_string())
+    })
+}
 /// An opaque reference to one live downstream launch. The gateway's launch
 /// pool can hold this without retaining an obsolete router or its other slots.
 #[derive(Clone)]
@@ -1404,13 +1506,8 @@ impl Router {
         if !self.server_order.contains(&id) {
             self.server_order.push(id.clone());
         }
-        self.servers.push(Arc::new(ServerSlot {
-            id: id.clone(),
-            inner: Mutex::new(server),
-            tool_revision: AtomicU64::new(0),
-            breaker: Mutex::new(Breaker::default()),
-            reconnect,
-        }));
+        self.servers
+            .push(Arc::new(ServerSlot::new(id.clone(), server, reconnect)));
         self.by_id.insert(id, idx);
     }
 
@@ -1497,13 +1594,11 @@ impl Router {
             let reconnect: Reconnect = Box::new(move || connect().ok());
             self.restored_candidates
                 .retain(|candidate| candidate.server != pending.id);
-            self.servers.push(Arc::new(ServerSlot {
-                id: pending.id.clone(),
-                inner: Mutex::new(server),
-                tool_revision: AtomicU64::new(0),
-                breaker: Mutex::new(Breaker::default()),
-                reconnect: Some(reconnect),
-            }));
+            self.servers.push(Arc::new(ServerSlot::new(
+                pending.id.clone(),
+                server,
+                Some(reconnect),
+            )));
             adopted.push(pending.id.clone());
         }
         self.pending = still_pending;
@@ -1567,13 +1662,7 @@ impl Router {
         if let Some(&index) = view.by_id.get(&server.id) {
             view.restored_candidates
                 .retain(|candidate| candidate.server != server.id);
-            view.servers[index] = Arc::new(ServerSlot {
-                id: server.id.clone(),
-                inner: Mutex::new(server),
-                tool_revision: AtomicU64::new(0),
-                breaker: Mutex::new(Breaker::default()),
-                reconnect,
-            });
+            view.servers[index] = Arc::new(ServerSlot::new(server.id.clone(), server, reconnect));
             view.rebuild_preserving_restored();
         } else {
             view.add_with_reconnect(server, reconnect);
@@ -2204,19 +2293,21 @@ impl Router {
             .ok_or_else(|| format!("no connected server '{server_id}'"))
     }
 
-    /// Retry wrapper that releases the per-server Mutex during the backoff sleep
-    /// so concurrent calls to the same server aren't blocked while one call waits
-    /// for a rate-limit or connection-retry delay.
+    /// Retry wrapper around one dispatch. On a multiplexing transport the
+    /// closure runs on a call handle without the per-server lock, so concurrent
+    /// calls to the same server proceed in parallel; otherwise it runs under the
+    /// lock. Either way the lock is never held during a backoff sleep.
     fn call_with_retry<T, F>(
         &self,
         slot: &Arc<ServerSlot>,
         cancel: Option<&CancelContext>,
         dispatch_cancelled_continuation: bool,
         replay_policy: ReplayPolicy,
+        access: SlotAccess,
         mut f: F,
     ) -> Result<T, String>
     where
-        F: FnMut(&mut DownstreamServer) -> Result<T, TransportError>,
+        F: FnMut(&mut dyn ServerDispatch) -> Result<T, TransportError>,
     {
         if !dispatch_cancelled_continuation && cancel.is_some_and(CancelContext::is_cancelled) {
             return Err("request cancelled before downstream attempt".to_string());
@@ -2248,13 +2339,8 @@ impl Router {
             if !dispatch_cancelled_continuation && cancel.is_some_and(CancelContext::is_cancelled) {
                 return Err("request cancelled before downstream attempt".to_string());
             }
-            let result = {
-                let mut server = slot
-                    .inner
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                f(&mut server)
-            };
+            let generation = slot.generation.load(Ordering::Acquire);
+            let result = Self::attempt(slot, access, cancel, &mut f);
             match result {
                 Ok(v) => {
                     slot.breaker
@@ -2295,6 +2381,8 @@ impl Router {
                                 slot,
                                 cancel,
                                 replay_policy.uncertain_failure(&e),
+                                generation,
+                                access,
                                 &mut f,
                             ) {
                                 return v;
@@ -2311,55 +2399,108 @@ impl Router {
         }
     }
 
+    /// Run one dispatch attempt. The slot lock is held only to fetch a call
+    /// handle; without one (a transport that cannot multiplex, or a state
+    /// change) the closure runs under the lock as before.
+    fn attempt<T, F>(
+        slot: &ServerSlot,
+        access: SlotAccess,
+        cancel: Option<&CancelContext>,
+        f: &mut F,
+    ) -> Result<T, TransportError>
+    where
+        F: FnMut(&mut dyn ServerDispatch) -> Result<T, TransportError>,
+    {
+        let handle = match access {
+            SlotAccess::Shared => slot
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .call_handle(),
+            SlotAccess::Locked => None,
+        };
+        match handle {
+            Some(mut handle) => {
+                let _permit = slot
+                    .in_flight
+                    .acquire(&slot.id, handle.call_timeout(), cancel)?;
+                f(&mut handle)
+            }
+            None => {
+                let mut server = slot
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                f(&mut *server)
+            }
+        }
+    }
+
     /// Re-spawn a slot's downstream connection and retry the call once on the fresh
     /// transport only when replay is safe. `uncertain_failure` instead preserves
     /// the original error and installs the fresh connection for future requests.
     /// Returns `Some(result)` when a reconnect was attempted (so the caller
     /// stops), or `None` when the slot has no reconnect factory (fall through to the
     /// normal breaker-failure path). The spawn runs without holding the `inner` lock so
-    /// a slow re-spawn doesn't wedge other callers to the same server.
+    /// a slow re-spawn doesn't wedge other callers to the same server. Concurrent
+    /// probes that failed on the same connection (`generation`) re-spawn it once;
+    /// the others retry on the connection that one installed.
     fn reconnect_and_retry<T, F>(
         &self,
         slot: &Arc<ServerSlot>,
         cancel: Option<&CancelContext>,
         uncertain_failure: Option<&TransportError>,
+        generation: u64,
+        access: SlotAccess,
         f: &mut F,
     ) -> Option<Result<T, String>>
     where
-        F: FnMut(&mut DownstreamServer) -> Result<T, TransportError>,
+        F: FnMut(&mut dyn ServerDispatch) -> Result<T, TransportError>,
     {
         let factory = slot.reconnect.as_ref()?;
-        eprintln!("toolport: server '{}' is down; re-spawning it", slot.id);
-        let Some(fresh) = factory() else {
-            eprintln!(
-                "toolport: re-spawn of '{}' failed; leaving it fast-failed",
-                slot.id
-            );
-            return None; // still unreachable: fall through to record_failure
-        };
+        {
+            let _reconnecting = slot
+                .reconnect_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.generation.load(Ordering::Acquire) == generation {
+                eprintln!("toolport: server '{}' is down; re-spawning it", slot.id);
+                let Some(fresh) = factory() else {
+                    eprintln!(
+                        "toolport: re-spawn of '{}' failed; leaving it fast-failed",
+                        slot.id
+                    );
+                    return None; // still unreachable: fall through to record_failure
+                };
+                if cancel.is_some_and(CancelContext::is_cancelled) {
+                    return Some(Err(
+                        "request cancelled before retrying the reconnected downstream".to_string(),
+                    ));
+                }
+                // Swap the live child/connection for the fresh one.
+                *slot
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
+                slot.generation.fetch_add(1, Ordering::AcqRel);
+                slot.tool_revision.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        if let Some(error) = uncertain_failure {
+            // Recovery invalidates cached tool identity but cannot prove whether
+            // the previous mutation completed. Use fresh transport next time.
+            slot.breaker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record_success();
+            return Some(Err(error.to_string()));
+        }
         if cancel.is_some_and(CancelContext::is_cancelled) {
             return Some(Err(
                 "request cancelled before retrying the reconnected downstream".to_string(),
             ));
         }
-        let retry = {
-            let mut server = slot
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *server = fresh; // swap the live child/connection for the fresh one
-            slot.tool_revision.fetch_add(1, Ordering::AcqRel);
-            if let Some(error) = uncertain_failure {
-                // Recovery invalidates cached tool identity but cannot prove whether
-                // the previous mutation completed. Use fresh transport next time.
-                slot.breaker
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .record_success();
-                return Some(Err(error.to_string()));
-            }
-            f(&mut server)
-        };
+        let retry = Self::attempt(slot, access, cancel, f);
         let mut breaker = slot
             .breaker
             .lock()
@@ -2419,6 +2560,7 @@ impl Router {
             cancel.as_ref(),
             mrtr.is_some_and(|request| !request.is_empty()),
             ReplayPolicy::NoAmbiguousReplay,
+            SlotAccess::Shared,
             |server| {
                 let supports_tasks = server
                     .extensions()
@@ -2489,6 +2631,7 @@ impl Router {
             cancel.as_ref(),
             false,
             ReplayPolicy::for_task(method),
+            SlotAccess::Shared,
             |server| server.task_request(method, forwarded.clone(), cancel.clone(), meta),
         )?;
         let mut result = result;
@@ -2649,6 +2792,7 @@ impl Router {
             cancel.as_ref(),
             mrtr.is_some_and(|request| !request.is_empty()),
             ReplayPolicy::ReadOnly,
+            SlotAccess::Shared,
             |server| server.read_resource_with_cancel_and_mrtr(uri, cancel.clone(), meta, mrtr),
         )
     }
@@ -2667,7 +2811,8 @@ impl Router {
             None,
             false,
             ReplayPolicy::NoAmbiguousReplay,
-            |server| server.subscribe_resource(uri),
+            SlotAccess::Locked,
+            |server| locked_server(server)?.subscribe_resource(uri),
         )
     }
 
@@ -2698,7 +2843,8 @@ impl Router {
             None,
             false,
             ReplayPolicy::NoAmbiguousReplay,
-            |server| server.unsubscribe_resource(uri),
+            SlotAccess::Locked,
+            |server| locked_server(server)?.unsubscribe_resource(uri),
         )
     }
 
@@ -2737,6 +2883,7 @@ impl Router {
             cancel.as_ref(),
             mrtr.is_some_and(|request| !request.is_empty()),
             ReplayPolicy::ReadOnly,
+            SlotAccess::Shared,
             |server| {
                 server.get_prompt_with_cancel_and_mrtr(
                     &name,
@@ -2767,6 +2914,7 @@ impl Router {
             cancel.as_ref(),
             false,
             ReplayPolicy::ReadOnly,
+            SlotAccess::Shared,
             |server| server.complete_with_cancel(forwarded.clone(), cancel.clone()),
         )
     }
@@ -3528,16 +3676,112 @@ mod tests {
         }
     }
 
+    /// A multiplexing transport: a `slow` call blocks until `gate` opens, any
+    /// other call answers at once.
+    struct GatedTransport {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    struct GatedCall {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Transport for GatedTransport {
+        fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+            match method {
+                "initialize" => Ok(json!({ "protocolVersion": "2025-06-18", "capabilities": {} })),
+                "tools/list" => Ok(json!({ "tools": [{ "name": "slow" }, { "name": "fast" }] })),
+                _ => Ok(json!({})),
+            }
+        }
+        fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn concurrent(&self) -> Option<Arc<dyn crate::downstream::ConcurrentTransport>> {
+            Some(Arc::new(GatedCall {
+                gate: Arc::clone(&self.gate),
+            }))
+        }
+    }
+
+    impl crate::downstream::ConcurrentTransport for GatedCall {
+        fn request_with_cancel_and_headers(
+            &self,
+            _method: &str,
+            params: Value,
+            _cancel: Option<CancelContext>,
+            _headers: &[(String, String)],
+        ) -> Result<Value, TransportError> {
+            if params["name"] == "slow" {
+                let (open, opened) = &*self.gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = opened.wait(open).unwrap();
+                }
+            }
+            Ok(json!({ "content": [{ "type": "text", "text": params["name"].clone() }] }))
+        }
+    }
+
+    #[test]
+    fn a_slow_concurrent_call_does_not_hold_the_slot_lock() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut router = Router::new();
+        router.add(
+            DownstreamServer::connect(
+                "s".into(),
+                Box::new(GatedTransport {
+                    gate: Arc::clone(&gate),
+                }),
+            )
+            .unwrap(),
+        );
+        let router = Arc::new(router);
+        let slow = {
+            let router = Arc::clone(&router);
+            std::thread::spawn(move || router.route_call("s__slow", json!({})))
+        };
+        let slot = router.slot_for("s").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while *slot.in_flight.count.lock().unwrap() == 0 {
+            assert!(Instant::now() < deadline, "the slow call never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // A refresh (or anything else needing the lock) is not stuck behind the call,
+        // and a second call to the same server completes while the first waits.
+        assert!(slot.inner.try_lock().is_ok());
+        assert!(router.route_call("s__fast", json!({})).is_ok());
+        assert!(!slow.is_finished());
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert!(slow.join().unwrap().is_ok());
+        assert_eq!(*slot.in_flight.count.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn in_flight_limit_fails_busy_after_the_deadline() {
+        let limit = InFlightLimit::default();
+        let mut permits: Vec<_> = (0..MAX_IN_FLIGHT_PER_SERVER)
+            .map(|_| limit.acquire("s", Duration::ZERO, None).unwrap())
+            .collect();
+        let busy = limit
+            .acquire("s", Duration::from_millis(20), None)
+            .err()
+            .expect("the limit is reached");
+        assert!(matches!(busy, TransportError::Busy(_)), "{busy}");
+        assert!(!busy.is_health_failure());
+        permits.pop();
+        assert!(limit.acquire("s", Duration::from_millis(20), None).is_ok());
+    }
+
     fn dead_slot(reconnect: Option<Reconnect>) -> Arc<ServerSlot> {
-        Arc::new(ServerSlot {
-            id: "s".into(),
-            inner: Mutex::new(
-                DownstreamServer::connect("s".into(), Box::new(DeadOnCallTransport)).unwrap(),
-            ),
-            tool_revision: AtomicU64::new(0),
-            breaker: Mutex::new(Breaker::default()),
+        Arc::new(ServerSlot::new(
+            "s".into(),
+            DownstreamServer::connect("s".into(), Box::new(DeadOnCallTransport)).unwrap(),
             reconnect,
-        })
+        ))
     }
 
     #[test]
@@ -3545,8 +3789,9 @@ mod tests {
         let router = Router::new();
         // Factory hands back a healthy connection, mirroring a re-spawn that succeeds.
         let slot = dead_slot(Some(Box::new(|| Some(mock_server("s")))));
-        let out =
-            router.reconnect_and_retry(&slot, None, None, &mut |ds| ds.call("echo", json!({})));
+        let out = router.reconnect_and_retry(&slot, None, None, 0, SlotAccess::Shared, &mut |ds| {
+            ds.call_with_cancel_and_mrtr("echo", json!({}), None, None, None)
+        });
         // The probe re-spawned the server and the retried call went through.
         let value = out.expect("reconnect attempted").expect("call recovered");
         assert!(serde_json::to_string(&value).unwrap().contains("s:echo"));
@@ -3568,7 +3813,9 @@ mod tests {
         // caller must fall through to record the failure.
         let slot = dead_slot(Some(Box::new(|| None)));
         let out: Option<Result<Value, String>> =
-            router.reconnect_and_retry(&slot, None, None, &mut |ds| ds.call("echo", json!({})));
+            router.reconnect_and_retry(&slot, None, None, 0, SlotAccess::Shared, &mut |ds| {
+                ds.call_with_cancel_and_mrtr("echo", json!({}), None, None, None)
+            });
         assert!(
             out.is_none(),
             "a failed re-spawn falls through to the breaker"
@@ -3590,10 +3837,17 @@ mod tests {
         let calls = Arc::clone(&retried_calls);
 
         let result = router
-            .reconnect_and_retry(&slot, Some(&cancel), None, &mut move |ds| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                ds.call("echo", json!({}))
-            })
+            .reconnect_and_retry(
+                &slot,
+                Some(&cancel),
+                None,
+                0,
+                SlotAccess::Shared,
+                &mut move |ds| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    ds.call_with_cancel_and_mrtr("echo", json!({}), None, None, None)
+                },
+            )
             .expect("reconnect was attempted")
             .unwrap_err();
 
@@ -3616,12 +3870,19 @@ mod tests {
         let slot = dead_slot(Some(Box::new(|| Some(mock_server("s")))));
 
         let result: Result<Value, String> = router
-            .reconnect_and_retry(&slot, Some(&cancel), None, &mut move |_server| {
-                assert!(cancel_from_retry.cancel("retry-cancel", Some("user pressed stop")));
-                Err(TransportError::Cancelled(
-                    "request cancelled during reconnected call".to_string(),
-                ))
-            })
+            .reconnect_and_retry(
+                &slot,
+                Some(&cancel),
+                None,
+                0,
+                SlotAccess::Shared,
+                &mut move |_server| {
+                    assert!(cancel_from_retry.cancel("retry-cancel", Some("user pressed stop")));
+                    Err(TransportError::Cancelled(
+                        "request cancelled during reconnected call".to_string(),
+                    ))
+                },
+            )
             .expect("reconnect was attempted");
 
         assert!(result.unwrap_err().contains("cancelled"));
@@ -3642,7 +3903,9 @@ mod tests {
         // reconnect is skipped and the breaker path handles the failure.
         let slot = dead_slot(None);
         let out: Option<Result<Value, String>> =
-            router.reconnect_and_retry(&slot, None, None, &mut |ds| ds.call("echo", json!({})));
+            router.reconnect_and_retry(&slot, None, None, 0, SlotAccess::Shared, &mut |ds| {
+                ds.call_with_cancel_and_mrtr("echo", json!({}), None, None, None)
+            });
         assert!(out.is_none());
     }
 
@@ -3839,6 +4102,7 @@ mod tests {
                 None,
                 false,
                 ReplayPolicy::for_task(method),
+                SlotAccess::Shared,
                 |server| server.task_request(method, json!({ "taskId": "fixture" }), None, None),
             );
             if method == "tasks/get" {

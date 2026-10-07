@@ -320,6 +320,29 @@ fn active_request_context() -> ActiveRequestContext {
     ACTIVE_REQUEST_CONTEXT.with(|cell| cell.borrow().clone())
 }
 
+/// Which upstream client a downstream request serves, as far as the server-request
+/// handler can tell: it reads the era, capabilities and MCP session. A stdio
+/// server's roots, sampling or elicitation request is only handed to a waiting
+/// call with the same key.
+fn downstream_request_context_key() -> String {
+    use std::hash::{Hash, Hasher};
+    ACTIVE_REQUEST_CONTEXT.with(|cell| {
+        let context = cell.borrow();
+        let mut capabilities = std::collections::hash_map::DefaultHasher::new();
+        context
+            .upstream_capabilities
+            .as_deref()
+            .map(Value::to_string)
+            .hash(&mut capabilities);
+        format!(
+            "{}|{}|{:x}",
+            context.upstream_version.as_deref().unwrap_or("-"),
+            context.mcp_session.as_deref().unwrap_or("-"),
+            capabilities.finish()
+        )
+    })
+}
+
 fn modern_client_supports_server_rpc(method: &str) -> bool {
     let capability = match method {
         "roots/list" => "roots",
@@ -19631,6 +19654,7 @@ fn main() {
     // Single-flight for every router build/swap (startup, watcher self-heal, and
     // ${ROOT} rebuilds). Created up front so the startup build can share it.
     let rebuild_lock = Arc::new(Mutex::new(()));
+    downstream::set_request_context_provider(Arc::new(downstream_request_context_key));
     let server_handler = make_server_request_handler(
         Arc::clone(&stdio_upstream),
         Arc::clone(&mcp_sessions),

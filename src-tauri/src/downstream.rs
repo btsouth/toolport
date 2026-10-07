@@ -6,13 +6,13 @@
 //! its tools. The transport is abstracted so the router can be tested with a mock
 //! instead of spawning real processes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -1005,6 +1005,10 @@ struct CancelledRequest {
 struct CancelEntry {
     stdin: Arc<Mutex<ChildStdin>>,
     downstream_id: Value,
+    /// The stdio request waiting on `downstream_id`, woken with `Cancelled` so a
+    /// cancelled call stops waiting instead of holding its thread until the read
+    /// timeout. `None` when nothing waits (a suspended legacy MRTR request).
+    waiter: Option<Weak<StdioCore>>,
 }
 
 /// Cancellation context for one proxied client request.
@@ -1150,6 +1154,9 @@ const MAX_CANCEL_THREADS: usize = 64;
 
 impl CancelEntry {
     fn send_cancel_async(&self, reason: Option<String>) {
+        if let Some(core) = self.waiter.as_ref().and_then(Weak::upgrade) {
+            core.cancel_waiter(&self.downstream_id);
+        }
         // Reserve a slot; if too many forwards are already blocked (a downstream that
         // stopped draining its stdin), drop this one rather than leak another thread.
         if CANCEL_THREADS_INFLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_CANCEL_THREADS {
@@ -2146,6 +2153,32 @@ pub trait Transport: Send {
     /// Handle server→client JSON-RPC (roots/list, sampling, …) by forwarding to the
     /// upstream MCP client. Default no-op: unsupported server requests are ignored.
     fn set_server_request_handler(&mut self, _handler: ServerRequestHandler) {}
+    /// A request path that can run alongside other requests on this connection,
+    /// carrying the current protocol metadata and read timeout. `None` (the
+    /// default) keeps every request on the serialized `&mut self` path.
+    fn concurrent(&self) -> Option<Arc<dyn ConcurrentTransport>> {
+        None
+    }
+}
+
+/// The part of a [`Transport`] that is safe to call from several threads at once,
+/// so one slow call does not hold up other calls to the same server.
+pub trait ConcurrentTransport: Send + Sync {
+    fn request_with_cancel_and_headers(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        headers: &[(String, String)],
+    ) -> Result<Value, TransportError>;
+    fn request_with_cancel(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+    ) -> Result<Value, TransportError> {
+        self.request_with_cancel_and_headers(method, params, cancel, &[])
+    }
 }
 
 fn downstream_trace(msg: &str) {
@@ -2993,21 +3026,17 @@ fn inject_container_env(command: &str, args: &[String], env: &[(String, String)]
 }
 
 /// Talks to a downstream MCP server over its stdio (a spawned child process).
-/// Stdout is drained on a background thread into a channel so reads can time out
-/// (a blocking `read_line` on an unresponsive child would otherwise hang forever).
+/// Stdout is drained on a background thread into a channel, and a demux thread
+/// routes each line to the request waiting on its id, so several requests can be
+/// in flight on the one pipe and each wait times out on its own (a blocking
+/// `read_line` on an unresponsive child would otherwise hang forever).
 pub struct StdioTransport {
-    child: Child,
+    /// Request machinery, shared with concurrent calls on this connection.
+    core: Arc<StdioCore>,
     /// Windows Job Object that owns the complete launcher process tree. Closing
     /// it terminates descendants that outlive an `npx`/`uvx` wrapper.
     #[cfg(windows)]
     job: Option<WindowsJob>,
-    stdin: Arc<Mutex<ChildStdin>>,
-    rx: Receiver<String>,
-    /// Tail of the child's stderr, drained on a background thread. A server that
-    /// dies on startup (bad package name, missing API key) explains itself here,
-    /// so we can report that instead of a bare "closed the connection".
-    stderr: Arc<Mutex<String>>,
-    next_id: i64,
     /// How long a single request waits for its response. Lowered during the
     /// connect handshake, then restored for (potentially slow) live tool calls.
     read_timeout: Duration,
@@ -3018,17 +3047,6 @@ pub struct StdioTransport {
     /// once this is set, so tool-list changes announced during startup are
     /// ignored. Flipped on by `arm_tools_watch` after the handshake.
     armed: Arc<AtomicBool>,
-    /// The command is a download-then-run launcher (npx, uvx, ...): its first
-    /// `initialize` gets the long connect budget, and a connect timeout is
-    /// reported as "still installing" rather than a dead server.
-    launcher: bool,
-    /// Answers server-initiated JSON-RPC (e.g. `roots/list`) by forwarding to the
-    /// upstream MCP client. Set by the gateway before the connect handshake.
-    server_handler: Option<ServerRequestHandler>,
-    /// A legacy server request suspended between two modern upstream round trips.
-    /// The child keeps processing the original request; the retry only supplies
-    /// the requested input and must not start a second downstream call.
-    pending_mrtr: Option<PendingLegacyMrtr>,
     /// Routes `notifications/progress` back to the client that minted the token
     /// (SOU-444). Shared with the stdout drain thread so the gateway can bind it
     /// after the transport is spawned, keeping `spawn_watched`'s signature stable.
@@ -3038,6 +3056,794 @@ pub struct StdioTransport {
     protocol_meta: Option<Value>,
     /// Request id of the current long-lived `subscriptions/listen` request.
     subscription_listener_id: Option<i64>,
+}
+
+/// Names the upstream request context of the calling thread. The gateway's
+/// server-request handler reads thread-locals (upstream era, capabilities, MCP
+/// session), so a stdio server's roots, sampling or elicitation request must be
+/// handled on a thread serving the same upstream client. Unset means every
+/// request shares one context.
+pub type RequestContextProvider = Arc<dyn Fn() -> String + Send + Sync>;
+
+static REQUEST_CONTEXT_PROVIDER: OnceLock<RequestContextProvider> = OnceLock::new();
+
+/// Install the process-wide [`RequestContextProvider`]. The first call wins.
+pub fn set_request_context_provider(provider: RequestContextProvider) {
+    let _ = REQUEST_CONTEXT_PROVIDER.set(provider);
+}
+
+fn request_context_key() -> String {
+    REQUEST_CONTEXT_PROVIDER
+        .get()
+        .map(|provider| provider())
+        .unwrap_or_default()
+}
+
+/// Server requests a stdio server may send while nothing is in flight. They go to
+/// the next request, as they did when they sat in the read channel; past this
+/// many the oldest is refused.
+const MAX_UNCLAIMED_SERVER_REQUESTS: usize = 16;
+/// Legacy server requests suspended for a modern upstream round trip, per server.
+/// Past this many the oldest is cancelled downstream.
+const MAX_SUSPENDED_LEGACY_MRTR: usize = 32;
+/// How long a suspended legacy server request waits for the client's retry.
+const SUSPENDED_LEGACY_MRTR_TTL: Duration = Duration::from_secs(15 * 60);
+/// JSON-RPC internal error, used to refuse a server request Toolport cannot route.
+const JSONRPC_INTERNAL_ERROR: i64 = -32603;
+
+/// What the demux thread hands one waiting stdio request.
+enum Delivery {
+    Response(Value),
+    ServerRequest(Value),
+    Cancelled,
+    Closed(String),
+}
+
+/// One request waiting for its response.
+struct StdioWaiter {
+    /// Registration order, so a server request goes to the oldest waiter.
+    seq: u64,
+    /// [`request_context_key`] of the thread waiting on this request.
+    context: String,
+    tx: Sender<Delivery>,
+    /// False while suspended for a modern upstream round trip: no thread is
+    /// waiting, so this request cannot handle a server request.
+    active: bool,
+}
+
+/// A legacy server request suspended between two modern upstream round trips.
+/// The child keeps processing the original request; the retry only supplies the
+/// requested input, then keeps waiting on the original downstream id through `rx`.
+struct SuspendedLegacyMrtr {
+    pending: PendingLegacyMrtr,
+    rx: Receiver<Delivery>,
+    since: Instant,
+}
+
+/// How a request relates to the suspended legacy MRTR requests.
+enum Continuation {
+    /// A new downstream request.
+    Fresh,
+    /// The retry did not answer the input request yet; repeat it.
+    StillWaiting(Value),
+    /// The retry answers a suspended request: send `response`, then keep
+    /// waiting on the original downstream id.
+    Resume {
+        downstream_id: Value,
+        response: Value,
+        rx: Receiver<Delivery>,
+    },
+}
+
+/// A server request no waiting thread could take yet.
+struct UnclaimedRequest {
+    /// Context of the suspended requests pending when it arrived, if any: only
+    /// that client may answer it. `None` when nothing was pending at all.
+    owner: Option<String>,
+    request: Value,
+}
+
+#[derive(Default)]
+struct StdioCoreState {
+    pending: HashMap<String, StdioWaiter>,
+    next_seq: u64,
+    suspended: Vec<SuspendedLegacyMrtr>,
+    unclaimed: VecDeque<UnclaimedRequest>,
+    /// Set once the child's stdout closed; every later request fails with it.
+    closed: Option<String>,
+}
+
+/// The request machinery of one stdio connection. A request registers a waiter
+/// under its id, writes its frame, and waits on its own channel; the demux thread
+/// routes each response to its waiter, so any number of requests share the pipe.
+struct StdioCore {
+    child: Mutex<Child>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    /// Tail of the child's stderr, drained on a background thread. A server that
+    /// dies on startup (bad package name, missing API key) explains itself here,
+    /// so we can report that instead of a bare "closed the connection".
+    stderr: Arc<Mutex<String>>,
+    next_id: AtomicI64,
+    state: Mutex<StdioCoreState>,
+    /// Answers server-initiated JSON-RPC (e.g. `roots/list`) by forwarding to the
+    /// upstream MCP client. Set by the gateway before the connect handshake.
+    server_handler: Mutex<Option<ServerRequestHandler>>,
+    /// The command is a download-then-run launcher (npx, uvx, ...): a connect
+    /// timeout is reported as "still installing" rather than a dead server.
+    launcher: bool,
+    /// Command name, for the one log line about unattributable server requests.
+    label: String,
+    /// Set once a server request arrived while calls from different upstream
+    /// contexts were in flight. Requests then hold `exclusive_gate`, one in flight
+    /// as before multiplexing, so every later server request has one owner.
+    exclusive: AtomicBool,
+    exclusive_gate: Mutex<()>,
+}
+
+fn waiter_key(id: &Value) -> String {
+    id_key(id).unwrap_or_default()
+}
+
+/// Removes a request's waiter when its call ends, unless it was suspended.
+struct WaiterGuard<'a> {
+    core: &'a StdioCore,
+    downstream_id: Value,
+    armed: bool,
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.core
+                .lock_state()
+                .pending
+                .remove(&waiter_key(&self.downstream_id));
+        }
+    }
+}
+
+impl StdioCore {
+    fn start(
+        child: Child,
+        stdin: Arc<Mutex<ChildStdin>>,
+        stderr: Arc<Mutex<String>>,
+        lines: Receiver<String>,
+        launcher: bool,
+        label: String,
+    ) -> Arc<Self> {
+        let core = Arc::new(StdioCore {
+            child: Mutex::new(child),
+            stdin,
+            stderr,
+            next_id: AtomicI64::new(1),
+            state: Mutex::new(StdioCoreState::default()),
+            server_handler: Mutex::new(None),
+            launcher,
+            label,
+            exclusive: AtomicBool::new(false),
+            exclusive_gate: Mutex::new(()),
+        });
+        // The demux holds only a weak reference, so dropping the transport and
+        // its calls frees the core; it ends with the drain channel either way.
+        let weak = Arc::downgrade(&core);
+        std::thread::spawn(move || {
+            while let Ok(line) = lines.recv() {
+                let Some(core) = weak.upgrade() else {
+                    return;
+                };
+                core.route_line(&line);
+            }
+            if let Some(core) = weak.upgrade() {
+                core.close();
+            }
+        });
+        core
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, StdioCoreState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_line(&self, message: &Value) -> std::io::Result<()> {
+        let mut stdin = self
+            .stdin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        writeln!(stdin, "{message}")?;
+        stdin.flush()
+    }
+
+    /// Build a useful error for when the child's stdout closed (it exited or
+    /// crashed). Includes the exit status and the tail of stderr when available -
+    /// that is where "package not found" or "missing API key" actually shows up.
+    fn closed_error(&self) -> String {
+        // The child just exited; give its stderr drain a brief moment to flush.
+        std::thread::sleep(Duration::from_millis(150));
+        let status = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_wait()
+            .ok()
+            .flatten();
+        let tail = self
+            .stderr
+            .lock()
+            .map(|b| b.trim().to_string())
+            .unwrap_or_default();
+        let mut msg = String::from("downstream server exited");
+        if let Some(code) = status.and_then(|s| s.code()) {
+            msg.push_str(&format!(" (status {code})"));
+        }
+        if tail.is_empty() {
+            msg.push_str(
+                " without stderr output. Check the command, args, and any required setup values.",
+            );
+        } else {
+            msg.push_str(":\n");
+            msg.push_str(&tail);
+        }
+        msg
+    }
+
+    fn request(
+        self: &Arc<Self>,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        protocol: Option<&Value>,
+        timeout: Duration,
+    ) -> Result<Value, TransportError> {
+        self.expire_suspended();
+        if cancel.as_ref().is_some_and(CancelContext::is_cancelled)
+            && !self.lock_state().suspended.is_empty()
+        {
+            if let Some(cancel) = cancel.as_ref() {
+                self.cancel_matching_suspended(method, &params, cancel);
+            }
+            return Err(TransportError::Cancelled(
+                "request cancelled before it reached the downstream server".to_string(),
+            ));
+        }
+        let mut params = params;
+        if let Some(protocol) = protocol {
+            merge_protocol_meta(&mut params, protocol);
+        }
+        let _exclusive = self.exclusive.load(Ordering::SeqCst).then(|| {
+            self.exclusive_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        // A legacy connection has no downstream requestState of its own, so one
+        // here can only be ours; never replay the call for an unknown one.
+        let (downstream_id, outbound, rx) =
+            match self.continuation(method, &params, protocol.is_none())? {
+                Continuation::StillWaiting(input_required) => return Ok(input_required),
+                Continuation::Resume {
+                    downstream_id,
+                    response,
+                    rx,
+                } => {
+                    self.resume(&downstream_id);
+                    (downstream_id, response, rx)
+                }
+                Continuation::Fresh => {
+                    let downstream_id = json!(self.next_id.fetch_add(1, Ordering::SeqCst));
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.register(&downstream_id, tx)?;
+                    let request = json!({
+                        "jsonrpc": "2.0",
+                        "id": downstream_id.clone(),
+                        "method": method,
+                        "params": params
+                    });
+                    (downstream_id, request, rx)
+                }
+            };
+        let waiter = WaiterGuard {
+            core: self,
+            downstream_id: downstream_id.clone(),
+            armed: true,
+        };
+
+        // A broken stdin pipe means the child is gone: a health failure, not a protocol error.
+        let mut cancel_after_write = None;
+        let cancel_guard;
+        {
+            let mut stdin = self
+                .stdin
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cancel_guard = cancel.map(|ctx| {
+                let guard = ctx.registry.register(
+                    ctx.client_request_id.clone(),
+                    CancelEntry {
+                        stdin: Arc::clone(&self.stdin),
+                        downstream_id: downstream_id.clone(),
+                        waiter: Some(Arc::downgrade(self)),
+                    },
+                );
+                cancel_after_write = Some(ctx);
+                guard
+            });
+            writeln!(stdin, "{outbound}")
+                .map_err(|e| TransportError::Unavailable(e.to_string()))?;
+            stdin
+                .flush()
+                .map_err(|e| TransportError::Unavailable(e.to_string()))?;
+        }
+        if let Some(ctx) = cancel_after_write {
+            if ctx.registry.is_cancelled(&ctx.client_request_id) {
+                ctx.registry.forward_cancel_if_ready(&ctx.client_request_id);
+            }
+        }
+        let _cancel_guard = cancel_guard;
+        self.wait(waiter, rx, method, &params, timeout)
+    }
+
+    /// Wait for this request's response, handling server requests attributed to
+    /// it on this thread. The deadline bounds the whole wait so an unresponsive
+    /// server fails fast instead of hanging the thread indefinitely.
+    fn wait(
+        &self,
+        mut waiter: WaiterGuard<'_>,
+        rx: Receiver<Delivery>,
+        method: &str,
+        params: &Value,
+        timeout: Duration,
+    ) -> Result<Value, TransportError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            match rx.recv_timeout(remaining) {
+                Ok(Delivery::Response(value)) => {
+                    if let Some(err) = value.get("error") {
+                        return Err(TransportError::Rpc(err.clone()));
+                    }
+                    return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+                }
+                Ok(Delivery::ServerRequest(mut value)) => {
+                    screen_url_elicitation_request(&mut value).map_err(|message| {
+                        TransportError::Fatal(format!(
+                            "Toolport refused unsafe URL elicitation: {message}"
+                        ))
+                    })?;
+                    let handler = self
+                        .server_handler
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    match handler.and_then(|handler| handler(&value)) {
+                        Some(ServerRequestAction::Respond(response)) => {
+                            self.write_line(&response)
+                                .map_err(|e| TransportError::Unavailable(e.to_string()))?;
+                        }
+                        Some(ServerRequestAction::InputRequired) => {
+                            let pending = PendingLegacyMrtr::new(
+                                value,
+                                waiter.downstream_id.clone(),
+                                method,
+                                params,
+                            )?;
+                            let result = pending.input_required();
+                            self.suspend(&mut waiter, pending, rx);
+                            return Ok(result);
+                        }
+                        None => {}
+                    }
+                }
+                Ok(Delivery::Cancelled) => {
+                    self.abandon(&mut waiter, &rx);
+                    return Err(TransportError::Cancelled(format!(
+                        "'{method}' cancelled by the client"
+                    )));
+                }
+                Ok(Delivery::Closed(message)) => return Err(TransportError::Unavailable(message)),
+                Err(RecvTimeoutError::Timeout) => {
+                    self.abandon(&mut waiter, &rx);
+                    // A launcher child that is alive but never answered `initialize`
+                    // even after the long budget is almost certainly still installing
+                    // its package (cold npm/PyPI cache, slow network). Say so: a bare
+                    // timeout reads as a broken server when it isn't. A dead child
+                    // never reaches here (its stdout closing ends the wait above).
+                    let alive = self
+                        .child
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .try_wait()
+                        .map(|s| s.is_none())
+                        .unwrap_or(false);
+                    if self.launcher && alive && method == "initialize" {
+                        return Err(TransportError::Unavailable(
+                            "timed out waiting for 'initialize'; the launcher is likely \
+                             still downloading the server package (first run on a cold \
+                             cache). It usually connects on the next refresh."
+                                .to_string(),
+                        ));
+                    }
+                    return Err(TransportError::Unavailable(format!(
+                        "timed out waiting for '{method}' response"
+                    )));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(TransportError::Unavailable(
+                        "downstream connection closed".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn continuation(
+        &self,
+        method: &str,
+        params: &Value,
+        legacy: bool,
+    ) -> Result<Continuation, TransportError> {
+        let Some(token) = params.get("requestState").and_then(Value::as_str) else {
+            return Ok(Continuation::Fresh);
+        };
+        let mut state = self.lock_state();
+        let Some(index) = state
+            .suspended
+            .iter()
+            .position(|suspended| suspended.pending.token == token)
+        else {
+            if legacy {
+                return Err(TransportError::Rpc(json!({
+                    "code": -32602,
+                    "message": "unknown or expired requestState"
+                })));
+            }
+            return Ok(Continuation::Fresh);
+        };
+        match state.suspended[index]
+            .pending
+            .response_for_retry(method, params)?
+        {
+            None => Ok(Continuation::StillWaiting(
+                state.suspended[index].pending.input_required(),
+            )),
+            Some(response) => {
+                let suspended = state.suspended.remove(index);
+                Ok(Continuation::Resume {
+                    downstream_id: suspended.pending.downstream_request_id,
+                    response,
+                    rx: suspended.rx,
+                })
+            }
+        }
+    }
+
+    fn register(&self, downstream_id: &Value, tx: Sender<Delivery>) -> Result<(), TransportError> {
+        let context = request_context_key();
+        let mut state = self.lock_state();
+        if let Some(closed) = &state.closed {
+            return Err(TransportError::Unavailable(closed.clone()));
+        }
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        // A server request that arrived while nothing was in flight goes to the
+        // next request, as it did when it waited in the read channel.
+        for request in Self::claim_unclaimed(&mut state, &context) {
+            let _ = tx.send(Delivery::ServerRequest(request));
+        }
+        state.pending.insert(
+            waiter_key(downstream_id),
+            StdioWaiter {
+                seq,
+                context,
+                tx,
+                active: true,
+            },
+        );
+        Ok(())
+    }
+
+    /// A retry resumed a suspended request: this thread now waits on it.
+    fn resume(&self, downstream_id: &Value) {
+        let context = request_context_key();
+        let mut state = self.lock_state();
+        let state = &mut *state;
+        let Some(waiter) = state.pending.get_mut(&waiter_key(downstream_id)) else {
+            // Its response or the close already reached the receiver.
+            return;
+        };
+        waiter.active = true;
+        waiter.context = context.clone();
+        let tx = waiter.tx.clone();
+        for request in Self::claim_unclaimed(state, &context) {
+            let _ = tx.send(Delivery::ServerRequest(request));
+        }
+    }
+
+    /// Take the unclaimed server requests a waiter serving `context` may answer.
+    fn claim_unclaimed(state: &mut StdioCoreState, context: &str) -> Vec<Value> {
+        let (mine, others): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut state.unclaimed)
+            .into_iter()
+            .partition(|unclaimed| {
+                unclaimed
+                    .owner
+                    .as_deref()
+                    .is_none_or(|owner| owner == context)
+            });
+        state.unclaimed = others;
+        mine.into_iter()
+            .map(|unclaimed| unclaimed.request)
+            .collect()
+    }
+
+    /// Stop waiting: drop this waiter, and pass any server request it was handed
+    /// but did not handle to whoever can still answer it.
+    fn abandon(&self, waiter: &mut WaiterGuard<'_>, rx: &Receiver<Delivery>) {
+        waiter.armed = false;
+        self.lock_state()
+            .pending
+            .remove(&waiter_key(&waiter.downstream_id));
+        while let Ok(delivery) = rx.try_recv() {
+            if let Delivery::ServerRequest(request) = delivery {
+                self.route_server_request(request);
+            }
+        }
+    }
+
+    fn suspend(
+        &self,
+        waiter: &mut WaiterGuard<'_>,
+        pending: PendingLegacyMrtr,
+        rx: Receiver<Delivery>,
+    ) {
+        waiter.armed = false;
+        let evicted = {
+            let mut state = self.lock_state();
+            if let Some(entry) = state.pending.get_mut(&waiter_key(&waiter.downstream_id)) {
+                entry.active = false;
+            }
+            state.suspended.push(SuspendedLegacyMrtr {
+                pending,
+                rx,
+                since: Instant::now(),
+            });
+            let overflow = state
+                .suspended
+                .len()
+                .saturating_sub(MAX_SUSPENDED_LEGACY_MRTR);
+            let evicted: Vec<SuspendedLegacyMrtr> = state.suspended.drain(..overflow).collect();
+            for suspended in &evicted {
+                state
+                    .pending
+                    .remove(&waiter_key(&suspended.pending.downstream_request_id));
+            }
+            evicted
+        };
+        for suspended in evicted {
+            self.retire(
+                suspended.pending.downstream_request_id,
+                Some("Toolport dropped an unanswered input request".to_string()),
+            );
+        }
+    }
+
+    /// Cancel a suspended request downstream; nothing waits on it any more.
+    fn retire(&self, downstream_id: Value, reason: Option<String>) {
+        CancelEntry {
+            stdin: Arc::clone(&self.stdin),
+            downstream_id,
+            waiter: None,
+        }
+        .send_cancel_async(reason);
+    }
+
+    fn expire_suspended(&self) {
+        let expired = {
+            let mut state = self.lock_state();
+            if state.suspended.is_empty() {
+                return;
+            }
+            let now = Instant::now();
+            let (expired, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.suspended)
+                .into_iter()
+                .partition(|suspended| {
+                    now.duration_since(suspended.since) >= SUSPENDED_LEGACY_MRTR_TTL
+                });
+            state.suspended = kept;
+            for suspended in &expired {
+                state
+                    .pending
+                    .remove(&waiter_key(&suspended.pending.downstream_request_id));
+            }
+            expired
+        };
+        for suspended in expired {
+            self.retire(
+                suspended.pending.downstream_request_id,
+                Some("Toolport's input request expired".to_string()),
+            );
+        }
+    }
+
+    /// Cancel and retire the suspended request this exact continuation belongs to.
+    fn cancel_matching_suspended(
+        &self,
+        method: &str,
+        params: &Value,
+        cancel: &CancelContext,
+    ) -> bool {
+        let suspended =
+            {
+                let mut state = self.lock_state();
+                let Some(index) = state.suspended.iter().position(|suspended| {
+                    suspended.pending.response_for_retry(method, params).is_ok()
+                }) else {
+                    return false;
+                };
+                let suspended = state.suspended.remove(index);
+                state
+                    .pending
+                    .remove(&waiter_key(&suspended.pending.downstream_request_id));
+                suspended
+            };
+        self.retire(suspended.pending.downstream_request_id, cancel.reason());
+        true
+    }
+
+    /// The client cancelled: stop waiting now. A late response is dropped.
+    fn cancel_waiter(&self, downstream_id: &Value) {
+        let waiter = self.lock_state().pending.remove(&waiter_key(downstream_id));
+        if let Some(waiter) = waiter {
+            let _ = waiter.tx.send(Delivery::Cancelled);
+        }
+    }
+
+    fn route_line(&self, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            return;
+        };
+        if is_server_initiated_request(&value) {
+            self.route_server_request(value);
+            return;
+        }
+        // Notifications were already handled by the stdout drain.
+        if value.get("method").is_some() {
+            return;
+        }
+        let Some(key) = value.get("id").and_then(id_key) else {
+            return;
+        };
+        let waiter = self.lock_state().pending.remove(&key);
+        if let Some(waiter) = waiter {
+            let _ = waiter.tx.send(Delivery::Response(value));
+        }
+    }
+
+    /// Hand a server request to the thread whose client it belongs to. JSON-RPC
+    /// does not say which of our requests caused it, so it goes to the oldest
+    /// waiting thread only when every pending request, suspended ones included,
+    /// serves the same upstream context. Otherwise it is refused: one client's
+    /// roots, sampling or elicitation must never reach another client.
+    fn route_server_request(&self, request: Value) {
+        const UNANSWERABLE: &str = "Toolport had no request in flight to answer this";
+        let refused = {
+            let mut state = self.lock_state();
+            let mut contexts = state.pending.values().map(|waiter| waiter.context.as_str());
+            let owner = contexts.next();
+            let mixed = owner.is_some_and(|owner| !contexts.all(|context| context == owner));
+            let owner = owner.map(str::to_string);
+            if mixed {
+                drop(state);
+                self.exclusive.store(true, Ordering::SeqCst);
+                let msg = format!(
+                    "toolport: '{}' sent a server request while calls from different \
+                     clients were in flight; refused it and now sending it one request \
+                     at a time",
+                    self.label
+                );
+                eprintln!("{msg}");
+                crate::gatewaylog::append(&msg);
+                Some((
+                    request,
+                    "Toolport could not attribute this request to one client",
+                ))
+            } else if let Some(oldest) = state
+                .pending
+                .values()
+                .filter(|waiter| waiter.active)
+                .min_by_key(|waiter| waiter.seq)
+            {
+                match oldest.tx.send(Delivery::ServerRequest(request)) {
+                    Ok(()) => None,
+                    Err(std::sync::mpsc::SendError(Delivery::ServerRequest(request))) => {
+                        Some((request, UNANSWERABLE))
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                state
+                    .unclaimed
+                    .push_back(UnclaimedRequest { owner, request });
+                if state.unclaimed.len() > MAX_UNCLAIMED_SERVER_REQUESTS {
+                    state
+                        .unclaimed
+                        .pop_front()
+                        .map(|oldest| (oldest.request, UNANSWERABLE))
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some((request, message)) = refused {
+            self.refuse(&request, message);
+        }
+    }
+
+    /// Answer a server request with an error, off the demux thread: a child that
+    /// stopped reading stdin must not stall the routing of its own responses.
+    fn refuse(&self, request: &Value, message: &str) {
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": request.get("id").cloned().unwrap_or(Value::Null),
+            "error": { "code": JSONRPC_INTERNAL_ERROR, "message": message }
+        });
+        if CANCEL_THREADS_INFLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_CANCEL_THREADS {
+            CANCEL_THREADS_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+        let stdin = Arc::clone(&self.stdin);
+        std::thread::spawn(move || {
+            let mut stdin = stdin
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = writeln!(stdin, "{reply}").and_then(|()| stdin.flush());
+            drop(stdin);
+            CANCEL_THREADS_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+
+    /// The child's stdout closed: fail every waiter, and every later request,
+    /// with the exit status and stderr tail.
+    fn close(&self) {
+        let message = self.closed_error();
+        let mut state = self.lock_state();
+        state.closed = Some(message.clone());
+        for (_, waiter) in state.pending.drain() {
+            let _ = waiter.tx.send(Delivery::Closed(message.clone()));
+        }
+        state.unclaimed.clear();
+    }
+}
+
+/// One concurrent call's view of a stdio connection: the shared core plus the
+/// protocol metadata and read timeout current when the call started.
+struct StdioCall {
+    core: Arc<StdioCore>,
+    protocol_meta: Option<Value>,
+    read_timeout: Duration,
+}
+
+impl ConcurrentTransport for StdioCall {
+    fn request_with_cancel_and_headers(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        _headers: &[(String, String)],
+    ) -> Result<Value, TransportError> {
+        self.core.request(
+            method,
+            params,
+            cancel,
+            self.protocol_meta.as_ref(),
+            self.read_timeout,
+        )
+    }
 }
 
 /// Owns a Windows Job Object configured to terminate every assigned process
@@ -3736,20 +4542,21 @@ impl StdioTransport {
             );
         });
 
-        Ok(StdioTransport {
+        let core = StdioCore::start(
             child,
+            stdin,
+            stderr_buf,
+            rx,
+            launcher,
+            command_basename(command),
+        );
+        Ok(StdioTransport {
+            core,
             #[cfg(windows)]
             job: Some(job),
-            stdin,
-            rx,
-            stderr: stderr_buf,
-            next_id: 1,
             read_timeout: STDIO_READ_TIMEOUT,
             connect_timeout: stdio_connect_timeout(command, args),
             armed,
-            launcher,
-            server_handler: None,
-            pending_mrtr: None,
             progress,
             protocol_meta: None,
             subscription_listener_id: None,
@@ -3769,33 +4576,6 @@ impl StdioTransport {
     pub fn set_connect_timeout(&mut self, timeout: Duration) {
         self.connect_timeout = timeout;
     }
-
-    /// Build a useful error for when the child's stdout closed (it exited or
-    /// crashed). Includes the exit status and the tail of stderr when available -
-    /// that is where "package not found" or "missing API key" actually shows up.
-    fn closed_error(&mut self) -> String {
-        // The child just exited; give its stderr drain a brief moment to flush.
-        std::thread::sleep(Duration::from_millis(150));
-        let status = self.child.try_wait().ok().flatten();
-        let tail = self
-            .stderr
-            .lock()
-            .map(|b| b.trim().to_string())
-            .unwrap_or_default();
-        let mut msg = String::from("downstream server exited");
-        if let Some(code) = status.and_then(|s| s.code()) {
-            msg.push_str(&format!(" (status {code})"));
-        }
-        if tail.is_empty() {
-            msg.push_str(
-                " without stderr output. Check the command, args, and any required setup values.",
-            );
-        } else {
-            msg.push_str(":\n");
-            msg.push_str(&tail);
-        }
-        msg
-    }
 }
 
 impl Transport for StdioTransport {
@@ -3809,162 +4589,13 @@ impl Transport for StdioTransport {
         params: Value,
         cancel: Option<CancelContext>,
     ) -> Result<Value, TransportError> {
-        if self.pending_mrtr.is_some() && cancel.as_ref().is_some_and(CancelContext::is_cancelled) {
-            if let Some(cancel) = cancel.as_ref() {
-                self.cancel_matching_pending_request(method, &params, cancel);
-            }
-            return Err(TransportError::Cancelled(
-                "request cancelled before it reached the downstream server".to_string(),
-            ));
-        }
-        let mut params = params;
-        if let Some(protocol) = &self.protocol_meta {
-            merge_protocol_meta(&mut params, protocol);
-        }
-        let (downstream_id, outbound) = if let Some(pending) = self.pending_mrtr.take() {
-            let input_required = pending.input_required();
-            let response = match pending.response_for_retry(method, &params) {
-                Err(error) => {
-                    self.pending_mrtr = Some(pending);
-                    return Err(error);
-                }
-                Ok(Some(response)) => response,
-                Ok(None) => {
-                    self.pending_mrtr = Some(pending);
-                    return Ok(input_required);
-                }
-            };
-            (pending.downstream_request_id.clone(), response)
-        } else {
-            let id = self.next_id;
-            self.next_id += 1;
-            let downstream_id = json!(id);
-            let request = json!({
-                "jsonrpc": "2.0",
-                "id": downstream_id.clone(),
-                "method": method,
-                "params": params
-            });
-            (downstream_id, request)
-        };
-
-        // A broken stdin pipe means the child is gone: a health failure, not a protocol error.
-        let mut cancel_after_write = None;
-        let cancel_guard;
-        {
-            let mut stdin = self.stdin.lock().map_err(|_| {
-                TransportError::Unavailable("downstream stdin lock poisoned".into())
-            })?;
-            cancel_guard = if let Some(ctx) = cancel {
-                let client_request_id = ctx.client_request_id.clone();
-                let registry = ctx.registry.clone();
-                let guard = registry.register(
-                    client_request_id.clone(),
-                    CancelEntry {
-                        stdin: Arc::clone(&self.stdin),
-                        downstream_id: downstream_id.clone(),
-                    },
-                );
-                cancel_after_write = Some((registry, client_request_id));
-                Some(guard)
-            } else {
-                None
-            };
-            writeln!(stdin, "{outbound}")
-                .map_err(|e| TransportError::Unavailable(e.to_string()))?;
-            stdin
-                .flush()
-                .map_err(|e| TransportError::Unavailable(e.to_string()))?;
-        }
-        if let Some((registry, client_request_id)) = cancel_after_write {
-            if registry.is_cancelled(&client_request_id) {
-                registry.forward_cancel_if_ready(&client_request_id);
-            }
-        }
-        let _cancel_guard = cancel_guard;
-
-        // Read until the response with our id arrives, skipping notifications.
-        // The deadline bounds the whole wait so an unresponsive server fails fast
-        // instead of hanging the thread (and the batch probe) indefinitely.
-        let deadline = Instant::now() + self.read_timeout;
-        loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or_default();
-            let line = match self.rx.recv_timeout(remaining) {
-                Ok(l) => l,
-                Err(RecvTimeoutError::Timeout) => {
-                    // A launcher child that is alive but never answered `initialize`
-                    // even after the long budget is almost certainly still installing
-                    // its package (cold npm/PyPI cache, slow network). Say so: a bare
-                    // timeout reads as a broken server when it isn't. A dead child
-                    // never reaches here (its stdout closing ends the wait below).
-                    let alive = self.child.try_wait().map(|s| s.is_none()).unwrap_or(false);
-                    if self.launcher && alive && method == "initialize" {
-                        return Err(TransportError::Unavailable(
-                            "timed out waiting for 'initialize'; the launcher is likely \
-                             still downloading the server package (first run on a cold \
-                             cache). It usually connects on the next refresh."
-                                .to_string(),
-                        ));
-                    }
-                    return Err(TransportError::Unavailable(format!(
-                        "timed out waiting for '{method}' response"
-                    )));
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(TransportError::Unavailable(self.closed_error()))
-                }
-            };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let mut value: Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if is_server_initiated_request(&value) {
-                screen_url_elicitation_request(&mut value).map_err(|message| {
-                    TransportError::Fatal(format!(
-                        "Toolport refused unsafe URL elicitation: {message}"
-                    ))
-                })?;
-                if let Some(handler) = &self.server_handler {
-                    match handler(&value) {
-                        Some(ServerRequestAction::Respond(response)) => {
-                            let mut stdin = self.stdin.lock().map_err(|_| {
-                                TransportError::Unavailable("downstream stdin lock poisoned".into())
-                            })?;
-                            writeln!(stdin, "{response}")
-                                .map_err(|e| TransportError::Unavailable(e.to_string()))?;
-                            stdin
-                                .flush()
-                                .map_err(|e| TransportError::Unavailable(e.to_string()))?;
-                            continue;
-                        }
-                        Some(ServerRequestAction::InputRequired) => {
-                            let pending = PendingLegacyMrtr::new(
-                                value,
-                                downstream_id.clone(),
-                                method,
-                                &params,
-                            )?;
-                            let result = pending.input_required();
-                            self.pending_mrtr = Some(pending);
-                            return Ok(result);
-                        }
-                        None => {}
-                    }
-                }
-            }
-            if ids_match(value.get("id"), Some(&downstream_id)) {
-                if let Some(err) = value.get("error") {
-                    return Err(TransportError::Rpc(err.clone()));
-                }
-                return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-            }
-        }
+        self.core.request(
+            method,
+            params,
+            cancel,
+            self.protocol_meta.as_ref(),
+            self.read_timeout,
+        )
     }
 
     fn cancel_matching_pending_request(
@@ -3973,22 +4604,7 @@ impl Transport for StdioTransport {
         params: &Value,
         cancel: &CancelContext,
     ) -> bool {
-        let Some(pending) = self.pending_mrtr.as_ref() else {
-            return false;
-        };
-        if pending.response_for_retry(method, params).is_err() {
-            return false;
-        }
-        let pending = self
-            .pending_mrtr
-            .take()
-            .expect("matching pending request exists");
-        CancelEntry {
-            stdin: Arc::clone(&self.stdin),
-            downstream_id: pending.downstream_request_id,
-        }
-        .send_cancel_async(cancel.reason());
-        true
+        self.core.cancel_matching_suspended(method, params, cancel)
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
@@ -3999,13 +4615,8 @@ impl Transport for StdioTransport {
             merge_protocol_meta(&mut params, protocol);
         }
         let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| TransportError::Fatal("downstream stdin lock poisoned".into()))?;
-        writeln!(stdin, "{msg}").map_err(|e| TransportError::Fatal(e.to_string()))?;
-        stdin
-            .flush()
+        self.core
+            .write_line(&msg)
             .map_err(|e| TransportError::Fatal(e.to_string()))
     }
 
@@ -4022,7 +4633,11 @@ impl Transport for StdioTransport {
     }
 
     fn set_server_request_handler(&mut self, handler: ServerRequestHandler) {
-        self.server_handler = Some(handler);
+        *self
+            .core
+            .server_handler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handler);
     }
 
     fn set_protocol_meta(&mut self, meta: Option<Value>) {
@@ -4042,8 +4657,7 @@ impl Transport for StdioTransport {
                 }),
             )?;
         }
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.core.next_id.fetch_add(1, Ordering::SeqCst);
         let mut params = filter.params();
         if let Some(protocol) = &self.protocol_meta {
             merge_protocol_meta(&mut params, protocol);
@@ -4054,17 +4668,19 @@ impl Transport for StdioTransport {
             "method": "subscriptions/listen",
             "params": params,
         });
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| TransportError::Fatal("downstream stdin lock poisoned".into()))?;
-        writeln!(stdin, "{message}")
-            .map_err(|error| TransportError::Unavailable(error.to_string()))?;
-        stdin
-            .flush()
+        self.core
+            .write_line(&message)
             .map_err(|error| TransportError::Unavailable(error.to_string()))?;
         self.subscription_listener_id = Some(id);
         Ok(())
+    }
+
+    fn concurrent(&self) -> Option<Arc<dyn ConcurrentTransport>> {
+        Some(Arc::new(StdioCall {
+            core: Arc::clone(&self.core),
+            protocol_meta: self.protocol_meta.clone(),
+            read_timeout: self.read_timeout,
+        }))
     }
 }
 
@@ -4193,12 +4809,17 @@ impl Drop for StdioTransport {
     fn drop(&mut self) {
         #[cfg(windows)]
         drop(self.job.take());
+        let mut child = self
+            .core
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(unix)]
-        kill_process_group(&mut self.child);
+        kill_process_group(&mut child);
         // Reaps the direct child. Grandchildren were signalled above but are not
         // ours to reap; they are reparented to init, which reaps them.
-        let _ = self.child.wait();
-        crate::child_ledger::forget(self.child.id());
+        let _ = child.wait();
+        crate::child_ledger::forget(child.id());
     }
 }
 
@@ -6081,6 +6702,27 @@ impl DownstreamServer {
         self.transport.set_read_timeout(timeout);
     }
 
+    /// An owned handle for one call that need not hold this server's lock, when
+    /// the transport supports concurrent requests. State-changing operations
+    /// (catalog refresh, subscriptions, reconnect) keep using `&mut self`.
+    pub fn call_handle(&self) -> Option<CallHandle> {
+        let transport = self.transport.concurrent()?;
+        Some(CallHandle {
+            transport,
+            id: self.id.clone(),
+            era: self.era.clone(),
+            modern_http: self.modern_http,
+            tools: if self.modern_http {
+                self.tools.clone()
+            } else {
+                Vec::new()
+            },
+            caps_extensions: self.caps_extensions.clone(),
+            call_timeout: self.call_timeout,
+            server_handler: self.server_handler.clone(),
+        })
+    }
+
     /// Install the upstream request bridge on both this server wrapper and its
     /// transport. The transport consumes real legacy server-initiated requests;
     /// the wrapper consumes modern `input_required` results for legacy clients.
@@ -6097,165 +6739,6 @@ impl DownstreamServer {
         self.transport
             .set_server_request_handler(Arc::clone(&stamped));
         self.server_handler = Some(stamped);
-    }
-
-    fn fulfill_input_required(
-        &self,
-        result: &Value,
-    ) -> Result<Option<MrtrRequest>, TransportError> {
-        let requests = match result.get("inputRequests") {
-            None => None,
-            Some(Value::Object(requests)) => Some(requests),
-            Some(_) => {
-                return Err(TransportError::Fatal(
-                    "modern server returned non-object inputRequests".to_string(),
-                ))
-            }
-        };
-        let request_state = match result.get("requestState") {
-            None => None,
-            Some(Value::String(state)) => Some(Value::String(state.clone())),
-            Some(_) => {
-                return Err(TransportError::Fatal(
-                    "modern server returned non-string requestState".to_string(),
-                ))
-            }
-        };
-        if requests.map_or(true, serde_json::Map::is_empty) && request_state.is_none() {
-            return Err(TransportError::Fatal(
-                "modern server returned input_required without inputRequests or requestState"
-                    .to_string(),
-            ));
-        }
-
-        let mut input_responses = serde_json::Map::new();
-        if let Some(requests) = requests {
-            let handler = self.server_handler.as_ref().ok_or_else(|| {
-                TransportError::Fatal(
-                    "upstream client cannot fulfill the server's input_required result".to_string(),
-                )
-            })?;
-            for (key, input) in requests {
-                let mut input = input.clone();
-                screen_url_elicitation_request(&mut input).map_err(|message| {
-                    TransportError::Fatal(format!(
-                        "Toolport refused unsafe URL elicitation: {message}"
-                    ))
-                })?;
-                let method = input.get("method").and_then(Value::as_str).ok_or_else(|| {
-                    TransportError::Fatal(format!("input request '{key}' is missing a method"))
-                })?;
-                if !matches!(
-                    method,
-                    "roots/list" | "sampling/createMessage" | "elicitation/create"
-                ) {
-                    return Err(TransportError::Fatal(format!(
-                        "input request '{key}' uses unsupported method '{method}'"
-                    )));
-                }
-                let id = json!(format!(
-                    "toolport-mrtr-{}",
-                    MRTR_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
-                ));
-                let request = json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "method": method,
-                    "params": input.get("params").cloned().unwrap_or_else(|| json!({}))
-                });
-                let response = match handler(&request) {
-                    Some(ServerRequestAction::Respond(response)) => response,
-                    Some(ServerRequestAction::InputRequired) => return Ok(None),
-                    None => {
-                        return Err(TransportError::Fatal(format!(
-                            "upstream client did not handle input request '{key}' ({method})"
-                        )))
-                    }
-                };
-                if let Some(error) = response.get("error") {
-                    return Err(TransportError::Rpc(error.clone()));
-                }
-                let response = response.get("result").cloned().ok_or_else(|| {
-                    TransportError::Fatal(format!(
-                        "upstream client returned no result for input request '{key}'"
-                    ))
-                })?;
-                input_responses.insert(key.clone(), response);
-            }
-        }
-
-        if input_responses.is_empty() {
-            std::thread::sleep(MRTR_STATE_ONLY_DELAY);
-        }
-        Ok(Some(MrtrRequest {
-            input_responses: (!input_responses.is_empty()).then(|| Value::Object(input_responses)),
-            request_state,
-        }))
-    }
-
-    fn request_with_mrtr(
-        &mut self,
-        method: &str,
-        params: Value,
-        cancel: Option<CancelContext>,
-        meta: Option<&Value>,
-        mrtr: Option<&MrtrRequest>,
-        headers: &[(String, String)],
-    ) -> Result<Value, TransportError> {
-        let modern_upstream = upstream_is_modern(meta);
-        let modern_downstream = matches!(self.era, Era::Modern { .. });
-        let mut retry = mrtr.cloned().unwrap_or_default();
-        for round in 0..=MRTR_LEGACY_MAX_ROUNDS {
-            let mut params = with_meta_and_mrtr(params.clone(), meta, Some(&retry));
-            if modern_downstream {
-                attach_serviceable_client_capabilities(&mut params, meta);
-            }
-            let mut result = self.transport.request_with_cancel_and_headers(
-                method,
-                params,
-                cancel.clone(),
-                headers,
-            )?;
-            strip_private_envelope(&mut result);
-            if result.get("resultType").and_then(Value::as_str) == Some("input_required") {
-                screen_input_required(&mut result, &self.id)?;
-            }
-            if result.get("resultType").and_then(Value::as_str) != Some("input_required") {
-                return Ok(result);
-            }
-            if modern_upstream && modern_client_supports_input_required(meta, &result) {
-                return Ok(result);
-            }
-            if round == MRTR_LEGACY_MAX_ROUNDS {
-                return Err(TransportError::Fatal(format!(
-                    "modern server exceeded the {MRTR_LEGACY_MAX_ROUNDS}-round input_required limit"
-                )));
-            }
-            match self.fulfill_input_required(&result) {
-                Ok(Some(next)) => retry = next,
-                Ok(None) if modern_upstream => return Ok(result),
-                Ok(None) => {
-                    return Err(TransportError::Fatal(
-                        "cannot nest an input_required bridge while fulfilling one".to_string(),
-                    ))
-                }
-                Err(TransportError::Rpc(error))
-                    if modern_upstream
-                        && error.get("code").and_then(Value::as_i64)
-                            == Some(MISSING_REQUIRED_CLIENT_CAPABILITY) =>
-                {
-                    return Ok(json!({
-                        "_toolportProtocolError": {
-                            "code": MISSING_REQUIRED_CLIENT_CAPABILITY,
-                            "message": error.get("message").cloned().unwrap_or_else(|| json!("URL elicitation requires client support or a running Toolport desktop broker")),
-                            "requiredCapability": "elicitation"
-                        }
-                    }));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        unreachable!("bounded MRTR loop always returns")
     }
 
     /// Re-fetch the server's tool list on the existing connection, after it
@@ -6552,19 +7035,7 @@ impl DownstreamServer {
         meta: Option<&Value>,
         mrtr: Option<&MrtrRequest>,
     ) -> Result<Value, TransportError> {
-        let headers = if self.modern_http {
-            tool_request_headers(&self.tools, tool, &arguments)?
-        } else {
-            Vec::new()
-        };
-        self.request_with_mrtr(
-            "tools/call",
-            json!({ "name": tool, "arguments": arguments }),
-            cancel,
-            meta,
-            mrtr,
-            &headers,
-        )
+        ServerDispatch::call_with_cancel_and_mrtr(self, tool, arguments, cancel, meta, mrtr)
     }
 
     /// Read one resource by its (original, downstream) uri.
@@ -6588,14 +7059,7 @@ impl DownstreamServer {
         meta: Option<&Value>,
         mrtr: Option<&MrtrRequest>,
     ) -> Result<Value, TransportError> {
-        self.request_with_mrtr(
-            "resources/read",
-            json!({ "uri": uri }),
-            cancel,
-            meta,
-            mrtr,
-            &[],
-        )
+        ServerDispatch::read_resource_with_cancel_and_mrtr(self, uri, cancel, meta, mrtr)
     }
 
     /// Subscribe to `notifications/resources/updated` for one resource URI on
@@ -6675,14 +7139,7 @@ impl DownstreamServer {
         meta: Option<&Value>,
         mrtr: Option<&MrtrRequest>,
     ) -> Result<Value, TransportError> {
-        self.request_with_mrtr(
-            "prompts/get",
-            json!({ "name": name, "arguments": arguments }),
-            cancel,
-            meta,
-            mrtr,
-            &[],
-        )
+        ServerDispatch::get_prompt_with_cancel_and_mrtr(self, name, arguments, cancel, meta, mrtr)
     }
 
     /// Whether this server advertised the completions utility at initialize.
@@ -6722,16 +7179,7 @@ impl DownstreamServer {
         cancel: Option<CancelContext>,
         meta: Option<&Value>,
     ) -> Result<Value, TransportError> {
-        if !self
-            .caps_extensions
-            .contains_key("io.modelcontextprotocol/tasks")
-        {
-            return Err(TransportError::Fatal(format!(
-                "server '{}' did not advertise io.modelcontextprotocol/tasks",
-                self.id
-            )));
-        }
-        self.request_with_mrtr(method, params, cancel, meta, None, &[])
+        ServerDispatch::task_request(self, method, params, cancel, meta)
     }
 
     /// The protocol era and version this connection negotiated (SOU-445).
@@ -6747,21 +7195,411 @@ impl DownstreamServer {
 
     pub fn complete_with_cancel(
         &mut self,
-        mut params: Value,
+        params: Value,
         cancel: Option<CancelContext>,
     ) -> Result<Value, TransportError> {
-        let original_meta = params.get("_meta").cloned();
-        sanitize_forwarded_meta(&mut params);
-        if matches!(self.era, Era::Modern { .. }) {
-            attach_serviceable_client_capabilities(&mut params, original_meta.as_ref());
-        }
-        self.transport
-            .request_with_cancel("completion/complete", params, cancel)
+        ServerDispatch::complete_with_cancel(self, params, cancel)
     }
 
     /// Forward a JSON-RPC notification to this downstream server.
     pub fn notify_downstream(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
         self.transport.notify(method, params)
+    }
+}
+
+/// Request dispatch shared by a locked [`DownstreamServer`] and an unlocked
+/// [`CallHandle`], so each call path (MRTR handling, routing headers, Tasks,
+/// completions) has one implementation whichever way the router reaches the server.
+pub trait ServerDispatch {
+    fn server_id(&self) -> &str;
+    fn era(&self) -> &Era;
+    fn modern_http(&self) -> bool;
+    /// Tool definitions, for modern HTTP routing headers.
+    fn tools(&self) -> &[Value];
+    fn extensions(&self) -> &serde_json::Map<String, Value>;
+    fn server_handler(&self) -> Option<&ServerRequestHandler>;
+    /// The locked server, for operations that change connection state. `None`
+    /// on a [`CallHandle`].
+    fn locked_server(&mut self) -> Option<&mut DownstreamServer> {
+        None
+    }
+    fn send(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        headers: &[(String, String)],
+    ) -> Result<Value, TransportError>;
+    fn send_plain(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+    ) -> Result<Value, TransportError>;
+
+    fn fulfill_input_required(
+        &self,
+        result: &Value,
+    ) -> Result<Option<MrtrRequest>, TransportError> {
+        let requests = match result.get("inputRequests") {
+            None => None,
+            Some(Value::Object(requests)) => Some(requests),
+            Some(_) => {
+                return Err(TransportError::Fatal(
+                    "modern server returned non-object inputRequests".to_string(),
+                ))
+            }
+        };
+        let request_state = match result.get("requestState") {
+            None => None,
+            Some(Value::String(state)) => Some(Value::String(state.clone())),
+            Some(_) => {
+                return Err(TransportError::Fatal(
+                    "modern server returned non-string requestState".to_string(),
+                ))
+            }
+        };
+        if requests.map_or(true, serde_json::Map::is_empty) && request_state.is_none() {
+            return Err(TransportError::Fatal(
+                "modern server returned input_required without inputRequests or requestState"
+                    .to_string(),
+            ));
+        }
+
+        let mut input_responses = serde_json::Map::new();
+        if let Some(requests) = requests {
+            let handler = self.server_handler().ok_or_else(|| {
+                TransportError::Fatal(
+                    "upstream client cannot fulfill the server's input_required result".to_string(),
+                )
+            })?;
+            for (key, input) in requests {
+                let mut input = input.clone();
+                screen_url_elicitation_request(&mut input).map_err(|message| {
+                    TransportError::Fatal(format!(
+                        "Toolport refused unsafe URL elicitation: {message}"
+                    ))
+                })?;
+                let method = input.get("method").and_then(Value::as_str).ok_or_else(|| {
+                    TransportError::Fatal(format!("input request '{key}' is missing a method"))
+                })?;
+                if !matches!(
+                    method,
+                    "roots/list" | "sampling/createMessage" | "elicitation/create"
+                ) {
+                    return Err(TransportError::Fatal(format!(
+                        "input request '{key}' uses unsupported method '{method}'"
+                    )));
+                }
+                let id = json!(format!(
+                    "toolport-mrtr-{}",
+                    MRTR_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+                ));
+                let request = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": input.get("params").cloned().unwrap_or_else(|| json!({}))
+                });
+                let response = match handler(&request) {
+                    Some(ServerRequestAction::Respond(response)) => response,
+                    Some(ServerRequestAction::InputRequired) => return Ok(None),
+                    None => {
+                        return Err(TransportError::Fatal(format!(
+                            "upstream client did not handle input request '{key}' ({method})"
+                        )))
+                    }
+                };
+                if let Some(error) = response.get("error") {
+                    return Err(TransportError::Rpc(error.clone()));
+                }
+                let response = response.get("result").cloned().ok_or_else(|| {
+                    TransportError::Fatal(format!(
+                        "upstream client returned no result for input request '{key}'"
+                    ))
+                })?;
+                input_responses.insert(key.clone(), response);
+            }
+        }
+
+        if input_responses.is_empty() {
+            std::thread::sleep(MRTR_STATE_ONLY_DELAY);
+        }
+        Ok(Some(MrtrRequest {
+            input_responses: (!input_responses.is_empty()).then(|| Value::Object(input_responses)),
+            request_state,
+        }))
+    }
+
+    fn request_with_mrtr(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+        headers: &[(String, String)],
+    ) -> Result<Value, TransportError> {
+        let modern_upstream = upstream_is_modern(meta);
+        let modern_downstream = self.era().is_modern();
+        let mut retry = mrtr.cloned().unwrap_or_default();
+        for round in 0..=MRTR_LEGACY_MAX_ROUNDS {
+            let mut params = with_meta_and_mrtr(params.clone(), meta, Some(&retry));
+            if modern_downstream {
+                attach_serviceable_client_capabilities(&mut params, meta);
+            }
+            let mut result = self.send(method, params, cancel.clone(), headers)?;
+            strip_private_envelope(&mut result);
+            if result.get("resultType").and_then(Value::as_str) == Some("input_required") {
+                screen_input_required(&mut result, self.server_id())?;
+            }
+            if result.get("resultType").and_then(Value::as_str) != Some("input_required") {
+                return Ok(result);
+            }
+            if modern_upstream && modern_client_supports_input_required(meta, &result) {
+                return Ok(result);
+            }
+            if round == MRTR_LEGACY_MAX_ROUNDS {
+                return Err(TransportError::Fatal(format!(
+                    "modern server exceeded the {MRTR_LEGACY_MAX_ROUNDS}-round input_required limit"
+                )));
+            }
+            match self.fulfill_input_required(&result) {
+                Ok(Some(next)) => retry = next,
+                Ok(None) if modern_upstream => return Ok(result),
+                Ok(None) => {
+                    return Err(TransportError::Fatal(
+                        "cannot nest an input_required bridge while fulfilling one".to_string(),
+                    ))
+                }
+                Err(TransportError::Rpc(error))
+                    if modern_upstream
+                        && error.get("code").and_then(Value::as_i64)
+                            == Some(MISSING_REQUIRED_CLIENT_CAPABILITY) =>
+                {
+                    return Ok(json!({
+                        "_toolportProtocolError": {
+                            "code": MISSING_REQUIRED_CLIENT_CAPABILITY,
+                            "message": error.get("message").cloned().unwrap_or_else(|| json!("URL elicitation requires client support or a running Toolport desktop broker")),
+                            "requiredCapability": "elicitation"
+                        }
+                    }));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("bounded MRTR loop always returns")
+    }
+
+    fn call_with_cancel_and_mrtr(
+        &mut self,
+        tool: &str,
+        arguments: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, TransportError> {
+        let headers = if self.modern_http() {
+            tool_request_headers(self.tools(), tool, &arguments)?
+        } else {
+            Vec::new()
+        };
+        self.request_with_mrtr(
+            "tools/call",
+            json!({ "name": tool, "arguments": arguments }),
+            cancel,
+            meta,
+            mrtr,
+            &headers,
+        )
+    }
+
+    fn read_resource_with_cancel_and_mrtr(
+        &mut self,
+        uri: &str,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, TransportError> {
+        self.request_with_mrtr(
+            "resources/read",
+            json!({ "uri": uri }),
+            cancel,
+            meta,
+            mrtr,
+            &[],
+        )
+    }
+
+    fn get_prompt_with_cancel_and_mrtr(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+        mrtr: Option<&MrtrRequest>,
+    ) -> Result<Value, TransportError> {
+        self.request_with_mrtr(
+            "prompts/get",
+            json!({ "name": name, "arguments": arguments }),
+            cancel,
+            meta,
+            mrtr,
+            &[],
+        )
+    }
+
+    /// Forward a Tasks extension request on the same modern hop as the call
+    /// that created it. The router has already translated the client-facing
+    /// task id back to the server's native id.
+    fn task_request(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+    ) -> Result<Value, TransportError> {
+        if !self
+            .extensions()
+            .contains_key("io.modelcontextprotocol/tasks")
+        {
+            return Err(TransportError::Fatal(format!(
+                "server '{}' did not advertise io.modelcontextprotocol/tasks",
+                self.server_id()
+            )));
+        }
+        self.request_with_mrtr(method, params, cancel, meta, None, &[])
+    }
+
+    fn complete_with_cancel(
+        &mut self,
+        mut params: Value,
+        cancel: Option<CancelContext>,
+    ) -> Result<Value, TransportError> {
+        let original_meta = params.get("_meta").cloned();
+        sanitize_forwarded_meta(&mut params);
+        if self.era().is_modern() {
+            attach_serviceable_client_capabilities(&mut params, original_meta.as_ref());
+        }
+        self.send_plain("completion/complete", params, cancel)
+    }
+}
+
+impl ServerDispatch for DownstreamServer {
+    fn server_id(&self) -> &str {
+        &self.id
+    }
+
+    fn era(&self) -> &Era {
+        &self.era
+    }
+
+    fn modern_http(&self) -> bool {
+        self.modern_http
+    }
+
+    fn tools(&self) -> &[Value] {
+        &self.tools
+    }
+
+    fn extensions(&self) -> &serde_json::Map<String, Value> {
+        &self.caps_extensions
+    }
+
+    fn server_handler(&self) -> Option<&ServerRequestHandler> {
+        self.server_handler.as_ref()
+    }
+
+    fn locked_server(&mut self) -> Option<&mut DownstreamServer> {
+        Some(self)
+    }
+
+    fn send(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        headers: &[(String, String)],
+    ) -> Result<Value, TransportError> {
+        self.transport
+            .request_with_cancel_and_headers(method, params, cancel, headers)
+    }
+
+    fn send_plain(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+    ) -> Result<Value, TransportError> {
+        self.transport.request_with_cancel(method, params, cancel)
+    }
+}
+
+/// Everything a dispatch needs from one connected server, owned so the call can
+/// run without holding the server's lock. Taken from [`DownstreamServer::call_handle`]
+/// when the transport can carry concurrent requests.
+pub struct CallHandle {
+    transport: Arc<dyn ConcurrentTransport>,
+    id: String,
+    era: Era,
+    modern_http: bool,
+    /// Only filled for modern HTTP, the one case that reads tool definitions.
+    tools: Vec<Value>,
+    caps_extensions: serde_json::Map<String, Value>,
+    call_timeout: Duration,
+    server_handler: Option<ServerRequestHandler>,
+}
+
+impl CallHandle {
+    /// The server's live-call read deadline when this handle was taken.
+    pub fn call_timeout(&self) -> Duration {
+        self.call_timeout
+    }
+}
+
+impl ServerDispatch for CallHandle {
+    fn server_id(&self) -> &str {
+        &self.id
+    }
+
+    fn era(&self) -> &Era {
+        &self.era
+    }
+
+    fn modern_http(&self) -> bool {
+        self.modern_http
+    }
+
+    fn tools(&self) -> &[Value] {
+        &self.tools
+    }
+
+    fn extensions(&self) -> &serde_json::Map<String, Value> {
+        &self.caps_extensions
+    }
+
+    fn server_handler(&self) -> Option<&ServerRequestHandler> {
+        self.server_handler.as_ref()
+    }
+
+    fn send(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        headers: &[(String, String)],
+    ) -> Result<Value, TransportError> {
+        self.transport
+            .request_with_cancel_and_headers(method, params, cancel, headers)
+    }
+
+    fn send_plain(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+    ) -> Result<Value, TransportError> {
+        self.transport.request_with_cancel(method, params, cancel)
     }
 }
 
@@ -8187,7 +9025,7 @@ mod tests {
         let mut transport = transport.expect("the stub server must spawn");
 
         assert!(
-            transport.launcher,
+            transport.core.launcher,
             "the connect budget must come from the configured `npx`, not the `node` \
              the rewrite produced"
         );
@@ -9395,33 +10233,463 @@ mod tests {
     }
 
     /// A `StdioTransport` whose stdin is `stdin` and whose only stdout line is
-    /// `response`, queued before the call so the read never depends on timing.
+    /// `response`, delivered once the request is waiting for it so the read
+    /// never depends on timing.
     fn stdio_transport_fixture(
         stdin: Arc<Mutex<std::process::ChildStdin>>,
         response: &Value,
     ) -> super::StdioTransport {
         use std::sync::atomic::AtomicBool;
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(response.to_string()).expect("queue the response");
-        drop(tx);
+        let core = super::StdioCore::start(
+            placeholder_child(),
+            stdin,
+            Arc::new(Mutex::new(String::new())),
+            rx,
+            false,
+            "fixture".to_string(),
+        );
+        let waiting = Arc::downgrade(&core);
+        let response = response.to_string();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                let Some(core) = waiting.upgrade() else {
+                    return;
+                };
+                if !core.lock_state().pending.is_empty() {
+                    break;
+                }
+                drop(core);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let _ = tx.send(response);
+        });
         super::StdioTransport {
-            child: placeholder_child(),
+            core,
             #[cfg(windows)]
             job: None,
-            stdin,
-            rx,
-            stderr: Arc::new(Mutex::new(String::new())),
-            next_id: 1,
             read_timeout: std::time::Duration::from_secs(30),
             connect_timeout: super::STDIO_CONNECT_TIMEOUT,
             armed: Arc::new(AtomicBool::new(false)),
-            launcher: false,
-            server_handler: None,
-            pending_mrtr: None,
             progress: Arc::new(Mutex::new(None)),
             protocol_meta: None,
             subscription_listener_id: None,
         }
+    }
+
+    thread_local! {
+        static TEST_REQUEST_CONTEXT: std::cell::RefCell<String> =
+            const { std::cell::RefCell::new(String::new()) };
+    }
+
+    /// A [`super::StdioCore`] over a recording child: requests go to the
+    /// recorder's stdin, and the test plays the server by pushing stdout lines.
+    struct CoreFixture {
+        core: Arc<super::StdioCore>,
+        lines: Option<std::sync::mpsc::Sender<String>>,
+        recorder: StdinRecorder,
+    }
+
+    impl CoreFixture {
+        fn new(tag: &str, stderr: &str) -> Self {
+            // Every test thread reads its own context; unset threads share "".
+            super::set_request_context_provider(Arc::new(|| {
+                TEST_REQUEST_CONTEXT.with(|context| context.borrow().clone())
+            }));
+            let recorder = StdinRecorder::new(tag);
+            let (lines, rx) = std::sync::mpsc::channel();
+            let core = super::StdioCore::start(
+                placeholder_child(),
+                Arc::clone(&recorder.stdin),
+                Arc::new(Mutex::new(stderr.to_string())),
+                rx,
+                false,
+                "fixture".to_string(),
+            );
+            CoreFixture {
+                core,
+                lines: Some(lines),
+                recorder,
+            }
+        }
+
+        /// Send one request from a new thread serving upstream `context`.
+        fn request(
+            &self,
+            context: &str,
+            params: Value,
+            cancel: Option<super::CancelContext>,
+        ) -> std::thread::JoinHandle<Result<Value, TransportError>> {
+            let core = Arc::clone(&self.core);
+            let context = context.to_string();
+            std::thread::Builder::new()
+                .name(format!("waiter-{context}"))
+                .spawn(move || {
+                    TEST_REQUEST_CONTEXT.with(|cell| *cell.borrow_mut() = context);
+                    core.request(
+                        "tools/call",
+                        params,
+                        cancel,
+                        None,
+                        std::time::Duration::from_secs(10),
+                    )
+                })
+                .unwrap()
+        }
+
+        fn wait_for(&self, what: &str, done: impl Fn(&super::StdioCore) -> bool) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !done(&self.core) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {what}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        fn wait_for_pending(&self, count: usize) {
+            self.wait_for(&format!("{count} pending request(s)"), |core| {
+                core.lock_state().pending.len() == count
+            });
+        }
+
+        fn server_says(&self, line: Value) {
+            self.lines
+                .as_ref()
+                .expect("stdout still open")
+                .send(line.to_string())
+                .unwrap();
+        }
+
+        fn close_stdout(&mut self) {
+            self.lines = None;
+        }
+
+        /// Everything written to the child's stdin, once every writer is done.
+        fn finish(self) -> Vec<Value> {
+            let CoreFixture {
+                core,
+                lines,
+                recorder,
+            } = self;
+            drop(lines);
+            let _ = core
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .wait();
+            drop(core);
+            recorder.finish()
+        }
+    }
+
+    fn response(id: i64, result: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "result": result })
+    }
+
+    #[test]
+    fn stdio_responses_out_of_order_reach_their_own_waiters() {
+        let fixture = CoreFixture::new("out-of-order", "");
+        let slow = fixture.request("a", json!({ "name": "slow" }), None);
+        fixture.wait_for_pending(1);
+        let fast = fixture.request("b", json!({ "name": "fast" }), None);
+        fixture.wait_for_pending(2);
+
+        fixture.server_says(response(2, json!({ "who": "fast" })));
+        assert_eq!(fast.join().unwrap().unwrap()["who"], "fast");
+        fixture.server_says(response(1, json!({ "who": "slow" })));
+        assert_eq!(slow.join().unwrap().unwrap()["who"], "slow");
+
+        let frames = fixture.finish();
+        assert_eq!(frames.len(), 2, "{frames:?}");
+    }
+
+    #[test]
+    fn stdio_server_request_with_one_waiter_is_handled_on_its_thread() {
+        let fixture = CoreFixture::new("one-waiter", "");
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let seen_tx = Mutex::new(seen_tx);
+        let handler: ServerRequestHandler = Arc::new(move |request| {
+            let thread = std::thread::current().name().map(str::to_string);
+            seen_tx.lock().unwrap().send(thread).unwrap();
+            Some(ServerRequestAction::Respond(json!({
+                "jsonrpc": "2.0",
+                "id": request["id"].clone(),
+                "result": { "roots": [] }
+            })))
+        });
+        *fixture.core.server_handler.lock().unwrap() = Some(handler);
+        let call = fixture.request("a", json!({ "name": "rooted" }), None);
+        fixture.wait_for_pending(1);
+
+        fixture.server_says(json!({ "jsonrpc": "2.0", "id": "srv-1", "method": "roots/list" }));
+        let thread = seen_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(thread.as_deref(), Some("waiter-a"));
+        fixture.server_says(response(1, json!({ "ok": true })));
+        assert_eq!(call.join().unwrap().unwrap()["ok"], true);
+
+        let frames = fixture.finish();
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_eq!(frames[1]["id"], "srv-1");
+        assert_eq!(frames[1]["result"]["roots"], json!([]));
+    }
+
+    #[test]
+    fn stdio_server_request_across_clients_is_refused_and_serializes_the_server() {
+        let fixture = CoreFixture::new("mixed", "");
+        let handled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&handled);
+        let handler: ServerRequestHandler = Arc::new(move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            None
+        });
+        *fixture.core.server_handler.lock().unwrap() = Some(handler);
+        let first = fixture.request("client-a", json!({ "name": "one" }), None);
+        fixture.wait_for_pending(1);
+        let second = fixture.request("client-b", json!({ "name": "two" }), None);
+        fixture.wait_for_pending(2);
+
+        fixture.server_says(json!({ "jsonrpc": "2.0", "id": "srv-x", "method": "roots/list" }));
+        fixture.wait_for("exclusive mode", |core| {
+            core.exclusive.load(std::sync::atomic::Ordering::SeqCst)
+        });
+        fixture.server_says(response(1, json!({})));
+        fixture.server_says(response(2, json!({})));
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        assert!(
+            !handled.load(std::sync::atomic::Ordering::SeqCst),
+            "neither client may see the other's server request"
+        );
+
+        // From now on one request at a time: the second waits for the first.
+        let third = fixture.request("client-a", json!({ "name": "three" }), None);
+        fixture.wait_for_pending(1);
+        let fourth = fixture.request("client-b", json!({ "name": "four" }), None);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(fixture.core.lock_state().pending.len(), 1);
+        fixture.server_says(response(3, json!({})));
+        third.join().unwrap().unwrap();
+        fixture.wait_for_pending(1);
+        fixture.server_says(response(4, json!({})));
+        fourth.join().unwrap().unwrap();
+
+        let frames = fixture.finish();
+        let refusal = frames
+            .iter()
+            .find(|frame| frame["id"] == "srv-x")
+            .unwrap_or_else(|| panic!("no refusal in {frames:?}"));
+        assert!(refusal["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("could not attribute"));
+    }
+
+    #[test]
+    fn stdio_server_request_is_not_given_to_another_client_while_one_is_suspended() {
+        let fixture = CoreFixture::new("suspended-owner", "");
+        let roots_asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&roots_asked);
+        let handler: ServerRequestHandler = Arc::new(move |request| {
+            if request["method"] == "roots/list" {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                return None;
+            }
+            Some(ServerRequestAction::InputRequired)
+        });
+        *fixture.core.server_handler.lock().unwrap() = Some(handler);
+        let suspended =
+            fixture.request("client-a", json!({ "name": "one", "arguments": {} }), None);
+        fixture.wait_for_pending(1);
+        fixture.server_says(json!({
+            "jsonrpc": "2.0",
+            "id": "elicit-a",
+            "method": "elicitation/create",
+            "params": { "message": "Continue?" }
+        }));
+        assert_eq!(
+            suspended.join().unwrap().unwrap()["resultType"],
+            "input_required"
+        );
+        let other = fixture.request("client-b", json!({ "name": "two" }), None);
+        fixture.wait_for("the other client's call", |core| {
+            core.lock_state()
+                .pending
+                .values()
+                .any(|waiter| waiter.active)
+        });
+
+        // It may belong to client A's suspended call, so client B must not see it.
+        fixture.server_says(json!({ "jsonrpc": "2.0", "id": "srv-a", "method": "roots/list" }));
+        fixture.wait_for("exclusive mode", |core| {
+            core.exclusive.load(std::sync::atomic::Ordering::SeqCst)
+        });
+        fixture.server_says(response(2, json!({})));
+        other.join().unwrap().unwrap();
+        assert!(!roots_asked.load(std::sync::atomic::Ordering::SeqCst));
+
+        let frames = fixture.finish();
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["id"] == "srv-a" && frame.get("error").is_some()),
+            "{frames:?}"
+        );
+    }
+
+    #[test]
+    fn stdio_cancellation_wakes_the_waiter_and_drops_the_late_response() {
+        let fixture = CoreFixture::new("cancel-wakes", "");
+        let registry = CancelRegistry::new();
+        assert!(registry.begin_client_request("c-9".to_string()));
+        let cancelled = fixture.request(
+            "a",
+            json!({ "name": "slow" }),
+            Some(registry.context("c-9".to_string())),
+        );
+        fixture.wait_for_pending(1);
+        assert!(registry.cancel("c-9", Some("user pressed stop")));
+        assert!(matches!(
+            cancelled.join().unwrap(),
+            Err(TransportError::Cancelled(_))
+        ));
+        assert!(fixture.core.lock_state().pending.is_empty());
+        registry.finish_client_request("c-9");
+
+        // The late answer has no waiter; the next request still gets its own.
+        fixture.server_says(response(1, json!({ "late": true })));
+        let next = fixture.request("a", json!({ "name": "next" }), None);
+        fixture.wait_for_pending(1);
+        fixture.server_says(response(2, json!({ "late": false })));
+        assert_eq!(next.join().unwrap().unwrap()["late"], false);
+
+        let frames = fixture.finish();
+        let cancel = frames
+            .iter()
+            .find(|frame| frame["method"] == "notifications/cancelled")
+            .unwrap_or_else(|| panic!("no cancellation in {frames:?}"));
+        assert_eq!(cancel["params"]["requestId"], 1);
+    }
+
+    #[test]
+    fn stdio_child_exit_fails_every_waiter_with_the_stderr_tail() {
+        let mut fixture = CoreFixture::new("exit", "boom: missing API key");
+        let first = fixture.request("a", json!({ "name": "one" }), None);
+        fixture.wait_for_pending(1);
+        let second = fixture.request("b", json!({ "name": "two" }), None);
+        fixture.wait_for_pending(2);
+
+        fixture.close_stdout();
+        for waiter in [first, second] {
+            match waiter.join().unwrap() {
+                Err(TransportError::Unavailable(message)) => {
+                    assert!(message.contains("missing API key"), "{message}")
+                }
+                other => panic!("expected the exit to fail the call, got {other:?}"),
+            }
+        }
+        match fixture
+            .request("a", json!({ "name": "late" }), None)
+            .join()
+            .unwrap()
+        {
+            Err(TransportError::Unavailable(message)) => {
+                assert!(message.contains("missing API key"), "{message}")
+            }
+            other => panic!("a request after the exit must fail at once, got {other:?}"),
+        }
+        fixture.finish();
+    }
+
+    #[test]
+    fn stdio_two_suspended_legacy_mrtr_calls_resume_independently() {
+        let fixture = CoreFixture::new("two-mrtr", "");
+        let handler: ServerRequestHandler = Arc::new(|request| {
+            (request["method"] == "elicitation/create")
+                .then_some(ServerRequestAction::InputRequired)
+        });
+        *fixture.core.server_handler.lock().unwrap() = Some(handler);
+        let elicit = |id: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "elicitation/create",
+                "params": { "message": "Continue?" }
+            })
+        };
+
+        // Both calls come from one client: a server request while another
+        // client's call is suspended would be refused instead.
+        let first = fixture.request("a", json!({ "name": "one", "arguments": {} }), None);
+        fixture.wait_for_pending(1);
+        fixture.server_says(elicit("elicit-1"));
+        let first = first.join().unwrap().unwrap();
+        let second = fixture.request("a", json!({ "name": "two", "arguments": {} }), None);
+        fixture.wait_for("the second call", |core| {
+            core.lock_state()
+                .pending
+                .values()
+                .any(|waiter| waiter.active)
+        });
+        fixture.server_says(elicit("elicit-2"));
+        let second = second.join().unwrap().unwrap();
+        assert_eq!(fixture.core.lock_state().suspended.len(), 2);
+
+        let retry = |name: &str, suspended: &Value| {
+            let key = suspended["inputRequests"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap()
+                .clone();
+            json!({
+                "name": name,
+                "arguments": {},
+                "requestState": suspended["requestState"].clone(),
+                "inputResponses": { key: { "action": "accept" } }
+            })
+        };
+        // An unknown requestState on a legacy connection must not replay the call.
+        let unknown = fixture.request(
+            "a",
+            json!({ "name": "one", "arguments": {}, "requestState": "forged" }),
+            None,
+        );
+        assert!(matches!(
+            unknown.join().unwrap(),
+            Err(TransportError::Rpc(_))
+        ));
+
+        let second_retry = fixture.request("a", retry("two", &second), None);
+        fixture.wait_for("the second retry", |core| {
+            core.lock_state().suspended.len() == 1
+        });
+        fixture.server_says(response(2, json!({ "done": "two" })));
+        assert_eq!(second_retry.join().unwrap().unwrap()["done"], "two");
+        let first_retry = fixture.request("a", retry("one", &first), None);
+        fixture.wait_for("the first retry", |core| {
+            core.lock_state().suspended.is_empty()
+        });
+        fixture.server_says(response(1, json!({ "done": "one" })));
+        assert_eq!(first_retry.join().unwrap().unwrap()["done"], "one");
+
+        let frames = fixture.finish();
+        let calls = frames
+            .iter()
+            .filter(|frame| frame["method"] == "tools/call")
+            .count();
+        assert_eq!(calls, 2, "retries must not replay tools/call: {frames:?}");
+        let answered: Vec<&Value> = frames
+            .iter()
+            .filter(|frame| frame.get("result").is_some())
+            .map(|frame| &frame["id"])
+            .collect();
+        assert_eq!(answered, [&json!("elicit-2"), &json!("elicit-1")]);
     }
 
     /// SBS-644. The cancel-before-registration race: the client cancels while the
@@ -9447,13 +10715,17 @@ mod tests {
             &json!({ "jsonrpc": "2.0", "id": 1, "result": { "ok": true } }),
         );
 
-        transport
-            .request_with_cancel(
-                "tools/call",
-                json!({ "name": "echo" }),
-                Some(registry.context("c-1".to_string())),
-            )
-            .expect("the queued response should complete the request");
+        // The deferred forward also wakes the waiter, so the call may end as
+        // cancelled before the queued response arrives. Either way the frames
+        // below are what reached the child.
+        match transport.request_with_cancel(
+            "tools/call",
+            json!({ "name": "echo" }),
+            Some(registry.context("c-1".to_string())),
+        ) {
+            Ok(_) | Err(TransportError::Cancelled(_)) => {}
+            Err(other) => panic!("unexpected result: {other}"),
+        }
 
         registry.finish_client_request("c-1");
         drop(transport);
@@ -9503,6 +10775,7 @@ mod tests {
             CancelEntry {
                 stdin: Arc::clone(&recorder.stdin),
                 downstream_id: json!(41),
+                waiter: None,
             },
         );
 
@@ -9543,6 +10816,7 @@ mod tests {
             CancelEntry {
                 stdin: Arc::clone(&first_recorder.stdin),
                 downstream_id: json!(41),
+                waiter: None,
             },
         );
         assert!(registry.cancel("c-3", Some("user pressed stop")));
@@ -9556,6 +10830,7 @@ mod tests {
             CancelEntry {
                 stdin: Arc::clone(&second_recorder.stdin),
                 downstream_id: json!(42),
+                waiter: None,
             },
         );
         // Same post-write step the stdio request path runs.
