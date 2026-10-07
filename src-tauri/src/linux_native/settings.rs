@@ -347,7 +347,9 @@ impl SettingsPage {
             .build();
         updates_copy.append(&update_advice);
         gtk::glib::spawn_future_local(async move {
-            if let Ok(advice) = gtk::gio::spawn_blocking(super::package_updates::update_advice).await {
+            if let Ok(advice) =
+                gtk::gio::spawn_blocking(super::package_updates::update_advice).await
+            {
                 update_advice.set_label(advice);
             }
         });
@@ -498,7 +500,6 @@ impl SettingsPage {
                 .build(),
         );
         page.append(&quarantine_list);
-
 
         scroller.set_child(Some(&page));
         root.append(&scroller);
@@ -1049,13 +1050,13 @@ impl SettingsPage {
             return;
         };
         if settings.profiles.is_empty() {
-            self.show_error("create a access set before adding folder routing");
+            self.show_error("create an access set before adding folder routing");
             return;
         }
         #[allow(deprecated)]
         let dialog = adw::MessageDialog::new(
             Some(&parent),
-            Some("Choose a access set"),
+            Some("Choose an access set"),
             Some("This access set will be selected when a client reports this folder or one of its descendants."),
         );
         dialog.add_response("cancel", "Cancel");
@@ -1078,7 +1079,7 @@ impl SettingsPage {
         dialog.connect_response(None, move |dialog, response| {
             if response == "save" {
                 let Some((profile, _)) = profiles.get(dropdown.selected() as usize) else {
-                    page.show_error("choose a access set");
+                    page.show_error("choose an access set");
                     dialog.close();
                     return;
                 };

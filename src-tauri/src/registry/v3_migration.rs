@@ -12,15 +12,29 @@ pub(super) fn migrate_v2_to_v3(value: &mut Value, _: &MigrationContext) -> Resul
     let Some(profiles) = document.get("profiles").and_then(Value::as_array) else {
         return Ok(());
     };
-    let active = document
+    // Match the loader's legacy normalization before pinning the default:
+    // unique names resolve to IDs; stale or ambiguous active references use
+    // the first-profile fallback, exactly as they did before schema v3.
+    let active_ref = document
         .get("activeProfileId")
         .and_then(Value::as_str)
-        .or_else(|| {
-            profiles
-                .first()
-                .and_then(|p| p.get("id"))
-                .and_then(Value::as_str)
-        })
+        .unwrap_or("")
+        .trim();
+    let by_id = profiles
+        .iter()
+        .find(|p| p.get("id").and_then(Value::as_str) == Some(active_ref));
+    let mut by_name = profiles.iter().filter(|p| {
+        p.get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case(active_ref))
+    });
+    let first_name = by_name.next();
+    let named = by_name.next().is_none().then_some(first_name).flatten();
+    let active = by_id
+        .or(named)
+        .or_else(|| profiles.first())
+        .and_then(|p| p.get("id"))
+        .and_then(Value::as_str)
         .unwrap_or("default")
         .to_string();
     if profiles.iter().any(|p| {

@@ -734,7 +734,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
-        for active in ["default", "work"] {
+        for active in ["default", "work", " Work ", "deleted"] {
             let dir = scratch_dir("brandon-v3");
             let _override = DataDirOverride::set(&dir);
             let client_files = seed_user_files(&dir);
@@ -754,14 +754,15 @@ mod tests {
                 {"id":"scoped-http", "label":"Scoped", "tokenSha256":"hash2", "profile":"default"}
             ]);
             v1["clientScopes"]["empty"] = json!("");
-            let before: Registry = serde_json::from_value(v1.clone()).unwrap();
+            let mut before: Registry = serde_json::from_value(v1.clone()).unwrap();
+            before.normalize_profile_references();
             let original = write_json(&path, &v1);
             let after = crate::registry::load_from(&path).unwrap();
             let v3 = read_json(&path);
             assert_eq!(v3["version"], 3);
             assert_eq!(
                 after.default_access_profile_id.as_deref(),
-                (active == "work").then_some("work")
+                matches!(active, "work" | " Work ").then_some("work")
             );
             let ids = |servers: Vec<&crate::registry::ServerEntry>| -> Vec<String> {
                 servers.iter().map(|s| s.id.clone()).collect()
@@ -1226,6 +1227,7 @@ mod tests {
         let _override = DataDirOverride::set(&dir);
         let path = dir.join("registry.json");
         let mut document = serde_json::to_value(crate::registry::Registry::default()).unwrap();
+        document["version"] = json!(2);
         document["servers"] = json!([{
             "id": "custom", "name": "Custom", "transport": "stdio", "command": "echo",
             "args": ["<launch-input>"], "env": [{"key": "ENV", "value": null}],
