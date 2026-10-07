@@ -2085,14 +2085,14 @@ impl Registry {
 
     pub fn access_upgrade_notice_pending(&self) -> bool {
         self.version >= 3
-            && self.unknown_fields.get("accessUpgradeNoticePending")
-                == Some(&serde_json::Value::Bool(true))
+            && self.unknown_fields.get("accessUpgradeNoticeDismissed")
+                != Some(&serde_json::Value::Bool(true))
     }
 
     pub fn dismiss_access_upgrade_notice(&mut self) {
         self.unknown_fields.insert(
-            "accessUpgradeNoticePending".into(),
-            serde_json::Value::Bool(false),
+            "accessUpgradeNoticeDismissed".into(),
+            serde_json::Value::Bool(true),
         );
     }
 

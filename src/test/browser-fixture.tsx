@@ -29,7 +29,7 @@ const registry: Registry = {
   activeProfileId: "local",
   defaultAccessContextId: "local",
   defaultAccessLegacyPolicy: true,
-  accessUpgradeNoticePending: true,
+  accessUpgradeNoticeDismissed: false,
   clientScopes: { codex: "" },
 };
 const auditRows = Array.from({ length: 200 }, (_, i) => ({
@@ -80,7 +80,7 @@ mockIPC(
     calls[command] = (calls[command] ?? 0) + 1;
     switch (command) {
       case "dismiss_access_upgrade_notice":
-        registry.accessUpgradeNoticePending = false;
+        registry.accessUpgradeNoticeDismissed = true;
         return registry;
       case "set_default_access":
         registry.defaultAccessProfileId = args.profile as string | null;

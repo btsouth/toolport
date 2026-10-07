@@ -16,9 +16,9 @@ it("shows the v3 upgrade notice, reuses cleanup, and hides after persisted dismi
     servers: [],
     profiles: [],
     activeProfileId: null,
-    accessUpgradeNoticePending: true,
+    accessUpgradeNoticeDismissed: false,
   };
-  const dismissed = { ...registry, accessUpgradeNoticePending: false };
+  const dismissed = { ...registry, accessUpgradeNoticeDismissed: true };
   vi.mocked(dismissAccessUpgradeNotice).mockResolvedValue(dismissed);
   vi.mocked(stopStaleGateways).mockResolvedValue({
     killed: ["old"],
@@ -36,5 +36,25 @@ it("shows the v3 upgrade notice, reuses cleanup, and hides after persisted dismi
   await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
   await waitFor(() => expect(onChange).toHaveBeenCalledWith(dismissed));
   rerender(<AccessUpgradeNotice registry={dismissed} onRegistryChange={onChange} />);
+  expect(screen.queryByRole("status")).not.toBeInTheDocument();
+});
+
+it("shows an existing v3 registry without a dismissal marker and skips v2", () => {
+  const registry: Registry = {
+    version: 3,
+    servers: [],
+    profiles: [],
+    activeProfileId: null,
+  };
+  const { rerender } = render(
+    <AccessUpgradeNotice registry={registry} onRegistryChange={vi.fn()} />,
+  );
+  expect(screen.getByRole("status")).toBeInTheDocument();
+  rerender(
+    <AccessUpgradeNotice
+      registry={{ ...registry, version: 2 }}
+      onRegistryChange={vi.fn()}
+    />,
+  );
   expect(screen.queryByRole("status")).not.toBeInTheDocument();
 });

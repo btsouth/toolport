@@ -12,7 +12,8 @@ export function AccessUpgradeNotice({
 }) {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState("");
-  if (!registry?.accessUpgradeNoticePending) return null;
+  if (!registry || registry.version < 3 || registry.accessUpgradeNoticeDismissed)
+    return null;
   return (
     <div
       role="status"
@@ -44,7 +45,7 @@ export function AccessUpgradeNotice({
                 .join(" "),
             );
           } catch (error) {
-            toastError("Could not stop old gateways", error);
+            toastError("Could not stop old gateways", { description: String(error) });
           } finally {
             setBusy(false);
           }
@@ -60,7 +61,9 @@ export function AccessUpgradeNotice({
           try {
             onRegistryChange(await dismissAccessUpgradeNotice());
           } catch (error) {
-            toastError("Could not dismiss upgrade notice", error);
+            toastError("Could not dismiss upgrade notice", {
+              description: String(error),
+            });
           } finally {
             setBusy(false);
           }

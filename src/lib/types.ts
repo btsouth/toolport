@@ -490,7 +490,7 @@ export interface Registry {
   defaultAccessProfileId?: string | null;
   defaultAccessContextId?: string | null;
   defaultAccessLegacyPolicy?: boolean;
-  accessUpgradeNoticePending?: boolean;
+  accessUpgradeNoticeDismissed?: boolean;
   /** Folder -> profile auto-routing mappings. Absent/empty = no folder routing. */
   folderProfiles?: FolderProfile[];
   /** Per-tool exposure overrides (rename / re-describe), keyed by server id then original tool name. */

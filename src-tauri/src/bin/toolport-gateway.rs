@@ -19678,7 +19678,7 @@ mod tests {
         let connect_calls = Arc::clone(&calls);
         router.add_supervised(
             "s".into(),
-            vec![json!({"name":"work"})],
+            vec![json!({"name":"work", "description":"fixture", "inputSchema":{"type":"object"}, "annotations":{"destructiveHint":false}})],
             Arc::new(move || {
                 Ok(DownstreamServer::connect(
                     "s".into(),
@@ -19735,6 +19735,7 @@ mod tests {
             snapshot.activate_supervisors();
             let result = worker.join().unwrap();
             assert_eq!(result["isError"], true, "{result}");
+            assert!(result.to_string().contains(STALE_LIVE_VIEW), "{result}");
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 0,

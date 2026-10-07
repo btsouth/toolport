@@ -83,7 +83,7 @@ pub(super) fn migrate_v2_to_v3(value: &mut Value, _: &MigrationContext) -> Resul
         Value::String(active.clone()),
     );
     document.insert("defaultAccessLegacyPolicy".into(), Value::Bool(true));
-    document.insert("accessUpgradeNoticePending".into(), Value::Bool(true));
+    document.insert("accessUpgradeNoticeDismissed".into(), Value::Bool(false));
     if active_set != union || active_missing {
         document.insert("defaultAccessProfileId".into(), Value::String(active));
     } else {
@@ -177,6 +177,8 @@ mod tests {
         std::fs::write(&path, fixture(false).to_string()).unwrap();
         let mut reg = load_from(&path).unwrap();
         assert!(reg.access_upgrade_notice_pending());
+        reg.unknown_fields.remove("accessUpgradeNoticeDismissed");
+        assert!(reg.access_upgrade_notice_pending(), "existing v3 registries get the first-launch notice too");
         reg.dismiss_access_upgrade_notice();
         crate::registry::save_to(&path, &reg).unwrap();
         assert!(!load_from(&path).unwrap().access_upgrade_notice_pending());
