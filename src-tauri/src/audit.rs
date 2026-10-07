@@ -643,7 +643,7 @@ fn write_line_at(path: &Path, entry: &Value) {
 /// [`MAX_AUDIT_BYTES`].
 ///
 /// The locked append and the rotation live in [`crate::registry::append_lines_locked`],
-/// shared with the agent-hook sensor log so both files keep the same cross-process
+/// shared with the other append-only logs so they keep the same cross-process
 /// guarantees by construction rather than by two copies staying in step (#708,
 /// SBS-868, SBS-869). Normal writes queue on the background telemetry writer so the
 /// lock and any rotation stay off the call path ([`crate::telemetry`]).

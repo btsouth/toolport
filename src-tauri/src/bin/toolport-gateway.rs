@@ -19034,10 +19034,11 @@ enum ArgAction {
     /// An argument looked like a flag (`-`-prefixed) but isn't one of the
     /// flags this binary knows. Carries the offending argument for the error.
     Unknown(String),
-    /// Invoked as an agent lifecycle hook (`--toolport-hook <event>`). Record the
-    /// event and exit 0. Carries the event argument, which may be empty when the
-    /// flag was written without one - [`conduit_lib::hooks::handle_event`] treats
-    /// that as an unknown event rather than a reason to fail.
+    /// Invoked as an agent lifecycle hook (`--toolport-hook <event>`). 2.0 removed
+    /// the sensor: this stays a silent no-op that exits 0, so hook entries an
+    /// earlier release installed do not error or block the client. Carries the event
+    /// argument, which may be empty when the flag was written without one; either
+    /// way it is ignored.
     Hook(String),
     /// Invoked as an agent's blocking guard hook (`--toolport-guard <agent>`). The guard
     /// was removed in 2.0; the flag stays so a stale client hook still exits 0 with an
@@ -19064,7 +19065,7 @@ fn parse_args(args: &[String]) -> ArgAction {
         return ArgAction::Version;
     }
     // Checked before the unknown-flag scan, and never added to KNOWN_FLAGS: falling
-    // through to `Run` would start a whole gateway for what must be a record-and-exit.
+    // through to `Run` would start a whole gateway for a flag that must exit at once.
     if let Some(index) = args
         .iter()
         .position(|a| a == conduit_lib::hooks::HOOK_MARKER)
@@ -19133,8 +19134,8 @@ fn usage() -> String {
          \x20   --private-gateway    One adapter's own gateway while the host daemon is\n\
          \x20                        unresponsive (internal)\n\
          \x20   --selftest-secrets    Diagnostic: read every vaulted secret and report\n\
-         \x20   --toolport-hook EVENT Record one agent lifecycle event and exit (installed\n\
-         \x20                         into an agent's settings by Toolport; always exits 0)\n\
+         \x20   --toolport-hook EVENT Deprecated no-op accepted so hook entries an\n\
+         \x20                         earlier version installed do not error; exits 0\n\
          \x20   --toolport-guard AGENT Retired no-op kept for client hooks Toolport\n\
          \x20                         installed in 1.x; always allows and exits 0\n\
          \x20   -h, --help            Print this message and exit\n\
@@ -19209,21 +19210,17 @@ fn main() {
             );
             std::process::exit(1);
         }
-        ArgAction::Hook(event) => {
+        ArgAction::Hook(_event) => {
             // Deliberately the first thing main can do: no registry load, no keychain,
-            // no socket, no gateway startup. This path runs once per observed tool
-            // call, so it has to stay a parse-and-append.
+            // no socket, no gateway startup. 2.0 removed the agent activity sensor, but
+            // hook entries an earlier release installed still invoke this flag, so it
+            // stays a silent no-op.
             //
-            // Exit 0 on EVERY path, including a payload that does not parse or is too
-            // large to keep. A hook's exit status is a signal to the harness, and on
-            // some events a non-zero one stops the user's work; a sensor that can do
-            // that is not a sensor. Nothing is written to stdout for the same reason.
-            //
-            // The read is capped: a PostToolUse payload embeds the tool's whole
-            // response, which `handle_event` discards but would otherwise have to
-            // allocate and parse first.
-            let (payload, _truncated) = conduit_lib::hooks::read_payload(std::io::stdin());
-            conduit_lib::hooks::handle_event(&event, &payload);
+            // Exit 0 on EVERY path and print nothing to stdout. A hook's exit status is
+            // a signal to the harness, and on some events a non-zero one stops the
+            // user's work. The payload is drained so the client's write cannot fail or
+            // block.
+            conduit_lib::hooks::noop_hook(std::io::stdin());
             std::process::exit(0);
         }
         ArgAction::Guard(_agent) => {

@@ -6,9 +6,6 @@ import type {
   CatalogEntry,
   DetectedClient,
   FolderProfile,
-  HookEvent,
-  HooksPreview,
-  HooksView as HooksViewData,
   ImportItem,
   InspectEntry,
   InstructionsStatusView,
@@ -990,36 +987,6 @@ export function enableAutostart(): Promise<void> {
 
 export function disableAutostart(): Promise<void> {
   return invoke<void>("disable_launch_at_login");
-}
-
-// ---- Native-agent hook sensor (SBS-822) ----
-//
-// Records what an agent does OUTSIDE the gateway (Bash, Edit, Read). Off until the user turns it
-// on. Every mutating call returns the refreshed view, so the tab never re-fetches to stay honest.
-
-/** Current state: the opt-in, the events registered, and every Claude Code profile found. */
-export function hooksView(): Promise<HooksViewData> {
-  return invoke<HooksViewData>("hooks_view");
-}
-
-/** Turn the sensor on or off. Turning it off removes it from every profile Toolport wrote. */
-export function hooksSetEnabled(enabled: boolean): Promise<HooksViewData> {
-  return invoke<HooksViewData>("hooks_set_enabled", { enabled });
-}
-
-/**
- * Dry-run the write for every profile: the exact before/after bytes, writing nothing anywhere.
- *
- * The `after` text comes from the same renderer the real write uses, so comments and formatting
- * shown here are what actually survives.
- */
-export function hooksPreview(): Promise<HooksPreview[]> {
-  return invoke<HooksPreview[]>("hooks_preview");
-}
-
-/** The most recent sensor rows, newest first. */
-export function hooksRecent(limit: number): Promise<HookEvent[]> {
-  return invoke<HookEvent[]>("hooks_recent", { limit });
 }
 
 /** Explicitly use an identical managed definition in the active profile. */
