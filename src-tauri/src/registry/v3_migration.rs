@@ -97,10 +97,13 @@ mod tests {
             {"id":"off","name":"Off","transport":"http","url":"https://example.com/off"}],
             "profiles":[{"id":"default","name":"Default","enabledServerIds":["github"],"toolScope":{"github":["read"]},"instructions":"Keep this"}],
             "activeProfileId":"default","clientScopes":{"unscoped":"","scoped":"default"},
-            "folderProfiles":[{"path":"/work","profile":"default"}],"future":{"keep":true}});
+            "folderProfiles":[{"path":"/work","profile":"default"}],
+            "httpClients":[{"id":"http-default","label":"Default HTTP","tokenSha256":"fixture-hash","profile":""}],
+            "future":{"keep":true}});
         if multiple {
             value["profiles"].as_array_mut().unwrap().push(json!({"id":"work","name":"Work","enabledServerIds":["files"],"toolScope":{"files":["list"]}}));
             value["clientScopes"]["worker"] = json!("work");
+            value["httpClients"].as_array_mut().unwrap().push(json!({"id":"http-work","label":"Work HTTP","tokenSha256":"work-hash","profile":"work"}));
             value["folderProfiles"]
                 .as_array_mut()
                 .unwrap()
@@ -151,7 +154,32 @@ mod tests {
                     "{multiple} {reference}"
                 );
             }
-            for field in ["profiles", "clientScopes", "folderProfiles", "future"] {
+            let bridge_ids = |reg: &Registry| {
+                reg.bridge_enabled_servers(None)
+                    .iter()
+                    .map(|server| server.id.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bridge_ids(&before), bridge_ids(&after), "legacy HTTP union");
+            for client in &before.http_clients {
+                if !client.profile.is_empty() {
+                    assert_eq!(
+                        view(&before, &client.profile),
+                        view(&after, &client.profile)
+                    );
+                }
+            }
+            assert_eq!(
+                before.configured_instructions(None),
+                after.configured_instructions(None)
+            );
+            for field in [
+                "profiles",
+                "clientScopes",
+                "folderProfiles",
+                "httpClients",
+                "future",
+            ] {
                 assert_eq!(original[field], migrated[field]);
             }
             assert_eq!(migrated["servers"][0]["future"], "keep");

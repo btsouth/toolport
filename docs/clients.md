@@ -129,3 +129,7 @@ it pins that profile as the default. Existing client bindings, folder mappings,
 tool scopes and integrity stores keep their stable profile IDs. When the server
 sets match, the old default tool policy is retained until you explicitly choose
 All enabled servers in Settings. The default integrity store remains the same.
+
+Shared HTTP tokens keep their existing full connected set when no access set is
+selected. Named access sets narrow their servers; tool restrictions apply to
+stdio clients. This preserves HTTP access during the upgrade.

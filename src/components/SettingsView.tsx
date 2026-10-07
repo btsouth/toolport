@@ -1045,7 +1045,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                 Access sets
               </h2>
               <p className="text-xs text-muted-foreground">
-                Access sets narrow the enabled servers and tools a client can use. Servers
+                Access sets narrow enabled servers and, for stdio clients, tools. Servers
                 that are off stay hidden from every client.
               </p>
               <p className="text-sm">Default access</p>
@@ -1394,7 +1394,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                                 (p) => p.id === c.profile || p.name === c.profile,
                               )?.name ||
                               c.profile ||
-                              "Default access"}
+                              "Full connected set"}
                         </span>
                         <button
                           type="button"
@@ -1463,7 +1463,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="__default__">Default access</SelectItem>
+                        <SelectItem value="__default__">Full connected set</SelectItem>
                         <SelectItem value="@all-enabled">All enabled servers</SelectItem>
                         {profiles.map((p) => (
                           <SelectItem key={p.id} value={p.id}>

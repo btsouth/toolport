@@ -1278,7 +1278,7 @@ impl SettingsPage {
                 .css_classes(["toolport-input"])
                 .build();
             form.append(&label);
-            let mut profile_names = vec!["Default access", "All enabled servers"];
+            let mut profile_names = vec!["Full connected set", "All enabled servers"];
             profile_names.extend(settings.profiles.iter().map(|(_, name)| name.as_str()));
             let profile = gtk::DropDown::new(
                 Some(gtk::StringList::new(&profile_names)),
