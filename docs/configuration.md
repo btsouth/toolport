@@ -1,8 +1,8 @@
 # Configuration
 
-Lazy discovery, the destructive-tool block, and agent control are global settings,
-stored in the registry and toggled in the app's Settings view, so they apply to every
-client (lazy discovery is on by default). Per-client behavior is set via env vars on the
+Lazy discovery and the destructive-tool block are global settings, stored in the
+registry and toggled in the app's Settings view, so they apply to every client
+(lazy discovery is on by default). Per-client behavior is set via env vars on the
 gateway entry, written for you when you connect a client:
 
 - `TOOLPORT_CLIENT_ID=<id>` - identifies this client for live profile resolution

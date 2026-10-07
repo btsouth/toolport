@@ -1142,7 +1142,7 @@ pub struct Router {
     /// downstream tool, so a rename never changes where a call goes.
     overrides: HashMap<String, HashMap<String, ToolOverride>>,
     /// Exposed name -> why it's hidden, for a clear message if a hidden tool is
-    /// still called by name (e.g. via conduit_call_tool).
+    /// still called by name (e.g. via toolport_call_tool).
     blocked: HashMap<String, String>,
     /// Aggregated resources, passed through as-is (uris are server-scoped).
     resources: Vec<Value>,

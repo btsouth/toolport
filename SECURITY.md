@@ -105,9 +105,6 @@ controls actively gate or block a call before it reaches an upstream server.
 - **Destructive-tool policy.** With the destructive-tool deny policy on, tools
   judged destructive (by their `destructiveHint`, or a write-verb name heuristic)
   are hidden from the catalog and blocked before a client can call them.
-- **Confirm-before-destructive.** A softer mode intercepts the first call to a
-  destructive tool, returns a preview, and only routes it after an explicit
-  `toolport_confirm`.
 - **Quarantine on drift.** When an already-approved tool changes in a high-risk
   way (poisoned description, or a destructive/annotation downgrade), it is
   quarantined and blocked until you re-approve it.

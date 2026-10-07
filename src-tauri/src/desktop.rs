@@ -1155,10 +1155,9 @@ fn set_deny_destructive(state: State<RegistryState>, deny: bool) -> Result<Regis
     Ok(reg)
 }
 
-/// Toggle per-call confirmation for destructive tools. When enabled, the gateway
-/// intercepts each destructive tool call, returns a preview with a token, and
-/// requires `conduit_confirm { token }` to proceed. Mutually exclusive with
-/// `deny_destructive` (confirm turns deny off).
+/// Legacy setter for the removed agent-token confirmation mode. Retained so an
+/// existing client call still round-trips; the v2 migration maps the stored value
+/// to the Ask safety level.
 #[tauri::command]
 fn set_confirm_destructive(state: State<RegistryState>, confirm: bool) -> Result<Registry, String> {
     let (reg, _) = write_registry(state.inner(), |reg| {
@@ -1170,7 +1169,7 @@ fn set_confirm_destructive(state: State<RegistryState>, confirm: bool) -> Result
 
 /// Toggle human-in-the-loop approval. When on, a gated tool call (destructive, or from an
 /// untrusted-provenance server) is HELD until a person approves or denies it in the app,
-/// via the approval broker. Distinct from confirm-destructive (which the agent re-confirms).
+/// via the approval broker.
 #[tauri::command]
 fn set_human_approval(state: State<RegistryState>, on: bool) -> Result<Registry, String> {
     let (reg, _) = write_registry(state.inner(), |reg| {
@@ -1580,18 +1579,6 @@ fn set_lazy_discovery(state: State<RegistryState>, lazy: bool) -> Result<Registr
 fn set_code_mode(state: State<RegistryState>, enabled: bool) -> Result<Registry, String> {
     let (reg, _) = write_registry(state.inner(), |reg| {
         reg.code_mode = enabled;
-        Ok(())
-    })?;
-    Ok(reg)
-}
-
-/// Opt into agent control: lets an agent enable or disable servers through the
-/// gateway's `conduit_enable_server` / `conduit_disable_server` tools. Off by
-/// default; the destructive-tool safety switch stays user-only regardless of this.
-#[tauri::command]
-fn set_allow_agent_control(state: State<RegistryState>, allow: bool) -> Result<Registry, String> {
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        reg.allow_agent_control = allow;
         Ok(())
     })?;
     Ok(reg)
@@ -3925,7 +3912,6 @@ pub fn run() {
             release_all_quarantine,
             set_lazy_discovery,
             set_code_mode,
-            set_allow_agent_control,
             set_client_discovery,
             team_connect,
             team_join_poll,

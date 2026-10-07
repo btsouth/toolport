@@ -17,8 +17,6 @@ extension retain the same behavior.
   "version": "1.0.0",
   "discoveryMode": "lazy",
   "codeMode": true,
-  "agentControl": false,
-  "destructiveConfirmation": false,
   "humanApproval": true
 }
 ```
@@ -26,14 +24,10 @@ extension retain the same behavior.
 - `version` is the independent version of this extension settings schema.
 - `discoveryMode` is `lazy`, `grouped`, or `full` for the requesting client.
 - `codeMode` reports whether `toolport_run_script` is available.
-- `agentControl` reports whether the server enable/disable tools are available.
-- `destructiveConfirmation` reports whether destructive calls use the
-  agent-facing `toolport_confirm` flow. It is `false` when human approval
-  supersedes that flow.
 - `humanApproval` reports whether the effective human approval gate is active,
   including a Teams-enforced gate.
 
-Servers implementing this extension MUST return all six fields. Clients MUST NOT
+Servers implementing this extension MUST return all four fields. Clients MUST NOT
 treat any `true` value as permission to bypass Toolport policy; the ordinary tool
 call remains the enforcement point. Clients SHOULD treat an unknown `version` as
 unsupported and continue through core MCP discovery and tool calls.

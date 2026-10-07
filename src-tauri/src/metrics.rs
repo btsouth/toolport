@@ -109,7 +109,7 @@ fn render_with_savings(
     }
 
     out.push_str(
-        "# HELP toolport_held_calls_total Destructive calls held for confirmation (retained log)\n",
+        "# HELP toolport_held_calls_total Destructive calls held for approval (retained log)\n",
     );
     out.push_str("# TYPE toolport_held_calls_total counter\n");
     for ((server, tool, client), n) in &held {
@@ -291,7 +291,7 @@ mod tests {
         ));
         assert!(!text.contains(r#"tool="advisor.hint_shown""#));
         assert!(!text.contains(r#"ok="true"} 2"#));
-        // HITL deny is not a confirm-destructive hold.
+        // HITL deny is not a held call.
         assert!(!text.contains("toolport_held_calls_total{"));
         assert!(text.contains(
             r#"toolport_tool_call_duration_milliseconds_count{server="s1",tool="echo"} 1"#
