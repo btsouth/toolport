@@ -1008,6 +1008,15 @@ fn apply_remove_http_client(registry: &mut Registry, id: &str) -> Result<(), Str
     Ok(())
 }
 
+/// Acknowledge the upgrade offer without changing any safety setting.
+pub fn dismiss_destructive_confirmation_notice() -> Result<Registry, String> {
+    registry::update(|registry| {
+        registry.destructive_confirmation_notice_seen = true;
+        Ok(())
+    })
+    .map(|(registry, ())| registry)
+}
+
 pub fn set_essential_setting(
     setting: EssentialSetting,
     enabled: bool,

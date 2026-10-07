@@ -1012,6 +1012,12 @@ pub struct Registry {
     /// of every call first.
     #[serde(default)]
     pub confirm_destructive: bool,
+    /// Upgrade notice acknowledgement, shared by both desktop shells. Older registries
+    /// deserialize to false; new installs start acknowledged. The confirmation bool is
+    /// always serialized, so existing false values cannot be distinguished from a user's
+    /// choice and must remain unchanged (including registries predating that field).
+    #[serde(default)]
+    pub destructive_confirmation_notice_seen: bool,
     /// Human-in-the-loop approval: when true, a *gated* tool call (destructive-hinted, or
     /// from an untrusted-provenance server) is held and surfaced to the Toolport app for a
     /// person to approve or deny before it runs. Unlike `confirm_destructive` (which the
@@ -1503,7 +1509,8 @@ impl Default for Registry {
             active_profile_id: Some(DEFAULT_PROFILE_ID.to_string()),
             gateway_topology: None,
             deny_destructive: false,
-            confirm_destructive: false,
+            confirm_destructive: true,
+            destructive_confirmation_notice_seen: true,
             human_approval: false,
             human_approval_allow: Vec::new(),
             team_forced_human_approval: false,
@@ -2209,6 +2216,7 @@ impl Registry {
     /// tools entirely, confirm intercepts them with a preview).
     pub fn set_confirm_destructive(&mut self, confirm: bool) {
         self.confirm_destructive = confirm;
+        self.destructive_confirmation_notice_seen = true;
         if confirm {
             self.deny_destructive = false;
         }
@@ -7051,5 +7059,80 @@ mod tests {
         assert_eq!(content, "{\"i\":7}\n{\"i\":8}\n{\"i\":9}\n");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod destructive_confirmation_migration_tests {
+    use super::*;
+
+    #[test]
+    fn destructive_confirmation_default_is_on_without_an_upgrade_notice() {
+        let registry = Registry::default();
+        assert!(registry.confirm_destructive);
+        assert!(!registry.deny_destructive);
+        assert!(!registry.human_approval);
+        assert!(registry.destructive_confirmation_notice_seen);
+    }
+
+    #[test]
+    fn destructive_confirmation_migration_preserves_existing_choices_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-confirm-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+        for confirm in [Some(false), Some(true), None] {
+            let mut legacy = serde_json::to_value(Registry::default()).unwrap();
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("destructiveConfirmationNoticeSeen");
+            if let Some(confirm) = confirm {
+                legacy["confirmDestructive"] = serde_json::json!(confirm);
+            } else {
+                legacy.as_object_mut().unwrap().remove("confirmDestructive");
+            }
+            // Explicit blocking and team locks must survive as well.
+            legacy["denyDestructive"] = serde_json::json!(true);
+            legacy["teamForcedHumanApproval"] = serde_json::json!(true);
+            std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+            let mut loaded = load_from(&path).unwrap();
+            assert_eq!(loaded.confirm_destructive, confirm.unwrap_or(false));
+            assert!(!loaded.destructive_confirmation_notice_seen);
+            assert!(loaded.deny_destructive);
+            assert!(loaded.team_forced_human_approval);
+            // Saving another setting does not consume the offer.
+            save_to(&path, &loaded).unwrap();
+            assert!(
+                !load_from(&path)
+                    .unwrap()
+                    .destructive_confirmation_notice_seen
+            );
+            loaded.destructive_confirmation_notice_seen = true;
+            save_to(&path, &loaded).unwrap();
+            let reloaded = load_from(&path).unwrap();
+            assert!(reloaded.destructive_confirmation_notice_seen);
+            assert_eq!(reloaded.confirm_destructive, confirm.unwrap_or(false));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn destructive_confirmation_migration_respects_a_new_user_choice() {
+        let mut registry = Registry::default();
+        registry.destructive_confirmation_notice_seen = false;
+        registry.set_confirm_destructive(false);
+        assert!(!registry.confirm_destructive);
+        assert!(registry.destructive_confirmation_notice_seen);
+        let reloaded: Registry =
+            serde_json::from_value(serde_json::to_value(&registry).unwrap()).unwrap();
+        assert!(!reloaded.confirm_destructive);
+        assert!(reloaded.destructive_confirmation_notice_seen);
     }
 }

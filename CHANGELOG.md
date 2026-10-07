@@ -6,6 +6,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Changed
+
+- New installs require the agent to confirm each tool call marked destructive
+  before it runs. Existing settings stay as they were, with a one-time offer in
+  the app to turn confirmation on in Settings. Human approval remains a separate
+  setting. Headless clients receive the confirmation preview immediately; scripts
+  that cannot confirm receive a clear error without running the tool.
+
 ## [1.24.0] - 2026-10-06
 
 ### Added

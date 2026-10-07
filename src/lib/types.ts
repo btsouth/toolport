@@ -528,6 +528,7 @@ export interface Registry {
   denyDestructive?: boolean;
   /** Per-call confirmation: intercept destructive tools with a preview + token. */
   confirmDestructive?: boolean;
+  destructiveConfirmationNoticeSeen?: boolean;
   /** Human-in-the-loop: hold a gated tool call until a person approves it in the app. */
   humanApproval?: boolean;
   /** Live request/response inspection: capture each tool call's args + result into a

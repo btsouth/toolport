@@ -14,6 +14,7 @@ import {
   listServerTools,
   setAllowRoutineWrites,
   setCodeMode,
+  setConfirmDestructive,
   stopStaleGateways,
 } from "@/lib/api";
 import type { Registry, RoutineSuggestion } from "@/lib/types";
@@ -33,6 +34,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     disableAutostart: vi.fn().mockResolvedValue(undefined),
     setAllowRoutineWrites: vi.fn(),
     setCodeMode: vi.fn(),
+    setConfirmDestructive: vi.fn(),
     listRoutineSuggestions: vi.fn().mockResolvedValue([]),
     approveRoutineSuggestion: vi.fn(),
     dismissRoutineSuggestion: vi.fn(),
@@ -648,5 +650,35 @@ describe("SettingsView restart check", () => {
     expect(
       screen.getByText(/1 app is still launching an old gateway/i),
     ).toBeInTheDocument();
+  });
+});
+
+describe("SettingsView destructive confirmation", () => {
+  it("shows the new default and preserves an explicit opt-out", async () => {
+    const fresh = {
+      ...registry,
+      confirmDestructive: true,
+      destructiveConfirmationNoticeSeen: true,
+    };
+    const optedOut = { ...fresh, confirmDestructive: false };
+    vi.mocked(setConfirmDestructive).mockResolvedValueOnce(optedOut);
+    const onRegistryChange = vi.fn();
+    render(
+      <ThemeProvider>
+        <SettingsView registry={fresh} onRegistryChange={onRegistryChange} />
+      </ThemeProvider>,
+    );
+    const control = screen.getByRole("switch", { name: /confirm destructive tools/i });
+    expect(control).toBeChecked();
+    await userEvent.click(control);
+    expect(setConfirmDestructive).toHaveBeenCalledWith(false);
+    await waitFor(() => expect(onRegistryChange).toHaveBeenCalledWith(optedOut));
+  });
+
+  it("keeps an older registry's absent confirmation setting off", () => {
+    renderSettings();
+    expect(
+      screen.getByRole("switch", { name: /confirm destructive tools/i }),
+    ).not.toBeChecked();
   });
 });

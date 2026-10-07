@@ -1178,3 +1178,8 @@ export function hooksRecent(limit: number): Promise<HookEvent[]> {
 export function teamUseManaged(serverId: string): Promise<Registry> {
   return invoke<Registry>("team_use_managed", { serverId });
 }
+
+/** Acknowledge the upgrade notice without changing safety settings. */
+export function dismissDestructiveConfirmationNotice(): Promise<Registry> {
+  return invoke<Registry>("dismiss_destructive_confirmation_notice");
+}
