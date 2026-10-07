@@ -18955,15 +18955,17 @@ mod tests {
         // Label mode does not set isError on a success that was only labeled.
         assert!(out.get("isError").is_none() || out["isError"] == false);
 
-        // Block on with contentDefense off must still scan and block (otherwise an org
-        // forceBlockOnInjection alone would be a no-op).
-        let mut reg = Registry {
-            safety_level: None,
-            ..Registry::default()
-        };
+        // A team injection flag at member Off must withhold results without raising the level.
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Off);
         reg.content_defense = false;
-        reg.team_forced_content_defense = false;
-        reg.block_on_injection = true;
+        conduit_lib::teams::apply_team_config(
+            &mut reg,
+            "t1",
+            &json!({"servers": [], "screeningPolicy": {"forceBlockOnInjection": true}}),
+        );
+        assert_eq!(reg.safety_level_effective(), registry::SafetyLevel::Off);
+        assert!(!reg.deny_destructive_effective());
         assert!(reg.content_defense_effective());
         assert!(reg.block_on_injection_effective());
         let result = json!({
