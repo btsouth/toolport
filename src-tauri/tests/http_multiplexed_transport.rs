@@ -510,6 +510,7 @@ fn failed_forced_refresh_probe(concurrent: bool) {
             request.respond(response).unwrap();
         }
     });
+    const BUSY: &str = "OAuth refresh is busy or its cross-process lock is unavailable; try again.";
     let attempts = Arc::new(AtomicUsize::new(0));
     let forced = Arc::clone(&attempts);
     let refresh: RefreshFn = Box::new(move |force| {
@@ -517,7 +518,7 @@ fn failed_forced_refresh_probe(concurrent: bool) {
             return Ok(None);
         }
         if forced.fetch_add(1, Ordering::SeqCst) == 0 {
-            Err("temporary lock timeout".into())
+            Err(BUSY.into())
         } else {
             Ok(Some("fresh".into()))
         }
@@ -531,10 +532,9 @@ fn failed_forced_refresh_probe(concurrent: bool) {
             transport.request("echo", json!({}))
         }
     };
-    assert!(call()
-        .unwrap_err()
-        .to_string()
-        .contains("temporary lock timeout"));
+    let first = call().unwrap_err().to_string();
+    assert_eq!(first, BUSY);
+    assert!(!conduit_lib::remote::is_auth_error(&first));
     let second = call();
     wire.join().unwrap();
     assert_eq!(
