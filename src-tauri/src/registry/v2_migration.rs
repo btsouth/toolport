@@ -734,7 +734,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
-        for active in ["default", "work", " Work ", "deleted"] {
+        for active in ["default", "work", " Work ", "deleted", ""] {
             let dir = scratch_dir("brandon-v3");
             let _override = DataDirOverride::set(&dir);
             let client_files = seed_user_files(&dir);
@@ -745,6 +745,9 @@ mod tests {
             let path = dir.join("registry.json");
             let mut v1 = brandon_v1(&dir);
             v1["activeProfileId"] = json!(active);
+            if active.is_empty() {
+                v1["profiles"][1]["name"] = json!("");
+            }
             v1["teamMinSafetyLevel"] = json!("strict");
             v1["team"]["minSafetyLevel"] = json!("strict");
             v1["profiles"][0]["futureProfileField"] = json!({"keep": true});

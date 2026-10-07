@@ -30,13 +30,16 @@ pub(super) fn migrate_v2_to_v3(value: &mut Value, _: &MigrationContext) -> Resul
     });
     let first_name = by_name.next();
     let named = by_name.next().is_none().then_some(first_name).flatten();
-    let active = by_id
-        .or(named)
-        .or_else(|| profiles.first())
-        .and_then(|p| p.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or("default")
-        .to_string();
+    let active = if active_ref.is_empty() {
+        None
+    } else {
+        by_id.or(named)
+    }
+    .or_else(|| profiles.first())
+    .and_then(|p| p.get("id"))
+    .and_then(Value::as_str)
+    .unwrap_or("default")
+    .to_string();
     if profiles.iter().any(|p| {
         p.get("id")
             .and_then(Value::as_str)
