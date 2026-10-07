@@ -177,5 +177,5 @@ And the summary line: tools exposed (flat vs lazy), total-token delta as a perce
 - Token counts depend on your runtime reporting `usage` (LM Studio and Ollama do).
 - Tasks must match servers you actually have connected; the defaults assume Resend / Neon / Vercel.
 - This measures the agent loop, not just the static tool-definition size. The static
-  size (a fixed set of meta-tools, about 2,200 tokens with Code Mode on, against the whole
-  catalog) is the upper bound; the loop shows what you actually pay.
+  size (a fixed set of meta-tools, about 500 tokens with Code Mode off and about 870 with
+  it on, against the whole catalog) is the upper bound; the loop shows what you actually pay.
