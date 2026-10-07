@@ -2161,6 +2161,8 @@ pub trait Transport: Send {
     /// Handle server→client JSON-RPC (roots/list, sampling, …) by forwarding to the
     /// upstream MCP client. Default no-op: unsupported server requests are ignored.
     fn set_server_request_handler(&mut self, _handler: ServerRequestHandler) {}
+    /// Credential owner for transports that recover from a shared vault.
+    fn set_server_id(&mut self, _id: &str) {}
     /// A request path that can run alongside other requests on this connection,
     /// carrying the current protocol metadata and read timeout. `None` (the
     /// default) keeps every request on the serialized `&mut self` path.
@@ -5356,7 +5358,7 @@ pub struct HttpTransport {
     /// raw token or the authentication failure is surfaced.
     refresh: Option<Arc<RefreshFn>>,
     /// Read only after a bearer rejection, to adopt another process's credential.
-    stored_auth: Option<Arc<StoredAuthFn>>,
+    auth_owner: Option<String>,
     /// Separate from token refresh: `insufficient_scope` requires interactive
     /// consent and a new authorization, not another token from the old grant.
     scope_reauthorize: Option<Arc<ScopeReauthorizeFn>>,
@@ -5420,8 +5422,6 @@ pub struct HttpTransport {
     /// ready, followers fail fast and no second worker can be started.
     draining: Option<Receiver<HttpAttemptOutcome>>,
 }
-
-type StoredAuthFn = dyn Fn() -> Result<Option<String>, String> + Send + Sync;
 
 struct HttpRefreshFailure {
     recorded_at: Instant,
@@ -5843,13 +5843,6 @@ struct PendingHttpMrtr {
 }
 
 impl HttpTransport {
-    pub(crate) fn set_stored_auth_reader(
-        &mut self,
-        reader: impl Fn() -> Result<Option<String>, String> + Send + Sync + 'static,
-    ) {
-        self.stored_auth = Some(Arc::new(reader));
-    }
-
     pub fn new(url: &str) -> Self {
         Self::with_auth(url, None)
     }
@@ -5910,7 +5903,7 @@ impl HttpTransport {
             next_id: Arc::new(AtomicI64::new(1)),
             auth: Arc::new(Mutex::new(auth)),
             refresh: refresh.map(Arc::new),
-            stored_auth: None,
+            auth_owner: None,
             scope_reauthorize: None,
             scope_upgrade_attempts: Arc::new(Mutex::new(HashSet::new())),
             forced_refresh_token: Arc::new(Mutex::new(None)),
@@ -6022,7 +6015,7 @@ impl HttpTransport {
             next_id: Arc::clone(&self.next_id),
             auth: Arc::clone(&self.auth),
             refresh: self.refresh.clone(),
-            stored_auth: self.stored_auth.clone(),
+            auth_owner: self.auth_owner.clone(),
             scope_reauthorize: self.scope_reauthorize.clone(),
             scope_upgrade_attempts: Arc::clone(&self.scope_upgrade_attempts),
             forced_refresh_token: Arc::clone(&self.forced_refresh_token),
@@ -6231,30 +6224,86 @@ impl HttpTransport {
         self.server_handler.as_ref().and_then(|handler| handler(v))
     }
 
-    /// Try to replace a token nearing expiry. Contention keeps the current token
-    /// through the safety window; a forced refresh after 401 still reports it.
-    /// Persistence failures reach the caller without an unlocked exchange.
+    /// Proactive work skips a busy auth gate. Lock and persistence failures must
+    /// reach the caller without a second exchange; other failures may keep using
+    /// the current token throughout its safety window.
     fn refresh_before_send(&mut self) -> Result<(), TransportError> {
         if let Some(refresh) = &self.refresh {
             let mut busy = match self.auth_gate.busy.try_lock() {
                 Ok(busy) => busy,
                 Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => return,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
             };
             if *busy {
-                return;
+                return Ok(());
             }
             *busy = true;
             drop(busy);
             let _gate = HttpAuthGuard(&self.auth_gate);
-            if let Ok(Some(token)) = refresh(false) {
-                *self
-                    .auth
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+            let current = self
+                .auth
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let failed = self
+                .refresh_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+            if failed && self.reuse_stored_auth(&current)? {
+                return Ok(());
+            }
+            match refresh(false) {
+                Ok(Some(token)) => {
+                    *self
+                        .auth
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+                    *self
+                        .refresh_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                }
+                Err(error) => {
+                    self.record_refresh_failure(current, error.clone());
+                    if crate::remote::is_refresh_storage_or_lock_error(&error) {
+                        return Err(TransportError::Fatal(error));
+                    }
+                }
+                Ok(None) => {}
             }
         }
         Ok(())
+    }
+
+    fn record_refresh_failure(&self, token: Option<String>, error: String) {
+        *self
+            .refresh_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HttpRefreshFailure {
+            recorded_at: Instant::now(),
+            token,
+            error,
+        });
+    }
+
+    fn reuse_stored_auth(&self, rejected: &Option<String>) -> Result<bool, TransportError> {
+        let Some(owner) = &self.auth_owner else {
+            return Ok(false);
+        };
+        let stored = crate::secrets::get_secret_result(owner, crate::secrets::HTTP_AUTH_KEY)
+            .map_err(|error| {
+                TransportError::Fatal(format!("could not read the vaulted auth token: {error}"))
+            })?;
+        if let Some(token) = stored.filter(|token| rejected.as_ref() != Some(token)) {
+            self.publish_refreshed_auth(token);
+            *self
+                .refresh_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// True when the token currently in hand is one a forced refresh already
@@ -6314,16 +6363,8 @@ impl HttpTransport {
                 return Err(TransportError::Fatal(failure.error.clone()));
             }
         }
-        if let Some(read) = &self.stored_auth {
-            let stored = read().map_err(|error| {
-                TransportError::Fatal(format!(
-                    "HTTP {code}: could not read the vaulted auth token: {error}"
-                ))
-            })?;
-            if stored.is_some() && stored != rejected {
-                self.publish_refreshed_auth(stored.unwrap());
-                return Ok(());
-            }
+        if self.reuse_stored_auth(&rejected)? {
+            return Ok(());
         }
         if self.forced_refresh_spent() {
             return Err(TransportError::Fatal(format!(
@@ -6338,16 +6379,10 @@ impl HttpTransport {
             Ok(None) => {
                 format!("HTTP {code} (needs authentication): token refresh returned no token")
             }
+            Err(e) if crate::remote::is_refresh_storage_or_lock_error(&e) => e,
             Err(e) => format!("HTTP {code} (needs authentication): token refresh failed: {e}"),
         };
-        *self
-            .refresh_failure
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HttpRefreshFailure {
-            recorded_at: Instant::now(),
-            token: rejected,
-            error: result.clone(),
-        });
+        self.record_refresh_failure(rejected, result.clone());
         Err(TransportError::Fatal(result))
     }
 
@@ -6480,7 +6515,7 @@ impl HttpTransport {
         // inline reply is still egress and must not slip past an open window.
         self.shared_backoff_gate()?;
         let payload = body.to_string();
-        self.refresh_before_send();
+        self.refresh_before_send()?;
         let mut refreshed = false;
         let wire_version = self.wire_protocol_version();
         let (resp, accepted_auth) = loop {
@@ -6939,6 +6974,10 @@ fn http_response_id_matches(response: &Value, request_id: Option<&Value>) -> boo
 }
 
 impl Transport for HttpTransport {
+    fn set_server_id(&mut self, id: &str) {
+        self.auth_owner = Some(id.to_string());
+    }
+
     fn connection_closed(&self) -> Option<bool> {
         Some(self.concurrency.closed.load(Ordering::SeqCst))
     }
@@ -7121,6 +7160,7 @@ impl Transport for HttpTransport {
         filter: SubscriptionFilter,
     ) -> Result<(), TransportError> {
         self.restore_drained()?;
+        self.refresh_before_send()?;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let mut params = filter.params();
         if let Some(protocol) = &self.protocol_meta {
@@ -7148,7 +7188,7 @@ impl Transport for HttpTransport {
             let mut retry_delay = Duration::from_millis(250);
             while live_generation.load(Ordering::SeqCst) == generation {
                 auth_shell.deadline = Some(Instant::now() + auth_shell.request_timeout);
-                auth_shell.refresh_before_send();
+                let proactive = auth_shell.refresh_before_send();
                 // Shared 429 backoff (#874): the listener is its own egress
                 // path, so never connect while another gateway process holds
                 // the provider's window open. Re-consult after each capped
@@ -7159,6 +7199,12 @@ impl Transport for HttpTransport {
                 }
                 let mut forced_refresh = false;
                 let response = loop {
+                    if let Err(error) = &proactive {
+                        downstream_trace(&format!(
+                            "HTTP subscription proactive refresh failed: {error}"
+                        ));
+                        break None;
+                    }
                     let mut request = agent
                         .post(&url)
                         .set("Content-Type", "application/json")
@@ -7432,6 +7478,7 @@ impl DownstreamServer {
     /// tools-only and fast and can't stall on a slow or hanging resources/prompts
     /// endpoint. The gateway calls `load_resources_prompts` to populate them.
     pub fn connect(id: String, mut transport: Box<dyn Transport>) -> Result<Self, String> {
+        transport.set_server_id(&id);
         // Fail the handshake fast so one unresponsive server can't stall the whole
         // batch probe / router rebuild for the full live-call timeout. The transport
         // picks the budget: download-then-run launchers (npx, uvx, ...) get a long
@@ -14492,6 +14539,138 @@ mod tests {
     }
 
     #[test]
+    fn rejected_http_token_adopts_the_vault_winner_without_refreshing() {
+        use crate::secrets;
+        use std::time::Duration;
+        secrets::tests::with_isolated_vault(|| {
+            for concurrent in [false, true] {
+                let server_id = "http-vault-winner";
+                secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, "stale").unwrap();
+                let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+                let url = format!("http://{}/", server.server_addr());
+                let mut transport = HttpTransport::with_auth_refresh(
+                    &url,
+                    Some("stale".into()),
+                    Some(Box::new(|force| {
+                        assert!(!force, "a saved winner must avoid another exchange");
+                        Ok(None)
+                    })),
+                );
+                transport.set_server_id(server_id);
+                // Another process has already rotated the shared vault. No local expiry
+                // or OAuth grant exists, so attempting an exchange here must fail.
+                secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, "winner").unwrap();
+                let wire = std::thread::spawn(move || {
+                    let mut auths = Vec::new();
+                    for _ in 0..2 {
+                        let Some(mut request) =
+                            server.recv_timeout(Duration::from_secs(3)).unwrap()
+                        else {
+                            break;
+                        };
+                        let auth = request
+                            .headers()
+                            .iter()
+                            .find(|h| h.field.equiv("Authorization"))
+                            .unwrap()
+                            .value
+                            .as_str()
+                            .to_string();
+                        let mut text = String::new();
+                        request.as_reader().read_to_string(&mut text).unwrap();
+                        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        let response = if auth == "Bearer winner" {
+                            tiny_http::Response::from_string(serde_json::json!({"jsonrpc":"2.0","id":body["id"],"result":{"ok":true}}).to_string())
+                        } else {
+                            tiny_http::Response::from_string("revoked").with_status_code(401)
+                        };
+                        auths.push(auth);
+                        request.respond(response).unwrap();
+                    }
+                    auths
+                });
+                let result = if concurrent {
+                    transport.concurrent().unwrap().request_with_cancel(
+                        "echo",
+                        serde_json::json!({}),
+                        None,
+                    )
+                } else {
+                    transport.request("echo", serde_json::json!({}))
+                };
+                let auths = wire.join().unwrap();
+                assert_eq!(result.unwrap(), serde_json::json!({"ok":true}));
+                assert_eq!(auths, ["Bearer stale", "Bearer winner"]);
+            }
+        });
+    }
+
+    #[test]
+    fn http_refresh_failure_rereads_the_vault_before_retrying_callbacks() {
+        use crate::secrets;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        secrets::tests::with_isolated_vault(|| {
+            for proactive in [false, true] {
+                const BUSY: &str =
+                    "OAuth refresh is busy or its cross-process lock is unavailable; try again.";
+                let owner = "refresh-vault-recovery";
+                secrets::set_secret(owner, secrets::HTTP_AUTH_KEY, "old").unwrap();
+                let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+                let url = format!("http://{}/", server.server_addr());
+                let wire = std::thread::spawn(move || {
+                    for _ in 0..if proactive { 1 } else { 2 } {
+                        let mut request = server
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap()
+                            .unwrap();
+                        let fresh = request.headers().iter().any(|h| {
+                            h.field.equiv("Authorization") && h.value.as_str() == "Bearer winner"
+                        });
+                        let mut text = String::new();
+                        request.as_reader().read_to_string(&mut text).unwrap();
+                        let body: Value = serde_json::from_str(&text).unwrap();
+                        let response = if fresh {
+                            tiny_http::Response::from_string(
+                                json!({"jsonrpc":"2.0","id":body["id"],"result":{"ok":true}})
+                                    .to_string(),
+                            )
+                        } else {
+                            tiny_http::Response::from_string("revoked").with_status_code(401)
+                        };
+                        request.respond(response).unwrap();
+                    }
+                });
+                let callbacks = Arc::new(AtomicUsize::new(0));
+                let attempts = Arc::clone(&callbacks);
+                let mut transport = HttpTransport::with_auth_refresh(
+                    &url,
+                    Some("old".into()),
+                    Some(Box::new(move |force| {
+                        if force || proactive {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            Err(BUSY.into())
+                        } else {
+                            Ok(None)
+                        }
+                    })),
+                );
+                transport.set_server_id(owner);
+                let error = transport.request("echo", json!({})).unwrap_err();
+                assert_eq!(error.to_string(), BUSY);
+                assert!(!crate::remote::is_auth_error(&error.to_string()));
+                secrets::set_secret(owner, secrets::HTTP_AUTH_KEY, "winner").unwrap();
+                assert_eq!(
+                    transport.request("echo", json!({})).unwrap(),
+                    json!({"ok":true})
+                );
+                wire.join().unwrap();
+                assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+            }
+        });
+    }
+
+    #[test]
     fn proactive_http_refresh_does_not_wait_for_a_busy_auth_gate() {
         let mut transport = super::HttpTransport::with_auth_refresh(
             "http://127.0.0.1:1/",
@@ -14502,7 +14681,7 @@ mod tests {
         );
         *transport.auth_gate.busy.lock().unwrap() = true;
         transport.deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(50));
-        transport.refresh_before_send();
+        transport.refresh_before_send().unwrap();
         assert!(
             std::time::Instant::now() < transport.deadline.unwrap(),
             "proactive refresh consumed the call deadline"

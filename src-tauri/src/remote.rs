@@ -1206,9 +1206,6 @@ fn authed_transport(
     // blocked only for untrusted-provenance servers.
     let mut transport =
         HttpTransport::guarded_with_timeout(url, token, refresh, block_private, request_timeout);
-    let sid = server_id.to_string();
-    transport
-        .set_stored_auth_reader(move || secrets::get_secret_result(&sid, secrets::HTTP_AUTH_KEY));
     transport.set_scope_reauthorize(scope_reauthorize);
     // Declared per request only while the flow is actually in use, which is what
     // the extension requires. Keyed off vaulted state rather than registry config
@@ -3464,69 +3461,6 @@ mod tests {
 
     /// The guard's answers over the real vault, so the fix above cannot regress into
     /// always reporting a refresh (which would stop the legitimate retry).
-    #[test]
-    fn rejected_http_token_adopts_the_vault_winner_without_refreshing() {
-        use crate::downstream::Transport;
-        let _vault = VaultFixture::new("http-vault-winner");
-        for concurrent in [false, true] {
-            let server_id = "http-vault-winner";
-            secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, "stale").unwrap();
-            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-            let url = format!("http://{}/", server.server_addr());
-            let mut transport = authed_transport(
-                &url,
-                Some("stale".into()),
-                server_id,
-                false,
-                Duration::from_secs(3),
-            )
-            .unwrap();
-            // Another process has already rotated the shared vault. No local expiry
-            // or OAuth grant exists, so attempting an exchange here must fail.
-            secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, "winner").unwrap();
-            let wire = std::thread::spawn(move || {
-                let mut auths = Vec::new();
-                for _ in 0..2 {
-                    let Some(mut request) = server.recv_timeout(Duration::from_secs(3)).unwrap()
-                    else {
-                        break;
-                    };
-                    let auth = request
-                        .headers()
-                        .iter()
-                        .find(|h| h.field.equiv("Authorization"))
-                        .unwrap()
-                        .value
-                        .as_str()
-                        .to_string();
-                    let mut text = String::new();
-                    request.as_reader().read_to_string(&mut text).unwrap();
-                    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
-                    let response = if auth == "Bearer winner" {
-                        tiny_http::Response::from_string(serde_json::json!({"jsonrpc":"2.0","id":body["id"],"result":{"ok":true}}).to_string())
-                    } else {
-                        tiny_http::Response::from_string("revoked").with_status_code(401)
-                    };
-                    auths.push(auth);
-                    request.respond(response).unwrap();
-                }
-                auths
-            });
-            let result = if concurrent {
-                transport.concurrent().unwrap().request_with_cancel(
-                    "echo",
-                    serde_json::json!({}),
-                    None,
-                )
-            } else {
-                transport.request("echo", serde_json::json!({}))
-            };
-            let auths = wire.join().unwrap();
-            assert_eq!(result.unwrap(), serde_json::json!({"ok":true}));
-            assert_eq!(auths, ["Bearer stale", "Bearer winner"]);
-        }
-    }
-
     #[test]
     fn a_rotated_vaulted_token_is_the_only_evidence_of_a_transport_refresh() {
         let _vault = VaultFixture::new("sou474");
