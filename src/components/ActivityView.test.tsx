@@ -3,6 +3,7 @@ import { render, screen, act, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ActivityView } from "./ActivityView";
 import type { AuditEntry, SearchTrace } from "@/lib/types";
+import type { SecurityEvent } from "@/lib/api";
 
 let windowVisible = true;
 vi.mock("@/lib/windowVisible", () => ({ useWindowVisible: () => windowVisible }));
@@ -549,6 +550,46 @@ describe("ActivityView tool identities", () => {
     );
     await act(async () => {});
     expect(screen.queryByText("Couldn't load tool identities.")).not.toBeInTheDocument();
+  });
+});
+
+describe("ActivityView security drift dismissals", () => {
+  function warnEvent(ts: number): SecurityEvent {
+    return {
+      ts,
+      type: "tool_drift",
+      server: "srv",
+      tool: "srv__read",
+      change: "changed",
+      severity: "warn",
+    };
+  }
+
+  it("maps warn drift to the loud lane and re-surfaces a later rewrite after dismissal", async () => {
+    localStorage.clear();
+    const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
+    getSecurityEvents.mockResolvedValue([warnEvent(1_700_000_000_000)]);
+
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+
+    // A warn definition-content drift is actionable: it rides the loud lane, not the
+    // quiet "New & changed tools" history.
+    expect(screen.getByText("Tool security notices")).toBeInTheDocument();
+    expect(screen.getByText("srv__read")).toBeInTheDocument();
+
+    // Review (dismiss) this rewrite.
+    await user.click(screen.getByRole("button", { name: "Dismiss this notice" }));
+    await act(async () => {});
+    expect(screen.queryByText("srv__read")).not.toBeInTheDocument();
+
+    // A later, different rewrite of the SAME tool must reappear: a warn dismissal is
+    // per instance, not per tool identity.
+    getSecurityEvents.mockResolvedValue([warnEvent(1_700_000_000_000 + 20 * 60 * 1000)]);
+    await act(async () => {
+      vi.advanceTimersByTime(3000);
+    });
+    expect(screen.getByText("srv__read")).toBeInTheDocument();
   });
 });
 

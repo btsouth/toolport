@@ -77,9 +77,11 @@ export interface SecurityEvent {
    * (e.g. an encoded payload) or on events written before evidence was captured. */
   evidence?: string;
   /** "high" = loud/actionable (poison, destructive-tool change, safety-annotation
-   * downgrade); "info" = benign non-destructive schema churn for the quiet history.
-   * Absent on events written before severity tiering; classified by type on read. */
-  severity?: "high" | "info";
+   * downgrade); "warn" = a read-only/definition-content change that the app shows on
+   * the actionable tier and quarantine-on-drift blocks; "info" = cosmetic churn for
+   * the quiet history. Absent on events written before severity tiering; classified
+   * by type on read. */
+  severity?: "high" | "warn" | "info";
 }
 
 /** Recent tool-definition integrity events (newest first). */

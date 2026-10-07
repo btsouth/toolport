@@ -10898,6 +10898,26 @@ fn cleanup_root_resource_subs_for_session(state: &GatewayState, session: &str) {
 /// catalog rather than publishing a stale unfiltered list.
 type IntegrityCheckFailure = (String, BTreeSet<String>);
 
+/// Test-only observer fired at the top of [`maybe_check_integrity`], before its store
+/// I/O. It lets a regression test look at the live router *during* the gate, so it can
+/// prove the drifted definition is never published in the first place. Registered and
+/// consumed on one thread, so a parallel test's gate cannot trigger it.
+#[cfg(test)]
+static INTEGRITY_GATE_OBSERVER: Mutex<Option<(std::thread::ThreadId, Box<dyn Fn() + Send + Sync>)>> =
+    Mutex::new(None);
+
+#[cfg(test)]
+fn observe_integrity_gate() {
+    let guard = INTEGRITY_GATE_OBSERVER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((thread, observer)) = guard.as_ref() {
+        if *thread == std::thread::current().id() {
+            observer();
+        }
+    }
+}
+
 fn maybe_check_integrity(
     registry: &Arc<Mutex<Registry>>,
     tools: &[Value],
@@ -10912,6 +10932,8 @@ fn maybe_check_integrity(
     if !enabled {
         return Ok(None);
     }
+    #[cfg(test)]
+    observe_integrity_gate();
     integrity::ensure_quarantine_store_for_fresh_pins(profile)
         .map_err(|error| (error, BTreeSet::new()))?;
     let events = integrity::check_staged(profile, tools).map_err(|e| {
@@ -10960,17 +10982,19 @@ fn maybe_check_integrity(
 }
 
 /// Run integrity detection on a freshly built catalog; if a high-risk drift was just
-/// quarantined, re-filter the live router so the blocked tools are hidden this cycle
-/// (not one rebuild later) and return the re-filtered catalog. Otherwise unchanged.
+/// quarantined, hide the blocked tools on `built` before it is published and return the
+/// re-filtered catalog. Otherwise unchanged. Taking `&mut Router` rather than the live
+/// Arc is the point: the quarantine lands on the router that is about to become live,
+/// not one already published.
 fn requarantine_if_needed(
     registry: &Arc<Mutex<Registry>>,
-    router: &Arc<Mutex<Arc<Router>>>,
+    built: &mut Router,
     tools: Vec<Value>,
     profile: Option<&str>,
 ) -> Vec<Value> {
     match maybe_check_integrity(registry, &tools, profile) {
         Ok(Some(pending)) => {
-            requarantine_after_integrity_change(router, pending, integrity::quarantined(profile))
+            requarantine_after_integrity_change(built, pending, integrity::quarantined(profile))
         }
         Ok(None) => tools,
         Err((e, pending)) => {
@@ -10978,19 +11002,41 @@ fn requarantine_if_needed(
                 "SECURITY: integrity store update failed: {e}; keeping the live blocked set"
             ));
             eprintln!("toolport: integrity store update failed: {e}; keeping the live blocked set");
-            fail_closed_integrity_catalog(router, profile, pending)
+            fail_closed_integrity_catalog(built, profile, pending)
         }
     }
 }
 
-fn requarantine_after_integrity_change(
+/// Publish a freshly built router into the live slot and run the tool-integrity gate
+/// on its catalog before returning. Every build path swaps in through here (startup,
+/// self-heal, registry watcher, downstream refresh, `${ROOT}`, reconnect adoption) so
+/// none can skip the drift check, and the gate runs before `ready` is set or the
+/// catalog is cached.
+///
+/// The gate runs against `built` BEFORE the swap. Call paths that are not behind the
+/// `ready` gate (watcher, self-heal, reconnect, `${ROOT}`) therefore can never observe
+/// a not-yet-quarantined definition, even for the instant the gate's file I/O takes: the
+/// slot only ever receives the already-filtered catalogue. Callers must persist the
+/// RETURNED catalog rather than the one from `built.aggregated_tools()`.
+fn publish_built_router(
+    registry: &Arc<Mutex<Registry>>,
     router: &Arc<Mutex<Arc<Router>>>,
+    mut built: Router,
+    profile: Option<&str>,
+) -> Vec<Value> {
+    let tools = built.aggregated_tools();
+    let tools = requarantine_if_needed(registry, &mut built, tools, profile);
+    *router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(built);
+    tools
+}
+
+fn requarantine_after_integrity_change(
+    router: &mut Router,
     pending: BTreeSet<String>,
     persisted: Result<BTreeSet<String>, String>,
 ) -> Vec<Value> {
-    let mut guard = router
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Only a successful read is allowed to lift a fail-closed catalog (SBS-871).
     let store_read_ok = persisted.is_ok();
     let mut enforce = match persisted {
@@ -11002,33 +11048,27 @@ fn requarantine_after_integrity_change(
             eprintln!(
                 "toolport: {e}; keeping the live quarantine set plus newly quarantined tools"
             );
-            guard.quarantined().clone()
+            router.quarantined().clone()
         }
     };
     // Even after a successful quarantine write, a post-write read may fail or race. The names
     // that triggered that write are already known and must never wait for a later watcher tick.
     enforce.extend(pending);
-    // make_mut clones the Router (sharing its Arc<ServerSlot> connections) only if an in-flight
-    // request still holds the old Arc; the old snapshot keeps serving until that request ends.
-    let r = Arc::make_mut(&mut guard);
     if store_read_ok {
-        r.requarantine_from_store(enforce);
+        router.requarantine_from_store(enforce);
     } else {
         // Store still unreadable: install the union, but leave any fail-closed hide up.
-        r.requarantine(enforce);
+        router.requarantine(enforce);
     }
-    r.aggregated_tools()
+    router.aggregated_tools()
 }
 
 fn fail_closed_integrity_catalog(
-    router: &Arc<Mutex<Arc<Router>>>,
+    router: &mut Router,
     profile: Option<&str>,
     pending: BTreeSet<String>,
 ) -> Vec<Value> {
-    let mut guard = router
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut fail_closed = guard.quarantined().clone();
+    let mut fail_closed = router.quarantined().clone();
     fail_closed.extend(pending);
     // If the quarantine write succeeded but the subsequent pin write failed, the durable
     // store contains the new block. If the store itself is unreadable, retain the current set
@@ -11036,12 +11076,11 @@ fn fail_closed_integrity_catalog(
     if let Ok(persisted) = integrity::quarantined(profile) {
         fail_closed.extend(persisted);
     }
-    let r = Arc::make_mut(&mut guard);
     // Never `requarantine_from_store` here: this is the integrity-store FAILURE path,
     // so a fail-closed catalog stays hidden. `reconcile_quarantine` lifts it on the
     // next watcher tick that actually reads the store (SBS-871).
-    r.requarantine(fail_closed);
-    r.aggregated_tools()
+    router.requarantine(fail_closed);
+    router.aggregated_tools()
 }
 
 /// The quarantine set the router SHOULD be enforcing right now, mirroring how the
@@ -11693,16 +11732,11 @@ fn adopt_reconnected_servers(
     if adopted.is_empty() {
         return;
     }
-    let tools = next.aggregated_tools();
-    *host
-        .router
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
     let resolved = profile
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let tools = requarantine_if_needed(&host.registry, &host.router, tools, resolved.as_deref());
+    let tools = publish_built_router(&host.registry, &host.router, next, resolved.as_deref());
     host.persist_and_emit_with_sessions(
         &tools,
         &host.cached_tools,
@@ -11977,13 +12011,9 @@ fn watch_tick(
             reestablish_all_resource_subscriptions(&new_router, subs);
         }
         let server_count = new_router.server_count();
-        let tools = new_router.aggregated_tools();
         // The registry and its trust verdict were already published together,
         // through `publish_registry`, before the rebuild (SBS-900).
-        *router
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(new_router);
-        let tools = requarantine_if_needed(registry, router, tools, resolved.as_deref());
+        let tools = publish_built_router(registry, router, new_router, resolved.as_deref());
         host.persist_and_emit_with_sessions(
             &tools,
             cached_tools,
@@ -12045,11 +12075,7 @@ fn watch_tick(
             } else {
                 next.refresh_stale_tools();
             }
-            let tools = next.aggregated_tools();
-            *router
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-            let tools = requarantine_if_needed(registry, router, tools, resolved.as_deref());
+            let tools = publish_built_router(registry, router, next, resolved.as_deref());
             host.persist_and_emit_with_sessions(
                 &tools,
                 cached_tools,
@@ -14931,12 +14957,12 @@ fn rebuild_router_for_root(state: &GatewayState) {
         prior_quarantine_from_router(&previous_router),
     );
     reestablish_all_resource_subscriptions(&new_router, &state.resource_subs);
-    let tools = new_router.aggregated_tools();
-    *state
-        .router
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(new_router);
-    let tools = requarantine_if_needed(&state.registry, &state.router, tools, profile.as_deref());
+    let tools = publish_built_router(
+        &state.registry,
+        &state.router,
+        new_router,
+        profile.as_deref(),
+    );
     state.persist_and_emit_with_sessions(
         &tools,
         &state.cached_tools,
@@ -14952,6 +14978,131 @@ fn rebuild_router_for_root(state: &GatewayState) {
         "toolport: ${{ROOT}} rebuild (root={root:?}, {} tools)",
         tools.len()
     ));
+}
+
+/// Publish a self-heal rebuild: run the integrity gate on the fresh catalog, keep the
+/// last-good catalog for a collapsed server, and refresh the cache. Split out of
+/// `process_request` so a test can drive the self-heal publish without an empty live
+/// router and real downstream processes. No-op when the rebuild connected nothing.
+fn finish_self_heal_build(
+    state: &GatewayState,
+    built: Router,
+    previous_router: &Router,
+    profile: Option<&str>,
+) {
+    if built.server_count() == 0 {
+        return;
+    }
+    reestablish_all_resource_subscriptions(&built, &state.resource_subs);
+    let tools = publish_built_router(&state.registry, &state.router, built, profile);
+    let tools = if tools.is_empty() {
+        tools
+    } else {
+        let current = state
+            .cached_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        state.preserve_collapsed_servers_guarded(tools, &current.tools)
+    };
+    // Re-adopt routes the guard kept from the previous catalog so the published
+    // router routes what the cache advertises (issue #700).
+    {
+        let mut guard = state
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::make_mut(&mut guard).adopt_restored_routes(previous_router, &tools);
+    }
+    state.invalidate_root_views();
+    state.invalidate_tool_scope_views();
+    // A fail-closed rebuild hides everything, so the cache must not keep serving the
+    // last-good catalog past it (SBS-871).
+    if router_is_fail_closed(&state.router) {
+        clear_catalog_for_fail_closed(&state.cached_tools, profile);
+    } else if !tools.is_empty() {
+        *state
+            .cached_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Arc::new(CatalogSnapshot::new(tools.clone()));
+        save_tool_cache(&tools, profile);
+    }
+    glog(&format!(
+        "self-heal: rebuilt router ({} servers, {} tools)",
+        state
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .server_count(),
+        tools.len()
+    ));
+    notify_tools_changed(&state.stdio_upstream, Some(&state.mcp_sessions));
+}
+
+/// Finish the startup background build: publish the freshly built router through the
+/// integrity gate, persist the catalog, and only then mark the gateway ready. Split
+/// out of the build thread so a test can drive the exact startup sequence with a
+/// router built in memory instead of spawning downstream processes.
+fn finish_startup_build(
+    host: &HostState,
+    built: Router,
+    profile: Option<&str>,
+    stdio: &SessionState,
+) {
+    glog(&format!(
+        "background build: {} tools from {} servers",
+        built.aggregated_tools().len(),
+        built.server_count()
+    ));
+    // Snapshot the pre-build router before publishing: authoritative routes for tools
+    // the guard keeps from the previous catalog.
+    let previous_router = {
+        let guard = host
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (**guard).clone()
+    };
+    let tools = publish_built_router(&host.registry, &host.router, built, profile);
+    host.invalidate_root_views();
+    host.invalidate_tool_scope_views();
+    // Read AFTER the integrity gate: it can newly quarantine a tool or keep a
+    // fail-closed catalog, so a pre-gate read would persist the wrong state.
+    if router_is_fail_closed(&host.router) {
+        clear_catalog_for_fail_closed(&host.cached_tools, profile);
+    } else if !tools.is_empty() {
+        // The disk cache loaded at startup is the baseline here, so a cold start that
+        // reaches a degraded downstream cannot overwrite a known-good catalog with its
+        // subset.
+        let tools = {
+            let current = host
+                .cached_tools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            host.preserve_collapsed_servers_guarded(tools, &current.tools)
+        };
+        // Re-adopt routes the guard kept from the previous catalog so the published
+        // router routes what the cache advertises (issue #700).
+        {
+            let mut guard = host
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Arc::make_mut(&mut guard).adopt_restored_routes(&previous_router, &tools);
+        }
+        *host
+            .cached_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Arc::new(CatalogSnapshot::new(tools.clone()));
+        save_tool_cache(&tools, profile);
+    } else {
+        glog("background build was empty; keeping previous tool cache");
+    }
+    host.ready.store(true, Ordering::SeqCst);
+    notify_tools_changed(stdio, Some(&host.mcp_sessions));
 }
 
 /// Fetch the upstream client's roots over stdio, update the shared `${ROOT}` path,
@@ -15428,57 +15579,7 @@ fn process_request(
                 Some(Arc::clone(&state.resource_subs)),
                 prior_quarantine_from_router(&previous_router),
             );
-            if built.server_count() > 0 {
-                reestablish_all_resource_subscriptions(&built, &state.resource_subs);
-                let tools = built.aggregated_tools();
-                *state
-                    .router
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(built);
-                let tools = if tools.is_empty() {
-                    tools
-                } else {
-                    let current = state
-                        .cached_tools
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
-                    state.preserve_collapsed_servers_guarded(tools, &current.tools)
-                };
-                // Re-adopt routes the guard kept from the previous catalog so the
-                // published router routes what the cache advertises (issue #700).
-                {
-                    let mut guard = state
-                        .router
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    Arc::make_mut(&mut guard).adopt_restored_routes(&previous_router, &tools);
-                }
-                state.invalidate_root_views();
-                state.invalidate_tool_scope_views();
-                // A fail-closed rebuild hides everything, so the cache must not keep
-                // serving the last-good catalog past it (SBS-871).
-                if router_is_fail_closed(&state.router) {
-                    clear_catalog_for_fail_closed(&state.cached_tools, profile_snapshot.as_deref());
-                } else if !tools.is_empty() {
-                    *state
-                        .cached_tools
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Arc::new(CatalogSnapshot::new(tools.clone()));
-                    save_tool_cache(&tools, profile_snapshot.as_deref());
-                }
-                glog(&format!(
-                    "self-heal: rebuilt router ({} servers, {} tools)",
-                    state
-                        .router
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .server_count(),
-                    tools.len()
-                ));
-                notify_tools_changed(&state.stdio_upstream, Some(&state.mcp_sessions));
-            }
+            finish_self_heal_build(state, built, &previous_router, profile_snapshot.as_deref());
         }
     }
 
@@ -19477,16 +19578,12 @@ fn main() {
 
     {
         let registry = Arc::clone(&registry);
-        let router = Arc::clone(&router);
         let stdio = Arc::clone(&stdio_upstream);
-        let ready = Arc::clone(&ready);
-        let cached_tools = Arc::clone(&cached_tools);
         let downstream_dirty = Arc::clone(&downstream_dirty);
         let server_handler = Arc::clone(&host.server_handler);
         let profile = Arc::clone(&profile);
         let client_root = Arc::clone(&stdio_upstream.client_root);
         let rebuild_lock = Arc::clone(&host.rebuild_lock);
-        let mcp_sessions = Arc::clone(&mcp_sessions);
         let resource_updated = host.resource_updated_sink.clone();
         let resource_subs_for_build = Arc::clone(&host.resource_subs);
         let host_for_build = Arc::clone(&host);
@@ -19524,63 +19621,9 @@ fn main() {
                 // Genuine cold start: no prior live set to keep (SBS-871).
                 None,
             );
-            let tools = built.aggregated_tools();
-            // Read before the router is moved below: a fail-closed build must clear
-            // the cache instead of being treated as a transient empty one (SBS-871).
-            let fail_closed = built.catalog_fail_closed();
-            glog(&format!(
-                "background build: {} tools from {} servers",
-                tools.len(),
-                built.server_count()
-            ));
-            // Snapshot the pre-rebuild router before publishing: authoritative
-            // routes for tools the guard keeps from the previous catalog.
-            let previous_router = {
-                let guard = router
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (**guard).clone()
-            };
-            *router
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(built);
-            host_for_build.invalidate_root_views();
-            host_for_build.invalidate_tool_scope_views();
-            // Don't let a transient empty build (registry caught mid-write, or
-            // every downstream momentarily unreachable) clobber a good catalog -
-            // that's what leaves a client showing only toolport_status. A
-            // fail-closed build is the deliberate exception: it MUST clobber it.
-            if fail_closed {
-                clear_catalog_for_fail_closed(&cached_tools, p.as_deref());
-            } else if !tools.is_empty() {
-                // The disk cache loaded at startup is the baseline here, so a cold
-                // start that reaches a degraded downstream cannot overwrite a
-                // known-good catalog with its subset.
-                let tools = {
-                    let current = cached_tools
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
-                    host_for_build.preserve_collapsed_servers_guarded(tools, &current.tools)
-                };
-                // Re-adopt routes the guard kept from the previous catalog so the
-                // published router routes what the cache advertises (issue #700).
-                {
-                    let mut guard = router
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    Arc::make_mut(&mut guard).adopt_restored_routes(&previous_router, &tools);
-                }
-                *cached_tools
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Arc::new(CatalogSnapshot::new(tools.clone()));
-                save_tool_cache(&tools, p.as_deref());
-            } else {
-                glog("background build was empty; keeping previous tool cache");
-            }
-            ready.store(true, Ordering::SeqCst);
-            notify_tools_changed(&stdio, Some(&mcp_sessions));
+            // Integrity runs inside: the gate must quarantine before `ready` is set,
+            // not on the first watcher tick after startup.
+            finish_startup_build(&host_for_build, built, p.as_deref(), &stdio);
         });
     }
 
@@ -33181,23 +33224,23 @@ mod tests {
     #[test]
     fn sbs871_integrity_change_with_an_unreadable_store_keeps_fail_closed() {
         let (router, _stdio) = fail_closed_harness();
+        let mut live = {
+            let guard = router.lock().unwrap();
+            (**guard).clone()
+        };
 
         requarantine_after_integrity_change(
-            &router,
+            &mut live,
             set_of(&["srv__new_drift"]),
             Err("quarantine store unreadable".into()),
         );
 
         assert!(
-            router.lock().unwrap().catalog_fail_closed(),
+            live.catalog_fail_closed(),
             "an unreadable store must not re-expose the catalog"
         );
         assert!(
-            router
-                .lock()
-                .unwrap()
-                .quarantined()
-                .contains("srv__new_drift"),
+            live.quarantined().contains("srv__new_drift"),
             "the new candidate is still recorded for when the hide lifts"
         );
     }
@@ -33207,14 +33250,15 @@ mod tests {
     #[test]
     fn sbs871_integrity_change_with_a_readable_store_lifts_fail_closed() {
         let (router, _stdio) = fail_closed_harness();
+        let mut live = {
+            let guard = router.lock().unwrap();
+            (**guard).clone()
+        };
 
-        requarantine_after_integrity_change(&router, BTreeSet::new(), Ok(set_of(&["srv__wipe"])));
+        requarantine_after_integrity_change(&mut live, BTreeSet::new(), Ok(set_of(&["srv__wipe"])));
 
-        assert!(!router.lock().unwrap().catalog_fail_closed());
-        assert_eq!(
-            router.lock().unwrap().quarantined(),
-            &set_of(&["srv__wipe"])
-        );
+        assert!(!live.catalog_fail_closed());
+        assert_eq!(live.quarantined(), &set_of(&["srv__wipe"]));
     }
 
     /// SBS-871: fail-closed makes aggregated_tools() empty, but every publish path
@@ -33275,11 +33319,15 @@ mod tests {
             let mut guard = router.lock().unwrap();
             Arc::make_mut(&mut guard).requarantine(set_of(&["srv__already_blocked"]));
         }
+        let mut live = {
+            let guard = router.lock().unwrap();
+            (**guard).clone()
+        };
 
-        fail_closed_integrity_catalog(&router, Some("sbs714-gateway"), set_of(&["srv__new_drift"]));
+        fail_closed_integrity_catalog(&mut live, Some("sbs714-gateway"), set_of(&["srv__new_drift"]));
 
         assert_eq!(
-            router.lock().unwrap().quarantined(),
+            live.quarantined(),
             &set_of(&["srv__already_blocked", "srv__new_drift"]),
             "a failed persistence step must preserve live blocks and add the new candidate"
         );
@@ -33293,18 +33341,298 @@ mod tests {
             let mut guard = router.lock().unwrap();
             Arc::make_mut(&mut guard).requarantine(set_of(&["srv__already_blocked"]));
         }
+        let mut live = {
+            let guard = router.lock().unwrap();
+            (**guard).clone()
+        };
 
         requarantine_after_integrity_change(
-            &router,
+            &mut live,
             set_of(&["srv__new_drift"]),
             Err("injected post-write read failure".to_string()),
         );
 
         assert_eq!(
-            router.lock().unwrap().quarantined(),
+            live.quarantined(),
             &set_of(&["srv__already_blocked", "srv__new_drift"]),
             "a post-write read error must preserve live blocks and enforce the new candidate"
         );
+    }
+
+    /// SEC-01: the startup background build must run the integrity gate BEFORE it
+    /// publishes the catalog and sets `ready`, so a server that reworded a read-only
+    /// tool's description while the gateway was down is quarantined before the first
+    /// `tools/list` rather than on the watcher's first tick.
+    #[test]
+    fn startup_build_quarantines_readonly_description_drift_before_ready() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("toolport-startup-integrity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        let profile = Some("startup-integrity");
+
+        // Baseline the original description, then simulate the server shipping a
+        // reworded one while the gateway was down.
+        let baseline = readonly_router("srv", "Read a record.");
+        conduit_lib::integrity::check_staged(profile, &baseline.aggregated_tools())
+            .expect("baseline pins");
+        // Mirror `build_router`: with pins already on disk, the quarantine store must be
+        // materialized before the gate reads it, or the SBS-871 fail-closed path refuses.
+        conduit_lib::integrity::ensure_quarantine_store_for_existing_pins(profile);
+        let drifted = readonly_router("srv", "Read a record. Summary text updated.");
+
+        let state = http_state(false);
+        {
+            let mut reg = state.registry.lock().unwrap();
+            reg.integrity_check = true;
+            reg.quarantine_on_drift = true;
+        }
+        state.host.ready.store(false, Ordering::SeqCst);
+
+        finish_startup_build(&state.host, drifted, profile, &state.stdio_upstream);
+
+        assert!(
+            state.host.ready.load(Ordering::SeqCst),
+            "the startup build must still set ready"
+        );
+        assert!(
+            state
+                .router
+                .lock()
+                .unwrap()
+                .quarantined()
+                .contains("srv__read"),
+            "the startup gate must hide the drifted read-only tool"
+        );
+        assert!(
+            conduit_lib::integrity::quarantined(profile)
+                .expect("store readable")
+                .contains("srv__read"),
+            "the startup gate must persist the quarantine before ready"
+        );
+        assert!(
+            !state
+                .router
+                .lock()
+                .unwrap()
+                .aggregated_tools()
+                .iter()
+                .any(|t| t["name"] == "srv__read"),
+            "the first tools/list must not advertise a quarantined tool"
+        );
+    }
+
+    /// SEC-01: the self-heal rebuild runs the same gate, so a tool that drifted while
+    /// the live router was empty cannot be served by the self-heal publish.
+    #[test]
+    fn self_heal_rebuild_quarantines_readonly_description_drift() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-selfheal-integrity-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        let profile = Some("selfheal-integrity");
+
+        let baseline = readonly_router("srv", "Read a record.");
+        conduit_lib::integrity::check_staged(profile, &baseline.aggregated_tools())
+            .expect("baseline pins");
+        // Mirror `build_router`: with pins already on disk, the quarantine store must be
+        // materialized before the gate reads it, or the SBS-871 fail-closed path refuses.
+        conduit_lib::integrity::ensure_quarantine_store_for_existing_pins(profile);
+        let drifted = readonly_router("srv", "Read a record. Summary text updated.");
+
+        let state = http_state(false);
+        {
+            let mut reg = state.registry.lock().unwrap();
+            reg.integrity_check = true;
+            reg.quarantine_on_drift = true;
+        }
+
+        finish_self_heal_build(&state, drifted, &Router::new(), profile);
+
+        assert!(
+            state
+                .router
+                .lock()
+                .unwrap()
+                .quarantined()
+                .contains("srv__read"),
+            "the self-heal publish must hide the drifted read-only tool"
+        );
+        assert!(
+            conduit_lib::integrity::quarantined(profile)
+                .expect("store readable")
+                .contains("srv__read"),
+            "the self-heal publish must persist the quarantine"
+        );
+    }
+
+    /// SEC-01: with quarantine-on-drift OFF the read-only description drift is still
+    /// recorded, at `warn`, and the tool stays callable (the setting is the only gate).
+    #[test]
+    fn startup_build_records_readonly_description_drift_at_warn_without_quarantine() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-startup-integrity-off-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        let profile = Some("startup-integrity-off");
+
+        let baseline = readonly_router("srv", "Read a record.");
+        conduit_lib::integrity::check_staged(profile, &baseline.aggregated_tools())
+            .expect("baseline pins");
+        // Mirror `build_router`: with pins already on disk, the quarantine store must be
+        // materialized before the gate reads it, or the SBS-871 fail-closed path refuses.
+        conduit_lib::integrity::ensure_quarantine_store_for_existing_pins(profile);
+        let drifted = readonly_router("srv", "Read a record. Summary text updated.");
+
+        let state = http_state(false);
+        {
+            let mut reg = state.registry.lock().unwrap();
+            reg.integrity_check = true;
+            reg.quarantine_on_drift = false;
+        }
+
+        finish_startup_build(&state.host, drifted, profile, &state.stdio_upstream);
+
+        assert!(
+            !state
+                .router
+                .lock()
+                .unwrap()
+                .quarantined()
+                .contains("srv__read"),
+            "quarantine-on-drift off must not block the tool"
+        );
+        assert!(
+            state
+                .router
+                .lock()
+                .unwrap()
+                .aggregated_tools()
+                .iter()
+                .any(|t| t["name"] == "srv__read"),
+            "the tool stays advertised while the setting is off"
+        );
+        assert!(
+            conduit_lib::integrity::quarantined(profile)
+                .expect("store readable")
+                .is_empty(),
+            "nothing is persisted to the quarantine store while the setting is off"
+        );
+        let events = conduit_lib::integrity::read_recent(20).expect("security log");
+        let drift = events
+            .iter()
+            .find(|e| e["tool"] == "srv__read")
+            .expect("the drift must still be recorded");
+        assert_eq!(
+            drift["severity"], "warn",
+            "the recorded tier is warn, not quiet info"
+        );
+    }
+
+    /// SEC-01 correction: `publish_built_router` must run the gate against the
+    /// not-yet-published router, so a caller on a path with no `ready` gate (watcher,
+    /// self-heal, reconnect, `${ROOT}`) never observes the drifted definition. The
+    /// observer fires at the top of the gate, mid-publish and before the swap, and
+    /// records what the LIVE slot advertises at that instant.
+    #[test]
+    fn published_router_never_exposes_a_drifted_tool_during_the_integrity_gate() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-publish-gate-order-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        let profile = Some("publish-gate-order");
+
+        let baseline = readonly_router("srv", "Read a record.");
+        conduit_lib::integrity::check_staged(profile, &baseline.aggregated_tools())
+            .expect("baseline pins");
+        conduit_lib::integrity::ensure_quarantine_store_for_existing_pins(profile);
+        let drifted = readonly_router("srv", "Read a record. Summary text updated.");
+
+        let state = http_state(false);
+        {
+            let mut reg = state.registry.lock().unwrap();
+            reg.integrity_check = true;
+            reg.quarantine_on_drift = true;
+        }
+
+        // A proxy for "a concurrent tools/call or tools/list during the gate".
+        let observed_live_advertised = Arc::new(Mutex::new(None::<bool>));
+        let live_slot = Arc::clone(&state.router);
+        let seen = Arc::clone(&observed_live_advertised);
+        *INTEGRITY_GATE_OBSERVER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
+            std::thread::current().id(),
+            Box::new(move || {
+                let live = live_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let advertises = live.aggregated_tools().iter().any(|t| t["name"] == "srv__read");
+                *seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(advertises);
+            }),
+        ));
+
+        let published =
+            publish_built_router(&state.registry, &state.router, drifted, profile);
+
+        *INTEGRITY_GATE_OBSERVER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+        assert_eq!(
+            *observed_live_advertised
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(false),
+            "the live router must not advertise the drifted tool while the gate runs"
+        );
+        assert!(
+            !published.iter().any(|t| t["name"] == "srv__read"),
+            "the returned catalog must exclude the drifted tool"
+        );
+        let live = state.router.lock().unwrap();
+        assert!(
+            live.quarantined().contains("srv__read"),
+            "the quarantine must be on the router the moment it becomes live"
+        );
+        assert!(
+            !live.aggregated_tools().iter().any(|t| t["name"] == "srv__read"),
+            "the published router must not advertise the drifted tool"
+        );
+    }
+
+    /// A routed router with one read-only tool whose description a test controls.
+    fn readonly_router(server: &str, description: &str) -> Router {
+        let ds = DownstreamServer::connect(
+            server.to_string(),
+            Box::new(MockRoute {
+                tools: vec![json!({
+                    "name": "read",
+                    "description": description,
+                    "inputSchema": { "type": "object" },
+                    "annotations": { "readOnlyHint": true }
+                })],
+            }),
+        )
+        .expect("mock downstream connects");
+        let mut router = Router::new();
+        router.add(ds);
+        router
     }
 
     #[test]
