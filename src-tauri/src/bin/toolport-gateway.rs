@@ -32133,6 +32133,56 @@ mod tests {
     }
 
     #[test]
+    fn search_prefers_exact_words_named_services_and_current_tools() {
+        let tool = |name: &str, description: &str| json!({ "name": name, "description": description, "inputSchema": {} });
+        let top =
+            |cat: &[Value], query: &str| search_catalog(cat, query, None, 5).0[0]["name"].clone();
+
+        // The exact verb beats a synonym, and a plural object reads as a list.
+        let cat = vec![
+            tool("aws__get_bucket", "Get bucket."),
+            tool("aws__list_bucket", "List bucket."),
+        ];
+        assert_eq!(top(&cat, "show my buckets"), "aws__list_bucket");
+        assert_eq!(top(&cat, "get the bucket"), "aws__get_bucket");
+
+        // Naming the service picks its tool, and "GitHub" stays one word.
+        let cat = vec![
+            tool(
+                "github__add_issue_comment",
+                "Add a comment to a GitHub issue.",
+            ),
+            tool("linear__create_comment", "Add a comment to a Linear issue."),
+            tool("git__git_show", "Shows the contents of a commit"),
+            tool(
+                "github__get_file_contents",
+                "Read the contents of a file in a GitHub repository.",
+            ),
+        ];
+        assert_eq!(
+            top(&cat, "add a comment to a Linear issue"),
+            "linear__create_comment"
+        );
+        assert_eq!(
+            top(&cat, "read a file on GitHub"),
+            "github__get_file_contents"
+        );
+
+        // A deprecated tool ranks below its replacement; "direct message" finds `dm`.
+        let cat = vec![
+            tool(
+                "fs__read_file",
+                "Read a file. DEPRECATED: use read_text_file instead.",
+            ),
+            tool("fs__read_text_file", "Read a file as text."),
+            tool("mail__send_email", "Send an email."),
+            tool("chat__send_dm", "Send a direct message to a user."),
+        ];
+        assert_eq!(top(&cat, "read a file"), "fs__read_text_file");
+        assert_eq!(top(&cat, "send a direct message"), "chat__send_dm");
+    }
+
+    #[test]
     fn index_tokens_drops_boilerplate_and_stopwords() {
         let toks = index_tokens("**Purpose:** Returns the list of products for the user.");
         // capability words survive (stemmed); boilerplate + function words are gone.
@@ -32892,7 +32942,7 @@ mod search_eval {
     const CATALOG: &str = include_str!("../../tests/fixtures/search-eval/catalog.json");
     const INTENTS: &str = include_str!("../../tests/fixtures/search-eval/intents.json");
     const TOP1_MIN: f64 = 0.85;
-    const TOP3_MIN: f64 = 0.88;
+    const TOP3_MIN: f64 = 0.90;
 
     fn catalog() -> Vec<Value> {
         let doc: Value = serde_json::from_str(CATALOG).expect("catalog fixture parses");
