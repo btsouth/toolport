@@ -1474,6 +1474,20 @@ impl ServerPage {
                     true,
                 ));
             }
+            state::RegistryState::NewerVersion(message) => {
+                self.clear_server_list();
+                *self.last_snapshot.borrow_mut() = None;
+                self.server_count.set_label("–");
+                self.enabled_count.set_label("–");
+                self.profile_count.set_label("–");
+                self.section_title.set_label("Servers unavailable");
+                self.list.append(&state_card(
+                    "software-update-available-symbolic",
+                    "Update Toolport",
+                    &format!("{message} Toolport left the registry untouched."),
+                    true,
+                ));
+            }
         }
     }
 

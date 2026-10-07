@@ -374,8 +374,7 @@ pub(super) struct ClientSnapshot {
 pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
     let path = registry::resolved_path().ok_or_else(|| "registry path unavailable".to_string())?;
     let registry = match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str::<Registry>(&contents)
-            .map_err(|error| format!("could not parse registry: {error}"))?,
+        Ok(contents) => registry::parse_registry_contents(&contents)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Registry::default(),
         Err(error) => return Err(format!("could not read registry: {error}")),
     };
@@ -474,6 +473,8 @@ pub(super) enum RegistryState {
     Ready(RegistrySnapshot),
     FirstRun,
     Unavailable,
+    /// A newer Toolport wrote the registry. Carries the message to show.
+    NewerVersion(String),
 }
 
 impl RegistrySnapshot {
@@ -583,8 +584,12 @@ fn load_read_only(path: Option<&Path>) -> RegistryState {
             return RegistryState::Unavailable;
         }
     };
-    match serde_json::from_str::<Registry>(&contents) {
+    match registry::parse_registry_contents(&contents) {
         Ok(registry) => RegistryState::Ready(RegistrySnapshot::from_registry(registry)),
+        Err(error) if registry::is_newer_version_error(&error) => {
+            eprintln!("toolport-gtk: {error}");
+            RegistryState::NewerVersion(error)
+        }
         Err(error) => {
             eprintln!("toolport-gtk: could not parse registry: {error}");
             RegistryState::Unavailable
@@ -1032,5 +1037,21 @@ mod tests {
         std::fs::write(&invalid, b"{ invalid").unwrap();
         assert_eq!(load_read_only(Some(&invalid)), RegistryState::Unavailable);
         let _ = std::fs::remove_file(invalid);
+    }
+
+    #[test]
+    fn a_newer_registry_schema_is_refused_not_shown() {
+        let newer = std::env::temp_dir().join(format!(
+            "toolport-gtk-newer-registry-{}.json",
+            std::process::id()
+        ));
+        let contents = r#"{"version":99,"servers":[],"profiles":[],"activeProfileId":"default"}"#;
+        std::fs::write(&newer, contents).unwrap();
+        let RegistryState::NewerVersion(message) = load_read_only(Some(&newer)) else {
+            panic!("a newer schema must not load as a snapshot");
+        };
+        assert!(registry::is_newer_version_error(&message), "{message}");
+        assert_eq!(std::fs::read_to_string(&newer).unwrap(), contents);
+        let _ = std::fs::remove_file(newer);
     }
 }

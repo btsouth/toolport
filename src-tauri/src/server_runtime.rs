@@ -152,7 +152,7 @@ pub fn probe_registered(server_id: &str) -> Result<ProbeResult, String> {
     let path = crate::registry::resolved_path().ok_or("could not resolve the registry path")?;
     let contents = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read the registry: {error}"))?;
-    let registry = serde_json::from_str::<crate::registry::Registry>(&contents)
+    let registry = crate::registry::parse_registry_contents(&contents)
         .map_err(|error| format!("could not parse the registry: {error}"))?;
     let server = registry
         .servers

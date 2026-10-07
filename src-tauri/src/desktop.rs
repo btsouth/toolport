@@ -4858,6 +4858,13 @@ fn registry_startup_failure_message(path: Option<&std::path::Path>, error: &str)
     let path = path
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "the Toolport data directory".to_string());
+    // Version skew has a different fix from corruption: restoring a backup or
+    // moving the file aside is the wrong advice when the file is simply newer.
+    if registry::is_newer_version_error(error) {
+        return format!(
+            "Toolport stopped before touching your registry because it was written by a newer version.\n\n{error}\n\nRegistry: {path}"
+        );
+    }
     format!(
         "Toolport could not safely load its registry, so it stopped before showing or saving an empty configuration. Your registry was not replaced.\n\nClose any other Toolport processes and try again. If the problem continues, restore a registry backup or move the unreadable registry aside, then reopen Toolport.\n\nRegistry: {path}\n\nError: {error}"
     )
