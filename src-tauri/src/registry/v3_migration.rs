@@ -178,7 +178,10 @@ mod tests {
         let mut reg = load_from(&path).unwrap();
         assert!(reg.access_upgrade_notice_pending());
         reg.unknown_fields.remove("accessUpgradeNoticeDismissed");
-        assert!(reg.access_upgrade_notice_pending(), "existing v3 registries get the first-launch notice too");
+        assert!(
+            reg.access_upgrade_notice_pending(),
+            "existing v3 registries get the first-launch notice too"
+        );
         reg.dismiss_access_upgrade_notice();
         crate::registry::save_to(&path, &reg).unwrap();
         assert!(!load_from(&path).unwrap().access_upgrade_notice_pending());

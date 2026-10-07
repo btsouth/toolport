@@ -213,7 +213,6 @@ pub fn open_data_dir() -> Result<(), String> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -221,7 +220,10 @@ mod tests {
         let mut reg = crate::registry::Registry::default();
         reg.default_access_profile_id = Some("default".into());
         let text = super::registry_summary(&reg);
-        assert!(text.contains("default access: Default access (Default)"), "{text}");
+        assert!(
+            text.contains("default access: Default access (Default)"),
+            "{text}"
+        );
         assert!(!text.contains("active profile"));
     }
 }

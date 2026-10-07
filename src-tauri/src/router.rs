@@ -6657,7 +6657,10 @@ mod tests {
 
         // Hidden, and also blocked on a direct call (not merely invisible).
         let err = router.route_call("db__add", json!({})).unwrap_err();
-        assert!(err.contains("outside this client's tool scope"), "unexpected: {err}");
+        assert!(
+            err.contains("outside this client's tool scope"),
+            "unexpected: {err}"
+        );
         assert!(router.route_call("db__echo", json!({})).is_ok());
     }
 

@@ -6945,7 +6945,9 @@ mod tests {
                 let managed = team_copy(&reg, "mine");
                 apply_use_managed(&mut reg, &managed, "default").unwrap();
                 assert!(reg.server_enabled(&managed));
-                for profile in &mut reg.profiles { profile.enabled_server_ids.clear(); }
+                for profile in &mut reg.profiles {
+                    profile.enabled_server_ids.clear();
+                }
                 reg = synced(&reg, &remote, 2);
                 assert!(reg.server_enabled(&managed));
                 reg.set_global_server_enabled(&managed, false).unwrap();

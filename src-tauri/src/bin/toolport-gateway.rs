@@ -19674,7 +19674,9 @@ mod tests {
         reg.safety_level = Some(registry::SafetyLevel::Off);
         *state.registry.lock().unwrap() = reg.clone();
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut router = Router::with_policy(registry_policy(&reg, None, false, false).with_quarantine(BTreeSet::new(), false));
+        let mut router = Router::with_policy(
+            registry_policy(&reg, None, false, false).with_quarantine(BTreeSet::new(), false),
+        );
         let connect_calls = Arc::clone(&calls);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -19710,10 +19712,18 @@ mod tests {
                     None,
                 )));
                 match prepare_dispatch(
-                    &snapshot, Some(&state.router), DispatchTarget::Tool("s__work"), None, false,
-                ).and_then(|()| snapshot.route_call("s__work", json!({}))) {
+                    &snapshot,
+                    Some(&state.router),
+                    DispatchTarget::Tool("s__work"),
+                    None,
+                    false,
+                )
+                .and_then(|()| snapshot.route_call("s__work", json!({})))
+                {
                     Ok(result) => result,
-                    Err(message) => json!({"isError":true, "content":[{"type":"text", "text":message}]}),
+                    Err(message) => {
+                        json!({"isError":true, "content":[{"type":"text", "text":message}]})
+                    }
                 }
             });
             // The connector holds the call until its live tool scope is revoked.
