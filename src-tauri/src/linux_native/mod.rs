@@ -58,6 +58,9 @@ pub fn run() {
             return;
         }
     };
+    // The sidebar hides Team until this install is paired. Reads the same load
+    // above so the nav reflects the registry the rest of startup sees.
+    let paired = registry.team.is_some();
     if !registry.live_inspect {
         crate::inspect::clear();
     }
@@ -104,6 +107,7 @@ pub fn run() {
             broker_for_activate.clone(),
             bridge_for_activate.clone(),
             notice_for_activate.clone(),
+            paired,
             !hidden,
         );
         if hidden && !tray::sni_watcher_present() {
@@ -121,6 +125,7 @@ pub fn run() {
             broker_for_open.clone(),
             bridge_for_open.clone(),
             notice_for_open.clone(),
+            paired,
             true,
         );
         let Some(action) = app.lookup_action("open-share-url") else {
@@ -251,6 +256,7 @@ fn build_window(
     startup_notice: std::rc::Rc<
         std::cell::RefCell<Option<crate::registry::RegistryRecoveryNotice>>,
     >,
+    paired: bool,
     present: bool,
 ) {
     if let Some(window) = app.windows().into_iter().next() {
@@ -322,6 +328,7 @@ fn build_window(
         playground_page.clone(),
         teams_page.clone(),
         settings_page.clone(),
+        paired,
     );
     // The Settings tab must not go stale while open: quarantine, remembered
     // approvals, and routine suggestions all change underneath it (the shipping
@@ -640,6 +647,34 @@ fn run_registry_startup_failure(app: &adw::Application, args: &[String], error: 
     app.run_with_args(args);
 }
 
+/// The 2.0 top-level navigation, in sidebar order. Team joins only on a paired
+/// install (see [`is_sidebar_row`]). Catalog and Playground leave the sidebar
+/// here; their pages and `show-*` actions stay so onboarding, the tray and
+/// pairing can still reach them until a later PR removes or relocates them.
+const NAV_SECTIONS: &[(&str, &str, &str)] = &[
+    ("servers", "Servers", "network-server-symbolic"),
+    ("clients", "Clients", "computer-symbolic"),
+    ("activity", "Activity", "view-list-symbolic"),
+    ("settings", "Settings", "emblem-system-symbolic"),
+    ("teams", "Team", "system-users-symbolic"),
+    ("catalog", "Catalog", "system-software-install-symbolic"),
+    ("playground", "Playground", "applications-science-symbolic"),
+];
+
+/// Number-key order for the fixed sidebar rows. Team is click-only, matching the
+/// React shell's four shortcuts.
+const NAV_SHORTCUTS: &[&str] = &["servers", "clients", "activity", "settings"];
+
+/// Whether `target` is drawn as a sidebar row. Team is hidden on an unpaired
+/// install; the dropped top-level views stay reachable by action only.
+fn is_sidebar_row(target: &str, paired: bool) -> bool {
+    match target {
+        "teams" => paired,
+        "catalog" | "playground" => false,
+        _ => true,
+    }
+}
+
 fn build_sidebar(
     app: &adw::Application,
     split: &adw::NavigationSplitView,
@@ -651,6 +686,7 @@ fn build_sidebar(
     playground_page: PlaygroundPage,
     teams_page: TeamsPage,
     settings_page: SettingsPage,
+    paired: bool,
 ) -> (gtk::Box, gtk::Label) {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("toolport-sidebar");
@@ -684,15 +720,7 @@ fn build_sidebar(
         .build();
 
     let mut buttons = Vec::new();
-    for (target, label, icon) in [
-        ("servers", "Servers", "network-server-symbolic"),
-        ("clients", "Clients", "computer-symbolic"),
-        ("activity", "Activity", "view-list-symbolic"),
-        ("catalog", "Catalog", "system-software-install-symbolic"),
-        ("playground", "Playground", "applications-science-symbolic"),
-        ("teams", "Teams", "system-users-symbolic"),
-        ("settings", "Settings", "emblem-system-symbolic"),
-    ] {
+    for &(target, label, icon) in NAV_SECTIONS {
         let button = gtk::Button::new();
         button.set_halign(gtk::Align::Fill);
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -714,7 +742,12 @@ fn build_sidebar(
         if target == "servers" {
             button.add_css_class("selected");
         }
-        nav.append(&button);
+        // Hidden pages keep their button, page and action so `show-catalog`,
+        // `show-playground` and `show-teams` still resolve from onboarding,
+        // pairing and the tray; only the sidebar row is dropped.
+        if is_sidebar_row(target, paired) {
+            nav.append(&button);
+        }
         buttons.push((target.to_string(), button));
     }
     for (target, button) in buttons.clone() {
@@ -744,8 +777,14 @@ fn build_sidebar(
             );
         });
     }
-    for (index, (target, _)) in buttons.iter().enumerate() {
+    for (target, _) in buttons.iter() {
         let action_name = format!("show-{target}");
+        // Number keys follow the visible sidebar rows only, so a dropped page
+        // cannot be reached by a stale chord. Team is click-only.
+        let shortcut_number = NAV_SHORTCUTS
+            .iter()
+            .position(|name| *name == target.as_str())
+            .map(|index| index + 1);
         let action = gtk::gio::SimpleAction::new(&action_name, None);
         let split = split.clone();
         let stack = stack.clone();
@@ -774,10 +813,10 @@ fn build_sidebar(
             );
         });
         app.add_action(&action);
-        if index < 9 {
+        if let Some(number) = shortcut_number {
             app.set_accels_for_action(
                 &format!("app.{action_name}"),
-                &[&format!("<Primary>{}", index + 1)],
+                &[&format!("<Primary>{number}")],
             );
         }
     }
@@ -9272,6 +9311,36 @@ fn state_card(icon_name: &str, title: &str, body: &str, error: bool) -> gtk::Box
 
 #[cfg(test)]
 mod tests {
+    /// The 2.0 sidebar is the four fixed views in order, with Team appended only
+    /// on a paired install. Catalog and Playground are no longer rows even though
+    /// their pages and actions stay reachable.
+    #[test]
+    fn sidebar_rows_are_the_four_views_plus_team_only_when_paired() {
+        let rows = |paired| {
+            super::NAV_SECTIONS
+                .iter()
+                .map(|(target, _, _)| *target)
+                .filter(|target| super::is_sidebar_row(*target, paired))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rows(false),
+            vec!["servers", "clients", "activity", "settings"]
+        );
+        assert_eq!(
+            rows(true),
+            vec!["servers", "clients", "activity", "settings", "teams"]
+        );
+    }
+
+    #[test]
+    fn sidebar_shortcuts_number_only_the_fixed_views() {
+        assert_eq!(
+            super::NAV_SHORTCUTS,
+            ["servers", "clients", "activity", "settings"].as_slice()
+        );
+    }
+
     #[test]
     fn cleared_launch_field_is_missing_in_native_probe_but_blank_secret_keeps_vault() {
         let mut input = crate::registry::LaunchInput {

@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 
+import type { Registry } from "@/lib/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppSidebar } from "./AppSidebar";
 
@@ -64,6 +65,16 @@ function fakeUpdate(version = "1.1.0") {
   return { version, body: "Release notes", close: vi.fn().mockResolvedValue(undefined) };
 }
 
+/** The minimum registry a paired install hands the sidebar: one profile so the
+ * ProfileBar renders, and a team connection so Team is a top-level row. */
+function pairedRegistry(): Registry {
+  return {
+    profiles: [{ id: "default", name: "Default" }],
+    activeProfileId: "default",
+    team: { teamId: "team-1" },
+  } as unknown as Registry;
+}
+
 beforeEach(() => {
   getSavingsSummary.mockReset();
   listQuarantined.mockReset();
@@ -108,6 +119,53 @@ describe("AppSidebar accessibility", () => {
       "aria-current",
       "page",
     );
+  });
+
+  it("shows the four top-level views and hides Team until paired", async () => {
+    const onSelectView = vi.fn();
+    const { rerender } = render(
+      <TooltipProvider>
+        <AppSidebar
+          registry={null}
+          onRegistryChange={vi.fn()}
+          view="servers"
+          onSelectView={onSelectView}
+          onReplayOnboarding={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+
+    const nav = screen.getByRole("navigation", { name: "Views" });
+    expect(
+      within(nav)
+        .getAllByRole("button")
+        .map((b) => b.textContent),
+    ).toEqual(["Servers", "Clients", "Activity", "Settings"]);
+    // Catalog, Playground, Agent rules, Agent activity and Team are not top-level.
+    for (const name of [
+      "Browse catalog",
+      "Playground",
+      "Agent rules",
+      "Agent activity",
+      "Team",
+    ]) {
+      expect(within(nav).queryByRole("button", { name })).not.toBeInTheDocument();
+    }
+
+    rerender(
+      <TooltipProvider>
+        <AppSidebar
+          registry={pairedRegistry()}
+          onRegistryChange={vi.fn()}
+          view="servers"
+          onSelectView={onSelectView}
+          onReplayOnboarding={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Team" }));
+    expect(onSelectView).toHaveBeenCalledWith("teams");
   });
 
   it("rechecks updates when a stale tray-hidden window is shown", async () => {
