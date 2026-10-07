@@ -6938,21 +6938,22 @@ mod tests {
 
         #[test]
         fn access_review_team_sync_preserves_switch_without_membership() {
-            let mut personal = publisher_registry();
-            personal.version = 3;
-            personal.servers[0].transport = "http".into();
-            personal.servers[0].command = None;
-            personal.servers[0].url = Some("https://example.com/mcp".into());
-            let remote = team_server_export(&personal);
-            let mut reg = synced(&personal, &remote, 1);
-            let managed = team_copy(&reg, "mine");
-            assert!(reg.server_enabled(&managed));
-            for profile in &mut reg.profiles { profile.enabled_server_ids.clear(); }
-            reg = synced(&reg, &remote, 2);
-            assert!(reg.server_enabled(&managed));
-            reg.set_global_server_enabled(&managed, false).unwrap();
-            reg = synced(&reg, &remote, 3);
-            assert!(!reg.server_enabled(&managed));
+            crate::secrets::tests::with_isolated_vault(|| {
+                let mut personal = publisher_registry();
+                personal.version = 3;
+                personal.servers[0].enabled = true;
+                let remote = team_server_export(&personal);
+                let mut reg = synced(&personal, &remote, 1);
+                let managed = team_copy(&reg, "mine");
+                apply_use_managed(&mut reg, &managed, "default").unwrap();
+                assert!(reg.server_enabled(&managed));
+                for profile in &mut reg.profiles { profile.enabled_server_ids.clear(); }
+                reg = synced(&reg, &remote, 2);
+                assert!(reg.server_enabled(&managed));
+                reg.set_global_server_enabled(&managed, false).unwrap();
+                reg = synced(&reg, &remote, 3);
+                assert!(!reg.server_enabled(&managed));
+            });
         }
 
         #[test]
