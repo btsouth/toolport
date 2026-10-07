@@ -14539,6 +14539,28 @@ mod tests {
     }
 
     #[test]
+    fn connect_binds_the_http_credential_owner_before_initialize() {
+        struct Probe(HttpTransport);
+        impl Transport for Probe {
+            fn set_server_id(&mut self, id: &str) {
+                self.0.set_server_id(id);
+            }
+            fn request(&mut self, _: &str, _: Value) -> Result<Value, TransportError> {
+                assert_eq!(self.0.auth_owner.as_deref(), Some("credential-owner"));
+                Err(TransportError::Unavailable("probe finished".into()))
+            }
+            fn notify(&mut self, _: &str, _: Value) -> Result<(), TransportError> {
+                unreachable!()
+            }
+        }
+        let result = DownstreamServer::connect(
+            "credential-owner".into(),
+            Box::new(Probe(HttpTransport::new("http://127.0.0.1:1/"))),
+        );
+        assert_eq!(result.err().unwrap(), "probe finished");
+    }
+
+    #[test]
     fn rejected_http_token_adopts_the_vault_winner_without_refreshing() {
         use crate::secrets;
         use std::time::Duration;
