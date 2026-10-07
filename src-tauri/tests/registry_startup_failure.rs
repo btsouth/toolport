@@ -152,4 +152,37 @@ fn corrupt_and_future_registries_refuse_startup_without_losing_bytes() {
     assert_eq!(std::fs::read(&path).unwrap(), future);
     assert_eq!(std::fs::read(&preserved[0]).unwrap(), corrupt);
     assert!(!scratch.0.join("registry.json.bak").exists());
+    let after: Vec<_> = std::fs::read_dir(&scratch.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|file| {
+            file.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("registry.json.unreadable-")
+        })
+        .collect();
+    assert_eq!(
+        after, preserved,
+        "future schemas never create quarantine copies"
+    );
+}
+
+#[test]
+fn unreadable_bytes_never_default_or_overwrite_from_last_good() {
+    let scratch = Scratch::new("unreadable-bytes");
+    let path = scratch.0.join("registry.json");
+    let original = [0xff, 0xfe, 0x80];
+    std::fs::write(&path, original).unwrap();
+    let backup = serde_json::to_vec(&Registry::default()).unwrap();
+    std::fs::write(scratch.0.join("registry.json.bak"), &backup).unwrap();
+    assert!(registry::load_from(&path)
+        .unwrap_err()
+        .contains("Could not read registry"));
+    assert_gateway_refuses(&scratch.0, "--daemon", "Could not read registry");
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert_eq!(
+        std::fs::read(scratch.0.join("registry.json.bak")).unwrap(),
+        backup
+    );
 }

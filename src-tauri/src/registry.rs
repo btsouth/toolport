@@ -3461,9 +3461,8 @@ enum ReadOutcome {
     /// Still missing or empty after retries: genuinely absent, not a race.
     Absent,
     /// The file is there but every read failed with something other than
-    /// not-found (sharing violation, permissions, I/O error). Recovery treats
-    /// this exactly like `Absent`, but a caller reading a security decision out
-    /// of the result has to know the real contents were never seen (SBS-900).
+    /// not-found (sharing violation, permissions, I/O error). Refuse recovery:
+    /// we cannot preserve bytes we could not read before replacing the primary.
     Unreadable,
 }
 
@@ -3480,8 +3479,8 @@ fn read_registry_file(path: &Path) -> ReadOutcome {
     const ATTEMPTS: u32 = 4;
     const BACKOFF_MS: u64 = 75;
     // Why the last attempt failed, so a file we were never allowed to read is not
-    // reported as a file that is not there (SBS-900). Recovery behaves the same
-    // for both; only the reported outcome differs.
+    // reported as a file that is not there (SBS-900). An unreadable primary
+    // must not be overwritten or treated as a first run.
     let mut last_error: Option<std::io::ErrorKind> = None;
     for attempt in 0..ATTEMPTS {
         match std::fs::read_to_string(path) {
@@ -3576,21 +3575,17 @@ pub enum LoadSource {
     /// No registry file and no backup worth recovering: a genuine first run.
     /// Empty here is the truth.
     FirstRun,
-    /// The primary was absent, unreadable, or unparseable, and the registry came
+    /// The primary was absent or unparseable, and the registry came
     /// from a backup. `save_to` snapshots the PRE-write content, so the newest
     /// backup is state N-1: the save that registered the first HTTP client is
     /// exactly the one whose backup still has none.
     Backup,
-    /// The primary exists but could not be read (locked, permissions, I/O) and
-    /// no backup was usable, so this is a `Registry::default()` standing in for
-    /// contents nobody has seen.
-    Unreadable,
 }
 
 impl LoadSource {
     /// True only when an absent value in the loaded registry means the user never
     /// configured it, rather than "this build could not tell". Everything
-    /// reconstructed or defaulted over unread contents is `false`, so a caller
+    /// reconstructed from a backup is `false`, so a caller
     /// that must fail closed can just ask.
     pub fn is_authoritative(self) -> bool {
         matches!(self, LoadSource::File | LoadSource::FirstRun)
@@ -3621,16 +3616,12 @@ fn load_from_inner_with(
                 Ok((Registry::default(), LoadSource::FirstRun))
             }
         }
-        // Same recovery, different truth: the file is there and we never saw it,
-        // so a default here is a placeholder, not a first run (SBS-900).
-        ReadOutcome::Unreadable => {
-            if let Some(reg) = restore_from_backup(path, migrations, target_version) {
-                record_registry_recovery("missing", None);
-                Ok((reg, LoadSource::Backup))
-            } else {
-                Ok((Registry::default(), LoadSource::Unreadable))
-            }
-        }
+        // We never saw the primary's bytes, so neither an empty default nor
+        // overwriting it from a backup is safe. Leave the evidence intact.
+        ReadOutcome::Unreadable => Err(format!(
+            "Could not read registry at {}. Check file permissions and contents, then try again. The registry and its backups have not been changed.",
+            path.display()
+        )),
         ReadOutcome::Content(content) => {
             // Parse the envelope first so the version is a fact we can check
             // BEFORE deserializing the data model. A newer schema that happens to
@@ -4381,7 +4372,7 @@ pub fn update<T>(
 }
 
 /// Like [`update`], but refuses to mutate or save when the registry was reconstructed from a
-/// backup or defaulted over unreadable contents. Use this for reconciliations whose filesystem
+/// backup. Use this for reconciliations whose filesystem
 /// side effects depend on absence being authoritative: a placeholder registry must never make
 /// rules cleanup look like an intentional clear.
 pub fn update_authoritative<T>(
@@ -7031,13 +7022,8 @@ pub(crate) mod tests {
             return;
         }
 
-        let (loaded, source) = load_from_with_source(&path).unwrap();
-        assert_eq!(source, LoadSource::Unreadable);
-        assert!(
-            !source.is_authoritative(),
-            "a default standing in for contents nobody read is not a first run"
-        );
-        assert!(loaded.http_clients.is_empty(), "it really is a default");
+        let error = load_from_with_source(&path).unwrap_err();
+        assert!(error.contains("Could not read registry"), "{error}");
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
         clear_registry_files(&path);
@@ -7345,6 +7331,10 @@ pub(crate) mod tests {
             4,
             "three copies plus the owner note"
         );
+        for i in 0..5 {
+            let dest = dir.join(format!("registry.json.unreadable-sha256-{}", sha256_hex(&format!("junk-{i}"))));
+            assert_eq!(dest.exists(), i >= 2, "only the newest three copies survive");
+        }
         assert_eq!(migration_backup_files(&path), migration_backups);
         for backup in migration_backups {
             assert_eq!(std::fs::read_to_string(backup).unwrap(), "migration");
