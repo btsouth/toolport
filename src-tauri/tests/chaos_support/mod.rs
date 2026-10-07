@@ -191,6 +191,19 @@ pub fn pid_running(pid: u64) -> bool {
             }
         }
     }
+    // No /proc on macOS; `ps` reports the same state letter.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        if let Ok(output) = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .stderr(Stdio::null())
+            .output()
+        {
+            if String::from_utf8_lossy(&output.stdout).trim_start().starts_with('Z') {
+                return false;
+            }
+        }
+    }
     pid_alive(pid)
 }
 
