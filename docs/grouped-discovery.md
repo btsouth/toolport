@@ -112,7 +112,7 @@ session would break it; grouped mode works everywhere today.
 ## Tokenizer cost
 
 On the shared Linux x64 devbox, matching release builds on the supervisor base
-grew from 30,285,720 to 32,199,600 bytes (+1,913,880 bytes, 6.3%). A release probe
+grew from 30,285,720 to 32,199,592 bytes (+1,913,872 bytes, 6.3%). A release probe
 initialized the bundled cl100k_base vocabulary in 38.2 ms on the telemetry worker;
 a preserved 150,558-byte catalog capture took 6.1 ms to count. This is the trimmed
 audit capture, not a reconstruction of the audit's full 166,913-byte response.
