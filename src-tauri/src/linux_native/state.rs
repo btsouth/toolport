@@ -765,6 +765,7 @@ mod tests {
 
     fn server(id: &str, name: &str, transport: &str) -> ServerEntry {
         ServerEntry {
+            inherit_env: false,
             id: id.to_string(),
             name: name.to_string(),
             transport: transport.to_string(),

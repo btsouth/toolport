@@ -574,6 +574,7 @@ impl Drop for AdapterClient {
 /// test binary) shifts it out from under the delta assertion.
 fn mock_server_entry(id: &str, transcript: &Path, cwd: Option<&str>) -> ServerEntry {
     ServerEntry {
+        inherit_env: false,
         id: id.to_string(),
         name: format!("Mock {id}"),
         transport: "stdio".to_string(),

@@ -686,6 +686,15 @@ pub struct ServerEntry {
     /// Only applies to stdio servers. See issue #239.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Opt a stdio server back in to inheriting the gateway process's whole
+    /// environment (minus the `TOOLPORT_*`/`CONDUIT_*` control variables).
+    /// Unset, the child gets only the non-secret system and toolchain locator
+    /// allowlist (SEC-04), so ambient credentials like `AWS_*`, `GITHUB_TOKEN`
+    /// or `OPENAI_API_KEY` never reach a third-party server. Set only for a
+    /// server that genuinely needs an ambient variable; everything else in the
+    /// gateway's environment is readable by the child.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inherit_env: bool,
     /// Where this entry came from, e.g. "imported:cursor" or "manual".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -4893,6 +4902,7 @@ mod tests {
 
     fn sample_server(name: &str) -> ServerEntry {
         ServerEntry {
+            inherit_env: false,
             id: String::new(),
             name: name.to_string(),
             transport: "stdio".to_string(),
@@ -5786,6 +5796,38 @@ mod tests {
             loaded.initialize_timeout().unwrap(),
             Some(std::time::Duration::from_secs(240))
         );
+    }
+
+    /// SEC-04: `inheritEnv` is additive. A server entry written before it existed
+    /// has no key and must keep round-tripping byte-identically; when a server
+    /// opts in, the `true` survives.
+    #[test]
+    fn inherit_env_is_additive_and_round_trips() {
+        let server = sample_server("github");
+        assert!(!server.inherit_env);
+
+        // Unset must not add a key, so an older entry round-trips unchanged.
+        let json = serde_json::to_string(&server).unwrap();
+        assert!(
+            !json.contains("inheritEnv"),
+            "unset inheritEnv must not be serialized: {json}"
+        );
+        let loaded: ServerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, server);
+        assert_eq!(
+            serde_json::to_string(&loaded).unwrap(),
+            json,
+            "an entry without inheritEnv must round-trip byte-identically"
+        );
+
+        // Opt in, and the true survives a round trip with the key present.
+        let mut on = server;
+        on.inherit_env = true;
+        let json = serde_json::to_string(&on).unwrap();
+        assert!(json.contains("\"inheritEnv\":true"), "{json}");
+        let back: ServerEntry = serde_json::from_str(&json).unwrap();
+        assert!(back.inherit_env);
+        assert_eq!(back, on);
     }
 
     #[test]
@@ -6840,6 +6882,7 @@ mod tests {
 
         let mut reg = Registry::default();
         reg.servers.push(ServerEntry {
+            inherit_env: false,
             id: "s1".into(),
             name: "s1".into(),
             transport: "stdio".into(),
@@ -7425,6 +7468,7 @@ mod registry_version_tests {
 
     fn simple_server(name: &str) -> ServerEntry {
         ServerEntry {
+            inherit_env: false,
             id: String::new(),
             name: name.to_string(),
             transport: "stdio".to_string(),

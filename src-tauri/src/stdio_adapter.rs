@@ -239,11 +239,60 @@ pub fn run_selected_stdio_adapter() {
 /// Start the host daemon as a detached sibling. A new process group keeps the
 /// daemon alive when the client tears down the adapter's group, so the next
 /// adapter finds it through the rendezvous instead of paying a cold start.
+///
+/// The adapter must not hand the daemon the environment the AI client launched it
+/// with (SEC-04): that environment can hold `AWS_*`, `GITHUB_TOKEN`,
+/// `OPENAI_API_KEY` and so on, and the daemon would then serve them to every
+/// client that attaches. The daemon is started from a cleared environment plus
+/// the same non-secret allowlist a downstream child gets, plus Toolport's own
+/// control variables, which it needs to run:
+///
+/// * `TOOLPORT_DATA_DIR` / `CONDUIT_DATA_DIR` and `TOOLPORT_REGISTRY` /
+///   `CONDUIT_REGISTRY` - the data directory and registry to serve, which must
+///   match the adapter's.
+/// * `TOOLPORT_SECRET_KEY` / `CONDUIT_SECRET_KEY` - the file-backend vault master
+///   key; without it the daemon cannot read the secrets it injects into children.
+/// * `TOOLPORT_SECRET_*` - per-secret environment fallbacks the daemon reads for
+///   a server whose secret is not in the vault.
+/// * `TOOLPORT_DISCOVERY`, `TOOLPORT_CODE_MODE`, `TOOLPORT_DEBUG` and their
+///   `CONDUIT_` legacy forms - the discovery, code-mode and trace flags the
+///   daemon bootstraps from.
+/// * `TOOLPORT_PROFILE`, `TOOLPORT_CLIENT_ID` and the legacy pair - the daemon's
+///   bootstrap profile and identity; adapters still pass their own per request.
+/// * `TOOLPORT_HTTP_TOKEN` and friends - only read in an HTTP mode, kept so a
+///   daemon started from an HTTP bridge keeps the same behavior.
+///
+/// The whole namespace is kept rather than a fixed list so a future control
+/// variable cannot silently stop working. None of it reaches the daemon's
+/// children: those go through [`crate::downstream::child_environment`], whose
+/// allowlist has no `TOOLPORT_`/`CONDUIT_` names. The AppImage bundle variables
+/// are kept too, because the daemon is a re-exec of our own bundled payload and
+/// needs the bundle's library paths.
+fn daemon_environment(
+    parent: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut env: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (name, value) in parent {
+        if crate::downstream::is_control_env_name(name)
+            || crate::downstream::is_allowed_child_env_name(name)
+            || crate::hostenv::is_bundled_env_name(name)
+        {
+            env.insert(name.clone(), value.clone());
+        }
+    }
+    env.into_iter().collect()
+}
+
 fn spawn_daemon() -> Result<(), String> {
     let exe = std::env::current_exe()
         .map_err(|error| format!("could not locate this executable: {error}"))?;
+    let parent: std::collections::BTreeMap<String, String> = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
     let mut command = Command::new(exe);
     command
+        .env_clear()
+        .envs(daemon_environment(&parent))
         .arg("--daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1424,6 +1473,50 @@ mod tests {
         ]));
         assert!(!adapter_requested(&["--daemon".to_string()]));
         assert!(!adapter_requested(&[]));
+    }
+
+    /// SEC-04: the daemon must not inherit the client's ambient credentials, but
+    /// it does need the whole Toolport control namespace and the locator vars.
+    #[test]
+    fn daemon_environment_keeps_control_vars_and_drops_ambient_secrets() {
+        let parent: std::collections::BTreeMap<String, String> = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/u"),
+            ("TOOLPORT_DATA_DIR", "/data"),
+            ("TOOLPORT_SECRET_KEY", "vault-key"),
+            ("TOOLPORT_FOO", "future-control"),
+            ("CONDUIT_BAR", "legacy-control"),
+            ("AWS_SECRET_ACCESS_KEY", "aws"),
+            ("GITHUB_TOKEN", "ghp"),
+            ("OPENAI_API_KEY", "sk"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let env: std::collections::BTreeMap<String, String> =
+            daemon_environment(&parent).into_iter().collect();
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/u"));
+        assert_eq!(
+            env.get("TOOLPORT_DATA_DIR").map(String::as_str),
+            Some("/data")
+        );
+        assert_eq!(
+            env.get("TOOLPORT_SECRET_KEY").map(String::as_str),
+            Some("vault-key")
+        );
+        assert_eq!(
+            env.get("TOOLPORT_FOO").map(String::as_str),
+            Some("future-control"),
+            "the whole control namespace is kept, not a fixed list"
+        );
+        assert_eq!(
+            env.get("CONDUIT_BAR").map(String::as_str),
+            Some("legacy-control")
+        );
+        assert!(!env.contains_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!env.contains_key("GITHUB_TOKEN"));
+        assert!(!env.contains_key("OPENAI_API_KEY"));
     }
 
     #[test]

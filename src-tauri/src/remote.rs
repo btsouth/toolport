@@ -1456,6 +1456,7 @@ mod tests {
 
     fn remote_server(url: &str, source: Option<&str>) -> ServerEntry {
         ServerEntry {
+            inherit_env: false,
             id: "t".into(),
             name: "Test".into(),
             transport: "http".into(),

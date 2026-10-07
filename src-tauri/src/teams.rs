@@ -3458,6 +3458,7 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         None => None,
     };
     let mut entry = ServerEntry {
+        inherit_env: false,
         id,
         name: name.to_string(),
         transport,
@@ -4307,6 +4308,7 @@ mod tests {
     fn base_registry() -> Registry {
         let mut r = Registry::default();
         r.servers.push(ServerEntry {
+            inherit_env: false,
             id: "mine".into(),
             name: "Mine".into(),
             transport: "stdio".into(),
@@ -4967,6 +4969,7 @@ mod tests {
         // sync would overwrite the member's own server's secrets/profile/tool routing.
         let mut r = base_registry();
         r.servers.push(ServerEntry {
+            inherit_env: false,
             id: "team_github".into(),
             name: "My own".into(),
             transport: "stdio".into(),
@@ -5107,6 +5110,7 @@ mod tests {
         let mut r = base_registry();
         // Occupy the natural team id so the team server gets a stable alternate id.
         r.servers.push(ServerEntry {
+            inherit_env: false,
             id: "team_github".into(),
             name: "Local GitHub".into(),
             transport: "stdio".into(),
@@ -5580,6 +5584,7 @@ mod tests {
     fn team_id_never_collides_with_a_local_id_under_sanitize() {
         let mut r = base_registry();
         r.servers.push(ServerEntry {
+            inherit_env: false,
             id: "team-acme-crm".into(),
             name: "Team Acme CRM".into(),
             transport: "http".into(),
@@ -6071,6 +6076,7 @@ mod tests {
         let mut r = base_registry(); // has "mine" (manual)
                                      // Toolport's own gateway entry: infra, must never be pushed to the team.
         r.servers.push(ServerEntry {
+            inherit_env: false,
             id: "toolport".into(),
             name: "Toolport".into(),
             transport: "stdio".into(),
@@ -6091,6 +6097,7 @@ mod tests {
         });
         // A team-sourced server: excluded too (don't echo the team's own set back).
         r.servers.push(ServerEntry {
+            inherit_env: false,
             id: "shared".into(),
             name: "Shared".into(),
             transport: "http".into(),
@@ -6535,6 +6542,7 @@ mod tests {
     #[test]
     fn consent_fingerprint_tracks_only_what_runs() {
         let base = ServerEntry {
+            inherit_env: false,
             id: "team_x".into(),
             name: "X".into(),
             transport: "stdio".into(),

@@ -14,7 +14,7 @@ use serde_json::json;
 /// Spawn the mock server with the given cwd and return what its `pwd` tool reports.
 fn reported_cwd(cwd: Option<&str>) -> String {
     let mock = env!("CARGO_BIN_EXE_mock-mcp-server");
-    let transport = StdioTransport::spawn(mock, &[], &[], cwd).expect("spawn mock");
+    let transport = StdioTransport::spawn(mock, &[], &[], cwd, false).expect("spawn mock");
     let server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect mock");
     let mut router = Router::new();

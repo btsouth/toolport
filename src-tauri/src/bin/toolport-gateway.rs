@@ -9729,6 +9729,7 @@ fn connect_one_result(
             &resolved.args,
             &env,
             resolved_cwd.as_deref(),
+            server.inherit_env,
             Arc::clone(dirty),
             resource_updated,
         ) {
@@ -26716,6 +26717,7 @@ mod tests {
         let mut reg = Registry::default();
         for id in ["alpha", "bravo"] {
             reg.servers.push(ServerEntry {
+                inherit_env: false,
                 id: id.into(),
                 name: id.into(),
                 transport: "stdio".into(),
@@ -26784,6 +26786,7 @@ mod tests {
         let mut reg = Registry::default();
         for id in ["github", "atlassian"] {
             reg.servers.push(ServerEntry {
+                inherit_env: false,
                 id: id.into(),
                 name: id.into(),
                 transport: "http".into(),
@@ -26867,6 +26870,7 @@ mod tests {
         // the hint must stay silent - otherwise every server reads as "0 tools".
         let mut reg = Registry::default();
         reg.servers.push(ServerEntry {
+            inherit_env: false,
             id: "github".into(),
             name: "github".into(),
             transport: "http".into(),
@@ -28399,6 +28403,7 @@ mod tests {
 
     fn stub_server(id: &str, name: &str) -> ServerEntry {
         ServerEntry {
+            inherit_env: false,
             id: id.into(),
             name: name.into(),
             transport: "stdio".into(),
@@ -32210,6 +32215,7 @@ mod tests {
         let host = dispatch_host(false);
         let mut reg = Registry::default();
         let id = reg.add_server(registry::ServerEntry {
+            inherit_env: false,
             id: String::new(),
             name: "github".to_string(),
             transport: "stdio".to_string(),

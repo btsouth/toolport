@@ -274,7 +274,13 @@ fn prewarm_launcher(server: &ServerEntry) {
             .cwd
             .as_deref()
             .and_then(|c| resolve_root_token(c, None));
-        if let Ok(t) = StdioTransport::spawn(&command, &resolved.args, &env, cwd.as_deref()) {
+        if let Ok(t) = StdioTransport::spawn(
+            &command,
+            &resolved.args,
+            &env,
+            cwd.as_deref(),
+            server.inherit_env,
+        ) {
             // Attempting the handshake keeps the child alive until the download
             // finishes (dropping the transport kills it), and warms it end-to-end
             // when the server actually comes up.
@@ -5016,6 +5022,7 @@ mod tests {
 
     fn github_with_secret() -> ServerEntry {
         ServerEntry {
+            inherit_env: false,
             id: "gh".into(),
             name: "GitHub".into(),
             transport: "stdio".into(),
@@ -5057,6 +5064,7 @@ mod tests {
 
     fn plain_server(id: &str, name: &str) -> ServerEntry {
         ServerEntry {
+            inherit_env: false,
             id: id.into(),
             name: name.into(),
             transport: "stdio".into(),
@@ -5560,6 +5568,7 @@ mod tests {
         let mut reg = Registry::default();
         reg.add_server(github_with_secret());
         reg.add_server(ServerEntry {
+            inherit_env: false,
             id: String::new(),
             name: "conduit".into(),
             transport: "stdio".into(),
@@ -5669,6 +5678,7 @@ mod tests {
         // A remote server whose URL carries inline creds must not leak them in a share.
         let mut reg = Registry::default();
         reg.add_server(ServerEntry {
+            inherit_env: false,
             id: "remote".into(),
             name: "Remote".into(),
             transport: "http".into(),
@@ -5735,6 +5745,7 @@ mod tests {
 
         let mut reg = Registry::default();
         reg.add_server(ServerEntry {
+            inherit_env: false,
             id: "pg".into(),
             name: "PostgreSQL".into(),
             transport: "stdio".into(),
@@ -5793,6 +5804,7 @@ mod tests {
 
         let mut reg = Registry::default();
         reg.add_server(ServerEntry {
+            inherit_env: false,
             id: "remote".into(),
             name: "Remote".into(),
             transport: "stdio".into(),
@@ -5833,6 +5845,7 @@ mod tests {
         // through the full share path (export -> serialize -> import elsewhere).
         let mut reg = Registry::default();
         reg.add_server(ServerEntry {
+            inherit_env: false,
             id: "pg".into(),
             name: "PostgreSQL".into(),
             transport: "stdio".into(),
@@ -5948,6 +5961,7 @@ mod tests {
     fn diagnostics_redacts_inline_arg_and_url_secrets() {
         let mut reg = Registry::default();
         reg.add_server(ServerEntry {
+            inherit_env: false,
             id: "pg".into(),
             name: "Postgres".into(),
             transport: "stdio".into(),
@@ -5970,6 +5984,7 @@ mod tests {
             unknown_fields: serde_json::Map::new(),
         });
         reg.add_server(ServerEntry {
+            inherit_env: false,
             id: "remote".into(),
             name: "Remote".into(),
             transport: "http".into(),

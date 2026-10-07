@@ -79,8 +79,14 @@ pub fn connect_server(server: &ServerEntry) -> Result<DownstreamServer, String> 
             .as_deref()
             .and_then(|cwd| resolve_root_token(cwd, None));
         let resolved = crate::launch_inputs::resolve_args(server)?;
-        let mut transport = StdioTransport::spawn(command, &resolved.args, &env, cwd.as_deref())
-            .map_err(|error| resolved.redact(error))?;
+        let mut transport = StdioTransport::spawn(
+            command,
+            &resolved.args,
+            &env,
+            cwd.as_deref(),
+            server.inherit_env,
+        )
+        .map_err(|error| resolved.redact(error))?;
         if let Some(timeout) = server.initialize_timeout()? {
             transport.set_connect_timeout(timeout);
         }
@@ -188,6 +194,7 @@ mod tests {
 
     fn server() -> ServerEntry {
         ServerEntry {
+            inherit_env: false,
             id: "probe".into(),
             name: "Probe".into(),
             transport: "stdio".into(),
