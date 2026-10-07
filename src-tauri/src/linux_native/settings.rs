@@ -1293,15 +1293,13 @@ impl SettingsPage {
             dialog.connect_response(None, move |dialog, response| {
                 if response == "add" {
                     let name = label.text().to_string();
-                    let selected = profile.selected();
-                    let profile_id = if selected == 0 {
-                        None
-                    } else if selected == 1 {
-                        Some(crate::registry::ALL_ENABLED_ACCESS.to_string())
-                    } else {
-                        profiles
-                            .get(selected.saturating_sub(1) as usize)
-                            .map(|(id, _)| id.clone())
+                    let profile_id = match http_access_choice(&profiles, profile.selected()) {
+                        Ok(profile) => profile,
+                        Err(error) => {
+                            page_for_response.show_error(&error);
+                            dialog.close();
+                            return;
+                        }
                     };
                     let page = page_for_response.clone();
                     gtk::glib::spawn_future_local(async move {
@@ -2386,9 +2384,46 @@ fn setting_switch_row(title: &str, description: &str) -> (gtk::Box, gtk::Switch)
     (row, toggle)
 }
 
+fn http_access_choice(
+    profiles: &[(String, String)],
+    selected: u32,
+) -> Result<Option<String>, String> {
+    match selected {
+        0 => Ok(None),
+        1 => Ok(Some(crate::registry::ALL_ENABLED_ACCESS.into())),
+        index => profiles
+            .get((index - 2) as usize)
+            .map(|(id, _)| Some(id.clone()))
+            .ok_or_else(|| "The access set is unavailable".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_access_picker_maps_named_sets_and_never_widens_an_invalid_choice() {
+        let profiles = vec![
+            ("default".into(), "Default".into()),
+            ("work".into(), "Work".into()),
+        ];
+        assert_eq!(http_access_choice(&profiles, 0).unwrap(), None);
+        assert_eq!(
+            http_access_choice(&profiles, 1).unwrap().as_deref(),
+            Some(crate::registry::ALL_ENABLED_ACCESS)
+        );
+        assert_eq!(
+            http_access_choice(&profiles, 2).unwrap().as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            http_access_choice(&profiles, 3).unwrap().as_deref(),
+            Some("work")
+        );
+        assert!(http_access_choice(&profiles, 4).is_err());
+    }
+
     use crate::registry_controller::ReleaseAllSummary;
 
     fn blocked(profile: &str, tool: &str) -> QuarantinedTool {
