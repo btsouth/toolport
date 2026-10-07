@@ -2,9 +2,9 @@
 //!
 //! GIO's freedesktop backend forgets a notification once the user clicks it, so
 //! `withdraw_notification` can no longer close it. Notification servers that
-//! keep a clicked urgent notification on screen (the Omarchy shell does) then
-//! show an approval that was already decided. Talking to the server directly
-//! keeps its id so a resolved, expired or replaced approval can be withdrawn.
+//! retain urgent popup cards after sender close (as Omarchy does) need a
+//! replacement to expire them. Track the server id until NotificationClosed,
+//! so withdrawing a dismissed approval never creates a new handled toast.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -66,9 +66,7 @@ impl ApprovalNotification {
                 gio::DBusSignalFlags::NONE,
                 move |signal| {
                     if let Some((id, _reason)) = signal.parameters.get::<(u32, u32)>() {
-                        if id != 0 && id == shown_for_close.get() {
-                            shown_for_close.set(0);
-                        }
+                        forget_closed(&shown_for_close, id);
                     }
                 },
             ));
@@ -132,20 +130,21 @@ impl ApprovalNotification {
             if current.get() == generation {
                 shown.set(id);
             } else if id != 0 && id != shown.get() {
-                withdraw(&connection, id);
+                // A superseded reply is not a tracked, visible prompt. Replacing
+                // it could create a fresh toast if the server already closed it.
+                close(&connection, id);
             }
         });
     }
 
-    /// Close the approval notification, clicked or not.
+    /// Withdraw only an approval the server has not reported closed.
     pub(super) fn withdraw(&self) {
         let Some(connection) = &self.connection else {
             self.app.withdraw_notification(FALLBACK_ID);
             return;
         };
         self.bump();
-        let id = self.shown.replace(0);
-        if id != 0 {
+        if let Some(id) = take_shown(&self.shown) {
             withdraw(connection, id);
         }
     }
@@ -174,36 +173,51 @@ fn withdrawal_parameters(id: u32) -> glib::Variant {
         .to_variant()
 }
 
+// NotificationClosed applies to every reason (expiry, dismissal, sender close).
+// An unrelated or old id must not clear a newer approval notification.
+fn forget_closed(shown: &Cell<u32>, id: u32) {
+    if id != 0 && id == shown.get() {
+        shown.set(0);
+    }
+}
+
+fn take_shown(shown: &Cell<u32>) -> Option<u32> {
+    match shown.replace(0) {
+        0 => None,
+        id => Some(id),
+    }
+}
+
 fn withdraw(connection: &gio::DBusConnection, id: u32) {
     // Omarchy ignores sender close for popup cards; a low-urgency replacement
     // expires instead. Keep close for notification servers that honor it.
-    let connection = connection.clone();
-    glib::spawn_future_local(async move {
-        let reply = connection
-            .call_future(
-                Some(BUS_NAME),
-                OBJECT_PATH,
-                BUS_NAME,
-                "Notify",
-                Some(&withdrawal_parameters(id)),
-                Some(glib::VariantTy::new("(u)").expect("static variant type")),
-                gio::DBusCallFlags::NONE,
-                5000,
-            )
-            .await;
-        let close_id = match reply {
-            Ok(reply) => reply
-                .child_value(0)
-                .get::<u32>()
-                .filter(|id| *id != 0)
-                .unwrap_or(id),
-            Err(error) => {
-                eprintln!("toolport-gtk: could not replace the approval notification: {error}");
-                id
-            }
-        };
-        close(&connection, close_id);
-    });
+    // Dispatch now rather than queueing a future after forgetting the shown id.
+    let connection_for_close = connection.clone();
+    connection.call(
+        Some(BUS_NAME),
+        OBJECT_PATH,
+        BUS_NAME,
+        "Notify",
+        Some(&withdrawal_parameters(id)),
+        Some(glib::VariantTy::new("(u)").expect("static variant type")),
+        gio::DBusCallFlags::NONE,
+        5000,
+        gio::Cancellable::NONE,
+        move |reply| {
+            let close_id = match reply {
+                Ok(reply) => reply
+                    .child_value(0)
+                    .get::<u32>()
+                    .filter(|id| *id != 0)
+                    .unwrap_or(id),
+                Err(error) => {
+                    eprintln!("toolport-gtk: could not replace the approval notification: {error}");
+                    id
+                }
+            };
+            close(&connection_for_close, close_id);
+        },
+    );
 }
 
 fn close(connection: &gio::DBusConnection, id: u32) {
@@ -224,6 +238,31 @@ fn close(connection: &gio::DBusConnection, id: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_notification_is_not_withdrawn_or_replaced() {
+        let shown = Cell::new(42);
+        forget_closed(&shown, 42);
+        assert_eq!(take_shown(&shown), None);
+    }
+
+    #[test]
+    fn unrelated_close_keeps_the_visible_notification() {
+        let shown = Cell::new(42);
+        forget_closed(&shown, 0);
+        forget_closed(&shown, 41);
+        assert_eq!(take_shown(&shown), Some(42));
+        assert_eq!(take_shown(&shown), None);
+    }
+
+    #[test]
+    fn old_close_does_not_forget_a_new_notification() {
+        let shown = Cell::new(42);
+        forget_closed(&shown, 42);
+        shown.set(43);
+        forget_closed(&shown, 42);
+        assert_eq!(take_shown(&shown), Some(43));
+    }
 
     #[test]
     fn withdrawal_replaces_the_pending_id_without_actions_or_critical_urgency() {
