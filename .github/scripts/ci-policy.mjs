@@ -46,6 +46,7 @@ export function requireResults(needs) {
   for (const job of [
     "changes",
     "frontend",
+    "linux-packages",
     "installer-script",
     "installer-script-bash",
     "pinned-install-urls",

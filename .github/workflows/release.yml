@@ -29,6 +29,29 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  linux-packages:
+    uses: ./.github/workflows/linux-packages.yml
+
+  linux-package-upload:
+    name: Attach GTK packages to draft
+    needs: [build, linux-packages]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: gtk-linux-packages
+          path: gtk-packages
+      - name: Attach the tested deb and rpm
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
+        with:
+          draft: true
+          name: Toolport ${{ github.ref_name }}
+          files: |
+            gtk-packages/*.deb
+            gtk-packages/*.rpm
+          fail_on_unmatched_files: true
+
   build:
     # Backstop only - GitHub defaults to 360 minutes. Deliberately generous: bundles Tauri on four targets and waits on Apple notarisation.
     # A tight limit here would kill a legitimate release, which costs more than a hang.
@@ -46,7 +69,7 @@ jobs:
             bundles: app
             target: x86_64-apple-darwin
           - os: ubuntu-22.04
-            bundles: deb,appimage
+            bundles: appimage
     runs-on: ${{ matrix.os }}
     env:
       # Presence flag only; job-level env is available when steps.if is evaluated.
@@ -328,7 +351,6 @@ jobs:
             src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
             src-tauri/target/*/release/bundle/macos/Toolport_*-apple-darwin.app.tar.gz
             src-tauri/target/*/release/bundle/macos/Toolport_*-apple-darwin.app.tar.gz.sig
-            src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/appimage/*.AppImage
             src-tauri/target/release/bundle/appimage/*.AppImage.sig
 

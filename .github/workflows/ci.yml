@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, next/2.0]
 
 # A new push to a PR cancels the in-flight run for that ref.
 concurrency:
@@ -15,6 +15,10 @@ permissions:
   contents: read
 
 jobs:
+  linux-packages:
+    name: GTK deb and rpm install tests
+    uses: ./.github/workflows/linux-packages.yml
+
   changes:
     name: Select checks
     runs-on: ubuntu-22.04
@@ -434,6 +438,7 @@ jobs:
       - build-test
       - cross-platform-rust
       - linux-native
+      - linux-packages
       - chaos
       - installer-script
       - installer-script-bash

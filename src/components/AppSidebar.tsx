@@ -32,6 +32,7 @@ import {
   checkForUpdate,
   installUpdate,
   releasePageUrl,
+  systemPackageUpdateAdvice,
   type SystemPackage,
   type UpdateProgress,
 } from "@/lib/updater";
@@ -66,7 +67,7 @@ function updateProgressLabel(progress: UpdateProgress | null): string {
  * release is published. The check is best-effort: any failure (dev build,
  * offline, no manifest yet) just shows the current version. Clicking downloads,
  * installs, and relaunches into the new version, except on .deb and .rpm installs,
- * which link to the release page instead. */
+ * which show package-manager guidance and link to release notes. */
 function VersionFooter({
   onImport,
   onReplay,
@@ -351,11 +352,7 @@ function UpdateNotes({
             </p>
           )}
           {systemPackage && (
-            <p className="text-sm text-muted-foreground">
-              This copy was installed from a .{systemPackage} package, so Toolport can't
-              replace it itself. Download the new .{systemPackage} and install it the same
-              way.
-            </p>
+            <p className="text-sm text-muted-foreground">{systemPackageUpdateAdvice()}</p>
           )}
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={() => onOpenChange(false)}>
@@ -368,7 +365,7 @@ function UpdateNotes({
                   void openExternal(releasePageUrl(update.version));
                 }}
               >
-                <ExternalLink className="size-4" /> Open download page
+                <ExternalLink className="size-4" /> View release notes
               </Button>
             ) : (
               <Button onClick={onInstall} disabled={installing}>

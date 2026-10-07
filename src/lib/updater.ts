@@ -168,7 +168,12 @@ async function systemPackage(): Promise<SystemPackage | null> {
   return null;
 }
 
-/** Release page for a version, where package installs download the new build. */
+/** System packages update through the manager that installed them. */
+export function systemPackageUpdateAdvice(): string {
+  return "Update Toolport through your package manager (apt, dnf, or pacman). If you use a package repository, refresh it before upgrading.";
+}
+
+/** Release notes for a version, including system-managed installs. */
 export function releasePageUrl(version: string): string {
   return `https://github.com/btsouth/toolport/releases/tag/v${version}`;
 }

@@ -51,6 +51,7 @@ function results(selected) {
     [
       "changes",
       "frontend",
+      "linux-packages",
       "installer-script",
       "installer-script-bash",
       "pinned-install-urls",

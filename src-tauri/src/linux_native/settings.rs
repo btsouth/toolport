@@ -311,7 +311,7 @@ impl SettingsPage {
         );
         updates_copy.append(
             &gtk::Label::builder()
-                .label("The native Linux app never downloads or replaces itself. Update Toolport through Omarchy or your normal pacman upgrade flow.")
+                .label("Update Toolport through your package manager: apt on Debian or Ubuntu, dnf on Fedora, or pacman on Arch and Omarchy.")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)

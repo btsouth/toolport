@@ -86,17 +86,11 @@ shipped, so submitting it unchanged re-submits that version's metadata and the n
 release never reaches winget. Check it with `winget validate --manifest <dir>`
 before opening the PR.
 
-Publishing also triggers the **AUR** (`aur.yml`): it renders
-`PKGBUILD`/`.SRCINFO` from the published `.deb` with `scripts/render-aur.sh`,
-builds the package in an `archlinux:base-devel` container to prove the PKGBUILD
-works, and pushes `toolport-bin`. Same reason as winget for waiting on publish:
-the sha256sums must come from assets that are actually downloadable. It skips
-prereleases (an Arch `pkgver` cannot carry `-rc.1`), and no-ops with a warning
-unless the `AUR_SSH_PRIVATE_KEY` secret is set, so it can never fail a release.
-One-time setup and how to publish by hand are in
-[`packaging/linux/aur/README.md`](../packaging/linux/aur/README.md). `PKGBUILD`
-is deliberately NOT checked in: it pins one release's checksum, so a tracked copy
-would only ever be stale.
+Linux system packages now ship the GTK shell as `.deb` and `.rpm`, built once on
+Ubuntu 24.04 and tested before upload to the draft. The Tauri AppImage remains the
+fallback for Ubuntu 22.04 and keeps its in-app updater. The AUR repackage workflow
+is retired; Arch uses the native pacman package. See
+[`docs/linux-packages.md`](linux-packages.md) for build and upgrade checks.
 
 Publishing is also when the **Homebrew tap** is bumped, and that is now
 automatic. `brew install --cask btsouth/toolport/toolport` and
