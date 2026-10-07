@@ -29,6 +29,8 @@
 //!   `n` starts exit before the handshake, like a server launched before the
 //!   network is up. The counter file records every start, so a test can also
 //!   count how often the gateway retried.
+//! - `MOCK_MCP_CALL_DELAY_MS=<ms>` — every `tools/call` waits this long before
+//!   answering, so a test can hold the gateway's request workers busy.
 //!
 //! The default configuration (no env set) is byte-identical to the pre-SOU-443
 //! fixture apart from the added `echo_meta` tool, so `list_changed`,
@@ -104,6 +106,7 @@ struct Config {
     revision: Revision,
     strict: bool,
     transcript: Option<String>,
+    call_delay: Option<std::time::Duration>,
 }
 
 impl Config {
@@ -114,6 +117,10 @@ impl Config {
             transcript: std::env::var("MOCK_MCP_TRANSCRIPT")
                 .ok()
                 .filter(|p| !p.is_empty()),
+            call_delay: std::env::var("MOCK_MCP_CALL_DELAY_MS")
+                .ok()
+                .and_then(|raw| raw.trim().parse().ok())
+                .map(std::time::Duration::from_millis),
         }
     }
 }
@@ -406,6 +413,9 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
         "resources/templates/list" => json!({ "resourceTemplates": [] }),
         "prompts/list" => prompt_list(state.grown),
         "tools/call" => {
+            if let Some(delay) = cfg.call_delay {
+                std::thread::sleep(delay);
+            }
             let params = req.get("params");
             let name = params
                 .and_then(|p| p.get("name"))

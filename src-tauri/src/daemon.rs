@@ -51,7 +51,12 @@ const DESCRIPTOR_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 /// on it. A loaded machine can outrun [`PROBE_TIMEOUT`] while its daemon is
 /// perfectly live. Twenty concurrent adapters exceeded the old six-second
 /// budget on macOS CI; silence alone is never evidence against the pointer.
-const SILENT_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
+///
+/// It is also the bound after which an adapter treats a daemon as wedged and
+/// moves its client to a private gateway. The identity probe is answered
+/// outside the request worker pool, so this much silence means the process is
+/// stopped or its accept path is stuck, not that it is busy with calls.
+pub const SILENT_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 const READY_POLL: Duration = Duration::from_millis(50);
 /// Operational idle grace: the daemon exits after this long with no requests.
 /// A default, not a user setting, in the first release.
@@ -203,6 +208,50 @@ pub fn probe_identity(descriptor: &DaemonDescriptor) -> Result<DaemonIdentity, S
     })
 }
 
+/// What one authenticated identity probe says about a daemon an adapter is
+/// already using.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Health {
+    /// It answered the handshake.
+    Answering,
+    /// It accepted the connection, or answered busy, but gave no identity
+    /// within the probe budget.
+    Silent,
+    /// Nothing usable is there any more.
+    Gone,
+}
+
+/// One bounded liveness check against a daemon this process already trusts.
+pub fn probe_health(descriptor: &DaemonDescriptor) -> Health {
+    match attempt_identity_probe(descriptor) {
+        Ok(_) => Health::Answering,
+        Err(ProbeFailure::Silent) => Health::Silent,
+        Err(ProbeFailure::Answered(_) | ProbeFailure::Unreachable) => Health::Gone,
+    }
+}
+
+/// One-line health notes `toolport_status` shows for this process, such as a
+/// client moved to a private gateway because the shared daemon stopped answering.
+static STATUS_NOTES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Record a note for `toolport_status`. Repeats are kept once.
+pub fn add_status_note(note: impl Into<String>) {
+    let note = note.into();
+    let mut notes = STATUS_NOTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !notes.contains(&note) {
+        notes.push(note);
+    }
+}
+
+pub fn status_notes() -> Vec<String> {
+    STATUS_NOTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// Request a graceful exit. The daemon keeps serving while any session, public
 /// service lease, or request is active and withdraws its descriptor before exit.
 pub fn request_shutdown_if_idle(descriptor: &DaemonDescriptor) -> Result<(), String> {
@@ -243,9 +292,12 @@ enum ProbeFailure {
 /// Read the outcome out of a ureq error. A refused or reset connection, or an
 /// endpoint that cannot be parsed or resolved, says the pointer is unusable
 /// garbage; an answered status or a mangled response says someone else owns
-/// the port; silence alone says nothing either way.
+/// the port; silence alone says nothing either way. A busy answer (503 or 429)
+/// is a live daemon shedding load, so it counts as silence: clearing its
+/// pointer would elect a second daemon beside it.
 fn classify_probe_error(error: ureq::Error) -> ProbeFailure {
     match &error {
+        ureq::Error::Status(429 | 503, _) => ProbeFailure::Silent,
         ureq::Error::Status(..) => ProbeFailure::Answered(error.to_string()),
         ureq::Error::Transport(transport) => {
             let io_kind = transport_io_kind(transport);
@@ -313,6 +365,31 @@ fn attempt_identity_probe(descriptor: &DaemonDescriptor) -> Result<DaemonIdentit
         .map_err(|e| ProbeFailure::Answered(format!("Daemon identity was not valid JSON: {e}")))
 }
 
+/// Why [`Rendezvous::ensure`] could not hand back a daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnsureError {
+    /// A daemon owns the pointer but stayed silent for [`SILENT_RETRY_TIMEOUT`].
+    /// Its descriptor was left in place and nothing was spawned beside it.
+    Unresponsive(DaemonDescriptor),
+    /// Anything else: the election, the spawn, or readiness failed.
+    Failed(String),
+}
+
+impl std::fmt::Display for EnsureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unresponsive(descriptor) => f.write_str(&unresponsive_daemon_error(descriptor)),
+            Self::Failed(detail) => f.write_str(detail),
+        }
+    }
+}
+
+impl From<String> for EnsureError {
+    fn from(detail: String) -> Self {
+        Self::Failed(detail)
+    }
+}
+
 /// One compatibility domain's rendezvous: the data directory and the build it may
 /// share a runtime with.
 ///
@@ -343,7 +420,7 @@ impl Rendezvous {
     pub fn ensure(
         &self,
         mut spawn: impl FnMut() -> Result<(), String>,
-    ) -> Result<DaemonDescriptor, String> {
+    ) -> Result<DaemonDescriptor, EnsureError> {
         let path = self.descriptor_path();
         // A descriptor may appear while we wait for the election lock. If it
         // then stays silent, retry outside the lock so other adapters are not
@@ -356,7 +433,7 @@ impl Rendezvous {
                 Probe::Live(descriptor) => return Ok(descriptor),
                 // A silent daemon may still be alive: reuse is unproven, and
                 // clearing or spawning beside it is the double-election defect.
-                Probe::Silent(descriptor) => return Err(unresponsive_daemon_error(&descriptor)),
+                Probe::Silent(descriptor) => return Err(EnsureError::Unresponsive(descriptor)),
                 Probe::Gone => {}
             }
 
@@ -374,7 +451,7 @@ impl Rendezvous {
                 match self.probe_for_reuse(&path) {
                     Probe::Live(descriptor) => return Ok(descriptor),
                     Probe::Silent(descriptor) => {
-                        return Err(unresponsive_daemon_error(&descriptor));
+                        return Err(EnsureError::Unresponsive(descriptor));
                     }
                     Probe::Gone => continue,
                 }
@@ -390,7 +467,7 @@ impl Rendezvous {
                     match self.probe_for_reuse(&path) {
                         Probe::Live(descriptor) => return Ok(descriptor),
                         Probe::Silent(descriptor) => {
-                            return Err(unresponsive_daemon_error(&descriptor));
+                            return Err(EnsureError::Unresponsive(descriptor));
                         }
                         Probe::Gone => continue,
                     }
@@ -414,9 +491,13 @@ impl Rendezvous {
                 }
                 std::thread::sleep(READY_POLL);
             }
-            return Err("the daemon did not become ready before the deadline".to_string());
+            return Err("the daemon did not become ready before the deadline"
+                .to_string()
+                .into());
         }
-        Err("the daemon descriptor changed repeatedly during startup".to_string())
+        Err("the daemon descriptor changed repeatedly during startup"
+            .to_string()
+            .into())
     }
 
     /// Read, claim-check, then prove with the authenticated handshake. A
@@ -667,6 +748,48 @@ mod tests {
         endpoint
     }
 
+    /// A listener that answers every request with `status`, as a saturated
+    /// daemon used to answer its own identity probe.
+    fn start_status_responder(status: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut scratch = [0u8; 1024];
+                let _ = stream.read(&mut scratch);
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        endpoint
+    }
+
+    #[test]
+    fn a_busy_answer_is_silence_not_a_stale_pointer() {
+        let key = CompatKey::new("test", "scratch");
+        for status in ["503 Service Unavailable", "429 Too Many Requests"] {
+            let descriptor = DaemonDescriptor::new(start_status_responder(status), "busy", &key);
+            assert!(
+                matches!(
+                    attempt_identity_probe(&descriptor),
+                    Err(ProbeFailure::Silent)
+                ),
+                "{status} must not let the rendezvous clear a live daemon's pointer"
+            );
+            assert_eq!(probe_health(&descriptor), Health::Silent);
+        }
+        let refused = DaemonDescriptor::new(start_status_responder("401 Unauthorized"), "x", &key);
+        assert!(matches!(
+            attempt_identity_probe(&refused),
+            Err(ProbeFailure::Answered(_))
+        ));
+    }
+
     #[test]
     fn descriptor_path_is_keyed_by_compat() {
         let dir = temp_dir("keyed");
@@ -848,7 +971,8 @@ mod tests {
                 let _ = start_listener(&closure_dir, &closure_compat);
                 Ok(())
             })
-            .expect_err("a silent daemon must not be silently replaced");
+            .expect_err("a silent daemon must not be silently replaced")
+            .to_string();
         assert!(
             error.contains(&wedged.endpoint),
             "the error must name the unresponsive daemon: {error}"
