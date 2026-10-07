@@ -388,11 +388,7 @@ fn client_access_label(registry: &Registry, scope: Option<&str>) -> String {
                 .find(|p| p.id == reference || p.name == reference)
                 .map(|p| p.name.clone())
                 .unwrap_or_else(|| format!("{reference} (unavailable)"));
-            if scope.is_none() {
-                format!("Default: {name}")
-            } else {
-                name
-            }
+            name
         }
     }
 }
@@ -808,7 +804,7 @@ mod tests {
         let mut registry = Registry::default();
         assert_eq!(client_access_label(&registry, None), "All enabled servers");
         registry.default_access_profile_id = Some("default".into());
-        assert_eq!(client_access_label(&registry, None), "Default: Default");
+        assert_eq!(client_access_label(&registry, None), "Default");
         assert_eq!(
             client_access_label(&registry, Some(crate::registry::ALL_ENABLED_ACCESS)),
             "All enabled servers"

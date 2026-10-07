@@ -2660,22 +2660,6 @@ fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuBu
     content.set_margin_start(6);
     content.set_margin_end(6);
 
-    let active = toolport_menu_button("Default access");
-    let client_for_active = client.clone();
-    let page_for_active = page.clone();
-    let menu_for_active = menu.clone();
-    active.connect_clicked(move |button| {
-        menu_for_active.popdown();
-        run_client_mutation(
-            &client_for_active,
-            true,
-            false,
-            None,
-            button,
-            page_for_active.clone(),
-        );
-    });
-    content.append(&active);
     let all = toolport_menu_button("All enabled servers");
     let all_client = client.clone();
     let all_page = page.clone();
@@ -5700,7 +5684,7 @@ fn build_content(
 
     let profile_actions = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
-        .tooltip_text("Profile actions")
+        .tooltip_text("Server actions")
         .build();
     profile_actions.add_css_class("flat");
     let profile_popover = toolport_menu_popover();
@@ -5715,7 +5699,7 @@ fn build_content(
     profile_action_list.append(&disable_all);
     profile_popover.set_child(Some(&profile_action_list));
     profile_actions.set_popover(Some(&profile_popover));
-    page.append(&profile_actions);
+    header.pack_end(&profile_actions);
 
     let section_title = gtk::Label::builder()
         .label("Servers")

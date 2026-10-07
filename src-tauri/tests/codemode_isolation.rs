@@ -427,7 +427,7 @@ fn mock_registry(reg: &mut Registry, dir: &Path) {
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_mock-mcp-server").into()),
     );
     reg.servers.push(serde_json::from_value(json!({
-        "id": "s", "name": "Fixture", "transport": "stdio", "command": mock,
+        "id": "s", "name": "Fixture", "transport": "stdio", "command": mock, "enabled": true,
         "env": [{ "key": "MOCK_MCP_TRANSCRIPT", "value": dir.join("downstream.jsonl"), "secret": false }]
     })).unwrap());
     reg.profiles[0].enabled_server_ids.push("s".into());

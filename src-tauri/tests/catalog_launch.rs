@@ -338,7 +338,7 @@ fn legacy_twilio_migration_keeps_vault_keys_and_requires_missing_account_setup()
     let path = fixture.dir.join("registry.json");
     let mut reg = registry::Registry::default();
     let old: registry::ServerEntry = serde_json::from_value(json!({
-        "id":"twilio-work", "name":"Twilio", "source":"catalog:curated",
+        "id":"twilio-work", "name":"Twilio", "source":"catalog:curated", "enabled":true,
         "transport":"stdio", "command":"npx", "args":["-y","@twilio-alpha/mcp"],
         "env":[{"key":"TWILIO_API_KEY","secret":true},{"key":"TWILIO_API_SECRET","secret":true}]
     }))

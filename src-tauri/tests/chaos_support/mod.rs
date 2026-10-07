@@ -143,6 +143,11 @@ pub fn set_enabled(dir: &Path, enabled: &[&str]) {
     let raw = std::fs::read_to_string(&path).expect("read registry");
     let mut registry: Value = serde_json::from_str(&raw).expect("parse registry");
     registry["profiles"][0]["enabledServerIds"] = json!(enabled);
+    if registry["version"].as_u64().unwrap_or(1) >= 3 {
+        for server in registry["servers"].as_array_mut().unwrap() {
+            server["enabled"] = json!(enabled.contains(&server["id"].as_str().unwrap()));
+        }
+    }
     let tmp = dir.join("registry.json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&registry).unwrap()).expect("write registry");
     std::fs::rename(&tmp, &path).expect("publish registry");
