@@ -843,8 +843,14 @@ fn process_report(needle: &str) -> Vec<String> {
 
 #[cfg(unix)]
 fn process_command_lines() -> Vec<String> {
+    // `-ww` is load-bearing, not cosmetic: without it `ps` truncates the command
+    // to the inherited `COLUMNS` width, which cuts the scratch directory off the
+    // tail of `mock-mcp-server <data-dir>/downstream.jsonl`. The per-case child
+    // count then reads zero and the pooling rows flake on any machine whose
+    // environment exports COLUMNS (a terminal, a CI runner). `process_report`
+    // already asks for unlimited width for the same reason.
     let output = Command::new("ps")
-        .args(["-axo", "command="])
+        .args(["-ww", "-axo", "command="])
         .output()
         .expect("run ps");
     String::from_utf8_lossy(&output.stdout)
@@ -867,6 +873,78 @@ fn process_command_lines() -> Vec<String> {
         .lines()
         .map(str::to_string)
         .collect()
+}
+
+/// Regression: the process table is machine-wide, so a per-case count is only
+/// right when the case's scratch directory survives into the `ps` output. `ps`
+/// clips `command=` to the inherited `COLUMNS` width, so a probe whose marker
+/// sits at the end of a long command line must still be visible.
+#[cfg(unix)]
+#[test]
+fn process_command_lines_are_not_truncated_by_columns() {
+    // Serialized with the matrix rows so the global COLUMNS set below cannot race
+    // a case that is counting processes.
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = std::env::var_os("COLUMNS");
+    struct RestoreColumns(Option<std::ffi::OsString>);
+    impl Drop for RestoreColumns {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("COLUMNS", value),
+                None => std::env::remove_var("COLUMNS"),
+            }
+        }
+    }
+    // Restore even on failure, so a regression cannot leak the narrow width.
+    let _restore = RestoreColumns(previous);
+    std::env::set_var("COLUMNS", "40");
+
+    let marker = format!(
+        "toolport-columns-probe-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let pad = "x".repeat(240);
+    // `read` is a shell builtin, so the shell stays in the process table with
+    // this exact argv. A `sh -c "sleep 30"` probe execs the lone command
+    // instead, and the kernel replaces the argv with `sleep 30`, dropping the
+    // marker. bash does that exec (it is macOS `/bin/sh`), dash does not (it is
+    // the Linux CI `/bin/sh`), so the exec version only tested the width on
+    // Linux. stdin stays open in the guard below, so `read` blocks until the
+    // probe is killed.
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg("read _line")
+        .arg(&pad)
+        .arg(&marker)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn a long-command probe");
+    struct ProbeGuard(std::process::Child);
+    impl Drop for ProbeGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _probe = ProbeGuard(child);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if process_command_lines()
+            .iter()
+            .any(|line| line.contains(marker.as_str()))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "COLUMNS truncated the probe's long command line out of the process table"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn kill_daemons(dir: &Path) {
