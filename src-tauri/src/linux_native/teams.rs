@@ -63,10 +63,7 @@ impl TeamsPage {
         // not quote is how two surfaces end up making two different claims.
         title_row.append(
             &gtk::Label::builder()
-                .label(format!(
-                    "Free for up to {} people",
-                    crate::teams_plan::FREE_SEATS
-                ))
+                .label(format!("Free for {} people", crate::teams_plan::FREE_SEATS))
                 .valign(gtk::Align::Center)
                 .css_classes(["toolport-badge", "success", "caption"])
                 .build(),
