@@ -502,6 +502,8 @@ fn disabling_a_failing_server_stops_its_retries() {
     ];
     write_registry(&dir, &servers, &["good", "broken"]);
     let mut gateway = Gateway::start(&dir);
+    // Uncached discovery is first use; daemon boot alone is lazy.
+    gateway.tool_names();
     wait_for("retries", Duration::from_secs(60), || {
         read_count(&counter) >= 3
     });
@@ -544,11 +546,12 @@ fn calls_do_not_respawn_servers_that_are_waiting_to_retry() {
         &["down"],
     );
     let mut gateway = Gateway::start_with_backoff(&dir, "60000");
+    gateway.tool_names();
     wait_for("the failed first connect", Duration::from_secs(60), || {
         gateway.status().contains("Not connected yet")
     });
     let after_first = read_count(&counter);
-    assert!(after_first >= 1, "the first build started the server");
+    assert!(after_first >= 1, "first discovery started the server");
     for _ in 0..5 {
         let status = gateway.status();
         assert!(status.contains("down"), "{status}");

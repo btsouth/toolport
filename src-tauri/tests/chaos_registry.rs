@@ -120,3 +120,130 @@ fn rapid_registry_toggles_do_not_break_a_stable_server() {
         "the re-enabled server answered wrong: {back}"
     );
 }
+
+#[test]
+fn editing_one_server_preserves_the_other_pid_and_in_flight_call() {
+    let scratch = Scratch::new("incremental-reload");
+    let a_pids = scratch.join("a.pids");
+    let b_pids = scratch.join("b.pids");
+    let transcript = scratch.join("b.requests");
+    let a_path = a_pids.to_string_lossy();
+    let b_path = b_pids.to_string_lossy();
+    let transcript_path = transcript.to_string_lossy();
+    let mut a = mock_entry("a", &[("MOCK_MCP_PID_FILE", &a_path)]);
+    let b = mock_entry(
+        "b",
+        &[
+            ("MOCK_MCP_PID_FILE", &b_path),
+            ("MOCK_MCP_TRANSCRIPT", &transcript_path),
+            ("MOCK_MCP_CONCURRENT", "1"),
+        ],
+    );
+    write_registry(scratch.path(), &[a.clone(), b.clone()], &["a", "b"]);
+    let _daemon = start_daemon(scratch.path());
+    let mut client = Client::start(scratch.path(), "observer");
+    assert!(client.wait_for_tool("a__echo", CATALOG));
+    assert!(client.wait_for_tool("b__sleep", CATALOG));
+    let old_a = std::fs::read_to_string(&a_pids).unwrap();
+    let old_b = std::fs::read_to_string(&b_pids).unwrap();
+    let mut worker = Client::start(scratch.path(), "worker");
+    let call = worker.call_async("b__sleep", json!({"ms": 6000}));
+    wait_for(
+        "B's call to reach its child",
+        Duration::from_secs(10),
+        || {
+            std::fs::read_to_string(&transcript)
+                .unwrap_or_default()
+                .contains("\"name\":\"sleep\"")
+        },
+    );
+    a["env"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"key":"RELOAD_REVISION", "value":"2", "secret":false}));
+    write_registry(scratch.path(), &[a, b], &["a", "b"]);
+    // Demand A after the edit; it must receive a new supervisor/child while B
+    // is still sleeping. The stable catalog stays readable throughout.
+    wait_for("A's replacement", Duration::from_secs(20), || {
+        let _ = client.call("a__echo", json!({"text":"changed"}));
+        std::fs::read_to_string(&a_pids)
+            .unwrap_or_default()
+            .lines()
+            .count()
+            > old_a.lines().count()
+    });
+    let list_started = std::time::Instant::now();
+    assert!(client.tool_names().contains(&"b__sleep".to_string()));
+    assert!(list_started.elapsed() < Duration::from_secs(2));
+    let reply = worker.wait_for_id(call, Duration::from_secs(15));
+    assert!(
+        !reply["result"]["isError"].as_bool().unwrap_or(false),
+        "B's call failed: {reply}"
+    );
+    assert!(reply.get("error").is_none(), "B's call failed: {reply}");
+    assert_eq!(
+        std::fs::read_to_string(&b_pids).unwrap(),
+        old_b,
+        "editing A restarted B"
+    );
+    assert!(chaos_support::reply_ok(
+        &client.call("b__echo", json!({"text":"steady"})),
+        "steady"
+    ));
+}
+
+#[test]
+fn a_cached_server_stays_lazy_then_stops_when_idle_and_restarts_on_use() {
+    let scratch = Scratch::new("lazy-idle");
+    let pids = scratch.join("lazy.pids");
+    let pid_path = pids.to_string_lossy();
+    write_registry(
+        scratch.path(),
+        &[mock_entry("lazy", &[("MOCK_MCP_PID_FILE", &pid_path)])],
+        &["lazy"],
+    );
+    let raw = json!({"name":"echo", "description":"Echo", "inputSchema":{"type":"object"}});
+    let mut exposed = raw.clone();
+    exposed["name"] = json!("lazy__echo");
+    std::fs::write(
+        scratch.join("tool-cache.json"),
+        json!({"version":1,"tools":[exposed]}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        scratch.join("tool-cache.servers.json"),
+        json!({"version":1,"servers":{"lazy":[raw]}}).to_string(),
+    )
+    .unwrap();
+    let _daemon = start_daemon(scratch.path());
+    let mut client = Client::start(scratch.path(), "lazy-client");
+    assert!(client.wait_for_tool("lazy__echo", CATALOG));
+    // Give the watcher and catalog publication time to run. Cached discovery
+    // alone must never launch this server.
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!pids.exists(), "cached discovery spawned a lazy server");
+    assert!(chaos_support::reply_ok(
+        &client.call("lazy__echo", json!({"text":"chaos"})),
+        "chaos"
+    ));
+    let first = std::fs::read_to_string(&pids).unwrap();
+    let pid = first.lines().last().unwrap().parse().unwrap();
+    wait_for(
+        "the idle server to stop",
+        conduit_lib::router::SERVER_IDLE_TIMEOUT + Duration::from_secs(20),
+        || !chaos_support::pid_running(pid),
+    );
+    assert!(client.tool_names().contains(&"lazy__echo".to_string()));
+    assert_eq!(
+        std::fs::read_to_string(&pids).unwrap(),
+        first,
+        "cached discovery restarted an idle server"
+    );
+    assert!(chaos_support::reply_ok(
+        &client.call("lazy__echo", json!({"text":"chaos"})),
+        "chaos"
+    ));
+    let second = std::fs::read_to_string(&pids).unwrap();
+    assert_eq!(second.lines().count(), first.lines().count() + 1);
+    assert_ne!(second.lines().last(), first.lines().last());
+}

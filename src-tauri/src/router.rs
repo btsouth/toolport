@@ -13,7 +13,7 @@
 //! map so `tools/call` still forwards the server's real, hyphenated tool name.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -599,6 +599,10 @@ struct ServerSlot {
     /// call that could still be using the connection it replaces.
     handle_calls: AtomicUsize,
     reconnect_gate: Mutex<()>,
+    supervisor: Option<Mutex<Supervisor>>,
+    /// Set when a rebuild replaced or removed this supervisor. It finishes
+    /// active calls but never starts again, and its waiters fail fast.
+    retired: AtomicBool,
 }
 
 impl ServerSlot {
@@ -614,6 +618,8 @@ impl ServerSlot {
             successes: AtomicU64::new(0),
             handle_calls: AtomicUsize::new(0),
             reconnect_gate: Mutex::new(()),
+            supervisor: None,
+            retired: AtomicBool::new(false),
         }
     }
 
@@ -629,12 +635,382 @@ impl ServerSlot {
     }
 }
 
-/// Counts one call on a call handle in [`ServerSlot::handle_calls`].
-struct HandleCall<'a>(&'a AtomicUsize);
+/// A downstream stays warm for five minutes after the last completed use.
+/// Discovery from an existing catalog does not count as use.
+pub const SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Counts supervisor startups that produced a connection, so the gateway can
+/// publish one without waiting for its next watcher tick.
+static SUPERVISOR_RESULTS: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
+
+pub fn started_supervisors() -> u64 {
+    *SUPERVISOR_RESULTS
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Wait until a startup after `seen` produced a connection, or until
+/// `deadline`. Returns the latest count.
+pub fn wait_for_started_supervisor(seen: u64, deadline: Instant) -> u64 {
+    let (count, signal) = &SUPERVISOR_RESULTS;
+    let mut current = count
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *current == seen {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        current = signal
+            .wait_timeout(current, deadline - now)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+    *current
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupervisorState {
+    Stopped,
+    Starting,
+    Ready,
+    Degraded,
+    Backoff,
+    NeedsAuth,
+    Stopping,
+}
+
+struct Supervisor {
+    state: SupervisorState,
+    connect: Connect,
+    backoff: ReconnectBackoff,
+    failures: u32,
+    ever_ready: bool,
+    last_error: String,
+    next_attempt: Instant,
+    last_use: Instant,
+    last_attempt: Instant,
+    subscription_use: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ready: Option<DownstreamServer>,
+    publishing: bool,
+}
+
+impl ServerSlot {
+    fn supervised(
+        id: String,
+        tools: Vec<Value>,
+        connect: Connect,
+        backoff: ReconnectBackoff,
+    ) -> Self {
+        let mut slot = Self::new(id.clone(), DownstreamServer::stopped(id, tools), None);
+        slot.supervisor = Some(Mutex::new(Supervisor {
+            state: SupervisorState::Stopped,
+            connect,
+            backoff,
+            failures: 0,
+            ever_ready: false,
+            last_error: String::new(),
+            next_attempt: Instant::now(),
+            last_use: Instant::now(),
+            last_attempt: Instant::now(),
+            subscription_use: None,
+            ready: None,
+            publishing: false,
+        }));
+        slot
+    }
+
+    fn retire(&self) {
+        let _lifecycle = self
+            .supervisor
+            .as_ref()
+            .map(|s| s.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        self.retired.store(true, Ordering::Release);
+    }
+
+    /// A published connection loaded the full catalog, and stopping keeps it.
+    fn catalog_complete(&self) -> bool {
+        self.supervisor.as_ref().is_none_or(|s| {
+            s.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ever_ready
+        })
+    }
+
+    fn status(&self) -> Option<PendingStatus> {
+        let state = self
+            .supervisor
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(PendingStatus {
+            id: self.id.clone(),
+            needs_auth: state.state == SupervisorState::NeedsAuth,
+            connecting: state.state == SupervisorState::Starting,
+            failures: state.failures,
+            last_error: state.last_error.clone(),
+            retry_in: Some(state.next_attempt.saturating_duration_since(Instant::now())),
+        })
+    }
+
+    fn start(self: &Arc<Self>, demand: bool) -> bool {
+        self.start_at(demand, Instant::now())
+    }
+
+    fn start_at(self: &Arc<Self>, demand: bool, now: Instant) -> bool {
+        let Some(supervisor) = &self.supervisor else {
+            return false;
+        };
+        if self.retired.load(Ordering::Acquire) {
+            return false;
+        }
+        let connect = {
+            let mut state = supervisor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.publishing
+                || !(demand && state.state == SupervisorState::Stopped
+                    || state.state == SupervisorState::Backoff
+                        && (now >= state.next_attempt
+                            || demand
+                                && now.saturating_duration_since(state.last_attempt)
+                                    >= Duration::from_secs(15)))
+            {
+                return false;
+            }
+            state.state = SupervisorState::Starting;
+            state.last_attempt = now;
+            Arc::clone(&state.connect)
+        };
+        // A Weak reference lets removal retire an in-progress start: its result
+        // cannot keep an obsolete supervisor or child alive on its own.
+        let weak = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name(format!("supervisor-{}", self.id))
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| connect()))
+                    .unwrap_or_else(|_| {
+                        Err(ConnectFailure {
+                            message: "connection startup panicked".to_string(),
+                            needs_auth: false,
+                        })
+                    });
+                if let Some(slot) = weak.upgrade() {
+                    let mut state = slot
+                        .supervisor
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // Retirement is set under this lock, so a replaced start
+                    // can never hand its connection to an obsolete slot.
+                    if slot.retired.load(Ordering::Acquire) {
+                        state.state = SupervisorState::Stopped;
+                        return;
+                    }
+                    match result {
+                        Ok(server) => {
+                            state.ready = Some(server);
+                            drop(state);
+                            let (count, signal) = &SUPERVISOR_RESULTS;
+                            let mut count = count
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            *count = count.wrapping_add(1);
+                            signal.notify_all();
+                        }
+                        Err(failure) => {
+                            state.failures = state.failures.saturating_add(1);
+                            state.last_error = failure.message;
+                            state.next_attempt = Instant::now()
+                                + state
+                                    .backoff
+                                    .delay(state.failures)
+                                    .mul_f64(reconnect_jitter())
+                                    .min(state.backoff.cap);
+                            state.state = if failure.needs_auth {
+                                SupervisorState::NeedsAuth
+                            } else {
+                                SupervisorState::Backoff
+                            };
+                        }
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            let mut state = supervisor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.state = SupervisorState::Backoff;
+            state.last_error = error.to_string();
+            state.next_attempt = Instant::now() + state.backoff.base;
+            return false;
+        }
+        true
+    }
+
+    /// Every dispatch waits for a demand start, including a post-approval call.
+    fn wait_for_start(
+        self: &Arc<Self>,
+        cancel: Option<&CancelContext>,
+        continuation: bool,
+    ) -> Result<(), String> {
+        let Some(supervisor) = &self.supervisor else {
+            return Ok(());
+        };
+        if !continuation && cancel.is_some_and(CancelContext::is_cancelled) {
+            return Err("request cancelled while the server was starting".to_string());
+        }
+        self.start(true);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if !continuation && cancel.is_some_and(CancelContext::is_cancelled) {
+                return Err("request cancelled while the server was starting".to_string());
+            }
+            let mut state = supervisor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.state == SupervisorState::Ready {
+                state.last_use = Instant::now();
+                return Ok(());
+            }
+            if self.retired.load(Ordering::Acquire) {
+                return Err(format!(
+                    "server '{}' was reconfigured while starting; send the request again",
+                    self.id
+                ));
+            }
+            let starting = state.state == SupervisorState::Starting;
+            drop(state);
+            if !starting || Instant::now() >= deadline {
+                return Err(self.unavailable());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn unavailable(&self) -> String {
+        let status = self.status().unwrap();
+        if status.needs_auth {
+            format!("server '{}' {}", self.id, status.describe())
+        } else {
+            let state = self
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let reason = if !state.ever_ready && state.state == SupervisorState::Backoff {
+                "has not connected yet"
+            } else {
+                "is restarting"
+            };
+            format!(
+                "server '{}' {reason}, retry in {}s ({})",
+                self.id,
+                // A demand retries after 15 seconds even on a longer schedule.
+                state
+                    .next_attempt
+                    .min(state.last_attempt + Duration::from_secs(15))
+                    .saturating_duration_since(Instant::now())
+                    .as_secs()
+                    + 1,
+                client_safe_error(&status.last_error)
+            )
+        }
+    }
+
+    /// Only a dead connection or a failed half-open probe can degrade a live
+    /// supervisor. A lone slow call must never end other multiplexed calls.
+    fn degrade(&self, generation: u64, successes: u64, error: &str, probe: bool) -> bool {
+        let Some(supervisor) = &self.supervisor else {
+            return false;
+        };
+        let mut state = supervisor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.state != SupervisorState::Ready
+            || self.generation.load(Ordering::Acquire) != generation
+        {
+            return state.state != SupervisorState::Ready;
+        }
+        let Ok(mut server) = self.inner.try_lock() else {
+            return false;
+        };
+        let closed = server.connection_closed() == Some(true);
+        if !closed && !(probe && self.quiescent_since(&server, successes)) {
+            return false;
+        }
+        state.state = SupervisorState::Degraded;
+        state.last_error = error.to_string();
+        state.failures = state.failures.saturating_add(1);
+        state.next_attempt = Instant::now()
+            + state
+                .backoff
+                .delay(state.failures)
+                .mul_f64(reconnect_jitter())
+                .min(state.backoff.cap);
+        server.stop();
+        state.state = SupervisorState::Backoff;
+        true
+    }
+
+    fn maintain(self: &Arc<Self>, now: Instant) {
+        let Some(supervisor) = &self.supervisor else {
+            return;
+        };
+        {
+            let mut state = supervisor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.state == SupervisorState::Ready {
+                // try_lock keeps a serial remote call from blocking the watcher.
+                if let Ok(mut server) = self.inner.try_lock() {
+                    if server.connection_closed() == Some(true) {
+                        state.state = SupervisorState::Degraded;
+                        state.last_error = "the server closed the connection".to_string();
+                        state.failures = state.failures.saturating_add(1);
+                        state.next_attempt = now
+                            + state
+                                .backoff
+                                .delay(state.failures)
+                                .mul_f64(reconnect_jitter())
+                                .min(state.backoff.cap);
+                        server.stop();
+                        state.state = SupervisorState::Backoff;
+                    } else if now.saturating_duration_since(state.last_use) >= SERVER_IDLE_TIMEOUT
+                        && self.handle_calls.load(Ordering::Acquire) == 0
+                        && server.suspended_calls() == 0
+                        && !state.subscription_use.as_ref().is_some_and(|used| used())
+                    {
+                        state.state = SupervisorState::Stopping;
+                        server.stop();
+                        state.state = SupervisorState::Stopped;
+                        state.failures = 0;
+                    }
+                }
+            }
+        }
+        self.start(false);
+    }
+}
+
+/// Counts a dispatch until its completion time is recorded. Both happen under
+/// the lifecycle lock, so idle shutdown cannot slip between those two updates.
+struct HandleCall<'a>(&'a ServerSlot);
 
 impl Drop for HandleCall<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        if let Some(supervisor) = &self.0.supervisor {
+            let mut state = supervisor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.last_use = Instant::now();
+            self.0.handle_calls.fetch_sub(1, Ordering::AcqRel);
+        } else {
+            self.0.handle_calls.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -723,6 +1099,15 @@ fn locked_server(server: &mut dyn ServerDispatch) -> Result<&mut DownstreamServe
 pub struct SharedServerSlot(Arc<ServerSlot>);
 
 impl SharedServerSlot {
+    pub fn maintain(&self) {
+        self.0.maintain(Instant::now());
+    }
+
+    /// Retire a removed launch without interrupting its active calls.
+    pub fn retire(&self) {
+        self.0.retire();
+    }
+
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -1122,6 +1507,7 @@ impl PendingHandle {
 #[derive(Default, Clone)]
 pub struct Router {
     servers: Vec<Arc<ServerSlot>>,
+    launch_specs: HashMap<String, Value>,
     /// Server id -> index into `servers`, so a call resolves its server without a
     /// linear scan and without locking any server to read its id.
     by_id: HashMap<String, usize>,
@@ -1577,6 +1963,206 @@ impl Router {
         self.by_id.insert(id, idx);
     }
 
+    pub fn add_supervised(
+        &mut self,
+        id: String,
+        tools: Vec<Value>,
+        connect: Connect,
+        backoff: ReconnectBackoff,
+        spec: Value,
+    ) {
+        let index = self.servers.len();
+        self.by_id.insert(id.clone(), index);
+        self.server_order.push(id.clone());
+        self.launch_specs.insert(id.clone(), spec);
+        self.servers.push(Arc::new(ServerSlot::supervised(
+            id, tools, connect, backoff,
+        )));
+        self.rebuild_preserving_restored();
+    }
+
+    pub fn launch_spec(&self, id: &str) -> Option<&Value> {
+        self.launch_specs.get(id)
+    }
+
+    pub fn reuse_supervisor(&mut self, previous: &Router, id: &str, spec: &Value) -> bool {
+        if previous.launch_spec(id) != Some(spec) {
+            return false;
+        }
+        let Some(slot) = previous.server_slot(id) else {
+            return false;
+        };
+        self.by_id.insert(id.to_string(), self.servers.len());
+        self.server_order.push(id.to_string());
+        self.servers.push(slot.0);
+        self.launch_specs.insert(id.to_string(), spec.clone());
+        self.rebuild_preserving_restored();
+        true
+    }
+
+    pub fn raw_catalogs(&self) -> Option<HashMap<String, Vec<Value>>> {
+        self.servers
+            .iter()
+            .map(|slot| Some((slot.id.clone(), slot.inner.try_lock().ok()?.tools.clone())))
+            .collect()
+    }
+
+    /// Subscription ownership stays with the gateway table across replacements.
+    pub fn set_subscription_use(&self, id: &str, used: Arc<dyn Fn() -> bool + Send + Sync>) {
+        if let Some(slot) = self.by_id.get(id).map(|&index| &self.servers[index]) {
+            if let Some(supervisor) = &slot.supervisor {
+                supervisor
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .subscription_use = Some(used);
+            }
+        }
+    }
+
+    /// Retire every supervisor `next` replaced or removed, so a waiter on an
+    /// obsolete startup fails fast instead of waiting out its deadline.
+    pub fn retire_replaced_supervisors(&self, next: &Router) {
+        for slot in &self.servers {
+            if next
+                .server_slot(&slot.id)
+                .is_none_or(|current| !Arc::ptr_eq(slot, &current.0))
+            {
+                slot.retire();
+            }
+        }
+    }
+
+    /// Discovery only starts servers without a catalog, in the caller's scope.
+    pub fn any_starting(&self, visible: impl Fn(&str) -> bool) -> bool {
+        self.servers.iter().any(|slot| {
+            visible(&slot.id)
+                && slot.supervisor.as_ref().is_some_and(|s| {
+                    s.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .state
+                        == SupervisorState::Starting
+                })
+        })
+    }
+
+    /// Demand starts a stopped server or a recovery whose retry is due.
+    pub fn prepare_lazy_use(&self, id: &str) -> bool {
+        if !self.policy.allows_server(id) {
+            return false;
+        }
+        let Some(&index) = self.by_id.get(id) else {
+            return false;
+        };
+        let slot = &self.servers[index];
+        slot.start(true);
+        self.lazy_starting(id)
+    }
+
+    pub fn wait_for_server(
+        &self,
+        id: &str,
+        cancel: Option<&CancelContext>,
+        continuation: bool,
+    ) -> Result<(), String> {
+        self.authorized_slot(id)?
+            .wait_for_start(cancel, continuation)
+    }
+
+    pub fn lazy_starting(&self, id: &str) -> bool {
+        self.by_id.get(id).is_some_and(|&index| {
+            self.servers[index].supervisor.as_ref().is_some_and(|s| {
+                let state = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.state == SupervisorState::Starting
+            })
+        })
+    }
+
+    /// Starts only servers whose full catalog was never loaded. An idle stop
+    /// keeps prompts and resources, so later lists do not restart the server.
+    pub fn demand_servers(&self, visible: impl Fn(&str) -> bool) {
+        for slot in &self.servers {
+            if visible(&slot.id) && !slot.catalog_complete() {
+                slot.start(true);
+            }
+        }
+    }
+
+    /// Whether a visible server is starting to load its first full catalog.
+    pub fn any_discovering(&self, visible: impl Fn(&str) -> bool) -> bool {
+        self.servers.iter().any(|slot| {
+            visible(&slot.id)
+                && slot.supervisor.as_ref().is_some_and(|s| {
+                    let state = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.state == SupervisorState::Starting && !state.ever_ready
+                })
+        })
+    }
+
+    /// Whether a visible server connected for its first catalog and now only
+    /// waits for the gateway to publish it.
+    pub fn any_publishing_first_catalog(&self, visible: impl Fn(&str) -> bool) -> bool {
+        self.servers.iter().any(|slot| {
+            visible(&slot.id)
+                && slot.supervisor.as_ref().is_some_and(|s| {
+                    let state = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    !state.ever_ready && (state.ready.is_some() || state.publishing)
+                })
+        })
+    }
+
+    pub fn discover_uncached(&self, visible: impl Fn(&str) -> bool) {
+        for slot in &self.servers {
+            if visible(&slot.id)
+                && !slot.catalog_complete()
+                && slot
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .tools
+                    .is_empty()
+            {
+                slot.start(true);
+            }
+        }
+    }
+
+    /// Called only after the fresh catalog passed the gateway integrity gate.
+    pub fn activate_supervisors(&self) {
+        self.activate_supervisors_for(|_| true);
+    }
+
+    /// [`Router::activate_supervisors`] limited to the servers this view owns.
+    pub fn activate_supervisors_for(&self, owned: impl Fn(&str) -> bool) {
+        for slot in &self.servers {
+            if !owned(&slot.id) {
+                continue;
+            }
+            if let Some(supervisor) = &slot.supervisor {
+                let mut state = supervisor
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.publishing {
+                    state.publishing = false;
+                    state.state = SupervisorState::Ready;
+                    state.ever_ready = true;
+                    state.failures = 0;
+                    state.last_error.clear();
+                }
+            }
+        }
+    }
+
+    pub fn maintain_supervisors(&self) {
+        self.maintain_supervisors_at(Instant::now());
+    }
+
+    /// [`Router::maintain_supervisors`] as of `now`, for idle shutdown checks.
+    pub fn maintain_supervisors_at(&self, now: Instant) {
+        for slot in &self.servers {
+            slot.maintain(now);
+        }
+    }
+
     /// Record a server whose first connect failed. It is retried in the background
     /// with capped exponential backoff (auth failures wait for new credentials, which
     /// arrive as a registry rebuild), and [`Router::adopt_ready_reconnects`] moves it
@@ -1607,12 +2193,34 @@ impl Router {
     /// Whether any server is still waiting to connect in the background.
     pub fn has_pending(&self) -> bool {
         self.pending.iter().any(|p| !p.is_cancelled())
+            || self.servers.iter().any(|slot| {
+                slot.supervisor.as_ref().is_some_and(|s| {
+                    s.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .state
+                        != SupervisorState::Ready
+                })
+            })
     }
 
     /// Every server still waiting to connect, with its retry state.
     pub fn pending_statuses(&self) -> Vec<PendingStatus> {
         let now = Instant::now();
-        self.pending.iter().map(|p| p.status(now)).collect()
+        self.pending
+            .iter()
+            .map(|p| p.status(now))
+            .chain(self.servers.iter().filter_map(|slot| {
+                let status = slot.status()?;
+                let state = slot
+                    .supervisor
+                    .as_ref()?
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .state;
+                (state != SupervisorState::Ready && state != SupervisorState::Stopped)
+                    .then_some(status)
+            }))
+            .collect()
     }
 
     pub fn pending_handles(&self) -> Vec<PendingHandle> {
@@ -1634,18 +2242,64 @@ impl Router {
 
     /// Whether a retry connected and is waiting for [`Router::adopt_ready_reconnects`].
     pub fn has_ready_reconnects(&self) -> bool {
+        self.has_ready_reconnects_for(|_| true)
+    }
+
+    /// [`Router::has_ready_reconnects`] limited to the servers this view owns.
+    pub fn has_ready_reconnects_for(&self, owned: impl Fn(&str) -> bool) -> bool {
         self.pending
             .iter()
-            .any(|p| !p.is_cancelled() && p.lock().ready.is_some())
+            .any(|p| owned(&p.id) && !p.is_cancelled() && p.lock().ready.is_some())
+            || self.servers.iter().any(|slot| {
+                owned(&slot.id)
+                    && slot.supervisor.as_ref().is_some_and(|s| {
+                        let state = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.ready.is_some() || state.publishing
+                    })
+            })
     }
 
     /// Move every pending server whose retry connected into a live slot, in the
     /// position a cold build would have given it. Returns the adopted ids.
     pub fn adopt_ready_reconnects(&mut self) -> Vec<String> {
+        self.adopt_ready_reconnects_for(|_| true)
+    }
+
+    /// Adopt only the servers this view owns. A rooted view shares the base
+    /// router's slots, and those must pass the base integrity gate instead.
+    pub fn adopt_ready_reconnects_for(&mut self, owned: impl Fn(&str) -> bool) -> Vec<String> {
         let mut adopted = Vec::new();
+        for slot in &self.servers {
+            if !owned(&slot.id) {
+                continue;
+            }
+            if let Some(supervisor) = &slot.supervisor {
+                let mut state = supervisor
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(server) = state.ready.take() {
+                    *slot
+                        .inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = server;
+                    state.publishing = true;
+                    state.last_use = Instant::now();
+                    slot.generation.fetch_add(1, Ordering::AcqRel);
+                    slot.tool_revision.fetch_add(1, Ordering::AcqRel);
+                    slot.breaker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record_success();
+                    adopted.push(slot.id.clone());
+                } else if state.publishing {
+                    // A newer rooted view may share an adopted, unpublished slot.
+                    adopted.push(slot.id.clone());
+                }
+            }
+        }
         let mut still_pending = Vec::new();
         for pending in std::mem::take(&mut self.pending) {
-            let ready = if pending.is_cancelled() {
+            let ready = if pending.is_cancelled() || !owned(&pending.id) {
                 None
             } else {
                 pending.lock().ready.take()
@@ -1702,6 +2356,23 @@ impl Router {
         if wanted.is_empty() {
             return None;
         }
+        if let Some(slot) = self.servers.iter().find(|slot| {
+            let prefix = sanitize_segment(&slot.id).to_lowercase();
+            visible(&slot.id)
+                && (slot.id.to_lowercase() == wanted
+                    || prefix == wanted
+                    || wanted.starts_with(&format!("{prefix}__")))
+        }) {
+            slot.start(true);
+            if slot.supervisor.as_ref().is_some_and(|s| {
+                s.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .state
+                    != SupervisorState::Ready
+            }) {
+                return slot.status();
+            }
+        }
         let pending = self.pending.iter().find(|p| {
             let prefix = sanitize_segment(&p.id).to_lowercase();
             !p.is_cancelled()
@@ -1733,6 +2404,39 @@ impl Router {
         } else {
             view.add_with_reconnect(server, reconnect);
         }
+        view
+    }
+
+    pub fn with_supervised_launch(
+        &self,
+        server: DownstreamServer,
+        connect: Connect,
+        backoff: ReconnectBackoff,
+    ) -> Self {
+        let mut view = self.clone();
+        let id = server.id.clone();
+        let slot = ServerSlot::supervised(id.clone(), Vec::new(), connect, backoff);
+        *slot
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = server;
+        {
+            let mut state = slot
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.publishing = true;
+            state.state = SupervisorState::Starting;
+        }
+        if let Some(index) = view.by_id.get(&id) {
+            view.servers[*index] = Arc::new(slot);
+        } else {
+            view.by_id.insert(id, view.servers.len());
+            view.servers.push(Arc::new(slot));
+        }
+        view.rebuild_preserving_restored();
         view
     }
 
@@ -1993,6 +2697,14 @@ impl Router {
     pub fn refresh_tools(&mut self) {
         // `&mut self` is exclusive, so locking each slot here can't contend.
         for slot in &self.servers {
+            if slot.supervisor.as_ref().is_some_and(|s| {
+                s.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .state
+                    != SupervisorState::Ready
+            }) {
+                continue;
+            }
             if slot
                 .inner
                 .lock()
@@ -2007,6 +2719,14 @@ impl Router {
 
     pub fn refresh_stale_tools(&mut self) {
         for slot in &self.servers {
+            if slot.supervisor.as_ref().is_some_and(|s| {
+                s.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .state
+                    != SupervisorState::Ready
+            }) {
+                continue;
+            }
             if slot
                 .inner
                 .lock()
@@ -2026,6 +2746,14 @@ impl Router {
     /// Mirrors [`refresh_tools`].
     pub fn refresh_resources(&mut self) {
         for slot in &self.servers {
+            if slot.supervisor.as_ref().is_some_and(|s| {
+                s.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .state
+                    != SupervisorState::Ready
+            }) {
+                continue;
+            }
             slot.inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2036,6 +2764,14 @@ impl Router {
 
     pub fn refresh_stale_resources(&mut self) {
         for slot in &self.servers {
+            if slot.supervisor.as_ref().is_some_and(|s| {
+                s.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .state
+                    != SupervisorState::Ready
+            }) {
+                continue;
+            }
             slot.inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2049,6 +2785,14 @@ impl Router {
     /// Mirrors [`refresh_tools`].
     pub fn refresh_prompts(&mut self) {
         for slot in &self.servers {
+            if slot.supervisor.as_ref().is_some_and(|s| {
+                s.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .state
+                    != SupervisorState::Ready
+            }) {
+                continue;
+            }
             slot.inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2059,6 +2803,14 @@ impl Router {
 
     pub fn refresh_stale_prompts(&mut self) {
         for slot in &self.servers {
+            if slot.supervisor.as_ref().is_some_and(|s| {
+                s.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .state
+                    != SupervisorState::Ready
+            }) {
+                continue;
+            }
             slot.inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2378,6 +3130,7 @@ impl Router {
         if !dispatch_cancelled_continuation && cancel.is_some_and(CancelContext::is_cancelled) {
             return Err("request cancelled before downstream attempt".to_string());
         }
+        slot.wait_for_start(cancel, dispatch_cancelled_continuation)?;
         // Circuit breaker: a server that just failed repeatedly is fast-failed here,
         // BEFORE taking its `inner` lock, so a dead/hung server neither pays its full
         // read timeout again nor queues callers behind an in-flight timing-out call.
@@ -2411,6 +3164,12 @@ impl Router {
             match result {
                 Ok(v) => {
                     slot.successes.fetch_add(1, Ordering::AcqRel);
+                    if let Some(supervisor) = &slot.supervisor {
+                        supervisor
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .failures = 0;
+                    }
                     slot.breaker
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2431,6 +3190,17 @@ impl Router {
                     // retries) counts toward the breaker; a normal error response does
                     // not disable the server.
                     if e.is_health_failure() {
+                        if slot.degrade(generation, successes, &e.to_string(), is_probe) {
+                            slot.breaker
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .record_concurrent_failure(started, Instant::now());
+                            let mut message = slot.unavailable();
+                            if replay_policy.uncertain_failure(&e).is_some() {
+                                message.push_str(". The previous operation may have completed; check before retrying it.");
+                            }
+                            return Err(message);
+                        }
                         // The server has now failed for a full cooldown and the probe
                         // confirms it's still down. Re-spawn the connection once and
                         // replay only when safe: an uncertain mutation instead keeps
@@ -2499,21 +3269,35 @@ impl Router {
     where
         F: FnMut(&mut dyn ServerDispatch) -> Result<T, TransportError>,
     {
+        let mut lifecycle = slot
+            .supervisor
+            .as_ref()
+            .map(|s| s.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        if lifecycle
+            .as_ref()
+            .is_some_and(|s| s.state != SupervisorState::Ready)
+        {
+            drop(lifecycle);
+            return (Err(TransportError::Busy(slot.unavailable())), None);
+        }
+        if let Some(state) = lifecycle.as_mut() {
+            state.last_use = Instant::now();
+        }
+        // Count queued serial calls before releasing the lifecycle lock. The
+        // watcher can now inspect other servers while this call waits for inner.
+        slot.handle_calls.fetch_add(1, Ordering::AcqRel);
+        let _counted = HandleCall(slot);
+        drop(lifecycle);
         let handle = match access {
-            SlotAccess::Shared => {
-                let server = slot
-                    .inner
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                server.call_handle().map(|handle| {
-                    slot.handle_calls.fetch_add(1, Ordering::AcqRel);
-                    (handle, HandleCall(&slot.handle_calls))
-                })
-            }
+            SlotAccess::Shared => slot
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .call_handle(),
             SlotAccess::Locked => None,
         };
         match handle {
-            Some((mut handle, _counted)) => {
+            Some(mut handle) => {
                 let _permit = match slot
                     .in_flight
                     .acquire(&slot.id, handle.call_timeout(), cancel)
@@ -2529,7 +3313,9 @@ impl Router {
                     .inner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (f(&mut *server), None)
+                let result = f(&mut *server);
+                drop(server);
+                (result, None)
             }
         }
     }
@@ -2956,6 +3742,23 @@ impl Router {
         uri: &str,
     ) -> Result<Value, String> {
         let slot = self.slot_for(server_id)?;
+        if let Some(supervisor) = &slot.supervisor {
+            // Best-effort cleanup never starts a connection. A stopped server
+            // has no subscription left, and `attempt` rechecks readiness.
+            if supervisor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .state
+                != SupervisorState::Ready
+            {
+                return Ok(json!({}));
+            }
+            return Self::attempt(&slot, SlotAccess::Locked, None, &mut |server| {
+                locked_server(server)?.unsubscribe_resource(uri)
+            })
+            .0
+            .map_err(|error| error.to_string());
+        }
         self.call_with_retry(
             &slot,
             None,
@@ -6264,6 +7067,509 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         done()
+    }
+
+    fn supervised_fixture(connect: Connect) -> Router {
+        let mut router = Router::new();
+        router.add_supervised(
+            "s".to_string(),
+            vec![json!({"name":"echo"})],
+            connect,
+            ReconnectBackoff {
+                base: Duration::from_millis(10),
+                cap: Duration::from_millis(40),
+            },
+            json!({"revision":1}),
+        );
+        router
+    }
+
+    fn ready_supervisor(router: &mut Router) {
+        assert!(wait_until(|| router.has_ready_reconnects()));
+        router.adopt_ready_reconnects();
+        router.activate_supervisors();
+    }
+
+    #[test]
+    fn supervisor_lazy_start_is_single_flight_and_cached_discovery_stays_stopped() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut router = supervised_fixture(flaky_connect("s", 0, Arc::clone(&calls)));
+        router.maintain_supervisors();
+        router.discover_uncached(|_| true);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(router.aggregated_tools()[0]["name"], "s__echo");
+        let slot = Arc::clone(&router.servers[0]);
+        let attempts: Vec<_> = (0..16)
+            .map(|_| {
+                let slot = Arc::clone(&slot);
+                std::thread::spawn(move || slot.start(true))
+            })
+            .collect();
+        assert_eq!(
+            attempts
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .filter(|started| *started)
+                .count(),
+            1
+        );
+        ready_supervisor(&mut router);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn supervisor_busy_inner_never_blocks_degrade_or_lifecycle_inspection() {
+        let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
+        router.prepare_lazy_use("s");
+        ready_supervisor(&mut router);
+        let slot = Arc::clone(&router.servers[0]);
+        let inner = slot.inner.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_slot = Arc::clone(&slot);
+        let worker = std::thread::spawn(move || {
+            tx.send(worker_slot.degrade(
+                worker_slot.generation.load(Ordering::Acquire),
+                0,
+                "offline",
+                true,
+            ))
+            .unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        drop(inner);
+        worker.join().unwrap();
+        assert_eq!(
+            result.unwrap(),
+            false,
+            "busy serial request must fall back to breaker"
+        );
+
+        let inner = slot.inner.lock().unwrap();
+        let worker_slot = Arc::clone(&slot);
+        let worker = std::thread::spawn(move || {
+            Router::attempt(&worker_slot, SlotAccess::Shared, None, &mut |_| Ok(()))
+        });
+        assert!(wait_until(|| slot.handle_calls.load(Ordering::Acquire) == 1));
+        let free = wait_until(|| slot.supervisor.as_ref().unwrap().try_lock().is_ok());
+        drop(inner);
+        worker.join().unwrap().0.unwrap();
+        assert!(free, "queued call held the supervisor behind inner");
+        router.maintain_supervisors();
+        assert!(router.pending_statuses().is_empty());
+        assert_eq!(slot.handle_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn supervisor_demand_shortens_long_backoff_and_ready_resets_failures() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut router = supervised_fixture(flaky_connect("s", 1, Arc::clone(&calls)));
+        let slot = Arc::clone(&router.servers[0]);
+        slot.supervisor.as_ref().unwrap().lock().unwrap().backoff = ReconnectBackoff {
+            base: Duration::from_secs(300),
+            cap: Duration::from_secs(300),
+        };
+        slot.start(true);
+        assert!(wait_until(|| slot.status().unwrap().failures == 1));
+        let last = slot
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .last_attempt;
+        assert!(!slot.start_at(true, last + Duration::from_secs(14)));
+        assert!(!slot.start_at(false, last + Duration::from_secs(15)));
+        assert!(slot.start_at(true, last + Duration::from_secs(15)));
+        ready_supervisor(&mut router);
+        assert_eq!(slot.status().unwrap().failures, 0);
+        assert!(slot.status().unwrap().last_error.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn supervisor_every_dispatch_waits_after_idle_stop_including_approved_tools() {
+        let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
+        router.prepare_lazy_use("s");
+        ready_supervisor(&mut router);
+        for method in [
+            "resources/read",
+            "prompts/get",
+            "completion/complete",
+            "tools/call",
+        ] {
+            let slot = Arc::clone(&router.servers[0]);
+            let last = slot.supervisor.as_ref().unwrap().lock().unwrap().last_use;
+            slot.maintain(last + SERVER_IDLE_TIMEOUT);
+            assert_eq!(
+                slot.supervisor.as_ref().unwrap().lock().unwrap().state,
+                SupervisorState::Stopped
+            );
+            let snapshot = router.clone();
+            let worker = std::thread::spawn(move || match method {
+                "resources/read" => snapshot.read_resource("s://readme"),
+                "prompts/get" => snapshot.get_prompt("s__greet", json!({})),
+                "completion/complete" => snapshot.complete(json!({
+                    "ref":{"type":"ref/prompt","name":"s__greet"},
+                    "argument":{"name":"name","value":"a"}
+                })),
+                _ => snapshot.route_call("s__echo", json!({})),
+            });
+            assert!(wait_until(|| router.has_ready_reconnects()));
+            router.adopt_ready_reconnects();
+            router.activate_supervisors();
+            assert!(
+                worker.join().unwrap().is_ok(),
+                "{method} failed its first post-idle dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_subscriptions_keep_idle_connections_warm_until_last_holder_leaves() {
+        let subscribed = Arc::new(AtomicBool::new(true));
+        let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
+        let used = Arc::clone(&subscribed);
+        router.set_subscription_use("s", Arc::new(move || used.load(Ordering::Acquire)));
+        router.prepare_lazy_use("s");
+        ready_supervisor(&mut router);
+        let slot = &router.servers[0];
+        let last = slot.supervisor.as_ref().unwrap().lock().unwrap().last_use;
+        slot.maintain(last + SERVER_IDLE_TIMEOUT);
+        assert_eq!(
+            slot.supervisor.as_ref().unwrap().lock().unwrap().state,
+            SupervisorState::Ready
+        );
+        subscribed.store(false, Ordering::Release);
+        slot.maintain(last + SERVER_IDLE_TIMEOUT);
+        assert_eq!(
+            slot.supervisor.as_ref().unwrap().lock().unwrap().state,
+            SupervisorState::Stopped
+        );
+    }
+
+    #[test]
+    fn supervisor_catalog_save_skips_busy_server_without_losing_its_cache() {
+        let router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
+        let inner = router.servers[0].inner.lock().unwrap();
+        assert!(router.raw_catalogs().is_none());
+        drop(inner);
+        assert_eq!(router.raw_catalogs().unwrap()["s"][0]["name"], "echo");
+    }
+
+    #[test]
+    fn supervisor_background_retry_waits_for_backoff_and_auth_waits_for_replacement() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut router = supervised_fixture(flaky_connect("s", 1, Arc::clone(&calls)));
+        router.servers[0].start(true);
+        assert!(wait_until(
+            || router.servers[0].status().unwrap().failures == 1
+        ));
+        assert!(router.servers[0]
+            .unavailable()
+            .contains("has not connected yet"));
+        let (last_attempt, retry_at) = {
+            let state = router.servers[0].supervisor.as_ref().unwrap().lock().unwrap();
+            (state.last_attempt, state.next_attempt)
+        };
+        assert!(!router.servers[0].start_at(true, last_attempt));
+        assert!(router.servers[0].start_at(false, retry_at));
+        ready_supervisor(&mut router);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let auth_calls = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&auth_calls);
+        let auth: Connect = Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Err(failure("HTTP 401", true))
+        });
+        let router = supervised_fixture(auth);
+        router.servers[0].start(true);
+        assert!(wait_until(|| router.servers[0]
+            .status()
+            .unwrap()
+            .needs_auth));
+        for _ in 0..10 {
+            router.maintain_supervisors();
+            router.servers[0].start(true);
+        }
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+        assert!(router.servers[0].unavailable().contains("needs sign-in"));
+    }
+
+    #[test]
+    fn supervisor_idle_stop_keeps_catalog_and_active_calls_keep_it_warm() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut router = supervised_fixture(flaky_connect("s", 0, Arc::clone(&calls)));
+        router.servers[0].start(true);
+        ready_supervisor(&mut router);
+        let slot = &router.servers[0];
+        let last_use = slot.supervisor.as_ref().unwrap().lock().unwrap().last_use;
+        slot.handle_calls.store(1, Ordering::SeqCst);
+        slot.maintain(last_use + SERVER_IDLE_TIMEOUT);
+        assert_eq!(
+            slot.supervisor.as_ref().unwrap().lock().unwrap().state,
+            SupervisorState::Ready
+        );
+        slot.handle_calls.store(0, Ordering::SeqCst);
+        slot.maintain(last_use + SERVER_IDLE_TIMEOUT);
+        assert_eq!(
+            slot.supervisor.as_ref().unwrap().lock().unwrap().state,
+            SupervisorState::Stopped
+        );
+        assert!(slot.unavailable().contains("is restarting"));
+        assert!(!router.aggregated_tools().is_empty());
+        slot.start(true);
+        ready_supervisor(&mut router);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn supervisor_idle_stop_keeps_prompts_and_resources_without_rediscovery() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut router = supervised_fixture(flaky_connect("s", 0, Arc::clone(&calls)));
+        router.servers[0].start(true);
+        ready_supervisor(&mut router);
+        // A prompts and resources only server has no tools to cache.
+        router.servers[0].inner.lock().unwrap().tools.clear();
+        let slot = Arc::clone(&router.servers[0]);
+        let last_use = slot.supervisor.as_ref().unwrap().lock().unwrap().last_use;
+        router.maintain_supervisors_at(last_use + SERVER_IDLE_TIMEOUT);
+        router.demand_servers(|_| true);
+        router.discover_uncached(|_| true);
+        assert_eq!(
+            slot.supervisor.as_ref().unwrap().lock().unwrap().state,
+            SupervisorState::Stopped,
+            "a list restarted an idle server with a complete catalog"
+        );
+        assert!(!router.any_discovering(|_| true));
+        assert!(!router.aggregated_prompts().is_empty());
+        assert!(!router.aggregated_resources().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A server that never published still loads its first full catalog.
+        let fresh = supervised_fixture(flaky_connect("s", 0, Arc::new(AtomicU64::new(0))));
+        fresh.demand_servers(|_| true);
+        assert!(fresh.any_discovering(|_| true));
+    }
+
+    #[test]
+    fn supervisor_startup_result_wakes_a_waiting_publisher() {
+        let router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
+        let mut seen = started_supervisors();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(5);
+        router.servers[0].start(true);
+        while !router.has_ready_reconnects() && Instant::now() < deadline {
+            seen = wait_for_started_supervisor(seen, deadline);
+        }
+        assert!(router.has_ready_reconnects());
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the publisher waited for its timeout instead of the result"
+        );
+    }
+
+    #[test]
+    fn supervisor_scoped_adoption_leaves_other_servers_to_their_owner() {
+        let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
+        router.servers[0].start(true);
+        assert!(wait_until(|| router.has_ready_reconnects()));
+        assert!(!router.has_ready_reconnects_for(|id| id == "other"));
+        assert!(router
+            .adopt_ready_reconnects_for(|id| id == "other")
+            .is_empty());
+        router.activate_supervisors_for(|id| id == "other");
+        assert!(router.has_ready_reconnects_for(|id| id == "s"));
+        assert_eq!(router.adopt_ready_reconnects_for(|id| id == "s"), vec!["s"]);
+        router.activate_supervisors_for(|id| id == "s");
+        assert!(router.pending_statuses().is_empty());
+    }
+
+    #[test]
+    fn supervisor_unsubscribe_never_starts_a_stopped_server() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let router = supervised_fixture(flaky_connect("s", 0, Arc::clone(&calls)));
+        let started = Instant::now();
+        assert!(router
+            .unsubscribe_resource_on_server("s", "s://readme")
+            .is_ok());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!router.any_starting(|_| true));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn supervisor_waiter_on_a_replaced_start_fails_fast_and_discards_its_result() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let calls = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&calls);
+        let old = supervised_fixture(Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+            Ok(mock_server("s"))
+        }));
+        let waiter = {
+            let old = old.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                (old.wait_for_server("s", None, false), started.elapsed())
+            })
+        };
+        assert!(wait_until(|| old.lazy_starting("s")));
+        let replacement = supervised_fixture(flaky_connect("s", 0, Arc::new(AtomicU64::new(0))));
+        old.retire_replaced_supervisors(&replacement);
+        let (result, waited) = waiter.join().unwrap();
+        assert!(
+            result.unwrap_err().contains("reconfigured while starting"),
+            "waiter did not fail fast"
+        );
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+        release_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!old.has_ready_reconnects(), "a retired start published");
+        assert!(
+            !old.servers[0].start(true),
+            "a retired supervisor started again"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn supervisor_unavailable_message_matches_the_demand_retry() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let router = supervised_fixture(flaky_connect("s", 1, Arc::clone(&calls)));
+        let slot = Arc::clone(&router.servers[0]);
+        slot.supervisor.as_ref().unwrap().lock().unwrap().backoff = ReconnectBackoff {
+            base: Duration::from_secs(300),
+            cap: Duration::from_secs(300),
+        };
+        slot.start(true);
+        assert!(wait_until(|| slot.status().unwrap().failures == 1));
+        let message = slot.unavailable();
+        let seconds: u64 = message
+            .split("retry in ")
+            .nth(1)
+            .and_then(|rest| rest.split('s').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no retry delay in {message}"));
+        assert!(
+            (1..=15).contains(&seconds),
+            "message promised the background schedule: {message}"
+        );
+    }
+
+    #[test]
+    fn supervisor_results_wait_for_integrity_publication_and_removed_starts_are_discarded() {
+        let mut router = supervised_fixture(flaky_connect("s", 0, Arc::new(AtomicU64::new(0))));
+        router.servers[0].start(true);
+        assert!(wait_until(|| router.has_ready_reconnects()));
+        router.adopt_ready_reconnects();
+        // An adopted, unpublished slot refuses dispatch without waiting.
+        let (result, _) = Router::attempt(
+            &router.servers[0],
+            SlotAccess::Shared,
+            None,
+            &mut |_| Ok(()),
+        );
+        assert!(result.unwrap_err().to_string().contains("restarting"));
+        router.activate_supervisors();
+        assert!(router.route_call("s__echo", json!({})).is_ok());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let finish_rx = Arc::new(Mutex::new(finish_rx));
+        let connect: Connect = Arc::new(move || {
+            started_tx.send(()).unwrap();
+            finish_rx.lock().unwrap().recv().unwrap();
+            Ok(mock_server("s"))
+        });
+        let router = supervised_fixture(connect);
+        let weak = Arc::downgrade(&router.servers[0]);
+        router.servers[0].start(true);
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(router);
+        assert!(
+            weak.upgrade().is_none(),
+            "the start thread retained a removed supervisor"
+        );
+        finish_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn supervisor_recovers_an_uncertain_call_without_replaying_its_effect() {
+        let effects = Arc::new(AtomicU32::new(0));
+        let fresh_effects = Arc::clone(&effects);
+        let connect: Connect = Arc::new(move || {
+            Ok(lost_reply_server(
+                "tools/call",
+                false,
+                Arc::clone(&fresh_effects),
+            ))
+        });
+        let mut router = Router::new().with_supervised_launch(
+            lost_reply_server("tools/call", true, Arc::clone(&effects)),
+            connect,
+            ReconnectBackoff {
+                base: Duration::from_millis(10),
+                cap: Duration::from_millis(20),
+            },
+        );
+        router.activate_supervisors();
+        {
+            let mut breaker = router.servers[0].breaker.lock().unwrap();
+            breaker.consecutive_failures = BREAKER_FAILURE_THRESHOLD;
+            breaker.open_until = Some(Instant::now() - Duration::from_secs(1));
+        }
+        let error = router.route_call("s__echo", json!({})).unwrap_err();
+        assert!(error.contains("restarting"));
+        assert!(error.contains("may have completed"));
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        assert!(wait_until(|| {
+            router.maintain_supervisors();
+            router.has_ready_reconnects()
+        }));
+        ready_supervisor(&mut router);
+        assert_eq!(
+            effects.load(Ordering::SeqCst),
+            1,
+            "recovery replayed the previous operation"
+        );
+        assert!(router.route_call("s__echo", json!({})).is_ok());
+        assert_eq!(effects.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn supervisor_start_panic_enters_backoff_instead_of_staying_starting() {
+        let router = supervised_fixture(Arc::new(|| panic!("fixture startup panic")));
+        router.servers[0].start(true);
+        assert!(wait_until(
+            || router.servers[0].status().unwrap().failures == 1
+        ));
+        assert_eq!(
+            router.servers[0]
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .state,
+            SupervisorState::Backoff
+        );
+    }
+
+    #[test]
+    fn supervisor_reuses_only_matching_launch_specs() {
+        let previous = supervised_fixture(flaky_connect("s", 0, Arc::new(AtomicU64::new(0))));
+        let mut same = Router::new();
+        assert!(same.reuse_supervisor(&previous, "s", &json!({"revision":1})));
+        assert!(same
+            .server_slot("s")
+            .unwrap()
+            .ptr_eq(&previous.server_slot("s").unwrap()));
+        let mut changed = Router::new();
+        assert!(!changed.reuse_supervisor(&previous, "s", &json!({"revision":2})));
     }
 
     #[test]

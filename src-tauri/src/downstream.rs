@@ -6756,6 +6756,17 @@ impl Drop for HttpTransport {
     }
 }
 
+struct StoppedTransport;
+
+impl Transport for StoppedTransport {
+    fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+        Err(TransportError::Unavailable("server is stopped".to_string()))
+    }
+    fn request(&mut self, _method: &str, _params: Value) -> Result<Value, TransportError> {
+        Err(TransportError::Unavailable("server is stopped".to_string()))
+    }
+}
+
 /// One connected downstream server: its id, its transport, and its cached
 /// tools, resources, resource templates, and prompts.
 pub struct DownstreamServer {
@@ -7061,6 +7072,42 @@ impl DownstreamServer {
             call_timeout: STDIO_READ_TIMEOUT,
             server_handler: None,
         })
+    }
+
+    /// A catalog without a live connection. The supervisor replaces it after
+    /// discovery and retains metadata when releasing an idle connection.
+    pub fn stopped(id: String, tools: Vec<Value>) -> Self {
+        Self {
+            id,
+            transport: Box::new(StoppedTransport),
+            tools,
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+            prompts: Vec::new(),
+            tool_cache_hint: CacheHint::default(),
+            resource_cache_hint: CacheHint::default(),
+            resource_template_cache_hint: CacheHint::default(),
+            prompt_cache_hint: CacheHint::default(),
+            shrink_tools_streak: 0,
+            shrink_resources_streak: 0,
+            shrink_templates_streak: 0,
+            shrink_prompts_streak: 0,
+            caps_resources: false,
+            caps_prompts: false,
+            caps_completions: false,
+            caps_extensions: serde_json::Map::new(),
+            era: Era::Legacy {
+                version: PROTOCOL_VERSION.to_string(),
+            },
+            modern_http: false,
+            modern_resource_subscriptions: HashSet::new(),
+            call_timeout: STDIO_READ_TIMEOUT,
+            server_handler: None,
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.transport = Box::new(StoppedTransport);
     }
 
     /// Widen the live-call read deadline for this server (per-server
