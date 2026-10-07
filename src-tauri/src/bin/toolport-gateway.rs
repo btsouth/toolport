@@ -47,8 +47,9 @@ use conduit_lib::remote;
 #[cfg(test)]
 use conduit_lib::router::ToolPolicy;
 use conduit_lib::router::{
-    is_destructive, sanitize_segment, Connect, ConnectFailure, DispatchTarget, PendingHandle,
-    Reconnect, ReconnectBackoff, RegistryPolicy, Router, SharedServerSlot,
+    is_destructive, sanitize_segment, started_supervisors, wait_for_started_supervisor, Connect,
+    ConnectFailure, DispatchTarget, PendingHandle, ReconnectBackoff, RegistryPolicy, Router,
+    SharedServerSlot, SERVER_IDLE_TIMEOUT,
 };
 use conduit_lib::savings;
 use conduit_lib::searchtrace;
@@ -1149,7 +1150,6 @@ impl ResourceSubscriptionTable {
             .unwrap_or_default()
     }
 
-    /// Every tracked `(uri, owner)` pair for re-subscribe after rebuild.
     fn tracked_uri_owners(&self) -> Vec<(String, String)> {
         self.uri_owner
             .iter()
@@ -1171,6 +1171,7 @@ impl ResourceSubscriptionTable {
         self.uri_owner.get(uri).map(String::as_str)
     }
 
+    #[cfg(test)]
     fn set_owner(&mut self, uri: &str, owner: &str) {
         if self.uri_owner.contains_key(uri) {
             self.uri_owner.insert(uri.to_string(), owner.to_string());
@@ -3874,6 +3875,26 @@ fn recheck_live_policy(
     }
 }
 
+/// Startup may outlast a policy edit, so check on both sides of the wait.
+fn prepare_dispatch(
+    router: &Router,
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+    target: DispatchTarget<'_>,
+    cancel: Option<&downstream::CancelContext>,
+    continuation: bool,
+) -> Result<(), String> {
+    recheck_live_policy(router, live_router, target)?;
+    router.authorize(target)?;
+    let owner = match target {
+        DispatchTarget::Tool(name) => router.route_of(name).map(|(owner, _)| owner),
+        DispatchTarget::Server(owner) => Some(owner),
+    };
+    if let Some(owner) = owner {
+        router.wait_for_server(owner, cancel, continuation)?;
+    }
+    recheck_live_policy(router, live_router, target)
+}
+
 const STALE_LIVE_VIEW: &str =
     "this connection's profile changed during the request; send the request again";
 
@@ -4065,6 +4086,31 @@ fn execute_call(
     // `None` only in test wrappers that lack `GatewayState`.
     live_router: Option<&Arc<Mutex<Arc<Router>>>>,
 ) -> Value {
+    if active_live_router_resolver().is_some_and(|view| (view.stale)()) {
+        return json!({"content": [{"type": "text", "text": STALE_LIVE_VIEW}], "isError": true});
+    }
+    // Resolve a cold owner only through the collision-safe registry map. Scope
+    // and tool policy are checked before demand so a rejected call cannot spawn
+    // a server; a blocked tool falls through to the usual policy refusal.
+    let mut fresh = clone_live_router(live_router);
+    if let Some(view) = &fresh {
+        if let Some(owner) = owner_of_exposed_tool(Some(view), &unique_prefix_owners(reg), name) {
+            if allowed.is_some_and(|set| !server_in_allowed_scope(&owner, set)) {
+                return json!({"content": [{"type": "text", "text": format!(
+                    "Toolport: '{}' is not available to this client.", sanitize_segment(&owner)
+                )}], "isError": true});
+            }
+            if view.authorize(DispatchTarget::Tool(name)).is_ok() {
+                if let Err(message) = view.wait_for_server(&owner, cancel.as_ref(), false) {
+                    return json!({"content": [{"type": "text", "text": format!("Toolport: {message}")}], "isError": true});
+                }
+                fresh = clone_live_router(live_router);
+            }
+        }
+    }
+    let router = fresh.as_deref().unwrap_or(router);
+    let fresh_catalog = fresh.as_ref().map(|view| view.aggregated_tools());
+    let cached = fresh_catalog.as_deref().unwrap_or(cached);
     let mut confirmed = false;
     let shape = opts.shape;
     if !opts.allow_app_only && !named_tool_is_model_visible(name, cached, router) {
@@ -4507,7 +4553,13 @@ fn execute_call(
     // This request kept the router it arrived with. If a newer one has gone live
     // since (a registry policy change, quarantine, or a rebuild), its policy has
     // the last word before anything is sent (P1.3).
-    let live_policy = recheck_live_policy(exec_router, live_router, DispatchTarget::Tool(name));
+    let live_policy = prepare_dispatch(
+        exec_router,
+        live_router,
+        DispatchTarget::Tool(name),
+        cancel.as_ref(),
+        effective_mrtr.is_some_and(|request| !request.is_empty()),
+    );
     match live_policy.and_then(|()| {
         exec_router.route_call_with_cancel_and_mrtr(
             name,
@@ -6761,6 +6813,9 @@ fn handle_request_with_cancel(
             Some(success(id, result))
         }
         "resources/list" => {
+            router.demand_servers(|server| {
+                allowed.is_none_or(|scope| server_in_allowed_scope(server, scope))
+            });
             let mut resources = router.aggregated_resources();
             // Scope to the client's allowed servers (a no-op when unscoped), so a
             // registered HTTP client can't list another server's resources.
@@ -6788,6 +6843,9 @@ fn handle_request_with_cancel(
             ))
         }
         "resources/templates/list" => {
+            router.demand_servers(|server| {
+                allowed.is_none_or(|scope| server_in_allowed_scope(server, scope))
+            });
             let mut templates = router.aggregated_resource_templates();
             // Same server-scoping rules as resources/list (SOU-327).
             if let Some(set) = allowed {
@@ -6849,9 +6907,13 @@ fn handle_request_with_cancel(
             };
             let client_meta = relay_owned.or(client_meta);
             let live_policy = match router.resource_server(uri) {
-                Some(owner) => {
-                    recheck_live_policy(router, live_router, DispatchTarget::Server(owner))
-                }
+                Some(owner) => prepare_dispatch(
+                    router,
+                    live_router,
+                    DispatchTarget::Server(owner),
+                    cancel.as_ref(),
+                    !mrtr.is_empty(),
+                ),
                 None => Ok(()),
             };
             match live_policy.and_then(|()| {
@@ -6937,6 +6999,9 @@ fn handle_request_with_cancel(
             }
         }
         "prompts/list" => {
+            router.demand_servers(|server| {
+                allowed.is_none_or(|scope| server_in_allowed_scope(server, scope))
+            });
             let mut prompts = router.aggregated_prompts();
             // Scope to the client's allowed servers (a no-op when unscoped).
             // Sanitize owner ids before comparing (SOU-327).
@@ -6994,9 +7059,13 @@ fn handle_request_with_cancel(
             };
             let client_meta = relay_owned.or(client_meta);
             let live_policy = match router.prompt_server(name) {
-                Some(owner) => {
-                    recheck_live_policy(router, live_router, DispatchTarget::Server(owner))
-                }
+                Some(owner) => prepare_dispatch(
+                    router,
+                    live_router,
+                    DispatchTarget::Server(owner),
+                    cancel.as_ref(),
+                    !mrtr.is_empty(),
+                ),
                 None => Ok(()),
             };
             match live_policy.and_then(|()| {
@@ -7052,10 +7121,12 @@ fn handle_request_with_cancel(
                             ));
                         }
                     }
-                    match recheck_live_policy(
+                    match prepare_dispatch(
                         router,
                         live_router,
                         DispatchTarget::Server(&server_id),
+                        cancel.as_ref(),
+                        false,
                     )
                     .and_then(|()| router.complete_with_cancel(params, cancel.clone()))
                     {
@@ -7111,7 +7182,13 @@ fn handle_request_with_cancel(
             let live_policy = if method == "tasks/cancel" {
                 Ok(())
             } else {
-                recheck_live_policy(router, live_router, DispatchTarget::Server(&owner))
+                prepare_dispatch(
+                    router,
+                    live_router,
+                    DispatchTarget::Server(&owner),
+                    cancel.as_ref(),
+                    false,
+                )
             };
             match live_policy.and_then(|()| {
                 router.route_task(method, params, cancel.clone(), client_meta.as_ref())
@@ -7311,21 +7388,12 @@ fn root_servers_in_scope(
 fn root_launch_keys(specs: &[ServerEntry], root: &str, secrets_generation: u64) -> Vec<LaunchKey> {
     specs
         .iter()
-        .map(|server| {
-            let env_names: BTreeSet<String> =
-                server.env.iter().map(|entry| entry.key.clone()).collect();
-            let cwd = server
-                .cwd
-                .as_deref()
-                .and_then(|cwd| downstream::resolve_root_token(cwd, Some(root)));
-            LaunchKey::stdio(
-                &server.id,
-                server.command.as_deref().unwrap_or(""),
-                &server.args,
-                cwd.as_deref(),
-                &env_names,
-                secrets_generation,
-            )
+        .map(|server| LaunchKey {
+            server: server.id.clone(),
+            kind: "stdio",
+            digest: registry::sha256_hex(
+                &effective_server_spec(server, Some(root), secrets_generation).to_string(),
+            ),
         })
         .collect()
 }
@@ -7441,6 +7509,35 @@ fn build_router(
     // Pre-rebuild live quarantine set. `None` is a genuine cold start (SBS-871).
     previous_quarantine: Option<PriorQuarantine>,
 ) -> Router {
+    build_router_incremental(
+        reg,
+        profile,
+        http_mode,
+        daemon_mode,
+        dirty,
+        server_handler,
+        root,
+        resource_updated,
+        resource_subs,
+        previous_quarantine,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_router_incremental(
+    reg: &Registry,
+    profile: Option<&str>,
+    http_mode: bool,
+    daemon_mode: bool,
+    dirty: &Arc<AtomicU8>,
+    server_handler: ServerRequestHandler,
+    root: Option<&str>,
+    resource_updated: Option<ResourceUpdatedDispatch>,
+    resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
+    previous_quarantine: Option<PriorQuarantine>,
+    previous_router: Option<&Router>,
+) -> Router {
     let registry_policy = registry_policy(reg, profile, http_mode, daemon_mode);
     // A daemon learns each adapter's project root only after that adapter's
     // handshake. Delay these launches until a session has a resolved root;
@@ -7497,75 +7594,141 @@ fn build_router(
     // next reconcile install a permanent empty set (SOU-320).
     let policy = registry_policy.with_quarantine(quarantined, fail_closed_catalog);
 
-    // Connect concurrently so total time is the slowest server, not the sum. Each
-    // thread hands back the server spec + dirty flag alongside the connection so we can
-    // build a reconnect factory (used to re-spawn it if it dies mid-session).
-    // Owned copy so each connect thread and each reconnect factory (both 'static)
-    // can carry the root without borrowing.
-    let root_owned = root.map(str::to_owned);
-    let handles: Vec<_> = servers
-        .into_iter()
-        .map(|server| {
-            let dirty = Arc::clone(dirty);
-            let handler = Arc::clone(&server_handler);
-            let root_t = root_owned.clone();
-            let resource_updated = resource_updated.clone();
-            std::thread::spawn(move || {
-                let ds = connect_one_result(
-                    &server,
-                    &dirty,
-                    handler,
-                    root_t.as_deref(),
-                    resource_updated.clone(),
-                );
-                (server, dirty, resource_updated, ds)
-            })
-        })
-        .collect();
-
     let mut router = Router::with_policy(policy);
-    // Per-tool exposure overrides (rename / re-describe) must be set before indexing,
-    // since they're applied as each server's tools are added.
     router.set_overrides(reg.tool_overrides.clone());
-    let backoff = reconnect_backoff();
-    for handle in handles {
-        let Ok((server, dirty, resource_updated, result)) = handle.join() else {
+    let raw_catalogs = load_server_catalogs(profile);
+    for server in servers {
+        let spec = effective_server_spec(&server, root, reg.secrets_generation);
+        if previous_router
+            .is_some_and(|previous| router.reuse_supervisor(previous, &server.id, &spec))
+        {
             continue;
-        };
-        // The same `connect_one` used for the initial spawn is the reconnect
-        // factory, so a re-spawn re-injects keychain secrets and re-handshakes
-        // exactly like a fresh connect, then re-issues resource subscriptions
-        // this server still owns.
+        }
+        let id = server.id.clone();
+        let tools = raw_catalogs.get(&id).cloned().unwrap_or_default();
+        let dirty = Arc::clone(dirty);
         let handler = Arc::clone(&server_handler);
-        let root_c = root_owned.clone();
+        let root = root.map(str::to_string);
         let subs = resource_subs.clone();
-        let server_id = server.id.clone();
-        let pending_id = server.id.clone();
+        let updated = resource_updated.clone();
         let connect: Connect = Arc::new(move || {
             let mut ds = connect_one_result(
                 &server,
                 &dirty,
                 Arc::clone(&handler),
-                root_c.as_deref(),
-                resource_updated.clone(),
+                root.as_deref(),
+                updated.clone(),
             )?;
-            if let Some(ref table) = subs {
-                resubscribe_server_resources(&mut ds, &server_id, table);
+            if let Some(table) = &subs {
+                resubscribe_server_resources(&mut ds, &server.id, table);
             }
             Ok(ds)
         });
-        match result {
-            Ok(ds) => {
-                let reconnect: Reconnect = Box::new(move || connect().ok());
-                router.add_with_reconnect(ds, Some(reconnect));
-            }
-            // Keep the server and retry it in the background, so a server that was
-            // not ready at startup (no network yet, a locked keychain, a slow first
-            // `npx`) joins the catalog once it is, without a restart (REL-03).
-            Err(failure) => router.add_pending(pending_id, failure, connect, backoff),
+        router.add_supervised(id.clone(), tools, connect, reconnect_backoff(), spec);
+        if let Some(table) = &resource_subs {
+            keep_subscribed_server_warm(&router, &id, Arc::clone(table));
         }
     }
     router
+}
+
+/// Cache only credential digests, never their values. A global vault generation
+/// prompts a per-server comparison rather than restarting unrelated servers.
+fn server_credential_revision(server: &ServerEntry, generation: u64) -> String {
+    type Revisions = HashMap<String, (u64, String)>;
+    static REVISIONS: std::sync::OnceLock<Mutex<Revisions>> = std::sync::OnceLock::new();
+    let mut keys: BTreeSet<(String, bool)> = server
+        .env
+        .iter()
+        .filter(|entry| entry.secret && entry.value.is_none())
+        .map(|entry| (entry.key.clone(), false))
+        .collect();
+    if let Some(launch) = &server.launch {
+        keys.extend(
+            launch
+                .inputs
+                .iter()
+                .filter(|input| input.secret && input.value.is_none())
+                .map(|input| (input.key.clone(), true)),
+        );
+    }
+    if server.command.is_none() && server.url.is_some() {
+        keys.insert((secrets::HTTP_AUTH_KEY.to_string(), false));
+        keys.insert((remote::OAUTH_STATE_KEY.to_string(), false));
+        if server.client_credentials.is_some() {
+            keys.insert((secrets::CLIENT_SECRET_KEY.to_string(), false));
+        }
+    }
+    if keys.is_empty() {
+        return String::new();
+    }
+    let cache_key = format!("{:?}:{}:{keys:?}", registry::conduit_dir(), server.id);
+    let cache = REVISIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some((_, digest)) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&cache_key)
+        .filter(|(old, _)| *old == generation)
+    {
+        return digest.clone();
+    }
+    let mut material = Vec::new();
+    for (key, vault_only) in keys {
+        let value = if vault_only {
+            secrets::get_vault_secret_result(&server.id, &key)
+        } else {
+            secrets::get_secret_result(&server.id, &key)
+        };
+        // Errors are represented without recording their possibly sensitive text.
+        material.push(json!({"key":key,"value":value.as_ref().ok(),"unreadable":value.is_err()}));
+    }
+    let digest = registry::sha256_hex(&Value::Array(material).to_string());
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(cache_key, (generation, digest.clone()));
+    digest
+}
+
+/// Only inputs consumed by connect_one_result belong to connection identity.
+fn effective_server_spec(
+    server: &ServerEntry,
+    root: Option<&str>,
+    secrets_generation: u64,
+) -> Value {
+    let env: BTreeMap<_, _> = server
+        .env
+        .iter()
+        .map(|entry| {
+            (
+                entry.key.clone(),
+                json!({"value": entry.value, "secret": entry.secret}),
+            )
+        })
+        .collect();
+    let launch = server.launch.as_ref().map(|launch| {
+        let inputs: BTreeMap<_, _> = launch
+            .inputs
+            .iter()
+            .map(|input| {
+                (
+                    &input.key,
+                    json!({"secret":input.secret,"required":input.required,"value":input.value}),
+                )
+            })
+            .collect();
+        json!({"inputs":inputs,"bindings":launch.bindings,"requiredEnv":launch.required_env})
+    });
+    json!({
+        "command": server.command, "args": server.args, "launch": launch, "url": server.url,
+        "source": server.source,
+        "cwdConfigured": server.cwd,
+        "cwd": server.cwd.as_deref().and_then(|cwd| downstream::resolve_root_token(cwd, root)),
+        "inheritEnv": server.inherit_env, "env": env,
+        "clientCredentials": server.client_credentials,
+        "requestTimeoutMs": server.request_timeout_ms, "initializeTimeoutMs": server.initialize_timeout_ms,
+        "credentialsRevision": server_credential_revision(server, secrets_generation),
+    })
 }
 
 /// Backoff for retrying servers that failed to connect: 2 s doubling to 5 min.
@@ -7602,20 +7765,6 @@ fn bind_resource_updated_sink(
     })
 }
 
-/// Connect a single enabled server (stdio with keychain secret injection, or
-/// remote with refresh-aware auth). Returns None on failure.
-fn connect_one(
-    server: &ServerEntry,
-    dirty: &Arc<AtomicU8>,
-    server_handler: ServerRequestHandler,
-    root: Option<&str>,
-    resource_updated: Option<ResourceUpdatedDispatch>,
-) -> Option<DownstreamServer> {
-    connect_one_result(server, dirty, server_handler, root, resource_updated).ok()
-}
-
-/// [`connect_one`], keeping why it failed so a background retry can report it and
-/// tell a sign-in problem from a transient one.
 fn connect_one_result(
     server: &ServerEntry,
     dirty: &Arc<AtomicU8>,
@@ -8537,6 +8686,15 @@ fn handle_resource_subscription(
     let session = active_resource_session_id();
     match method {
         "resources/subscribe" => {
+            if let Err(message) = prepare_dispatch(
+                router,
+                Some(&state.router),
+                DispatchTarget::Server(&owner),
+                cancel,
+                false,
+            ) {
+                return Some(error(id, -32602, &format!("Toolport: {message}")));
+            }
             // Single-flight: the first caller opens downstream, the rest wait on the
             // gate and then either join the open subscription or inherit the leader's
             // error. Deliberately fail-closed -- a waiter does NOT retry as a new leader,
@@ -8716,50 +8874,43 @@ fn handle_resource_subscription(
     }
 }
 
-/// Re-issue `resources/subscribe` for every tracked URI against a live router
-/// (after full rebuild). Fail closed per URI: drop local tracking when the
-/// owner is gone or the downstream rejects the re-subscribe.
-fn reestablish_all_resource_subscriptions(
+/// A subscribed replacement starts immediately; the connect factory restores
+/// its subscriptions before the supervisor publishes the new connection.
+fn keep_subscribed_server_warm(
+    router: &Router,
+    id: &str,
+    table: Arc<Mutex<ResourceSubscriptionTable>>,
+) {
+    let owner = id.to_string();
+    let used: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+        !table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .uris_for_owner(&owner)
+            .is_empty()
+    });
+    let eager = used();
+    router.set_subscription_use(id, used);
+    if eager {
+        router.prepare_lazy_use(id);
+    }
+}
+
+/// After a rebuild, drop local tracking for URIs whose owner is no longer in
+/// the router. Kept and replaced servers restore their own subscriptions.
+fn drop_orphaned_resource_subscriptions(
     router: &Router,
     subs: &Arc<Mutex<ResourceSubscriptionTable>>,
 ) {
-    let tracked = {
-        let table = subs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        table.tracked_uri_owners()
-    };
-    if tracked.is_empty() {
-        return;
-    }
-    for (uri, old_owner) in tracked {
-        match router.resource_server(&uri) {
-            Some(owner) => {
-                if owner != old_owner {
-                    let mut table = subs
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    table.set_owner(&uri, owner);
-                }
-                if let Err(e) = router.subscribe_resource(&uri) {
-                    eprintln!(
-                        "toolport: re-subscribe '{uri}' after rebuild failed: {e}; dropping local holders"
-                    );
-                    let mut table = subs
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    table.clear_uri(&uri);
-                }
-            }
-            None => {
-                eprintln!(
-                    "toolport: resource '{uri}' no longer owned after rebuild; dropping subscriptions"
-                );
-                let mut table = subs
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                table.clear_uri(&uri);
-            }
+    let mut table = subs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (uri, owner) in table.tracked_uri_owners() {
+        if router.server_slot(&owner).is_none() {
+            eprintln!(
+                "toolport: resource '{uri}' owner '{owner}' was removed by a rebuild; dropping subscriptions"
+            );
+            table.clear_uri(&uri);
         }
     }
 }
@@ -9011,9 +9162,12 @@ fn publish_built_router(
 ) -> Vec<Value> {
     let tools = built.aggregated_tools();
     let tools = requarantine_if_needed(registry, &mut built, tools, profile);
-    *router
+    let mut live = router
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(built);
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    live.retire_replaced_supervisors(&built);
+    *live = Arc::new(built);
+    live.activate_supervisors();
     tools
 }
 
@@ -9371,6 +9525,11 @@ impl HostState {
         scope_diff_only: bool,
         previous_adapter_tools: Option<&HashMap<McpSessionOwner, Vec<Value>>>,
     ) {
+        let live = router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        save_server_catalogs(&live, profile);
         self.invalidate_root_views();
         self.invalidate_tool_scope_views();
         let previous_catalog = scope_diff_only.then(|| {
@@ -9503,6 +9662,27 @@ fn load_tool_cache(profile: Option<&str>) -> Vec<Value> {
         .filter(|v| v.get("version").and_then(Value::as_u64) == Some(TOOL_CACHE_VERSION))
         .and_then(|v| v.get("tools").and_then(Value::as_array).cloned())
         .unwrap_or_default()
+}
+
+fn server_catalog_path(profile: Option<&str>) -> Option<PathBuf> {
+    tool_cache_path(profile).map(|path| path.with_extension("servers.json"))
+}
+
+fn load_server_catalogs(profile: Option<&str>) -> HashMap<String, Vec<Value>> {
+    server_catalog_path(profile)
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(|value| value["version"] == 1)
+        .and_then(|value| serde_json::from_value(value["servers"].clone()).ok())
+        .unwrap_or_default()
+}
+
+fn save_server_catalogs(router: &Router, profile: Option<&str>) {
+    if let (Some(path), Some(catalogs)) = (server_catalog_path(profile), router.raw_catalogs()) {
+        if let Ok(raw) = serde_json::to_string(&json!({"version": 1, "servers": catalogs})) {
+            let _ = registry::atomic_write(&path, &raw);
+        }
+    }
 }
 
 fn save_tool_cache(tools: &[Value], profile: Option<&str>) {
@@ -9653,8 +9833,19 @@ fn watch_registry(
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         ),
     };
+    let mut seen = started_supervisors();
     loop {
-        std::thread::sleep(Duration::from_millis(1000));
+        // A started server is published as soon as it connects, through the
+        // same gated path as the tick, so a first lazy call does not wait for it.
+        let tick = Instant::now() + Duration::from_millis(1000);
+        loop {
+            let latest = wait_for_started_supervisor(seen, tick);
+            if latest == seen {
+                break;
+            }
+            seen = latest;
+            drive_reconnects(&host, &stdio, &profile);
+        }
         let _ = watch_tick(
             &path,
             &stdio,
@@ -9676,6 +9867,30 @@ fn watch_registry(
 /// downstream refresh), then starts the attempts that are due. Attempts run on
 /// their own threads, so nothing here waits on a downstream server.
 fn drive_reconnects(host: &HostState, stdio: &SessionState, profile: &Arc<Mutex<Option<String>>>) {
+    let (root_slots, root_views) = {
+        let pool = host
+            .root_launch_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            pool.launches
+                .values()
+                .map(|launch| launch.slot.clone())
+                .collect::<Vec<_>>(),
+            pool.views
+                .iter()
+                .map(|(keys, view)| (keys.clone(), Arc::clone(view)))
+                .collect::<Vec<_>>(),
+        )
+    };
+    for slot in root_slots {
+        slot.maintain();
+    }
+    for (keys, view) in root_views {
+        if view.has_ready_reconnects_for(|id| keys.iter().any(|key| key.server == id)) {
+            host.reconcile_rooted_view(&keys, view);
+        }
+    }
     let live = host
         .router
         .lock()
@@ -9703,6 +9918,7 @@ fn drive_reconnects(host: &HostState, stdio: &SessionState, profile: &Arc<Mutex<
     } else {
         live
     };
+    live.maintain_supervisors();
     live.start_due_reconnects();
 }
 
@@ -9733,7 +9949,36 @@ fn adopt_reconnected_servers(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    let resources_changed = !next.aggregated_resources().is_empty()
+        || !next.aggregated_resource_templates().is_empty()
+        || !previous_router.aggregated_resources().is_empty()
+        || !previous_router.aggregated_resource_templates().is_empty();
+    let prompts_changed =
+        !next.aggregated_prompts().is_empty() || !previous_router.aggregated_prompts().is_empty();
     let tools = publish_built_router(&host.registry, &host.router, next, resolved.as_deref());
+    let current = host
+        .router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if resources_changed {
+        notify_list_changed_for_router_diff(
+            stdio,
+            Some(&host.mcp_sessions),
+            &previous_router,
+            &current,
+            ChangedListKind::Resources,
+        );
+    }
+    if prompts_changed {
+        notify_list_changed_for_router_diff(
+            stdio,
+            Some(&host.mcp_sessions),
+            &previous_router,
+            &current,
+            ChangedListKind::Prompts,
+        );
+    }
     host.persist_and_emit_with_sessions(
         &tools,
         &host.cached_tools,
@@ -9841,9 +10086,8 @@ fn watch_tick(
     }
 
     if file_changed {
-        // The registry changed: servers may have been added, removed, or
-        // reconfigured, so reload and rebuild from scratch. This re-connects
-        // everything, which also subsumes any pending downstream change.
+        // Reload the registry, then compose a new catalog from unchanged
+        // supervisors and lazy slots for changed or newly enabled servers.
         eprintln!("toolport: registry file changed on disk");
         // Don't advance `last_mtime` until a successful load, so a half-written file
         // (caught mid-save) is retried on the next tick instead of skipped.
@@ -9952,9 +10196,8 @@ fn watch_tick(
             *guard = resolved.clone();
             prev
         };
-        // Full rebuild spawns stdio children. Single-flight with startup self-heal
-        // and ${ROOT} rebuild so two concurrent build_router+swap paths cannot
-        // double-spawn and kill the loser's children on Drop (SOU-337).
+        // Single-flight catalog composition with startup and root placement.
+        // Unchanged supervisors are shared, including calls already in flight.
         let _rebuild = rebuild_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -9969,7 +10212,7 @@ fn watch_tick(
             (**guard).clone()
         };
         // Build the new router (spawns processes) before taking the router lock.
-        let new_router = build_router(
+        let new_router = build_router_incremental(
             &new_reg,
             resolved.as_deref(),
             http_mode,
@@ -9980,10 +10223,10 @@ fn watch_tick(
             resource_updated.cloned(),
             resource_subs.cloned(),
             prior_quarantine_from_router(&previous_router),
+            Some(&previous_router),
         );
-        // Re-issue tracked resource subscriptions against the fresh connections.
         if let Some(subs) = resource_subs {
-            reestablish_all_resource_subscriptions(&new_router, subs);
+            drop_orphaned_resource_subscriptions(&new_router, subs);
         }
         let server_count = new_router.server_count();
         // The registry and its trust verdict were already published together,
@@ -10166,6 +10409,7 @@ type RootPlacementTestHook = Arc<dyn Fn(&str) -> Option<DownstreamServer> + Send
 struct RootLaunchPool {
     base: Option<Arc<Router>>,
     specs: Vec<ServerEntry>,
+    effective_specs: HashMap<String, Value>,
     secrets_generation: u64,
     launches: BTreeMap<LaunchKey, RootLaunch>,
     /// Weak entries keep the same gate for overlapping placements, including
@@ -10183,7 +10427,7 @@ struct RootLaunchPool {
     incomplete_until: BTreeMap<Vec<LaunchKey>, Instant>,
 }
 
-const ROOT_VIEW_IDLE_GRACE: Duration = Duration::from_secs(60);
+const ROOT_VIEW_IDLE_GRACE: Duration = SERVER_IDLE_TIMEOUT;
 
 struct RootLaunch {
     slot: SharedServerSlot,
@@ -10193,9 +10437,53 @@ struct RootLaunch {
 }
 
 impl RootLaunchPool {
+    fn refresh_specs(
+        &mut self,
+        specs: Vec<ServerEntry>,
+        generation: u64,
+    ) -> BTreeMap<LaunchKey, RootLaunch> {
+        // Preserve the digest accepted at launch. Re-reading an old generation
+        // after vault rotation would compare the new credential to itself.
+        let effective_specs: HashMap<_, _> = specs
+            .iter()
+            .map(|server| {
+                (
+                    server.id.clone(),
+                    effective_server_spec(server, None, generation),
+                )
+            })
+            .collect();
+        let changed: HashSet<_> = self
+            .effective_specs
+            .iter()
+            .filter(|(id, spec)| effective_specs.get(*id) != Some(*spec))
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.effective_specs = effective_specs;
+        let keys: Vec<_> = self
+            .launches
+            .keys()
+            .filter(|key| changed.contains(&key.server))
+            .cloned()
+            .collect();
+        let mut retired = BTreeMap::new();
+        for key in keys {
+            if let Some(launch) = self.launches.remove(&key) {
+                launch.active.store(false, Ordering::SeqCst);
+                launch.slot.retire();
+                retired.insert(key, launch);
+            }
+        }
+        self.specs = specs;
+        self.secrets_generation = generation;
+        retired
+    }
+
+    #[cfg(test)]
     fn retire_launches(&mut self) -> BTreeMap<LaunchKey, RootLaunch> {
         for launch in self.launches.values() {
             launch.active.store(false, Ordering::SeqCst);
+            launch.slot.retire();
         }
         std::mem::take(&mut self.launches)
     }
@@ -10627,7 +10915,7 @@ impl HostState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let retired_launches =
             if pool.specs != specs || pool.secrets_generation != reg.secrets_generation {
-                let retired = pool.retire_launches();
+                let retired = pool.refresh_specs(specs.clone(), reg.secrets_generation);
                 pool.failed_until.clear();
                 pool.incomplete_until.clear();
                 pool.specs = specs;
@@ -10724,6 +11012,7 @@ impl HostState {
                 retained_launches.insert(key, launch);
             } else {
                 launch.active.store(false, Ordering::SeqCst);
+                launch.slot.retire();
                 retired_launches.push(launch);
             }
         }
@@ -10873,45 +11162,77 @@ impl HostState {
             }
             None => view.fail_closed_catalog(),
         }
+        save_server_catalogs(view, Some(scope));
     }
 
     fn reconcile_rooted_view(&self, keys: &[LaunchKey], cached: Arc<Router>) -> Arc<Router> {
-        let scope = {
-            let pool = self
+        // Base slots shared by this view publish only through the base router.
+        let rooted = |id: &str| keys.iter().any(|key| key.server == id);
+        let mut cached = cached;
+        loop {
+            let scope = {
+                let pool = self
+                    .root_launch_pool
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                pool.root_scopes.get(keys).cloned()
+            };
+            if cached.has_ready_reconnects_for(rooted) {
+                let mut updated = (*cached).clone();
+                updated.adopt_ready_reconnects_for(rooted);
+                if let Some(scope) = &scope {
+                    self.check_rooted_integrity(&mut updated, scope, keys);
+                }
+                let updated = Arc::new(updated);
+                let mut pool = self
+                    .root_launch_pool
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(current) = pool.views.get_mut(keys) {
+                    if Arc::ptr_eq(current, &cached) {
+                        *current = Arc::clone(&updated);
+                        updated.activate_supervisors_for(rooted);
+                        return updated;
+                    }
+                }
+                let current = pool.views.get(keys).cloned();
+                drop(pool);
+                if let Some(current) = current {
+                    cached = current;
+                    continue;
+                }
+                return cached;
+            }
+            let wanted = scope.and_then(|scope| self.rooted_quarantine(&scope));
+            if wanted
+                .as_ref()
+                .is_some_and(|set| set == cached.quarantined() && !cached.catalog_fail_closed())
+                || wanted.is_none() && cached.catalog_fail_closed()
+            {
+                return cached;
+            }
+            let mut updated = (*cached).clone();
+            if let Some(set) = wanted {
+                updated.requarantine_from_store(set);
+            } else {
+                updated.fail_closed_catalog();
+            }
+            let updated = Arc::new(updated);
+            let mut pool = self
                 .root_launch_pool
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pool.root_scopes.get(keys).cloned()
-        };
-        let wanted = scope.and_then(|scope| self.rooted_quarantine(&scope));
-        if wanted
-            .as_ref()
-            .is_some_and(|set| set == cached.quarantined() && !cached.catalog_fail_closed())
-            || wanted.is_none() && cached.catalog_fail_closed()
-        {
-            return cached;
+            let Some(current) = pool.views.get_mut(keys) else {
+                return cached;
+            };
+            if !Arc::ptr_eq(current, &cached) {
+                return Arc::clone(current);
+            }
+            *current = Arc::clone(&updated);
+            drop(pool);
+            self.invalidate_tool_scope_views();
+            return updated;
         }
-        let mut updated = (*cached).clone();
-        if let Some(set) = wanted {
-            updated.requarantine_from_store(set);
-        } else {
-            updated.fail_closed_catalog();
-        }
-        let updated = Arc::new(updated);
-        let mut pool = self
-            .root_launch_pool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(current) = pool.views.get_mut(keys) else {
-            return cached;
-        };
-        if !Arc::ptr_eq(current, &cached) {
-            return Arc::clone(current);
-        }
-        *current = Arc::clone(&updated);
-        drop(pool);
-        self.invalidate_tool_scope_views();
-        updated
     }
 
     fn router_for_root(
@@ -10988,7 +11309,10 @@ impl HostState {
         let mut retired_launches = Vec::new();
         let mut retired_views = Vec::new();
         if pool.specs != all_specs || pool.secrets_generation != reg.secrets_generation {
-            retired_launches.extend(pool.retire_launches().into_values());
+            retired_launches.extend(
+                pool.refresh_specs(all_specs.clone(), reg.secrets_generation)
+                    .into_values(),
+            );
             retired_views.extend(std::mem::take(&mut pool.views).into_values());
             pool.failed_until.clear();
             pool.incomplete_until.clear();
@@ -11069,7 +11393,6 @@ impl HostState {
             #[cfg(not(test))]
             let fixture: Option<DownstreamServer> = None;
             let dirty = Arc::clone(&self.downstream_dirty);
-            let handler = Arc::clone(&self.server_handler);
             let active = Arc::new(AtomicBool::new(true));
             let dispatch = make_resource_updated_sink(
                 Arc::clone(&self.resource_stdio),
@@ -11082,27 +11405,29 @@ impl HostState {
                     dispatch(producer, uri);
                 }
             }));
-            let Some(mut ds) =
-                fixture.or_else(|| connect_one(&server, &dirty, handler, Some(root), sink.clone()))
-            else {
-                active.store(false, Ordering::SeqCst);
-                connected.push((key, None));
-                continue;
-            };
-            // A replacement child at the same rooted cwd inherits active
-            // subscribers before the route becomes visible to new requests.
-            resubscribe_server_resources(&mut ds, &server.id, &subscriptions);
+            let initial = fixture.map(|mut server| {
+                let id = server.id.clone();
+                resubscribe_server_resources(&mut server, &id, &subscriptions);
+                server
+            });
+            let root_scope = format!("root:{}", registry::sha256_hex(root));
+            let cached = load_server_catalogs(Some(&root_scope))
+                .remove(&server.id)
+                .unwrap_or_default();
             let spec = server.clone();
             let root = root.to_string();
             let subs = Arc::clone(&subscriptions);
             let handler = Arc::clone(&self.server_handler);
             let server_id = server.id.clone();
             let reconnect_active = Arc::clone(&active);
-            let reconnect: Reconnect = Box::new(move || {
+            let connect: Connect = Arc::new(move || {
                 if !reconnect_active.load(Ordering::SeqCst) {
-                    return None;
+                    return Err(ConnectFailure {
+                        message: "launch retired".to_string(),
+                        needs_auth: false,
+                    });
                 }
-                let mut ds = connect_one(
+                let mut ds = connect_one_result(
                     &spec,
                     &dirty,
                     Arc::clone(&handler),
@@ -11110,14 +11435,31 @@ impl HostState {
                     sink.clone(),
                 )?;
                 if !reconnect_active.load(Ordering::SeqCst) {
-                    return None;
+                    return Err(ConnectFailure {
+                        message: "launch retired".to_string(),
+                        needs_auth: false,
+                    });
                 }
                 resubscribe_server_resources(&mut ds, &server_id, &subs);
-                Some(ds)
+                Ok(ds)
             });
-            let slot = Router::new()
-                .with_server_launch(ds, Some(reconnect))
-                .server_slot(&server.id);
+            let launch_view = if let Some(server) = initial {
+                Router::new().with_supervised_launch(server, connect, reconnect_backoff())
+            } else {
+                let mut view = Router::new();
+                view.add_supervised(
+                    server.id.clone(),
+                    cached,
+                    connect,
+                    reconnect_backoff(),
+                    Value::Null,
+                );
+                view
+            };
+            keep_subscribed_server_warm(&launch_view, &server.id, Arc::clone(&subscriptions));
+            // A root-specific discovery with no catalog is first use too.
+            launch_view.discover_uncached(|_| true);
+            let slot = launch_view.server_slot(&server.id);
             connected.push((
                 key,
                 slot.map(|slot| RootLaunch {
@@ -11144,6 +11486,7 @@ impl HostState {
             for (_, launch) in &connected {
                 if let Some(launch) = launch {
                     launch.active.store(false, Ordering::SeqCst);
+                    launch.slot.retire();
                 }
             }
             return base;
@@ -11154,6 +11497,7 @@ impl HostState {
             if pool.launches.contains_key(&key) {
                 if let Some(launch) = launch {
                     launch.active.store(false, Ordering::SeqCst);
+                    launch.slot.retire();
                     discarded.push(launch);
                 }
                 continue;
@@ -11193,6 +11537,7 @@ impl HostState {
             &format!("root:{}", registry::sha256_hex(root)),
             &keys,
         );
+        view.activate_supervisors_for(|id| keys.iter().any(|key| key.server == id));
         let view = Arc::new(view);
         let mut pool = self
             .root_launch_pool
@@ -12973,7 +13318,7 @@ fn rebuild_router_for_root(state: &GatewayState) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (**guard).clone()
     };
-    let new_router = build_router(
+    let new_router = build_router_incremental(
         &reg,
         profile.as_deref(),
         state.http,
@@ -12984,8 +13329,9 @@ fn rebuild_router_for_root(state: &GatewayState) {
         state.resource_updated_sink.clone(),
         Some(Arc::clone(&state.resource_subs)),
         prior_quarantine_from_router(&previous_router),
+        Some(&previous_router),
     );
-    reestablish_all_resource_subscriptions(&new_router, &state.resource_subs);
+    drop_orphaned_resource_subscriptions(&new_router, &state.resource_subs);
     let tools = publish_built_router(
         &state.registry,
         &state.router,
@@ -13022,8 +13368,15 @@ fn finish_self_heal_build(
     if built.server_count() == 0 {
         return;
     }
-    reestablish_all_resource_subscriptions(&built, &state.resource_subs);
+    drop_orphaned_resource_subscriptions(&built, &state.resource_subs);
     let tools = publish_built_router(&state.registry, &state.router, built, profile);
+    let live = state
+        .router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    save_server_catalogs(&live, profile);
+
     let tools = if tools.is_empty() {
         tools
     } else {
@@ -13094,6 +13447,13 @@ fn finish_startup_build(
         (**guard).clone()
     };
     let tools = publish_built_router(&host.registry, &host.router, built, profile);
+    let live = host
+        .router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    save_server_catalogs(&live, profile);
+
     host.invalidate_root_views();
     host.invalidate_tool_scope_views();
     // Read AFTER the integrity gate: it can newly quarantine a tool or keep a
@@ -13454,6 +13814,12 @@ fn adapter_live_view(
     LiveRouterResolver { stale, resolve }
 }
 
+/// First prompt and resource lists stop waiting for servers still connecting
+/// after this long. A server that is slower, or hangs in initialize, announces
+/// its catalog later with list_changed. One that already connected is still
+/// awaited while the gateway publishes it.
+const FIRST_CATALOG_WAIT: Duration = Duration::from_secs(2);
+
 /// One request in, one response out: wait for a cold cache / live router when
 /// the method needs it, self-heal an empty router on a call, then dispatch.
 /// Shared by the stdio loop and the HTTP server so they can't diverge.
@@ -13530,6 +13896,84 @@ fn process_request(
         }
     }
 
+    if matches!(
+        method,
+        "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
+    ) {
+        let live = state
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let cached = state
+            .cached_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if method != "tools/list" {
+            live.demand_servers(|id| {
+                allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
+            });
+        }
+        live.discover_uncached(|id| {
+            allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
+                && !cached.tools.iter().any(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| {
+                            name.starts_with(&format!("{}__", sanitize_segment(id)))
+                        })
+                })
+        });
+    }
+
+    // Tools can use their disk cache immediately. Other first lists wait for
+    // startup because the disk cache contains tools only. A cold tools/list
+    // waits for every first catalog, not just the first server to publish.
+    // Prompt and resource lists share one short bound. Warm lists stay fast.
+    let catalog_list = matches!(
+        method,
+        "resources/list" | "resources/templates/list" | "prompts/list"
+    );
+    let catalog_deadline = Instant::now() + FIRST_CATALOG_WAIT;
+    if matches!(
+        method,
+        "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
+    ) && (method != "tools/list"
+        || state
+            .cached_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tools
+            .is_empty())
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let visible = |id: &str| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope));
+        while Instant::now() < deadline {
+            let live = state
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if !live.any_discovering(visible)
+                || catalog_list
+                    && Instant::now() >= catalog_deadline
+                    && !live.any_publishing_first_catalog(visible)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // A server becomes Ready inside its publication, before that publication
+        // refreshes the tool cache. Let an in-flight publication finish first.
+        drop(
+            state
+                .rebuild_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+
     // Snapshot the live-updated profile once: the watcher may swap it mid-request,
     // but a single request should see one consistent value throughout.
     let profile_snapshot = state
@@ -13596,7 +14040,7 @@ fn process_request(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (**guard).clone()
             };
-            let built = build_router(
+            let built = build_router_incremental(
                 &reg,
                 profile_snapshot.as_deref(),
                 state.http,
@@ -13607,6 +14051,7 @@ fn process_request(
                 state.resource_updated_sink.clone(),
                 Some(Arc::clone(&state.resource_subs)),
                 prior_quarantine_from_router(&previous_router),
+                Some(&previous_router),
             );
             finish_self_heal_build(state, built, &previous_router, profile_snapshot.as_deref());
         }
@@ -13635,11 +14080,46 @@ fn process_request(
     let adapter_root = daemon_adapter
         .then(|| state.active_adapter_root())
         .flatten();
-    let rooted_router = if daemon_adapter {
+    let mut rooted_router = if daemon_adapter {
         state.router_for_root(base_router, &reg, adapter_root.as_deref(), allowed)
     } else {
         base_router
     };
+    // Rooted prompt/resource catalogs are not on disk either. Demand them and
+    // share the same bounded first-list wait as ordinary servers.
+    let rooted_list = catalog_list;
+    if daemon_adapter && rooted_list {
+        rooted_router
+            .demand_servers(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)));
+    }
+    // Rooted composition can take a while, so its bound starts at its demand.
+    let rooted_catalog_deadline = Instant::now() + FIRST_CATALOG_WAIT;
+    if daemon_adapter
+        && (rooted_list || method == "tools/list" && rooted_router.aggregated_tools().is_empty())
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let visible = |id: &str| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope));
+        while rooted_router.any_discovering(visible)
+            && (!rooted_list
+                || Instant::now() < rooted_catalog_deadline
+                || rooted_router.any_publishing_first_catalog(visible))
+            && Instant::now() < deadline
+        {
+            if cancel
+                .as_ref()
+                .is_some_and(downstream::CancelContext::is_cancelled)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+            let base = state
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            rooted_router = state.router_for_root(base, &reg, adapter_root.as_deref(), allowed);
+        }
+    }
     let (router, adapter_catalog) = if state.daemon_mode.load(Ordering::SeqCst) {
         adapter_profile
             .map(|profile| state.router_for_adapter_profile(rooted_router.clone(), &reg, profile))
@@ -16599,6 +17079,34 @@ fn respond_http_overloaded(request: tiny_http::Request) {
     let _ = request.respond(response);
 }
 
+/// Data-less paths that must answer without a bearer token.
+///
+/// A container HEALTHCHECK has no way to read the operator's `TOOLPORT_HTTP_TOKEN`,
+/// so the readiness probe has to sit outside the auth gate, exactly like the
+/// data-less OPTIONS preflight. Everything reachable here must therefore carry no
+/// registry data, version, tool names, or counts: only a status code.
+fn path_is_public_probe(path: &str) -> bool {
+    path == "/healthz"
+}
+
+/// The readiness response for a [`path_is_public_probe`] path: a status code and
+/// nothing else.
+///
+/// `200` once the live registry is a faithful copy of what is on disk; `503` when
+/// the boot load failed, which is the host-owned bind-mount case where the runtime
+/// user (uid 10001) cannot create the registry lock and the gateway serves the
+/// cached catalog only. Listener liveness alone must not read as ready, or the
+/// degraded container stays "healthy" in Docker.
+fn healthz_out(state: &GatewayState, method: &str) -> HttpOut {
+    if method != "GET" && method != "HEAD" {
+        HttpOut::new(405, "text/plain; charset=utf-8", String::new())
+    } else if state.registry_trusted.load(Ordering::SeqCst) {
+        HttpOut::new(200, "text/plain; charset=utf-8", String::new())
+    } else {
+        HttpOut::new(503, "text/plain; charset=utf-8", String::new())
+    }
+}
+
 /// Handle one accepted HTTP request end to end: parse, CORS, auth/scope, dispatch,
 /// and respond. A pure function of the request plus the shared state and guards, so
 /// it is safe to run on many worker threads concurrently.
@@ -16710,6 +17218,20 @@ fn handle_connection(
             .unwrap_or(&state.http_bind_host),
         &state.http_allowed_origins,
     );
+
+    // Readiness probe: answered before the auth gate so a container HEALTHCHECK
+    // needs no token, and data-free so a probe can never read registry contents,
+    // a version, or a tool count. See [`healthz_out`].
+    if path_is_public_probe(&path) {
+        let out = if forbidden {
+            HttpOut::json_err(403, "cross-site browser requests are not allowed")
+        } else {
+            healthz_out(state, &method)
+        };
+        let response = tiny_http::Response::from_string(out.body).with_status_code(out.status);
+        let _ = request.respond(response);
+        return;
+    }
 
     // Auth + scope gate: resolve the bearer to (authorized, allowed-servers).
     // OPTIONS is the data-less preflight, always allowed and unscoped. Else the
@@ -18997,6 +19519,798 @@ mod tests {
                 .starts_with("Toolport: blocked"),
             "block alone must still withhold high-confidence payload"
         );
+    }
+
+    fn wait_for_supervisor_result(router: &Router) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !router.has_ready_reconnects() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            router.has_ready_reconnects(),
+            "supervisor never completed startup"
+        );
+    }
+
+    fn cached_supervisor() -> Router {
+        let mut router = Router::new();
+        router.add_supervised(
+            "cache".into(),
+            vec![json!({"name":"cached"})],
+            Arc::new(|| {
+                let mut server =
+                    DownstreamServer::connect("cache".into(), Box::new(CacheRoute)).unwrap();
+                server.load_resources_prompts();
+                Ok(server)
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        router
+    }
+
+    #[test]
+    fn supervisor_first_prompts_and_resources_lists_wait_for_the_full_catalog() {
+        let _env = DataDirTestEnv::new("supervisor-lists");
+        for (method, field) in [
+            ("prompts/list", "prompts"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+        ] {
+            let state = http_state(false);
+            *state.router.lock().unwrap() = Arc::new(cached_supervisor());
+            std::thread::scope(|scope| {
+                let adopter = scope.spawn(|| {
+                    let live = state.router.lock().unwrap().clone();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !live.has_ready_reconnects() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(live.has_ready_reconnects());
+                    adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
+                });
+                let reply = process_request(
+                    &state,
+                    &json!({"jsonrpc":"2.0","id":1,"method":method}),
+                    &SearchGuard::default(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    DiscoveryMode::Full,
+                )
+                .unwrap();
+                adopter.join().unwrap();
+                assert_eq!(
+                    reply["result"][field].as_array().unwrap().len(),
+                    1,
+                    "{method} returned the tools-only cache"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn supervisor_rooted_prompts_and_resources_wait_even_with_cached_tools() {
+        let _env = DataDirTestEnv::new("supervisor-rooted-lists");
+        for (method, field) in [
+            ("prompts/list", "prompts"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+        ] {
+            let state = http_state(false);
+            state.daemon_mode.store(true, Ordering::SeqCst);
+            let root = _env.dir.display().to_string();
+            let _context = ActiveRequestContextGuard::enter(ActiveRequestContext {
+                adapter_root: Some(root.clone()),
+                ..ActiveRequestContext::default()
+            });
+            let mut server = stub_server("cache", "Cache");
+            server.cwd = Some("${ROOT}".into());
+            let mut reg = Registry::default();
+            reg.servers.push(server);
+            reg.set_server_enabled("default", "cache", true).unwrap();
+            *state.registry.lock().unwrap() = reg.clone();
+            let keys = root_launch_keys(&daemon_root_servers(&reg), &root, 0);
+            let view = Arc::new(cached_supervisor());
+            let subs = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
+            {
+                let mut pool = state.root_launch_pool.lock().unwrap();
+                pool.specs = daemon_root_servers(&reg);
+                pool.base = Some(state.router.lock().unwrap().clone());
+                pool.launches.insert(
+                    keys[0].clone(),
+                    RootLaunch {
+                        slot: view.server_slot("cache").unwrap(),
+                        subscriptions: Arc::clone(&subs),
+                        subscription_key: ("cache".into(), root.clone()),
+                        active: Arc::new(AtomicBool::new(true)),
+                    },
+                );
+                pool.subscriptions.insert(("cache".into(), root), subs);
+                pool.views.insert(keys, view);
+            }
+            let reply = process_request(
+                &state,
+                &json!({"jsonrpc":"2.0","id":1,"method":method}),
+                &SearchGuard::default(),
+                None,
+                Some("default"),
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .unwrap();
+            assert_eq!(
+                reply["result"][field].as_array().unwrap().len(),
+                1,
+                "{method} returned the rooted tools-only cache"
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_dispatch_rechecks_policy_after_waiting_for_startup() {
+        let _env = DataDirTestEnv::new("supervisor-wait-policy");
+        let state = http_state(false);
+        let snapshot = Arc::new(cached_supervisor());
+        *state.router.lock().unwrap() = Arc::clone(&snapshot);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                prepare_dispatch(
+                    &snapshot,
+                    Some(&state.router),
+                    DispatchTarget::Server("cache"),
+                    None,
+                    false,
+                )
+            });
+            wait_for_supervisor_result(&snapshot);
+            let mut published = (*snapshot).clone();
+            published.adopt_ready_reconnects();
+            published.apply_registry_policy(RegistryPolicy {
+                servers: Some(HashSet::new()),
+                ..RegistryPolicy::default()
+            });
+            *state.router.lock().unwrap() = Arc::new(published);
+            snapshot.activate_supervisors();
+            let error = worker.join().unwrap().unwrap_err();
+            assert!(error.contains("turned off"), "{error}");
+        });
+    }
+
+    #[test]
+    fn supervisor_adoption_announces_prompts_and_resources_to_existing_clients() {
+        let _env = DataDirTestEnv::new("supervisor-notifications");
+        let state = http_state(false);
+        let router = cached_supervisor();
+        router.prepare_lazy_use("cache");
+        wait_for_supervisor_result(&router);
+        *state.router.lock().unwrap() = Arc::new(router);
+        adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
+        assert_eq!(
+            deferred_count(&state.stdio_upstream, "notifications/prompts/list_changed"),
+            1
+        );
+        assert_eq!(
+            deferred_count(
+                &state.stdio_upstream,
+                "notifications/resources/list_changed"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn supervisor_rooted_publication_rechecks_a_view_replaced_during_integrity() {
+        let _env = DataDirTestEnv::new("supervisor-root-publish-race");
+        let state = http_state(false);
+        let server = stub_server("cache", "Cache");
+        let keys = root_launch_keys(&[server], "/project", 0);
+        let cached = Arc::new(cached_supervisor());
+        cached.prepare_lazy_use("cache");
+        wait_for_supervisor_result(&cached);
+        {
+            let mut pool = state.root_launch_pool.lock().unwrap();
+            pool.views.insert(keys.clone(), Arc::clone(&cached));
+            pool.root_scopes.insert(
+                keys.clone(),
+                format!("root:{}", registry::sha256_hex("/project")),
+            );
+        }
+        let host = Arc::clone(&state.host);
+        let hook_keys = keys.clone();
+        let gates = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&gates);
+        *INTEGRITY_GATE_OBSERVER.lock().unwrap() = Some((
+            std::thread::current().id(),
+            Box::new(move || {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let mut pool = host.root_launch_pool.lock().unwrap();
+                    let current = pool.views.get(&hook_keys).unwrap();
+                    let replacement = Arc::new((**current).clone());
+                    pool.views.insert(hook_keys.clone(), replacement);
+                }
+            }),
+        ));
+        let published = state.reconcile_rooted_view(&keys, cached);
+        *INTEGRITY_GATE_OBSERVER.lock().unwrap() = None;
+        assert_eq!(
+            gates.load(Ordering::SeqCst),
+            2,
+            "current view skipped its integrity gate"
+        );
+        assert!(
+            !published.any_starting(|_| true),
+            "shared slot stayed Starting after adoption"
+        );
+        assert!(published.pending_statuses().is_empty());
+        assert_eq!(published.aggregated_prompts().len(), 1);
+        assert!(Arc::ptr_eq(
+            &published,
+            state
+                .root_launch_pool
+                .lock()
+                .unwrap()
+                .views
+                .get(&keys)
+                .unwrap()
+        ));
+    }
+
+    fn counting_cache_supervisor(id: &str, tools: Vec<Value>, starts: &Arc<AtomicUsize>) -> Router {
+        let starts = Arc::clone(starts);
+        let server_id = id.to_string();
+        let mut router = Router::new();
+        router.add_supervised(
+            id.into(),
+            tools,
+            Arc::new(move || {
+                starts.fetch_add(1, Ordering::SeqCst);
+                let mut server =
+                    DownstreamServer::connect(server_id.clone(), Box::new(CacheRoute)).unwrap();
+                server.load_resources_prompts();
+                Ok(server)
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        router
+    }
+
+    #[test]
+    fn supervisor_rooted_view_leaves_shared_base_servers_to_the_base_gate() {
+        let _env = DataDirTestEnv::new("supervisor-rooted-base-gate");
+        let state = http_state(false);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let base = Arc::new(counting_cache_supervisor(
+            "base",
+            vec![json!({"name":"stale"})],
+            &starts,
+        ));
+        *state.router.lock().unwrap() = Arc::clone(&base);
+        let keys = root_launch_keys(&[stub_server("cache", "Cache")], "/project", 0);
+        let rooted = cached_supervisor();
+        let view = Arc::new(base.with_shared_server_slot(&rooted.server_slot("cache").unwrap()));
+        {
+            let mut pool = state.root_launch_pool.lock().unwrap();
+            pool.base = Some(Arc::clone(&base));
+            pool.views.insert(keys.clone(), Arc::clone(&view));
+            pool.root_scopes.insert(
+                keys.clone(),
+                format!("root:{}", registry::sha256_hex("/project")),
+            );
+        }
+        // A rooted client lazily starts both its own server and a shared base one.
+        view.prepare_lazy_use("cache");
+        view.prepare_lazy_use("base");
+        wait_for_supervisor_result(&base);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !view.has_ready_reconnects_for(|id| id == "cache") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drive_reconnects(&state.host, &state.stdio_upstream, &state.profile);
+        let published = state.root_launch_pool.lock().unwrap().views[&keys].clone();
+        let names = |router: &Router| {
+            let mut names: Vec<String> = router
+                .aggregated_tools()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(&published),
+            vec!["base__stale".to_string(), "cache__cached".to_string()],
+            "the rooted view published a base server without the base gate"
+        );
+        // The base router adopted its own server through publish_built_router.
+        let live = state.router.lock().unwrap().clone();
+        assert!(
+            !Arc::ptr_eq(&live, &base),
+            "the base router never adopted it"
+        );
+        assert_eq!(names(&live), vec!["base__cached".to_string()]);
+        assert!(live.pending_statuses().is_empty());
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn supervisor_lists_after_idle_stop_keep_the_catalog_without_restarting() {
+        let _env = DataDirTestEnv::new("supervisor-idle-lists");
+        let state = http_state(false);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let router = counting_cache_supervisor("cache", Vec::new(), &starts);
+        router.prepare_lazy_use("cache");
+        wait_for_supervisor_result(&router);
+        *state.router.lock().unwrap() = Arc::new(router);
+        adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
+        let live = state.router.lock().unwrap().clone();
+        live.maintain_supervisors_at(Instant::now() + SERVER_IDLE_TIMEOUT);
+        assert!(live.pending_statuses().is_empty());
+        for (method, field) in [
+            ("prompts/list", "prompts"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+            ("tools/list", "tools"),
+        ] {
+            let started = Instant::now();
+            let reply = process_request(
+                &state,
+                &json!({"jsonrpc":"2.0","id":1,"method":method}),
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .unwrap();
+            assert!(
+                !reply["result"][field].as_array().unwrap().is_empty(),
+                "{method} lost the stopped server's catalog"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{method} waited"
+            );
+            assert!(
+                !live.any_starting(|_| true),
+                "{method} restarted the server"
+            );
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    fn hanging_supervisor(router: &mut Router, id: &str) -> std::sync::mpsc::Sender<()> {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        router.add_supervised(
+            id.into(),
+            Vec::new(),
+            Arc::new(move || {
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+                Err(ConnectFailure {
+                    message: "initialize timed out".into(),
+                    needs_auth: false,
+                })
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        release_tx
+    }
+
+    #[test]
+    fn supervisor_first_lists_do_not_wait_out_a_hanging_server() {
+        let _env = DataDirTestEnv::new("supervisor-hanging-first-list");
+        let state = http_state(false);
+        let mut router =
+            counting_cache_supervisor("cache", Vec::new(), &Arc::new(AtomicUsize::new(0)));
+        router.prepare_lazy_use("cache");
+        wait_for_supervisor_result(&router);
+        let release = hanging_supervisor(&mut router, "hang");
+        *state.router.lock().unwrap() = Arc::new(router);
+        adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
+        for (method, field) in [
+            ("prompts/list", "prompts"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+        ] {
+            let started = Instant::now();
+            let reply = process_request(
+                &state,
+                &json!({"jsonrpc":"2.0","id":1,"method":method}),
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .unwrap();
+            let waited = started.elapsed();
+            assert!(
+                waited < FIRST_CATALOG_WAIT + Duration::from_secs(2),
+                "{method} waited {waited:?} for a hanging server"
+            );
+            assert_eq!(
+                reply["result"][field].as_array().unwrap().len(),
+                1,
+                "{method} lost the ready server's entries"
+            );
+        }
+        assert!(state.router.lock().unwrap().lazy_starting("hang"));
+        drop(release);
+    }
+
+    #[test]
+    fn supervisor_first_lists_still_wait_for_a_connected_server_being_published() {
+        let _env = DataDirTestEnv::new("supervisor-slow-publication");
+        let state = http_state(false);
+        let router = cached_supervisor();
+        router.prepare_lazy_use("cache");
+        wait_for_supervisor_result(&router);
+        *state.router.lock().unwrap() = Arc::new(router);
+        std::thread::scope(|scope| {
+            // Publication (integrity gate, cache writes) outlasts the bound.
+            let adopter = scope.spawn(|| {
+                std::thread::sleep(FIRST_CATALOG_WAIT + Duration::from_millis(500));
+                adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
+            });
+            let reply = process_request(
+                &state,
+                &json!({"jsonrpc":"2.0","id":1,"method":"prompts/list"}),
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .unwrap();
+            adopter.join().unwrap();
+            assert_eq!(
+                reply["result"]["prompts"].as_array().unwrap().len(),
+                1,
+                "a connected server lost its first list to the bound"
+            );
+        });
+    }
+
+    #[test]
+    fn supervisor_publication_fails_waiters_on_a_replaced_start_fast() {
+        let _env = DataDirTestEnv::new("supervisor-replaced-start");
+        let state = http_state(false);
+        let mut old = Router::new();
+        let release = hanging_supervisor(&mut old, "hang");
+        let old = Arc::new(old);
+        *state.router.lock().unwrap() = Arc::clone(&old);
+        let waiter = {
+            let old = Arc::clone(&old);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                (old.wait_for_server("hang", None, false), started.elapsed())
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !old.lazy_starting("hang") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A config edit replaces the server while its first start hangs.
+        let mut replacement = Router::new();
+        let _replacement_release = hanging_supervisor(&mut replacement, "hang");
+        publish_built_router(&state.registry, &state.router, replacement, None);
+        let (result, waited) = waiter.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("reconfigured while starting"), "{error}");
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+        drop(release);
+    }
+
+    #[test]
+    fn supervisor_blocked_tool_call_does_not_start_its_server() {
+        let _env = DataDirTestEnv::new("supervisor-blocked-call");
+        let reg = Registry {
+            safety_level: Some(registry::SafetyLevel::Off),
+            servers: vec![stub_server("cache", "Cache")],
+            ..Registry::default()
+        };
+        for reason in ["quarantine", "disabled"] {
+            let starts = Arc::new(AtomicUsize::new(0));
+            let mut router = counting_cache_supervisor(
+                "cache",
+                vec![json!({"name":"cached"}), json!({"name":"other"})],
+                &starts,
+            );
+            if reason == "quarantine" {
+                router.requarantine_from_store(BTreeSet::from(["cache__cached".to_string()]));
+            } else {
+                router.apply_registry_policy(RegistryPolicy {
+                    disabled: HashMap::from([(
+                        "cache".to_string(),
+                        HashSet::from(["cached".to_string()]),
+                    )]),
+                    ..RegistryPolicy::default()
+                });
+            }
+            let snapshot = Arc::new(router);
+            let live = Arc::new(Mutex::new(Arc::clone(&snapshot)));
+            let reply = execute_call(
+                &reg,
+                &snapshot,
+                &snapshot.aggregated_tools(),
+                Some("test"),
+                None,
+                None,
+                None,
+                "cache__cached",
+                json!({}),
+                None,
+                None,
+                CallOpts {
+                    direct: true,
+                    shape: false,
+                    allow_app_only: true,
+                },
+                Some(&live),
+            );
+            assert_eq!(reply["isError"], true, "got {reply}");
+            assert!(reply.to_string().contains(reason), "got {reply}");
+            assert!(
+                !snapshot.any_starting(|_| true),
+                "{reason} call started the server"
+            );
+            assert_eq!(starts.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn rebuild_drops_subscriptions_whose_owner_was_removed() {
+        let _env = DataDirTestEnv::new("supervisor-orphaned-subscriptions");
+        let state = http_state(false);
+        {
+            let mut subs = state.resource_subs.lock().unwrap();
+            subs.add("subscriber", "fixture://kept", "cache").unwrap();
+            subs.add("subscriber", "fixture://gone", "removed").unwrap();
+        }
+        let built = counting_cache_supervisor(
+            "cache",
+            vec![json!({"name":"cached"})],
+            &Arc::new(AtomicUsize::new(0)),
+        );
+        finish_self_heal_build(&state, built, &Router::new(), None);
+        let subs = state.resource_subs.lock().unwrap();
+        assert_eq!(
+            subs.tracked_uri_owners(),
+            vec![("fixture://kept".to_string(), "cache".to_string())]
+        );
+        assert!(subs.sessions_for_uri("fixture://gone").is_empty());
+        assert_eq!(subs.total_count(), 1);
+    }
+
+    #[test]
+    fn supervisor_subscribed_replacements_start_eagerly_and_restore_subscriptions() {
+        let _env = DataDirTestEnv::new("supervisor-subscription-replacement");
+        struct SubscriptionRoute(Arc<AtomicUsize>);
+        impl downstream::Transport for SubscriptionRoute {
+            fn request(
+                &mut self,
+                method: &str,
+                params: Value,
+            ) -> Result<Value, downstream::TransportError> {
+                if method == "resources/subscribe" {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+                downstream::Transport::request(&mut CacheRoute, method, params)
+            }
+            fn notify(
+                &mut self,
+                method: &str,
+                params: Value,
+            ) -> Result<(), downstream::TransportError> {
+                downstream::Transport::notify(&mut CacheRoute, method, params)
+            }
+        }
+        let state = http_state(false);
+        state
+            .resource_subs
+            .lock()
+            .unwrap()
+            .add("subscriber", "fixture://cached", "cache")
+            .unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let subs = Arc::clone(&state.resource_subs);
+        let calls = Arc::clone(&count);
+        let mut replacement = Router::new();
+        replacement.add_supervised(
+            "cache".into(),
+            vec![json!({"name":"cached"})],
+            Arc::new(move || {
+                let mut server = DownstreamServer::connect(
+                    "cache".into(),
+                    Box::new(SubscriptionRoute(Arc::clone(&calls))),
+                )
+                .unwrap();
+                server.load_resources_prompts();
+                resubscribe_server_resources(&mut server, "cache", &subs);
+                Ok(server)
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":2}),
+        );
+        keep_subscribed_server_warm(&replacement, "cache", Arc::clone(&state.resource_subs));
+        wait_for_supervisor_result(&replacement);
+        replacement.adopt_ready_reconnects();
+        replacement.activate_supervisors();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .resource_subs
+                .lock()
+                .unwrap()
+                .sessions_for_uri("fixture://cached"),
+            vec!["subscriber".to_string()]
+        );
+
+        // Exercise the production incremental builder as well: a changed spec
+        // with subscribers attempts startup without any client request.
+        let mut reg = Registry::default();
+        let mut entry = stub_server("cache", "Cache");
+        entry.command = Some(_env.dir.join("missing-replacement").display().to_string());
+        reg.servers.push(entry);
+        reg.set_server_enabled("default", "cache", true).unwrap();
+        let built = build_router_incremental(
+            &reg,
+            Some("default"),
+            false,
+            false,
+            &state.downstream_dirty,
+            Arc::clone(&state.server_handler),
+            None,
+            None,
+            Some(Arc::clone(&state.resource_subs)),
+            None,
+            Some(&replacement),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while built
+            .pending_statuses()
+            .iter()
+            .all(|status| status.failures == 0)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            built
+                .pending_statuses()
+                .iter()
+                .any(|status| status.failures == 1),
+            "replacement was left stopped despite subscribers"
+        );
+    }
+
+    #[test]
+    fn supervision_identity_excludes_policy_but_includes_every_connection_input() {
+        let _env = DataDirTestEnv::new("supervisor-spec");
+        let server: ServerEntry = serde_json::from_value(
+            json!({"id":"a","name":"A","transport":"stdio","command":"mock","args":[],"env":[]}),
+        )
+        .unwrap();
+        let original = effective_server_spec(&server, None, 0);
+        let mut metadata = server.clone();
+        metadata.name = "Renamed".to_string();
+        metadata.disabled_tools.push("echo".to_string());
+        assert_eq!(effective_server_spec(&metadata, None, 0), original);
+        let mut changed = server.clone();
+        changed.source = Some("community".into());
+        assert_ne!(effective_server_spec(&changed, None, 0), original);
+        changed = server.clone();
+        changed.args.push("--new".to_string());
+        assert_ne!(effective_server_spec(&changed, None, 0), original);
+        changed = server.clone();
+        changed.inherit_env = true;
+        assert_ne!(effective_server_spec(&changed, None, 0), original);
+        changed = server.clone();
+        changed.request_timeout_ms = Some(1000);
+        assert_ne!(effective_server_spec(&changed, None, 0), original);
+        changed = server.clone();
+        changed.cwd = Some("${ROOT}".to_string());
+        assert_ne!(
+            effective_server_spec(&changed, Some("/a"), 0),
+            effective_server_spec(&changed, Some("/b"), 0)
+        );
+        assert_eq!(
+            effective_server_spec(&server, None, 1),
+            original,
+            "unrelated credential rotation restarted a plain server"
+        );
+        let configured: ServerEntry = serde_json::from_value(json!({
+            "id":"a","name":"A","transport":"stdio","command":"mock",
+            "args":["<launch-input>"], "launch": {
+                "inputs":[{"key":"ROOT","label":"Project","secret":false,"value":"/one"}],
+                "bindings":[{"index":0,"parts":[{"kind":"input","key":"ROOT"}]}]
+            }
+        }))
+        .unwrap();
+        let configured_spec = effective_server_spec(&configured, None, 0);
+        let mut metadata = configured.clone();
+        let launch = metadata.launch.as_mut().unwrap();
+        launch.inputs[0].label = "Workspace".into();
+        launch.template = Some("curated".into());
+        launch.revision = Some(2);
+        assert_eq!(effective_server_spec(&metadata, None, 0), configured_spec);
+        metadata.launch.as_mut().unwrap().inputs[0].value = Some("/two".into());
+        assert_ne!(effective_server_spec(&metadata, None, 0), configured_spec);
+    }
+
+    #[test]
+    fn supervision_credential_rotation_changes_only_the_owning_server() {
+        let _env = DataDirTestEnv::new("supervisor-credentials");
+        // Environment-backed test credentials avoid the platform vault entirely.
+        let old_a = std::env::var_os("TOOLPORT_SECRET_SUPERVISOR_A");
+        let old_b = std::env::var_os("TOOLPORT_SECRET_SUPERVISOR_B");
+        std::env::set_var("TOOLPORT_SECRET_SUPERVISOR_A", "one");
+        std::env::set_var("TOOLPORT_SECRET_SUPERVISOR_B", "steady");
+        let make = |id: &str, key: &str| {
+            serde_json::from_value::<ServerEntry>(json!({"id":id,"name":id,"transport":"stdio","command":"mock","env":[{"key":key,"secret":true}]})).unwrap()
+        };
+        let a = make("a", "SUPERVISOR_A");
+        let b = make("b", "SUPERVISOR_B");
+        let before_a = effective_server_spec(&a, None, 100);
+        let before_b = effective_server_spec(&b, None, 100);
+        let mut pool = RootLaunchPool::default();
+        pool.refresh_specs(vec![a.clone(), b.clone()], 100);
+        let keys = root_launch_keys(&[a.clone(), b.clone()], "/project", 100);
+        for (server, key) in [&a, &b].into_iter().zip(&keys) {
+            let router = readonly_router(&server.id, "Read");
+            pool.launches.insert(
+                key.clone(),
+                RootLaunch {
+                    slot: router.server_slot(&server.id).unwrap(),
+                    subscriptions: Arc::new(Mutex::new(ResourceSubscriptionTable::default())),
+                    subscription_key: (server.id.clone(), "/project".to_string()),
+                    active: Arc::new(AtomicBool::new(true)),
+                },
+            );
+        }
+        std::env::set_var("TOOLPORT_SECRET_SUPERVISOR_A", "two");
+        let after_a = effective_server_spec(&a, None, 101);
+        let after_b = effective_server_spec(&b, None, 101);
+        // Computing new keys first reproduces the production placement ordering.
+        root_launch_keys(&[a.clone(), b.clone()], "/project", 101);
+        let retired = pool.refresh_specs(vec![a, b], 101);
+        assert_eq!(retired.len(), 1);
+        assert!(retired.contains_key(&keys[0]));
+        assert!(!retired[&keys[0]].active.load(Ordering::SeqCst));
+        assert!(pool.launches[&keys[1]].active.load(Ordering::SeqCst));
+        if let Some(value) = old_a {
+            std::env::set_var("TOOLPORT_SECRET_SUPERVISOR_A", value);
+        } else {
+            std::env::remove_var("TOOLPORT_SECRET_SUPERVISOR_A");
+        }
+        if let Some(value) = old_b {
+            std::env::set_var("TOOLPORT_SECRET_SUPERVISOR_B", value);
+        } else {
+            std::env::remove_var("TOOLPORT_SECRET_SUPERVISOR_B");
+        }
+        assert_ne!(before_a, after_a);
+        assert_eq!(before_b, after_b, "A's credential rotation restarted B");
     }
 
     #[test]
@@ -25887,6 +27201,37 @@ mod tests {
         assert_eq!(out.status, 200);
         assert!(out.body.contains("POST /mcp"), "body={}", out.body);
         assert!(out.body.contains("/openapi.json"));
+    }
+
+    #[test]
+    fn public_probe_paths_are_exactly_healthz() {
+        assert!(path_is_public_probe("/healthz"));
+        assert!(!path_is_public_probe("/"));
+        assert!(!path_is_public_probe("/openapi.json"));
+        assert!(!path_is_public_probe("/mcp"));
+        assert!(!path_is_public_probe("/healthz/"));
+    }
+
+    #[test]
+    fn healthz_reports_registry_readiness_and_carries_no_data() {
+        let state = http_state(true);
+        let ok = healthz_out(&state, "GET");
+        assert_eq!(ok.status, 200);
+        assert!(
+            ok.body.is_empty(),
+            "readiness must not leak data: {:?}",
+            ok.body
+        );
+
+        // A failed boot load (the host-owned bind mount where uid 10001 cannot
+        // create the registry lock) must read as not ready, not as healthy.
+        state.registry_trusted.store(false, Ordering::SeqCst);
+        let degraded = healthz_out(&state, "GET");
+        assert_eq!(degraded.status, 503);
+        assert!(degraded.body.is_empty());
+
+        let wrong_method = healthz_out(&state, "POST");
+        assert_eq!(wrong_method.status, 405);
     }
 
     #[test]

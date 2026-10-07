@@ -2441,7 +2441,7 @@ fn matrix_pooling_root_views_keep_one_ordinary_child() {
 }
 
 #[test]
-fn matrix_pooling_secret_generation_retires_the_old_root_launch() {
+fn matrix_pooling_root_restarts_only_when_its_effective_spec_changes() {
     let _guard = CASE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2470,12 +2470,23 @@ fn matrix_pooling_secret_generation_retires_the_old_root_launch() {
     let mut reg = registry::load_from(&path).expect("load fixture registry");
     reg.secrets_generation += 1;
     registry::save_to(&path, &reg).expect("rotate secret generation");
+    // An unrelated vault revision must leave this plain server warm.
+    std::thread::sleep(Duration::from_millis(2200));
+    assert!(client.call_tool(&pwd, json!({}))["isError"] != true);
+    assert_eq!(transcript_initialize_count(&transcript), 1);
+    // Changing a connection input retires only that effective launch.
+    reg.servers[0].env.push(registry::EnvVar {
+        key: "ROOT_LAUNCH_REVISION".into(),
+        value: Some("2".into()),
+        secret: false,
+    });
+    registry::save_to(&path, &reg).expect("change root launch spec");
     let deadline = Instant::now() + Duration::from_secs(10);
     while transcript_initialize_count(&transcript) < 2 {
         client.call_tool(&pwd, json!({}));
         assert!(
             Instant::now() < deadline,
-            "the old rooted launch survived a secret generation change"
+            "the old rooted launch survived an effective spec change"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -2500,7 +2511,7 @@ fn matrix_pooling_secret_generation_retires_the_old_root_launch() {
 }
 
 #[test]
-fn matrix_pooling_rooted_subscription_survives_secret_generation_rollover() {
+fn matrix_pooling_rooted_subscription_survives_an_effective_spec_change() {
     let _guard = CASE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2536,6 +2547,11 @@ fn matrix_pooling_rooted_subscription_survives_secret_generation_rollover() {
     let path = dir.join("registry.json");
     let mut reg = registry::load_from(&path).expect("load fixture registry");
     reg.secrets_generation += 1;
+    reg.servers[0].env.push(registry::EnvVar {
+        key: "ROOT_LAUNCH_REVISION".into(),
+        value: Some("2".into()),
+        secret: false,
+    });
     registry::save_to(&path, &reg).expect("rotate secret generation");
     let deadline = Instant::now() + Duration::from_secs(10);
     while transcript_initialize_count(&transcript) < 2 {

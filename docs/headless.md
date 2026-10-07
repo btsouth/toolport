@@ -108,17 +108,58 @@ curl -s -X POST http://127.0.0.1:8765/mcp \
 
 ### Pull from GHCR (recommended)
 
+Image tags:
+
+- `latest` is the newest published stable release (a plain `vX.Y.Z` tag).
+- `X.Y.Z` (for example `2.0.0`) pins one release. Prefer this in production
+  once you have a known-good deploy.
+- `edge` is the tip of the `main` branch, built from unreleased code. It can
+  change or break at any time and should not be used in production.
+
 After the first CI publish, make the package public (GitHub → Packages →
-`toolport-gateway` → Package settings → Change visibility). Then:
+`toolport-gateway` → Package settings → Change visibility). Then, with a named
+volume so the runtime user (uid 10001) owns `/data`:
 
 ```bash
-docker pull ghcr.io/btsouth/toolport-gateway:latest
-mkdir -p data
 cp data/registry.json.example data/registry.json
 cp docker-compose.example.yml docker-compose.yml
 # create .env with at least TOOLPORT_HTTP_TOKEN=...
 docker compose up -d
+# seed the registry into the volume; the gateway picks it up on its next reload
+docker compose cp data/registry.json toolport-gateway:/data/registry.json
+docker compose exec --user root toolport-gateway chown 10001:10001 /data/registry.json
 ```
+
+`docker compose ps` shows `healthy` only once the registry has loaded. A
+`starting` or `unhealthy` gateway is not ready: check `docker compose logs`.
+
+### Volume ownership (read this before switching to a bind mount)
+
+The published image runs as uid **10001**. Docker initializes a named volume
+with the image's `/data` ownership, so the recommended named volume needs no
+host changes. A host bind mount is owned by the host user instead, and uid 10001
+then cannot create the registry lock. The container still starts but serves the
+cached catalog only and reports `unhealthy`, logging:
+
+```text
+toolport-gateway: /data is not writable by the runtime user (uid 10001).
+```
+
+Give the bind mount to that uid (one line, run on the host):
+
+```bash
+sudo chown -R 10001:10001 ./data
+```
+
+Then replace the volume line in `docker-compose.yml` with `- ./data:/data`.
+
+### Healthcheck
+
+The image healthcheck and the compose healthcheck both call `GET /healthz`,
+which answers `200` only when the registry loaded and `503` when the gateway is
+serving the cached catalog only. It is unauthenticated and returns no data, so
+it needs no token. `GET /` (the help page) stays authenticated and is not a
+readiness check.
 
 ### Build locally
 
@@ -142,6 +183,7 @@ Image defaults:
 - `TOOLPORT_REGISTRY=/data/registry.json`
 - port `8765`
 - volume `/data`
+- runs as uid `10001`, with a readiness healthcheck on `GET /healthz`
 
 ## Secrets without the OS keychain
 
@@ -240,9 +282,12 @@ Use this before exposing a headless gateway beyond a trusted host or LAN.
 - [ ] **GHCR visibility**: make the package public only if you want anonymous
       pulls; otherwise configure registry auth.
 - [ ] **Pin the image**: use a digest or version tag in production, not only
-      `:latest`, once you have a known-good deploy.
-- [ ] **Healthcheck token**: compose passes `TOOLPORT_HTTP_TOKEN` into the
-      healthcheck; ensure logs don't echo env vars.
+      `:latest` (newest stable release). `edge` is unreleased `main` and is not
+      a production tag.
+- [ ] **Healthcheck**: `GET /healthz` returns `503` until the registry loads, so
+      an `unhealthy` container means the registry did not load (usually a
+      bind-mount owned by the host user instead of uid `10001`). See
+      [Volume ownership](#volume-ownership-read-this-before-switching-to-a-bind-mount).
 
 ### Runtime expectations
 

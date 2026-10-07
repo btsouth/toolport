@@ -90,6 +90,17 @@ fn a_killed_downstream_child_is_respawned() {
     let daemon = daemon_pid(scratch.path()).expect("daemon pid");
     let child = find_child(daemon, "mock-mcp-server").expect("the mock child");
     signal(child, "-KILL");
+    let failed = client.call("x__echo", json!({"text":"after-kill"}));
+    assert!(
+        !failed.to_string().contains("Broken pipe"),
+        "raw pipe failure leaked: {failed}"
+    );
+    // Recovery is driven by the supervisor, even with no calls probing it.
+    wait_for(
+        "background replacement of the killed child",
+        Duration::from_secs(20),
+        || find_child(daemon, "mock-mcp-server").is_some_and(|pid| pid != child),
+    );
 
     // The next calls fail while the pipe is dead, then the server is respawned
     // (or served from the adapter's own gateway) and answers again without a

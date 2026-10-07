@@ -125,18 +125,22 @@ Developer ID cert (not an iOS distribution cert).
 The release workflow already passes these env vars to the macOS build; set them as
 repository secrets (Settings → Secrets and variables → Actions):
 
-| Secret                       | Value                                                                              |
-| ---------------------------- | ---------------------------------------------------------------------------------- |
-| `APPLE_CERTIFICATE`          | base64 of the `.p12`: `base64 -i cert.p12 \| pbcopy`                               |
-| `APPLE_CERTIFICATE_PASSWORD` | the password you set when exporting the `.p12`                                     |
-| `APPLE_SIGNING_IDENTITY`     | `Developer ID Application: Your Name (TEAMID)` (exact string from Keychain Access) |
-| `APPLE_ID`                   | your Apple ID email                                                                |
-| `APPLE_PASSWORD`             | the app-specific password from step 3                                              |
-| `APPLE_TEAM_ID`              | the 10-char Team ID                                                                |
+| Secret                               | Value                                                                              |
+| ------------------------------------ | ---------------------------------------------------------------------------------- |
+| `APPLE_CERTIFICATE`                  | base64 of the `.p12`: `base64 -i cert.p12 \| pbcopy`                               |
+| `APPLE_CERTIFICATE_PASSWORD`         | the password you set when exporting the `.p12`                                     |
+| `APPLE_SIGNING_IDENTITY`             | `Developer ID Application: Your Name (TEAMID)` (exact string from Keychain Access) |
+| `APPLE_ID`                           | your Apple ID email                                                                |
+| `APPLE_PASSWORD`                     | the app-specific password from step 3                                              |
+| `APPLE_TEAM_ID`                      | the 10-char Team ID                                                                |
+| `APPLE_PROVISIONING_PROFILE_APP`     | base64 of the app's Developer ID provisioning profile                              |
+| `APPLE_PROVISIONING_PROFILE_GATEWAY` | base64 of the gateway sidecar's provisioning profile                               |
 
-With those set, a tagged build produces a **signed, notarized** `.dmg`, no
-Gatekeeper warning. Without them, the macOS build is simply unsigned (and users
-fall back to the right-click → Open workaround in the README).
+Published macOS releases require **all** of these secrets. The release workflow
+runs `scripts/macos-package-ci.sh` on every macOS target, and that script fails
+fast when any is missing, so a tag without them fails the macOS job rather than
+producing an unsigned build. Forks and local testing do not get an unsigned
+macOS release; there is no unsigned fallback in the workflow.
 
 ## Gotcha: the bundled gateway must be signed too
 
