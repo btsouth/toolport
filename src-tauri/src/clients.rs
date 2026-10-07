@@ -6184,11 +6184,13 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
             backup: backup.map(|p| p.display().to_string()),
             managed: None,
             restored: restored_names,
-            used_move_record: true,
+            used_move_record: moved::matches_path(client_id, &path)?,
             revision: None,
         recovery_path: None,
         });
     }
+    let current = crate::registry_controller::registry_for_disconnect()?;
+    restore::check_legacy_gateway(def.format, &path, current.client_managed_entries.get(client_id))?;
     let restored = moved::restore(client_id, def.format, &path)?;
     if restored.is_none() && (!mutation::exists(&path) || !read_client(&def).gateway_installed) {
         return Ok(WriteOutcome {

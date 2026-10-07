@@ -27,7 +27,9 @@ pub fn all(dry_run: bool) -> Result<Vec<ClientResult>, String> {
     );
     // Secondary Claude profiles and settings have path-specific recovery records
     // too. They are restored even if the profile's config override has changed.
-    for (id, path, format) in restore::recorded_paths() {
+    let mut recorded = restore::recorded_paths();
+    recorded.extend(moved::recorded_paths());
+    for (id, path, format) in recorded {
         let format = match format {
             Ok(format) => format,
             Err(error) => {
@@ -49,22 +51,7 @@ pub fn all(dry_run: bool) -> Result<Vec<ClientResult>, String> {
         let result = if dry_run {
             Ok(())
         } else {
-            restore::run(&id, &path, format, || {
-                mutation::disconnecting();
-                backup_file(&id, &path)?;
-                restore::apply(&id, format, &path)?;
-                Ok(())
-            })
-            .and_then(|()| {
-                let revision = if mutation::exists(&path) {
-                    Some(crate::registry::sha256_hex(&read_config_file(&path)?))
-                } else {
-                    None
-                };
-                let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
-                let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
-                restore::finish(&id, &path, revision.as_deref())
-            })
+            restore_path(&id, &path, format, current.client_managed_entries.get(&id))
         };
         results.push(ClientResult {
             client_id: id,
@@ -74,6 +61,42 @@ pub fn all(dry_run: bool) -> Result<Vec<ClientResult>, String> {
         });
     }
     Ok(results)
+}
+
+fn restore_path(
+    id: &str,
+    path: &Path,
+    format: Format,
+    managed: Option<&ManagedEntry>,
+) -> Result<(), String> {
+    let (revision, used_move_record) = restore::run(id, path, format, || {
+        mutation::disconnecting();
+        backup_file(id, path)?;
+        if !restore::apply(id, format, path)? {
+            restore::check_legacy_gateway(format, path, managed)?;
+            moved::restore(id, format, path)?;
+            edit_format(format, path, None, true)?;
+        } else if restore::needs_moved(id, path)? {
+            moved::restore(id, format, path)?;
+        }
+        let revision = mutation::read(path)
+            .flatten()
+            .as_deref()
+            .map(crate::registry::sha256_hex);
+        Ok((revision, moved::matches_path(id, path)?))
+    })?;
+    finish_uninstall(
+        id,
+        &WriteOutcome {
+            path: path.to_string_lossy().into_owned(),
+            backup: None,
+            managed: None,
+            restored: Vec::new(),
+            used_move_record,
+            revision,
+            recovery_path: None,
+        },
+    )
 }
 
 fn run(
@@ -192,6 +215,36 @@ mod tests {
             std::fs::read_to_string(dir.join("last")).unwrap(),
             fixtures[2].2
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn legacy_secondary_path_restores_without_the_apps_profile_environment() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-old-profile-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("old-profile.json");
+        let native = r#"{"session":1,"mcpServers":{"native":{"command":"native","env":{"TOKEN":"fixture"}}}}"#;
+        std::fs::write(&path, native).unwrap();
+        moved::record("claude-code", Format::JsonMcpServers, &path).unwrap();
+        let entry: ServerEntry = serde_json::from_value(serde_json::json!({"id":"toolport", "name":"toolport", "transport":"stdio", "command":"/fixture/toolport-gateway"})).unwrap();
+        write_format(Format::JsonMcpServers, &path, &[entry], true).unwrap();
+        assert!(moved::recorded_paths()
+            .iter()
+            .any(|(id, recorded, _)| id == "claude-code" && recorded == &path));
+        restore_path("claude-code", &path, Format::JsonMcpServers, None).unwrap();
+        let restored = read_config_file(&path).unwrap();
+        assert_eq!(
+            parse_json_value(&restored).unwrap(),
+            parse_json_value(native).unwrap()
+        );
+        assert!(!moved::has_record("claude-code"));
+        restore_path("claude-code", &path, Format::JsonMcpServers, None).unwrap();
+        assert_eq!(read_config_file(&path).unwrap(), restored);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -379,6 +379,32 @@ fn named_list(root: &mut Value, key: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub(super) fn check_legacy_gateway(
+    format: Format,
+    path: &Path,
+    managed: Option<&ManagedEntry>,
+) -> Result<(), String> {
+    if !mutation::exists(path) {
+        return Ok(());
+    }
+    for server in parse_client_content(format, &read_config_file(path)?)? {
+        if detected_is_gateway(&server)
+            && !managed.map_or_else(
+                || {
+                    server
+                        .command
+                        .as_deref()
+                        .is_some_and(command_is_gateway_binary)
+                },
+                |record| managed_matches_detected(&server, record),
+            )
+        {
+            return Err(format!("Client config conflict at {}: customized legacy gateway has no original byte snapshot. Config unchanged.", path.display()));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn released(client_id: &str, path: &Path) -> Result<bool, String> {
     Ok(load(client_id, path)?
         .is_some_and(|record| record.disconnected && record.disconnect_before.is_none()))
@@ -637,8 +663,9 @@ pub(super) fn check_finished(
     path: &Path,
     expected: Option<&str>,
 ) -> Result<(), String> {
-    if load(client_id, path)?.is_some_and(|record| record.last_written_hash.as_deref() != expected)
-    {
+    if load(client_id, path)?.is_some_and(|record| {
+        record.last_written_hash.as_deref() != expected || !record.disconnected
+    }) {
         return Err("Client was changed by another Toolport operation before disconnect finished; recovery retained".into());
     }
     Ok(())
@@ -1310,6 +1337,41 @@ mod tests {
         std::fs::write(&path, native).unwrap();
         disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
         assert_eq!(read_config_file(&path).unwrap(), native);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn a_same_byte_connect_cannot_be_finalized_by_an_older_disconnect() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-finish-generation-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("config.json");
+        write_format(Format::JsonMcpServers, &path, &[entry()], true).unwrap();
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            edit_format(Format::JsonMcpServers, &path, Some(&entry()), true)
+        })
+        .unwrap();
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            apply("fixture", Format::JsonMcpServers, &path).map(|_| ())
+        })
+        .unwrap();
+        let expected = crate::registry::sha256_hex(&read_config_file(&path).unwrap());
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            edit_format(Format::JsonMcpServers, &path, Some(&entry()), true)
+        })
+        .unwrap();
+        assert_eq!(
+            crate::registry::sha256_hex(&read_config_file(&path).unwrap()),
+            expected
+        );
+        assert!(finish("fixture", &path, Some(&expected))
+            .unwrap_err()
+            .contains("another Toolport operation"));
+        assert!(!released("fixture", &path).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

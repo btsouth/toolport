@@ -103,6 +103,40 @@ fn load(client_id: &str) -> Result<Option<Record>, String> {
     }
 }
 
+pub(super) fn matches_path(client_id: &str, path: &Path) -> Result<bool, String> {
+    Ok(load(client_id)?.is_some_and(|record| record.config_path == path.to_string_lossy()))
+}
+
+pub(super) fn recorded_paths() -> Vec<(String, PathBuf, Result<Format, String>)> {
+    let mut paths = Vec::new();
+    for def in defs() {
+        if !has_record(def.id) {
+            continue;
+        }
+        match load(def.id) {
+            Ok(Some(record)) => {
+                let path = PathBuf::from(record.config_path);
+                if path.is_absolute() {
+                    paths.push((def.id.into(), path, Ok(def.format)));
+                } else {
+                    paths.push((
+                        def.id.into(),
+                        record_path(def.id).unwrap_or_default(),
+                        Err("Legacy move record has no absolute config path".into()),
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => paths.push((
+                def.id.into(),
+                record_path(def.id).unwrap_or_default(),
+                Err(error),
+            )),
+        }
+    }
+    paths
+}
+
 /// Copy every non-gateway entry in `path` into the client's move record before
 /// migration strips them. Entries already recorded by an earlier move are kept;
 /// a name moved again takes its newest definition.
