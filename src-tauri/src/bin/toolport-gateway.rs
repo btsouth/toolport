@@ -30476,7 +30476,7 @@ mod tests {
         assert!(toolport["codeMode"].is_boolean());
         assert_eq!(toolport["agentControl"], false);
         assert_eq!(toolport["destructiveConfirmation"], false);
-        assert_eq!(toolport["humanApproval"], false);
+        assert_eq!(toolport["humanApproval"], true);
     }
 
     /// Profiles for the server-instructions tests (#971): `default` (active) and `infra`
@@ -33419,6 +33419,7 @@ mod tests {
         {
             let mut reg = state.registry.lock().unwrap();
             reg.integrity_check = true;
+            reg.set_safety_level(registry::SafetyLevel::Strict);
             reg.quarantine_on_drift = true;
         }
         state.host.ready.store(false, Ordering::SeqCst);
@@ -33482,6 +33483,7 @@ mod tests {
         {
             let mut reg = state.registry.lock().unwrap();
             reg.integrity_check = true;
+            reg.set_safety_level(registry::SafetyLevel::Strict);
             reg.quarantine_on_drift = true;
         }
 
@@ -33598,6 +33600,7 @@ mod tests {
         {
             let mut reg = state.registry.lock().unwrap();
             reg.integrity_check = true;
+            reg.set_safety_level(registry::SafetyLevel::Strict);
             reg.quarantine_on_drift = true;
         }
 
@@ -33724,9 +33727,9 @@ mod tests {
 
         assert_eq!(
             effective_quarantine(&registry, profile, &AtomicBool::new(false)),
-            None
+            Some(BTreeSet::new())
         );
-        assert!(!reconcile_quarantine(
+        assert!(reconcile_quarantine(
             &registry,
             &router,
             &stdio,
@@ -33736,14 +33739,14 @@ mod tests {
         ));
         assert_eq!(
             router.lock().unwrap().quarantined(),
-            &set_of(&["srv__wipe"]),
-            "the watcher must retain live blocks until the corrupt trust root is repaired"
+            &BTreeSet::new(),
+            "Ask clears blocks while retaining the integrity findings"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn baseline_tamper_is_quarantined_while_optional_drift_policy_is_off() {
+    fn baseline_tamper_is_recorded_without_blocking_at_ask() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("toolport-mandatory-q-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -33769,22 +33772,10 @@ mod tests {
         reg.integrity_check = true;
         reg.quarantine_on_drift = false;
         let registry = Arc::new(Mutex::new(reg));
-        assert!(
-            maybe_check_integrity(&registry, &tools, profile)
-                .unwrap()
-                .is_some(),
-            "lost baseline must create a quarantine even with optional drift blocking off"
-        );
-        assert_eq!(
-            integrity::mandatory_quarantined(profile).unwrap(),
-            BTreeSet::from(["srv__read".to_string()]),
-            "the baseline-tamper quarantine is durable and mandatory"
-        );
-        assert_eq!(
-            effective_quarantine(&registry, profile, &AtomicBool::new(false)),
-            None,
-            "while the trust root remains corrupt, watcher reconciliation must retain the live set"
-        );
+        assert!(maybe_check_integrity(&registry, &tools, profile).unwrap().is_none());
+        assert_eq!(effective_quarantine(&registry, profile, &AtomicBool::new(false)), Some(BTreeSet::new()));
+        assert!(integrity::read_recent(20).unwrap().iter().any(|event| event["change"] == "tamper"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -37022,6 +37013,7 @@ mod tests {
         )))
         .unwrap();
 
+        first.registry.lock().unwrap().set_safety_level(registry::SafetyLevel::Strict);
         assert_eq!(
             effective_quarantine(&first.registry, profile, &first.quarantine_read_failed),
             None,
