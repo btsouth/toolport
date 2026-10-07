@@ -20461,6 +20461,7 @@ mod tests {
         let mut entry = stub_server("cache", "Cache");
         entry.command = Some(_env.dir.join("missing-replacement").display().to_string());
         reg.servers.push(entry);
+        reg.set_access_server("default", "cache", true).unwrap();
         reg.set_server_enabled("default", "cache", true).unwrap();
         let built = build_router_incremental(
             &reg,
