@@ -42,7 +42,7 @@ pub struct CatalogEntry {
     pub category: String,
     /// Direct link to where the user creates this server's credential (e.g. the
     /// provider's API-token page). Powers the guided "go get your creds" step in
-    /// Stacks (and the normal add flow). Curated entries only.
+    /// Collections (and the normal add flow). Curated entries only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials_url: Option<String>,
     /// One-line hint on what credential to create (scopes, what to paste).
@@ -93,7 +93,7 @@ fn category_for(name: &str) -> &'static str {
 }
 
 /// Where to create the credential for a curated server, and a one-line hint, for
-/// the guided "go get your creds" step in Stacks. Returns `(url, hint)`; an empty
+/// the guided "go get your creds" step in Collections. Returns `(url, hint)`; an empty
 /// `url` means there's no single page (a connection string you supply, OAuth, or
 /// no auth) so only the hint shows. `None` = unknown / no guidance.
 fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {

@@ -3,8 +3,9 @@ import { Check, ExternalLink, Loader2, Plus, Search, ShieldCheck } from "lucide-
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
 import { openExternal } from "@/lib/openUrl";
-import { addServer, listStacks, popularCatalog, searchCatalog } from "@/lib/api";
-import type { CatalogEntry, Registry, ServerEntry, Stack } from "@/lib/types";
+import { addCatalogServer, listStacks, popularCatalog, searchCatalog } from "@/lib/api";
+import { addCollection } from "@/lib/collections";
+import type { CatalogEntry, Registry, Stack } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -38,26 +39,26 @@ export function CatalogView({ registry, onAdded }: Props) {
   // network/registry failure would render as an innocent "no results for …".
   const [searchError, setSearchError] = useState(false);
   const [searchNonce, setSearchNonce] = useState(0);
-  const [stacks, setStacks] = useState<Stack[]>([]);
-  const [stacksLoading, setStacksLoading] = useState(true);
-  const [stacksError, setStacksError] = useState(false);
-  const [stackBusy, setStackBusy] = useState<string | null>(null);
+  const [collections, setCollections] = useState<Stack[]>([]);
+  const [collectionsLoading, setCollectionsLoading] = useState(true);
+  const [collectionsError, setCollectionsError] = useState(false);
+  const [collectionBusy, setCollectionBusy] = useState<string | null>(null);
   const [configEntry, setConfigEntry] = useState<CatalogEntry | null>(null);
 
   const have = new Set((registry?.servers ?? []).map((s) => s.name.toLowerCase()));
 
-  const reloadStacks = useCallback(() => {
-    setStacksLoading(true);
-    setStacksError(false);
+  const reloadCollections = useCallback(() => {
+    setCollectionsLoading(true);
+    setCollectionsError(false);
     listStacks()
-      .then(setStacks)
-      .catch(() => setStacksError(true))
-      .finally(() => setStacksLoading(false));
+      .then(setCollections)
+      .catch(() => setCollectionsError(true))
+      .finally(() => setCollectionsLoading(false));
   }, []);
 
   useEffect(() => {
-    reloadStacks();
-  }, [reloadStacks]);
+    reloadCollections();
+  }, [reloadCollections]);
 
   const reloadPopular = useCallback(() => {
     setPopularLoading(true);
@@ -130,18 +131,7 @@ export function CatalogView({ registry, onAdded }: Props) {
     }
     setBusy(entry.name);
     try {
-      const server: ServerEntry = {
-        id: "",
-        name: entry.name,
-        transport: entry.transport,
-        command: entry.command,
-        args: entry.args,
-        launch: entry.launch,
-        env: entry.envKeys.map((key) => ({ key, value: null, secret: true })),
-        url: entry.url,
-        source: `catalog:${entry.source}`,
-      };
-      onAdded(await addServer(server));
+      onAdded(await addCatalogServer(entry));
       toast.success(`Added ${entry.name}`, {
         description: "Enable it, then authenticate if it needs credentials.",
       });
@@ -152,53 +142,34 @@ export function CatalogView({ registry, onAdded }: Props) {
     }
   }
 
-  /** Add every server in a stack that isn't already in Toolport, then point the
-   * user at the credential steps for the ones that need them. */
-  async function setupStack(stack: Stack) {
-    setStackBusy(stack.id);
+  /** Add every server in a Collection that isn't already in Toolport, then point
+   * the user at the credential steps for the ones that need them. */
+  async function setupCollection(collection: Stack) {
+    setCollectionBusy(collection.id);
     const existing = new Set((registry?.servers ?? []).map((s) => s.name.toLowerCase()));
-    let added = 0;
-    let needCreds = 0;
     try {
-      for (const entry of stack.servers) {
-        if (existing.has(entry.name.toLowerCase())) continue;
-        const server: ServerEntry = {
-          id: "",
-          name: entry.name,
-          transport: entry.transport,
-          command: entry.command,
-          args: entry.args,
-          launch: entry.launch,
-          env: entry.envKeys.map((key) => ({ key, value: null, secret: true })),
-          url: entry.url,
-          source: `catalog:${entry.source}`,
-        };
-        onAdded(await addServer(server));
-        added++;
-        if (
-          entry.credentialsUrl ||
-          entry.envKeys.length > 0 ||
-          entry.launch?.inputs.length
-        )
-          needCreds++;
-      }
+      const { added, needSetup } = await addCollection(
+        collection.servers,
+        existing,
+        onAdded,
+      );
       if (added === 0) {
-        toast.success(`${stack.name}: every server is already in Toolport`);
+        toast.success(`${collection.name}: every server is already in Toolport`);
       } else {
         toast.success(
-          `Added ${added} server${added === 1 ? "" : "s"} from ${stack.name}`,
+          `Added ${added} server${added === 1 ? "" : "s"} from ${collection.name}`,
           {
             description:
-              needCreds > 0
-                ? `${needCreds} need setup values. Open "Setup steps", then finish setup under Servers.`
+              needSetup > 0
+                ? `${needSetup} need setup values. Open "Setup steps", then finish setup under Servers.`
                 : "Enable them under Servers.",
           },
         );
       }
     } catch (e) {
-      toastError(`Couldn't finish setting up ${stack.name}: ${e}`);
+      toastError(`Couldn't finish setting up ${collection.name}: ${e}`);
     } finally {
-      setStackBusy(null);
+      setCollectionBusy(null);
     }
   }
 
@@ -262,38 +233,38 @@ export function CatalogView({ registry, onAdded }: Props) {
       </div>
 
       {browsing &&
-        (stacksLoading ? (
+        (collectionsLoading ? (
           <div
             role="status"
-            aria-label="Loading stacks"
+            aria-label="Loading collections"
             className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3"
           >
             {Array.from({ length: 3 }).map((_, i) => (
               <Skeleton key={i} className="h-32 rounded-lg" />
             ))}
           </div>
-        ) : stacksError ? (
+        ) : collectionsError ? (
           <div
             role="status"
             aria-live="polite"
             className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5"
           >
             <div>
-              <p className="text-sm font-medium">Stacks couldn't load</p>
+              <p className="text-sm font-medium">Collections couldn't load</p>
               <p className="text-xs text-muted-foreground">
-                Toolport couldn't load the one-click bundles. Try again in a moment.
+                Toolport couldn't load the curated groups. Try again in a moment.
               </p>
             </div>
-            <Button variant="outline" size="sm" onClick={reloadStacks}>
+            <Button variant="outline" size="sm" onClick={reloadCollections}>
               Try again
             </Button>
           </div>
-        ) : stacks.length > 0 ? (
-          <StacksSection
-            stacks={stacks}
+        ) : collections.length > 0 ? (
+          <CollectionsSection
+            collections={collections}
             haveNames={have}
-            busyId={stackBusy}
-            onSetup={setupStack}
+            busyId={collectionBusy}
+            onSetup={setupCollection}
           />
         ) : null)}
 
@@ -417,15 +388,15 @@ export function CatalogView({ registry, onAdded }: Props) {
   );
 }
 
-/** "Quick start" stacks: role-based bundles you can add in one click, with the
+/** "Collections": curated groups of servers you can add in one click, with the
  * credential steps spelled out per server. */
-function StacksSection({
-  stacks,
+function CollectionsSection({
+  collections,
   haveNames,
   busyId,
   onSetup,
 }: {
-  stacks: Stack[];
+  collections: Stack[];
   haveNames: Set<string>;
   busyId: string | null;
   onSetup: (s: Stack) => void;
@@ -433,16 +404,16 @@ function StacksSection({
   return (
     <section>
       <h2 className="mb-2 flex items-center gap-2 text-xs font-medium tracking-wide text-muted-foreground uppercase">
-        Stacks
+        Collections
         <span className="font-normal text-muted-foreground/60 normal-case">
-          one-click bundles for a use case
+          curated groups to add together
         </span>
       </h2>
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        {stacks.map((s) => (
-          <StackCard
+        {collections.map((s) => (
+          <CollectionCard
             key={s.id}
-            stack={s}
+            collection={s}
             haveNames={haveNames}
             busy={busyId === s.id}
             onSetup={() => onSetup(s)}
@@ -453,31 +424,31 @@ function StacksSection({
   );
 }
 
-function StackCard({
-  stack,
+function CollectionCard({
+  collection,
   haveNames,
   busy,
   onSetup,
 }: {
-  stack: Stack;
+  collection: Stack;
   haveNames: Set<string>;
   busy: boolean;
   onSetup: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const missing = stack.servers.filter((e) => !haveNames.has(e.name.toLowerCase()));
+  const missing = collection.servers.filter((e) => !haveNames.has(e.name.toLowerCase()));
   const allAdded = missing.length === 0;
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-ring/20 bg-muted/20 p-3">
       <div className="flex items-start justify-between gap-2">
-        <span className="text-sm font-medium">{stack.name}</span>
+        <span className="text-sm font-medium">{collection.name}</span>
         <span className="shrink-0 text-[11px] text-muted-foreground">
-          {stack.servers.length} servers
+          {collection.servers.length} servers
         </span>
       </div>
-      <p className="min-h-8 text-xs text-muted-foreground">{stack.description}</p>
+      <p className="min-h-8 text-xs text-muted-foreground">{collection.description}</p>
       <div className="flex flex-wrap gap-1">
-        {stack.servers.map((e) => (
+        {collection.servers.map((e) => (
           <span
             key={e.name}
             className={`rounded px-1.5 py-0.5 text-[11px] ${
@@ -521,7 +492,7 @@ function StackCard({
       </div>
       {open && (
         <div className="mt-1 flex flex-col gap-1.5 border-t pt-2">
-          {stack.servers.map((e) => (
+          {collection.servers.map((e) => (
             <div key={e.name} className="text-[11px] leading-snug">
               <span className="font-medium text-foreground">{e.name}</span>
               {e.setupHint && (

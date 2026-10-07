@@ -269,7 +269,7 @@ Keep comments at the density of the file you're editing.
 ## Good places to start
 
 - New curated catalog entries (real, verified MCP servers) in `catalog.rs`.
-- New curated stacks (role-based server bundles) in `stacks.rs`.
+- New curated Collections (groups of catalog servers added together) in `stacks.rs`.
 - Additional client support in `clients.rs` (a new AI tool's config format).
 - Frontend polish: empty states and error messages.
 - Tests for any of the above.
@@ -332,12 +332,12 @@ checked automatically.
 **Reference PR:** [#19](https://github.com/btsouth/toolport/pull/19) (Firecrawl
 catalog entry — a single `cmd()` line + category).
 
-## Adding a curated stack
+## Adding a curated Collection
 
-Stacks are role-based bundles of catalog servers a user can set up in one flow
-(e.g. "Full-stack web dev", "Founder / indie SaaS"). They live in
-`src-tauri/src/stacks.rs` as an ordered list of catalog entry names, resolved
-against `catalog::curated()` at runtime.
+Collections are groups of catalog servers a user can add in one flow (e.g.
+"Full-stack web dev", "Founder / indie SaaS"). The UI calls them Collections;
+they live in `src-tauri/src/stacks.rs` as an ordered list of catalog entry names,
+resolved against `catalog::curated()` at runtime.
 
 This is one of the easiest first contributions: you only need names that already
 exist in the catalog. Do **not** add new catalog entries here — that is a
@@ -345,9 +345,9 @@ separate change (see [Adding a curated catalog entry](#adding-a-curated-catalog-
 
 ### 1. Pick servers that already exist
 
-Each stack references servers by their exact `catalog::curated()` **name**
+Each Collection references servers by their exact `catalog::curated()` **name**
 (e.g. `"GitHub"`, `"Linear"`, `"Notion"`). A mistyped name is silently dropped
-when the stack is built, so the unit tests below are the tripwire.
+when the Collection is built, so the unit tests below are the tripwire.
 
 Browse `src-tauri/src/catalog.rs` (or the in-app catalog) for available names.
 Only use servers already in `curated()`.
@@ -366,7 +366,7 @@ StackDef {
 ```
 
 - `id` — stable kebab-case identifier (used in tests and UI keys)
-- `name` / `description` — shown in the catalog stacks view
+- `name` / `description` — shown in the catalog Collections view
 - `server_names` — exact catalog names, in the order they should appear
 
 You do **not** need to update any hardcoded server-count total; the tests derive
@@ -376,7 +376,7 @@ expected resolution from `stack_defs()` itself.
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml stacks
-npm run tauri dev   # stacks show up in the catalog view
+npm run tauri dev   # Collections show up in the catalog view
 ```
 
 `every_stack_resolves_all_its_servers` fails with the stack id and the missing

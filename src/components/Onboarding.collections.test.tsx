@@ -23,10 +23,10 @@ const registry: Registry = {
   activeProfileId: "default",
 };
 
-const stack: Stack = {
+const collection: Stack = {
   id: "developer",
   name: "Developer",
-  description: "A developer stack.",
+  description: "A developer Collection.",
   servers: [],
 };
 
@@ -52,44 +52,44 @@ function deferred<T>() {
 
 beforeEach(() => vi.clearAllMocks());
 
-describe("Onboarding stack loading", () => {
-  it("keeps onboarding usable and retries a failed stacks fetch", async () => {
+describe("Onboarding collection loading", () => {
+  it("keeps onboarding usable and retries a failed collections fetch", async () => {
     vi.mocked(listStacks)
       .mockRejectedValueOnce(new Error("registry unavailable"))
-      .mockResolvedValueOnce([stack]);
+      .mockResolvedValueOnce([collection]);
     const user = userEvent.setup();
 
     render(<Onboarding {...props} />);
 
-    expect(await screen.findByText("Starter stacks couldn't load")).toBeInTheDocument();
+    expect(await screen.findByText("Collections couldn't load")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Browse the full catalog" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "I'll add servers later" })).toBeEnabled();
 
     await user.click(screen.getByRole("button", { name: "Try again" }));
 
     expect(await screen.findByRole("button", { name: "Developer" })).toBeInTheDocument();
-    expect(screen.queryByText("Starter stacks couldn't load")).not.toBeInTheDocument();
+    expect(screen.queryByText("Collections couldn't load")).not.toBeInTheDocument();
     expect(listStacks).toHaveBeenCalledTimes(2);
   });
 
-  it("shows a skeleton while loading and stays quiet for an empty stack catalog", async () => {
+  it("shows a skeleton while loading and stays quiet for an empty collection catalog", async () => {
     const pending = deferred<Stack[]>();
     vi.mocked(listStacks).mockReturnValueOnce(pending.promise);
 
     render(<Onboarding {...props} />);
 
     expect(
-      screen.getByRole("status", { name: "Loading starter stacks" }),
+      screen.getByRole("status", { name: "Loading collections" }),
     ).toBeInTheDocument();
 
     await act(async () => pending.resolve([]));
 
     await waitFor(() =>
       expect(
-        screen.queryByRole("status", { name: "Loading starter stacks" }),
+        screen.queryByRole("status", { name: "Loading collections" }),
       ).not.toBeInTheDocument(),
     );
-    expect(screen.queryByText("Starter stacks couldn't load")).not.toBeInTheDocument();
+    expect(screen.queryByText("Collections couldn't load")).not.toBeInTheDocument();
     expect(screen.queryByText("What do you work on?")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Browse the full catalog" })).toBeEnabled();
   });

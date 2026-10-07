@@ -31,10 +31,10 @@ const entry: CatalogEntry = {
   category: "Code & infrastructure",
 };
 
-const stack: Stack = {
+const collection: Stack = {
   id: "developer",
   name: "Developer",
-  description: "A developer stack.",
+  description: "A developer Collection.",
   servers: [entry],
 };
 
@@ -60,29 +60,29 @@ beforeEach(() => {
   vi.mocked(addServer).mockResolvedValue(registry);
 });
 
-describe("CatalogView stack loading", () => {
-  it("keeps the catalog visible and retries a failed stacks fetch", async () => {
+describe("CatalogView collection loading", () => {
+  it("keeps the catalog visible and retries a failed collections fetch", async () => {
     vi.mocked(listStacks)
       .mockRejectedValueOnce(new Error("registry unavailable"))
-      .mockResolvedValueOnce([stack]);
+      .mockResolvedValueOnce([collection]);
     const user = userEvent.setup();
 
     render(<CatalogView registry={registry} onAdded={vi.fn()} />);
 
-    expect(await screen.findByText("Stacks couldn't load")).toBeInTheDocument();
+    expect(await screen.findByText("Collections couldn't load")).toBeInTheDocument();
     expect(screen.getByText("GitHub")).toBeInTheDocument();
     expect(screen.queryByText("Catalog couldn't load")).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Try again" }));
 
     expect(await screen.findByText("Developer")).toBeInTheDocument();
-    expect(screen.queryByText("Stacks couldn't load")).not.toBeInTheDocument();
+    expect(screen.queryByText("Collections couldn't load")).not.toBeInTheDocument();
     expect(listStacks).toHaveBeenCalledTimes(2);
   });
 
-  it("shows stacks when the popular catalog is empty", async () => {
+  it("shows collections when the popular catalog is empty", async () => {
     vi.mocked(popularCatalog).mockResolvedValueOnce([]);
-    vi.mocked(listStacks).mockResolvedValueOnce([stack]);
+    vi.mocked(listStacks).mockResolvedValueOnce([collection]);
 
     render(<CatalogView registry={registry} onAdded={vi.fn()} />);
 
@@ -90,44 +90,46 @@ describe("CatalogView stack loading", () => {
     expect(screen.getByText("No popular servers available")).toBeInTheDocument();
   });
 
-  it("keeps stack failure and retry visible when the popular catalog is empty", async () => {
+  it("keeps collection failure and retry visible when the popular catalog is empty", async () => {
     vi.mocked(popularCatalog).mockResolvedValueOnce([]);
     vi.mocked(listStacks)
       .mockRejectedValueOnce(new Error("registry unavailable"))
-      .mockResolvedValueOnce([stack]);
+      .mockResolvedValueOnce([collection]);
     const user = userEvent.setup();
 
     render(<CatalogView registry={registry} onAdded={vi.fn()} />);
 
-    expect(await screen.findByText("Stacks couldn't load")).toBeInTheDocument();
+    expect(await screen.findByText("Collections couldn't load")).toBeInTheDocument();
     expect(screen.getByText("No popular servers available")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Try again" }));
 
     expect(await screen.findByText("Developer")).toBeInTheDocument();
-    expect(screen.queryByText("Stacks couldn't load")).not.toBeInTheDocument();
+    expect(screen.queryByText("Collections couldn't load")).not.toBeInTheDocument();
     expect(listStacks).toHaveBeenCalledTimes(2);
   });
 
-  it("shows a skeleton while loading and stays quiet for an empty stack catalog", async () => {
+  it("shows a skeleton while loading and stays quiet for an empty collection catalog", async () => {
     const pending = deferred<Stack[]>();
     vi.mocked(listStacks).mockReturnValueOnce(pending.promise);
 
     render(<CatalogView registry={registry} onAdded={vi.fn()} />);
 
     expect(
-      await screen.findByRole("status", { name: "Loading stacks" }),
+      await screen.findByRole("status", { name: "Loading collections" }),
     ).toBeInTheDocument();
 
     await act(async () => pending.resolve([]));
 
     await waitFor(() =>
       expect(
-        screen.queryByRole("status", { name: "Loading stacks" }),
+        screen.queryByRole("status", { name: "Loading collections" }),
       ).not.toBeInTheDocument(),
     );
-    expect(screen.queryByText("Stacks couldn't load")).not.toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: /^Stacks/ })).not.toBeInTheDocument();
+    expect(screen.queryByText("Collections couldn't load")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: /^Collections/ }),
+    ).not.toBeInTheDocument();
     expect(screen.getByText("GitHub")).toBeInTheDocument();
   });
 });

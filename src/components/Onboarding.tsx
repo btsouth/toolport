@@ -19,7 +19,6 @@ import {
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
 import {
-  addCatalogServer,
   getAuditLog,
   importServers,
   installGateway,
@@ -28,6 +27,7 @@ import {
   teamConnect,
   teamJoinPoll,
 } from "@/lib/api";
+import { addCollection } from "@/lib/collections";
 import { ClientLogo } from "@/components/ClientLogo";
 import { clientRestartHint } from "@/lib/clientConnect";
 import { HOSTED_TEAMS_URL, TEAMS_MARKETING_URL, teamUrlError } from "@/lib/teamUrl";
@@ -526,29 +526,29 @@ function AddServers({
   const [busy, setBusy] = useState(false);
   const [importPreview, setImportPreview] = useState<ImportItem[] | null>(null);
   const [imported, setImported] = useState<{ added: number; on: number } | null>(null);
-  const [stacks, setStacks] = useState<Stack[]>([]);
-  const [stacksLoading, setStacksLoading] = useState(true);
-  const [stacksError, setStacksError] = useState(false);
+  const [collections, setCollections] = useState<Stack[]>([]);
+  const [collectionsLoading, setCollectionsLoading] = useState(true);
+  const [collectionsError, setCollectionsError] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [applying, setApplying] = useState(false);
-  // True once the user has added a stack or imported, so "Next" replaces "later".
+  // True once the user has added a Collection or imported, so "Next" replaces "later".
   const [touched, setTouched] = useState(false);
 
-  const reloadStacks = useCallback(() => {
-    setStacksLoading(true);
-    setStacksError(false);
+  const reloadCollections = useCallback(() => {
+    setCollectionsLoading(true);
+    setCollectionsError(false);
     listStacks()
-      .then(setStacks)
-      .catch(() => setStacksError(true))
-      .finally(() => setStacksLoading(false));
+      .then(setCollections)
+      .catch(() => setCollectionsError(true))
+      .finally(() => setCollectionsLoading(false));
   }, []);
 
   useEffect(() => {
-    reloadStacks();
-  }, [reloadStacks]);
+    reloadCollections();
+  }, [reloadCollections]);
 
   const have = new Set(registry.servers.map((s) => s.name.toLowerCase()));
-  const stack = stacks.find((s) => s.id === selected) ?? null;
+  const collection = collections.find((s) => s.id === selected) ?? null;
 
   async function doImport() {
     setBusy(true);
@@ -587,26 +587,17 @@ function AddServers({
     }
   }
 
-  /** Add every server in the chosen stack that isn't already in Toolport. */
-  async function applyStack(s: Stack) {
+  /** Add every server in the chosen Collection that isn't already in Toolport. */
+  async function applyCollection(s: Stack) {
     setApplying(true);
     const existing = new Set(registry.servers.map((x) => x.name.toLowerCase()));
-    let last = registry;
-    let added = 0;
-    let needCreds = 0;
     try {
-      for (const entry of s.servers) {
-        if (existing.has(entry.name.toLowerCase())) continue;
-        last = await addCatalogServer(entry);
-        added++;
-        if (
-          entry.credentialsUrl ||
-          entry.envKeys.length > 0 ||
-          entry.launch?.inputs.length
-        )
-          needCreds++;
-      }
-      onImport(last);
+      const {
+        added,
+        needSetup,
+        registry: next,
+      } = await addCollection(s.servers, existing);
+      onImport(next ?? registry);
       setTouched(true);
       toast.success(
         added > 0
@@ -614,8 +605,8 @@ function AddServers({
           : `${s.name}: every server is already in Toolport`,
         {
           description:
-            needCreds > 0
-              ? `${needCreds} need setup values. Complete their Launch setup or credentials under Servers, then enable them.`
+            needSetup > 0
+              ? `${needSetup} need setup values. Complete their Launch setup or credentials under Servers, then enable them.`
               : "Enable them next.",
         },
       );
@@ -629,43 +620,43 @@ function AddServers({
   return (
     <>
       <StepHeader icon={<Download className="size-5" />} title="Add your first servers">
-        Pick what you work on and Toolport sets up a matching stack. You can also import
-        from your other tools or browse the full catalog.
+        Pick what you work on and Toolport sets up a matching Collection. You can also
+        import from your other tools or browse the full catalog.
       </StepHeader>
 
       <div className="flex flex-col gap-3">
-        {/* Role picker: each stack is a use case / role. */}
-        {stacksLoading ? (
+        {/* Collection picker: each Collection is a use case / role. */}
+        {collectionsLoading ? (
           <div
             role="status"
-            aria-label="Loading starter stacks"
+            aria-label="Loading collections"
             className="flex flex-wrap gap-1.5"
           >
             {Array.from({ length: 3 }).map((_, i) => (
               <Skeleton key={i} className="h-7 w-24 rounded-full" />
             ))}
           </div>
-        ) : stacksError ? (
+        ) : collectionsError ? (
           <div
             role="status"
             aria-live="polite"
             className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5"
           >
             <div>
-              <p className="text-sm font-medium">Starter stacks couldn't load</p>
+              <p className="text-sm font-medium">Collections couldn't load</p>
               <p className="text-xs text-muted-foreground">
                 Try again to see role-based recommendations.
               </p>
             </div>
-            <Button variant="outline" size="sm" onClick={reloadStacks}>
+            <Button variant="outline" size="sm" onClick={reloadCollections}>
               Try again
             </Button>
           </div>
-        ) : stacks.length > 0 ? (
+        ) : collections.length > 0 ? (
           <div className="flex flex-col gap-1.5">
             <span className="text-xs text-muted-foreground">What do you work on?</span>
             <div className="flex flex-wrap gap-1.5">
-              {stacks.map((s) => (
+              {collections.map((s) => (
                 <button
                   key={s.id}
                   type="button"
@@ -684,12 +675,12 @@ function AddServers({
           </div>
         ) : null}
 
-        {/* The recommended stack for the chosen role. */}
-        {stack && (
+        {/* The recommended Collection for the chosen role. */}
+        {collection && (
           <div className="flex flex-col gap-2 rounded-md border bg-muted/20 p-2.5">
-            <p className="text-xs text-muted-foreground">{stack.description}</p>
+            <p className="text-xs text-muted-foreground">{collection.description}</p>
             <div className="flex flex-col gap-1">
-              {stack.servers.map((e) => (
+              {collection.servers.map((e) => (
                 <div key={e.name} className="flex items-center gap-1.5 text-[11px]">
                   {have.has(e.name.toLowerCase()) ? (
                     <Check className="size-3 shrink-0 text-success" />
@@ -712,14 +703,14 @@ function AddServers({
               size="sm"
               className="self-start"
               disabled={applying}
-              onClick={() => applyStack(stack)}
+              onClick={() => applyCollection(collection)}
             >
               {applying ? (
                 <Loader2 className="size-3.5 animate-spin" />
               ) : (
                 <Plus className="size-3.5" />
               )}
-              Add this stack
+              Add this Collection
             </Button>
           </div>
         )}

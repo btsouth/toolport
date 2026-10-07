@@ -86,10 +86,10 @@ describe("Onboarding dialog accessibility", () => {
     expect(screen.getByRole("dialog")).toHaveAccessibleName("Join your team");
   });
 
-  it("exposes the selected state of the role/stack choice buttons", async () => {
+  it("exposes the selected state of the role/Collection choice buttons", async () => {
     vi.mocked(listStacks).mockResolvedValue([
-      { id: "dev", name: "Developer", description: "A dev stack", servers: [] },
-      { id: "ops", name: "Operations", description: "An ops stack", servers: [] },
+      { id: "dev", name: "Developer", description: "A dev Collection", servers: [] },
+      { id: "ops", name: "Operations", description: "An ops Collection", servers: [] },
     ]);
     const user = userEvent.setup();
     render(
