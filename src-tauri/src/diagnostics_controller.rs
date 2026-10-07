@@ -212,3 +212,16 @@ pub fn open_data_dir() -> Result<(), String> {
         .map_err(|error| format!("could not open the data directory: {error}"))?;
     Ok(())
 }
+
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn access_review_diagnostics_labels_default_access() {
+        let mut reg = crate::registry::Registry::default();
+        reg.default_access_profile_id = Some("default".into());
+        let text = super::registry_summary(&reg);
+        assert!(text.contains("default access: Default access (Default)"), "{text}");
+        assert!(!text.contains("active profile"));
+    }
+}

@@ -498,7 +498,7 @@ export interface ShareDefinitionPreview {
   fields: { label: string; value: string }[];
 }
 
-/** What sharing does, or did, to one selected server in the active profile. */
+/** What sharing does, or did, to one selected server in the local access context. */
 export interface LocalHandoff {
   id: string;
   name: string;
@@ -934,7 +934,7 @@ export function disableAutostart(): Promise<void> {
   return invoke<void>("disable_launch_at_login");
 }
 
-/** Explicitly use an identical managed definition in the active profile. */
+/** Explicitly use an identical managed definition in the local access context. */
 export function teamUseManaged(serverId: string): Promise<Registry> {
   return invoke<Registry>("team_use_managed", { serverId });
 }

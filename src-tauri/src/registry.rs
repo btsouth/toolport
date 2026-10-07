@@ -3949,7 +3949,7 @@ mod catalog_launch_migration_tests {
         server.launch = template.launch;
         let mut registry = Registry::default();
         registry.servers.push(server);
-        let profile = registry.active_profile_id();
+        let profile = registry.default_access_id();
         let error = registry
             .set_server_enabled(&profile, "files", true)
             .unwrap_err();
@@ -5293,10 +5293,10 @@ mod tests {
     }
 
     #[test]
-    fn toggle_drives_active_profile_membership() {
+    fn toggle_drives_global_server_switch() {
         let mut r = Registry::default();
         let id = r.add_server(sample_server("github"));
-        let profile = r.active_profile_id();
+        let profile = r.default_access_id();
         assert!(!r.is_enabled(&profile, &id));
         r.set_server_enabled(&profile, &id, true).unwrap();
         assert!(r.is_enabled(&profile, &id));
@@ -5353,6 +5353,7 @@ mod tests {
         let mut r = Registry::default();
         let id = r.add_server(sample_server("postgres"));
         let work = r.add_profile("Work");
+        r.set_access_server("default", &id, true).unwrap();
         r.set_server_enabled("default", &id, true).unwrap();
         assert!(r.is_enabled("default", &id));
         assert!(!r.is_enabled(&work, &id));
@@ -5366,7 +5367,9 @@ mod tests {
         let db = r.add_server(sample_server("postgres"));
         let pay = r.add_server(sample_server("stripe"));
         let billing = r.add_profile("Billing");
-        // default enables only postgres; Billing enables only stripe.
+        r.set_access_server("default", &db, true).unwrap();
+        r.set_access_server(&billing, &pay, true).unwrap();
+        // Both switches are on; each access set includes only its own server.
         r.set_server_enabled("default", &db, true).unwrap();
         r.set_server_enabled(&billing, &pay, true).unwrap();
 
@@ -5733,7 +5736,10 @@ mod tests {
         let c = r.add_server(sample_server("charlie"));
         let billing = r.add_profile("Billing");
         let support = r.add_profile("Support");
-        // default (active) enables alpha; Billing -> bravo; Support -> charlie.
+        r.set_access_server("default", &a, true).unwrap();
+        r.set_access_server(&billing, &b, true).unwrap();
+        r.set_access_server(&support, &c, true).unwrap();
+        // Each client includes one globally enabled server.
         r.set_server_enabled("default", &a, true).unwrap();
         r.set_server_enabled(&billing, &b, true).unwrap();
         r.set_server_enabled(&support, &c, true).unwrap();

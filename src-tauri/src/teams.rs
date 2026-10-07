@@ -2948,11 +2948,10 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     }
 
     // 1. Capture the prior generation of this team's servers, and which of them the
-    //    member had ENABLED IN EACH PROFILE. That enablement is their standing consent for
+    //    member had INCLUDED IN EACH ACCESS SET. That enablement is their standing consent for
     //    the review-required ones, so we re-apply it per profile after the replace instead
-    //    of forcing a re-approval on every sync. Capturing per-profile (not just the active
-    //    one) is what keeps a team server the member enabled in a NON-active profile from
-    //    being stripped on every sync and never restored.
+    //    of forcing a re-approval on every sync. Capturing each set keeps an explicitly
+    //    scoped client's membership from being stripped on every sync.
     let old_ids: Vec<String> = previous.iter().map(|server| server.id.clone()).collect();
     // What the member actually consented to, per id: the execution-relevant fields of the
     // entry as it stood when they enabled it. Standing consent is restored below only for a
@@ -3117,10 +3116,9 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
         conn.managed_server_ids = managed_server_ids;
     }
 
-    // 3. Enable per profile. New public remotes auto-enable in the ACTIVE profile
-    //    (first-run convenience). EVERY profile then restores the exact team servers the
-    //    member had enabled in THAT profile before this sync — their standing consent — so a
-    //    server enabled in a non-active profile survives the replace. Review servers the
+    // 3. Restore access-set membership. New public remotes join the local context
+    //    (first-run convenience). Each set keeps the exact team servers it included before
+    //    this sync. In v1/v2 that membership is also enablement. Review servers the
     //    member never consented to stay off, so nothing local runs without an explicit opt-in.
     //
     //    For a review server, consent is to a DEFINITION, not to an id: it is carried over
