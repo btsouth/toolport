@@ -8684,7 +8684,7 @@ mod tests {
             "-File".to_string(),
             script_file.to_string_lossy().into_owned(),
         ];
-        let mut transport = StdioTransport::spawn("powershell.exe", &args, &[], None, false)
+        let transport = StdioTransport::spawn("powershell.exe", &args, &[], None, false)
             .expect("spawn Job Object-owned launcher");
 
         // Poll for parsable CONTENT, not mere existence - the same fix the Unix sibling
@@ -8707,11 +8707,17 @@ mod tests {
                 std::fs::read_to_string(&diag_file)
                     .unwrap_or_else(|e| format!("<no diag file: {e}>")),
                 transport
+                    .core
                     .stderr
                     .lock()
                     .map(|b| b.trim().to_string())
                     .unwrap_or_default(),
-                transport.child.try_wait().ok().flatten(),
+                transport
+                    .core
+                    .child
+                    .lock()
+                    .ok()
+                    .and_then(|mut child| child.try_wait().ok().flatten()),
                 super::child_environment(&super::process_env_map(), &[], false)
                     .into_iter()
                     .map(|(k, v)| format!("{k}={v}"))
