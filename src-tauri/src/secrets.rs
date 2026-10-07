@@ -226,9 +226,9 @@ mod platform {
         match crate::clients::resolve_gateway_path() {
             Some(gw_path) => match trusted_app(&gw_path) {
                 Ok(t) => trusted_apps.push(t),
-                Err(e) => eprintln!("conduit: gateway not added to keychain ACL ({e}); app-only"),
+                Err(e) => eprintln!("toolport: gateway not added to keychain ACL ({e}); app-only"),
             },
-            None => eprintln!("conduit: gateway path unresolved; keychain ACL is app-only"),
+            None => eprintln!("toolport: gateway path unresolved; keychain ACL is app-only"),
         }
         let trusted = CFArray::from_CFTypes(&trusted_apps);
         let label = CFString::new("conduit-mcp");
@@ -832,11 +832,11 @@ mod platform {
                 // is a 1.2-1.7s stall, and a vault failure that persists past the
                 // retry (the keyring coming back LOCKED, say) looks identical to
                 // one that never had a daemon crash behind it.
-                eprintln!("conduit: secret service died mid-call ({e}); retrying once");
+                eprintln!("toolport: secret service died mid-call ({e}); retrying once");
                 std::thread::sleep(delay);
                 let retried = op();
                 if let Err(e) = &retried {
-                    eprintln!("conduit: secret service still failing after the retry ({e})");
+                    eprintln!("toolport: secret service still failing after the retry ({e})");
                 }
                 retried
             }
@@ -1100,7 +1100,7 @@ mod file {
     fn path() -> Result<PathBuf, String> {
         crate::registry::conduit_dir()
             .map(|d| d.join("secrets.enc"))
-            .ok_or_else(|| "no conduit data directory".to_string())
+            .ok_or_else(|| "no Toolport data directory".to_string())
     }
 
     /// Seal `plain` as base64(`nonce` || ciphertext) under `key` with a fresh nonce.
@@ -1410,7 +1410,9 @@ pub fn migrate_legacy_entries(secret_keys: &[(String, String)]) -> MigrationRepo
         //    flips the file backend on for this install. If it fails (locked
         //    keychain), don't write the marker — retry on the next launch.
         if let Err(e) = platform::ensure_master_key() {
-            eprintln!("conduit: could not ensure secrets master key, will retry next launch ({e})");
+            eprintln!(
+                "toolport: could not ensure secrets master key, will retry next launch ({e})"
+            );
             return MigrationReport::default();
         }
 
@@ -1424,7 +1426,7 @@ pub fn migrate_legacy_entries(secret_keys: &[(String, String)]) -> MigrationRepo
             Err(e) => {
                 // Don't write the marker — the migration didn't run, so it
                 // should retry on the next launch.
-                eprintln!("conduit: secret migration skipped, will retry next launch ({e})");
+                eprintln!("toolport: secret migration skipped, will retry next launch ({e})");
                 return MigrationReport::default();
             }
         };
@@ -1482,7 +1484,7 @@ pub fn migrate_secrets_to_dpk(secret_keys: &[(String, String)]) -> MigrationRepo
             Ok(report) => report,
             Err(e) => {
                 eprintln!(
-                    "conduit: data-protection keychain migration skipped, will retry next launch ({e})"
+                    "toolport: data-protection keychain migration skipped, will retry next launch ({e})"
                 );
                 return MigrationReport::default();
             }

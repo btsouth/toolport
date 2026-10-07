@@ -398,6 +398,7 @@ jobs:
       - frontend
       - build-test
       - cross-platform-rust
+      - linux-native
       - installer-script
       - installer-script-bash
       - pinned-install-urls

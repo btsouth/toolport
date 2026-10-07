@@ -1643,7 +1643,7 @@ impl Router {
                     message,
                 }) if attempt < HTTP_MAX_RETRIES => {
                     let wait = retry_wait(retry_after, attempt);
-                    eprintln!("conduit: retrying downstream call after {wait:?}: {message}");
+                    eprintln!("toolport: retrying downstream call after {wait:?}: {message}");
                     wait_for_retry_or_cancel(wait, cancel).map_err(|error| error.to_string())?;
                     attempt += 1;
                 }
@@ -1704,10 +1704,10 @@ impl Router {
         F: FnMut(&mut DownstreamServer) -> Result<T, TransportError>,
     {
         let factory = slot.reconnect.as_ref()?;
-        eprintln!("conduit: server '{}' is down; re-spawning it", slot.id);
+        eprintln!("toolport: server '{}' is down; re-spawning it", slot.id);
         let Some(fresh) = factory() else {
             eprintln!(
-                "conduit: re-spawn of '{}' failed; leaving it fast-failed",
+                "toolport: re-spawn of '{}' failed; leaving it fast-failed",
                 slot.id
             );
             return None; // still unreachable: fall through to record_failure
@@ -1741,7 +1741,7 @@ impl Router {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Some(match retry {
             Ok(v) => {
-                eprintln!("conduit: server '{}' recovered after re-spawn", slot.id);
+                eprintln!("toolport: server '{}' recovered after re-spawn", slot.id);
                 breaker.record_success();
                 Ok(v)
             }
