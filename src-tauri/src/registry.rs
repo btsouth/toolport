@@ -1233,12 +1233,14 @@ pub struct Registry {
     /// previously-approved tool's definition changes (a rug-pull signal) or a known
     /// server quietly adds a tool. Detection only, it records a security event and
     /// never blocks. On by default.
+    // 2.0: unused, dropped by the v2 migration
     #[serde(default = "default_true")]
     pub integrity_check: bool,
     /// Content defense (anti-agentjacking): scan untrusted tool RESULTS for injection
     /// and label flagged content as data, not instructions, before the agent sees it.
     /// Detection + labeling. On by default. Pair with [`block_on_injection`] to fail closed
     /// on high-confidence hits (SOU-345).
+    // 2.0: unused, dropped by the v2 migration
     #[serde(default = "default_true")]
     pub content_defense: bool,
     /// Replace PII in tool results with stable pseudonyms before they reach the model,
@@ -2365,10 +2367,7 @@ impl Registry {
         self.human_approval = on;
     }
 
-    /// Whether the HITL gate is active: the member's OWN toggle, OR an active team's forced
-    /// policy. The gate reads this instead of `human_approval` directly so an org lock stays
-    /// releasable (it lives in `team_forced_human_approval`, cleared on leave) rather than
-    /// permanently overwriting the member's own choice.
+    /// Member choice, derived from legacy gates when the additive field is absent.
     pub fn safety_level_selected(&self) -> SafetyLevel {
         // Legacy blocking flags map to Strict, approval/confirmation to Ask,
         // and no blocking gates to Off. Labeling and recording never block.

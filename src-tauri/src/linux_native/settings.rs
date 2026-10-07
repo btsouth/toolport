@@ -492,13 +492,13 @@ impl SettingsPage {
 
         page.append(&settings_heading(
             "Quarantined tools",
-            "High-risk definition changes stay blocked until you explicitly re-approve them.",
+            "Strict blocks retained high-risk definition changes until you explicitly re-approve them.",
         ));
         let quarantine_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         quarantine_list.add_css_class("toolport-settings-group");
         quarantine_list.append(
             &gtk::Label::builder()
-                .label("Checking for blocked tools…")
+                .label("Checking retained quarantines…")
                 .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
