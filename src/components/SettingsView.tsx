@@ -1253,10 +1253,9 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                 const updated = await setSafetyLevel(
                   event.target.value as "off" | "ask" | "strict",
                 );
-                const reconciled = {
-                  ...latestRegistry.current!,
-                  safetyLevel: updated.safetyLevel,
-                };
+                const reconciled = latestRegistry.current
+                  ? { ...latestRegistry.current, safetyLevel: updated.safetyLevel }
+                  : updated;
                 latestRegistry.current = reconciled;
                 onRegistryChange(reconciled);
               } catch (error) {
@@ -1283,35 +1282,6 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           registry?.teamForcedBlockOnInjection) && (
           <p className="text-xs">Team policy raises the effective safety level.</p>
         )}
-        <details>
-          <summary>Advanced</summary>
-          {toggle(
-            EyeOff,
-            piiRedaction,
-            "text-info",
-            "Hide personal data from the model",
-            "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. A value only goes back to the server it came from, so a call that would send one server's data to another is refused. Real data stays on this machine and is forgotten when the conversation ends. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
-            apply("pii-redaction", setPiiRedaction),
-            "pii-redaction",
-          )}
-          {toggle(
-            Bot,
-            allowAgentControl,
-            "text-success",
-            "Allow agent control",
-            "Let an agent turn servers on/off; your destructive-tool block always stays yours",
-            apply("allow-agent-control", setAllowAgentControl),
-            "allow-agent-control",
-          )}
-          {toggle(
-            Activity,
-            liveInspect,
-            "text-info",
-            "Live request/response inspection",
-            "Off by default. While on, Toolport captures each tool call's arguments and results to a small local, ephemeral buffer (the last 50 calls) so you can inspect them in Activity. This is separate from the audit log, never leaves your machine, and is cleared when you turn it off or restart the gateway.",
-            applyLiveInspect,
-            "live-inspect",
-          )}
           {quarantined.length === 0 && quarantineError && (
             <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
               <ShieldX className="size-4 shrink-0 text-destructive" />
@@ -1353,6 +1323,35 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                 ))}
               </ul>
             </div>
+          )}
+        <details>
+          <summary>Advanced</summary>
+          {toggle(
+            EyeOff,
+            piiRedaction,
+            "text-info",
+            "Hide personal data from the model",
+            "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. A value only goes back to the server it came from, so a call that would send one server's data to another is refused. Real data stays on this machine and is forgotten when the conversation ends. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
+            apply("pii-redaction", setPiiRedaction),
+            "pii-redaction",
+          )}
+          {toggle(
+            Bot,
+            allowAgentControl,
+            "text-success",
+            "Allow agent control",
+            "Let an agent turn servers on/off; your destructive-tool block always stays yours",
+            apply("allow-agent-control", setAllowAgentControl),
+            "allow-agent-control",
+          )}
+          {toggle(
+            Activity,
+            liveInspect,
+            "text-info",
+            "Live request/response inspection",
+            "Off by default. While on, Toolport captures each tool call's arguments and results to a small local, ephemeral buffer (the last 50 calls) so you can inspect them in Activity. This is separate from the audit log, never leaves your machine, and is cleared when you turn it off or restart the gateway.",
+            applyLiveInspect,
+            "live-inspect",
           )}
           {allowedTools.length === 0 && allowedError && (
             <div className="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
