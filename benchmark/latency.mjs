@@ -235,6 +235,8 @@ async function main() {
   const g = client(gw);
   const handshake = await timed(() => g.call("initialize", INIT));
   g.notify("notifications/initialized");
+  // Cold tools/list discovers schemas; cached servers stay stopped until use.
+  await g.call("tools/list", {});
   await waitUntil(async () => {
     const response = await g.call("tools/call", {
       name: "toolport_search_tools",
