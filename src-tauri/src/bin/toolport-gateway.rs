@@ -19165,7 +19165,7 @@ mod tests {
             None,
             None,
             CallOpts {
-                direct: false,
+                direct: true,
                 shape: true,
                 allow_app_only: false,
             },
@@ -24909,9 +24909,13 @@ mod tests {
             !republish_registry_policy(&live, policy),
             "an identical policy is not a change"
         );
+        let reg = Registry {
+            safety_level: Some(registry::SafetyLevel::Off),
+            ..Registry::default()
+        };
         let call = |name: &str| {
             execute_call(
-                &Registry::default(),
+                &reg,
                 &snapshot,
                 &cached,
                 Some("test"),
@@ -26832,8 +26836,8 @@ mod tests {
     fn toolport_extension_reports_active_features_without_gating_core_tools() {
         let host = dispatch_host(false);
         host.set_code_mode(true);
-        let mut reg = Registry {
-            safety_level: None,
+        let reg = Registry {
+            safety_level: Some(registry::SafetyLevel::Ask),
             ..Registry::default()
         };
         let router = Router::new();
@@ -26856,24 +26860,6 @@ mod tests {
         assert_eq!(settings["discoveryMode"], "full");
         assert_eq!(settings["codeMode"], true);
         assert_eq!(settings["humanApproval"], true);
-
-        reg.human_approval = true;
-        let human_gated = handle_request(
-            &host,
-            &modern_req(3, "server/discover", json!({})),
-            &reg,
-            &router,
-            &[],
-            false,
-            None,
-            &SearchGuard::default(),
-            None,
-            None,
-        )
-        .unwrap();
-        let human_settings =
-            &human_gated["result"]["capabilities"]["extensions"][TOOLPORT_GATEWAY_EXTENSION];
-        assert_eq!(human_settings["humanApproval"], true);
 
         // No client extension opt-in is required: the extension describes the
         // existing core tools, which remain the graceful-degradation path.
