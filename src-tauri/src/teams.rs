@@ -2233,7 +2233,7 @@ fn apply_use_managed(reg: &mut Registry, managed_id: &str, profile: &str) -> Res
         || serde_json::to_value(&managed.client_credentials).ok()
             != serde_json::to_value(&personal.client_credentials).ok()
     {
-        return Err("The managed definition differs from your personal server. Complete its setup separately before switching profiles.".into());
+        return Err("The managed definition differs from your personal server. Complete its setup separately before using the Team copy.".into());
     }
     if !reg.profiles.iter().any(|p| p.id == profile) {
         return Err("local access context unavailable".into());
@@ -3160,8 +3160,8 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
             };
         }
     }
-    // What the member still has to look at: review servers that are OFF in the active
-    // profile after consent was restored. Counting every review server here (as before)
+    // What the member still has to look at: review servers missing consent in the local
+    // access context after the prior consent was restored. Counting every review server here (as before)
     // told the member that servers they had already enabled were "off until you review
     // them", which was untrue for the carried-over ones and hid the changed ones among them.
     let active_enabled: HashSet<&String> = reg

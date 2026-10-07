@@ -2585,7 +2585,7 @@ impl Registry {
         Ok(())
     }
 
-    /// Servers enabled in the active profile - what the gateway should expose.
+    /// Servers visible through Default access for an unscoped client.
     pub fn enabled_servers(&self) -> Vec<&ServerEntry> {
         let active = self.default_access_id();
         self.servers
