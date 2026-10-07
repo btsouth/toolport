@@ -413,7 +413,9 @@ dropdown popover row:selected {{
   min-height: 34px;
   padding: 0 12px;
   border-radius: 9px;
-  color: @toolport_muted;
+  /* Omarchy's `muted` is a border colour and falls below 3:1 on most stock
+     themes; navigation is primary text, as in Omarchy's own menus. */
+  color: @toolport_fg;
   transition: 120ms ease;
 }}
 
@@ -440,7 +442,7 @@ dropdown popover row:selected {{
   border: 1px solid alpha(@toolport_fg, 0.10);
   border-radius: 999px;
   background-color: alpha(@toolport_fg, 0.04);
-  color: @toolport_muted;
+  color: alpha(@toolport_fg, 0.62);
   font-size: 12px;
 }}
 
@@ -839,7 +841,7 @@ button.toolport-activity-filter {{
   color: @toolport_accent;
 }}
 .toolport-state-muted {{
-  color: @toolport_muted;
+  color: alpha(@toolport_fg, 0.62);
 }}
 
 /* Wider than `toolport-summary-item`, which is sized for a number over a
@@ -1209,5 +1211,19 @@ foreground = "#abcdef"
         assert!(css.contains("--dialog-bg-color: @toolport_bg_dark"));
         assert!(css.contains("window.messagedialog"));
         assert!(css.contains("dialog-host > dialog.alert sheet"));
+    }
+
+    #[test]
+    fn navigation_and_status_text_never_use_the_muted_border_colour() {
+        let css = OmarchyPalette::default().css();
+        for selector in [
+            ".toolport-nav-item {",
+            ".toolport-mode-badge {",
+            ".toolport-state-muted {",
+        ] {
+            let start = css.find(selector).expect("the selector is generated");
+            let rule = &css[start..start + css[start..].find('}').unwrap()];
+            assert!(!rule.contains("@toolport_muted"), "{selector}");
+        }
     }
 }

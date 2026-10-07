@@ -615,6 +615,7 @@ fn configure_self_hosted(entry: &crate::catalog::CatalogEntry, hint: &str, page:
         client_credentials: None,
         enabled: false,
         requires_review: false,
+        probe_fingerprint: 0,
     };
     let editor =
         super::open_server_editor_prefilled(Some(view), None, page.server_page.clone(), Some(hint));
@@ -784,6 +785,8 @@ fn catalog_card(
         &gtk::Label::builder()
             .label(&entry.name)
             .halign(gtk::Align::Start)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .tooltip_text(&entry.name)
             .css_classes(["heading"])
             .build(),
     );
