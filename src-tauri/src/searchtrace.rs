@@ -153,16 +153,19 @@ fn record(
 }
 
 /// Append and rotate under the same cross-process lock as other local logs.
+/// Normal writes queue on the background telemetry writer so the lock and any
+/// rotation stay off the search path ([`crate::telemetry`]).
 fn write_line(entry: &Value) {
     let Some(path) = trace_path() else {
         return;
     };
-    let _ = crate::registry::append_line_locked(
+    crate::telemetry::record(
         &path,
         &entry.to_string(),
-        MAX_TRACE_BYTES,
-        KEEP_LINES,
-        None,
+        crate::telemetry::Rotation::TrimTail {
+            max_bytes: MAX_TRACE_BYTES,
+            keep_lines: KEEP_LINES,
+        },
     );
 }
 
@@ -173,6 +176,9 @@ fn write_line(entry: &Value) {
 /// "no traces" (SBS-873). Unparseable lines are skipped — a mid-write or
 /// corrupt line is not an IO failure.
 pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
+    // Land this process's queued traces before reading so a caller never misses
+    // its own writes.
+    crate::telemetry::flush();
     let mut rows = Vec::new();
     for path in [legacy_trace_path(), trace_path()].into_iter().flatten() {
         let content = match std::fs::read_to_string(&path) {
@@ -204,6 +210,8 @@ pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
 /// Delete the trace log. Returns `Err` only on a real removal failure; a missing file
 /// (nothing to clear) is success, so a caller can honestly confirm it is gone.
 pub fn try_clear() -> std::io::Result<()> {
+    // Write anything queued before deleting, so a queued trace cannot reappear.
+    crate::telemetry::flush();
     let mut first_error = None;
     for path in [legacy_trace_path(), trace_path()].into_iter().flatten() {
         let _lock = match crate::registry::lock_at(&path) {

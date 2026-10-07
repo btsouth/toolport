@@ -4748,6 +4748,8 @@ pub fn run() {
             // endpoint descriptor so a gateway dialing after we're gone reads no broker
             // (a clean Unreachable) rather than connecting to the dead port we left behind.
             if matches!(event, tauri::RunEvent::Exit) {
+                // Land any queued audit/savings/search-trace lines before the app exits.
+                crate::telemetry::flush();
                 if let Some(stop) = app_handle.try_state::<TeamLifecycleStop>() {
                     stop.0.store(true, std::sync::atomic::Ordering::Release);
                 }

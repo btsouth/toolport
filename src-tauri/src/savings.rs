@@ -37,6 +37,8 @@ fn v2_path() -> Option<PathBuf> {
 /// missing file (nothing to clear) is success. Local and irreversible; the running
 /// total resets to zero and the next serve starts a fresh file.
 pub fn try_clear() -> std::io::Result<()> {
+    // Write anything queued before deleting, so a queued line cannot reappear.
+    crate::telemetry::flush();
     let mut first_error = None;
     for path in [savings_path(), v2_path()].into_iter().flatten() {
         let _lock = match crate::registry::lock_at(&path) {
@@ -210,10 +212,20 @@ pub fn record_orchestration(round_trips_saved: u64) {
 /// any rotation; an old gateway never opens this versioned path.
 fn append_line(entry: &Value) {
     if let Some(path) = v2_path() {
-        let _ = append_line_at(&path, entry, MAX_SAVINGS_BYTES, KEEP_LINES, None);
+        crate::telemetry::record(
+            &path,
+            &entry.to_string(),
+            crate::telemetry::Rotation::Savings {
+                max_bytes: MAX_SAVINGS_BYTES,
+                keep_lines: KEEP_LINES,
+            },
+        );
     }
 }
 
+/// Single-line wrapper used by the savings tests. Production writes go through
+/// [`append_lines_at`] on the background telemetry writer.
+#[cfg(test)]
 fn append_line_at(
     path: &Path,
     entry: &Value,
@@ -221,9 +233,46 @@ fn append_line_at(
     keep_lines: usize,
     after_snapshot: Option<&mut dyn FnMut()>,
 ) -> Result<(), String> {
+    let line = entry.to_string();
+    append_lines_at_with_hook(
+        path,
+        std::slice::from_ref(&line),
+        max_bytes,
+        keep_lines,
+        after_snapshot,
+    )
+}
+
+/// Append a batch of already-serialized JSONL `lines` under ONE acquisition of the
+/// path's cross-process lock, then apply the savings cap. Used by the background
+/// telemetry writer ([`crate::telemetry`]) so neither the lock nor a fold-rotation
+/// runs on the request thread.
+pub(crate) fn append_lines_at(
+    path: &Path,
+    lines: &[String],
+    max_bytes: u64,
+    keep_lines: usize,
+) -> Result<(), String> {
+    append_lines_at_with_hook(path, lines, max_bytes, keep_lines, None)
+}
+
+fn append_lines_at_with_hook(
+    path: &Path,
+    lines: &[String],
+    max_bytes: u64,
+    keep_lines: usize,
+    after_snapshot: Option<&mut dyn FnMut()>,
+) -> Result<(), String> {
     let _lock = crate::registry::lock_at(path)?;
     let mut file = crate::registry::open_append_private(path).map_err(|e| e.to_string())?;
-    file.write_all(format!("{entry}\n").as_bytes())
+    let mut bytes = String::new();
+    for line in lines {
+        bytes.push_str(line);
+        if !line.ends_with('\n') {
+            bytes.push('\n');
+        }
+    }
+    file.write_all(bytes.as_bytes())
         .map_err(|e| e.to_string())?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
     drop(file);
@@ -465,6 +514,9 @@ fn read_lines(path: Option<PathBuf>) -> io::Result<Vec<Value>> {
 }
 
 pub fn try_entries() -> io::Result<Vec<Value>> {
+    // Land this process's queued savings lines before reading so a caller never
+    // misses its own writes.
+    crate::telemetry::flush();
     let mut old = read_lines(savings_path())?;
     if old.iter().any(|row| row["v"] == 2) {
         return Err(io::Error::new(
@@ -722,6 +774,8 @@ mod tests {
             |_| Some("alpha".into()),
         );
         record_discovery(101, 50);
+        // The background writer owns the append now: land it before reading v2 directly.
+        crate::telemetry::flush();
         let v2 = v2_path().unwrap();
         let v2_before = std::fs::read(&v2).unwrap();
         let initial = try_summary().unwrap();
@@ -820,6 +874,8 @@ mod tests {
             &[json!({"name":"toolport_status"})],
             |_| Some("alpha".into()),
         );
+        // The background writer owns the append; land it before the file check.
+        crate::telemetry::flush();
         assert!(!legacy.exists());
         assert!(v2.exists());
         assert_eq!(try_summary().unwrap()["legacyEstimatedTokensAvoided"], 0);

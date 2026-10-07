@@ -149,22 +149,52 @@ pub(crate) fn trimmed_tail(content: &str, keep: usize) -> String {
 /// Append one already-serialized JSONL `line` to `path` under the cross-process
 /// lock for that path, then trim to `keep_lines` once the file passes `max_bytes`.
 ///
-/// Shared by the tool-call audit log ([`crate::audit`]) and the agent-hook sensor
-/// log ([`crate::hooks`]). Both are appended to by several independent processes at
-/// once - every client's gateway, and one short-lived process per hook event - so an
-/// in-process mutex is not enough. Atomic replacement protects readers from partial
-/// files, but only this shared critical section prevents a stale rotation snapshot
-/// from replacing an append that completed in another process (#708).
+/// Thin wrapper over [`append_lines_locked`] for the callers whose writes stay on
+/// the calling thread: the agent-hook sensor log and the integrity pin store. The
+/// audit, savings and search-trace logs go through [`append_lines_locked`] on the
+/// background writer instead (see [`crate::telemetry`]).
+pub(crate) fn append_line_locked(
+    path: &Path,
+    line: &str,
+    max_bytes: u64,
+    keep_lines: usize,
+    after_snapshot: Option<&mut dyn FnMut()>,
+) -> Result<(), String> {
+    let line = line.to_string();
+    append_lines_locked(
+        path,
+        std::slice::from_ref(&line),
+        max_bytes,
+        keep_lines,
+        after_snapshot,
+    )
+}
+
+/// Append a batch of already-serialized JSONL `lines` to `path` under ONE
+/// acquisition of the path's cross-process lock, then trim to `keep_lines` once
+/// the file passes `max_bytes`.
+///
+/// Shared by the tool-call audit log ([`crate::audit`]), the search-trace log
+/// ([`crate::searchtrace`]) and the agent-hook sensor log ([`crate::hooks`]).
+/// They are appended to by several independent processes at once - every client's
+/// gateway, and one short-lived process per hook event - so an in-process mutex is
+/// not enough. Atomic replacement protects readers from partial files, but only
+/// this shared critical section prevents a stale rotation snapshot from replacing
+/// an append that completed in another process (#708).
+///
+/// Batching several lines under one lock is what keeps the lock, the write and any
+/// rotation off the request thread: the caller queues a formatted line and this
+/// runs on the writer thread.
 ///
 /// `after_snapshot` is a test seam: it runs between reading the file for rotation and
 /// writing the trimmed result, so a test can prove an append landing in that window
 /// is not lost.
 ///
-/// Returns `Err` only when the line could not be recorded. Trimming is best-effort:
+/// Returns `Err` only when the lines could not be recorded. Trimming is best-effort:
 /// a failure there never fails the append it follows.
-pub(crate) fn append_line_locked(
+pub(crate) fn append_lines_locked(
     path: &Path,
-    line: &str,
+    lines: &[String],
     max_bytes: u64,
     keep_lines: usize,
     after_snapshot: Option<&mut dyn FnMut()>,
@@ -187,9 +217,12 @@ pub(crate) fn append_line_locked(
         }
         Err(error) => return Err(error.to_string()),
     };
-    let mut bytes = line.to_string();
-    if !bytes.ends_with('\n') {
-        bytes.push('\n');
+    let mut bytes = String::new();
+    for line in lines {
+        bytes.push_str(line);
+        if !line.ends_with('\n') {
+            bytes.push('\n');
+        }
     }
     file.write_all(bytes.as_bytes())
         .map_err(|e| e.to_string())?;
