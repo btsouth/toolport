@@ -2061,7 +2061,10 @@ impl Registry {
     }
 
     pub fn access_profile(&self, id: &str) -> Option<&Profile> {
-        let id = if id == self.default_access_id() && self.default_access_profile_id.is_none() && self.default_access_legacy_policy {
+        let id = if id == self.default_access_id()
+            && self.default_access_profile_id.is_none()
+            && self.default_access_legacy_policy
+        {
             self.default_access_context_id.as_deref().unwrap_or("")
         } else {
             id

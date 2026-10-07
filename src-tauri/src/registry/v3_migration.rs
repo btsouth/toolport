@@ -223,4 +223,59 @@ mod tests {
         assert!(!reg.is_enabled("default", "off"));
         assert!(!reg.is_enabled("missing", "off"));
     }
+    #[test]
+    fn migrated_default_keeps_quarantine_without_leaking_to_other_access_sets() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-v3-quarantine-{}-{}",
+            std::process::id(),
+            crate::registry::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = crate::registry::DataDirOverride::new(&dir);
+        for (id, tool) in [("default", "github__read"), ("work", "files__list")] {
+            std::fs::write(
+                dir.join(format!(
+                    "quarantine-v2-{}.json",
+                    crate::registry::profile_store_key(id)
+                )),
+                json!({tool: {"reason":"changed", "at":1}}).to_string(),
+            )
+            .unwrap();
+        }
+        for multiple in [false, true] {
+            let mut value = fixture(multiple);
+            migrate_v2_to_v3(
+                &mut value,
+                &MigrationContext {
+                    data_dir: dir.clone(),
+                    date: "2026-10-07".into(),
+                },
+            )
+            .unwrap();
+            value["version"] = json!(3);
+            let mut reg: Registry = serde_json::from_value(value).unwrap();
+            let blocked =
+                crate::integrity::quarantined_checked(Some(&reg.default_access_id())).unwrap();
+            assert!(blocked.contains("github__read"));
+            assert!(!blocked.contains("files__list"));
+            assert!(crate::integrity::quarantined_checked(Some("work"))
+                .unwrap()
+                .contains("files__list"));
+            assert!(!crate::integrity::quarantined_checked(Some("work"))
+                .unwrap()
+                .contains("github__read"));
+            reg.set_default_access(None).unwrap();
+            assert!(
+                reg.access_profile(&reg.default_access_id()).is_none(),
+                "explicit All drops legacy tool narrowing"
+            );
+            assert!(
+                crate::integrity::quarantined_checked(Some(&reg.default_access_id()))
+                    .unwrap()
+                    .contains("github__read")
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

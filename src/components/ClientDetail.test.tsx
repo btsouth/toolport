@@ -242,12 +242,9 @@ describe("ClientDetail customized entry (SOU-406)", () => {
       />,
     );
 
-    await userEvent.click(screen.getByRole("button", { name: /move into gateway/i }));
-    const dialog = screen.getByRole("dialog");
-    const scopeSelect = dialog.querySelector('[role="combobox"]');
-    expect(scopeSelect).not.toBeNull();
-    await userEvent.click(scopeSelect!);
+    await userEvent.click(screen.getByRole("combobox", { name: "Access" }));
     await userEvent.click(await screen.findByRole("option", { name: /^Home$/i }));
+    await userEvent.click(screen.getByRole("button", { name: /move into gateway/i }));
     await userEvent.click(screen.getByRole("button", { name: /move 1 into toolport/i }));
 
     await waitFor(() =>
@@ -309,9 +306,46 @@ describe("ClientDetail connect toast (SOU-317)", () => {
     expect(toastSuccess).toHaveBeenCalledWith(
       "Connected Toolport to Claude Desktop",
       expect.objectContaining({
-        description:
-          'Restart Claude Desktop so it loads Toolport. Scoped to the "Work" profile.',
+        description: "Restart Claude Desktop so it loads Toolport. Access: Work.",
       }),
     );
   });
+});
+
+it("shows a migrated default without rewriting the client and explicitly applies All", async () => {
+  const reg = emptyRegistry();
+  reg.version = 3;
+  reg.profiles = [{ id: "default", name: "Default", enabledServerIds: ["on"] }];
+  reg.defaultAccessProfileId = "default";
+  reg.clientScopes = { "claude-desktop": "" };
+  reg.servers = ["on", "off"].map((id) => ({
+    id,
+    name: id,
+    enabled: id === "on",
+    transport: "http",
+    command: null,
+    args: [],
+    env: [],
+    url: null,
+    source: null,
+  }));
+  installGateway.mockResolvedValue({ backup: false });
+  render(
+    <ClientDetail
+      client={client({ gatewayInstalled: true, entryState: "managed" })}
+      registry={reg}
+      onChanged={() => {}}
+      onRegistryChange={() => {}}
+    />,
+  );
+  expect(screen.getByRole("combobox", { name: "Access" })).toHaveTextContent("Default");
+  expect(installGateway).not.toHaveBeenCalled();
+  await userEvent.click(screen.getByRole("combobox", { name: "Access" }));
+  await userEvent.click(
+    await screen.findByRole("option", { name: "All enabled servers" }),
+  );
+  await userEvent.click(screen.getByRole("button", { name: /apply access/i }));
+  await waitFor(() =>
+    expect(installGateway).toHaveBeenCalledWith("claude-desktop", "@all-enabled", false),
+  );
 });

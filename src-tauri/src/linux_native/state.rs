@@ -467,8 +467,6 @@ pub(super) struct RegistrySnapshot {
     pub(super) enabled_count: usize,
     pub(super) profile_count: usize,
     pub(super) active_profile_id: String,
-    pub(super) active_profile: String,
-    pub(super) active_profile_tool_scope: std::collections::HashMap<String, Vec<String>>,
     /// Whether this install is paired with a team. Drives the Team sidebar row,
     /// which has to appear the moment pairing writes the registry, not only on
     /// the next launch.
@@ -493,18 +491,6 @@ pub(super) enum RegistryState {
 impl RegistrySnapshot {
     pub(super) fn from_registry(registry: Registry) -> Self {
         let active_profile_id = registry.active_profile_id();
-        let active_profile = registry
-            .profiles
-            .iter()
-            .find(|profile| profile.id == active_profile_id)
-            .map(|profile| profile.name.clone())
-            .unwrap_or_else(|| "Default".to_string());
-        let active_profile_tool_scope = registry
-            .profiles
-            .iter()
-            .find(|profile| profile.id == active_profile_id)
-            .map(|profile| profile.tool_scope.clone())
-            .unwrap_or_default();
         let servers = registry
             .servers
             .iter()
@@ -566,8 +552,6 @@ impl RegistrySnapshot {
             enabled_count: servers.iter().filter(|server| server.enabled).count(),
             profile_count: registry.profiles.len(),
             active_profile_id,
-            active_profile,
-            active_profile_tool_scope,
             profiles,
             servers,
             paired: registry.team.is_some(),
@@ -833,7 +817,6 @@ mod tests {
 
         assert_eq!(snapshot.enabled_count, 1);
         assert_eq!(snapshot.profile_count, 1);
-        assert_eq!(snapshot.active_profile, "Default");
         assert_eq!(
             snapshot.servers,
             vec![

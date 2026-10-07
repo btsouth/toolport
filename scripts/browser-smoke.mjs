@@ -76,6 +76,26 @@ try {
   await expect(page.getByRole("main").getByText("35.0k tokens saved")).toBeVisible();
   await expect(page.getByText(/Historical bytes\/4: ≈41.1k/)).toBeVisible();
   await page.screenshot({ path: path.join(output, "activity.png") });
+  await page.getByRole("button", { name: "Clients", exact: true }).click();
+  await page.getByRole("button", { name: /Codex/ }).click();
+  await expect(page.getByRole("combobox", { name: "Access", exact: true })).toBeVisible();
+  await page.getByRole("combobox", { name: "Access", exact: true }).click();
+  await expect(
+    page.getByRole("option", { name: "All enabled servers", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("option", { name: "Work", exact: true })).toBeVisible();
+  await page.screenshot({ path: path.join(output, "client-access.png") });
+  await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByText("Advanced", { exact: true }).click();
+  await expect(
+    page.getByRole("combobox", { name: "Default access", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("Access sets", { exact: true })).toBeVisible();
+  await page.screenshot({
+    path: path.join(output, "settings-advanced.png"),
+    fullPage: true,
+  });
   const fixture = await page.evaluate(() => window.toolportFixture);
   expect(fixture.missing).toEqual([]);
   expect(errors).toEqual([]);

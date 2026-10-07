@@ -104,8 +104,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   // config into a client that isn't installed just creates a file nothing reads.
   const present = client.appPresent;
   const profiles = registry?.profiles ?? [];
-  // The scope Toolport last connected this client with ("" = follow the active
-  // profile). Keep the picker in sync with it as the selected client changes.
+  // The access Toolport last connected this client with (empty uses the default). Keep the picker in sync with it as the selected client changes.
   const currentScope = registry?.clientScopes?.[client.id] ?? "";
   useEffect(() => {
     if (!currentScope) {
@@ -210,10 +209,9 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       await installGateway(client.id, profile || undefined, false);
       // Rescope rewrites the client's MCP config the same way Connect does; without a
       // restart hint the change is invisible until the next cold start (SOU-317).
-      const scopeName = profiles.find((p) => p.id === profile)?.name ?? profile;
       toast.success(
         profile
-          ? `${client.name} scoped to "${scopeName}".`
+          ? `${client.name} access set to "${accessLabel(profile)}".`
           : `${client.name} now uses the default access.`,
         { description: clientRestartHint(client.name) },
       );
@@ -377,9 +375,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         // pick up a new gateway entry until relaunch. Scope/backup are secondary.
         toast.success(`Connected Toolport to ${client.name}`, {
           description: connectSuccessDescription(client.name, [
-            profile
-              ? `Scoped to the "${profiles.find((p) => p.id === profile)?.name ?? profile}" profile.`
-              : null,
+            profile ? `Access: ${accessLabel(profile)}.` : null,
             !profile && outcome.backup ? "Previous config backed up." : null,
           ]),
         });
@@ -448,16 +444,16 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {!customized && <span className="text-xs text-muted-foreground">Access</span>}
           {!customized && (
             <Select
-              value={profile || "__default__"}
-              onValueChange={(v) => setProfile(v === "__default__" ? "" : v)}
+              value={profile || registry?.defaultAccessProfileId || "@all-enabled"}
+              onValueChange={setProfile}
             >
               <SelectTrigger aria-label="Access" size="sm" className="w-52">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="__default__">Default: {accessLabel("")}</SelectItem>
                 <SelectItem value="@all-enabled">All enabled servers</SelectItem>
                 {profiles.map((p) => (
                   <SelectItem key={p.id} value={p.id}>
@@ -605,7 +601,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           </div>
           {scopeServers(currentScope).length === 0 ? (
             <p className="text-xs text-muted-foreground">
-              No enabled servers in this scope yet. Enable some under All servers.
+              No enabled servers in this access set yet. Turn servers on in Servers and
+              include them under Settings &gt; Advanced.
             </p>
           ) : (
             <div className="flex flex-wrap gap-1.5">
@@ -796,32 +793,6 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                 plugins or extensions can't be moved, only {client.name} controls those.
                 They stay where they are (you can still import a copy above).
               </p>
-            )}
-            {profiles.length > 1 && (
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs text-muted-foreground">
-                  Scope this client to
-                </span>
-                <Select
-                  value={profile || "__default__"}
-                  onValueChange={(v) => setProfile(v === "__default__" ? "" : v)}
-                >
-                  <SelectTrigger aria-label="Access" size="sm" className="w-52">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__default__">
-                      Default: {accessLabel("")}
-                    </SelectItem>
-                    <SelectItem value="@all-enabled">All enabled servers</SelectItem>
-                    {profiles.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>
-                        {p.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
             )}
           </div>
           <DialogFooter>

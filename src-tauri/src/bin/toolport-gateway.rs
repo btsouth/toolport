@@ -20637,6 +20637,53 @@ mod tests {
     }
 
     #[test]
+    fn access_precedence_and_global_off_apply_to_every_gateway_scope() {
+        let mut reg = Registry::default();
+        reg.default_access_context_id = Some("default".into());
+        let work = reg.add_profile("Work");
+        let mut server: ServerEntry = serde_json::from_value(json!({"id":"files","name":"Files","transport":"http","url":"https://example.test","enabled":true})).unwrap();
+        reg.servers.push(server.clone());
+        reg.set_access_server("default", "files", true).unwrap();
+        reg.set_access_server(&work, "files", true).unwrap();
+        reg.set_default_access(Some("default")).unwrap();
+        reg.set_client_scope("cursor", Some(&work));
+        let env = Some("default".into());
+        reg.set_folder_profiles(vec![registry::FolderProfile {
+            path: "/work".into(),
+            profile: "default".into(),
+        }]);
+        assert_eq!(
+            effective_profile(&reg, Some("cursor"), &env, Some("/work/project")),
+            Some("default".into())
+        );
+        assert_eq!(
+            effective_profile(&reg, Some("cursor"), &env, None),
+            Some(work.clone())
+        );
+        assert_eq!(
+            effective_profile(&reg, Some("other"), &env, None),
+            Some("default".into())
+        );
+        assert_eq!(
+            effective_profile(&reg, None, &None, None),
+            Some(reg.default_access_id())
+        );
+        reg.set_client_scope("cursor", Some(registry::ALL_ENABLED_ACCESS));
+        let all = effective_profile(&reg, Some("cursor"), &env, None).unwrap();
+        assert_eq!(all, reg.all_access_id());
+        server.id = "unprofiled".into();
+        reg.servers.push(server);
+        assert_eq!(reg.enabled_servers_for(&all).len(), 2);
+        assert!(adapter_tool_scope(&reg, &all).is_empty());
+        reg.set_global_server_enabled("files", false).unwrap();
+        for id in ["default".to_string(), work, all, reg.default_access_id()] {
+            assert!(!reg.is_enabled(&id, "files"));
+        }
+        assert!(reg.enabled_servers_for("@all-enabled:forged").is_empty());
+        assert!(reg.enabled_servers_for("@default-access:forged").is_empty());
+    }
+
+    #[test]
     fn resolve_live_profile_switch_takes_effect_on_next_resolution() {
         // Simulates a profile switch mid-session: same client_id, registry
         // mutated in place (as the watcher would see across two poll ticks).

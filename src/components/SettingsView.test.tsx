@@ -10,6 +10,7 @@ import {
   isAutostartEnabled,
   listServerTools,
   setCodeMode,
+  setDefaultAccess,
   setPiiRedaction,
   setSafetyLevel,
   stopStaleGateways,
@@ -30,6 +31,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     enableAutostart: vi.fn().mockResolvedValue(undefined),
     disableAutostart: vi.fn().mockResolvedValue(undefined),
     setCodeMode: vi.fn(),
+    setDefaultAccess: vi.fn(),
     setPiiRedaction: vi.fn(),
     setSafetyLevel: vi.fn(),
     clientsNeedingRestart: vi.fn().mockResolvedValue([]),
@@ -477,4 +479,30 @@ describe("SettingsView setting merges", () => {
     });
     expect(safetyControl).toBeEnabled();
   });
+});
+
+it("keeps access sets and folder routing under Advanced and changes the default explicitly", async () => {
+  const user = userEvent.setup();
+  const onChange = vi.fn();
+  const pinned = { ...registry, version: 3, defaultAccessProfileId: "default" };
+  vi.mocked(setDefaultAccess).mockResolvedValue({
+    ...pinned,
+    defaultAccessProfileId: null,
+  });
+  render(
+    <ThemeProvider>
+      <SettingsView registry={pinned} onRegistryChange={onChange} />
+    </ThemeProvider>,
+  );
+  const advanced = screen.getByText("Advanced").closest("details")!;
+  expect(advanced).not.toHaveAttribute("open");
+  expect(within(advanced).getByText("Access sets")).toBeInTheDocument();
+  expect(within(advanced).getByText(/folder routing/i)).toBeInTheDocument();
+  await user.click(screen.getByText("Advanced"));
+  await user.click(screen.getByRole("combobox", { name: "Default access" }));
+  await user.click(await screen.findByRole("option", { name: "All enabled servers" }));
+  await waitFor(() => expect(setDefaultAccess).toHaveBeenCalledWith(null));
+  expect(onChange).toHaveBeenCalledWith(
+    expect.objectContaining({ defaultAccessProfileId: null }),
+  );
 });

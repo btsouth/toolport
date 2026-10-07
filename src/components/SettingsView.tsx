@@ -1048,7 +1048,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                 Access sets narrow the enabled servers and tools a client can use. Servers
                 that are off stay hidden from every client.
               </p>
-              <label className="text-sm">Default access</label>
+              <p className="text-sm">Default access</p>
               <Select
                 value={registry?.defaultAccessProfileId || "@all-enabled"}
                 onValueChange={async (id) => {
