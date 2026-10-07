@@ -82,10 +82,11 @@ describe("fmtTokens", () => {
       expect(fmtTokens(value)).toBe(expected);
   });
 
-  it("passes 0 and negative inputs through unformatted", () => {
+  it("formats signed net savings using the same compact units", () => {
     expect(fmtTokens(0)).toBe("0");
     expect(fmtTokens(-1)).toBe("-1");
-    expect(fmtTokens(-12345)).toBe("-12345");
+    expect(fmtTokens(-12345)).toBe("-12.3k");
+    expect(fmtTokens(-3_692_944_923)).toBe("-3.7B");
   });
 });
 
