@@ -5701,7 +5701,12 @@ fn build_content(
     page.append(&list);
 
     scroller.set_child(Some(&page));
-    let adaptive = adw::BreakpointBin::builder().child(&scroller).vexpand(true).build();
+    let adaptive = adw::BreakpointBin::builder()
+        .child(&scroller)
+        .width_request(200)
+        .height_request(200)
+        .vexpand(true)
+        .build();
     adaptive.add_breakpoint(short);
     root.append(&adaptive);
     let server_page = (
