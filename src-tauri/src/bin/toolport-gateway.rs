@@ -26821,6 +26821,7 @@ mod tests {
             .push(registry::FolderProfile {
                 path: "/work/flake".into(),
                 profile: "q".into(),
+                unknown_fields: Default::default(),
             });
         let denied = call("x__work");
         assert_eq!(denied["isError"], true, "got {denied}");
