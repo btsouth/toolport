@@ -14,6 +14,7 @@ mod settings;
 mod state;
 mod teams;
 mod theme;
+mod tools;
 mod tray;
 
 use adw::prelude::*;
@@ -21,6 +22,7 @@ use catalog::CatalogPage;
 use gtk::glib::prelude::ToValue;
 use settings::SettingsPage;
 use teams::TeamsPage;
+use tools::ServerToolsPanel;
 
 /// The desktop identity. The GTK shell replaces the Tauri one on Linux rather
 /// than sitting beside it (they share `~/.config/Toolport` and only one can hold
