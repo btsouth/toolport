@@ -1207,10 +1207,6 @@ impl Router {
         self.overrides = overrides;
     }
 
-    /// The real `(server id, original tool name)` an exposed name routes to, or `None` if
-    /// unknown. Callers that need a call's provenance or server-scoping MUST use this rather
-    /// than string-splitting the exposed name on `__` — that split silently mis-derives the
-    /// server for a renamed tool (overrides) or any server id containing `__`.
     /// Preview one server's aliases using the same collision and override rules as dispatch.
     pub fn server_tool_aliases(
         server_id: &str,
@@ -1234,6 +1230,10 @@ impl Router {
         })
     }
 
+    /// The real `(server id, original tool name)` an exposed name routes to, or `None` if
+    /// unknown. Callers that need a call's provenance or server-scoping MUST use this rather
+    /// than string-splitting the exposed name on `__` — that split silently mis-derives the
+    /// server for a renamed tool (overrides) or any server id containing `__`.
     pub fn route_of(&self, exposed: &str) -> Option<(&str, &str)> {
         self.routes
             .get(exposed)
