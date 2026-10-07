@@ -90,7 +90,7 @@ updater has automated process tests; no signed desktop update run is recorded.
 ### Remaining structural cleanup and implementation notes
 
 - P1.3 `HostState` (in progress). The host runtime now lives on `HostState` (registry and
-  its trust flag, router, catalog snapshot, routine candidates and advisor, ready/dirty
+  its trust flag, router, catalog snapshot, ready/dirty
   flags, rebuild lock, listener config, server handler, resource subscriptions and the
   `resources/updated` sink), together with its session table, its daemon runtime (daemon
   flag and activity lease), its rebuild streak map, its quarantine read flag, its code-mode
@@ -271,7 +271,7 @@ the host-scoped call sites reading `state.registry`, `state.router`, and friends
 ownership did not rewrite several hundred lines.
 
 - Landed: `HostState` holds the registry and its trust flag, the live router, the catalog
-  snapshot, the routine candidate registry and advisor ledger, the ready and dirty flags,
+  snapshot, the ready and dirty flags,
   the rebuild lock, the listener configuration (`lazy`, `http`, bind host, allowed
   origins), the server-request handler, the resource subscription table, and the
   `resources/updated` dispatch sink. `GatewayState` keeps the session-side fields: the
@@ -317,11 +317,8 @@ ownership did not rewrite several hundred lines.
   reload and asserts a second host's flag is untouched. Both were checked by sabotage, and
   between them each assertion is load-bearing. Worth knowing for the same move next time: the
   migrated off-path assertions cannot detect a gate that is silently always-off (they assert
-  refusal, which a dead gate also produces), so the switch is kept honest by the new pair, by
-  `run_script_respects_live_code_mode_flag`, and by the three migrated tests that assert the on
-  path (`flattened_routine_tools_are_advertised_and_run`,
-  `routine_write_opt_in_defaults_off_and_controls_advertisement`, and
-  `immutable_code_run_returns_promotion_candidate_without_retaining_input`).
+  refusal, which a dead gate also produces), so the switch is kept honest by the new pair and
+  by `run_script_respects_live_code_mode_flag`.
 - Fifth increment, landed: the host owns its discovery mode. `DISCOVERY_MODE` is gone,
   and with it `DISCOVERY_MODE_TEST_LOCK`, `DiscoveryModeGuard`, and the free
   `discovery_mode()` / `set_discovery_mode()` / `grouped_discovery()`. `HostState` owns a
@@ -357,8 +354,8 @@ ownership did not rewrite several hundred lines.
   `handle_request_with_cancel`), which deliberately takes narrow parameters rather than
   the whole state, so moving them means threading a host handle through that core. That
   threading is wider than it looks: `handle_request` is a test-only wrapper with 63 call
-  sites, all of them tests, and `execute_call` is reached through the routine and script
-  dispatch helpers, so the slice needs a deliberate decision about how the test helper gets
+  sites, all of them tests, and `execute_call` is reached through the script
+  dispatch helper, so the slice needs a deliberate decision about how the test helper gets
   its host. The code-mode increment answered it (see below); the rest can reuse the answer.
   `PROGRESS_DISPATCH` and `PROGRESS_ROUTES` stay where they are for the same reason: the
   dispatch is read by `prepare_progress`, three layers below anything that holds the state,
@@ -408,9 +405,8 @@ attempt should reuse rather than re-derive.
   which is deliberate: tests pass `lazy`, their own `reg` and `router`, and a profile, and the
   wrapper builds the `CatalogSearchIndex` those need. The host it is handed supplies
   host-scoped state and nothing else, so tests bind one host per body (the `dispatch_host`
-  helper) rather than one per call: 5 tests dispatch twice or more under one code-mode state
-  (`routine_write_opt_in_defaults_off_and_controls_advertisement` 2 calls,
-  `code_mode_flag_fails_closed_when_registry_load_fails` 2,
+  helper) rather than one per call: 4 tests dispatch twice or more under one code-mode state
+  (`code_mode_flag_fails_closed_when_registry_load_fails` 2,
   `toolport_extension_reports_active_features_without_gating_core_tools` 3,
   `a_corrupt_quarantine_store_keeps_the_current_set_instead_of_un_blocking` 23,
   `watch_tick_marks_a_recovered_registry_untrusted` 21), and a per-call host would reset the
@@ -424,11 +420,9 @@ attempt should reuse rather than re-derive.
   inside them": both helpers call `handle_request` with `lazy = true`, which short-circuits the
   mode before any host read, so their per-call hosts never carry discovery state.)
 - What the `CODE_MODE` half cost, measured, so the remaining two can be sized against a
-  number that actually landed. 8 functions gained a host parameter: the 6 readers
-  (`gateway_capabilities`, `grouped_tool_defs`, `append_routine_tool_defs`,
-  `save_routine_dispatch`, `save_routine_promotion_dispatch`, `advise_after_direct_call`,
-  which between them carried 11 production and 11 test call sites) plus `handle_request` and
-  `handle_request_with_cancel`. 89 call sites moved in all, 13 production and 76 test, the test
+  number that actually landed. The readers `gateway_capabilities` and `grouped_tool_defs`,
+  together with `handle_request` and `handle_request_with_cancel`, gained a host parameter,
+  carrying 11 production and 11 test call sites between them. 89 call sites moved in all, 13 production and 76 test, the test
   wrapper being 61 of them and 63 in the tree now. 53
   test bodies build a host they now own; the 18 `CodeModeGuard::acquire()` sites and 19
   `set_code_mode_flag` sites in tests are 21 setter calls on that host now, and three of the
@@ -442,8 +436,7 @@ attempt should reuse rather than re-derive.
   trusting either number. The `#[cfg(test)]` definition sits outside `mod tests`, which is why
   counting the identifier alone reads one higher (64 here; a first pass on this doc wrote that
   occurrence count down as the call-site count, hence the old 62), and
-  `execute_call` is reached through `run_routine_dispatch`, `execute_script_dispatch`, and
-  `execute_script_dispatch_with_candidate`. Threading `host: &HostState` through that chain
+  `execute_call` is reached through `execute_script_dispatch`. Threading `host: &HostState` through that chain
   is mechanical except for how the tests receive their host. Tests that assert PII or HITL
   continuity across calls (for example
   `clearing_a_pii_session_drops_the_previous_conversations_map`) need one host for the

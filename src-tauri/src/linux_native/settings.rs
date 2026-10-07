@@ -23,7 +23,6 @@ pub(super) struct SettingsPage {
     pinned_section: gtk::Box,
     pinned_list: gtk::Box,
     code_mode: gtk::Switch,
-    allow_routine_writes: gtk::Switch,
     allow_agent_control: gtk::Switch,
     live_inspect: gtk::Switch,
     pii_redaction: gtk::Switch,
@@ -39,8 +38,6 @@ pub(super) struct SettingsPage {
     add_http_client: gtk::Button,
     folder_list: gtk::Box,
     folder_button: gtk::Button,
-    routine_list: gtk::Box,
-    rendered_routines: Rc<RefCell<Option<Vec<crate::routines::RoutineSuggestion>>>>,
     quarantine_list: gtk::Box,
     allowed_list: gtk::Box,
     refresh_button: gtk::Button,
@@ -183,12 +180,7 @@ impl SettingsPage {
             "Code mode",
             "Off by default. Enable agents to combine scoped tool calls in one sandboxed server-side script. TOOLPORT_CODE_MODE=1 forces it on.",
         );
-
-        let (routine_row, allow_routine_writes) = setting_switch_row(
-            "Allow routine writes",
-            "Let agents suggest persistent routines. Saving one still requires your approval.",
-        );
-
+        capabilities.append(&code_row);
         page.append(&capabilities);
 
         let pinned_section = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -238,7 +230,6 @@ impl SettingsPage {
         let protection = gtk::Box::new(gtk::Orientation::Vertical, 0);
         protection.add_css_class("toolport-settings-group");
         protection.append(&code_row);
-        protection.append(&routine_row);
         let (pii_row, pii_redaction) = setting_switch_row(
             "Pseudonymize PII",
             "Replace detected personal values before results reach the model.",
@@ -478,21 +469,6 @@ impl SettingsPage {
         page.append(&http_client_list);
 
         page.append(&settings_heading(
-            "Suggested routines",
-            "Review value-free workflow suggestions before saving them as executable routines.",
-        ));
-        let routine_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        routine_list.add_css_class("toolport-settings-group");
-        routine_list.append(
-            &gtk::Label::builder()
-                .label("Checking for routine suggestions…")
-                .halign(gtk::Align::Start)
-                .css_classes(["toolport-muted"])
-                .build(),
-        );
-        page.append(&routine_list);
-
-        page.append(&settings_heading(
             "Quarantined tools",
             "Strict blocks retained high-risk definition changes until you explicitly re-approve them.",
         ));
@@ -524,7 +500,6 @@ impl SettingsPage {
             pinned_section,
             pinned_list,
             code_mode,
-            allow_routine_writes,
             allow_agent_control,
             live_inspect,
             pii_redaction,
@@ -540,8 +515,6 @@ impl SettingsPage {
             add_http_client,
             folder_list,
             folder_button,
-            routine_list,
-            rendered_routines: Rc::new(RefCell::new(None)),
             quarantine_list,
             allowed_list,
             refresh_button,
@@ -1271,11 +1244,6 @@ impl SettingsPage {
                 "code mode",
             ),
             (
-                self.allow_routine_writes.clone(),
-                crate::registry_controller::EssentialSetting::AllowRoutineWrites,
-                "routine writes",
-            ),
-            (
                 self.allow_agent_control.clone(),
                 crate::registry_controller::EssentialSetting::AllowAgentControl,
                 "agent control",
@@ -1429,7 +1397,6 @@ impl SettingsPage {
                     crate::autostart::is_enabled_linux(NATIVE_AUTOSTART_NAME)?,
                     read_quarantined_tools(),
                     read_allowed_tools(&broker)?,
-                    broker.list_suggestions(),
                     crate::registry_controller::folder_routing_settings()?,
                     crate::registry_controller::http_client_settings()?,
                     crate::registry_controller::pinned_prerequisites()?,
@@ -1444,7 +1411,6 @@ impl SettingsPage {
                     launch_at_login,
                     quarantined,
                     allowed,
-                    suggestions,
                     folder_routing,
                     http_clients,
                     pinned,
@@ -1467,7 +1433,6 @@ impl SettingsPage {
                     page.render_endpoint(page.bridge.status());
                     page.render_quarantine(quarantined);
                     page.render_allowed(allowed);
-                    page.render_routines(suggestions);
                     page.render_folder_routing(folder_routing);
                     page.render_http_clients(http_clients);
                     page.render_pinned_prerequisites(pinned);
@@ -1505,11 +1470,6 @@ impl SettingsPage {
         self.pinned_section.set_visible(settings.lazy_discovery);
         set_switch(&self.code_mode, settings.code_mode);
         self.code_mode.set_sensitive(true);
-        set_switch(&self.allow_routine_writes, settings.allow_routine_writes);
-        self.allow_routine_writes.set_sensitive(settings.code_mode);
-        self.allow_routine_writes.set_tooltip_text(
-            (!settings.code_mode).then_some("Enable code mode to allow routine writes"),
-        );
         set_switch(&self.allow_agent_control, settings.allow_agent_control);
         self.allow_agent_control.set_sensitive(true);
         set_switch(&self.live_inspect, settings.live_inspect);
@@ -1589,159 +1549,6 @@ impl SettingsPage {
             self.allowed_list.append(&allowed_row(entry, self.clone()));
         }
     }
-
-    fn render_routines(&self, suggestions: Vec<crate::routines::RoutineSuggestion>) {
-        if self.rendered_routines.borrow().as_ref() == Some(&suggestions) {
-            return;
-        }
-        *self.rendered_routines.borrow_mut() = Some(suggestions.clone());
-        while let Some(child) = self.routine_list.first_child() {
-            self.routine_list.remove(&child);
-        }
-        if suggestions.is_empty() {
-            self.routine_list.append(&empty_state(
-                "No routine suggestions are waiting for review.",
-            ));
-            return;
-        }
-        for suggestion in suggestions {
-            self.routine_list
-                .append(&routine_row(suggestion, self.clone()));
-        }
-    }
-}
-
-fn routine_row(suggestion: crate::routines::RoutineSuggestion, page: SettingsPage) -> gtk::Box {
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    card.add_css_class("toolport-setting-row");
-
-    let name = gtk::Entry::builder()
-        .text(&suggestion.suggested_name)
-        .placeholder_text("Routine name")
-        .build();
-    card.append(&name);
-    let description = gtk::Entry::builder()
-        .placeholder_text("Description (optional)")
-        .build();
-    card.append(&description);
-
-    let dependencies = suggestion
-        .evidence
-        .observed_dependencies()
-        .iter()
-        .map(|dependency| dependency.name())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let provenance = match suggestion.evidence.provenance() {
-        crate::routines::EvidenceProvenance::ImmutableRun => "executed end to end",
-        crate::routines::EvidenceProvenance::SynthesizedFromObservedCalls => {
-            "synthesized from observed calls"
-        }
-    };
-    let risk = match suggestion.evidence.risk_class() {
-        crate::routines::RoutineRiskClass::Low => "low",
-        crate::routines::RoutineRiskClass::Medium => "medium",
-        crate::routines::RoutineRiskClass::High => "high",
-        crate::routines::RoutineRiskClass::Unknown => "unknown",
-    };
-    card.append(
-        &gtk::Label::builder()
-            .label(format!(
-                "{} calls · {risk} risk · {provenance}\nDependencies: {dependencies}",
-                suggestion.evidence.calls()
-            ))
-            .halign(gtk::Align::Start)
-            .xalign(0.0)
-            .wrap(true)
-            .css_classes(["toolport-muted"])
-            .build(),
-    );
-
-    let source_view = gtk::TextView::builder()
-        .editable(false)
-        .cursor_visible(false)
-        .monospace(true)
-        .wrap_mode(gtk::WrapMode::None)
-        .top_margin(10)
-        .bottom_margin(10)
-        .left_margin(10)
-        .right_margin(10)
-        .build();
-    source_view.buffer().set_text(&suggestion.source);
-    let source_scroll = gtk::ScrolledWindow::builder()
-        .child(&source_view)
-        .min_content_height(140)
-        .max_content_height(240)
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .build();
-    let source = gtk::Expander::builder()
-        .label("Review source")
-        .child(&source_scroll)
-        .build();
-    card.append(&source);
-
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    actions.set_halign(gtk::Align::End);
-    let dismiss = gtk::Button::with_label("Dismiss");
-    dismiss.add_css_class("toolport-secondary-action");
-    actions.append(&dismiss);
-    let save = gtk::Button::with_label("Save routine");
-    save.add_css_class("suggested-action");
-    actions.append(&save);
-    card.append(&actions);
-
-    let fingerprint = suggestion.definition_fingerprint.clone();
-    let page_for_dismiss = page.clone();
-    dismiss.connect_clicked(move |_| {
-        crate::routine_controller::dismiss_suggestion(&page_for_dismiss.broker, &fingerprint);
-        page_for_dismiss
-            .feedback
-            .set_label("Routine suggestion dismissed.");
-        page_for_dismiss.feedback.remove_css_class("error");
-        page_for_dismiss.feedback.add_css_class("success");
-        page_for_dismiss.refresh();
-    });
-
-    let fingerprint = suggestion.definition_fingerprint;
-    save.connect_clicked(move |button| {
-        let routine_name = name.text().to_string();
-        let routine_description = description.text().to_string();
-        let fingerprint = fingerprint.clone();
-        button.set_sensitive(false);
-        dismiss.set_sensitive(false);
-        let broker = page.broker.clone();
-        let page = page.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::routine_controller::approve_suggestion(
-                    &broker,
-                    &fingerprint,
-                    routine_name,
-                    Some(routine_description),
-                )
-            })
-            .await;
-            match result {
-                Ok(Ok(saved)) => {
-                    page.feedback
-                        .set_label(&format!("Saved routine ‘{}’.", saved.name()));
-                    page.feedback.remove_css_class("error");
-                    page.feedback.add_css_class("success");
-                    page.refresh();
-                }
-                Ok(Err(error)) => {
-                    page.show_error(&error);
-                    page.refresh();
-                }
-                Err(_) => {
-                    page.show_error("the routine save stopped unexpectedly");
-                    page.refresh();
-                }
-            }
-        });
-    });
-    card
 }
 
 #[derive(Clone)]

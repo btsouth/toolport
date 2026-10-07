@@ -1215,10 +1215,7 @@ pub struct Registry {
     /// `CONDUIT_CODE_MODE`) still force-enables regardless of the toggle.
     #[serde(default)]
     pub code_mode: bool,
-    /// Opt-in permission for agents to request persistence of Code Mode routines. Off by
-    /// default. This only exposes the save surface; each save still requires a separate,
-    /// content-bound human approval. Existing routines may still be listed and run while
-    /// writes are disabled.
+    // 2.0: unused, dropped by the v2 migration
     #[serde(default)]
     pub allow_routine_writes: bool,
     /// Opt-in agent control: when true, an agent may turn servers on or off via

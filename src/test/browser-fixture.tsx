@@ -103,7 +103,6 @@ mockIPC(
         return { total: 200, errors: 0, errorRate: 0, servers: [] };
       case "list_quarantined":
       case "list_pending_approvals":
-      case "list_routine_suggestions":
       case "get_security_events":
       case "get_search_traces":
       case "get_inspect_log":

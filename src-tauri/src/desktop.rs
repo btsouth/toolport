@@ -30,8 +30,6 @@ use crate::oauth_controller::*;
 use crate::registry::Profile;
 use crate::registry::{self, FolderProfile, Registry, ServerEntry};
 use crate::remote;
-use crate::routine_controller;
-use crate::routines;
 use crate::savings;
 use crate::searchtrace;
 use crate::secrets;
@@ -1224,36 +1222,6 @@ fn decide_approval(
     Ok(())
 }
 
-/// Strong routine candidates the gateway queued for the passive Settings area.
-/// Polled by the frontend; the `routine-suggestion` event prompts a refresh.
-#[tauri::command]
-fn list_routine_suggestions(
-    broker: State<approval_broker::ApprovalBroker>,
-) -> Vec<routines::RoutineSuggestion> {
-    broker.list_suggestions()
-}
-
-/// Persist a queued suggestion. The user's click IS the persistence authorization:
-/// the card showed the same disclosure the approval prompt would (name, dependencies,
-/// risk, provenance, collapsible source), so no second prompt fires. Everything still
-/// passes the store's own validation and the equivalence dedupe, and the routine
-/// watcher advertises the result to every client.
-#[tauri::command]
-fn approve_routine_suggestion(
-    broker: State<approval_broker::ApprovalBroker>,
-    fingerprint: String,
-    name: String,
-    description: Option<String>,
-) -> Result<routines::RoutineDefinition, String> {
-    routine_controller::approve_suggestion(&broker, &fingerprint, name, description)
-}
-
-/// Drop a queued suggestion and keep the same definition out for this app run.
-#[tauri::command]
-fn dismiss_routine_suggestion(broker: State<approval_broker::ApprovalBroker>, fingerprint: String) {
-    routine_controller::dismiss_suggestion(&broker, &fingerprint);
-}
-
 /// A tool allowed to skip human approval, for the Settings "Allowed tools" list.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1612,17 +1580,6 @@ fn set_lazy_discovery(state: State<RegistryState>, lazy: bool) -> Result<Registr
 fn set_code_mode(state: State<RegistryState>, enabled: bool) -> Result<Registry, String> {
     let (reg, _) = write_registry(state.inner(), |reg| {
         reg.code_mode = enabled;
-        Ok(())
-    })?;
-    Ok(reg)
-}
-
-/// Opt into agent-requested Routine persistence. The gateway refreshes this setting live,
-/// but every save remains separately gated by content-bound human approval.
-#[tauri::command]
-fn set_allow_routine_writes(state: State<RegistryState>, allow: bool) -> Result<Registry, String> {
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        reg.allow_routine_writes = allow;
         Ok(())
     })?;
     Ok(reg)
@@ -3949,9 +3906,6 @@ pub fn run() {
             set_human_approval,
             list_pending_approvals,
             decide_approval,
-            list_routine_suggestions,
-            approve_routine_suggestion,
-            dismiss_routine_suggestion,
             list_allowed_tools,
             revoke_allowed_tool,
             set_tool_override,
@@ -3971,7 +3925,6 @@ pub fn run() {
             release_all_quarantine,
             set_lazy_discovery,
             set_code_mode,
-            set_allow_routine_writes,
             set_allow_agent_control,
             set_client_discovery,
             team_connect,

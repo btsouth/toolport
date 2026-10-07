@@ -330,8 +330,8 @@ fn build_window(
         settings_page.clone(),
         paired,
     );
-    // The Settings tab must not go stale while open: quarantine, remembered
-    // approvals, and routine suggestions all change underneath it (the shipping
+    // The Settings tab must not go stale while open: quarantine and remembered
+    // approvals change underneath it (the shipping
     // app polls the same way).
     {
         let settings_for_tick = settings_page.clone();
@@ -2873,7 +2873,7 @@ struct ActivityPage {
     expanded_stat_servers: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
     server_stat_order: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
     expanded_activity_rows: ActivityExpansionState,
-    /// Persisted security review markers. Routine drift uses a durable identity;
+    /// Persisted security review markers. Tool drift uses a durable identity;
     /// high-severity findings record the newest reviewed timestamp so a later
     /// recurrence becomes visible again.
     security_dismissed: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
@@ -3599,7 +3599,7 @@ impl ActivityPage {
                 loud_count + quiet_count
             )
         } else {
-            format!("Protection history · {quiet_count} routine changes")
+            format!("Protection history · {quiet_count} quiet changes")
         }));
         for (event, count) in crate::integrity::collapse_security_by_identity(&loud)
             .into_iter()
@@ -5542,7 +5542,6 @@ fn approval_reason(reason: crate::approval::ApprovalReason) -> &'static str {
         crate::approval::ApprovalReason::DestructiveAndUntrusted => {
             "destructive tool from an untrusted source"
         }
-        crate::approval::ApprovalReason::PersistentCodeWrite => "persistent routine write",
         crate::approval::ApprovalReason::PiiCrossServer => "cross-server data release",
     }
 }

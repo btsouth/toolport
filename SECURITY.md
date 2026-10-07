@@ -126,7 +126,7 @@ records tokens or full authorization URLs.
 
 ## Telemetry and hosted services
 
-In local use, Toolport sends **no telemetry**. Routine tool traffic is only
+In local use, Toolport sends **no telemetry**. Tool traffic is only
 between the gateway and the upstream MCP servers _you_ configure. Data leaves your
 machine only through features you explicitly turn on:
 

@@ -18,7 +18,6 @@ import type {
   PendingApproval,
   ProbeResult,
   Registry,
-  RoutineSuggestion,
   SavingsSummary,
   SearchTrace,
   ToolIdentity,
@@ -212,30 +211,6 @@ export function decideApproval(
   return invoke<void>("decide_approval", { id, approved, scope });
 }
 
-/** Strong routine candidates the gateway queued for the passive save area. */
-export function listRoutineSuggestions(): Promise<RoutineSuggestion[]> {
-  return invoke<RoutineSuggestion[]>("list_routine_suggestions");
-}
-
-/** Persist a queued suggestion. The click is the persistence authorization: the card
- * showed the same disclosure the approval prompt would, so no second prompt fires. */
-export function approveRoutineSuggestion(
-  fingerprint: string,
-  name: string,
-  description?: string,
-): Promise<unknown> {
-  return invoke<unknown>("approve_routine_suggestion", {
-    fingerprint,
-    name,
-    description,
-  });
-}
-
-/** Drop a queued suggestion and keep the same definition out for this app run. */
-export function dismissRoutineSuggestion(fingerprint: string): Promise<void> {
-  return invoke<void>("dismiss_routine_suggestion", { fingerprint });
-}
-
 /** Tools currently allowed to skip human approval (persistent "always" + this session). */
 export function listAllowedTools(): Promise<AllowedTool[]> {
   return invoke<AllowedTool[]>("list_allowed_tools");
@@ -375,11 +350,6 @@ export function setLazyDiscovery(lazy: boolean): Promise<Registry> {
 /** Toggle server-side code mode (the toolport_run_script meta-tool) for all clients. */
 export function setCodeMode(enabled: boolean): Promise<Registry> {
   return invoke<Registry>("set_code_mode", { enabled });
-}
-
-/** Opt into agent-requested Routine writes. Each save still requires human approval. */
-export function setAllowRoutineWrites(allow: boolean): Promise<Registry> {
-  return invoke<Registry>("set_allow_routine_writes", { allow });
 }
 
 /** Override one client's discovery mode ("full" | "lazy" | "grouped"), or clear it

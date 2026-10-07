@@ -31,7 +31,8 @@ first.
 ## 3. Remove Toolport's data
 
 The data directory holds the registry, audit and savings logs, cached tool lists,
-saved routines, client-config backups, and the gateway binaries Toolport published
+the v2 migration's exports (including any pre-2.0 saved scripts), client-config backups,
+and the gateway binaries Toolport published
 for clients to spawn. Removing the directory removes all of it.
 
 - **Linux:** `~/.config/Toolport`

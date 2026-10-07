@@ -346,8 +346,8 @@ pub fn shape_result_preserving_prefix(
 
 /// Stash a Toolport-authored payload and return a cursor readable through
 /// `toolport_fetch_result`, with the same owner scoping, TTL, and bounds as shaped
-/// results. This lets a small marker in a tool result point at bulkier material (the
-/// routine advisor's synthesized draft) without inflating the result it rides on.
+/// results. This lets a small marker in a tool result point at bulkier material
+/// without inflating the result it rides on.
 pub fn stash_payload(body: String, structured: Option<Value>, owner: Option<&str>) -> String {
     let cursor = next_cursor();
     let size = body.len() + structured.as_ref().map(value_size).unwrap_or(0);

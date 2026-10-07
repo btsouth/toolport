@@ -435,11 +435,7 @@ export interface PendingApproval {
   tool: string;
   toolFingerprint?: string | null;
   reason:
-    | "destructive"
-    | "untrusted_source"
-    | "destructive_and_untrusted"
-    | "persistent_code_write"
-    | "pii_cross_server";
+    "destructive" | "untrusted_source" | "destructive_and_untrusted" | "pii_cross_server";
   arguments: unknown;
   /** A screened URL-mode elicitation brokered by the desktop because the MCP host
    * did not declare URL elicitation support. */
@@ -460,27 +456,6 @@ export interface PendingApproval {
   } | null;
   /** Wall-clock epoch-ms when this call auto-denies; the overlay counts down to it. */
   deadlineMs: number;
-}
-
-/** A strong, repeated orchestration pattern the gateway queued for the passive save
- * area in Settings. Self-contained: approving persists from this payload alone. */
-export interface RoutineSuggestion {
-  suggestedName: string;
-  source: string;
-  inputSchema: unknown;
-  limits: Record<string, unknown>;
-  definitionFingerprint: string;
-  evidence: {
-    sourceRunId: string;
-    executedAtMs: number;
-    calls: number;
-    observedDependencies: { name: string; toolFingerprint?: string | null }[];
-    validationVersion: number;
-    riskClass: string;
-    /** Absent = immutable_run (the source really executed). */
-    provenance?: "immutable_run" | "synthesized_from_observed_calls";
-  };
-  intermediateBytes: number;
 }
 
 /** A tool the user allowed to skip human approval (Settings "Allowed tools" list). */
@@ -548,9 +523,6 @@ export interface Registry {
   /** Code mode: advertise `toolport_run_script` so agents can orchestrate many tool
    * calls in one server-side script. Off by default; opt in under Advanced. */
   codeMode?: boolean;
-  /** Opt-in: let agents request saving immutable Code Mode routines. Every save still
-   * requires a separate human approval. */
-  allowRoutineWrites?: boolean;
   /** Per-client discovery-mode override, keyed by client id (e.g. "cursor" ->
    * "grouped"). Absent = that client inherits the global mode. */
   clientDiscovery?: Record<string, string>;
