@@ -20929,6 +20929,79 @@ mod tests {
             .contains("non-empty"));
     }
 
+    /// run_script input handling: `data` and `input` are mutually exclusive, `input`
+    /// and `inputSchema` must travel together, and input that violates its schema is
+    /// rejected before any downstream call runs.
+    #[test]
+    fn code_run_rejects_mixed_input_modes_and_missing_schema_pairs() {
+        let reg = Registry::default();
+        let (router, calls, catalog) = counting_router(false);
+        let dispatch = |args: Value| {
+            run_script_dispatch(
+                &reg,
+                Some(&router),
+                &catalog,
+                None,
+                None,
+                None,
+                None,
+                &args,
+                None,
+            )
+        };
+
+        let mixed = dispatch(json!({
+            "script": "return 1;",
+            "data": {},
+            "input": {},
+            "inputSchema": { "type": "object" }
+        }));
+        assert!(mixed["isError"].as_bool().unwrap_or(false));
+        assert!(mixed["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("mutually exclusive"));
+
+        let schema_without_input = dispatch(json!({
+            "script": "return 1;",
+            "inputSchema": { "type": "object" }
+        }));
+        assert!(schema_without_input["isError"].as_bool().unwrap_or(false));
+        assert!(schema_without_input["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("`inputSchema` requires `input`"));
+
+        let input_without_schema = dispatch(json!({
+            "script": "return 1;",
+            "input": {}
+        }));
+        assert!(input_without_schema["isError"].as_bool().unwrap_or(false));
+        assert!(input_without_schema["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("`input` requires `inputSchema`"));
+
+        // A schema violation fails before execution, so the downstream call in the
+        // script never reaches the router.
+        let invalid_input = dispatch(json!({
+            "script": "toolport.call('s__work', {}); return 1;",
+            "input": { "id": "not-an-integer" },
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "integer" } },
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        }));
+        assert!(invalid_input["isError"].as_bool().unwrap_or(false));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "input validation must precede any downstream call"
+        );
+    }
+
     /// Without a shareable router (no code-mode-capable context), the dispatch is unavailable
     /// rather than running against a missing catalog.
     #[test]

@@ -2417,4 +2417,55 @@ mod tests {
         assert_eq!(out.calls, 0, "checkpoint must not count against max_calls");
         assert_eq!(out.checkpoint, Some(json!({ "a": 2 })));
     }
+
+    #[test]
+    fn schema_validation_is_draft_2020_12_and_local_only() {
+        assert!(validate_input_schema(&json!({
+            "type": "object",
+            "$defs": { "value": { "type": "string" } },
+            "properties": { "value": { "$ref": "#/$defs/value" } }
+        }))
+        .is_ok());
+        assert!(validate_input_schema(&json!({
+            "type": "object",
+            "properties": { "value": { "$ref": "https://example.com/schema" } }
+        }))
+        .unwrap_err()
+        .contains("external reference"));
+        assert!(validate_input_schema(&json!({ "type": "string" })).is_err());
+        assert!(validate_input_schema(&json!({ "type": "not-a-type" })).is_err());
+    }
+
+    #[test]
+    fn argument_errors_report_paths_without_values() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "secret": { "type": "integer" } },
+            "required": ["secret"],
+            "additionalProperties": false
+        });
+        let error = validate_arguments(&schema, &json!({ "secret": "do-not-echo" })).unwrap_err();
+        assert!(error.contains("/secret"));
+        assert!(!error.contains("do-not-echo"));
+    }
+
+    #[test]
+    fn argument_errors_are_bounded_and_enforce_object_rules() {
+        let properties = (0..20)
+            .map(|index| (format!("field{index}"), json!({ "type": "integer" })))
+            .collect::<serde_json::Map<_, _>>();
+        let schema = json!({
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": false
+        });
+        let arguments = (0..20)
+            .map(|index| (format!("field{index}"), json!("private-value")))
+            .chain(std::iter::once(("unexpected".to_string(), json!(true))))
+            .collect::<serde_json::Map<_, _>>();
+
+        let error = validate_arguments(&schema, &Value::Object(arguments)).unwrap_err();
+        assert_eq!(error.matches("instance ").count(), MAX_VALIDATION_ERRORS);
+        assert!(!error.contains("private-value"));
+    }
 }

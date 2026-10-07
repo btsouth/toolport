@@ -10,6 +10,7 @@ import {
   isAutostartEnabled,
   listServerTools,
   setCodeMode,
+  setPiiRedaction,
   setSafetyLevel,
   stopStaleGateways,
 } from "@/lib/api";
@@ -29,6 +30,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     enableAutostart: vi.fn().mockResolvedValue(undefined),
     disableAutostart: vi.fn().mockResolvedValue(undefined),
     setCodeMode: vi.fn(),
+    setPiiRedaction: vi.fn(),
     setSafetyLevel: vi.fn(),
     clientsNeedingRestart: vi.fn().mockResolvedValue([]),
     stopStaleGateways: vi.fn(),
@@ -37,6 +39,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
 
 const mockedListServerTools = vi.mocked(listServerTools);
 const mockedIsAutostartEnabled = vi.mocked(isAutostartEnabled);
+const mockedSetCodeMode = vi.mocked(setCodeMode);
+const mockedSetPiiRedaction = vi.mocked(setPiiRedaction);
 const mockedClientsNeedingRestart = vi.mocked(clientsNeedingRestart);
 const mockedStopStaleGateways = vi.mocked(stopStaleGateways);
 const mockedToastError = vi.mocked(toastError);
@@ -321,4 +325,60 @@ it("keeps Code Mode off by default under Advanced and persists opt-in", async ()
   await waitFor(() =>
     expect(onRegistryChange).toHaveBeenCalledWith({ ...absent, codeMode: true }),
   );
+});
+
+describe("SettingsView setting merges", () => {
+  it("keeps concurrent successful setting responses from reverting each other", async () => {
+    const user = userEvent.setup();
+    const onRegistryChange = vi.fn();
+    const piiRequest = deferred<Registry>();
+    const codeModeRequest = deferred<Registry>();
+    mockedSetPiiRedaction.mockReset();
+    mockedSetCodeMode.mockReset();
+    mockedSetPiiRedaction.mockReturnValueOnce(piiRequest.promise);
+    mockedSetCodeMode.mockReturnValueOnce(codeModeRequest.promise);
+
+    render(
+      <ThemeProvider>
+        <SettingsView registry={registry} onRegistryChange={onRegistryChange} />
+      </ThemeProvider>,
+    );
+    await user.click(screen.getByText("Advanced"));
+
+    const piiControl = screen.getByRole("switch", {
+      name: /hide personal data from the model/i,
+    });
+    const codeModeControl = screen.getByRole("switch", { name: /code mode/i });
+    const safetyControl = screen.getByRole("combobox", { name: "Safety" });
+
+    await user.click(piiControl);
+    expect(mockedSetPiiRedaction).toHaveBeenCalledWith(true);
+    expect(piiControl).toBeDisabled();
+    expect(codeModeControl).toBeEnabled();
+    expect(safetyControl).toBeEnabled();
+
+    await user.click(codeModeControl);
+    expect(mockedSetCodeMode).toHaveBeenCalledWith(false);
+    expect(codeModeControl).toBeDisabled();
+    expect(piiControl).toBeDisabled();
+    expect(safetyControl).toBeEnabled();
+
+    // Resolve the later request first, then return a stale Hide-personal-data snapshot
+    // that still has Code Mode enabled. Each response must update only the setting it
+    // owns, so the stale snapshot must not turn Code Mode back on.
+    const codeModeOff = { ...registry, codeMode: false };
+    codeModeRequest.resolve(codeModeOff);
+    await waitFor(() => expect(codeModeControl).toBeEnabled());
+    expect(onRegistryChange).toHaveBeenCalledWith(codeModeOff);
+
+    const piiOn = { ...registry, codeMode: true, piiRedaction: true };
+    piiRequest.resolve(piiOn);
+    await waitFor(() => expect(piiControl).toBeEnabled());
+    expect(onRegistryChange).toHaveBeenLastCalledWith({
+      ...registry,
+      codeMode: false,
+      piiRedaction: true,
+    });
+    expect(safetyControl).toBeEnabled();
+  });
 });
