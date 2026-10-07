@@ -1562,7 +1562,7 @@ impl ServerPage {
         }
         let mut rows = Vec::with_capacity(servers.len());
         for server in servers {
-            let card = server_card(server, &snapshot.active_profile_id, None, self.clone());
+            let card = server_card(server, &snapshot.active_profile_id, self.clone());
             self.list.append(&card);
             rows.push((server.clone(), card));
         }
@@ -6756,12 +6756,7 @@ fn open_server_details(server: &state::ServerView, page: &ServerPage, show_tools
     window.present();
 }
 
-fn server_card(
-    server: &state::ServerView,
-    profile_id: &str,
-    tool_scope: Option<Vec<String>>,
-    page: ServerPage,
-) -> gtk::Box {
+fn server_card(server: &state::ServerView, profile_id: &str, page: ServerPage) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     card.add_css_class("toolport-card");
     card.set_margin_top(1);
@@ -6972,20 +6967,6 @@ fn server_card(
     tools.connect_clicked(move |_| open_server_details(&server_for_tools, &page_for_tools, true));
     actions.append(&tools);
 
-    let scope = action_menu_button("Profile tool scope", "view-list-symbolic");
-    let server_for_scope = server.clone();
-    let profile_for_scope = profile_id.to_string();
-    let page_for_scope = page.clone();
-    scope.connect_clicked(move |_| {
-        open_profile_tool_scope(
-            server_for_scope.clone(),
-            profile_for_scope.clone(),
-            tool_scope.clone(),
-            page_for_scope.clone(),
-        )
-    });
-    actions.append(&scope);
-
     let edit = action_menu_button("Edit", "document-edit-symbolic");
     edit.set_sensitive(matches!(
         server.transport_id.as_str(),
@@ -7054,158 +7035,6 @@ fn server_card(
         .build();
     card.append(&menu);
     card
-}
-
-fn open_profile_tool_scope(
-    server: state::ServerView,
-    profile_id: String,
-    current_scope: Option<Vec<String>>,
-    page: ServerPage,
-) {
-    let Some(parent) = page.app.active_window() else {
-        return;
-    };
-    let window = adw::Window::builder()
-        .application(&page.app)
-        .transient_for(&parent)
-        .modal(true)
-        .title(format!("Tool scope for {}", server.name))
-        .default_width(520)
-        .default_height(560)
-        .build();
-    window.add_css_class("toolport-editor");
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let header = adw::HeaderBar::new();
-    let cancel = gtk::Button::with_label("Cancel");
-    cancel.add_css_class("toolport-secondary-action");
-    header.pack_start(&cancel);
-    let save = gtk::Button::with_label("Save");
-    save.add_css_class("suggested-action");
-    save.set_sensitive(false);
-    header.pack_end(&save);
-    root.append(&header);
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.add_css_class("toolport-editor-body");
-    content.append(&editor_intro(
-        "view-list-symbolic",
-        "Tools available in this profile",
-        "Uncheck tools this profile should hide. Selecting every tool restores the server's default full scope.",
-    ));
-    let feedback = gtk::Label::builder()
-        .label("Loading server tools…")
-        .halign(gtk::Align::Fill)
-        .xalign(0.0)
-        .wrap(true)
-        .css_classes(["toolport-feedback"])
-        .build();
-    content.append(&feedback);
-    let tool_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    tool_list.add_css_class("toolport-settings-group");
-    content.append(&tool_list);
-    let scroller = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&content)
-        .build();
-    root.append(&scroller);
-    window.set_content(Some(&root));
-    let window_for_cancel = window.clone();
-    cancel.connect_clicked(move |_| window_for_cancel.close());
-
-    let selections = std::rc::Rc::new(std::cell::RefCell::new(
-        Vec::<(gtk::CheckButton, String)>::new(),
-    ));
-    let selections_for_save = selections.clone();
-    let page_for_save = page.clone();
-    let window_for_save = window.clone();
-    let server_id = server.id;
-    let server_id_for_save = server_id.clone();
-    save.connect_clicked(move |button| {
-        button.set_sensitive(false);
-        let selections = selections_for_save.borrow();
-        let selected = selections
-            .iter()
-            .filter(|(check, _)| check.is_active())
-            .map(|(_, tool)| tool.clone())
-            .collect::<Vec<_>>();
-        let tools = (selected.len() != selections.len()).then_some(selected);
-        drop(selections);
-        let profile_id = profile_id.clone();
-        let server_id = server_id_for_save.clone();
-        let page = page_for_save.clone();
-        let window = window_for_save.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::registry_controller::set_profile_server_tools(&profile_id, &server_id, tools)
-            })
-            .await;
-            match result {
-                Ok(Ok(registry)) => {
-                    page.render(state::RegistryState::Ready(
-                        state::RegistrySnapshot::from_registry(registry),
-                    ));
-                    page.show_confirmation("Updated the active profile's tool scope.");
-                    window.close();
-                }
-                Ok(Err(error)) => {
-                    page.show_feedback(&format!("Could not update tool scope: {error}"), true)
-                }
-                Err(_) => page.show_feedback("The tool-scope update stopped unexpectedly.", true),
-            }
-        });
-    });
-
-    let current_scope =
-        current_scope.map(|tools| tools.into_iter().collect::<std::collections::HashSet<_>>());
-    let selections_for_load = selections;
-    gtk::glib::spawn_future_local(async move {
-        let result =
-            gtk::gio::spawn_blocking(move || crate::playground::list_tools(&server_id)).await;
-        match result {
-            Ok(Ok(tools)) => {
-                if tools.is_empty() {
-                    feedback.set_label("This server does not advertise any tools.");
-                    return;
-                }
-                for tool in tools {
-                    let Some(name) = tool
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                    else {
-                        continue;
-                    };
-                    let check = gtk::CheckButton::builder()
-                        .label(&name)
-                        .active(
-                            current_scope
-                                .as_ref()
-                                .is_none_or(|scope| scope.contains(&name)),
-                        )
-                        .build();
-                    check.set_margin_top(8);
-                    check.set_margin_bottom(8);
-                    check.set_margin_start(12);
-                    check.set_margin_end(12);
-                    tool_list.append(&check);
-                    selections_for_load.borrow_mut().push((check, name));
-                }
-                feedback.set_label("Changes apply only to the active server profile.");
-                feedback.remove_css_class("error");
-                feedback.add_css_class("success");
-                save.set_sensitive(!selections_for_load.borrow().is_empty());
-            }
-            Ok(Err(error)) => {
-                feedback.set_label(&format!("Could not load tools: {error}"));
-                feedback.add_css_class("error");
-            }
-            Err(_) => {
-                feedback.set_label("The server tool read stopped unexpectedly.");
-                feedback.add_css_class("error");
-            }
-        }
-    });
-    window.present();
 }
 
 /// The one-line explanation of a live auth probe, shown above the credential

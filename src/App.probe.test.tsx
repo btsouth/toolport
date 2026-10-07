@@ -67,9 +67,11 @@ vi.mock("@/components/AppSidebar", () => ({
       {registry?.profiles.some((profile) => profile.id === "work") && (
         <button
           type="button"
-          onClick={() => onRegistryChange({ ...registry, activeProfileId: "work" })}
+          onClick={() =>
+            onRegistryChange({ ...registry, defaultAccessProfileId: "work" })
+          }
         >
-          Switch profile
+          Change default access
         </button>
       )}
     </>
@@ -98,7 +100,7 @@ beforeEach(() => {
   localStorage.clear();
   captured.onProbe = null;
   getRegistry.mockResolvedValue({
-    version: 1,
+    version: 3,
     servers: [],
     profiles: [],
     activeProfileId: null,
@@ -158,10 +160,11 @@ describe("App health visibility", () => {
   it("keeps an enabled server with no health result out of Ready", async () => {
     localStorage.setItem("toolport.onboarded", "1");
     getRegistry.mockResolvedValue({
-      version: 1,
+      version: 3,
       servers: [
         {
           id: "server-1",
+          enabled: true,
           name: "Unchecked server",
           transport: "stdio",
           command: "example",
@@ -188,6 +191,7 @@ describe("App health visibility", () => {
     localStorage.setItem("toolport.onboarded", "1");
     const server = {
       id: "server-1",
+      enabled: true,
       name: "Example",
       transport: "stdio",
       command: "example",
@@ -197,14 +201,14 @@ describe("App health visibility", () => {
       source: "manual",
     };
     const enabledRegistry = {
-      version: 1,
+      version: 3,
       servers: [server],
       profiles: [{ id: "default", name: "Default", enabledServerIds: ["server-1"] }],
       activeProfileId: "default",
     };
     const disabledRegistry = {
       ...enabledRegistry,
-      profiles: [{ id: "default", name: "Default", enabledServerIds: [] }],
+      servers: [{ ...server, enabled: false }],
     };
     const nextProbe = deferred<ProbeResult[]>();
     probeServers
@@ -247,6 +251,7 @@ describe("App health visibility", () => {
     localStorage.setItem("toolport.onboarded", "1");
     const server = {
       id: "server-1",
+      enabled: true,
       name: "Example",
       transport: "stdio",
       command: "example",
@@ -256,14 +261,14 @@ describe("App health visibility", () => {
       source: "manual",
     };
     const enabledRegistry = {
-      version: 1,
+      version: 3,
       servers: [server],
       profiles: [{ id: "default", name: "Default", enabledServerIds: ["server-1"] }],
       activeProfileId: "default",
     };
     const disabledRegistry = {
       ...enabledRegistry,
-      profiles: [{ id: "default", name: "Default", enabledServerIds: [] }],
+      servers: [{ ...server, enabled: false }],
     };
     const nextProbe = deferred<ProbeResult[]>();
     probeServers
@@ -298,10 +303,11 @@ describe("App health visibility", () => {
     expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
   });
 
-  it("invalidates health and probes after switching profiles", async () => {
+  it("invalidates health and probes after changing default access", async () => {
     localStorage.setItem("toolport.onboarded", "1");
     const server = (id: string, name: string) => ({
       id,
+      enabled: id === "server-1",
       name,
       transport: "stdio",
       command: "example",
@@ -311,7 +317,7 @@ describe("App health visibility", () => {
       source: "manual",
     });
     getRegistry.mockResolvedValue({
-      version: 1,
+      version: 3,
       servers: [server("server-1", "Default server"), server("server-2", "Work server")],
       profiles: [
         { id: "default", name: "Default", enabledServerIds: ["server-1"] },
@@ -335,7 +341,7 @@ describe("App health visibility", () => {
     render(<App />);
 
     expect(await screen.findByRole("button", { name: /ready 1/i })).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Switch profile" }));
+    await userEvent.click(screen.getByRole("button", { name: "Change default access" }));
 
     await waitFor(() => expect(probeServers).toHaveBeenCalledTimes(2));
     expect(

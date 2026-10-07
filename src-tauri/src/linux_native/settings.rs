@@ -810,41 +810,23 @@ impl SettingsPage {
                 });
                 content.append(&included);
                 if profile.enabled_server_ids.contains(&server.id) {
-                    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-                    let tools = gtk::Entry::builder()
-                        .placeholder_text("Comma-separated tool names; * means all tools")
-                        .hexpand(true)
-                        .build();
-                    tools.set_text(
-                        &profile
-                            .tool_scope
-                            .get(&server.id)
-                            .map(|tools| tools.join(", "))
-                            .unwrap_or_else(|| "*".into()),
-                    );
-                    let save = gtk::Button::with_label("Save tools");
-                    let (pid, sid, page, entry) = (
+                    let tools =
+                        gtk::Button::with_label(&format!("Choose tools for {}", server.name));
+                    let (server, pid, scope, page) = (
+                        server.clone(),
                         profile.id.clone(),
-                        server.id.clone(),
+                        profile.tool_scope.get(&server.id).cloned(),
                         self.clone(),
-                        tools.clone(),
                     );
-                    save.connect_clicked(move |_| {
-                        let text = entry.text();
-                        let tools = (text.trim() != "*").then(|| {
-                            text.split(',')
-                                .map(|t| t.trim().to_string())
-                                .filter(|t| !t.is_empty())
-                                .collect()
-                        });
-                        let (pid, sid) = (pid.clone(), sid.clone());
-                        page.mutate_access(move || {
-                            crate::registry_controller::set_profile_server_tools(&pid, &sid, tools)
-                        });
+                    tools.connect_clicked(move |_| {
+                        open_access_tool_scope(
+                            server.clone(),
+                            pid.clone(),
+                            scope.clone(),
+                            page.clone(),
+                        )
                     });
-                    row.append(&tools);
-                    row.append(&save);
-                    content.append(&row);
+                    content.append(&tools);
                 }
             }
             let delete = gtk::Button::with_label("Delete access set");
@@ -888,7 +870,7 @@ impl SettingsPage {
             .set_sensitive(!settings.profiles.is_empty());
         if settings.profiles.is_empty() {
             self.folder_list.append(&empty_state(
-                "Create a server profile before adding project folder routing.",
+                "Create a access set before adding project folder routing.",
             ));
             return;
         }
@@ -1060,14 +1042,14 @@ impl SettingsPage {
             return;
         };
         if settings.profiles.is_empty() {
-            self.show_error("create a server profile before adding folder routing");
+            self.show_error("create a access set before adding folder routing");
             return;
         }
         #[allow(deprecated)]
         let dialog = adw::MessageDialog::new(
             Some(&parent),
-            Some("Choose a server profile"),
-            Some("This profile will be selected when a client reports this folder or one of its descendants."),
+            Some("Choose a access set"),
+            Some("This access set will be selected when a client reports this folder or one of its descendants."),
         );
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("save", "Save mapping");
@@ -1089,7 +1071,7 @@ impl SettingsPage {
         dialog.connect_response(None, move |dialog, response| {
             if response == "save" {
                 let Some((profile, _)) = profiles.get(dropdown.selected() as usize) else {
-                    page.show_error("choose a server profile");
+                    page.show_error("choose a access set");
                     dialog.close();
                     return;
                 };
@@ -1276,7 +1258,7 @@ impl SettingsPage {
             let dialog = adw::MessageDialog::new(
                 Some(&parent),
                 Some("Add a scoped HTTP client"),
-                Some("Toolport generates a bearer token that is shown once. Choose which server profile this client can access."),
+                Some("Toolport generates a bearer token that is shown once. Choose which access set this client can access."),
             );
             dialog.add_response("cancel", "Cancel");
             dialog.add_response("add", "Add client");
@@ -1289,7 +1271,7 @@ impl SettingsPage {
                 .css_classes(["toolport-input"])
                 .build();
             form.append(&label);
-            let mut profile_names = vec!["All enabled servers"];
+            let mut profile_names = vec!["Default access", "All enabled servers"];
             profile_names.extend(settings.profiles.iter().map(|(_, name)| name.as_str()));
             let profile = gtk::DropDown::new(
                 Some(gtk::StringList::new(&profile_names)),
@@ -1305,6 +1287,8 @@ impl SettingsPage {
                     let selected = profile.selected();
                     let profile_id = if selected == 0 {
                         None
+                    } else if selected == 1 {
+                        Some(crate::registry::ALL_ENABLED_ACCESS.to_string())
                     } else {
                         profiles
                             .get(selected.saturating_sub(1) as usize)
@@ -1799,6 +1783,157 @@ fn posture_summary(settings: &crate::registry_controller::EssentialSettings) -> 
 }
 
 /// Which profile scopes a re-approve-all pass must clear, in first-seen order.
+fn open_access_tool_scope(
+    server: crate::registry::ServerEntry,
+    profile_id: String,
+    current_scope: Option<Vec<String>>,
+    page: SettingsPage,
+) {
+    let Some(parent) = page
+        .root
+        .root()
+        .and_then(|root| root.downcast::<gtk::Window>().ok())
+    else {
+        return;
+    };
+    let window = adw::Window::builder()
+        .transient_for(&parent)
+        .modal(true)
+        .title(format!("Tool scope for {}", server.name))
+        .default_width(520)
+        .default_height(560)
+        .build();
+    window.set_application(parent.application().as_ref());
+    window.add_css_class("toolport-editor");
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let header = adw::HeaderBar::new();
+    let cancel = gtk::Button::with_label("Cancel");
+    cancel.add_css_class("toolport-secondary-action");
+    header.pack_start(&cancel);
+    let save = gtk::Button::with_label("Save");
+    save.add_css_class("suggested-action");
+    save.set_sensitive(false);
+    header.pack_end(&save);
+    root.append(&header);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.add_css_class("toolport-editor-body");
+    content.append(&super::editor_intro(
+        "view-list-symbolic",
+        "Tools available in this access set",
+        "Uncheck tools this access set should hide. Selecting every tool restores the server's default full scope.",
+    ));
+    let feedback = gtk::Label::builder()
+        .label("Loading server tools…")
+        .halign(gtk::Align::Fill)
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["toolport-feedback"])
+        .build();
+    content.append(&feedback);
+    let tool_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    tool_list.add_css_class("toolport-settings-group");
+    content.append(&tool_list);
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&content)
+        .build();
+    root.append(&scroller);
+    window.set_content(Some(&root));
+    let window_for_cancel = window.clone();
+    cancel.connect_clicked(move |_| window_for_cancel.close());
+
+    let selections = std::rc::Rc::new(std::cell::RefCell::new(
+        Vec::<(gtk::CheckButton, String)>::new(),
+    ));
+    let selections_for_save = selections.clone();
+    let page_for_save = page.clone();
+    let window_for_save = window.clone();
+    let server_id = server.id;
+    let server_id_for_save = server_id.clone();
+    save.connect_clicked(move |button| {
+        button.set_sensitive(false);
+        let selections = selections_for_save.borrow();
+        let selected = selections
+            .iter()
+            .filter(|(check, _)| check.is_active())
+            .map(|(_, tool)| tool.clone())
+            .collect::<Vec<_>>();
+        let tools = (selected.len() != selections.len()).then_some(selected);
+        drop(selections);
+        let profile_id = profile_id.clone();
+        let server_id = server_id_for_save.clone();
+        let page = page_for_save.clone();
+        let window = window_for_save.clone();
+        gtk::glib::spawn_future_local(async move {
+            let result = gtk::gio::spawn_blocking(move || {
+                crate::registry_controller::set_profile_server_tools(&profile_id, &server_id, tools)
+            })
+            .await;
+            match result {
+                Ok(Ok(registry)) => {
+                    page.render_access_sets(registry);
+                    window.close();
+                }
+                Ok(Err(error)) => page.show_error(&format!("Could not update tool scope: {error}")),
+                Err(_) => page.show_error("The tool-scope update stopped unexpectedly."),
+            }
+        });
+    });
+
+    let current_scope =
+        current_scope.map(|tools| tools.into_iter().collect::<std::collections::HashSet<_>>());
+    let selections_for_load = selections;
+    gtk::glib::spawn_future_local(async move {
+        let result =
+            gtk::gio::spawn_blocking(move || crate::playground::list_tools(&server_id)).await;
+        match result {
+            Ok(Ok(tools)) => {
+                if tools.is_empty() {
+                    feedback.set_label("This server does not advertise any tools.");
+                    return;
+                }
+                for tool in tools {
+                    let Some(name) = tool
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    let check = gtk::CheckButton::builder()
+                        .label(&name)
+                        .active(
+                            current_scope
+                                .as_ref()
+                                .is_none_or(|scope| scope.contains(&name)),
+                        )
+                        .build();
+                    check.set_margin_top(8);
+                    check.set_margin_bottom(8);
+                    check.set_margin_start(12);
+                    check.set_margin_end(12);
+                    tool_list.append(&check);
+                    selections_for_load.borrow_mut().push((check, name));
+                }
+                feedback.set_label("Changes apply only to this access set.");
+                feedback.remove_css_class("error");
+                feedback.add_css_class("success");
+                save.set_sensitive(!selections_for_load.borrow().is_empty());
+            }
+            Ok(Err(error)) => {
+                feedback.set_label(&format!("Could not load tools: {error}"));
+                feedback.add_css_class("error");
+            }
+            Err(_) => {
+                feedback.set_label("The server tool read stopped unexpectedly.");
+                feedback.add_css_class("error");
+            }
+        }
+    });
+    window.present();
+}
+
 fn distinct_profiles(entries: &[QuarantinedTool]) -> Vec<String> {
     let mut profiles: Vec<String> = Vec::new();
     for entry in entries {
@@ -1819,7 +1954,7 @@ fn release_all_feedback(summary: &crate::registry_controller::ReleaseAllSummary)
         let failures = summary.failed.len();
         return (
             format!(
-                "Re-approved {released}. {failures} profile {} could not be re-approved: {}",
+                "Re-approved {released}. {failures} access-set {} could not be re-approved: {}",
                 if failures == 1 { "scope" } else { "scopes" },
                 summary.failed[0]
             ),
@@ -1950,9 +2085,9 @@ fn quarantine_row(entry: QuarantinedTool, page: SettingsPage) -> gtk::Box {
             .build(),
     );
     let scope = if entry.profile.is_empty() {
-        "All profiles".to_string()
+        "All access sets".to_string()
     } else {
-        format!("Profile: {}", entry.profile)
+        format!("Access set: {}", entry.profile)
     };
     copy.append(
         &gtk::Label::builder()
@@ -2325,7 +2460,7 @@ mod tests {
         });
         assert_eq!(
             message,
-            "Re-approved 1. 1 profile scope could not be re-approved: store locked"
+            "Re-approved 1. 1 access-set scope could not be re-approved: store locked"
         );
         assert!(is_error);
     }

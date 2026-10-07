@@ -1033,6 +1033,7 @@ fn apply_add_http_client(
     profile: String,
 ) -> Result<(), String> {
     if !profile.is_empty()
+        && profile != registry::ALL_ENABLED_ACCESS
         && !registry
             .profiles
             .iter()
@@ -1291,7 +1292,10 @@ fn enable_moved_servers(
 /// server awaiting review, an unresolved launch input) is still imported, off.
 pub(crate) fn apply_import_entry(registry: &mut Registry, entry: ServerEntry) -> String {
     let id = registry.add_server(entry);
-    let profile_id = registry.active_profile_id();
+    let profile_id = registry
+        .default_access_profile_id
+        .clone()
+        .unwrap_or_else(|| registry.active_profile_id());
     if apply_server_enabled(registry, &profile_id, &id, true, false).is_ok() {
         let _ = registry.set_access_server(&profile_id, &id, true);
     }

@@ -1388,7 +1388,13 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                           {c.label || "(unnamed)"}
                         </span>
                         <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                          {c.profile || "all servers"}
+                          {c.profile === "@all-enabled"
+                            ? "All enabled servers"
+                            : profiles.find(
+                                (p) => p.id === c.profile || p.name === c.profile,
+                              )?.name ||
+                              c.profile ||
+                              "Default access"}
                         </span>
                         <button
                           type="button"
@@ -1446,20 +1452,21 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   />
                   {profiles.length > 0 && (
                     <Select
-                      value={newProfile || "__all__"}
-                      onValueChange={(v) => setNewProfile(v === "__all__" ? "" : v)}
+                      value={newProfile || "__default__"}
+                      onValueChange={(v) => setNewProfile(v === "__default__" ? "" : v)}
                     >
                       <SelectTrigger
                         size="sm"
-                        aria-label="Scope"
+                        aria-label="Access"
                         className="h-8 w-32 shrink-0 text-xs"
                       >
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="__all__">All servers</SelectItem>
+                        <SelectItem value="__default__">Default access</SelectItem>
+                        <SelectItem value="@all-enabled">All enabled servers</SelectItem>
                         {profiles.map((p) => (
-                          <SelectItem key={p.id} value={p.name}>
+                          <SelectItem key={p.id} value={p.id}>
                             {p.name}
                           </SelectItem>
                         ))}
