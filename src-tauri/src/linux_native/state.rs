@@ -412,6 +412,23 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
                 .find(|profile| profile.id == *scope || profile.name == *scope)
                 .map(|profile| profile.name.clone())
         });
+        if client.scope_id.is_none() {
+            client.scope_name = Some(
+                registry
+                    .default_access_profile_id
+                    .as_ref()
+                    .map(|id| {
+                        registry
+                            .profiles
+                            .iter()
+                            .find(|p| &p.id == id)
+                            .map(|p| format!("Default: {}", p.name))
+                            .unwrap_or_else(|| format!("Default: {id} (unavailable)"))
+                    })
+                    .unwrap_or_else(|| "All enabled servers".into()),
+            );
+        }
+
         client.discovery_mode = registry.client_discovery.get(&client.id).cloned();
     }
     clients.sort_by(|left, right| {

@@ -232,7 +232,7 @@ mod tests {
             crate::registry::now_ms()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let _override = crate::registry::DataDirOverride::new(&dir);
+        let _override = crate::registry::DataDirOverride::set(dir.clone());
         for (id, tool) in [("default", "github__read"), ("work", "files__list")] {
             std::fs::write(
                 dir.join(format!(

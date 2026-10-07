@@ -5686,7 +5686,7 @@ fn build_content(
     summary.set_column_spacing(10);
     summary.set_column_homogeneous(true);
     let mut values = Vec::new();
-    for (column, (value, label)) in [("0", "Servers"), ("0", "Enabled"), ("1", "Profiles")]
+    for (column, (value, label)) in [("0", "Servers"), ("0", "Enabled"), ("1", "Access sets")]
         .into_iter()
         .enumerate()
     {

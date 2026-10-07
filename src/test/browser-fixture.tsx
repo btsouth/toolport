@@ -68,33 +68,34 @@ localStorage.setItem("toolport.onboarded", "1");
 
 mockIPC(
   (command, payload) => {
+    const args = payload && !Array.isArray(payload) ? payload : {};
     calls[command] = (calls[command] ?? 0) + 1;
     switch (command) {
       case "set_default_access":
-        registry.defaultAccessProfileId = payload?.profile as string | null;
+        registry.defaultAccessProfileId = args.profile as string | null;
         return registry;
       case "set_access_server": {
-        const profile = registry.profiles.find((p) => p.id === payload?.profileId)!;
+        const profile = registry.profiles.find((p) => p.id === args.profileId)!;
         profile.enabledServerIds = profile.enabledServerIds.filter(
-          (id) => id !== payload?.serverId,
+          (id) => id !== args.serverId,
         );
-        if (payload?.included) profile.enabledServerIds.push(payload.serverId as string);
+        if (args.included) profile.enabledServerIds.push(args.serverId as string);
         return registry;
       }
       case "create_profile":
         registry.profiles.push({
-          id: String(payload?.name).toLowerCase(),
-          name: String(payload?.name),
+          id: String(args.name).toLowerCase(),
+          name: String(args.name),
           enabledServerIds: [],
         });
         return registry;
       case "delete_profile":
-        registry.profiles = registry.profiles.filter((p) => p.id !== payload?.id);
+        registry.profiles = registry.profiles.filter((p) => p.id !== args.id);
         return registry;
       case "install_gateway":
         registry.clientScopes = {
           ...registry.clientScopes,
-          [String(payload?.clientId)]: String(payload?.profile || ""),
+          [String(args.clientId)]: String(args.profile || ""),
         };
         return registry;
       case "get_registry":
@@ -168,6 +169,12 @@ mockIPC(
           content: [{ type: "text", text: `Fixture result: ${JSON.stringify(payload)}` }],
           isError: false,
         };
+      case "plugin:autostart|is_enabled":
+        return false;
+      case "http_bridge_status":
+        return { running: false, port: null, url: null, token: null };
+      case "clients_needing_restart":
+      case "list_allowed_tools":
       case "list_quarantined":
       case "list_pending_approvals":
       case "get_security_events":
