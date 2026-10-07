@@ -1,15 +1,20 @@
-//! Curated "stacks": role-based bundles of catalog servers with guided setup.
+//! Curated "Collections": groups of catalog servers the user adds together with
+//! guided setup.
 //!
-//! A stack is just a named, ordered list of catalog entries (referenced by name),
+//! A Collection is a named, ordered list of catalog entries (referenced by name),
 //! resolved against [`catalog::curated`] so the UI gets each server's command,
-//! env keys, and credential hints in one call. Applying a stack reuses the
+//! env keys, and credential hints in one call. Applying a Collection reuses the
 //! existing add-server / profile / install primitives; nothing here writes state.
+//!
+//! The UI calls these Collections. The module, `Stack` type and `list_stacks`
+//! command keep their legacy names so the IPC and stored data stay unchanged.
 
 use serde::Serialize;
 
 use crate::catalog::{self, CatalogEntry};
 
-/// One curated stack: a use-case bundle the user can set up in one flow.
+/// One curated Collection: a use-case group of servers the user can set up in
+/// one flow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Stack {
@@ -17,12 +22,12 @@ pub struct Stack {
     pub id: String,
     pub name: String,
     pub description: String,
-    /// The stack's servers, resolved to full catalog entries (with cred hints).
-    /// A name that doesn't resolve is dropped, so the list is always usable.
+    /// The Collection's servers, resolved to full catalog entries (with cred
+    /// hints). A name that doesn't resolve is dropped, so the list is always usable.
     pub servers: Vec<CatalogEntry>,
 }
 
-/// Raw stack definition before catalog resolution. Kept as a separate list so
+/// Raw Collection definition before catalog resolution. Kept as a separate list so
 /// tests can assert every referenced name resolves without a magic server total.
 struct StackDef {
     id: &'static str,
@@ -85,8 +90,8 @@ fn stack_defs() -> Vec<StackDef> {
     ]
 }
 
-/// The curated set of stacks. Each references catalog entries by name; we resolve
-/// them here so a typo surfaces as a missing server in tests, not at runtime.
+/// The curated set of Collections. Each references catalog entries by name; we
+/// resolve them here so a typo surfaces as a missing server in tests, not at runtime.
 pub fn stacks() -> Vec<Stack> {
     let catalog = catalog::curated();
     let by_name: std::collections::HashMap<&str, &CatalogEntry> =

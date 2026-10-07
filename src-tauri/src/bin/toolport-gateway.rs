@@ -8940,7 +8940,7 @@ fn maybe_check_integrity(
         ));
             eprintln!("toolport: SECURITY tool drift ({change}) {tool}");
         }
-        // Drift quarantine is Strict-only; baseline tamper also blocks at Ask.
+        // Drift quarantine is Strict or team-forced; baseline tamper also blocks at Ask.
         if quarantine_on || (blocking && integrity::baseline_tamper_detected(&events)) {
             let pending = integrity::quarantine_candidates(tools, &events);
             integrity::apply_quarantine(profile, tools, &events)
@@ -8958,7 +8958,7 @@ fn maybe_check_integrity(
         }
     })();
     match result {
-        Err((error, _)) if !blocking => {
+        Err((error, _)) if !blocking && !quarantine_on => {
             glog(&format!("SECURITY: integrity recording failed: {error}"));
             Ok(None)
         }
@@ -9069,20 +9069,23 @@ fn fail_closed_integrity_catalog(
 }
 
 /// The quarantine set the router SHOULD be enforcing right now, mirroring how the
-/// initial build gates on safety: Strict enforces all entries, Ask enforces baseline
-/// tamper entries, and Off leaves the persisted findings unenforced.
+/// initial build gates on safety: Strict or team-forced drift quarantine enforces all
+/// entries. Otherwise Ask enforces baseline tamper and Off leaves findings unenforced.
 fn effective_quarantine(
     registry: &Arc<Mutex<Registry>>,
     profile: Option<&str>,
     read_failed: &AtomicBool,
 ) -> Option<BTreeSet<String>> {
-    let level = {
+    let (level, quarantine_on) = {
         let r = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        r.safety_level_effective()
+        (
+            r.safety_level_effective(),
+            r.quarantine_on_drift_effective(),
+        )
     };
-    let stored = if level == registry::SafetyLevel::Strict {
+    let stored = if quarantine_on {
         integrity::quarantined_checked(profile)
     } else if level == registry::SafetyLevel::Ask {
         integrity::mandatory_quarantined_checked(profile)
@@ -18967,15 +18970,17 @@ mod tests {
         // Label mode does not set isError on a success that was only labeled.
         assert!(out.get("isError").is_none() || out["isError"] == false);
 
-        // Block on with contentDefense off must still scan and block (otherwise an org
-        // forceBlockOnInjection alone would be a no-op).
-        let mut reg = Registry {
-            safety_level: None,
-            version: 1,
-            ..Registry::default()
-        };
-        reg.team_forced_content_defense = false;
-        reg.block_on_injection = true;
+        // A team injection flag at member Off must withhold results without raising the level.
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Off);
+        reg.content_defense = false;
+        conduit_lib::teams::apply_team_config(
+            &mut reg,
+            "t1",
+            &json!({"servers": [], "screeningPolicy": {"forceBlockOnInjection": true}}),
+        );
+        assert_eq!(reg.safety_level_effective(), registry::SafetyLevel::Off);
+        assert!(!reg.deny_destructive_effective());
         assert!(reg.content_defense_effective());
         assert!(reg.block_on_injection_effective());
         let result = json!({
@@ -29804,6 +29809,50 @@ mod tests {
             &set_of(&["srv__already_blocked", "srv__new_drift"]),
             "a post-write read error must preserve live blocks and enforce the new candidate"
         );
+    }
+
+    #[test]
+    fn team_quarantine_at_member_off_enforces_drift_and_survives_watcher_reconciliation() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("toolport-team-quarantine-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        let profile = Some("team-quarantine-off");
+        let baseline = readonly_router("srv", "Read a record.");
+        integrity::check_staged(profile, &baseline.aggregated_tools()).unwrap();
+        integrity::ensure_quarantine_store_for_existing_pins(profile);
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Off);
+        conduit_lib::teams::apply_team_config(
+            &mut reg,
+            "t1",
+            &json!({"servers": [], "screeningPolicy": {"forceQuarantineOnDrift": true}}),
+        );
+        assert_eq!(reg.safety_level_effective(), registry::SafetyLevel::Off);
+        assert!(!reg.deny_destructive_effective());
+        let registry = Arc::new(Mutex::new(reg));
+        let mut drifted = readonly_router("srv", "Read a record. Summary text updated.");
+        let tools = drifted.aggregated_tools();
+        let published = requarantine_if_needed(&registry, &mut drifted, tools, profile);
+        assert!(!published.iter().any(|tool| tool["name"] == "srv__read"));
+        assert!(drifted.quarantined().contains("srv__read"));
+        let read_failed = AtomicBool::new(false);
+        assert!(effective_quarantine(&registry, profile, &read_failed)
+            .unwrap()
+            .contains("srv__read"));
+        // Store failures must keep enforced quarantine at Off rather than silently release it.
+        std::fs::write(
+            dir.join(format!(
+                "quarantine-v2-{}.json",
+                registry::profile_store_key("team-quarantine-off")
+            )),
+            b"corrupt",
+        )
+        .unwrap();
+        assert!(effective_quarantine(&registry, profile, &read_failed).is_none());
+        assert!(maybe_check_integrity(&registry, &baseline.aggregated_tools(), profile).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// SEC-01: the startup background build must run the integrity gate BEFORE it

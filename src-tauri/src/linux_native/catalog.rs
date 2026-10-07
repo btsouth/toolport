@@ -112,7 +112,7 @@ impl CatalogPage {
         feedback.set_visible(false);
         page.append(&feedback);
         let stack_heading = gtk::Label::builder()
-            .label("Starter stacks")
+            .label("Collections")
             .halign(gtk::Align::Start)
             .css_classes(["heading"])
             .build();
@@ -656,7 +656,7 @@ fn stack_card(
         .filter(|entry| !existing.contains(&entry.name.to_lowercase()))
         .count();
     // Setup steps up front: which credential each server needs and where to
-    // create it, so "Add stack" is not a leap of faith.
+    // create it, so "Add Collection" is not a leap of faith.
     {
         let steps = gtk::Expander::new(Some("Setup steps"));
         steps.set_expanded(page.expanded_stacks.borrow().contains(&stack.id));
@@ -732,7 +732,7 @@ fn stack_card(
             .css_classes(["caption", "toolport-muted"])
             .build(),
     );
-    let add = gtk::Button::with_label(if missing == 0 { "Added" } else { "Add stack" });
+    let add = gtk::Button::with_label(if missing == 0 { "Added" } else { "Add Collection" });
     add.set_sensitive(missing > 0);
     add.add_css_class(if missing == 0 {
         "toolport-secondary-action"
@@ -761,7 +761,7 @@ fn stack_card(
                     page.refresh();
                 }
                 Ok(Err(error)) => page.show_error(&error),
-                Err(_) => page.show_error("the stack setup stopped unexpectedly"),
+                Err(_) => page.show_error("the collection setup stopped unexpectedly"),
             }
         });
     });

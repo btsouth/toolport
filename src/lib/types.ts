@@ -330,12 +330,13 @@ export interface CatalogEntry {
   urlHint?: string;
 }
 
-/** A curated "stack": a role-based bundle of catalog servers for guided setup. */
+/** A curated Collection: a group of catalog servers the user adds together for
+ * guided setup. The wire type keeps its legacy name (`list_stacks`). */
 export interface Stack {
   id: string;
   name: string;
   description: string;
-  /** The stack's servers, resolved to full catalog entries (with cred hints). */
+  /** The Collection's servers, resolved to full catalog entries (with cred hints). */
   servers: CatalogEntry[];
 }
 
@@ -489,6 +490,7 @@ export interface Registry {
   pinnedTools?: Record<string, string[]>;
   /** Member safety choice. Absent values derive from retained legacy fields. */
   safetyLevel?: "off" | "ask" | "strict";
+  teamMinSafetyLevel?: "off" | "ask" | "strict";
   teamForcedHumanApproval?: boolean;
   teamForcedDenyDestructive?: boolean;
   teamForcedQuarantineOnDrift?: boolean;
