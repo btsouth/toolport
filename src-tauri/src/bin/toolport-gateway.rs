@@ -33127,6 +33127,9 @@ mod tests {
         let baseline = readonly_router("srv", "Read a record.");
         conduit_lib::integrity::check_staged(profile, &baseline.aggregated_tools())
             .expect("baseline pins");
+        // Mirror `build_router`: with pins already on disk, the quarantine store must be
+        // materialized before the gate reads it, or the SBS-871 fail-closed path refuses.
+        conduit_lib::integrity::ensure_quarantine_store_for_existing_pins(profile);
         let drifted = readonly_router("srv", "Read a record. Summary text updated.");
 
         let state = http_state(false);
@@ -33187,6 +33190,9 @@ mod tests {
         let baseline = readonly_router("srv", "Read a record.");
         conduit_lib::integrity::check_staged(profile, &baseline.aggregated_tools())
             .expect("baseline pins");
+        // Mirror `build_router`: with pins already on disk, the quarantine store must be
+        // materialized before the gate reads it, or the SBS-871 fail-closed path refuses.
+        conduit_lib::integrity::ensure_quarantine_store_for_existing_pins(profile);
         let drifted = readonly_router("srv", "Read a record. Summary text updated.");
 
         let state = http_state(false);
@@ -33232,6 +33238,9 @@ mod tests {
         let baseline = readonly_router("srv", "Read a record.");
         conduit_lib::integrity::check_staged(profile, &baseline.aggregated_tools())
             .expect("baseline pins");
+        // Mirror `build_router`: with pins already on disk, the quarantine store must be
+        // materialized before the gate reads it, or the SBS-871 fail-closed path refuses.
+        conduit_lib::integrity::ensure_quarantine_store_for_existing_pins(profile);
         let drifted = readonly_router("srv", "Read a record. Summary text updated.");
 
         let state = http_state(false);
