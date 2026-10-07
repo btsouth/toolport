@@ -128,6 +128,7 @@ struct Config {
     garbage_stdout: Option<std::time::Duration>,
     stderr_flood: bool,
     concurrent: bool,
+    sleep_barrier: Option<usize>,
     roots_before_list: bool,
 }
 
@@ -153,6 +154,10 @@ impl Config {
                 .map(std::time::Duration::from_millis),
             stderr_flood: std::env::var("MOCK_MCP_STDERR_FLOOD").as_deref() == Ok("1"),
             concurrent: std::env::var("MOCK_MCP_CONCURRENT").as_deref() == Ok("1"),
+            sleep_barrier: std::env::var("MOCK_MCP_SLEEP_BARRIER")
+                .ok()
+                .and_then(|raw| raw.parse().ok())
+                .filter(|count| *count > 0),
             roots_before_list: std::env::var("MOCK_MCP_ROOTS_BEFORE_LIST").as_deref() == Ok("1"),
         }
     }
@@ -619,7 +624,10 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
                     if !cfg.concurrent {
                         std::thread::sleep(std::time::Duration::from_millis(ms));
                     }
-                    format!("slept {ms} ms")
+                    match cfg.sleep_barrier.filter(|_| cfg.concurrent) {
+                        Some(count) => format!("slept {ms} ms after {count} arrivals"),
+                        None => format!("slept {ms} ms"),
+                    }
                 }
                 "greet" => {
                     let who = args.get("name").and_then(|t| t.as_str()).unwrap_or("there");
@@ -845,7 +853,11 @@ fn sleep_ms(req: &Value) -> Option<u64> {
 
 /// `MOCK_MCP_CONCURRENT=1`: one thread per request, responses in completion order.
 fn serve_concurrent(cfg: Config, state: State) {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
+    // A one-shot rendezvous proves overlap without measuring runner speed.
+    let barrier = cfg
+        .sleep_barrier
+        .map(|count| Arc::new((Mutex::new(0_usize), Condvar::new(), count)));
     let cfg = Arc::new(cfg);
     let state = Arc::new(Mutex::new(state));
     let out = Arc::new(Mutex::new(std::io::stdout()));
@@ -858,8 +870,33 @@ fn serve_concurrent(cfg: Config, state: State) {
         };
         record(&cfg, &req);
         let (cfg, state, out) = (Arc::clone(&cfg), Arc::clone(&state), Arc::clone(&out));
+        let barrier = barrier.clone();
         std::thread::spawn(move || {
             if let Some(ms) = sleep_ms(&req) {
+                if let Some(barrier) = barrier {
+                    let (arrived, ready, count) = &*barrier;
+                    let mut arrived = arrived.lock().unwrap();
+                    *arrived += 1;
+                    ready.notify_all();
+                    let (arrived, _) = ready
+                        .wait_timeout_while(arrived, std::time::Duration::from_secs(60), |n| {
+                            *n < *count
+                        })
+                        .unwrap();
+                    if *arrived < *count {
+                        let mut out = out.lock().unwrap();
+                        let _ = writeln!(
+                            out,
+                            "{}",
+                            json!({
+                                "jsonrpc": "2.0", "id": req["id"],
+                                "error": {"code": -32603, "message": "sleep calls did not overlap"}
+                            })
+                        );
+                        let _ = out.flush();
+                        return;
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
             let mut pre = Vec::new();

@@ -167,14 +167,10 @@ pub fn clear() {
 mod tests {
     use super::*;
 
-    fn reset() {
-        clear();
-    }
-
     #[test]
     fn record_then_read_recent_returns_it() {
         let _data_dir = crate::registry::data_dir_test_lock();
-        reset();
+        let (_override, root) = isolated_data_dir("record");
         record(
             Some("cursor"),
             "github",
@@ -194,13 +190,13 @@ mod tests {
         assert_eq!(e["durationMs"], 42);
         assert_eq!(e["request"]["q"], "conduit");
         assert_eq!(e["response"]["content"][0]["text"], "hit");
-        reset();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn ring_caps_at_fifty() {
         let _data_dir = crate::registry::data_dir_test_lock();
-        reset();
+        let (_override, root) = isolated_data_dir("ring");
         for i in 0..60 {
             record(
                 None,
@@ -218,13 +214,13 @@ mod tests {
         // ...and they are the most recent (i = 59 newest, i = 10 oldest kept).
         assert_eq!(recent[0]["request"]["i"], 59);
         assert_eq!(recent[49]["request"]["i"], 10);
-        reset();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn oversized_request_is_truncated_not_stored() {
         let _data_dir = crate::registry::data_dir_test_lock();
-        reset();
+        let (_override, root) = isolated_data_dir("oversized");
         // A request whose serialized JSON is well over the 4 KB cap.
         let big = "x".repeat(8 * 1024);
         record(
@@ -251,7 +247,7 @@ mod tests {
         assert!(!recent[0].to_string().contains(&big));
         // The (small) response is stored intact.
         assert_eq!(recent[0]["response"]["ok"], true);
-        reset();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -263,7 +259,7 @@ mod tests {
     #[test]
     fn read_recent_skips_corrupt_lines_without_shrinking_page() {
         let _data_dir = crate::registry::data_dir_test_lock();
-        reset();
+        let (_override, root) = isolated_data_dir("corrupt");
 
         let path = inspect_path().unwrap();
         // Direct write (not via record/write_line) must ensure the data dir exists.
@@ -287,17 +283,23 @@ mod tests {
         assert_eq!(recent[0]["i"], 4);
         assert_eq!(recent[1]["i"], 3);
         assert_eq!(recent[2]["i"], 2);
-        reset();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn isolated_data_dir(label: &str) -> (crate::registry::DataDirOverride, PathBuf) {
-        let path = std::env::temp_dir().join(format!(
-            "toolport-inspect-read-{label}-{}-{}",
-            std::process::id(),
-            epoch_millis()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("scratch data dir");
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = loop {
+            let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "toolport-inspect-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => break path,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("scratch data dir: {error}"),
+            }
+        };
         (crate::registry::DataDirOverride::set(&path), path)
     }
 

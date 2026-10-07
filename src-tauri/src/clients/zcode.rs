@@ -432,14 +432,17 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            Self(
-                std::env::temp_dir()
-                    .join(format!("toolport-zcode-{}-{unique}", std::process::id())),
-            )
+            static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            loop {
+                let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let path = std::env::temp_dir()
+                    .join(format!("toolport-zcode-{}-{sequence}", std::process::id()));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("ZCode fixture: {error}"),
+                }
+            }
         }
 
         fn native(&self) -> PathBuf {
@@ -460,6 +463,21 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).ok();
         }
+    }
+
+    #[test]
+    fn fixtures_reserve_distinct_directories_in_parallel() {
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..32).map(|_| scope.spawn(Fixture::new)).collect();
+            let fixtures: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect();
+            let paths: std::collections::HashSet<_> =
+                fixtures.iter().map(|fixture| &fixture.0).collect();
+            assert_eq!(paths.len(), fixtures.len());
+            assert!(fixtures.iter().all(|fixture| fixture.0.is_dir()));
+        });
     }
 
     fn gateway() -> ServerEntry {

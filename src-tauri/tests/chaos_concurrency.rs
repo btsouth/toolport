@@ -21,7 +21,12 @@ use serde_json::json;
 const CATALOG: Duration = Duration::from_secs(60);
 
 /// One client issues `calls` requests without waiting, then collects them all.
-fn burst(client: &mut Client, server: &str, calls: i64, delay_ms: u64) -> Vec<Result<String, String>> {
+fn burst(
+    client: &mut Client,
+    server: &str,
+    calls: i64,
+    delay_ms: u64,
+) -> Vec<Result<String, String>> {
     let ids: Vec<i64> = (0..calls)
         .map(|_| {
             let tool = format!("{server}__sleep");
@@ -178,13 +183,20 @@ fn a_slow_call_does_not_block_a_fast_call_to_the_same_server() {
     let _ = slow;
 }
 
-/// REL-01: one hundred parallel 200 ms calls to one server must overlap.
+/// REL-01: 100 parallel calls fill the server to its designed in-flight limit (64,
+/// `MAX_IN_FLIGHT_PER_SERVER` in router.rs) at once, proven without timing, and all succeed.
 #[test]
 fn one_hundred_parallel_calls_to_one_server_overlap() {
     let scratch = Scratch::new("load-one");
     write_registry(
         scratch.path(),
-        &[mock_entry("x", &[("MOCK_MCP_CONCURRENT", "1")])],
+        &[mock_entry(
+            "x",
+            &[
+                ("MOCK_MCP_CONCURRENT", "1"),
+                ("MOCK_MCP_SLEEP_BARRIER", "64"),
+            ],
+        )],
         &["x"],
     );
     let _daemon = start_daemon(scratch.path());
@@ -200,7 +212,6 @@ fn one_hundred_parallel_calls_to_one_server_overlap() {
         );
     }
 
-    let started = Instant::now();
     let workers: Vec<_> = clients
         .into_iter()
         .map(|mut client| {
@@ -215,23 +226,13 @@ fn one_hundred_parallel_calls_to_one_server_overlap() {
     for worker in workers {
         for result in worker.join().expect("worker") {
             match result {
-                Ok(_) => total += 1,
+                Ok(reply) => {
+                    assert_eq!(reply, "slept 200 ms after 64 arrivals");
+                    total += 1;
+                }
                 Err(error) => panic!("a parallel call failed: {error}"),
             }
         }
     }
     assert_eq!(total, 100);
-    // Serialized, these are 20 s. Multiplexed, the target is a few hundred ms,
-    // which Linux meets (~0.4 s). macOS CI runners take several seconds through
-    // the daemon path, so elsewhere the bound only proves the calls overlap.
-    let bound = if cfg!(target_os = "linux") {
-        Duration::from_secs(5)
-    } else {
-        Duration::from_secs(15)
-    };
-    assert!(
-        started.elapsed() < bound,
-        "100 parallel 200 ms calls took {:?}",
-        started.elapsed()
-    );
 }

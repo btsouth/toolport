@@ -2319,6 +2319,8 @@ mod tests {
 
     #[test]
     fn concurrent_toggles_do_not_lose_each_other() {
+        // Assert both updates survive contention, independent of runner scheduling.
+        let _timeout = registry::LockTimeoutOverride::generous();
         let path = test_path("concurrent");
         cleanup(&path);
         let mut registry = Registry::default();

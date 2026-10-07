@@ -49,6 +49,10 @@ fn state_lock() -> &'static Mutex<BackoffState> {
 }
 
 fn now_ms() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = tests::CLOCK.with(std::cell::Cell::get) {
+        return now;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -209,6 +213,29 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    thread_local! {
+        pub(super) static CLOCK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    struct TestClock;
+
+    impl TestClock {
+        fn new() -> Self {
+            CLOCK.with(|clock| clock.set(Some(1_000_000)));
+            Self
+        }
+
+        fn advance(&self, millis: u64) {
+            CLOCK.with(|clock| clock.set(Some(clock.get().unwrap() + millis)));
+        }
+    }
+
+    impl Drop for TestClock {
+        fn drop(&mut self) {
+            CLOCK.with(|clock| clock.set(None));
+        }
+    }
+
     static TEST_DIR_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
     struct TestDir(PathBuf);
@@ -282,6 +309,7 @@ mod tests {
     #[test]
     fn loaded_deadlines_are_capped_at_one_window() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = TestClock::new();
         reset_for_test();
         let dir = TestDir::new("cap-on-load");
         let path = dir.0.join(FILE_NAME);
@@ -304,6 +332,7 @@ mod tests {
     #[test]
     fn consult_picks_up_windows_recorded_after_bind() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = TestClock::new();
         reset_for_test();
         let dir = TestDir::new("cross-process-pickup");
         let path = dir.0.join(FILE_NAME);
@@ -323,6 +352,7 @@ mod tests {
     #[test]
     fn record_persists_window_and_read_back() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = TestClock::new();
         reset_for_test();
         let dir = TestDir::new("record-read-back");
         let path = dir.0.join(FILE_NAME);
@@ -334,16 +364,23 @@ mod tests {
         assert!(remaining <= Duration::from_secs(2) && !remaining.is_zero());
         let file = load_file(&path).unwrap();
         let ts = *file.not_before.get("https://api.example.com").unwrap();
-        let now = now_ms();
-        assert!(
-            ts > now && ts <= now + 2_000,
-            "window should be ~2s from now, got {ts} vs {now}"
+        assert_eq!(ts, now_ms() + 2_000);
+        // Model a later process loading the persisted window, then its exact expiry.
+        _clock.advance(1_000);
+        reset_for_test();
+        bind_data_dir(&dir.0);
+        assert_eq!(
+            remaining_for_url("https://api.example.com/other-path"),
+            Some(Duration::from_secs(1))
         );
+        _clock.advance(1_000);
+        assert_eq!(remaining_for_url("https://api.example.com"), None);
     }
 
     #[test]
     fn record_caps_retry_after_at_http_retry_cap() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = TestClock::new();
         reset_for_test();
         let dir = TestDir::new("cap-retry-after");
         let path = dir.0.join(FILE_NAME);
@@ -363,6 +400,7 @@ mod tests {
     #[test]
     fn record_without_retry_after_uses_full_cap() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = TestClock::new();
         reset_for_test();
         let dir = TestDir::new("default-cap");
         let path = dir.0.join(FILE_NAME);
@@ -382,6 +420,7 @@ mod tests {
     #[test]
     fn expired_window_means_no_backoff() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = TestClock::new();
         reset_for_test();
         let dir = TestDir::new("expired");
         let path = dir.0.join(FILE_NAME);
@@ -398,6 +437,7 @@ mod tests {
     #[test]
     fn missing_file_means_no_backoff() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = TestClock::new();
         reset_for_test();
         let dir = TestDir::new("missing");
         bind_data_dir(&dir.0);
@@ -409,6 +449,7 @@ mod tests {
     #[test]
     fn corrupt_file_degrades_silently() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = TestClock::new();
         reset_for_test();
         let dir = TestDir::new("corrupt");
         let path = dir.0.join(FILE_NAME);
@@ -427,6 +468,7 @@ mod tests {
     #[test]
     fn record_never_shortens_a_persisted_window() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = TestClock::new();
         reset_for_test();
         let dir = TestDir::new("keep-longest");
         let path = dir.0.join(FILE_NAME);
@@ -451,6 +493,7 @@ mod tests {
     #[test]
     fn unbound_state_stays_in_memory_and_writes_no_file() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = TestClock::new();
         reset_for_test();
 
         record_rate_limited("https://api.example.com", Some(Duration::from_secs(2)));
