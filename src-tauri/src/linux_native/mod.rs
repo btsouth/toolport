@@ -3451,13 +3451,10 @@ impl ActivityPage {
                 .map(|duration| format!("{duration} ms"))
                 .unwrap_or_else(|| "–".to_string()),
         );
-        self.tokens_saved.set_label(&if snapshot.tokens_saved > 0 {
-            state::format_token_count(snapshot.tokens_saved)
-        } else {
-            "–".to_string()
-        });
+        self.tokens_saved
+            .set_label(&format_saved_tokens(snapshot.tokens_saved));
         self.tokens_saved.set_tooltip_text(Some(
-            "Tool-definition tokens Toolport kept out of your agent's context, estimated from their serialized size. Actual model usage depends on the client and caching.",
+            "cl100k_base tokenizer; net of discovery responses and extra catalog exposure; counted once per session and scoped catalog hash (sessionless HTTP: per listener/client). Historical estimates excluded; not model billing.",
         ));
         self.feedback.set_label("");
         self.feedback.remove_css_class("error");
@@ -3774,12 +3771,6 @@ impl ActivityPage {
         } else {
             String::new()
         };
-        if snapshot.savings_list_loads > 0 {
-            detail.push_str(&format!(
-                " · ≈{} per load",
-                state::format_token_count(snapshot.tokens_saved / snapshot.savings_list_loads)
-            ));
-        }
         if snapshot.savings_latest_catalog_ts > 0 {
             detail.push_str(&format!(
                 "\nLatest load: {} / {} tools full → {} / {} tools exposed.",
@@ -3815,16 +3806,22 @@ impl ActivityPage {
         }
         if snapshot.savings_legacy_tokens > 0 {
             detail.push_str(&format!(
-                "\nIncludes ≈{} from older estimated records.",
+                "\nHistorical: ≈{} from older estimated records, excluded.",
                 state::format_token_count(snapshot.savings_legacy_tokens)
             ));
         }
         if has_catalog {
-            detail.push_str("\nEstimate: serialized UTF-8 bytes ÷ 4. Actual model usage depends on client, model, and caching.");
+            self.savings_value.set_tooltip_text(Some("cl100k_base tokenizer; net of discovery responses and extra catalog exposure; counted once per session and scoped full/exposed catalog hash (sessionless HTTP: per listener/client). Historical estimates excluded. Client transformations and caching mean this is not model billing."));
         } else {
             detail.push_str(
                 "\nExact text bytes at Toolport's MCP boundary; model token usage may differ.",
             );
+        }
+        if snapshot.savings_old_v2_tokens > 0 {
+            detail.push_str(&format!(
+                "\nHistorical bytes/4: ≈{} estimated tokens, excluded.",
+                state::format_token_count(snapshot.savings_old_v2_tokens)
+            ));
         }
         self.savings_detail.set_label(&detail);
     }
@@ -4695,8 +4692,16 @@ fn savings_title(loads: u64) -> &'static str {
     }
 }
 
+fn format_saved_tokens(tokens_saved: i64) -> String {
+    format!(
+        "{}{}",
+        if tokens_saved < 0 { "-" } else { "" },
+        state::format_token_count(tokens_saved.unsigned_abs())
+    )
+}
+
 fn savings_primary_display(
-    tokens_saved: u64,
+    tokens_saved: i64,
     loads: u64,
     discovery_bytes: u64,
 ) -> (String, &'static str) {
@@ -4706,17 +4711,14 @@ fn savings_primary_display(
             "discovery text returned",
         );
     }
-    (
-        format!("≈ {}", state::format_token_count(tokens_saved)),
-        "tokens of tool definitions kept out of agent context",
-    )
+    (format_saved_tokens(tokens_saved), "tokens saved")
 }
 
-fn savings_share_line(tokens_saved: u64, loads: u64, searches: u64, bytes: u64) -> String {
+fn savings_share_line(tokens_saved: i64, loads: u64, searches: u64, bytes: u64) -> String {
     if loads == 0 {
         return format!("Toolport recorded {searches} discovery searches returning {} of text at its MCP boundary. toolport.app", format_byte_count(bytes));
     }
-    format!("Toolport kept ≈{} tokens of MCP tool definitions out of my agent's context across {loads} loads. Estimated from serialized size (UTF-8 bytes / 4), not model billing. toolport.app", state::format_token_count(tokens_saved))
+    format!("Toolport recorded {}{} tokens saved, net of discovery responses. Counted with cl100k_base once per session and catalog hash, not model billing. toolport.app", if tokens_saved < 0 { "-" } else { "" }, state::format_token_count(tokens_saved.unsigned_abs()))
 }
 
 fn format_byte_count(bytes: u64) -> String {
@@ -9616,7 +9618,11 @@ mod tests {
     }
 
     #[test]
-    fn savings_detail_and_share_describe_estimated_catalog_exposure() {
+    fn savings_detail_and_share_describe_net_tokenized_exposure() {
+        assert_eq!(
+            savings_primary_display(-123, 1, 0),
+            ("-123".into(), "tokens saved")
+        );
         assert!(!savings_banner_visible(0, 0));
         assert!(
             savings_banner_visible(0, 1),
@@ -9625,10 +9631,7 @@ mod tests {
         assert!(savings_banner_visible(1, 0));
         assert_eq!(
             savings_primary_display(41_100, 12, 0),
-            (
-                "≈ 41.1k".into(),
-                "tokens of tool definitions kept out of agent context"
-            )
+            ("41.1k".into(), "tokens saved")
         );
         assert_eq!(
             savings_primary_display(0, 0, 12_340),
@@ -9651,7 +9654,7 @@ mod tests {
         assert_eq!(savings_detail_line(1, 3, None), "1 catalog load");
         assert_eq!(
             savings_share_line(41_100, 12, 0, 0),
-            "Toolport kept ≈41.1k tokens of MCP tool definitions out of my agent's context across 12 loads. Estimated from serialized size (UTF-8 bytes / 4), not model billing. toolport.app"
+            "Toolport recorded 41.1k tokens saved, net of discovery responses. Counted with cl100k_base once per session and catalog hash, not model billing. toolport.app"
         );
         assert_eq!(savings_share_line(0, 0, 3, 12_340), "Toolport recorded 3 discovery searches returning 12.3 KB of text at its MCP boundary. toolport.app");
     }

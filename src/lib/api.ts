@@ -81,7 +81,7 @@ export function getSecurityEvents(limit = 100): Promise<SecurityEvent[]> {
   return invoke<SecurityEvent[]>("get_security_events", { limit });
 }
 
-/** Catalog exposure: exact serialized MCP bytes plus a bytes/4 token-equivalent estimate. */
+/** Net cl100k_base savings, exact MCP bytes, and separate historical estimates. */
 export function getSavingsSummary(): Promise<SavingsSummary> {
   return invoke<SavingsSummary>("savings_summary");
 }

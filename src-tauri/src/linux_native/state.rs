@@ -34,9 +34,9 @@ pub(super) struct ActivitySnapshot {
     pub(super) call_count: usize,
     pub(super) error_count: usize,
     pub(super) average_duration_ms: Option<u64>,
-    /// Compatibility token-equivalent estimate from catalog exposure records.
+    /// Signed net tokenizer count, excluding historical estimates.
     /// Exact MCP surface bytes are recorded separately; provider usage is unknown.
-    pub(super) tokens_saved: u64,
+    pub(super) tokens_saved: i64,
     pub(super) savings_list_loads: u64,
     pub(super) savings_peak_catalog: u64,
     pub(super) savings_since_ts: u64,
@@ -53,6 +53,7 @@ pub(super) struct ActivitySnapshot {
     pub(super) savings_discovery_count: u64,
     pub(super) savings_discovery_bytes: u64,
     pub(super) savings_legacy_tokens: u64,
+    pub(super) savings_old_v2_tokens: u64,
     /// Every pinned tool's provenance, newest-changed first.
     pub(super) tool_identities: Vec<crate::integrity::ToolIdentity>,
     /// A damaged identity store affects this panel, not the rest of Activity.
@@ -146,6 +147,7 @@ impl ActivitySnapshot {
             savings_discovery_count: 0,
             savings_discovery_bytes: 0,
             savings_legacy_tokens: 0,
+            savings_old_v2_tokens: 0,
             tool_identities: Vec::new(),
             tool_identities_error: None,
             server_stats: Vec::new(),
@@ -280,7 +282,10 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0)
     };
-    snapshot.tokens_saved = savings_number("tokensSaved");
+    snapshot.tokens_saved = savings
+        .get("tokensSaved")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
     snapshot.savings_list_loads = savings_number("listLoads");
     snapshot.savings_peak_catalog = savings_number("peakCatalog");
     snapshot.savings_since_ts = savings_number("sinceTs");
@@ -297,6 +302,7 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
     snapshot.savings_discovery_count = savings_number("discoveryCount");
     snapshot.savings_discovery_bytes = savings_number("discoveryResponseBytes");
     snapshot.savings_legacy_tokens = savings_number("legacyEstimatedTokensAvoided");
+    snapshot.savings_old_v2_tokens = savings_number("estimatedTokensAvoided");
     // Identity provenance has its own panel. A damaged pin or quarantine store
     // must show as unknown there without hiding retained calls and audit stats.
     match crate::registry::load()

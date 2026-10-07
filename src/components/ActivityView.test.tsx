@@ -432,12 +432,14 @@ describe("ActivityView discovery", () => {
 
 it("distinguishes measured bytes from legacy estimates in catalog savings", async () => {
   getSavingsSummary.mockResolvedValue({
-    tokensSaved: 3_692_944_923,
+    tokensSaved: 923,
     listLoads: 2751,
     peakCatalog: 1725,
     sinceTs: 1700000000000,
     legacyEstimatedTokensAvoided: 3_692_944_000,
     measuredLoads: 1,
+    tokenizedLoads: 1,
+    estimatedTokensAvoided: 2000,
     latestCatalogTs: 1700000000001,
     latestFullToolCount: 1725,
     latestExposedToolCount: 7,
@@ -451,7 +453,12 @@ it("distinguishes measured bytes from legacy estimates in catalog savings", asyn
   });
   render(<ActivityView refreshKey={0} registry={null} />);
   await act(async () => {});
-  expect(screen.getAllByText(/3\.7B/).length).toBeGreaterThan(0);
+  expect(screen.getByText(/923/)).toHaveTextContent("tokens saved");
+  expect(screen.getByText(/923/)).toHaveAttribute(
+    "title",
+    expect.stringContaining("net of discovery"),
+  );
+  expect(screen.getByText(/Historical bytes\/4/)).toBeInTheDocument();
   expect(screen.getByText(/8\.0 KB full/)).toBeInTheDocument();
   expect(
     screen.getByText(/Latest load: 8\.0 KB \/ 1,725 tools full/),
@@ -468,7 +475,7 @@ it("shares a token savings statement without a billing claim", async () => {
     value: { writeText },
   });
   getSavingsSummary.mockResolvedValue({
-    tokensSaved: 3_692_944_923,
+    tokensSaved: -123,
     listLoads: 2751,
     peakCatalog: 1725,
     sinceTs: 1700000000000,
@@ -477,10 +484,11 @@ it("shares a token savings statement without a billing claim", async () => {
   await act(async () => {});
   await user.click(screen.getByRole("button", { name: "Share" }));
   expect(writeText).toHaveBeenCalledWith(
-    expect.stringContaining("tokens of MCP tool definitions out of my agent's context"),
+    expect.stringContaining("-123 tokens saved, net of discovery responses"),
   );
   expect(writeText.mock.calls[0][0]).toContain("not model billing");
-  expect(writeText.mock.calls[0][0]).toContain("2,751 loads");
+  expect(writeText.mock.calls[0][0]).toContain("once per session and catalog hash");
+  expect(writeText.mock.calls[0][0]).toContain("cl100k_base");
   expect(writeText.mock.calls[0][0]).not.toMatch(/billed tokens|money saved/i);
 });
 

@@ -258,8 +258,12 @@ export interface AuditStats {
 
 /** Cumulative catalog exposure measurements plus the legacy estimate. */
 export interface SavingsSummary {
-  /** Compatibility total: v1 legacy estimates plus v2 UTF-8 bytes / 4. */
+  /** Signed cl100k_base catalog delta minus discovery responses; excludes historical estimates. */
   tokensSaved: number;
+  tokenizedLoads?: number;
+  catalogTokenDelta?: number;
+  discoveryTokens?: number;
+  tokenizer?: "cl100k_base";
   listLoads: number;
   peakCatalog: number;
   sinceTs: number;
