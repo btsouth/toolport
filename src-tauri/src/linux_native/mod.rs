@@ -86,29 +86,33 @@ pub fn run() {
     app.add_action(&quit);
     app.set_accels_for_action("app.quit", &["<Primary>q"]);
     migrate_preview_identity();
+    crate::autostart::repair_linux(settings::NATIVE_AUTOSTART_NAME);
     ensure_url_scheme_handlers();
 
     let tray = tray::start(&app);
     // Hidden launch requires a REAL tray host, not just a spawned SNI item: the
     // item is registered optimistically so the icon appears when a host shows
-    // up later, but a hidden window with no icon today is unreachable.
-    let hide_first_activation = std::rc::Rc::new(std::cell::Cell::new(
-        launch_hidden && tray.is_some() && tray::sni_watcher_present(),
-    ));
+    // up later, but a hidden window with no icon today is unreachable. At login
+    // the host may still be starting, so give it a short grace period.
+    let hide_first_activation =
+        std::rc::Rc::new(std::cell::Cell::new(launch_hidden && tray.is_some()));
     let broker_for_activate = broker.clone();
     let bridge_for_activate = bridge.clone();
     let hide_first_for_activate = hide_first_activation.clone();
     let notice_for_activate = startup_notice.clone();
     app.connect_activate(move |app| {
-        let present = !hide_first_for_activate.replace(false);
+        let hidden = hide_first_for_activate.replace(false);
         build_window(
             app,
             theme::ThemeController::new(),
             broker_for_activate.clone(),
             bridge_for_activate.clone(),
             notice_for_activate.clone(),
-            present,
-        )
+            !hidden,
+        );
+        if hidden && !tray::sni_watcher_present() {
+            tray::present_unless_host_appears(app, tray::HOST_GRACE);
+        }
     });
     let broker_for_open = broker.clone();
     let bridge_for_open = bridge.clone();
