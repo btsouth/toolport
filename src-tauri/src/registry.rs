@@ -3504,45 +3504,59 @@ fn read_registry_file(path: &Path) -> ReadOutcome {
     }
 }
 
-/// Preserve an unreadable registry file next to the original before anything
-/// overwrites it. "Unreadable" does NOT always mean corrupt: on a machine
-/// running mixed builds it can be a NEWER schema this binary can't parse, and
-/// destroying it silently loses whatever the newer build stored. Best-effort;
-/// keeps the most recent few so a repeating failure can't fill the disk.
-/// Returns the quarantine file path when a copy was written.
-fn quarantine_unreadable(path: &Path, content: &str) -> Option<PathBuf> {
+/// Preserve corrupt bytes before recovery or repair overwrites the primary.
+/// The content hash gives repeated loads the same immutable evidence copy.
+/// Keep three distinct copies, including legacy timestamped copies, without
+/// touching the separate backup and migration journals.
+fn quarantine_unreadable(path: &Path, content: &str) -> Result<PathBuf, String> {
     const KEEP: usize = 3;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
     let mut name = path.as_os_str().to_owned();
-    name.push(format!(".unreadable-{ts}"));
+    name.push(format!(".unreadable-sha256-{}", sha256_hex(content)));
     let dest = PathBuf::from(name);
-    atomic_write(&dest, content).ok()?;
-    // Prune older quarantine files beyond the newest KEEP.
+    if dest.exists() {
+        if !std::fs::symlink_metadata(&dest).is_ok_and(|metadata| metadata.file_type().is_file())
+            || !std::fs::read_to_string(&dest).is_ok_and(|saved| saved == content)
+        {
+            return Err(format!("Could not preserve corrupt registry at {}: an incompatible copy already exists. Move it aside and try again.", dest.display()));
+        }
+    } else {
+        atomic_write(&dest, content).map_err(|error| {
+            format!("Could not preserve corrupt registry at {}: {error}. Check the data directory's permissions and free space, then try again.", dest.display())
+        })?;
+    }
     let (Some(dir), Some(base)) = (path.parent(), path.file_name().and_then(|f| f.to_str())) else {
-        return None;
+        return Ok(dest);
     };
     let prefix = format!("{base}.unreadable-");
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return None;
+        return Ok(dest);
     };
-    let mut quarantined: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|f| f.to_str())
-                .is_some_and(|f| f.starts_with(&prefix))
+    let mut quarantined: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let candidate = entry.path();
+            let suffix = candidate.file_name()?.to_str()?.strip_prefix(&prefix)?;
+            let recognized = suffix.parse::<u128>().is_ok()
+                || suffix.strip_prefix("sha256-").is_some_and(|hash| {
+                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+            let metadata = std::fs::symlink_metadata(&candidate).ok()?;
+            if !recognized || !metadata.file_type().is_file() || candidate == dest {
+                return None;
+            }
+            Some((
+                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                candidate,
+            ))
         })
         .collect();
-    // Timestamps are fixed-width for any realistic epoch, so name order = age order.
     quarantined.sort();
-    while quarantined.len() > KEEP {
-        let _ = std::fs::remove_file(quarantined.remove(0));
+    // Always keep the evidence for the primary being recovered, even if it is
+    // an older copy being reused. Reuse does not rewrite its bytes or timestamp.
+    while quarantined.len() >= KEEP {
+        let _ = std::fs::remove_file(quarantined.remove(0).1);
     }
-    Some(dest)
+    Ok(dest)
 }
 
 /// Where a loaded [`Registry`] actually came from.
@@ -3693,10 +3707,10 @@ fn corrupt_registry(
     migrations: &[Migration],
     target_version: u32,
 ) -> Result<(Registry, LoadSource), String> {
-    let quarantine = quarantine_unreadable(path, content);
+    let quarantine = quarantine_unreadable(path, content)?;
     match restore_from_backup(path, migrations, target_version) {
         Some(registry) => {
-            record_registry_recovery("corrupt", quarantine);
+            record_registry_recovery("corrupt", Some(quarantine));
             Ok((registry, LoadSource::Backup))
         }
         None => Err(format!("Corrupt registry: {parse_error}")),
@@ -4184,7 +4198,7 @@ fn write_registry_document(
                 // whatever the one .bak happens to hold.
                 write_backup_generation(path, &existing, sequence);
             } else {
-                quarantine_unreadable(path, &existing);
+                quarantine_unreadable(path, &existing)?;
             }
         }
     }
@@ -4317,14 +4331,17 @@ impl Drop for LockTimeoutOverride {
 }
 
 fn lock_for(path: &Path, timeout: std::time::Duration) -> Result<FileLock, String> {
+    let lock_error = |error| {
+        format!("Could not open the registry lock at {}: {error}. Toolport requires a writable data directory to load safely. Check directory permissions or choose a writable TOOLPORT_DATA_DIR, then try again.", lock_path(path).display())
+    };
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(parent).map_err(lock_error)?;
     }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .open(lock_path(path))
-        .map_err(|e| format!("Could not open the registry lock: {e}"))?;
+        .map_err(lock_error)?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match file.try_lock_exclusive() {
@@ -7185,23 +7202,159 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn quarantine_prunes_to_the_newest_three() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("conduit-reg-prune-{}.json", std::process::id()));
-        cleanup_quarantine(&path);
-        for i in 0..5 {
-            quarantine_unreadable(&path, &format!("junk-{i}"));
-            // Distinct millisecond timestamps so each call gets its own file.
-            std::thread::sleep(std::time::Duration::from_millis(3));
+    fn repeated_corruption_loads_reuse_evidence_and_keep_last_good() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("reg-repeated-corruption");
+        let path = dir.join("registry.json");
+        let corrupt = "{ identical corruption";
+        std::fs::write(&path, corrupt).unwrap();
+        for _ in 0..10 {
+            assert!(load_from(&path).unwrap_err().contains("Corrupt registry"));
         }
-        let q = quarantine_files(&path);
-        assert_eq!(q.len(), 3, "quarantine must stay bounded");
-        let newest = std::fs::read_to_string(q.last().unwrap()).unwrap();
+        let copies = quarantine_files(&path);
+        assert_eq!(copies.len(), 1);
+        assert_eq!(std::fs::read_to_string(&copies[0]).unwrap(), corrupt);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+        let copied_at = std::fs::metadata(&copies[0]).unwrap().modified().unwrap();
+
+        let mut good = Registry::default();
+        good.add_server(sample_server("last-good"));
+        let good_bytes = serde_json::to_string_pretty(&good).unwrap();
+        std::fs::write(backup_path(&path), &good_bytes).unwrap();
+        for _ in 0..10 {
+            std::fs::write(&path, corrupt).unwrap();
+            let (loaded, source) = load_from_with_source(&path).unwrap();
+            assert_eq!(source, LoadSource::Backup);
+            assert_eq!(loaded.servers[0].id, "last-good");
+            assert_eq!(
+                std::fs::read_to_string(backup_path(&path)).unwrap(),
+                good_bytes
+            );
+        }
+        assert_eq!(quarantine_files(&path), copies);
         assert_eq!(
-            newest, "junk-4",
-            "pruning removes the oldest, keeps the newest"
+            std::fs::metadata(&copies[0]).unwrap().modified().unwrap(),
+            copied_at
         );
-        cleanup_quarantine(&path);
+
+        std::fs::write(&path, "{ different corruption").unwrap();
+        assert_eq!(load_from(&path).unwrap().servers[0].id, "last-good");
+        assert_eq!(quarantine_files(&path).len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&path)).unwrap(),
+            good_bytes
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_quarantine_keeps_primary_and_last_good_during_load_and_repair() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("reg-quarantine-failure");
+        let path = dir.join("registry.json");
+        let corrupt = "{ preserve this evidence";
+        std::fs::write(&path, corrupt).unwrap();
+        let good = serde_json::to_string_pretty(&Registry::default()).unwrap();
+        std::fs::write(backup_path(&path), &good).unwrap();
+        // A directory at the hash destination injects an evidence-write failure.
+        let dest = dir.join(format!(
+            "registry.json.unreadable-sha256-{}",
+            sha256_hex(corrupt)
+        ));
+        std::fs::create_dir(&dest).unwrap();
+        assert!(load_from(&path).unwrap_err().contains("Could not preserve"));
+        assert!(save_to(&path, &Registry::default())
+            .unwrap_err()
+            .contains("Could not preserve"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+        assert_eq!(std::fs::read_to_string(backup_path(&path)).unwrap(), good);
+        assert!(atomic_temp_files(&dest).is_empty());
+        std::fs::remove_dir(&dest).unwrap();
+        save_to(&path, &Registry::default()).unwrap();
+        assert!(load_from(&path).is_ok());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), corrupt);
+        assert_eq!(std::fs::read_to_string(backup_path(&path)).unwrap(), good);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn lock_creation_failure_refuses_load_and_update_without_mutation() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("reg-lock-failure");
+        let path = dir.join("registry.json");
+        let bytes = serde_json::to_string_pretty(&Registry::default()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        // Portable injection: opening a directory as the lock file must fail.
+        std::fs::create_dir(lock_path(&path)).unwrap();
+        let error = load_from(&path).unwrap_err();
+        assert!(error.contains("writable TOOLPORT_DATA_DIR"), "{error}");
+        assert!(
+            error.contains(&lock_path(&path).display().to_string()),
+            "{error}"
+        );
+        let mut called = false;
+        assert!(update_at(&path, |_| {
+            called = true;
+            Ok(())
+        })
+        .is_err());
+        assert!(
+            !called,
+            "no client or registry mutation may run without the lock"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn quarantine_prunes_to_the_newest_three() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("reg-prune");
+        let path = dir.join("registry.json");
+        // Seed the legacy naming format and migration backups. Only recognized
+        // corrupt copies participate in this retention policy.
+        let legacy = dir.join("registry.json.unreadable-1");
+        std::fs::write(&legacy, "legacy corruption").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&legacy)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        let unrelated = dir.join("registry.json.unreadable-owner-note");
+        std::fs::write(&unrelated, "keep").unwrap();
+        for i in 0..5 {
+            write_migration_backup_at(&path, "migration", 1, i).unwrap();
+        }
+        let migration_backups = migration_backup_files(&path);
+        for i in 0..5 {
+            // Explicit file times make age ordering deterministic without sleeps.
+            let dest = quarantine_unreadable(&path, &format!("junk-{i}")).unwrap();
+            assert!(dest.exists(), "current evidence is always retained");
+            std::fs::File::options()
+                .write(true)
+                .open(&dest)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(i + 1))
+                .unwrap();
+        }
+        assert!(!legacy.exists());
+        assert!(unrelated.exists());
+        assert_eq!(
+            quarantine_files(&path).len(),
+            4,
+            "three copies plus the owner note"
+        );
+        assert_eq!(migration_backup_files(&path), migration_backups);
+        for backup in migration_backups {
+            assert_eq!(std::fs::read_to_string(backup).unwrap(), "migration");
+        }
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".conduit-tmp")));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
