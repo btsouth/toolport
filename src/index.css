@@ -207,6 +207,11 @@
   }
 }
 @media (max-height: 500px) {
+  .access-upgrade-notice p {
+    flex-basis: 100%;
+    max-height: 40px;
+    overflow-y: auto;
+  }
   .app-header p {
     display: none;
   }

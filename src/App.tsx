@@ -918,7 +918,7 @@ function App() {
           )}
 
           <ScrollArea className="min-h-0 flex-1">
-            <div className="p-6">
+            <div className="p-3 sm:p-6">
               <ErrorBoundary
                 resetKey={`${view}:${selectedClient?.id ?? ""}`}
                 fallback={(err, retry) => <ViewCrash error={err} onRetry={retry} />}
