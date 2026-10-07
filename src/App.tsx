@@ -846,6 +846,15 @@ function App() {
                       </Button>
                     }
                   />
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    title="Browse Toolport's curated server catalog"
+                    onClick={() => selectView("catalog")}
+                  >
+                    <Store className="size-4" />
+                    Browse catalog
+                  </Button>
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
                       <Button variant="ghost" size="icon" aria-label="More actions">

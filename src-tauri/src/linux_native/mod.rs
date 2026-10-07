@@ -317,7 +317,7 @@ fn build_window(
     stack.add_named(&playground_page.root, Some("playground"));
     stack.add_named(&teams_page.root, Some("teams"));
     stack.add_named(&settings_page.root, Some("settings"));
-    let (sidebar, quarantine_badge) = build_sidebar(
+    let (sidebar, quarantine_badge, team_button) = build_sidebar(
         app,
         &split,
         &stack,
@@ -426,6 +426,11 @@ fn build_window(
     window.set_content(Some(&alerts));
     theme.attach(&window);
     let state = state::RegistryController::new(move |snapshot| {
+        // Team joins the sidebar the moment the registry says this install is
+        // paired, without a relaunch.
+        if let state::RegistryState::Ready(ready) = &snapshot {
+            team_button.set_visible(ready.paired);
+        }
         server_page.render(snapshot);
         if let Some(notice) = startup_notice.borrow_mut().take() {
             let detail = notice
@@ -687,7 +692,7 @@ fn build_sidebar(
     teams_page: TeamsPage,
     settings_page: SettingsPage,
     paired: bool,
-) -> (gtk::Box, gtk::Label) {
+) -> (gtk::Box, gtk::Label, gtk::Button) {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.add_css_class("toolport-sidebar");
 
@@ -720,6 +725,7 @@ fn build_sidebar(
         .build();
 
     let mut buttons = Vec::new();
+    let mut team_button = None;
     for &(target, label, icon) in NAV_SECTIONS {
         let button = gtk::Button::new();
         button.set_halign(gtk::Align::Fill);
@@ -747,6 +753,14 @@ fn build_sidebar(
         // pairing and the tray; only the sidebar row is dropped.
         if is_sidebar_row(target, paired) {
             nav.append(&button);
+        } else if target == "teams" {
+            // Team is appended even when unpaired so pairing can reveal the row
+            // in place instead of waiting for the next launch.
+            button.set_visible(false);
+            nav.append(&button);
+        }
+        if target == "teams" {
+            team_button = Some(button.clone());
         }
         buttons.push((target.to_string(), button));
     }
@@ -830,7 +844,11 @@ fn build_sidebar(
     root.append(&nav_scroll);
 
     install_star_prompt(&root);
-    (root, quarantine_badge)
+    (
+        root,
+        quarantine_badge,
+        team_button.expect("the Team row is always in NAV_SECTIONS"),
+    )
 }
 
 /// The one-off "star the repo" ask, shown once ever, only to someone actually
@@ -5649,6 +5667,21 @@ fn build_content(
         .css_classes(["flat", "toolport-header-add"])
         .build();
     header.pack_end(&add_server);
+    // Catalog left the sidebar in 2.0, so an install that already has servers
+    // never sees the onboarding catalog link. Keep it reachable from the Servers
+    // header for both fresh and existing setups.
+    let browse_catalog = gtk::Button::with_label("Browse catalog");
+    browse_catalog.set_tooltip_text(Some("Browse Toolport's curated server catalog"));
+    browse_catalog.add_css_class("toolport-secondary-action");
+    {
+        let app = app.clone();
+        browse_catalog.connect_clicked(move |_| {
+            if let Some(action) = app.lookup_action("show-catalog") {
+                action.activate(None);
+            }
+        });
+    }
+    header.pack_end(&browse_catalog);
     let menu_popover = gtk::Popover::new();
     menu_popover.add_css_class("toolport-main-menu");
     menu_popover.set_has_arrow(false);
