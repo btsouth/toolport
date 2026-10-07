@@ -220,6 +220,38 @@ jobs:
       - name: Headless gateway security smoke
         run: npm run smoke:headless
 
+  chaos:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    name: Chaos suite (Linux)
+    timeout-minutes: 30
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Install Linux build dependencies
+        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+          key: ci-chaos
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The chaos cases are separate integration binaries; `cargo test` has no
+      # glob for `--test`, so run each one explicitly.
+      - name: Chaos suite
+        run: |
+          for test in chaos_concurrency chaos_env_allowlist chaos_faulty_servers chaos_process_kill chaos_registry; do
+            cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --test "$test"
+          done
+
   cross-platform-rust:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -402,6 +434,7 @@ jobs:
       - build-test
       - cross-platform-rust
       - linux-native
+      - chaos
       - installer-script
       - installer-script-bash
       - pinned-install-urls
