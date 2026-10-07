@@ -34,7 +34,14 @@ const auditRows = Array.from({ length: 200 }, (_, i) => ({
   durationMs: 12,
 }));
 const savingsSummary: SavingsSummary = {
-  tokensSaved: 41_100,
+  tokensSaved: 35_000,
+  tokenizedLoads: 12,
+  catalogTokenDelta: 36_600,
+  discoveryTokens: 1_600,
+  tokenizer: "cl100k_base",
+  discoveryCount: 12,
+  discoveryResponseBytes: 6_400,
+  legacyEstimatedTokensAvoided: 123_000,
   listLoads: 12,
   peakCatalog: 75,
   sinceTs: 1_700_000_000_000,
