@@ -484,3 +484,95 @@ fn http_responses_with_another_requests_id_are_rejected() {
     assert!(result.unwrap_err().to_string().contains("response id"));
     wire.join().unwrap();
 }
+
+#[test]
+fn failed_forced_refresh_recovers_on_the_next_call() {
+    for concurrent in [false, true] {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", server.server_addr());
+        let wire = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let Some(mut request) = server.recv_timeout(Duration::from_secs(3)).unwrap() else {
+                    break;
+                };
+                let fresh = request
+                    .headers()
+                    .iter()
+                    .any(|h| h.field.equiv("Authorization") && h.value.as_str() == "Bearer fresh");
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                let body: Value = serde_json::from_str(&body).unwrap();
+                let response = if fresh {
+                    tiny_http::Response::from_string(
+                        json!({"jsonrpc":"2.0","id":body["id"],"result":{"ok":true}}).to_string(),
+                    )
+                } else {
+                    tiny_http::Response::from_string("revoked").with_status_code(401)
+                };
+                request.respond(response).unwrap();
+            }
+        });
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let forced = Arc::clone(&attempts);
+        let refresh: RefreshFn = Box::new(move |force| {
+            if !force {
+                return Ok(None);
+            }
+            if forced.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err("temporary lock timeout".into())
+            } else {
+                Ok(Some("fresh".into()))
+            }
+        });
+        let mut transport =
+            HttpTransport::with_auth_refresh(&url, Some("stale".into()), Some(refresh));
+        let handle = transport.concurrent().unwrap();
+        let mut call = || {
+            if concurrent {
+                handle.request_with_cancel("echo", json!({}), None)
+            } else {
+                transport.request("echo", json!({}))
+            }
+        };
+        assert!(call()
+            .unwrap_err()
+            .to_string()
+            .contains("temporary lock timeout"));
+        let second = call();
+        wire.join().unwrap();
+        assert_eq!(
+            second.unwrap(),
+            json!({"ok":true}),
+            "concurrent={concurrent}"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[test]
+fn http_null_id_errors_preserve_the_server_message() {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", server.server_addr());
+    let wire = std::thread::spawn(move || {
+        for status in [200, 400] {
+            let request = server
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            request.respond(tiny_http::Response::from_string(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"invalid request from server"}}).to_string()).with_status_code(status)).unwrap();
+        }
+    });
+    let mut transport = HttpTransport::new(&url);
+    transport.set_protocol_meta(Some(
+        json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28"}),
+    ));
+    for _ in 0..2 {
+        let error = transport.request("echo", json!({})).unwrap_err();
+        assert!(
+            matches!(error, conduit_lib::downstream::TransportError::Rpc(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains("invalid request from server"));
+    }
+    wire.join().unwrap();
+}

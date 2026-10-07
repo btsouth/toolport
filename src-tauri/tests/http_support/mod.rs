@@ -15,6 +15,10 @@ pub struct HttpMock {
 }
 impl HttpMock {
     pub fn new() -> Self {
+        Self::with_rendezvous(0)
+    }
+    pub fn with_rendezvous(target: usize) -> Self {
+        let rendezvous = Arc::new((Mutex::new(0usize), Condvar::new()));
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let url = format!("http://{}/mcp", server.server_addr());
         let stop = Arc::new(AtomicBool::new(false));
@@ -34,6 +38,7 @@ impl HttpMock {
                 let body: Value = serde_json::from_str(&text).unwrap();
                 tx.send(body.clone()).unwrap();
                 let release = Arc::clone(&released);
+                let rendezvous = Arc::clone(&rendezvous);
                 workers.push(std::thread::spawn(move || {
                     let id = body["id"].clone();
                     let result = match body["method"].as_str().unwrap_or_default() {
@@ -41,6 +46,19 @@ impl HttpMock {
                         "tools/list" => json!({"tools":[{"name":"sleep", "inputSchema":{"type":"object"}}, {"name":"echo", "inputSchema":{"type":"object"}}]}),
                         "tools/call" => {
                             let args = &body["params"]["arguments"];
+                            if args["rendezvous"] == true {
+                                assert!(target > 0);
+                                let (lock, ready) = &*rendezvous;
+                                let mut arrived = lock.lock().unwrap();
+                                let wave = *arrived / target;
+                                *arrived += 1;
+                                ready.notify_all();
+                                let (arrived, _) = ready.wait_timeout_while(arrived, Duration::from_secs(5), |arrived| *arrived / target == wave).unwrap();
+                                if *arrived / target == wave {
+                                    let _ = request.respond(tiny_http::Response::from_string(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"HTTP calls did not overlap at rendezvous"}}).to_string()));
+                                    return;
+                                }
+                            }
                             let text = if let Some(ms) = args["ms"].as_u64() {
                                 let (lock, ready) = &*release;
                                 let _ = ready.wait_timeout_while(lock.lock().unwrap(), Duration::from_millis(ms), |released| !*released).unwrap();

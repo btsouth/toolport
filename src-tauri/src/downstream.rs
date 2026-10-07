@@ -14393,6 +14393,119 @@ mod tests {
     }
 
     #[test]
+    fn proactive_http_refresh_does_not_wait_for_a_busy_auth_gate() {
+        let mut transport = super::HttpTransport::with_auth_refresh(
+            "http://127.0.0.1:1/",
+            Some("valid".into()),
+            Some(Box::new(|_| {
+                panic!("busy gate must skip proactive callback")
+            })),
+        );
+        *transport.auth_gate.busy.lock().unwrap() = true;
+        transport.deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(50));
+        transport.refresh_before_send();
+        assert!(
+            std::time::Instant::now() < transport.deadline.unwrap(),
+            "proactive refresh consumed the call deadline"
+        );
+    }
+
+    fn pending_http_probe() -> super::PendingHttpMrtr {
+        super::PendingHttpMrtr {
+            common: super::PendingLegacyMrtr::new(
+                json!({"jsonrpc":"2.0","id":"server-probe","method":"roots/list"}),
+                json!(1),
+                "echo",
+                &json!({}),
+            )
+            .unwrap(),
+            reader: Box::new(std::io::Cursor::new(Vec::<u8>::new())),
+            bytes_read: 0,
+        }
+    }
+
+    #[test]
+    fn dropping_a_queued_http_outcome_refuses_its_suspended_request() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", server.server_addr());
+        let transport = super::HttpTransport::new(&url);
+        let mut owned = transport.request_shell();
+        owned.pending_mrtr = Some(pending_http_probe());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(super::HttpDelivery::Done(Box::new(
+                super::HttpAttemptOutcome {
+                    transport: owned,
+                    result: Ok(json!({})),
+                },
+            )))
+            .unwrap_or_else(|_| panic!("send failed"));
+        drop(receiver);
+        let mut reply = server
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .expect("abandoned queued outcome must retire its request");
+        let mut text = String::new();
+        reply.as_reader().read_to_string(&mut text).unwrap();
+        let response: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(response["id"], "server-probe");
+        assert_eq!(response["error"]["message"], super::CALL_ENDED);
+        reply.respond(tiny_http::Response::empty(202)).unwrap();
+    }
+
+    #[test]
+    fn expired_http_retirement_does_not_block_the_next_call() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", server.server_addr());
+        let (release, wait) = std::sync::mpsc::channel();
+        let wire = std::thread::spawn(move || {
+            let mut retirement = None;
+            for _ in 0..2 {
+                let Some(mut request) = server
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .unwrap()
+                else {
+                    break;
+                };
+                let mut text = String::new();
+                request.as_reader().read_to_string(&mut text).unwrap();
+                let body: Value = serde_json::from_str(&text).unwrap();
+                if body.get("error").is_some() {
+                    retirement = Some(request);
+                } else {
+                    request
+                        .respond(tiny_http::Response::from_string(
+                            json!({"jsonrpc":"2.0","id":body["id"],"result":{"ok":true}})
+                                .to_string(),
+                        ))
+                        .unwrap();
+                }
+            }
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(3));
+            if let Some(request) = retirement {
+                let _ = request.respond(tiny_http::Response::empty(202));
+            }
+        });
+        let mut transport = super::HttpTransport::new(&url);
+        transport.set_read_timeout(std::time::Duration::from_millis(500));
+        let pending = pending_http_probe();
+        transport.concurrency.pending.lock().unwrap().insert(
+            pending.common.token.clone(),
+            (
+                std::time::Instant::now() - super::SUSPENDED_LEGACY_MRTR_TTL,
+                pending,
+            ),
+        );
+        let result = transport
+            .concurrent()
+            .unwrap()
+            .request_with_cancel("echo", json!({}), None);
+        release.send(()).unwrap();
+        wire.join().unwrap();
+        assert_eq!(result.unwrap(), json!({"ok":true}));
+    }
+
+    #[test]
     fn forced_refresh_without_callback_returns_auth_error() {
         use super::HttpTransport;
 

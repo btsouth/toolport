@@ -210,7 +210,10 @@ pub fn pid_running(pid: u64) -> bool {
             .stderr(Stdio::null())
             .output()
         {
-            if String::from_utf8_lossy(&output.stdout).trim_start().starts_with('Z') {
+            if String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .starts_with('Z')
+            {
                 return false;
             }
         }
@@ -257,9 +260,7 @@ pub fn daemon_pids(dir: &Path) -> Vec<u64> {
 
 /// A daemon pid from the scratch dir that is still running.
 pub fn live_daemon_pid(dir: &Path) -> Option<u64> {
-    daemon_pids(dir)
-        .into_iter()
-        .find(|pid| pid_running(*pid))
+    daemon_pids(dir).into_iter().find(|pid| pid_running(*pid))
 }
 
 pub fn wait_for_descriptor(dir: &Path) -> Value {
@@ -372,9 +373,11 @@ pub fn start_daemon_with_env(dir: &Path, env: &[(&str, &str)]) -> ChildGuard {
             .expect("spawn the daemon"),
     );
     let pid = u64::from(guard.0.id());
-    wait_for("the daemon to publish its descriptor", RESPONSE_TIMEOUT, || {
-        daemon_pids(dir).contains(&pid)
-    });
+    wait_for(
+        "the daemon to publish its descriptor",
+        RESPONSE_TIMEOUT,
+        || daemon_pids(dir).contains(&pid),
+    );
     guard
 }
 
@@ -477,7 +480,10 @@ impl Client {
 
     /// Send a `tools/call` without waiting for its response.
     pub fn call_async(&mut self, name: &str, arguments: Value) -> i64 {
-        self.send_request("tools/call", json!({ "name": name, "arguments": arguments }))
+        self.send_request(
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+        )
     }
 
     /// Wait for the response to `id`, buffering any other in-flight responses.
@@ -513,7 +519,10 @@ impl Client {
     }
 
     pub fn call(&mut self, name: &str, arguments: Value) -> Value {
-        self.request("tools/call", json!({ "name": name, "arguments": arguments }))
+        self.request(
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+        )
     }
 
     fn initialize(&mut self) {
