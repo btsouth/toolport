@@ -1,9 +1,0 @@
-# Share selected servers
-
-The primary GTK and Tauri action selects personal servers and previews additive changes against the latest team version. The subsequent write checks both that version and a fingerprint of the selected definitions. Unrelated team definitions and all non-server configuration survive. Personal originals remain. The older whole-set replacement commands remain available for explicit advanced callers, but are no longer the primary UI.
-
-Environment values, client secrets, URL userinfo and recognized secret arguments are excluded or redacted using the existing exporter. Working directories now survive publication/import and appear alongside command, argument boundaries and credential names in review. Machine-specific paths can require local setup on another computer; they are not portable installations.
-
-“Use managed version for this profile” is an explicit reviewed action. It requires the personal and managed execution targets (including argument boundaries, environment names, working directory and OAuth client metadata) to match exactly. It copies declared environment credentials only within the local keychain, never overwrites an existing managed keychain value, enables the managed identity and disables the personal identity in the active profile. Other profiles and the personal definition remain intact. HTTP/OAuth sessions are not transplanted across security identities; authenticate the managed server locally.
-
-Validation includes additive publication against a real synthetic backend, stale-version rejection, unrelated configuration preservation, absence of a synthetic secret in the remote definition, explicit profile switching and rejection after an execution-target change. UI and pure merge tests cover selection and confirmation. Final native two-user usability validation remains part of the release gate.
