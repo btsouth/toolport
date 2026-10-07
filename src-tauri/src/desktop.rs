@@ -1336,10 +1336,12 @@ fn set_tool_pinned(
     Ok(reg)
 }
 
-/// Flip the global destructive-tool deny switch. When on, the gateway hides and
-/// blocks every tool annotated `destructiveHint: true` across all servers.
+/// Set the member's safety level while preserving team policy.
 #[tauri::command]
-fn set_safety_level(state: State<RegistryState>, level: registry::SafetyLevel) -> Result<Registry, String> {
+fn set_safety_level(
+    state: State<RegistryState>,
+    level: registry::SafetyLevel,
+) -> Result<Registry, String> {
     let (reg, _) = write_registry(state.inner(), |reg| {
         reg.set_safety_level(level);
         Ok(())

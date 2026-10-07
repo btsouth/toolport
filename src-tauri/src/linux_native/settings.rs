@@ -1248,8 +1248,10 @@ impl SettingsPage {
                 })
                 .await;
                 page.begin_mutation();
-                if let Ok(Err(error)) = result {
-                    page.show_error(&error);
+                match result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => page.show_error(&error),
+                    Err(_) => page.show_error("the safety update stopped unexpectedly"),
                 }
                 page.safety_level.set_sensitive(true);
                 page.refresh();

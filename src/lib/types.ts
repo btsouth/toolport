@@ -511,12 +511,13 @@ export interface Registry {
   toolOverrides?: Record<string, Record<string, ToolOverride>>;
   /** Tools pinned as lazy-discovery prerequisites, keyed by server id -> original tool names. */
   pinnedTools?: Record<string, string[]>;
-  /** Global switch: hide and block every destructive-hinted tool. */
+  /** Member safety choice. Absent values derive from retained legacy fields. */
   safetyLevel?: "off" | "ask" | "strict";
   teamForcedHumanApproval?: boolean;
   teamForcedDenyDestructive?: boolean;
   teamForcedQuarantineOnDrift?: boolean;
   teamForcedBlockOnInjection?: boolean;
+  /** Retained legacy switch for registries without a safety level. */
   denyDestructive?: boolean;
   /** Per-call confirmation: intercept destructive tools with a preview + token. */
   confirmDestructive?: boolean;
