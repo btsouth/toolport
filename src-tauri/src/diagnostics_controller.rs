@@ -149,6 +149,7 @@ fn redact_argument(argument: &str) -> String {
 }
 
 fn gateway_log_tail(lines: usize) -> String {
+    crate::telemetry::flush();
     let Some(path) = registry::gateway_log_path() else {
         return "(log path unavailable)\n".to_string();
     };

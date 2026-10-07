@@ -24517,7 +24517,7 @@ mod tests {
         assert_eq!(call.status, 200, "body={}", call.body);
 
         // The audit append is asynchronous now: land it before reading the file.
-        conduit_lib::telemetry::shutdown();
+        conduit_lib::telemetry::flush();
         let audit = std::fs::read_to_string(dir.join("audit.jsonl")).expect("audit log exists");
 
         let entry: Value = audit
@@ -32102,6 +32102,7 @@ mod tests {
             effective_quarantine(&registry, profile, &AtomicBool::new(false)),
             Some(BTreeSet::new())
         );
+        assert!(conduit_lib::telemetry::flush());
         assert!(std::fs::read_to_string(dir.join("gateway.log"))
             .unwrap()
             .contains("SECURITY: integrity recording failed:"));

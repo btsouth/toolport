@@ -643,7 +643,7 @@ describe("telemetry health", () => {
       },
       gatewayNotes: ["Client configs updated, but ownership state was not saved."],
     });
-    render(<ActivityView />);
+    render(<ActivityView refreshKey={0} registry={null} />);
     expect(await screen.findByText(/3 records dropped/)).toBeInTheDocument();
     expect(screen.getByText(/ownership state was not saved/)).toBeInTheDocument();
   });
@@ -662,7 +662,7 @@ describe("telemetry health", () => {
         unavailable: true,
       },
     });
-    render(<ActivityView />);
+    render(<ActivityView refreshKey={0} registry={null} />);
     expect(
       await screen.findByText(/Gateway telemetry health is unavailable/),
     ).toBeInTheDocument();
