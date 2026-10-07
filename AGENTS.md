@@ -19,6 +19,10 @@ aggregates Activity history. Frontend IPC wrappers are in `src/lib/api.ts`.
 - Every verification run writes step logs and a JSON summary under `.verify/`.
   A failed command stops the run and prints its log path. Do not call a partial
   run a full pass.
+- Rust integration tests that spawn `mock-mcp-server` need `--features test-support`
+  (for example `cargo test --manifest-path src-tauri/Cargo.toml --no-default-features
+--features test-support --lib --bins --tests`). The feature keeps test binaries out of
+  shipped packages.
 - `npm test -- --project logic` runs pure tests without jsdom. Component tests
   use `--project ui`; individual file filters also work. Local tests default to
   two workers; override `--maxWorkers` when appropriate.

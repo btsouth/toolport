@@ -77,14 +77,16 @@ while the release is still a draft. It no-ops with a warning unless the
 `WINGET_TOKEN` secret (a PAT with `public_repo`) is set, so it can never fail a
 release.
 
-To submit by hand instead, copy `packaging/winget` to a new
-`manifests/t/Toolport/Toolport/<version>/` directory in a fork of
-`microsoft/winget-pkgs` and update it for the release first: `PackageVersion`
-in all three files, plus `InstallerUrl`, `InstallerSha256`, `ReleaseDate` and
-`ReleaseNotesUrl`. The copy in this repo stays pinned to whatever version last
-shipped, so submitting it unchanged re-submits that version's metadata and the new
-release never reaches winget. Check it with `winget validate --manifest <dir>`
-before opening the PR.
+To retry a failed submission, run `winget.yml` manually with the same stable tag.
+It downloads the existing installer, checks its SHA256 against the release asset
+metadata, syncs the token owner's `winget-pkgs` fork from upstream `master`, and
+reuses `toolport-<version>` after checking its saved manifest version, URL and hash. It never builds or
+uploads release assets. An existing open or merged PR is reused; a closed,
+unmerged PR or a retry manifest naming different artifacts fails for operator review. Releases without
+an asset SHA256 digest fail validation rather than inventing a trusted checksum.
+The fork must already exist. Its `master` is reset to upstream; other branches
+are preserved. The checked-in files in `packaging/winget` are templates, with
+version, installer URL/hash and release notes URL filled from the release.
 
 Linux system packages now ship the GTK shell as `.deb` and `.rpm`, built once on
 Ubuntu 24.04 and tested before upload to the draft. The Tauri AppImage remains the

@@ -402,16 +402,6 @@ fn set_profile_server_tools(
     Ok(reg)
 }
 
-/// Write a server set into a client's config (backs up first). Not yet called by
-/// the UI; reserved for bulk operations.
-#[tauri::command]
-fn write_to_client(
-    client_id: String,
-    servers: Vec<ServerEntry>,
-) -> Result<clients::WriteOutcome, String> {
-    clients::write_servers(&client_id, &servers)
-}
-
 /// Connect a client through the stdio adapter, optionally scoped to a profile.
 /// Pass force only after confirming replacement of a customized entry.
 #[tauri::command]
@@ -3803,7 +3793,6 @@ pub fn run() {
             set_active_profile,
             set_folder_profiles,
             set_profile_server_tools,
-            write_to_client,
             install_gateway,
             uninstall_gateway,
             migrate_client,

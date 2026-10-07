@@ -62,6 +62,9 @@ jobs:
 
       - run: npm ci
 
+      - name: Release publication and payload fixtures
+        run: node --test .github/scripts/release-hygiene.test.mjs
+
       - name: Production dependency audit
         run: npm run audit:prod
 
@@ -256,7 +259,7 @@ jobs:
       - name: Chaos suite
         run: |
           for test in chaos_concurrency chaos_env_allowlist chaos_faulty_servers chaos_process_kill chaos_registry; do
-            cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --test "$test"
+            cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support --test "$test"
           done
 
   cross-platform-rust:
@@ -296,7 +299,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Compile Rust tests and record build timings
         if: matrix.os != 'windows-latest'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib --bins --tests --no-run --timings
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support --lib --bins --tests --no-run --timings
 
       - name: Compile Windows Rust tests and record build timings
         if: matrix.os == 'windows-latest'
@@ -304,7 +307,7 @@ jobs:
 
       - name: Rust tests (lib + binaries + integration, no desktop)
         if: matrix.os != 'windows-latest'
-        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib --bins --tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support --lib --bins --tests
 
       # Reuse the local Windows helper so a stale debug gateway cannot lock the
       # executable while Cargo rebuilds it.
@@ -314,7 +317,7 @@ jobs:
 
       - name: Build headless gateway for cross-platform smoke
         if: matrix.os != 'ubuntu-22.04'
-        run: cargo build --manifest-path src-tauri/Cargo.toml --bin toolport-gateway --bin mock-mcp-server --no-default-features
+        run: cargo build --manifest-path src-tauri/Cargo.toml --bin toolport-gateway --bin mock-mcp-server --no-default-features --features test-support
 
       - name: Headless gateway security smoke (macOS)
         if: matrix.os == 'macos-latest'

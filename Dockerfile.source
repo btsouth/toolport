@@ -39,6 +39,12 @@ RUN chmod 755 /usr/local/bin/toolport-gateway /usr/local/bin/docker-entrypoint.s
 # The runtime user is fixed at uid 10001; a host-owned bind mount must be owned
 # by that uid (the entrypoint says so) or the registry cannot load. See
 # Dockerfile and docker-compose.example.yml.
+# Only the gateway and entrypoint belong in the application binary directory.
+RUN find /usr/local/bin -mindepth 1 -maxdepth 1 -print | sort > /tmp/toolport-contents \
+    && cat /tmp/toolport-contents \
+    && test "$(cat /tmp/toolport-contents)" = "$(printf '/usr/local/bin/docker-entrypoint.sh\n/usr/local/bin/toolport-gateway')" \
+    && rm /tmp/toolport-contents
+
 USER toolport
 # HTTP mode comes from the `--http` flag on the ENTRYPOINT below, not from the
 # environment: the gateway ignores TOOLPORT_HTTP/CONDUIT_HTTP when its stdin is a

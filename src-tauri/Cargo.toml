@@ -5,6 +5,7 @@ description = "Local MCP gateway: manage all your MCP servers in one place, set 
 authors = ["South Forge AI"]
 edition = "2021"
 default-run = "conduit"
+autobins = false
 
 [[bin]]
 name = "conduit"
@@ -15,6 +16,16 @@ required-features = ["desktop"]
 name = "toolport-gtk"
 path = "src/bin/toolport-gtk.rs"
 required-features = ["gtk-desktop"]
+
+# Explicit targets prevent test helpers from being discovered by release bundlers.
+[[bin]]
+name = "toolport-gateway"
+path = "src/bin/toolport-gateway.rs"
+
+[[bin]]
+name = "mock-mcp-server"
+path = "src/bin/mock-mcp-server.rs"
+required-features = ["test-support"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

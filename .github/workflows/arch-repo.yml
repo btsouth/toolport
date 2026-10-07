@@ -39,7 +39,7 @@ jobs:
       TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Check the tag is publishable
         run: |
@@ -101,7 +101,9 @@ jobs:
             pkg=$(ls -1 *.pkg.tar.zst | grep -v -- "-debug-" | head -1)
             echo "built $pkg"
             namcap "$pkg" || true
-            bsdtar -tf "$pkg" > contents.txt
+            bsdtar -tf "$pkg" | tee contents.txt
+            unexpected=$(grep -E "^usr/bin/[^/]+$" contents.txt | grep -Ev "^usr/bin/(toolport-gtk|toolport-gateway)$" || true)
+            test -z "$unexpected" || { echo "::error::Unexpected binaries: $unexpected"; exit 1; }
             for want in usr/bin/toolport-gtk usr/bin/toolport-gateway; do
               grep -qx "$want" contents.txt || { echo "::error::$want missing from $pkg"; exit 1; }
             done

@@ -18,6 +18,12 @@ RUN chmod 755 /usr/local/bin/toolport-gateway /usr/local/bin/docker-entrypoint.s
 # by that uid (see the entrypoint warning) or the gateway cannot load the
 # registry; the named volume in docker-compose.example.yml is initialized with
 # the image's ownership and just works.
+# Only the gateway and entrypoint belong in the application binary directory.
+RUN find /usr/local/bin -mindepth 1 -maxdepth 1 -print | sort > /tmp/toolport-contents \
+    && cat /tmp/toolport-contents \
+    && test "$(cat /tmp/toolport-contents)" = "$(printf '/usr/local/bin/docker-entrypoint.sh\n/usr/local/bin/toolport-gateway')" \
+    && rm /tmp/toolport-contents
+
 USER toolport
 ENV CONDUIT_HTTP=8765
 ENV CONDUIT_HTTP_HOST=0.0.0.0
