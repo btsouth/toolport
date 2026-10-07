@@ -133,6 +133,7 @@ All enabled servers in Settings. The default integrity store remains the same.
 Shared HTTP tokens keep their existing full connected set when no access set is
 selected. Named access sets narrow their servers; tool restrictions apply to
 stdio clients. This preserves HTTP access during the upgrade.
+
 ### Disconnect and original configs
 
 Before its first edit, Toolport saves exact original bytes or a file-absent record
