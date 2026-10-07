@@ -4137,7 +4137,14 @@ fn write_registry_document(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let existing = std::fs::read_to_string(path).ok();
+    let existing = match std::fs::read_to_string(path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!(
+            "Could not read existing registry at {}: {error}. Refusing to replace unreadable bytes. Check file permissions and contents, then try again.",
+            path.display()
+        )),
+    };
     // An older binary must never overwrite a registry a newer build wrote: this
     // is the write half of the mixed-version guard (the read half is in
     // `load_from_inner_with`). Check BEFORE the no-op comparison and before any

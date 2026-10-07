@@ -180,6 +180,11 @@ fn unreadable_bytes_never_default_or_overwrite_from_last_good() {
         .unwrap_err()
         .contains("Could not read registry"));
     assert_gateway_refuses(&scratch.0, "--daemon", "Could not read registry");
+    let error = registry::save_to(&path, &Registry::default()).unwrap_err();
+    assert!(
+        error.contains("Refusing to replace unreadable bytes"),
+        "{error}"
+    );
     assert_eq!(std::fs::read(&path).unwrap(), original);
     assert_eq!(
         std::fs::read(scratch.0.join("registry.json.bak")).unwrap(),
