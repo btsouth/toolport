@@ -69,7 +69,10 @@ localStorage.setItem("toolport.onboarded", "1");
 mockIPC(
   (command, payload) => {
     const args: Record<string, unknown> =
-      payload && !Array.isArray(payload) && !(payload instanceof ArrayBuffer)
+      payload &&
+      !Array.isArray(payload) &&
+      !(payload instanceof ArrayBuffer) &&
+      !(payload instanceof Uint8Array)
         ? payload
         : {};
     calls[command] = (calls[command] ?? 0) + 1;

@@ -80,7 +80,7 @@ describe("server Tools panel", () => {
     expect(await screen.findByText("Record found")).toBeVisible();
   });
 
-  it("refreshes quarantine state when the active profile changes", async () => {
+  it("refreshes quarantine state when the default access changes", async () => {
     const view = render(
       <ServerToolsPanel
         serverId="alpha"
@@ -95,7 +95,7 @@ describe("server Tools panel", () => {
     view.rerender(
       <ServerToolsPanel
         serverId="alpha"
-        registry={{ ...registry, activeProfileId: "other" }}
+        registry={{ ...registry, defaultAccessProfileId: "other" }}
         onRegistryChange={vi.fn()}
       />,
     );

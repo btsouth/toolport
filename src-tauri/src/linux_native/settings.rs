@@ -812,7 +812,7 @@ impl SettingsPage {
                 if profile.enabled_server_ids.contains(&server.id) {
                     let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
                     let tools = gtk::Entry::builder()
-                        .placeholder_text("All tools, or comma-separated tool names")
+                        .placeholder_text("Comma-separated tool names; * means all tools")
                         .hexpand(true)
                         .build();
                     tools.set_text(
@@ -820,7 +820,7 @@ impl SettingsPage {
                             .tool_scope
                             .get(&server.id)
                             .map(|tools| tools.join(", "))
-                            .unwrap_or_default(),
+                            .unwrap_or_else(|| "*".into()),
                     );
                     let save = gtk::Button::with_label("Save tools");
                     let (pid, sid, page, entry) = (
@@ -831,7 +831,7 @@ impl SettingsPage {
                     );
                     save.connect_clicked(move |_| {
                         let text = entry.text();
-                        let tools = (!text.trim().is_empty()).then(|| {
+                        let tools = (text.trim() != "*").then(|| {
                             text.split(',')
                                 .map(|t| t.trim().to_string())
                                 .filter(|t| !t.is_empty())
