@@ -1304,26 +1304,26 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         )}
         <details>
           <summary>Advanced</summary>
-        {toggle(
-          Braces,
-          codeMode,
-          "text-info",
-          "Code mode",
-          "Off by default: enable agents to run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary; turn off to hide toolport_run_script.",
-          apply("code-mode", setCodeMode),
-          "code-mode",
-        )}
-        {codeMode
-          ? toggle(
-              Braces,
-              allowRoutineWrites,
-              "text-warning",
-              "Allow routine writes",
-              "Allow agents to request saving persistent routines. Every save still requires your approval.",
-              apply("allow-routine-writes", setAllowRoutineWrites),
-              "allow-routine-writes",
-            )
-          : null}
+          {toggle(
+            Braces,
+            codeMode,
+            "text-info",
+            "Code mode",
+            "Off by default: enable agents to run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary; turn off to hide toolport_run_script.",
+            apply("code-mode", setCodeMode),
+            "code-mode",
+          )}
+          {codeMode
+            ? toggle(
+                Braces,
+                allowRoutineWrites,
+                "text-warning",
+                "Allow routine writes",
+                "Allow agents to request saving persistent routines. Every save still requires your approval.",
+                apply("allow-routine-writes", setAllowRoutineWrites),
+                "allow-routine-writes",
+              )
+            : null}
 
           {toggle(
             EyeOff,

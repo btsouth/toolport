@@ -92,6 +92,7 @@ const registry: Registry = {
     },
   ],
   activeProfileId: "default",
+  codeMode: true,
 };
 
 function renderSettings() {
@@ -681,8 +682,13 @@ it("keeps Code Mode off by default under Advanced and persists opt-in", async ()
   const user = userEvent.setup();
   const onRegistryChange = vi.fn();
   const absent = { ...registry, codeMode: undefined };
+  vi.mocked(setCodeMode).mockReset();
   vi.mocked(setCodeMode).mockResolvedValueOnce({ ...absent, codeMode: true });
-  render(<ThemeProvider><SettingsView registry={absent} onRegistryChange={onRegistryChange} /></ThemeProvider>);
+  render(
+    <ThemeProvider>
+      <SettingsView registry={absent} onRegistryChange={onRegistryChange} />
+    </ThemeProvider>,
+  );
   const advanced = screen.getByText("Advanced").closest("details");
   expect(advanced).not.toHaveAttribute("open");
   await user.click(screen.getByText("Advanced"));
@@ -691,5 +697,7 @@ it("keeps Code Mode off by default under Advanced and persists opt-in", async ()
   expect(control).not.toBeChecked();
   await user.click(control);
   expect(setCodeMode).toHaveBeenCalledWith(true);
-  await waitFor(() => expect(onRegistryChange).toHaveBeenCalledWith({ ...absent, codeMode: true }));
+  await waitFor(() =>
+    expect(onRegistryChange).toHaveBeenCalledWith({ ...absent, codeMode: true }),
+  );
 });
