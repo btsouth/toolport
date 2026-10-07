@@ -4860,6 +4860,7 @@ mod tests {
                 enabled_server_ids: Vec::new(),
                 tool_scope: std::collections::HashMap::new(),
                 instructions: None,
+                unknown_fields: Default::default(),
             });
         }
         crate::registry::save(&registry).expect("save two-profile registry");
@@ -4928,6 +4929,7 @@ mod tests {
                 enabled_server_ids: Vec::new(),
                 tool_scope: std::collections::HashMap::new(),
                 instructions: None,
+                unknown_fields: Default::default(),
             });
         }
         crate::registry::save(&registry).expect("save the two-profile registry");
@@ -5010,6 +5012,7 @@ mod tests {
             enabled_server_ids: Vec::new(),
             tool_scope: std::collections::HashMap::new(),
             instructions: None,
+            unknown_fields: Default::default(),
         });
         crate::registry::save(&registry).expect("save the registry");
         let profile_path = quarantine_path(Some("billing")).expect("profile store path");
@@ -5048,6 +5051,7 @@ mod tests {
             enabled_server_ids: Vec::new(),
             tool_scope: std::collections::HashMap::new(),
             instructions: None,
+            unknown_fields: Default::default(),
         });
         crate::registry::save(&registry).expect("save the registry");
         write_loaded_pin_store(Some("billing"));
@@ -5086,6 +5090,7 @@ mod tests {
             enabled_server_ids: Vec::new(),
             tool_scope: std::collections::HashMap::new(),
             instructions: None,
+            unknown_fields: Default::default(),
         });
         crate::registry::save(&registry).expect("save the registry");
 

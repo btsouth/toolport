@@ -117,8 +117,8 @@ updater has automated process tests; no signed desktop update run is recorded.
   `notifications/progress` frame through the hand-off, without the `list_changed` /
   `resources/updated` check on the peer's declared era. Pre-existing, unchanged by the
   threading work, and on the list so it is not read as an oversight.
-- The daemon is the only topology in 2.0. The retained v1 `gateway_topology`
-  field is ignored; existing Shared HTTP client configs are preserved at startup.
+- The daemon is the only topology in 2.0. The v2 registry migration drops the v1
+  `gateway_topology` field; existing Shared HTTP client configs are preserved.
 - Two tests resolved the data directory per call on paths `DataDirOverride` was not
   guarding, so the gateway suite wrote into the developer's real data dir: the audit writer
   (`audit::audit_path`) and the search-trace writer (`searchtrace::path`). A full run

@@ -6,9 +6,10 @@
 #
 # 1. Stops the Toolport app and gateways this user runs. Only processes whose
 #    executable is an installed Toolport binary are signalled.
-# 2. If the registry was migrated past v1, moves it aside (kept, never deleted)
-#    and restores the newest registry.json.v1-<ms>.bak the migration wrote.
-#    Refuses when no v1 backup exists.
+# 2. If the registry was migrated past v1, keeps a copy (never deleted) and
+#    atomically restores the newest registry.json.v1-<ms>.bak the migration wrote.
+#    Refuses when no v1 backup exists. With no registry at all (an interrupted
+#    run), restores the newest v1 backup.
 # 3. Reinstalls 1.x: the newest cached toolport-1.* package, or the one given
 #    with --package, through `sudo pacman -U`.
 # 4. Prints what it changed.
@@ -124,30 +125,67 @@ registry_version() {
   echo "$version"
 }
 
+newest_v1_backup() {
+  # A preview may never have created its data directory. Only absence is safe
+  # to treat as no backups; permission and other I/O errors must still stop us.
+  python3 - "$data_dir" <<'PYTHON'
+import fnmatch
+import os
+import sys
+
+try:
+    with os.scandir(sys.argv[1]) as entries:
+        backups = [entry.name for entry in entries
+                   if fnmatch.fnmatchcase(entry.name, "registry.json.v1-*.bak")]
+except FileNotFoundError:
+    backups = []
+print(max(backups, default=""))
+PYTHON
+}
+
+# Put a backup in place without ever leaving the registry missing: copy it beside
+# the primary, flush it, then rename it over the primary in one step.
+restore_backup() {
+  local tmp="$data_dir/.registry.json.rollback-$$"
+  run cp -p "$data_dir/$1" "$tmp"
+  run sync "$tmp"
+  run mv -f "$tmp" "$registry"
+  run sync "$data_dir"
+  restored="$1"
+  local stamp="${1#registry.json.v1-}"
+  stamp="${stamp%.bak}"
+  when="$(date -d "@$((stamp / 1000))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$stamp")"
+}
+
 restored=""
 if [ -f "$registry" ]; then
   version="$(registry_version "$registry")"
   if [ "$version" -gt 1 ]; then
-    backup="$(find "$data_dir" -maxdepth 1 -name 'registry.json.v1-*.bak' -printf '%f\n' | sort | tail -n 1)"
+    backup="$(newest_v1_backup)"
     if [ -z "$backup" ]; then
       echo "error: the registry is at version $version and no registry.json.v1-*.bak exists in $data_dir." >&2
-      echo "Toolport 1.x cannot open it. Nothing was changed; reinstall the preview or restore a backup by hand." >&2
+      echo "Nothing was changed; reinstall the preview or restore a backup by hand." >&2
       exit 1
     fi
+    # Keep a copy of the preview registry; the primary stays until the restore replaces it.
     aside="$registry.v$version-rollback-$(date +%Y%m%d-%H%M%S)"
-    run mv "$registry" "$aside"
-    run cp -p "$data_dir/$backup" "$registry"
-    restored="$backup"
-    stamp="${backup#registry.json.v1-}"
-    stamp="${stamp%.bak}"
-    when="$(date -d "@$((stamp / 1000))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$stamp")"
-    echo "Registry: version $version moved to $(basename "$aside"); restored $backup (taken $when)."
+    run cp -p "$registry" "$aside"
+    run sync "$aside"
+    restore_backup "$backup"
+    echo "Registry: version $version copied to $(basename "$aside"); restored $backup (taken $when)."
     echo "Changes made in the preview after that time are not in the restored registry."
   else
     echo "Registry: version $version, which 1.x reads as is. Left in place."
   fi
 else
-  echo "Registry: none at $registry. Nothing to restore."
+  # A rollback interrupted before the restore finished can leave no primary.
+  backup="$(newest_v1_backup)"
+  if [ -n "$backup" ]; then
+    restore_backup "$backup"
+    echo "Registry: none at $registry; restored $backup (taken $when)."
+  else
+    echo "Registry: none at $registry. Nothing to restore."
+  fi
 fi
 
 # 3. Reinstall 1.x.

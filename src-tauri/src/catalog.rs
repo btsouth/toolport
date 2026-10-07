@@ -344,6 +344,7 @@ pub fn curated() -> Vec<CatalogEntry> {
                 secret,
                 required: true,
                 value: None,
+                unknown_fields: Default::default(),
             });
         };
         match e.name.as_str() {
@@ -356,16 +357,26 @@ pub fn curated() -> Vec<CatalogEntry> {
                     parts: vec![
                         ArgPart::Input {
                             key: "TWILIO_ACCOUNT_SID".into(),
+                            unknown_fields: Default::default(),
                         },
-                        ArgPart::Literal { value: "/".into() },
+                        ArgPart::Literal {
+                            value: "/".into(),
+                            unknown_fields: Default::default(),
+                        },
                         ArgPart::Input {
                             key: "TWILIO_API_KEY".into(),
+                            unknown_fields: Default::default(),
                         },
-                        ArgPart::Literal { value: ":".into() },
+                        ArgPart::Literal {
+                            value: ":".into(),
+                            unknown_fields: Default::default(),
+                        },
                         ArgPart::Input {
                             key: "TWILIO_API_SECRET".into(),
+                            unknown_fields: Default::default(),
                         },
                     ],
+                    unknown_fields: Default::default(),
                 });
                 launch.revision = Some(2);
             }
@@ -375,7 +386,9 @@ pub fn curated() -> Vec<CatalogEntry> {
                     index: 2,
                     parts: vec![ArgPart::Input {
                         key: "POSTGRES_URL".into(),
+                        unknown_fields: Default::default(),
                     }],
+                    unknown_fields: Default::default(),
                 });
                 launch.revision = Some(2);
             }
@@ -385,7 +398,9 @@ pub fn curated() -> Vec<CatalogEntry> {
                     index: 4,
                     parts: vec![ArgPart::Input {
                         key: "REDIS_URL".into(),
+                        unknown_fields: Default::default(),
                     }],
+                    unknown_fields: Default::default(),
                 });
             }
             "Filesystem" => {
@@ -394,7 +409,9 @@ pub fn curated() -> Vec<CatalogEntry> {
                     index: 2,
                     parts: vec![ArgPart::Input {
                         key: "ALLOWED_DIRECTORY".into(),
+                        unknown_fields: Default::default(),
                     }],
+                    unknown_fields: Default::default(),
                 });
                 launch.revision = Some(2);
             }
@@ -1392,6 +1409,7 @@ mod tests {
             .parts
             .push(ArgPart::Input {
                 key: "MISSING".into(),
+                unknown_fields: Default::default(),
             });
         assert!(bad.launch.unwrap().validate(&bad.args, true).is_err());
         let mut unused = curated().into_iter().find(|e| e.name == "Twilio").unwrap();
@@ -1401,6 +1419,7 @@ mod tests {
             secret: false,
             required: true,
             value: None,
+            unknown_fields: Default::default(),
         });
         assert!(unused.launch.unwrap().validate(&unused.args, true).is_err());
         let mut missing_binding = curated().into_iter().find(|e| e.name == "Twilio").unwrap();

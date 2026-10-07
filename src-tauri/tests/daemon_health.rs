@@ -154,11 +154,13 @@ fn write_registry(dir: &Path, extra_env: &[(&str, &str)]) {
         key: "MOCK_MCP_TRANSCRIPT".to_string(),
         value: Some(transcript.display().to_string()),
         secret: false,
+        unknown_fields: Default::default(),
     }];
     env.extend(extra_env.iter().map(|(key, value)| EnvVar {
         key: key.to_string(),
         value: Some(value.to_string()),
         secret: false,
+        unknown_fields: Default::default(),
     }));
     let server = ServerEntry {
         id: "mock".to_string(),

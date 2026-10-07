@@ -558,6 +558,7 @@ fn add_http_client(
             label: label.trim().to_string(),
             token_sha256: registry::sha256_hex(&token),
             profile: profile.unwrap_or_default().trim().to_string(),
+            unknown_fields: Default::default(),
         });
         Ok(())
     })?;
@@ -1147,39 +1148,6 @@ fn set_safety_level(
     Ok(reg)
 }
 
-#[tauri::command]
-fn set_deny_destructive(state: State<RegistryState>, deny: bool) -> Result<Registry, String> {
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        reg.set_deny_destructive(deny);
-        Ok(())
-    })?;
-    Ok(reg)
-}
-
-/// Legacy setter for the removed agent-token confirmation mode. Retained so an
-/// existing client call still round-trips; the stored value is still read live to
-/// derive the Ask safety level for a registry with no explicit level.
-#[tauri::command]
-fn set_confirm_destructive(state: State<RegistryState>, confirm: bool) -> Result<Registry, String> {
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        reg.set_confirm_destructive(confirm);
-        Ok(())
-    })?;
-    Ok(reg)
-}
-
-/// Toggle human-in-the-loop approval. When on, a gated tool call (destructive, or from an
-/// untrusted-provenance server) is HELD until a person approves or denies it in the app,
-/// via the approval broker.
-#[tauri::command]
-fn set_human_approval(state: State<RegistryState>, on: bool) -> Result<Registry, String> {
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        reg.set_human_approval(on);
-        Ok(())
-    })?;
-    Ok(reg)
-}
-
 /// The tool calls currently held awaiting a human decision (for the Pending Approvals UI).
 /// Polled by the frontend; the `approval-pending` / `approval-resolved` events prompt a refresh.
 #[tauri::command]
@@ -1320,6 +1288,7 @@ fn set_tool_override(
             registry::ToolOverride {
                 name: norm(name),
                 description: norm(description),
+                unknown_fields: Default::default(),
             },
         );
         Ok(())
@@ -1418,31 +1387,6 @@ fn list_tool_identities(state: State<RegistryState>) -> Result<Vec<ToolIdentity>
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     integrity::tool_identities(&reg.servers, &reg.profiles)
-}
-
-/// Toggle quarantine-on-drift. When enabled, the gateway hides and blocks a high-risk
-/// tool (poisoned definition, or a destructive tool whose definition changed/appeared)
-/// that drifts from its pinned baseline, until the user re-approves it.
-#[tauri::command]
-fn set_quarantine_on_drift(state: State<RegistryState>, on: bool) -> Result<Registry, String> {
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        reg.quarantine_on_drift = on;
-        Ok(())
-    })?;
-    Ok(reg)
-}
-
-/// Toggle opt-in block-on-injection (SOU-345). When enabled, a high-confidence injection
-/// hit fails the tool call instead of only labeling the content (scanning runs even if
-/// the separate content-defense label toggle is off). Org force (`forceBlockOnInjection`)
-/// can still enable this via the team overlay.
-#[tauri::command]
-fn set_block_on_injection(state: State<RegistryState>, on: bool) -> Result<Registry, String> {
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        reg.block_on_injection = on;
-        Ok(())
-    })?;
-    Ok(reg)
 }
 
 /// Toggle PII pseudonymization of tool results (SBS-346).
@@ -3889,9 +3833,6 @@ pub fn run() {
             set_tool_enabled,
             set_tool_pinned,
             set_safety_level,
-            set_deny_destructive,
-            set_confirm_destructive,
-            set_human_approval,
             list_pending_approvals,
             decide_approval,
             list_allowed_tools,
@@ -3905,8 +3846,6 @@ pub fn run() {
             clear_search_traces,
             clear_activity_logs,
             list_tool_identities,
-            set_quarantine_on_drift,
-            set_block_on_injection,
             set_pii_redaction,
             list_quarantined,
             release_quarantine,
@@ -4552,6 +4491,7 @@ mod tests {
                 key: "TOKEN".into(),
                 value: Some("sk-live-xyz".into()),
                 secret: true,
+                unknown_fields: Default::default(),
             }],
             url: None,
             source: None,
@@ -5045,6 +4985,7 @@ mod tests {
             enabled_server_ids: vec!["gh".into()],
             tool_scope: Default::default(),
             instructions: None,
+            unknown_fields: Default::default(),
         }];
         let mut baselines = BTreeMap::new();
         let bl = |fp: &str, fs: u64, lc: u64| integrity::ToolBaseline {
@@ -6522,6 +6463,7 @@ mod tests {
                 label: format!("Client: {client_id}"),
                 token_sha256: registry::sha256_hex("leftover-bearer"),
                 profile: String::new(),
+                unknown_fields: Default::default(),
             });
             registry::save(&reg).unwrap();
             Self {

@@ -436,6 +436,7 @@ fn mock_registry(reg: &mut Registry, dir: &Path) {
         registry::ToolOverride {
             name: Some("s__delete_item".into()),
             description: None,
+            unknown_fields: Default::default(),
         },
     );
 }
@@ -476,8 +477,7 @@ fn isolated_host_calls_preserve_confirmation_pii_and_rate_limits() {
     let mut gateway = Gateway::configured(
         |reg, dir| {
             mock_registry(reg, dir);
-            reg.safety_level = None;
-            reg.confirm_destructive = true;
+            reg.set_safety_level(conduit_lib::registry::SafetyLevel::Ask);
             reg.pii_redaction = true;
             reg.team = Some(serde_json::from_value(json!({
             "serverUrl": "https://example.invalid", "teamId": "test", "role": "member",
@@ -601,6 +601,7 @@ fn http_client_memory_failure_does_not_stop_other_clients_and_scope_stays_enforc
                     label: id.into(),
                     token_sha256: registry::sha256_hex(id),
                     profile: profile.into(),
+                    unknown_fields: Default::default(),
                 });
             }
         },

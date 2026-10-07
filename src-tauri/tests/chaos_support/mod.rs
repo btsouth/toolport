@@ -126,7 +126,7 @@ pub fn http_entry(id: &str, url: &str) -> Value {
 /// watcher never reads a half-written document.
 pub fn write_registry(dir: &Path, servers: &[Value], enabled: &[&str]) {
     let registry = json!({
-        "version": 1,
+        "version": 2,
         "servers": servers,
         "profiles": [{ "id": "default", "name": "Default", "enabledServerIds": enabled }],
         "activeProfileId": "default",

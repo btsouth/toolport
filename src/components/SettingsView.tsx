@@ -294,27 +294,13 @@ interface Props {
 }
 
 type SettingKey =
-  | "autostart"
-  | "lazy-discovery"
-  | "code-mode"
-  | "deny-destructive"
-  | "confirm-destructive"
-  | "human-approval"
-  | "quarantine-on-drift"
-  | "block-on-injection"
-  | "pii-redaction"
-  | "live-inspect";
+  "autostart" | "lazy-discovery" | "code-mode" | "pii-redaction" | "live-inspect";
 
 type RegistrySettingKey = Exclude<SettingKey, "autostart">;
 
 const REGISTRY_FIELD_BY_SETTING = {
   "lazy-discovery": "lazyDiscovery",
   "code-mode": "codeMode",
-  "deny-destructive": "denyDestructive",
-  "confirm-destructive": "confirmDestructive",
-  "human-approval": "humanApproval",
-  "quarantine-on-drift": "quarantineOnDrift",
-  "block-on-injection": "blockOnInjection",
   "pii-redaction": "piiRedaction",
   "live-inspect": "liveInspect",
 } as const satisfies Record<RegistrySettingKey, keyof Registry>;

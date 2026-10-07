@@ -954,6 +954,7 @@ fn finish_connect(
         call_audit_export_cursor: None,
         call_audit_export: false,
         rate_limits: Vec::new(),
+        unknown_fields: Default::default(),
     };
     // Pull BEFORE loading the registry, then load a FRESH copy AFTER the (possibly
     // multi-second) network round trip and apply onto that — mirroring `sync_inner`.
@@ -3414,6 +3415,7 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
                         key,
                         value: None,
                         secret: e.get("secret").and_then(Value::as_bool).unwrap_or(true),
+                        unknown_fields: Default::default(),
                     })
                 })
                 .collect()
@@ -4328,7 +4330,9 @@ mod tests {
 
     fn base_registry() -> Registry {
         let mut r = Registry::default();
-        r.safety_level = None; // Exercise retained v1 fields and releasable team overlays.
+        // Exercise retained v1 fields and releasable team overlays.
+        r.version = 1;
+        r.safety_level = None;
         r.servers.push(ServerEntry {
             inherit_env: false,
             id: "mine".into(),
@@ -4768,6 +4772,7 @@ mod tests {
             enabled_server_ids: Vec::new(),
             tool_scope: Default::default(),
             instructions: None,
+            unknown_fields: Default::default(),
         });
         let cfg = json!({ "servers": [
             { "id": "review1", "name": "Review1", "transport": "stdio", "command": "run-me" }
@@ -5360,7 +5365,6 @@ mod tests {
     #[test]
     fn forced_content_defense_and_drift_quarantine_are_releasable() {
         let mut r = base_registry();
-        r.content_defense = false;
         r.quarantine_on_drift = false;
 
         apply_team_config(
@@ -5379,10 +5383,6 @@ mod tests {
             r.quarantine_on_drift_effective(),
             "org forced drift-quarantine on"
         );
-        assert!(
-            !r.content_defense,
-            "member's own content-defense is untouched"
-        );
 
         // Org dropping the policy releases both to the member's own (off), no permanent lock.
         apply_team_config(&mut r, "t1", &json!({ "servers": [] }));
@@ -5396,11 +5396,9 @@ mod tests {
     #[test]
     fn leaving_a_team_releases_every_forced_safety_lock() {
         let mut r = base_registry();
-        // Member's OWN settings all off, so "effective" is driven purely by the org lock
-        // (content_defense defaults on, so set it explicitly to isolate the forced overlay).
+        // Member's OWN settings all off, so "effective" is driven purely by the org lock.
         r.human_approval = false;
         r.deny_destructive = false;
-        r.content_defense = false;
         r.quarantine_on_drift = false;
         r.block_on_injection = false;
         apply_team_config(
@@ -5566,7 +5564,6 @@ mod tests {
         // overlay, so an admin sees what is actually enforced on the member's machine.
         let mut r = base_registry();
         r.deny_destructive = true; // member's own on
-        r.content_defense = false;
         r.quarantine_on_drift = false;
         r.human_approval = false;
         r.block_on_injection = false;
@@ -5986,6 +5983,7 @@ mod tests {
             key: "GITHUB_TOKEN".into(),
             secret: true,
             value: Some("SYNTHETIC_ENV_SECRET".into()),
+            unknown_fields: Default::default(),
         }];
         let exported = team_server_export(&reg);
         let before = exported.clone();
@@ -6707,11 +6705,13 @@ mod tests {
                     key: "B".into(),
                     value: None,
                     secret: true,
+                    unknown_fields: Default::default(),
                 },
                 EnvVar {
                     key: "A".into(),
                     value: None,
                     secret: true,
+                    unknown_fields: Default::default(),
                 },
             ],
             url: None,
@@ -6735,17 +6735,26 @@ mod tests {
                 secret: false,
                 required: true,
                 value: None,
+                unknown_fields: Default::default(),
             }],
             bindings: vec![crate::registry::ArgBinding {
                 index: 2,
-                parts: vec![crate::registry::ArgPart::Input { key: "SID".into() }],
+                parts: vec![crate::registry::ArgPart::Input {
+                    key: "SID".into(),
+                    unknown_fields: Default::default(),
+                }],
+                unknown_fields: Default::default(),
             }],
             ..Default::default()
         });
         let before_binding_change = consent_fingerprint(&bound);
-        bound.launch.as_mut().unwrap().bindings[0]
-            .parts
-            .insert(0, crate::registry::ArgPart::Literal { value: "/".into() });
+        bound.launch.as_mut().unwrap().bindings[0].parts.insert(
+            0,
+            crate::registry::ArgPart::Literal {
+                value: "/".into(),
+                unknown_fields: Default::default(),
+            },
+        );
         assert_ne!(
             consent_fingerprint(&bound),
             before_binding_change,

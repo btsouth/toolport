@@ -8,12 +8,14 @@ fn overlapping_caps_same_window_and_tool_do_not_double_count() {
             window: "day".into(),
             max_calls: 2,
             tool: None,
+            unknown_fields: Default::default(),
         },
         Cap {
             id: "team-day".into(),
             window: "day".into(),
             max_calls: 2,
             tool: None,
+            unknown_fields: Default::default(),
         },
     ];
 

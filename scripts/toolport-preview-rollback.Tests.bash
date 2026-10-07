@@ -73,6 +73,37 @@ aside="$(find "$TOOLPORT_DATA_DIR" -name 'registry.json.v2-rollback-*')"
 [ -f "$TOOLPORT_DATA_DIR/registry.json.v1-1791000000000.bak" ] && pass "backup itself kept" || fail "backup consumed"
 echo "$out" | grep -q "restored registry.json.v1-1791000000000.bak" && pass "restore reported" || fail "output: $out"
 
+# A registry the real v1 -> v2 migration wrote (the Rust test
+# rollback_fixture_is_a_real_migration keeps v2.json equal to its output for
+# v1.json): the exact v1 file comes back and the exports stay.
+setup v2-migrated
+fixtures="$repo_root/src-tauri/tests/fixtures/registry-v1-to-v2"
+cp "$fixtures/v2.json" "$TOOLPORT_DATA_DIR/registry.json"
+cp "$fixtures/v1.json" "$TOOLPORT_DATA_DIR/registry.json.v1-1791000000000.bak"
+mkdir -p "$TOOLPORT_DATA_DIR/exports"
+printf 'Always run the tests.\n' > "$TOOLPORT_DATA_DIR/exports/rules-2026-10-07.md"
+touch "$TOOLPORT_ROLLBACK_PKG_CACHE/toolport-1.24.0-1-x86_64.pkg.tar.zst"
+out="$(rollback)"
+cmp -s "$fixtures/v1.json" "$TOOLPORT_DATA_DIR/registry.json" && pass "migrated registry rolled back to the exact v1 file" || fail "restored: $(head -c 200 "$TOOLPORT_DATA_DIR/registry.json")"
+aside="$(find "$TOOLPORT_DATA_DIR" -name 'registry.json.v2-rollback-*')"
+[ -n "$aside" ] && cmp -s "$fixtures/v2.json" "$aside" && pass "migrated registry kept aside" || fail "no exact v2 copy kept"
+[ -f "$TOOLPORT_DATA_DIR/exports/rules-2026-10-07.md" ] && pass "exports left in place" || fail "exports removed"
+echo "$out" | grep -q "Registry: version 2 copied to" && pass "migrated version reported" || fail "output: $out"
+[ -z "$(find "$TOOLPORT_DATA_DIR" -name '.registry.json.rollback-*')" ] && pass "no restore temp file left" || fail "temp file left behind"
+
+# Re-entry after a run stopped before its restore finished: no primary, the v2
+# copy aside and the v1 backups still there. The newest v1 backup is restored.
+setup missing-primary
+cp "$fixtures/v2.json" "$TOOLPORT_DATA_DIR/registry.json.v2-rollback-20261007-120000"
+printf '{"version": 1, "servers": [{"id": "old"}]}\n' > "$TOOLPORT_DATA_DIR/registry.json.v1-1790000000000.bak"
+cp "$fixtures/v1.json" "$TOOLPORT_DATA_DIR/registry.json.v1-1791000000000.bak"
+touch "$TOOLPORT_ROLLBACK_PKG_CACHE/toolport-1.24.0-1-x86_64.pkg.tar.zst"
+out="$(rollback)"
+cmp -s "$fixtures/v1.json" "$TOOLPORT_DATA_DIR/registry.json" && pass "missing primary restored from the newest v1 backup" || fail "registry: $(cat "$TOOLPORT_DATA_DIR/registry.json" 2>&1 | head -c 200)"
+echo "$out" | grep -q "none at .*; restored registry.json.v1-1791000000000.bak" && pass "re-entry restore reported" || fail "output: $out"
+grep -qx -- "-U $TOOLPORT_ROLLBACK_PKG_CACHE/toolport-1.24.0-1-x86_64.pkg.tar.zst" "$PACMAN_LOG" \
+  && pass "1.x reinstalled after the restore" || fail "pacman got: $(cat "$PACMAN_LOG")"
+
 # v2 registry with no v1 backup: refuses and changes nothing.
 setup v2-no-backup
 printf '{"version": 2}\n' > "$TOOLPORT_DATA_DIR/registry.json"
@@ -120,6 +151,28 @@ rollback >/dev/null
 sleep 0.2
 if kill -0 "$daemon" 2>/dev/null; then fail "Toolport gateway still running"; else pass "Toolport gateway stopped"; fi
 if kill -0 "$stranger" 2>/dev/null; then pass "unrelated process left alone"; else fail "unrelated process was killed"; fi
+
+# A preview install that never created its data directory still reinstalls 1.x.
+setup absent-data-directory
+rmdir "$TOOLPORT_DATA_DIR"
+if out="$(rollback 2>&1)"; then
+  pass "absent data directory does not block rollback"
+else
+  fail "absent data directory blocks reinstall: $out"
+fi
+grep -qx -- "-S toolport" "$PACMAN_LOG" && pass "package reinstall reached without a data directory" || fail "no package reinstall without data directory"
+echo "$out" | grep -q "Registry: none at .*Nothing to restore" && pass "absent registry reported" || fail "output: $out"
+
+# An invalid data-directory path is an I/O failure, not an absent directory.
+setup invalid-data-directory
+rmdir "$TOOLPORT_DATA_DIR"
+printf 'not a directory\n' > "$TOOLPORT_DATA_DIR"
+if rollback >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "invalid data directory allowed reinstall"
+else
+  pass "invalid data directory stops rollback"
+fi
+[ ! -s "$PACMAN_LOG" ] && pass "nothing reinstalled after directory I/O failure" || fail "pacman ran: $(cat "$PACMAN_LOG")"
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures failure(s)" >&2

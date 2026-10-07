@@ -38,8 +38,8 @@ Every `TOOLPORT_*` name still accepts the pre-rename `CONDUIT_*` alias (for exam
 
 **One gateway per host.** Client-spawned stdio gateways use a small adapter by
 default; one host daemon owns the router and shares ordinary downstream
-connections. `gatewayTopology: "legacy"` and the legacy environment override
-are ignored, with a notice in the gateway log. Existing Shared HTTP client entries
+connections. The 2.0 upgrade drops a stored `gatewayTopology: "legacy"`, and the
+legacy environment override is ignored, with a notice in the gateway log. Existing Shared HTTP client entries
 and their authentication remain unchanged at startup. Connecting, resetting or
 migrating a client explicitly writes the stdio adapter entry. Settings > Integrations
 still provides the HTTP/OpenAPI bridge.
@@ -115,6 +115,18 @@ servers ("GitHub (work)", "GitHub (personal)"), authenticate each with its own
 account, and enable one in each profile. A client scoped to the work profile
 (`TOOLPORT_PROFILE`) then only ever sees the work account. Tool names are
 namespaced per server, so the two never collide even in the same profile.
+
+**Upgrading from 1.x.** The first 2.0 start upgrades `registry.json` to schema v2.
+Before changing it, Toolport saves the 1.x file next to it as
+`registry.json.v1-<time>.bak`. User data from features 2.0 removed is copied to
+`exports/` in the data directory, never overwriting a file there: personal agent
+rules as `rules-<date>.md`, saved routines as `routines-<date>.json` (the original
+`routines.json` stays), and agent permission rules as `agent-permissions-<date>.json`.
+Client files are not edited. The upgrade sets one safety level (Strict if you blocked
+destructive tools, quarantined drift or blocked injection, otherwise Ask) and turns
+Code Mode off. Released 1.x builds do not check the schema version, so 2.0 keeps the
+1.x safety toggles in step with the level: a 1.x process still running during the
+upgrade enforces the same policy. To go back to 1.x, restore the `.bak` file.
 
 ### Downstream lifecycle
 

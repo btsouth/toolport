@@ -251,12 +251,6 @@ pub enum EssentialSetting {
     LazyDiscovery,
     CodeMode,
     LiveInspect,
-    DenyDestructive,
-    ConfirmDestructive,
-    HumanApproval,
-    ContentDefense,
-    QuarantineOnDrift,
-    BlockOnInjection,
     PiiRedaction,
 }
 
@@ -390,6 +384,7 @@ pub(crate) fn server_from_detected(server: &clients::McpServer, client_id: &str)
                 key: key.clone(),
                 value: None,
                 secret: true,
+                unknown_fields: Default::default(),
             })
             .collect(),
         url: server.url.clone(),
@@ -624,6 +619,7 @@ fn catalog_server(entry: crate::catalog::CatalogEntry) -> ServerEntry {
                 key,
                 value: None,
                 secret: true,
+                unknown_fields: Default::default(),
             })
             .collect(),
         url: entry.url,
@@ -949,6 +945,7 @@ pub fn upsert_folder_profile(path: &str, profile: &str) -> Result<FolderRoutingS
         mappings.push(crate::registry::FolderProfile {
             path: path.to_string(),
             profile: profile.to_string(),
+            unknown_fields: Default::default(),
         });
         registry.set_folder_profiles(mappings);
         Ok(())
@@ -1032,6 +1029,7 @@ fn apply_add_http_client(
         label,
         token_sha256,
         profile,
+        unknown_fields: Default::default(),
     });
     Ok(())
 }
@@ -1053,12 +1051,6 @@ pub fn set_essential_setting(
             EssentialSetting::LazyDiscovery => registry.set_lazy_discovery(enabled),
             EssentialSetting::CodeMode => registry.code_mode = enabled,
             EssentialSetting::LiveInspect => registry.set_live_inspect(enabled),
-            EssentialSetting::DenyDestructive => registry.set_deny_destructive(enabled),
-            EssentialSetting::ConfirmDestructive => registry.set_confirm_destructive(enabled),
-            EssentialSetting::HumanApproval => registry.set_human_approval(enabled),
-            EssentialSetting::ContentDefense => registry.content_defense = enabled,
-            EssentialSetting::QuarantineOnDrift => registry.quarantine_on_drift = enabled,
-            EssentialSetting::BlockOnInjection => registry.block_on_injection = enabled,
             EssentialSetting::PiiRedaction => registry.pii_redaction = enabled,
         }
         Ok(())
@@ -1181,6 +1173,7 @@ pub fn set_tool_override(
             crate::registry::ToolOverride {
                 name: clean(name),
                 description: clean(description),
+                unknown_fields: Default::default(),
             },
         );
         Ok(())
@@ -1605,6 +1598,7 @@ pub fn apply_secret_declaration(
             key: key.to_string(),
             value: None,
             secret: true,
+            unknown_fields: Default::default(),
         }),
     }
     registry.secrets_generation = registry.secrets_generation.wrapping_add(1);
@@ -2262,6 +2256,7 @@ mod tests {
             label: "Client: cursor".into(),
             token_sha256: "managed-hash".into(),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
 
         assert!(apply_remove_http_client(&mut registry, "client:cursor").is_err());
@@ -2372,6 +2367,7 @@ mod tests {
             key: "TOKEN".into(),
             value: None,
             secret: true,
+            unknown_fields: Default::default(),
         });
         existing.disabled_tools.push("dangerous".into());
         existing
@@ -2405,10 +2401,15 @@ mod tests {
                 secret: false,
                 required: true,
                 value: Some("/tmp/root".into()),
+                unknown_fields: Default::default(),
             }],
             bindings: vec![crate::registry::ArgBinding {
                 index: 2,
-                parts: vec![crate::registry::ArgPart::Input { key: "ROOT".into() }],
+                parts: vec![crate::registry::ArgPart::Input {
+                    key: "ROOT".into(),
+                    unknown_fields: Default::default(),
+                }],
+                unknown_fields: Default::default(),
             }],
             ..Default::default()
         });
@@ -2910,6 +2911,7 @@ mod tests {
                 label: "Other client".into(),
                 token_sha256: "other-hash".into(),
                 profile: String::new(),
+                unknown_fields: Default::default(),
             });
             if shared_http {
                 registry.http_clients.push(crate::registry::HttpClient {
@@ -2917,6 +2919,7 @@ mod tests {
                     label: "Claude Code".into(),
                     token_sha256: "old-hash".into(),
                     profile: String::new(),
+                    unknown_fields: Default::default(),
                 });
             }
             let fixture = MoveFixture::new(&registry);

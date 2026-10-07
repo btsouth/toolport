@@ -8999,8 +8999,8 @@ fn cleanup_root_resource_subs_for_session(state: &GatewayState, session: &str) {
 /// momentarily unreachable server would otherwise wipe the cache and leave the
 /// client showing only toolport_status); the emit still fires so the client
 /// re-fetches from cache.
-/// Run tool-definition integrity detection on a freshly built catalog (gated by
-/// the registry's `integrity_check`, on by default). Any drift is recorded to the
+/// Run tool-definition integrity detection on a freshly built catalog (always on
+/// in 2.0). Any drift is recorded to the
 /// security log inside `integrity::check`; here we also surface it in the gateway
 /// log so it's visible in "Copy diagnostics". Ordinary drift blocks only when its
 /// policy is enabled; baseline loss blocks at Ask and Strict because the trust root is gone.
@@ -9743,6 +9743,18 @@ fn router_relevant(reg: &Registry) -> Value {
     if let Some(obj) = v.as_object_mut() {
         obj.remove("team");
         obj.remove("gatewayInstructions");
+        // From v2 on the 1.x safety toggles only mirror `safetyLevel` for 1.x readers.
+        if reg.version >= 2 {
+            for key in [
+                "denyDestructive",
+                "confirmDestructive",
+                "humanApproval",
+                "quarantineOnDrift",
+                "blockOnInjection",
+            ] {
+                obj.remove(key);
+            }
+        }
         if let Some(profiles) = obj.get_mut("profiles").and_then(Value::as_array_mut) {
             for profile in profiles.iter_mut().filter_map(Value::as_object_mut) {
                 profile.remove("instructions");
@@ -17729,14 +17741,12 @@ fn main() {
             conduit_lib::stdio_adapter::run_selected_stdio_adapter();
         }
     }
-    let legacy_registry = registry::load_resolved_with_source()
-        .ok()
-        .filter(|(_, source)| source.is_authoritative())
-        .is_some_and(|(reg, _)| reg.gateway_topology == Some(registry::GatewayTopology::Legacy));
+    // The registry's legacy topology field is dropped by the v2 migration; only the
+    // environment override can still ask for it.
     let legacy_env =
         conduit_lib::brand::env_var("TOOLPORT_GATEWAY_TOPOLOGY", "CONDUIT_GATEWAY_TOPOLOGY")
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("legacy"));
-    if (legacy_registry || legacy_env)
+    if legacy_env
         && registry::conduit_dir().is_some_and(|dir| {
             std::fs::create_dir_all(&dir).is_ok()
                 && std::fs::OpenOptions::new()
@@ -18282,6 +18292,7 @@ mod tests {
         let router = Router::new();
         let mut on = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         on.deny_destructive = true;
@@ -18314,6 +18325,7 @@ mod tests {
 
         let mut off = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         off.deny_destructive = false;
@@ -18325,6 +18337,7 @@ mod tests {
 
         let mut on = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         on.deny_destructive = true;
@@ -19320,6 +19333,7 @@ mod tests {
                 m
             },
             instructions: None,
+            unknown_fields: Default::default(),
         });
         reg.profiles.push(registry::Profile {
             id: "b".into(),
@@ -19334,6 +19348,7 @@ mod tests {
                 m
             },
             instructions: None,
+            unknown_fields: Default::default(),
         });
         let merged = merge_tool_scopes_for_http(&reg);
         let set = merged.get("team_gh").expect("org scope present");
@@ -19427,6 +19442,7 @@ mod tests {
     fn block_on_injection_withholds_high_confidence_payload() {
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         reg.block_on_injection = true;
@@ -19476,6 +19492,7 @@ mod tests {
         // Default (block off): still labels, never withholds.
         let reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         let result = json!({
@@ -19493,7 +19510,6 @@ mod tests {
         // A team injection flag at member Off must withhold results without raising the level.
         let mut reg = Registry::default();
         reg.set_safety_level(registry::SafetyLevel::Off);
-        reg.content_defense = false;
         conduit_lib::teams::apply_team_config(
             &mut reg,
             "t1",
@@ -20345,6 +20361,7 @@ mod tests {
             call_audit_export_cursor: None,
             call_audit_export: false,
             rate_limits: Vec::new(),
+            unknown_fields: Default::default(),
         });
         assert_eq!(
             router_relevant(&reg),
@@ -20364,8 +20381,8 @@ mod tests {
         reg.gateway_instructions = None;
         reg.profiles[0].instructions = None;
 
-        // A policy flag lives OUTSIDE the team block: a real change the router must rebuild for.
-        reg.deny_destructive = !reg.deny_destructive;
+        // A policy change lives OUTSIDE the team block: a real change the router must rebuild for.
+        reg.set_safety_level(registry::SafetyLevel::Strict);
         assert_ne!(
             router_relevant(&reg),
             base,
@@ -20627,7 +20644,7 @@ mod tests {
         let _era = UpstreamEraGuard::enter(Some(MODERN_PROTOCOL_VERSION.to_string()));
         let _capabilities = UpstreamCapabilitiesGuard::enter(&request);
         let mut reg = Registry::default();
-        reg.set_human_approval(true);
+        reg.set_safety_level(registry::SafetyLevel::Ask);
         let router = routed_router("s", "delete");
         let cached = router.aggregated_tools();
 
@@ -21324,6 +21341,7 @@ mod tests {
         reg.folder_profiles = vec![registry::FolderProfile {
             path: "/proj/work".into(),
             profile: "Work".into(),
+            unknown_fields: Default::default(),
         }];
         reg.client_scopes.insert("cursor".into(), "Billing".into());
         let env = Some("Env".to_string());
@@ -21456,9 +21474,9 @@ mod tests {
         let _data_env = DataDirTestEnv::new("run_script_final_aggregate_is_screened_for_injection");
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
-        reg.content_defense = true;
         reg.block_on_injection = false;
         let router = Arc::new(paging_router("quarterly numbers".to_string()));
         let args = json!({
@@ -21522,9 +21540,9 @@ mod tests {
         let _data_env = DataDirTestEnv::new("run_script_blocked_failure_keeps_the_recovery_ledger");
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
-        reg.content_defense = true;
         reg.block_on_injection = true;
         let router = Arc::new(paging_router("quarterly numbers".to_string()));
         let run = |args: &Value| {
@@ -24176,6 +24194,7 @@ mod tests {
             label: "full".into(),
             token_sha256: registry::sha256_hex("fulltok"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         assert_eq!(
             resolve_http_scope(&reg, None, Some("fulltok"), false, true),
@@ -24192,6 +24211,7 @@ mod tests {
             label: "scoped".into(),
             token_sha256: registry::sha256_hex("scopedtok"),
             profile: "Default".into(),
+            unknown_fields: Default::default(),
         });
         assert!(matches!(
             resolve_http_scope(&reg, None, Some("scopedtok"), false, true),
@@ -24229,6 +24249,7 @@ mod tests {
             label: "Cursor".into(),
             token_sha256: registry::sha256_hex("client-token"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
 
         let (_, caller) =
@@ -24323,6 +24344,7 @@ mod tests {
             label: "Cursor".into(),
             token_sha256: registry::sha256_hex("tok1"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         assert_eq!(
             http_client_label(&reg, Some("tok1")).as_deref(),
@@ -24334,6 +24356,7 @@ mod tests {
             label: "   ".into(),
             token_sha256: registry::sha256_hex("tok2"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         assert_eq!(http_client_label(&reg, Some("tok2")).as_deref(), Some("c2"));
     }
@@ -24347,12 +24370,14 @@ mod tests {
             label: "Open WebUI".into(),
             token_sha256: registry::sha256_hex("tok1"),
             profile: billing,
+            unknown_fields: Default::default(),
         });
         reg.http_clients.push(registry::HttpClient {
             id: "c2".into(),
             label: "Open WebUI".into(),
             token_sha256: registry::sha256_hex("tok2"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
 
         let (_, first) = resolve_http_caller(&reg, None, Some("tok1"), false, true).unwrap();
@@ -24379,12 +24404,14 @@ mod tests {
             label: "Open WebUI".into(),
             token_sha256: registry::sha256_hex("t-a"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         reg.http_clients.push(registry::HttpClient {
             id: "beta".into(),
             label: "Open WebUI".into(),
             token_sha256: registry::sha256_hex("t-b"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         let (_, a) = resolve_http_caller(&reg, None, Some("t-a"), false, true).unwrap();
         let (_, b) = resolve_http_caller(&reg, None, Some("t-b"), false, true).unwrap();
@@ -26085,6 +26112,7 @@ mod tests {
             label: "Open WebUI".into(),
             token_sha256: registry::sha256_hex("tok-personal"),
             profile: personal,
+            unknown_fields: Default::default(),
         });
         let (allowed, caller) =
             resolve_http_caller(&reg, None, Some("tok-personal"), false, true).unwrap();
@@ -26112,6 +26140,7 @@ mod tests {
             label: "Claude Code".into(),
             token_sha256: registry::sha256_hex("tok-cc"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         let resolve = |reg: &Registry| {
             resolve_http_caller(reg, None, Some("tok-cc"), false, true)
@@ -26448,6 +26477,7 @@ mod tests {
                 enabled_server_ids: servers.into_iter().map(String::from).collect(),
                 tool_scope: HashMap::new(),
                 instructions: None,
+                unknown_fields: Default::default(),
             });
         }
         let calls = Arc::new(AtomicUsize::new(0));
@@ -28183,6 +28213,7 @@ mod tests {
     fn instructions_registry() -> Registry {
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         for (name, instructions) in [
@@ -28329,6 +28360,7 @@ mod tests {
                 label: id.into(),
                 token_sha256: registry::sha256_hex(id),
                 profile: profile.into(),
+                unknown_fields: Default::default(),
             });
         }
         *state.registry.lock().unwrap() = reg.clone();
@@ -30189,6 +30221,7 @@ mod tests {
         );
         let reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         let host = dispatch_host(false);
@@ -30338,6 +30371,7 @@ mod tests {
         let host = dispatch_host(false);
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         let guard = SearchGuard::default();
@@ -31352,7 +31386,6 @@ mod tests {
         let state = http_state(false);
         {
             let mut reg = state.registry.lock().unwrap();
-            reg.integrity_check = true;
             reg.set_safety_level(registry::SafetyLevel::Strict);
             reg.quarantine_on_drift = true;
         }
@@ -31416,7 +31449,6 @@ mod tests {
         let state = http_state(false);
         {
             let mut reg = state.registry.lock().unwrap();
-            reg.integrity_check = true;
             reg.set_safety_level(registry::SafetyLevel::Strict);
             reg.quarantine_on_drift = true;
         }
@@ -31465,7 +31497,6 @@ mod tests {
         let state = http_state(false);
         {
             let mut reg = state.registry.lock().unwrap();
-            reg.integrity_check = true;
             reg.quarantine_on_drift = false;
         }
 
@@ -31533,7 +31564,6 @@ mod tests {
         let state = http_state(false);
         {
             let mut reg = state.registry.lock().unwrap();
-            reg.integrity_check = true;
             reg.set_safety_level(registry::SafetyLevel::Strict);
             reg.quarantine_on_drift = true;
         }
@@ -31720,7 +31750,6 @@ mod tests {
         })];
 
         let mut reg = Registry::default();
-        reg.integrity_check = true;
         reg.quarantine_on_drift = false;
         let registry = Arc::new(Mutex::new(reg));
         assert_eq!(
@@ -31895,6 +31924,7 @@ mod tests {
 
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         reg.quarantine_on_drift = true;
@@ -32340,6 +32370,7 @@ mod tests {
             label: "Open WebUI".into(),
             token_sha256: registry::sha256_hex("tok"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         conduit_lib::registry::save_to(&reg_path, &with_client).unwrap();
 
@@ -32428,6 +32459,7 @@ mod tests {
 
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         reg.quarantine_on_drift = true;
@@ -32570,6 +32602,7 @@ mod tests {
 
         let mut reg = Registry {
             safety_level: None,
+            version: 1,
             ..Registry::default()
         };
         reg.quarantine_on_drift = true;
@@ -34076,25 +34109,6 @@ mod tests {
     }
 
     #[test]
-    fn confirm_and_deny_destructive_are_mutually_exclusive() {
-        let mut reg = Registry::default();
-
-        // Enabling confirm turns off deny.
-        reg.set_deny_destructive(true);
-        reg.set_confirm_destructive(true);
-        assert!(reg.confirm_destructive);
-        assert!(!reg.deny_destructive, "enabling confirm must turn off deny");
-
-        // Enabling deny turns off confirm.
-        reg.set_deny_destructive(true);
-        assert!(reg.deny_destructive);
-        assert!(
-            !reg.confirm_destructive,
-            "enabling deny must turn off confirm"
-        );
-    }
-
-    #[test]
     fn legacy_confirm_destructive_requires_human_approval_on_direct_call() {
         // A registry written by 1.x can carry confirm_destructive with no explicit safety
         // level. The gateway must read the legacy flag live and derive Ask, so a direct
@@ -34107,6 +34121,7 @@ mod tests {
         // No explicit level and a legacy confirm flag: the derived level must be Ask.
         let reg = Registry {
             safety_level: None,
+            version: 1,
             confirm_destructive: true,
             ..Registry::default()
         };

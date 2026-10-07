@@ -23,19 +23,46 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 pub(crate) static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+mod v2_migration;
+
 /// The newest registry schema version this build knows how to load and write.
-const REGISTRY_VERSION: u32 = 1;
+const REGISTRY_VERSION: u32 = 2;
 
 /// One ordered schema migration: it rewrites a registry document at version N
 /// into version N+1. The loader stamps the `version` field after each step, so
-/// a step only transforms data. Index `i` migrates v(i+1) -> v(i+2).
-pub type Migration = fn(&mut serde_json::Value) -> Result<(), String>;
+/// a step only transforms data, plus any export it must write before data is
+/// dropped. Index `i` migrates v(i+1) -> v(i+2).
+pub type Migration = fn(&mut serde_json::Value, &MigrationContext) -> Result<(), String>;
 
-/// The shipped `vN -> vN+1` pipeline, in order. Empty while the schema is still
-/// v1; every later schema change appends the next step here. Its length must
-/// stay `REGISTRY_VERSION - 1` (asserted by a test), so a step can neither be
+/// What a migration step may need beyond the document: where to put exports of
+/// user data a schema change drops. Steps run after the pre-migration backup
+/// and before the migrated registry is written.
+pub struct MigrationContext {
+    /// The directory holding the registry being migrated.
+    pub data_dir: PathBuf,
+    /// Today's UTC date as `YYYY-MM-DD`, used in export file names.
+    pub date: String,
+}
+
+impl MigrationContext {
+    fn for_registry(path: &Path) -> Self {
+        let data_dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let days = (now_ms() / 86_400_000) as i64;
+        let (year, month, day) = crate::usage_report::civil_from_days(days);
+        MigrationContext {
+            data_dir,
+            date: format!("{year:04}-{month:02}-{day:02}"),
+        }
+    }
+}
+
+/// The shipped `vN -> vN+1` pipeline, in order. Its length must stay
+/// `REGISTRY_VERSION - 1` (asserted by a test), so a step can neither be
 /// silently skipped nor applied twice.
-const MIGRATIONS: &[Migration] = &[];
+const MIGRATIONS: &[Migration] = &[v2_migration::migrate_v1_to_v2];
 
 /// A registry that could not be loaded or safely written because of its schema
 /// version. Kept distinct from the generic corruption error so version skew (an
@@ -529,6 +556,9 @@ pub struct EnvVar {
     pub value: Option<String>,
     #[serde(default)]
     pub secret: bool,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A named launch input. Only nonsecret values may be serialized here. Secret
@@ -543,13 +573,24 @@ pub struct LaunchInput {
     pub required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ArgPart {
-    Literal { value: String },
-    Input { key: String },
+    Literal {
+        value: String,
+        #[serde(flatten)]
+        unknown_fields: serde_json::Map<String, serde_json::Value>,
+    },
+    Input {
+        key: String,
+        #[serde(flatten)]
+        unknown_fields: serde_json::Map<String, serde_json::Value>,
+    },
 }
 
 /// Replaces exactly one argument at `index`. Parts are concatenated without a
@@ -559,6 +600,9 @@ pub enum ArgPart {
 pub struct ArgBinding {
     pub index: usize,
     pub parts: Vec<ArgPart>,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -576,6 +620,9 @@ pub struct LaunchConfig {
     pub template: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<u32>,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 impl LaunchConfig {
@@ -623,14 +670,14 @@ impl LaunchConfig {
                 return Err("launch argument binding has an invalid or duplicate index".into());
             }
             for part in &binding.parts {
-                if let ArgPart::Literal { value } = part {
+                if let ArgPart::Literal { value, .. } = part {
                     if value.len() > 32
                         || value.chars().any(|c| c.is_alphanumeric() || c.is_control())
                     {
                         return Err("launch argument literals may contain punctuation only".into());
                     }
                 }
-                if let ArgPart::Input { key } = part {
+                if let ArgPart::Input { key, .. } = part {
                     if !keys.contains(key.as_str()) {
                         return Err(format!("launch argument refers to missing input '{key}'"));
                     }
@@ -880,98 +927,9 @@ pub struct Profile {
     /// server's instructions into context don't repeat the same block once per profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
-}
-
-/// One named set of the user's own agent rules (CLAUDE.md / AGENTS.md / GEMINI.md content).
-/// Several sets can exist so a user can switch between, say, "Work" and "Personal"; exactly one
-/// is active at a time.
-///
-/// `(id, revision)` is what the personal sentinel marker carries, standing in for the team
-/// scope's `(team_id, version)` — see [`crate::instructions::Scope`]. `revision` therefore only
-/// moves when `content` actually changes, so a rename is not a rewrite of every client's file.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RuleSet {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub content: String,
-    #[serde(default)]
-    pub revision: i64,
-}
-
-/// What Claude Code should do with a native tool call that matches a rule (SBS-1058). The
-/// names are Claude Code's own `permissions` list names, so a rule maps to one list.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionAction {
-    Allow,
-    Ask,
-    Deny,
-}
-
-impl PermissionAction {
-    /// The key under `permissions` this action writes to.
-    pub fn list_key(self) -> &'static str {
-        match self {
-            PermissionAction::Allow => "allow",
-            PermissionAction::Ask => "ask",
-            PermissionAction::Deny => "deny",
-        }
-    }
-}
-
-/// How a guard hook acts on the permission rules (SBS-1059).
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GuardMode {
-    /// Hook not installed.
-    #[default]
-    Off,
-    /// Hook installed; every call is evaluated and the decision recorded, but the answer is
-    /// always "allow". For seeing what a policy WOULD do before letting it act.
-    Observe,
-    /// Hook installed; deny and ask rules take effect.
-    Enforce,
-}
-
-impl GuardMode {
-    pub fn is_off(&self) -> bool {
-        *self == GuardMode::Off
-    }
-}
-
-/// One native permission rule: a pattern in Claude Code's rule syntax (`Bash(rm -rf *)`,
-/// `Read(./.env)`, `WebFetch(domain:example.com)`, `mcp__server__tool`) and what to do.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "camelCase")]
-pub struct PermissionRule {
-    pub pattern: String,
-    pub action: PermissionAction,
-}
-
-/// One registered project folder for project-level agent rules (SBS-1037). The consent unit
-/// inside it is a FILE, not a client: at project level nearly every client reads the root
-/// `AGENTS.md`, Gemini reads `GEMINI.md`, Claude Code and VS Code read `.claude/rules/`, so
-/// `files` maps each of those (by key) to whether the user switched it on. Off means never
-/// written.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RulesProject {
-    pub id: String,
-    /// Absolute path of the folder, as the user picked it.
-    pub path: String,
-    /// Display name; defaults to the folder name.
-    pub name: String,
-    /// The rule set applied to this project, if any. Independent of the global active set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub set_id: Option<String>,
-    /// Per-file opt-in, keyed by file key. Absent means off.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub files: HashMap<String, bool>,
-    /// Absolute paths this project's applies have written, so removal touches exactly those.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub targets: Vec<String>,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Maps a project folder to a profile, so the gateway can auto-scope a client to the right
@@ -984,6 +942,9 @@ pub struct RulesProject {
 pub struct FolderProfile {
     pub path: String,
     pub profile: String,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A consumer registered to reach the gateway over the HTTP/OpenAPI bridge with
@@ -1001,6 +962,9 @@ pub struct HttpClient {
     /// (no extra filtering), so it behaves like the legacy single-token bridge.
     #[serde(default)]
     pub profile: String,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 /// SHA-256 (hex) of a string. Used to hash bearer tokens so plaintext never hits
@@ -1072,18 +1036,10 @@ pub struct ToolOverride {
     /// A replacement description shown to the client instead of the server's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
-
-/// Startup topology for client-spawned stdio gateways. An absent registry value
-/// follows the release default; an explicit value survives future default flips.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GatewayTopology {
-    Legacy,
-    Daemon,
-}
-
-pub const DEFAULT_GATEWAY_TOPOLOGY: GatewayTopology = GatewayTopology::Daemon;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1116,24 +1072,15 @@ pub struct Registry {
     pub profiles: Vec<Profile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_profile_id: Option<String>,
-    // 2.0: unused, dropped by the v2 migration
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gateway_topology: Option<GatewayTopology>,
-    /// Global safety switch: when true, the gateway hides and blocks any tool a
-    /// server annotates with `destructiveHint: true` (deletes, drops, writes).
-    /// One toggle to keep agents read-only across every connected server.
+    /// The 1.x safety toggles (`denyDestructive`, `confirmDestructive`, `humanApproval`,
+    /// `quarantineOnDrift`, `blockOnInjection`). In a v1 registry they select the safety
+    /// level (see [`Registry::safety_level_selected`]). From v2 on they are a write-only
+    /// mirror of `safety_level`, kept in sync on every save so a 1.x process still running
+    /// across the upgrade enforces the equivalent policy; 2.0 never reads them there.
     #[serde(default)]
     pub deny_destructive: bool,
-    /// Legacy per-call confirmation for destructive tools. Toolport 2.0 removed the
-    /// agent-token confirm flow, so no confirmation step reads it. It is still read
-    /// live to derive the safety level: with no explicit level and no blocking gate,
-    /// a true value selects Ask (see `safety_level_selected`).
     #[serde(default)]
     pub confirm_destructive: bool,
-    /// Human-in-the-loop approval: when true, a *gated* tool call (destructive-hinted, or
-    /// from an untrusted-provenance server) is held and surfaced to the Toolport app for a
-    /// person to approve or deny before it runs. The call blocks until a decision or a
-    /// fail-closed timeout. Off by default.
     #[serde(default)]
     pub human_approval: bool,
     /// Tools the user chose to "always allow" past human approval, so the HITL gate skips
@@ -1216,26 +1163,6 @@ pub struct Registry {
     /// `CONDUIT_CODE_MODE`) still force-enables regardless of the toggle.
     #[serde(default)]
     pub code_mode: bool,
-    // 2.0: unused, dropped by the v2 migration
-    #[serde(default)]
-    pub allow_routine_writes: bool,
-    // 2.0: unused, dropped by the v2 migration
-    #[serde(default)]
-    pub allow_agent_control: bool,
-    /// Tool-definition integrity: fingerprint each connected tool and flag when a
-    /// previously-approved tool's definition changes (a rug-pull signal) or a known
-    /// server quietly adds a tool. Detection only, it records a security event and
-    /// never blocks. On by default.
-    // 2.0: unused, dropped by the v2 migration
-    #[serde(default = "default_true")]
-    pub integrity_check: bool,
-    /// Content defense (anti-agentjacking): scan untrusted tool RESULTS for injection
-    /// and label flagged content as data, not instructions, before the agent sees it.
-    /// Detection + labeling. On by default. Pair with [`block_on_injection`] to fail closed
-    /// on high-confidence hits (SOU-345).
-    // 2.0: unused, dropped by the v2 migration
-    #[serde(default = "default_true")]
-    pub content_defense: bool,
     /// Replace PII in tool results with stable pseudonyms before they reach the model,
     /// re-hydrating them on the way back out (SBS-346). OFF by default: it rewrites tool
     /// output, and unlike content defense a missed value fails OPEN, so it is a reduction
@@ -1320,82 +1247,6 @@ pub struct Registry {
     /// the rest of the registry JSON is unchanged.
     #[serde(default)]
     pub secrets_generation: u64,
-    // 2.0: unused, dropped by the v2 migration.
-    /// The user's own agent rule sets. Several can exist; `active_rule_set_id` picks the one
-    /// written to clients.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rule_sets: Vec<RuleSet>,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Which of `rule_sets` is currently applied. `None` = none; every file we wrote is removed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_rule_set_id: Option<String>,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Per-client opt-in for personal rules, keyed by client id. ABSENT MEANS OFF: writing into
-    /// someone's `~/.claude/rules` or `AGENTS.md` is not something to do unasked, so a client
-    /// only receives rules once the user turns it on.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub rules_clients: HashMap<String, bool>,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Absolute paths of the personal-rules files we have written, so cleanup after a set
-    /// switch / client opt-out / uninstall touches exactly what we created and nothing else.
-    /// Same role as `TeamConnection::team_instructions_targets`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rules_targets: Vec<String>,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Project folders the user registered for project-level agent rules (SBS-1037). Nothing
-    /// is ever discovered: a folder is here because the user added it, and its files are
-    /// written only by an explicit Apply for that project, never at startup.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rules_projects: Vec<RulesProject>,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Cursor guard hook (SBS-1059): how the `--toolport-guard cursor` hook Toolport installs
-    /// into `~/.cursor/hooks.json` treats the same permission rules. `Off` = not installed.
-    #[serde(default, skip_serializing_if = "GuardMode::is_off")]
-    pub guard_cursor_mode: GuardMode,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Cursor guard, when enforcing: route an "ask first" rule through Toolport's approval
-    /// window instead of Cursor's own prompt (SBS-1059). Off = Cursor prompts.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub guard_cursor_ask_via_toolport: bool,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Claude Code guard (SBS-1059): the `--toolport-guard claude-code` PreToolUse hook.
-    /// Claude Code enforces deny and allow natively, so this hook's one job is asks:
-    /// `Enforce` moves the ask rules it can judge (shell commands, file reads, MCP tools)
-    /// out of `settings.json` and into Toolport's approval window. `Observe` installs the
-    /// hook and records what it would decide; the native rules stay as they are.
-    #[serde(default, skip_serializing_if = "GuardMode::is_off")]
-    pub guard_claude_mode: GuardMode,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Absolute paths of the hooks files the guard has been written into, for exact cleanup.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub guard_targets: Vec<String>,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Native permission policy for Claude Code (SBS-1058): rules in Claude Code's own
-    /// `permissions` syntax that Toolport wrote into every profile's `settings.json`.
-    /// The written entries are the user's policy and were left in place when the feature
-    /// was removed in 2.0.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub agent_permissions_enabled: bool,
-    // 2.0: unused, dropped by the v2 migration.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub agent_permission_rules: Vec<PermissionRule>,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Per settings file, exactly the rule strings Toolport ADDED there (a rule the user
-    /// already had is not added and not recorded, so it is never removed). Removal and
-    /// policy changes strip exactly these. Same role as `hook_targets` / `rules_targets`.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub agent_permission_targets: HashMap<String, Vec<PermissionRule>>,
-    /// Whether the native-agent hook sensor is installed. The sensor was removed in
-    /// 2.0; the field stays so a v1 registry still deserializes.
-    // 2.0: unused, dropped by the v2 migration
-    #[serde(default)]
-    pub hooks_enabled: bool,
-    /// Absolute paths of the agent settings files the hook sensor wrote into, so
-    /// removal touched exactly what it created. The sensor was removed in 2.0; the
-    /// field stays so a v1 registry still deserializes.
-    // 2.0: unused, dropped by the v2 migration
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hook_targets: Vec<String>,
     /// Top-level fields THIS build doesn't know, preserved verbatim across
     /// load -> save. The registry is shared by mixed versions of the app and
     /// long-running gateways (a dev build, the installed release, and gateways
@@ -1429,6 +1280,9 @@ pub struct ManagedEntry {
     /// Unix epoch seconds when we last wrote this entry.
     #[serde(default)]
     pub updated_at: u64,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 fn managed_transport_stdio() -> String {
@@ -1473,6 +1327,7 @@ impl ManagedEntry {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            unknown_fields: Default::default(),
         }
     }
 }
@@ -1577,6 +1432,9 @@ pub struct TeamConnection {
     /// the team server; empty = no org caps. Enforced cooperatively in the local gateway.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rate_limits: Vec<crate::rate_limits::Cap>,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Settings for embedding-based search re-ranking. The embedding API key, if the
@@ -1594,6 +1452,9 @@ pub struct SemanticSettings {
     /// Weight of semantic vs lexical, 0.0 (pure lexical) .. 1.0 (pure semantic).
     #[serde(default = "default_blend")]
     pub blend: f32,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_blend() -> f32 {
@@ -1607,6 +1468,7 @@ impl Default for SemanticSettings {
             endpoint: String::new(),
             model: String::new(),
             blend: 0.5,
+            unknown_fields: Default::default(),
         }
     }
 }
@@ -1634,9 +1496,9 @@ impl Default for Registry {
                 enabled_server_ids: Vec::new(),
                 tool_scope: HashMap::new(),
                 instructions: None,
+                unknown_fields: Default::default(),
             }],
             active_profile_id: Some(DEFAULT_PROFILE_ID.to_string()),
-            gateway_topology: None,
             safety_level: Some(SafetyLevel::Ask),
             deny_destructive: false,
             confirm_destructive: false,
@@ -1657,10 +1519,6 @@ impl Default for Registry {
             gateway_instructions: None,
             discovery_mode: None,
             code_mode: false,
-            allow_routine_writes: false,
-            allow_agent_control: false,
-            integrity_check: true,
-            content_defense: true,
             block_on_injection: false,
             injection_block_exempt: HashMap::new(),
             live_inspect: false,
@@ -1675,20 +1533,6 @@ impl Default for Registry {
             http_bridge_enabled: false,
             http_bridge_port: None,
             secrets_generation: 0,
-            rule_sets: Vec::new(),
-            active_rule_set_id: None,
-            rules_clients: HashMap::new(),
-            rules_targets: Vec::new(),
-            rules_projects: Vec::new(),
-            guard_cursor_mode: GuardMode::Off,
-            guard_cursor_ask_via_toolport: false,
-            guard_claude_mode: GuardMode::Off,
-            guard_targets: Vec::new(),
-            agent_permissions_enabled: false,
-            agent_permission_rules: Vec::new(),
-            agent_permission_targets: HashMap::new(),
-            hooks_enabled: false,
-            hook_targets: Vec::new(),
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -2024,10 +1868,6 @@ pub(crate) fn unique_id(base: &str, existing: &[String]) -> String {
 }
 
 impl Registry {
-    pub fn gateway_topology_effective(&self) -> GatewayTopology {
-        DEFAULT_GATEWAY_TOPOLOGY
-    }
-
     fn profile_id_for_ref(&self, profile_ref: &str) -> Option<String> {
         let profile_ref = profile_ref.trim();
         if profile_ref.is_empty() {
@@ -2332,39 +2172,12 @@ impl Registry {
             .unwrap_or(false)
     }
 
-    /// Set the global destructive-tool deny switch. Mutually exclusive with
-    /// `confirm_destructive`: enabling deny clears confirm.
-    pub fn set_deny_destructive(&mut self, deny: bool) {
-        self.safety_level = None;
-        self.deny_destructive = deny;
-        if deny {
-            self.confirm_destructive = false;
-        }
-    }
-
-    /// Set the legacy per-call confirmation flag for destructive tools. Toolport 2.0
-    /// removed the agent-token confirm flow, so this only feeds `safety_level_selected`:
-    /// it clears the explicit level, and a true value then derives Ask when no blocking
-    /// gate is on. Mutually exclusive with `deny_destructive`, which hides gated tools.
-    pub fn set_confirm_destructive(&mut self, confirm: bool) {
-        self.safety_level = None;
-        self.confirm_destructive = confirm;
-        if confirm {
-            self.deny_destructive = false;
-        }
-    }
-
-    /// Turn human-in-the-loop approval on or off. Clears the explicit `safety_level` so
-    /// the derived level follows: like a legacy `confirm_destructive`, a true value maps
-    /// to Ask, which holds a gated call for a person. Independent of `deny_destructive`,
-    /// which hides gated tools entirely.
-    pub fn set_human_approval(&mut self, on: bool) {
-        self.safety_level = None;
-        self.human_approval = on;
-    }
-
-    /// Member choice, derived from legacy gates when the additive field is absent.
+    /// The member's own level. From v2 on an absent level means the 2.0 default,
+    /// Ask. Only a v1 registry derives it from the 1.x toggles.
     pub fn safety_level_selected(&self) -> SafetyLevel {
+        if self.version >= 2 {
+            return self.safety_level.unwrap_or_default();
+        }
         // Legacy blocking flags map to Strict, approval/confirmation to Ask,
         // and no blocking gates to Off. Labeling and recording never block.
         self.safety_level.unwrap_or_else(|| {
@@ -2401,6 +2214,24 @@ impl Registry {
 
     pub fn set_safety_level(&mut self, level: SafetyLevel) {
         self.safety_level = Some(level);
+        self.sync_legacy_safety_mirror();
+    }
+
+    /// Rewrite the 1.x toggles from the selected level in a v2+ registry, so a 1.x
+    /// reader enforces the same policy: Strict blocks destructive tools, drift and
+    /// injection and holds calls for approval, Ask holds calls for approval, Off sets
+    /// nothing. Read by 1.x's rules this derives the same level back.
+    pub fn sync_legacy_safety_mirror(&mut self) {
+        if self.version < 2 {
+            return;
+        }
+        let level = self.safety_level_selected();
+        let strict = level == SafetyLevel::Strict;
+        self.deny_destructive = strict;
+        self.quarantine_on_drift = strict;
+        self.block_on_injection = strict;
+        self.human_approval = level >= SafetyLevel::Ask;
+        self.confirm_destructive = false;
     }
 
     pub fn requires_human_approval(&self, destructive: bool, untrusted: bool) -> bool {
@@ -2530,6 +2361,7 @@ impl Registry {
             enabled_server_ids: Vec::new(),
             tool_scope: HashMap::new(),
             instructions: None,
+            unknown_fields: Default::default(),
         });
         id
     }
@@ -3274,6 +3106,7 @@ fn run_migration_steps(
     value: &mut serde_json::Value,
     migrations: &[Migration],
     target_version: u32,
+    context: &MigrationContext,
 ) -> Result<(), String> {
     let mut version = document_version(value);
     while version < target_version {
@@ -3283,7 +3116,7 @@ fn run_migration_steps(
                 version + 1
             )
         })?;
-        step(value).map_err(|error| {
+        step(value, context).map_err(|error| {
             format!(
                 "Registry migration from schema v{version} to v{} failed: {error}",
                 version + 1
@@ -3310,7 +3143,12 @@ fn migrate_document(
         return Ok(());
     }
     write_migration_backup(path, original, from_version)?;
-    run_migration_steps(value, migrations, target_version)
+    run_migration_steps(
+        value,
+        migrations,
+        target_version,
+        &MigrationContext::for_registry(path),
+    )
 }
 
 /// Recover the registry from the backups `save_to` maintains, newest-first by
@@ -3385,7 +3223,8 @@ fn restore_from_backup(
             if write_migration_backup(path, &content, from_version).is_err() {
                 continue;
             }
-            if run_migration_steps(&mut value, migrations, target_version).is_err() {
+            let context = MigrationContext::for_registry(path);
+            if run_migration_steps(&mut value, migrations, target_version, &context).is_err() {
                 continue;
             }
         }
@@ -3537,7 +3376,7 @@ fn load_from_inner(path: &Path) -> Result<(Registry, LoadSource), String> {
 
 /// [`load_from_inner`] with an explicit pipeline, so tests can prove the
 /// framework with a migration that has not shipped yet. Production always calls
-/// the empty [`MIGRATIONS`] against [`REGISTRY_VERSION`].
+/// [`MIGRATIONS`] against [`REGISTRY_VERSION`].
 fn load_from_inner_with(
     path: &Path,
     migrations: &[Migration],
@@ -3582,12 +3421,17 @@ fn load_from_inner_with(
                         // a failed step leaves the primary untouched.
                         migrate_document(path, &mut value, &content, migrations, target_version)?;
                     }
-                    match serde_json::from_value::<Registry>(value) {
+                    match serde_json::from_value::<Registry>(value.clone()) {
                         Ok(reg) => {
                             // Publish the migrated document atomically, only
-                            // after it deserialized into a Registry.
+                            // after it deserialized into a Registry. The raw
+                            // document is written, not the struct, so nested
+                            // fields this build does not model survive.
                             if needs_migration {
-                                save_to(path, &reg)?;
+                                validate_server_launches(&reg)?;
+                                let json = serde_json::to_string_pretty(&value)
+                                    .map_err(|e| e.to_string())?;
+                                write_registry_document(path, &json, &value)?;
                             }
                             Ok((reg, LoadSource::File))
                         }
@@ -3611,6 +3455,7 @@ fn load_from_inner_with(
         }
     }?;
     registry.normalize_profile_references();
+    registry.sync_legacy_safety_mirror();
     // This path is reached only under the registry file lock. Save an exact
     // legacy-template migration here so a concurrent older writer cannot race
     // between detection and the atomic backup-preserving write.
@@ -3715,6 +3560,7 @@ fn migrate_curated_legacy(registry: &mut Registry) -> bool {
                 key: key.clone(),
                 value: None,
                 secret: true,
+                unknown_fields: Default::default(),
             })
             .collect();
         // Changed requirements must be reviewed and completed before launch.
@@ -3931,11 +3777,13 @@ mod catalog_launch_migration_tests {
             key: "SLACK_BOT_TOKEN".into(),
             value: None,
             secret: true,
+            unknown_fields: Default::default(),
         }];
         server.env.push(EnvVar {
             key: "SLACK_TEAM_ID".into(),
             value: None,
             secret: true,
+            unknown_fields: Default::default(),
         });
         let mut registry = Registry::default();
         registry.servers.push(server);
@@ -4003,7 +3851,10 @@ pub fn parse_registry_contents(contents: &str) -> Result<Registry, String> {
     if found > REGISTRY_VERSION {
         return Err(newer_version_error(found, REGISTRY_VERSION));
     }
-    serde_json::from_value(value).map_err(|error| format!("Corrupt registry: {error}"))
+    let mut registry: Registry =
+        serde_json::from_value(value).map_err(|error| format!("Corrupt registry: {error}"))?;
+    registry.sync_legacy_safety_mirror();
+    Ok(registry)
 }
 
 /// Run [`load_from_inner_with`] holding the registry lock, so a test can prove
@@ -4019,6 +3870,15 @@ fn load_from_with_migrations_for_test(
 }
 
 pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
+    validate_server_launches(registry)?;
+    let mut registry = registry.clone();
+    registry.sync_legacy_safety_mirror();
+    let json = serde_json::to_string_pretty(&registry).map_err(|e| e.to_string())?;
+    let value = serde_json::to_value(&registry).map_err(|e| e.to_string())?;
+    write_registry_document(path, &json, &value)
+}
+
+fn validate_server_launches(registry: &Registry) -> Result<(), String> {
     for server in &registry.servers {
         if let Some(launch) = &server.launch {
             launch.validate(&server.args, true)?;
@@ -4028,18 +3888,27 @@ pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
             // Structural validation above is enough for saving.
         }
     }
+    Ok(())
+}
+
+/// Write `json` (the serialized form of `value`) as the primary, with the
+/// newer-version guard, the no-op guard and the backup journal.
+fn write_registry_document(
+    path: &Path,
+    json: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let json = serde_json::to_string_pretty(registry).map_err(|e| e.to_string())?;
     let existing = std::fs::read_to_string(path).ok();
     // An older binary must never overwrite a registry a newer build wrote: this
     // is the write half of the mixed-version guard (the read half is in
     // `load_from_inner_with`). Check BEFORE the no-op comparison and before any
     // backup/quarantine work, so the newer file is left byte-for-byte as it was.
     if let Some(cur) = existing.as_deref() {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(cur) {
-            let found = document_version(&value);
+        if let Ok(on_disk) = serde_json::from_str::<serde_json::Value>(cur) {
+            let found = document_version(&on_disk);
             if found > REGISTRY_VERSION {
                 return Err(newer_version_error(found, REGISTRY_VERSION));
             }
@@ -4055,10 +3924,7 @@ pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
     // HashMap key-order jitter across a load->save round-trip can't masquerade as a change.
     if let Some(cur) = existing.as_deref() {
         if let Ok(cur_val) = serde_json::from_str::<serde_json::Value>(cur) {
-            if serde_json::to_value(registry)
-                .map(|v| v == cur_val)
-                .unwrap_or(false)
-            {
+            if *value == cur_val {
                 return Ok(());
             }
         }
@@ -4093,7 +3959,7 @@ pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
     }
     // The registry is the single source of truth for every server, so a crash,
     // power loss, or full disk mid-write must not be able to truncate it.
-    atomic_write(path, &json)
+    atomic_write(path, json)
 }
 
 pub fn load() -> Result<Registry, String> {
@@ -4739,26 +4605,6 @@ mod tests {
 
     static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    #[test]
-    fn legacy_gateway_topology_is_retired_without_changing_v1_bytes() {
-        let mut reg = Registry::default();
-        assert_eq!(reg.gateway_topology_effective(), GatewayTopology::Daemon);
-        let absent = serde_json::to_value(&reg).unwrap();
-        assert!(absent.get("gatewayTopology").is_none());
-        reg.gateway_topology = Some(GatewayTopology::Daemon);
-        let opted_in = serde_json::to_value(&reg).unwrap();
-        assert_eq!(opted_in["gatewayTopology"], "daemon");
-        let loaded: Registry = serde_json::from_value(opted_in).unwrap();
-        assert_eq!(loaded.gateway_topology_effective(), GatewayTopology::Daemon);
-        reg.gateway_topology = Some(GatewayTopology::Legacy);
-        assert_eq!(reg.gateway_topology_effective(), GatewayTopology::Daemon);
-        assert_eq!(
-            serde_json::to_value(&reg).unwrap()["gatewayTopology"],
-            "legacy",
-            "the v2 migration owns removal of the stored field"
-        );
-    }
-
     /// SBS-890: an error body is the downstream server's own words. It has been
     /// through the injection scan and the PII pass, and neither is a credential
     /// test, so the redactor is what keeps a key out of `audit.jsonl`.
@@ -4958,25 +4804,22 @@ mod tests {
         let path = dir.join("registry.json");
         save_to(&path, &Registry::default()).unwrap();
 
-        // Simulate a concurrent external writer flipping `allow_agent_control` on disk.
+        // Simulate a concurrent external writer flipping `live_inspect` on disk.
         let mut disk = load_from(&path).unwrap();
-        disk.allow_agent_control = true;
+        disk.live_inspect = true;
         save_to(&path, &disk).unwrap();
 
         // Our update touches a different field. Loading fresh must keep the concurrent change.
         let (out, ()) = update_at(&path, |r| {
-            r.deny_destructive = true;
+            r.pii_redaction = true;
             Ok(())
         })
         .unwrap();
-        assert!(out.deny_destructive, "our change applied");
-        assert!(
-            out.allow_agent_control,
-            "the concurrent write was NOT reverted"
-        );
+        assert!(out.pii_redaction, "our change applied");
+        assert!(out.live_inspect, "the concurrent write was NOT reverted");
 
         let reloaded = load_from(&path).unwrap();
-        assert!(reloaded.deny_destructive && reloaded.allow_agent_control);
+        assert!(reloaded.pii_redaction && reloaded.live_inspect);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5083,6 +4926,7 @@ mod tests {
             ToolOverride {
                 name: Some("repo-search".to_string()),
                 description: None,
+                unknown_fields: Default::default(),
             },
         );
         r.set_tool_pinned(&id, "create_issue", true);
@@ -5132,6 +4976,7 @@ mod tests {
             ToolOverride {
                 name: Some("repo-search".to_string()),
                 description: None,
+                unknown_fields: Default::default(),
             },
         );
         r.set_tool_pinned(&id, "create_issue", true);
@@ -5323,14 +5168,17 @@ mod tests {
             FolderProfile {
                 path: "/home/me/work".into(),
                 profile: "Work".into(),
+                unknown_fields: Default::default(),
             },
             FolderProfile {
                 path: "/home/me/work/client-a".into(),
                 profile: "ClientA".into(),
+                unknown_fields: Default::default(),
             },
             FolderProfile {
                 path: "/home/me/personal".into(),
                 profile: "Personal".into(),
+                unknown_fields: Default::default(),
             },
         ];
         // Exact match, and a descendant picks the parent mapping.
@@ -5429,14 +5277,17 @@ mod tests {
             FolderProfile {
                 path: "/a".into(),
                 profile: "P".into(),
+                unknown_fields: Default::default(),
             },
             FolderProfile {
                 path: "  ".into(),
                 profile: "P".into(),
+                unknown_fields: Default::default(),
             }, // blank path
             FolderProfile {
                 path: "/b".into(),
                 profile: " ".into(),
+                unknown_fields: Default::default(),
             }, // blank profile
         ]);
         assert_eq!(r.folder_profiles.len(), 1);
@@ -5449,6 +5300,7 @@ mod tests {
         r.folder_profiles = vec![FolderProfile {
             path: "/home/me/work/".into(),
             profile: "Work".into(),
+            unknown_fields: Default::default(),
         }];
         // A trailing slash on the mapping and backslash separators in the root both normalize.
         assert_eq!(r.profile_for_root("/home/me/work"), Some("Work".into()));
@@ -5513,6 +5365,7 @@ mod tests {
             transport: "stdio".into(),
             url: None,
             updated_at: 42,
+            unknown_fields: Default::default(),
         };
         r.set_client_managed_entry("claude-desktop", entry.clone());
         assert_eq!(r.client_managed_entry("claude-desktop"), Some(&entry));
@@ -5567,6 +5420,7 @@ mod tests {
             label: "Open WebUI".into(),
             token_sha256: sha256_hex(token),
             profile: "Billing".into(),
+            unknown_fields: Default::default(),
         });
         // The plaintext token resolves to its client; a wrong token doesn't.
         assert_eq!(
@@ -5605,12 +5459,14 @@ mod tests {
             label: "x".into(),
             token_sha256: "h1".into(),
             profile: "Billing".into(),
+            unknown_fields: Default::default(),
         });
         r.http_clients.push(HttpClient {
             id: "2".into(),
             label: "y".into(),
             token_sha256: "h2".into(),
             profile: "Support".into(),
+            unknown_fields: Default::default(),
         });
         let ids: Vec<_> = r
             .bridge_enabled_servers(None)
@@ -5625,6 +5481,7 @@ mod tests {
             label: "z".into(),
             token_sha256: "h3".into(),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         assert_eq!(r.bridge_enabled_servers(None).len(), 3);
     }
@@ -5675,11 +5532,11 @@ mod tests {
     }
 
     #[test]
-    fn deny_destructive_round_trips_through_disk() {
+    fn strict_safety_round_trips_through_disk() {
         let mut r = Registry::default();
         let id = r.add_server(sample_server("postgres"));
         r.set_tool_enabled(&id, "drop_table", false).unwrap();
-        r.set_deny_destructive(true);
+        r.set_safety_level(SafetyLevel::Strict);
 
         let mut path = std::env::temp_dir();
         path.push(format!("conduit-policy-test-{}.json", std::process::id()));
@@ -5687,7 +5544,8 @@ mod tests {
         let loaded = load_from(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert!(loaded.deny_destructive);
+        assert_eq!(loaded.safety_level_selected(), SafetyLevel::Strict);
+        assert!(loaded.deny_destructive, "the 1.x mirror is written");
         assert!(!loaded.is_tool_enabled(&id, "drop_table"));
     }
 
@@ -5932,14 +5790,14 @@ mod tests {
         std::env::set_var("TOOLPORT_REGISTRY", &locked_path);
 
         update(|registry| {
-            registry.deny_destructive = true;
+            registry.pii_redaction = true;
             std::env::set_var("TOOLPORT_REGISTRY", &redirected_path);
             Ok(())
         })
         .unwrap();
 
         let persisted = load_from(&locked_path).unwrap();
-        assert!(persisted.deny_destructive);
+        assert!(persisted.pii_redaction);
         assert!(
             !redirected_path.exists(),
             "update wrote to a path whose lock it never held"
@@ -6291,9 +6149,9 @@ mod tests {
         let path = dir.join("registry.json");
 
         let mut stale = Registry::default();
-        stale.allow_agent_control = false;
+        stale.live_inspect = false;
         let mut latest = Registry::default();
-        latest.allow_agent_control = true;
+        latest.live_inspect = true;
         atomic_write(
             &backup_path(&path),
             &serde_json::to_string_pretty(&stale).unwrap(),
@@ -6322,13 +6180,13 @@ mod tests {
 
         let loaded = reader.join().unwrap().expect("reader loads newest primary");
         assert!(
-            loaded.allow_agent_control,
+            loaded.live_inspect,
             "reader must not return the stale backup"
         );
         let persisted: Registry =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(
-            persisted.allow_agent_control,
+            persisted.live_inspect,
             "recovery must not overwrite the newer primary after the writer releases"
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -6682,6 +6540,7 @@ mod tests {
             label: "Open WebUI".into(),
             token_sha256: sha256_hex("tok"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         }
     }
 
@@ -7510,14 +7369,20 @@ mod tests {
 mod registry_version_tests {
     use super::*;
 
-    /// A migration that only exists for tests, proving the framework can run a
-    /// v1 -> v2 step without shipping a real schema change.
-    fn test_migration_v1_to_v2(value: &mut serde_json::Value) -> Result<(), String> {
+    /// A migration that only exists for tests, proving the framework runs a
+    /// pipeline independently of the shipped steps.
+    fn test_migration_v1_to_v2(
+        value: &mut serde_json::Value,
+        _context: &MigrationContext,
+    ) -> Result<(), String> {
         value["testMigrated"] = serde_json::Value::Bool(true);
         Ok(())
     }
 
-    fn failing_migration_v1_to_v2(_value: &mut serde_json::Value) -> Result<(), String> {
+    fn failing_migration_v1_to_v2(
+        _value: &mut serde_json::Value,
+        _context: &MigrationContext,
+    ) -> Result<(), String> {
         Err("boom".to_string())
     }
 
@@ -7633,12 +7498,21 @@ mod registry_version_tests {
         let path = resolved_path().unwrap();
         std::fs::write(&path, MISSING_VERSION).unwrap();
 
-        let registry = load().unwrap();
-        assert_eq!(registry.version, 1, "a missing version is read as v1");
-        assert!(
-            migration_backup_files(&path).is_empty(),
-            "a current-version load must not migrate or back up"
+        let value: serde_json::Value = serde_json::from_str(MISSING_VERSION).unwrap();
+        assert_eq!(
+            document_version(&value),
+            1,
+            "a missing version is read as v1"
         );
+        let registry = load().unwrap();
+        assert_eq!(registry.version, REGISTRY_VERSION, "and migrated from v1");
+        let backups = migration_backup_files(&path);
+        assert_eq!(backups.len(), 1);
+        assert!(backups[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("registry.json.v1-"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -7656,7 +7530,7 @@ mod registry_version_tests {
         let before = std::fs::read(&path).unwrap();
 
         let loaded = load().unwrap();
-        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.version, REGISTRY_VERSION);
         assert_eq!(loaded.servers.len(), 1);
         assert_eq!(
             std::fs::read(&path).unwrap(),
@@ -7853,7 +7727,10 @@ mod registry_version_tests {
         for (label, document) in fixtures {
             std::fs::write(&path, document).unwrap();
             let registry = load().unwrap_or_else(|error| panic!("{label} failed to load: {error}"));
-            assert_eq!(registry.version, 1, "{label} is a v1 document");
+            assert_eq!(
+                registry.version, REGISTRY_VERSION,
+                "{label} migrates from v1"
+            );
             assert!(!registry.servers.is_empty(), "{label} has a server");
             assert!(
                 registry

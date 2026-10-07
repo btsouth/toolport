@@ -5428,6 +5428,7 @@ mod tests {
                 ToolOverride {
                     name: Some("renamed".to_string()),
                     description: None,
+                    unknown_fields: Default::default(),
                 },
             )]),
         )]);
@@ -5548,6 +5549,7 @@ mod tests {
             ToolOverride {
                 name: Some("say".into()),
                 description: Some("say it back".into()),
+                unknown_fields: Default::default(),
             },
         );
         srv.insert(
@@ -5555,6 +5557,7 @@ mod tests {
             ToolOverride {
                 name: None,
                 description: Some("cleaned".into()),
+                unknown_fields: Default::default(),
             },
         );
         router.set_overrides(HashMap::from([("srv".to_string(), srv)]));
@@ -5593,6 +5596,7 @@ mod tests {
             ToolOverride {
                 name: Some("say".into()),
                 description: None,
+                unknown_fields: Default::default(),
             },
         );
         let policy = ToolPolicy {
@@ -5629,6 +5633,7 @@ mod tests {
             ToolOverride {
                 name: Some("say".into()),
                 description: None,
+                unknown_fields: Default::default(),
             },
         );
         let policy = ToolPolicy {
@@ -5672,6 +5677,7 @@ mod tests {
             ToolOverride {
                 name: Some("search".into()),
                 description: None,
+                unknown_fields: Default::default(),
             },
         );
         let mut router = Router::new();
@@ -5749,6 +5755,7 @@ mod tests {
             ToolOverride {
                 name: Some("srv__echo".into()),
                 description: None,
+                unknown_fields: Default::default(),
             },
         )]);
         router.set_overrides(HashMap::from([("srv".to_string(), srv)]));
@@ -5779,6 +5786,7 @@ mod tests {
             ToolOverride {
                 name: Some("say".into()),
                 description: None,
+                unknown_fields: Default::default(),
             },
         )]);
         router.set_overrides(HashMap::from([("srv".to_string(), srv)]));
@@ -6020,6 +6028,7 @@ mod tests {
                 ToolOverride {
                     name: Some("renamed-t1".into()),
                     description: None,
+                    unknown_fields: Default::default(),
                 },
             )]),
         )]));
