@@ -344,6 +344,9 @@ jobs:
       - name: Bash tests for scripts/install.sh
         run: bash scripts/install.Tests.bash
 
+      - name: Bash tests for scripts/toolport-preview-rollback.sh
+        run: bash scripts/toolport-preview-rollback.Tests.bash
+
   # SBS-894: toolport.app/install.sh and /install.ps1 redirect to a PINNED
   # COMMIT of those scripts, because they are piped into a shell and a movable
   # URL there means anything that lands on main runs on users' machines. Both
