@@ -739,9 +739,8 @@ function ProfileToolScope({
 export function SettingsView({ registry, onRegistryChange }: Props) {
   const { theme, setTheme } = useTheme();
   const lazyDiscovery = registry?.lazyDiscovery ?? true;
-  // On by default (SOU-397); only treat explicit false as off when the field is missing
-  // during a partial load, match the registry serde default.
-  const codeMode = registry?.codeMode ?? true;
+  // Match the registry default when the field is absent or still loading.
+  const codeMode = registry?.codeMode ?? false;
   const allowRoutineWrites = registry?.allowRoutineWrites ?? false;
   const allowAgentControl = registry?.allowAgentControl ?? false;
   const piiRedaction = registry?.piiRedaction ?? false;
@@ -1192,8 +1191,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         {/* Pinned prerequisites is a refinement of lazy discovery (the tools it must never
             hide), not a peer feature, so nest it under the Lazy discovery toggle with an
             indent + left rail. It has no meaning when lazy discovery is off, so it collapses
-            away entirely then. Code mode below is an independent capability and stays a
-            full-width sibling. */}
+            away entirely then. */}
         {lazyDiscovery ? (
           <div className="ml-4 border-l-2 border-border/50 pl-3">
             <PinnedPrerequisites
@@ -1202,26 +1200,6 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             />
           </div>
         ) : null}
-        {toggle(
-          Braces,
-          codeMode,
-          "text-info",
-          "Code mode",
-          "On by default: agents can run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary; turn off to hide toolport_run_script.",
-          apply("code-mode", setCodeMode),
-          "code-mode",
-        )}
-        {codeMode
-          ? toggle(
-              Braces,
-              allowRoutineWrites,
-              "text-warning",
-              "Allow routine writes",
-              "Allow agents to request saving persistent routines. Every save still requires your approval.",
-              apply("allow-routine-writes", setAllowRoutineWrites),
-              "allow-routine-writes",
-            )
-          : null}
         {/* Rendered independently of the writes toggle: a suggestion queued while
             writes were on stays actionable (the user is the authority here). A
             successful empty read hides the section; a failed load is a visible
@@ -1326,6 +1304,27 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         )}
         <details>
           <summary>Advanced</summary>
+          {toggle(
+            Braces,
+            codeMode,
+            "text-info",
+            "Code mode",
+            "Off by default: enable agents to run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary; turn off to hide toolport_run_script. TOOLPORT_CODE_MODE=1 still forces it on.",
+            apply("code-mode", setCodeMode),
+            "code-mode",
+          )}
+          {codeMode
+            ? toggle(
+                Braces,
+                allowRoutineWrites,
+                "text-warning",
+                "Allow routine writes",
+                "Allow agents to request saving persistent routines. Every save still requires your approval.",
+                apply("allow-routine-writes", setAllowRoutineWrites),
+                "allow-routine-writes",
+              )
+            : null}
+
           {toggle(
             EyeOff,
             piiRedaction,

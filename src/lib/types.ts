@@ -546,7 +546,7 @@ export interface Registry {
    * none of their own. Absent = built-in text; empty = send none. */
   gatewayInstructions?: string;
   /** Code mode: advertise `toolport_run_script` so agents can orchestrate many tool
-   * calls in one server-side script. On by default (SOU-397); Settings is the kill switch. */
+   * calls in one server-side script. Off by default; opt in under Advanced. */
   codeMode?: boolean;
   /** Opt-in: let agents request saving immutable Code Mode routines. Every save still
    * requires a separate human approval. */
