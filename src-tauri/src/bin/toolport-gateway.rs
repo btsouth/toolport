@@ -19674,19 +19674,19 @@ mod tests {
         reg.safety_level = Some(registry::SafetyLevel::Off);
         *state.registry.lock().unwrap() = reg.clone();
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut router = Router::with_policy(registry_policy(&reg, None, false, false));
+        let mut router = Router::with_policy(registry_policy(&reg, None, false, false).with_quarantine(BTreeSet::new(), false));
         let connect_calls = Arc::clone(&calls);
         router.add_supervised(
             "s".into(),
             vec![json!({"name":"work"})],
             Arc::new(move || {
-                DownstreamServer::connect(
+                Ok(DownstreamServer::connect(
                     "s".into(),
                     Box::new(CountingRoute {
                         calls: Arc::clone(&connect_calls),
                         destructive: false,
                     }),
-                )
+                ).unwrap())
             }),
             ReconnectBackoff::default(),
             json!({"revision":1}),
@@ -19745,6 +19745,7 @@ mod tests {
 
     #[test]
     fn access_review_status_uses_public_access_names() {
+        let _env = DataDirTestEnv::new("access-review-status");
         let state = http_state(false);
         let mut reg = Registry::default();
         reg.default_access_context_id = Some("default".into());

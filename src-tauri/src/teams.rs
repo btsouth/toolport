@@ -428,7 +428,7 @@ pub struct PushPreview {
 }
 
 /// How one selected personal server relates to the Team, and what sharing it will
-/// do in the active profile. Both desktop shells render these sentences as-is.
+/// do in the local access context. Both desktop shells render these sentences as-is.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareSelectionPreview {
@@ -2236,7 +2236,7 @@ fn apply_use_managed(reg: &mut Registry, managed_id: &str, profile: &str) -> Res
         return Err("The managed definition differs from your personal server. Complete its setup separately before switching profiles.".into());
     }
     if !reg.profiles.iter().any(|p| p.id == profile) {
-        return Err("active profile unavailable".into());
+        return Err("local access context unavailable".into());
     }
     crate::local_auth::ensure_unconfigured(reg, &managed)?;
     // One local vault owner also shares OAuth refresh state and its lock.
@@ -3152,12 +3152,14 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     }
     if reg.version >= 3 {
         for server in reg.servers.iter_mut().filter(|s| is_team_server(s, &tag)) {
-            let in_access_set = reg
-                .profiles
-                .iter()
-                .any(|p| p.enabled_server_ids.contains(&server.id));
-            server.enabled =
-                in_access_set && previous_global.get(&server.id).copied().unwrap_or(true);
+            // Keep the user's switch across sync. A changed review-required
+            // definition still loses consent, regardless of access membership.
+            server.enabled = if review_ids.contains(&server.id) {
+                previous_global.get(&server.id).copied().unwrap_or(false)
+                    && consent_holds(&server.id)
+            } else {
+                previous_global.get(&server.id).copied().unwrap_or(true)
+            };
         }
     }
     // What the member still has to look at: review servers that are OFF in the active
@@ -6932,6 +6934,25 @@ mod tests {
 
         fn handed_off() -> (Registry, Value) {
             handed_off_with(LocalValue::None)
+        }
+
+        #[test]
+        fn access_review_team_sync_preserves_switch_without_membership() {
+            let mut personal = publisher_registry();
+            personal.version = 3;
+            personal.servers[0].transport = "http".into();
+            personal.servers[0].command = None;
+            personal.servers[0].url = Some("https://example.com/mcp".into());
+            let remote = team_server_export(&personal);
+            let mut reg = synced(&personal, &remote, 1);
+            let managed = team_copy(&reg, "mine");
+            assert!(reg.server_enabled(&managed));
+            for profile in &mut reg.profiles { profile.enabled_server_ids.clear(); }
+            reg = synced(&reg, &remote, 2);
+            assert!(reg.server_enabled(&managed));
+            reg.set_global_server_enabled(&managed, false).unwrap();
+            reg = synced(&reg, &remote, 3);
+            assert!(!reg.server_enabled(&managed));
         }
 
         #[test]
