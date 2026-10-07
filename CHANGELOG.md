@@ -6,6 +6,44 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.24.0] - 2026-10-06
+
+### Added
+
+- Servers that fail to connect when Toolport starts keep retrying in the background,
+  from every 2 seconds up to every 5 minutes, and join your AI clients without a
+  restart. `toolport_status` shows which servers are retrying and which need you to
+  sign in. Servers that refuse your credentials wait for a new sign-in instead of
+  retrying. (#1003)
+- Disconnecting a client puts back the servers "Move into gateway" took out of its
+  config. (#1002)
+- ZCode is a supported client. (#990)
+- The Linux app has a "Check servers again" button. (#999)
+
+### Changed
+
+- Importing servers, or moving them into Toolport, turns them on, so your AI clients
+  get their tools right away. (#1002)
+- Shared setups no longer carry API keys in server URLs. Keys in the path, query and
+  userinfo are replaced with placeholders, and the import asks the recipient to fill
+  in their own. (#1001)
+- The Teams page shows the current plans: Free for 2 people, and Team at $19 a month
+  for up to 10. (#1009)
+- The Arch installer runs a full system upgrade (`pacman -Syu`) instead of a partial
+  one. (#997)
+
+### Fixed
+
+- The Linux app no longer relaunches every server while you search, refocus the
+  window or edit one server. Long names no longer widen the window, sidebar text is
+  readable on all themes, and an approval notification closes once the call is
+  decided, even after you click it. (#999)
+- An agent can no longer turn on a team server that is waiting for your review. (#1001)
+- Project rules are never written through a symbolic link that points outside the
+  project. (#1001)
+- A sign-in waiting on another Toolport window no longer reports a failure when that
+  window finishes at the same moment. (#1005)
+
 ## [1.23.5] - 2026-10-02
 
 ### Fixed

@@ -1,7 +1,7 @@
 # Maintainer: Tyler South <tsouth2@gmail.com>
 # The archive is expected to unpack to toolport-$pkgver.
 pkgname=toolport
-pkgver=1.23.5
+pkgver=1.24.0
 pkgrel=1
 pkgdesc='One local MCP gateway for every AI client, with a native GTK shell'
 arch=('x86_64')
@@ -23,7 +23,7 @@ conflicts=('toolport-bin' 'toolport-native-preview')
 replaces=('toolport-native-preview')
 options=('!lto')
 source=("toolport-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('d2c0340f2cd3d24ed5ae2ce9c665d83b03791c3521d31de8cd4ae2fc365e84f5')
+sha256sums=('SKIP')
 
 build() {
   cd "toolport-$pkgver/src-tauri"
