@@ -460,6 +460,10 @@ pub(super) struct RegistrySnapshot {
     pub(super) active_profile_id: String,
     pub(super) active_profile: String,
     pub(super) active_profile_tool_scope: std::collections::HashMap<String, Vec<String>>,
+    /// Whether this install is paired with a team. Drives the Team sidebar row,
+    /// which has to appear the moment pairing writes the registry, not only on
+    /// the next launch.
+    pub(super) paired: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -548,6 +552,7 @@ impl RegistrySnapshot {
             active_profile_tool_scope,
             profiles,
             servers,
+            paired: registry.team.is_some(),
         }
     }
 }

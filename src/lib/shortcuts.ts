@@ -1,16 +1,9 @@
 import type { View } from "./types";
 
-/** Views in the order their number key selects them (SBS-143). */
-export const SHORTCUT_VIEWS: View[] = [
-  "servers",
-  "activity",
-  "catalog",
-  "playground",
-  "teams",
-  "settings",
-  // Keep the shipped 1–6 mappings stable; Clients was promoted later.
-  "clients",
-];
+/** Views in the order their number key selects them (SBS-143). The four 2.0
+ * sidebar views, in sidebar order; Team is click-only and catalog, Playground,
+ * Agent rules and Agent activity are no longer top-level. */
+export const SHORTCUT_VIEWS: View[] = ["servers", "clients", "activity", "settings"];
 
 /** What a keystroke resolved to, or `null` when it is not a shortcut. */
 export type ShortcutAction =
@@ -104,7 +97,7 @@ export interface ShortcutHelpRow {
 export function shortcutHelp(isMac: boolean): ShortcutHelpRow[] {
   const mod = isMac ? "⌘" : "Ctrl";
   return [
-    { keys: `${mod}1 – ${mod}7`, what: "Switch view" },
+    { keys: `${mod}1 – ${mod}4`, what: "Switch view" },
     { keys: `/ or ${mod}F`, what: "Focus the server search" },
     { keys: `${mod}N`, what: "Add a server" },
     { keys: `${mod}R`, what: "Refresh servers and clients" },

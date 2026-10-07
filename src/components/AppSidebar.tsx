@@ -5,7 +5,6 @@ import {
   ClipboardList,
   Compass,
   ExternalLink,
-  FlaskConical,
   FolderOpen,
   Layers,
   Loader2,
@@ -13,7 +12,6 @@ import {
   ScrollText,
   Settings,
   Share2,
-  Store,
   Users,
   Zap,
 } from "lucide-react";
@@ -517,6 +515,8 @@ export function AppSidebar({
     </button>
   );
 
+  const paired = registry?.team != null;
+
   return (
     <aside className="flex h-screen w-72 shrink-0 flex-col border-r bg-sidebar">
       <div className="flex items-center gap-2.5 px-4 py-4">
@@ -561,22 +561,13 @@ export function AppSidebar({
         )}
 
         <nav aria-label="Views" className="flex flex-col gap-0.5 px-3 pt-2">
-          {navItem(Layers, "All servers", view === "servers", () =>
-            onSelectView("servers"),
-          )}
+          {navItem(Layers, "Servers", view === "servers", () => onSelectView("servers"))}
           {navItem(MonitorCog, "Clients", view === "clients", () =>
             onSelectView("clients"),
-          )}
-          {navItem(Store, "Browse catalog", view === "catalog", () =>
-            onSelectView("catalog"),
-          )}
-          {navItem(FlaskConical, "Playground", view === "playground", () =>
-            onSelectView("playground"),
           )}
           {navItem(ScrollText, "Activity", view === "activity", () =>
             onSelectView("activity"),
           )}
-          {navItem(Users, "Teams", view === "teams", () => onSelectView("teams"))}
           {navItem(
             Settings,
             "Settings",
@@ -585,6 +576,8 @@ export function AppSidebar({
             quarantinedCount,
             quarantineStale,
           )}
+          {paired &&
+            navItem(Users, "Team", view === "teams", () => onSelectView("teams"))}
         </nav>
 
         {savings && savings.tokensSaved > 0 && (
