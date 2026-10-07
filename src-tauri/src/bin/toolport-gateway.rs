@@ -19709,25 +19709,12 @@ mod tests {
                     None,
                     None,
                 )));
-                execute_call(
-                    &reg,
-                    &snapshot,
-                    &snapshot.aggregated_tools(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    "s__work",
-                    json!({}),
-                    None,
-                    None,
-                    CallOpts {
-                        direct: true,
-                        shape: false,
-                        allow_app_only: true,
-                    },
-                    Some(&state.router),
-                )
+                match prepare_dispatch(
+                    &snapshot, Some(&state.router), DispatchTarget::Tool("s__work"), None, false,
+                ).and_then(|()| snapshot.route_call("s__work", json!({}))) {
+                    Ok(result) => result,
+                    Err(message) => json!({"isError":true, "content":[{"type":"text", "text":message}]}),
+                }
             });
             // The connector holds the call until its live tool scope is revoked.
             started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
