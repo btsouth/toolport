@@ -1282,48 +1282,46 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           registry?.teamForcedBlockOnInjection) && (
           <p className="text-xs">Team policy raises the effective safety level.</p>
         )}
-          {quarantined.length === 0 && quarantineError && (
-            <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
+        {quarantined.length === 0 && quarantineError && (
+          <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">
+            <ShieldX className="size-4 shrink-0 text-destructive" />
+            <span>Couldn&apos;t read quarantine status. Retrying every 15s.</span>
+          </div>
+        )}
+        {quarantined.length > 0 && (
+          <div className="flex flex-col gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
+            <div className="flex items-center gap-2">
               <ShieldX className="size-4 shrink-0 text-destructive" />
-              <span>Couldn&apos;t read quarantine status. Retrying every 15s.</span>
+              <span className="text-sm font-medium">Quarantined tools</span>
+              <span className="text-xs text-muted-foreground">
+                {quarantineError ? "status may be stale" : "blocked until you re-approve"}
+              </span>
             </div>
-          )}
-          {quarantined.length > 0 && (
-            <div className="flex flex-col gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2.5">
-              <div className="flex items-center gap-2">
-                <ShieldX className="size-4 shrink-0 text-destructive" />
-                <span className="text-sm font-medium">Quarantined tools</span>
-                <span className="text-xs text-muted-foreground">
-                  {quarantineError
-                    ? "status may be stale"
-                    : "blocked until you re-approve"}
-                </span>
-              </div>
-              <ul className="flex flex-col gap-1.5">
-                {quarantined.map((q) => (
-                  <li
-                    key={`${q.profile}:${q.tool}`}
-                    className="flex items-center gap-2 text-xs"
+            <ul className="flex flex-col gap-1.5">
+              {quarantined.map((q) => (
+                <li
+                  key={`${q.profile}:${q.tool}`}
+                  className="flex items-center gap-2 text-xs"
+                >
+                  <span className="min-w-0 truncate font-mono">{q.tool}</span>
+                  <span
+                    className="min-w-0 truncate text-muted-foreground"
+                    title={q.detail || q.reason}
                   >
-                    <span className="min-w-0 truncate font-mono">{q.tool}</span>
-                    <span
-                      className="min-w-0 truncate text-muted-foreground"
-                      title={q.detail || q.reason}
-                    >
-                      {q.detail ? q.detail : q.reason}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => reapprove(q)}
-                      className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
-                    >
-                      Re-approve
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
+                    {q.detail ? q.detail : q.reason}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => reapprove(q)}
+                    className="ml-auto shrink-0 rounded-md border bg-background px-2 py-0.5 text-[11px] font-medium hover:bg-accent"
+                  >
+                    Re-approve
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <details>
           <summary>Advanced</summary>
           {toggle(
