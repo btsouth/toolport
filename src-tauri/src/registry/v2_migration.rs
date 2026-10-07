@@ -1018,4 +1018,151 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "two");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn ordinary_save_preserves_migrated_nested_fields() {
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _data = data_dir_test_lock();
+        let dir = scratch_dir("migrated-nested-save");
+        let _override = DataDirOverride::set(&dir);
+        let path = dir.join("registry.json");
+        write_json(&path, &brandon_v1(&dir));
+        let mut loaded = load_from(&path).unwrap();
+        let first = read_json(&path);
+        assert_eq!(first["team"]["futureTeamField"], json!({"keep": ["team"]}));
+        assert_eq!(first["servers"][0]["env"][0]["futureEnvField"], "keep-env");
+        assert_eq!(
+            first["clientManagedEntries"]["claude-desktop"]["futureEntryField"],
+            "keep-entry"
+        );
+        loaded.live_inspect = !loaded.live_inspect;
+        crate::registry::save_to(&path, &loaded).unwrap();
+        let saved = read_json(&path);
+        let observed = json!({"team": saved["team"]["futureTeamField"],
+            "env": saved["servers"][0]["env"][0]["futureEnvField"],
+            "client": saved["clientManagedEntries"]["claude-desktop"]["futureEntryField"]});
+        assert_eq!(
+            observed,
+            json!({"team": {"keep": ["team"]}, "env": "keep-env", "client": "keep-entry"})
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn catalog_migration_preserves_migrated_nested_fields() {
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _data = data_dir_test_lock();
+        let dir = scratch_dir("migrated-nested-catalog");
+        let _override = DataDirOverride::set(&dir);
+        let path = dir.join("registry.json");
+        let mut v1 = brandon_v1(&dir);
+        v1["servers"].as_array_mut().unwrap().push(json!({
+            "id": "atlassian-work", "name": "Atlassian", "transport": "http",
+            "url": "https://mcp.atlassian.com/v1/mcp/authv2", "source": "catalog:curated"
+        }));
+        write_json(&path, &v1);
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(
+            loaded.servers[2].url.as_deref(),
+            Some("https://mcp.atlassian.com/v2/mcp?tools=all")
+        );
+        let saved = read_json(&path);
+        let observed = json!({"team": saved["team"]["futureTeamField"],
+            "env": saved["servers"][0]["env"][0]["futureEnvField"],
+            "client": saved["clientManagedEntries"]["claude-desktop"]["futureEntryField"]});
+        assert_eq!(
+            observed,
+            json!({"team": {"keep": ["team"]}, "env": "keep-env", "client": "keep-entry"})
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v2_save_preserves_unknown_fields_at_every_persisted_depth() {
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _data = data_dir_test_lock();
+        let dir = scratch_dir("v2-nested-save");
+        let _override = DataDirOverride::set(&dir);
+        let path = dir.join("registry.json");
+        let mut document = serde_json::to_value(crate::registry::Registry::default()).unwrap();
+        document["servers"] = json!([{
+            "id": "custom", "name": "Custom", "transport": "stdio", "command": "echo",
+            "args": ["<launch-input>"], "env": [{"key": "ENV", "value": null}],
+            "clientCredentials": {"clientId": "client"},
+            "launch": {"inputs": [{"key": "INPUT", "label": "Input", "secret": false, "value": "value"}],
+                "bindings": [{"index": 0, "parts": [{"kind": "literal", "value": "/"}, {"kind": "input", "key": "INPUT"}]}]}
+        }]);
+        document["profiles"] =
+            json!([{"id": "default", "name": "Default", "enabledServerIds": ["custom"]}]);
+        document["folderProfiles"] = json!([{"path": "/project", "profile": "default"}]);
+        document["httpClients"] = json!([{"id": "web", "label": "Web", "tokenSha256": "hash"}]);
+        document["toolOverrides"] = json!({"custom": {"tool": {"name": "renamed"}}});
+        document["team"] = json!({"serverUrl": "https://teams.example.com", "teamId": "team", "role": "member",
+            "rateLimits": [{"id": "cap", "window": "day", "maxCalls": 10}]});
+        document["clientManagedEntries"] =
+            json!({"client": {"command": "gateway", "transport": "stdio"}});
+        let paths = [
+            "",
+            "/servers/0",
+            "/servers/0/env/0",
+            "/servers/0/clientCredentials",
+            "/servers/0/launch",
+            "/servers/0/launch/inputs/0",
+            "/servers/0/launch/bindings/0",
+            "/servers/0/launch/bindings/0/parts/0",
+            "/servers/0/launch/bindings/0/parts/1",
+            "/profiles/0",
+            "/folderProfiles/0",
+            "/httpClients/0",
+            "/toolOverrides/custom/tool",
+            "/semanticSearch",
+            "/team",
+            "/team/rateLimits/0",
+            "/clientManagedEntries/client",
+        ];
+        let sentinel = json!({"array": [null, true, 18446744073709551615u64, "\u{96ea}", {"known": "nested"}]});
+        for pointer in paths {
+            document
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("futureField".into(), sentinel.clone());
+        }
+        write_json(&path, &document);
+        let mut loaded = load_from(&path).unwrap();
+        // Known keys are consumed by serde rather than being replayed from the flatten map.
+        assert!(!loaded.servers[0].unknown_fields.contains_key("name"));
+        assert!(!loaded.servers[0].env[0]
+            .unknown_fields
+            .contains_key("value"));
+        assert!(!loaded
+            .team
+            .as_ref()
+            .unwrap()
+            .unknown_fields
+            .contains_key("teamId"));
+        loaded.servers[0].name = "Changed".into();
+        for _ in 0..2 {
+            crate::registry::save_to(&path, &loaded).unwrap();
+            let saved = read_json(&path);
+            assert_eq!(saved["servers"][0]["name"], "Changed");
+            assert!(saved["servers"][0]["env"][0].get("value").is_none());
+            for pointer in paths {
+                assert_eq!(
+                    saved.pointer(pointer).unwrap()["futureField"],
+                    sentinel,
+                    "{pointer}"
+                );
+            }
+            loaded = load_from(&path).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

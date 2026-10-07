@@ -436,6 +436,7 @@ fn mock_registry(reg: &mut Registry, dir: &Path) {
         registry::ToolOverride {
             name: Some("s__delete_item".into()),
             description: None,
+            unknown_fields: Default::default(),
         },
     );
 }
@@ -600,6 +601,7 @@ fn http_client_memory_failure_does_not_stop_other_clients_and_scope_stays_enforc
                     label: id.into(),
                     token_sha256: registry::sha256_hex(id),
                     profile: profile.into(),
+                    unknown_fields: Default::default(),
                 });
             }
         },

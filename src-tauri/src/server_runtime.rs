@@ -296,6 +296,7 @@ mod tests {
                     secret: false,
                     required: true,
                     value: Some("account".into()),
+                    unknown_fields: Default::default(),
                 },
                 LaunchInput {
                     key: "KEY".into(),
@@ -303,6 +304,7 @@ mod tests {
                     secret: false,
                     required: true,
                     value: Some("key".into()),
+                    unknown_fields: Default::default(),
                 },
                 LaunchInput {
                     key: "SECRET".into(),
@@ -310,6 +312,7 @@ mod tests {
                     secret: true,
                     required: true,
                     value: Some("secret".into()),
+                    unknown_fields: Default::default(),
                 },
             ],
             bindings: vec![ArgBinding {
@@ -317,14 +320,26 @@ mod tests {
                 parts: vec![
                     ArgPart::Input {
                         key: "ACCOUNT".into(),
+                        unknown_fields: Default::default(),
                     },
-                    ArgPart::Literal { value: "/".into() },
-                    ArgPart::Input { key: "KEY".into() },
-                    ArgPart::Literal { value: ":".into() },
+                    ArgPart::Literal {
+                        value: "/".into(),
+                        unknown_fields: Default::default(),
+                    },
+                    ArgPart::Input {
+                        key: "KEY".into(),
+                        unknown_fields: Default::default(),
+                    },
+                    ArgPart::Literal {
+                        value: ":".into(),
+                        unknown_fields: Default::default(),
+                    },
                     ArgPart::Input {
                         key: "SECRET".into(),
+                        unknown_fields: Default::default(),
                     },
                 ],
+                unknown_fields: Default::default(),
             }],
             ..Default::default()
         });
@@ -350,6 +365,7 @@ mod tests {
             key: "API_KEY".into(),
             value: None,
             secret: true,
+            unknown_fields: Default::default(),
         });
         server.launch = Some(LaunchConfig::default());
         assert!(!env_key_required(&server, "API_KEY"));

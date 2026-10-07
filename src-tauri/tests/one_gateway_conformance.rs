@@ -584,6 +584,7 @@ fn mock_server_entry(id: &str, transcript: &Path, cwd: Option<&str>) -> ServerEn
             key: "MOCK_MCP_TRANSCRIPT".to_string(),
             value: Some(transcript.display().to_string()),
             secret: false,
+            unknown_fields: Default::default(),
         }],
         url: None,
         source: Some("manual".to_string()),
@@ -604,6 +605,7 @@ fn profile(id: &str, enabled: &[&str]) -> Profile {
         enabled_server_ids: enabled.iter().map(|s| s.to_string()).collect(),
         tool_scope: std::collections::HashMap::new(),
         instructions: None,
+        unknown_fields: Default::default(),
     }
 }
 
@@ -1444,6 +1446,7 @@ fn matrix_rollout_default_selects_the_shared_daemon() {
         label: "Probe client".into(),
         token_sha256: registry::sha256_hex("registered-probe-token"),
         profile: String::new(),
+        unknown_fields: Default::default(),
     });
     registry::save_to(&path, &reg).expect("register probe client");
 
@@ -1593,6 +1596,7 @@ fn matrix_desktop_http_proxy_shares_daemon_and_releases_lease() {
         label: "Proxy client".into(),
         token_sha256: registry::sha256_hex("registered-proxy-token"),
         profile: String::new(),
+        unknown_fields: Default::default(),
     });
     registry::save_to(&registry_path, &reg).expect("register HTTP proxy client");
     let mut adapter = spawn_adapter(&dir, &AdapterOptions::default());
@@ -3437,6 +3441,7 @@ fn matrix_routing_declared_root_selects_folder_profile() {
     reg.folder_profiles.push(FolderProfile {
         path: root.display().to_string(),
         profile: "scope-two".to_string(),
+        unknown_fields: Default::default(),
     });
     let reported_root = conduit_lib::downstream::file_uri_to_path(&file_uri(&root))
         .expect("declared root URI must decode on this platform");
@@ -3683,6 +3688,7 @@ fn matrix_routing_server_request_is_refused_while_another_client_has_a_call_in_f
         key: "MOCK_MCP_CONCURRENT".to_string(),
         value: Some("1".to_string()),
         secret: false,
+        unknown_fields: Default::default(),
     });
     write_registry(&dir, vec![server], vec![]);
     let options = AdapterOptions {

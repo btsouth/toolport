@@ -18798,6 +18798,7 @@ mod tests {
                 m
             },
             instructions: None,
+            unknown_fields: Default::default(),
         });
         reg.profiles.push(registry::Profile {
             id: "b".into(),
@@ -18812,6 +18813,7 @@ mod tests {
                 m
             },
             instructions: None,
+            unknown_fields: Default::default(),
         });
         let merged = merge_tool_scopes_for_http(&reg);
         let set = merged.get("team_gh").expect("org scope present");
@@ -19032,6 +19034,7 @@ mod tests {
             call_audit_export_cursor: None,
             call_audit_export: false,
             rate_limits: Vec::new(),
+            unknown_fields: Default::default(),
         });
         assert_eq!(
             router_relevant(&reg),
@@ -20011,6 +20014,7 @@ mod tests {
         reg.folder_profiles = vec![registry::FolderProfile {
             path: "/proj/work".into(),
             profile: "Work".into(),
+            unknown_fields: Default::default(),
         }];
         reg.client_scopes.insert("cursor".into(), "Billing".into());
         let env = Some("Env".to_string());
@@ -22863,6 +22867,7 @@ mod tests {
             label: "full".into(),
             token_sha256: registry::sha256_hex("fulltok"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         assert_eq!(
             resolve_http_scope(&reg, None, Some("fulltok"), false, true),
@@ -22879,6 +22884,7 @@ mod tests {
             label: "scoped".into(),
             token_sha256: registry::sha256_hex("scopedtok"),
             profile: "Default".into(),
+            unknown_fields: Default::default(),
         });
         assert!(matches!(
             resolve_http_scope(&reg, None, Some("scopedtok"), false, true),
@@ -22916,6 +22922,7 @@ mod tests {
             label: "Cursor".into(),
             token_sha256: registry::sha256_hex("client-token"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
 
         let (_, caller) =
@@ -23010,6 +23017,7 @@ mod tests {
             label: "Cursor".into(),
             token_sha256: registry::sha256_hex("tok1"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         assert_eq!(
             http_client_label(&reg, Some("tok1")).as_deref(),
@@ -23021,6 +23029,7 @@ mod tests {
             label: "   ".into(),
             token_sha256: registry::sha256_hex("tok2"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         assert_eq!(http_client_label(&reg, Some("tok2")).as_deref(), Some("c2"));
     }
@@ -23034,12 +23043,14 @@ mod tests {
             label: "Open WebUI".into(),
             token_sha256: registry::sha256_hex("tok1"),
             profile: billing,
+            unknown_fields: Default::default(),
         });
         reg.http_clients.push(registry::HttpClient {
             id: "c2".into(),
             label: "Open WebUI".into(),
             token_sha256: registry::sha256_hex("tok2"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
 
         let (_, first) = resolve_http_caller(&reg, None, Some("tok1"), false, true).unwrap();
@@ -23066,12 +23077,14 @@ mod tests {
             label: "Open WebUI".into(),
             token_sha256: registry::sha256_hex("t-a"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         reg.http_clients.push(registry::HttpClient {
             id: "beta".into(),
             label: "Open WebUI".into(),
             token_sha256: registry::sha256_hex("t-b"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         let (_, a) = resolve_http_caller(&reg, None, Some("t-a"), false, true).unwrap();
         let (_, b) = resolve_http_caller(&reg, None, Some("t-b"), false, true).unwrap();
@@ -24772,6 +24785,7 @@ mod tests {
             label: "Open WebUI".into(),
             token_sha256: registry::sha256_hex("tok-personal"),
             profile: personal,
+            unknown_fields: Default::default(),
         });
         let (allowed, caller) =
             resolve_http_caller(&reg, None, Some("tok-personal"), false, true).unwrap();
@@ -24799,6 +24813,7 @@ mod tests {
             label: "Claude Code".into(),
             token_sha256: registry::sha256_hex("tok-cc"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         let resolve = |reg: &Registry| {
             resolve_http_caller(reg, None, Some("tok-cc"), false, true)
@@ -25137,6 +25152,7 @@ mod tests {
                 enabled_server_ids: servers.into_iter().map(String::from).collect(),
                 tool_scope: HashMap::new(),
                 instructions: None,
+                unknown_fields: Default::default(),
             });
         }
         let calls = Arc::new(AtomicUsize::new(0));
@@ -26892,6 +26908,7 @@ mod tests {
                 label: id.into(),
                 token_sha256: registry::sha256_hex(id),
                 profile: profile.into(),
+                unknown_fields: Default::default(),
             });
         }
         *state.registry.lock().unwrap() = reg.clone();
@@ -30865,6 +30882,7 @@ mod tests {
             label: "Open WebUI".into(),
             token_sha256: registry::sha256_hex("tok"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         conduit_lib::registry::save_to(&reg_path, &with_client).unwrap();
 

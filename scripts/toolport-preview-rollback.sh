@@ -126,7 +126,21 @@ registry_version() {
 }
 
 newest_v1_backup() {
-  find "$data_dir" -maxdepth 1 -name 'registry.json.v1-*.bak' -printf '%f\n' | sort | tail -n 1
+  # A preview may never have created its data directory. Only absence is safe
+  # to treat as no backups; permission and other I/O errors must still stop us.
+  python3 - "$data_dir" <<'PYTHON'
+import fnmatch
+import os
+import sys
+
+try:
+    with os.scandir(sys.argv[1]) as entries:
+        backups = [entry.name for entry in entries
+                   if fnmatch.fnmatchcase(entry.name, "registry.json.v1-*.bak")]
+except FileNotFoundError:
+    backups = []
+print(max(backups, default=""))
+PYTHON
 }
 
 # Put a backup in place without ever leaving the registry missing: copy it beside

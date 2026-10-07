@@ -5395,6 +5395,7 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
         key: k.to_string(),
         value: Some(v.to_string()),
         secret: false,
+        unknown_fields: Default::default(),
     };
     // Discovery mode (lazy vs full) is NOT written here: the gateway reads it
     // from the registry, so the app's global setting governs every client
@@ -6849,12 +6850,14 @@ mod tests {
             key: crate::brand::CLIENT_ID.to_string(),
             value: Some(client_id.to_string()),
             secret: false,
+            unknown_fields: Default::default(),
         }];
         if let Some(p) = profile.map(str::trim).filter(|p| !p.is_empty()) {
             env.push(EnvVar {
                 key: crate::brand::PROFILE.to_string(),
                 value: Some(p.to_string()),
                 secret: false,
+                unknown_fields: Default::default(),
             });
         }
         ServerEntry {
@@ -7009,6 +7012,7 @@ mod tests {
                 key: "TOKEN".to_string(),
                 value: Some("plain-value".to_string()),
                 secret: false,
+                unknown_fields: Default::default(),
             }],
             url: None,
             source: None,
@@ -7034,6 +7038,7 @@ mod tests {
                 key: "Authorization".to_string(),
                 value: Some("Bearer fixture".to_string()),
                 secret: false,
+                unknown_fields: Default::default(),
             }],
             url: Some(format!("https://{name}.example.com/mcp")),
             source: None,
@@ -8018,6 +8023,7 @@ bad = "not-a-table"
                 transport: "sharedHttp".into(),
                 url: Some("http://127.0.0.1:8765/mcp".into()),
                 updated_at: 1,
+                unknown_fields: Default::default(),
             };
             // Even an old ownership record must not authorize a startup conversion.
             record.command = "/opt/Toolport/bin/conduit-gateway-1.0.0".into();
@@ -8147,6 +8153,7 @@ bad = "not-a-table"
             transport: "stdio".into(),
             url: None,
             updated_at: 1,
+            unknown_fields: Default::default(),
         };
         let matching = McpServer {
             name: GATEWAY_ENTRY_NAME.into(),
@@ -8210,6 +8217,7 @@ bad = "not-a-table"
             transport: "stdio".to_string(),
             url: None,
             updated_at: 0,
+            unknown_fields: Default::default(),
         }
     }
 
@@ -10110,6 +10118,7 @@ command = "npx"
             key: "MY_MCP_TOKEN".to_string(),
             value: None,
             secret: true,
+            unknown_fields: Default::default(),
         }];
 
         let servers = vec![

@@ -88,8 +88,8 @@ pub fn resolve_args_with(
         let mut value = String::new();
         for part in &binding.parts {
             match part {
-                ArgPart::Literal { value: literal } => value.push_str(literal),
-                ArgPart::Input { key } => {
+                ArgPart::Literal { value: literal, .. } => value.push_str(literal),
+                ArgPart::Input { key, .. } => {
                     let input = launch
                         .inputs
                         .iter()
@@ -154,6 +154,7 @@ mod tests {
                     secret: false,
                     required: true,
                     value: Some("AC123".into()),
+                    unknown_fields: Default::default(),
                 },
                 LaunchInput {
                     key: "KEY".into(),
@@ -161,15 +162,26 @@ mod tests {
                     secret: true,
                     required: true,
                     value: None,
+                    unknown_fields: Default::default(),
                 },
             ],
             bindings: vec![ArgBinding {
                 index: 2,
                 parts: vec![
-                    ArgPart::Input { key: "SID".into() },
-                    ArgPart::Literal { value: "/".into() },
-                    ArgPart::Input { key: "KEY".into() },
+                    ArgPart::Input {
+                        key: "SID".into(),
+                        unknown_fields: Default::default(),
+                    },
+                    ArgPart::Literal {
+                        value: "/".into(),
+                        unknown_fields: Default::default(),
+                    },
+                    ArgPart::Input {
+                        key: "KEY".into(),
+                        unknown_fields: Default::default(),
+                    },
                 ],
+                unknown_fields: Default::default(),
             }],
             ..Default::default()
         });
@@ -197,10 +209,15 @@ mod tests {
                 secret: false,
                 required: true,
                 value: Some("-e".into()),
+                unknown_fields: Default::default(),
             }],
             bindings: vec![ArgBinding {
                 index: 0,
-                parts: vec![ArgPart::Input { key: "FLAG".into() }],
+                parts: vec![ArgPart::Input {
+                    key: "FLAG".into(),
+                    unknown_fields: Default::default(),
+                }],
+                unknown_fields: Default::default(),
             }],
             ..Default::default()
         });
@@ -222,12 +239,15 @@ mod tests {
                 secret: false,
                 required: true,
                 value: Some("/tmp".into()),
+                unknown_fields: Default::default(),
             }],
             bindings: vec![ArgBinding {
                 index: 2,
                 parts: vec![ArgPart::Input {
                     key: "DIRECTORY".into(),
+                    unknown_fields: Default::default(),
                 }],
+                unknown_fields: Default::default(),
             }],
             required_env: vec!["API_KEY".into()],
             ..Default::default()

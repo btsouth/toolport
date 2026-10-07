@@ -954,6 +954,7 @@ fn finish_connect(
         call_audit_export_cursor: None,
         call_audit_export: false,
         rate_limits: Vec::new(),
+        unknown_fields: Default::default(),
     };
     // Pull BEFORE loading the registry, then load a FRESH copy AFTER the (possibly
     // multi-second) network round trip and apply onto that — mirroring `sync_inner`.
@@ -3414,6 +3415,7 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
                         key,
                         value: None,
                         secret: e.get("secret").and_then(Value::as_bool).unwrap_or(true),
+                        unknown_fields: Default::default(),
                     })
                 })
                 .collect()
@@ -4770,6 +4772,7 @@ mod tests {
             enabled_server_ids: Vec::new(),
             tool_scope: Default::default(),
             instructions: None,
+            unknown_fields: Default::default(),
         });
         let cfg = json!({ "servers": [
             { "id": "review1", "name": "Review1", "transport": "stdio", "command": "run-me" }
@@ -5980,6 +5983,7 @@ mod tests {
             key: "GITHUB_TOKEN".into(),
             secret: true,
             value: Some("SYNTHETIC_ENV_SECRET".into()),
+            unknown_fields: Default::default(),
         }];
         let exported = team_server_export(&reg);
         let before = exported.clone();
@@ -6701,11 +6705,13 @@ mod tests {
                     key: "B".into(),
                     value: None,
                     secret: true,
+                    unknown_fields: Default::default(),
                 },
                 EnvVar {
                     key: "A".into(),
                     value: None,
                     secret: true,
+                    unknown_fields: Default::default(),
                 },
             ],
             url: None,
@@ -6729,17 +6735,26 @@ mod tests {
                 secret: false,
                 required: true,
                 value: None,
+                unknown_fields: Default::default(),
             }],
             bindings: vec![crate::registry::ArgBinding {
                 index: 2,
-                parts: vec![crate::registry::ArgPart::Input { key: "SID".into() }],
+                parts: vec![crate::registry::ArgPart::Input {
+                    key: "SID".into(),
+                    unknown_fields: Default::default(),
+                }],
+                unknown_fields: Default::default(),
             }],
             ..Default::default()
         });
         let before_binding_change = consent_fingerprint(&bound);
-        bound.launch.as_mut().unwrap().bindings[0]
-            .parts
-            .insert(0, crate::registry::ArgPart::Literal { value: "/".into() });
+        bound.launch.as_mut().unwrap().bindings[0].parts.insert(
+            0,
+            crate::registry::ArgPart::Literal {
+                value: "/".into(),
+                unknown_fields: Default::default(),
+            },
+        );
         assert_ne!(
             consent_fingerprint(&bound),
             before_binding_change,

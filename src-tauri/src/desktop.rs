@@ -558,6 +558,7 @@ fn add_http_client(
             label: label.trim().to_string(),
             token_sha256: registry::sha256_hex(&token),
             profile: profile.unwrap_or_default().trim().to_string(),
+            unknown_fields: Default::default(),
         });
         Ok(())
     })?;
@@ -1287,6 +1288,7 @@ fn set_tool_override(
             registry::ToolOverride {
                 name: norm(name),
                 description: norm(description),
+                unknown_fields: Default::default(),
             },
         );
         Ok(())
@@ -4489,6 +4491,7 @@ mod tests {
                 key: "TOKEN".into(),
                 value: Some("sk-live-xyz".into()),
                 secret: true,
+                unknown_fields: Default::default(),
             }],
             url: None,
             source: None,
@@ -4982,6 +4985,7 @@ mod tests {
             enabled_server_ids: vec!["gh".into()],
             tool_scope: Default::default(),
             instructions: None,
+            unknown_fields: Default::default(),
         }];
         let mut baselines = BTreeMap::new();
         let bl = |fp: &str, fs: u64, lc: u64| integrity::ToolBaseline {

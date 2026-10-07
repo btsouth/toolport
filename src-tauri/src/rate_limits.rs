@@ -26,6 +26,9 @@ pub struct Cap {
     /// When set, only this original tool name (or `server/tool`) counts toward the cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
+    /// Fields from newer builds, preserved when persisted in the registry.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Parse `rateLimits` from a team config JSON blob. Unknown entries are skipped.
@@ -71,6 +74,7 @@ pub fn parse_caps(team_cfg: &Value) -> Vec<Cap> {
             window,
             max_calls: max,
             tool,
+            unknown_fields: Default::default(),
         });
     }
     out
@@ -432,6 +436,7 @@ mod tests {
             window: "day".into(),
             max_calls: 2,
             tool: None,
+            unknown_fields: Default::default(),
         }];
         assert!(check_and_count(&caps, "srv", "echo").is_ok());
         assert!(check_and_count(&caps, "srv", "add").is_ok());
@@ -450,12 +455,14 @@ mod tests {
                 window: "day".into(),
                 max_calls: 2,
                 tool: None,
+                unknown_fields: Default::default(),
             },
             Cap {
                 id: "team-day".into(),
                 window: "day".into(),
                 max_calls: 2,
                 tool: None,
+                unknown_fields: Default::default(),
             },
         ];
 
@@ -475,18 +482,21 @@ mod tests {
                 window: "day".into(),
                 max_calls: 10,
                 tool: None,
+                unknown_fields: Default::default(),
             },
             Cap {
                 id: "month-global".into(),
                 window: "month".into(),
                 max_calls: 10,
                 tool: None,
+                unknown_fields: Default::default(),
             },
             Cap {
                 id: "day-echo".into(),
                 window: "day".into(),
                 max_calls: 10,
                 tool: Some("echo".into()),
+                unknown_fields: Default::default(),
             },
         ];
 
@@ -508,6 +518,7 @@ mod tests {
             window: "day".into(),
             max_calls: 10,
             tool: None,
+            unknown_fields: Default::default(),
         }];
 
         *state_lock().lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -553,6 +564,7 @@ mod tests {
             window: "day".into(),
             max_calls: 2,
             tool: None,
+            unknown_fields: Default::default(),
         }];
 
         *state_lock().lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -598,6 +610,7 @@ mod tests {
             window: "day".into(),
             max_calls: 2,
             tool: None,
+            unknown_fields: Default::default(),
         }];
 
         *state_lock().lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -650,18 +663,21 @@ mod tests {
                 window: "day".into(),
                 max_calls: 10,
                 tool: None,
+                unknown_fields: Default::default(),
             },
             Cap {
                 id: "month".into(),
                 window: "month".into(),
                 max_calls: u64::MAX,
                 tool: None,
+                unknown_fields: Default::default(),
             },
             Cap {
                 id: "echo".into(),
                 window: "day".into(),
                 max_calls: 10,
                 tool: Some("echo".into()),
+                unknown_fields: Default::default(),
             },
         ];
 
@@ -757,6 +773,7 @@ mod tests {
             window: "day".into(),
             max_calls: 1,
             tool: Some("list_issues".into()),
+            unknown_fields: Default::default(),
         }];
         assert!(check_and_count(&caps, "linear", "create_issue").is_ok());
         assert!(check_and_count(&caps, "linear", "create_issue").is_ok());

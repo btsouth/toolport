@@ -152,6 +152,28 @@ sleep 0.2
 if kill -0 "$daemon" 2>/dev/null; then fail "Toolport gateway still running"; else pass "Toolport gateway stopped"; fi
 if kill -0 "$stranger" 2>/dev/null; then pass "unrelated process left alone"; else fail "unrelated process was killed"; fi
 
+# A preview install that never created its data directory still reinstalls 1.x.
+setup absent-data-directory
+rmdir "$TOOLPORT_DATA_DIR"
+if out="$(rollback 2>&1)"; then
+  pass "absent data directory does not block rollback"
+else
+  fail "absent data directory blocks reinstall: $out"
+fi
+grep -qx -- "-S toolport" "$PACMAN_LOG" && pass "package reinstall reached without a data directory" || fail "no package reinstall without data directory"
+echo "$out" | grep -q "Registry: none at .*Nothing to restore" && pass "absent registry reported" || fail "output: $out"
+
+# An invalid data-directory path is an I/O failure, not an absent directory.
+setup invalid-data-directory
+rmdir "$TOOLPORT_DATA_DIR"
+printf 'not a directory\n' > "$TOOLPORT_DATA_DIR"
+if rollback >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "invalid data directory allowed reinstall"
+else
+  pass "invalid data directory stops rollback"
+fi
+[ ! -s "$PACMAN_LOG" ] && pass "nothing reinstalled after directory I/O failure" || fail "pacman ran: $(cat "$PACMAN_LOG")"
+
 if [ "$failures" -gt 0 ]; then
   echo "$failures failure(s)" >&2
   exit 1

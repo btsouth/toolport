@@ -170,6 +170,7 @@ fn write_registry(scratch: &Scratch, wrapped: bool) {
         key: key.to_string(),
         value: Some(value),
         secret: false,
+        unknown_fields: Default::default(),
     })
     .collect();
     let server = ServerEntry {

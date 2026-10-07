@@ -9368,6 +9368,7 @@ mod tests {
             secret: false,
             required: true,
             value: Some("/previous/directory".into()),
+            unknown_fields: Default::default(),
         };
         super::apply_launch_probe_value(&mut input, "");
         assert_eq!(input.value, None, "the probe must use the cleared field");

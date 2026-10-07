@@ -797,6 +797,7 @@ mod tests {
             key: "TOKEN".into(),
             value: Some("must-not-enter-the-view".into()),
             secret: true,
+            unknown_fields: Default::default(),
         });
         registry.servers.push(local);
         registry.servers.push(server("remote", "GitHub", "http"));

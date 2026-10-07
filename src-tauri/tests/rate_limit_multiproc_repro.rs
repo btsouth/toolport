@@ -10,6 +10,7 @@ fn caps() -> Vec<Cap> {
         window: "day".into(),
         max_calls: 10_000,
         tool: None,
+        unknown_fields: Default::default(),
     }]
 }
 

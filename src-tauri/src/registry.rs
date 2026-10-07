@@ -556,6 +556,9 @@ pub struct EnvVar {
     pub value: Option<String>,
     #[serde(default)]
     pub secret: bool,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A named launch input. Only nonsecret values may be serialized here. Secret
@@ -570,13 +573,24 @@ pub struct LaunchInput {
     pub required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ArgPart {
-    Literal { value: String },
-    Input { key: String },
+    Literal {
+        value: String,
+        #[serde(flatten)]
+        unknown_fields: serde_json::Map<String, serde_json::Value>,
+    },
+    Input {
+        key: String,
+        #[serde(flatten)]
+        unknown_fields: serde_json::Map<String, serde_json::Value>,
+    },
 }
 
 /// Replaces exactly one argument at `index`. Parts are concatenated without a
@@ -586,6 +600,9 @@ pub enum ArgPart {
 pub struct ArgBinding {
     pub index: usize,
     pub parts: Vec<ArgPart>,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -603,6 +620,9 @@ pub struct LaunchConfig {
     pub template: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<u32>,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 impl LaunchConfig {
@@ -650,14 +670,14 @@ impl LaunchConfig {
                 return Err("launch argument binding has an invalid or duplicate index".into());
             }
             for part in &binding.parts {
-                if let ArgPart::Literal { value } = part {
+                if let ArgPart::Literal { value, .. } = part {
                     if value.len() > 32
                         || value.chars().any(|c| c.is_alphanumeric() || c.is_control())
                     {
                         return Err("launch argument literals may contain punctuation only".into());
                     }
                 }
-                if let ArgPart::Input { key } = part {
+                if let ArgPart::Input { key, .. } = part {
                     if !keys.contains(key.as_str()) {
                         return Err(format!("launch argument refers to missing input '{key}'"));
                     }
@@ -907,6 +927,9 @@ pub struct Profile {
     /// server's instructions into context don't repeat the same block once per profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Maps a project folder to a profile, so the gateway can auto-scope a client to the right
@@ -919,6 +942,9 @@ pub struct Profile {
 pub struct FolderProfile {
     pub path: String,
     pub profile: String,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A consumer registered to reach the gateway over the HTTP/OpenAPI bridge with
@@ -936,6 +962,9 @@ pub struct HttpClient {
     /// (no extra filtering), so it behaves like the legacy single-token bridge.
     #[serde(default)]
     pub profile: String,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 /// SHA-256 (hex) of a string. Used to hash bearer tokens so plaintext never hits
@@ -1007,6 +1036,9 @@ pub struct ToolOverride {
     /// A replacement description shown to the client instead of the server's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1248,6 +1280,9 @@ pub struct ManagedEntry {
     /// Unix epoch seconds when we last wrote this entry.
     #[serde(default)]
     pub updated_at: u64,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 fn managed_transport_stdio() -> String {
@@ -1292,6 +1327,7 @@ impl ManagedEntry {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            unknown_fields: Default::default(),
         }
     }
 }
@@ -1396,6 +1432,9 @@ pub struct TeamConnection {
     /// the team server; empty = no org caps. Enforced cooperatively in the local gateway.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rate_limits: Vec<crate::rate_limits::Cap>,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Settings for embedding-based search re-ranking. The embedding API key, if the
@@ -1413,6 +1452,9 @@ pub struct SemanticSettings {
     /// Weight of semantic vs lexical, 0.0 (pure lexical) .. 1.0 (pure semantic).
     #[serde(default = "default_blend")]
     pub blend: f32,
+    /// Fields from newer builds, preserved on every registry save.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_blend() -> f32 {
@@ -1426,6 +1468,7 @@ impl Default for SemanticSettings {
             endpoint: String::new(),
             model: String::new(),
             blend: 0.5,
+            unknown_fields: Default::default(),
         }
     }
 }
@@ -1453,6 +1496,7 @@ impl Default for Registry {
                 enabled_server_ids: Vec::new(),
                 tool_scope: HashMap::new(),
                 instructions: None,
+                unknown_fields: Default::default(),
             }],
             active_profile_id: Some(DEFAULT_PROFILE_ID.to_string()),
             safety_level: Some(SafetyLevel::Ask),
@@ -2317,6 +2361,7 @@ impl Registry {
             enabled_server_ids: Vec::new(),
             tool_scope: HashMap::new(),
             instructions: None,
+            unknown_fields: Default::default(),
         });
         id
     }
@@ -3515,6 +3560,7 @@ fn migrate_curated_legacy(registry: &mut Registry) -> bool {
                 key: key.clone(),
                 value: None,
                 secret: true,
+                unknown_fields: Default::default(),
             })
             .collect();
         // Changed requirements must be reviewed and completed before launch.
@@ -3731,11 +3777,13 @@ mod catalog_launch_migration_tests {
             key: "SLACK_BOT_TOKEN".into(),
             value: None,
             secret: true,
+            unknown_fields: Default::default(),
         }];
         server.env.push(EnvVar {
             key: "SLACK_TEAM_ID".into(),
             value: None,
             secret: true,
+            unknown_fields: Default::default(),
         });
         let mut registry = Registry::default();
         registry.servers.push(server);
@@ -4878,6 +4926,7 @@ mod tests {
             ToolOverride {
                 name: Some("repo-search".to_string()),
                 description: None,
+                unknown_fields: Default::default(),
             },
         );
         r.set_tool_pinned(&id, "create_issue", true);
@@ -4927,6 +4976,7 @@ mod tests {
             ToolOverride {
                 name: Some("repo-search".to_string()),
                 description: None,
+                unknown_fields: Default::default(),
             },
         );
         r.set_tool_pinned(&id, "create_issue", true);
@@ -5118,14 +5168,17 @@ mod tests {
             FolderProfile {
                 path: "/home/me/work".into(),
                 profile: "Work".into(),
+                unknown_fields: Default::default(),
             },
             FolderProfile {
                 path: "/home/me/work/client-a".into(),
                 profile: "ClientA".into(),
+                unknown_fields: Default::default(),
             },
             FolderProfile {
                 path: "/home/me/personal".into(),
                 profile: "Personal".into(),
+                unknown_fields: Default::default(),
             },
         ];
         // Exact match, and a descendant picks the parent mapping.
@@ -5224,14 +5277,17 @@ mod tests {
             FolderProfile {
                 path: "/a".into(),
                 profile: "P".into(),
+                unknown_fields: Default::default(),
             },
             FolderProfile {
                 path: "  ".into(),
                 profile: "P".into(),
+                unknown_fields: Default::default(),
             }, // blank path
             FolderProfile {
                 path: "/b".into(),
                 profile: " ".into(),
+                unknown_fields: Default::default(),
             }, // blank profile
         ]);
         assert_eq!(r.folder_profiles.len(), 1);
@@ -5244,6 +5300,7 @@ mod tests {
         r.folder_profiles = vec![FolderProfile {
             path: "/home/me/work/".into(),
             profile: "Work".into(),
+            unknown_fields: Default::default(),
         }];
         // A trailing slash on the mapping and backslash separators in the root both normalize.
         assert_eq!(r.profile_for_root("/home/me/work"), Some("Work".into()));
@@ -5308,6 +5365,7 @@ mod tests {
             transport: "stdio".into(),
             url: None,
             updated_at: 42,
+            unknown_fields: Default::default(),
         };
         r.set_client_managed_entry("claude-desktop", entry.clone());
         assert_eq!(r.client_managed_entry("claude-desktop"), Some(&entry));
@@ -5362,6 +5420,7 @@ mod tests {
             label: "Open WebUI".into(),
             token_sha256: sha256_hex(token),
             profile: "Billing".into(),
+            unknown_fields: Default::default(),
         });
         // The plaintext token resolves to its client; a wrong token doesn't.
         assert_eq!(
@@ -5400,12 +5459,14 @@ mod tests {
             label: "x".into(),
             token_sha256: "h1".into(),
             profile: "Billing".into(),
+            unknown_fields: Default::default(),
         });
         r.http_clients.push(HttpClient {
             id: "2".into(),
             label: "y".into(),
             token_sha256: "h2".into(),
             profile: "Support".into(),
+            unknown_fields: Default::default(),
         });
         let ids: Vec<_> = r
             .bridge_enabled_servers(None)
@@ -5420,6 +5481,7 @@ mod tests {
             label: "z".into(),
             token_sha256: "h3".into(),
             profile: String::new(),
+            unknown_fields: Default::default(),
         });
         assert_eq!(r.bridge_enabled_servers(None).len(), 3);
     }
@@ -6474,6 +6536,7 @@ mod tests {
             label: "Open WebUI".into(),
             token_sha256: sha256_hex("tok"),
             profile: String::new(),
+            unknown_fields: Default::default(),
         }
     }
 
