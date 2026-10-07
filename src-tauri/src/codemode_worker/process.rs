@@ -117,8 +117,8 @@ fn error_result(error: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": error }], "isError": true })
 }
 
-/// Only the parent owns host bindings. Every script, including dry runs and
-/// routines, uses the same process boundary and bounded pipe queues.
+/// Only the parent owns host bindings. Every script, including dry runs, uses the
+/// same process boundary and bounded pipe queues.
 #[allow(clippy::too_many_arguments)]
 pub fn run_script(
     script: &str,

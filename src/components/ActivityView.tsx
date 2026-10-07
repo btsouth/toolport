@@ -138,7 +138,7 @@ function securityKey(e: SecurityEvent): string {
  * `security_dismissal_key`: the loud/actionable tier (high AND warn, per `eventSeverity`)
  * records the instance's timestamp too, so clearing one description rewrite does not also
  * silence a later, different rewrite of the same tool. The quiet tier keeps the
- * identity-only key so routine vendor churn stays dismissed. */
+ * identity-only key so ordinary vendor churn stays dismissed. */
 function dismissalKey(e: SecurityEvent): string {
   const identity = securityKey(e);
   return eventSeverity(e) === "high" ? `${identity}@${e.ts}` : identity;

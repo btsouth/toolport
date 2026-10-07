@@ -84,10 +84,9 @@ The profile is the one the connection is scoped to: a registered HTTP client's
 own profile, which is the active profile unless `TOOLPORT_PROFILE` sets another.
 Changes apply the next time a client connects and don't restart any servers.
 
-**Code mode limits.** Execution, validation, and saved routines run Boa in a separate
+**Code mode limits.** Execution and validation run Boa in a separate
 worker process. The parent enforces the 60-second wall-clock budget even during pure
-JavaScript and permits at most four simultaneous runs. Saved routines can set lower
-execution limits. Each worker has a 512 MiB allocation budget: Linux uses `RLIMIT_AS`
+JavaScript and permits at most four simultaneous runs. Each worker has a 512 MiB allocation budget: Linux uses `RLIMIT_AS`
 before exec, Windows assigns the suspended child to a memory-limited Job Object, and
 macOS uses a worker-only Rust allocator cap because Darwin's `RLIMIT_AS` is advisory.
 The macOS cap covers Boa's Rust heap, not the process's total resident memory. Allocation

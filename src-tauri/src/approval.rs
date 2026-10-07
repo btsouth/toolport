@@ -56,9 +56,6 @@ pub enum ApprovalReason {
     UntrustedSource,
     /// Both of the above.
     DestructiveAndUntrusted,
-    /// Persisting an immutable Code Mode routine. This is always one-shot and binds to
-    /// the exact source, schema, limits, and content hash shown in the request.
-    PersistentCodeWrite,
     /// The call carries a pseudonym minted by a DIFFERENT server, so dispatching it would
     /// hand one server's data to another (SBS-696). Never produced by [`gate_reason`]: this
     /// gate is not about the tool at all, it is about a specific value's destination, and it

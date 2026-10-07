@@ -43,7 +43,7 @@
 //!   * recursion limit — depth, which trips almost immediately.
 //!
 //! These count iterations and depth, not allocation or elapsed time. Production
-//! execution, dry runs, and saved routines all require the worker boundary to contain
+//! execution and dry runs both require the worker boundary to contain
 //! allocation failures and terminate expensive built-ins.
 //!
 //! `pure_js_runaways_are_bounded_by_count_not_wall_clock` pins this so a boa upgrade that
@@ -88,12 +88,99 @@ pub struct FetchArgs {
 pub type FetchBinding = Arc<dyn Fn(FetchArgs) -> Value + Send + Sync>;
 
 /// The JSON payload exposed to a script. Ordinary Code Mode keeps its historical mutable
-/// `data` global. Persisted routines get a distinct, deeply frozen `input` global so a saved
-/// definition cannot mutate the arguments it was invoked with or observe a writable alias.
+/// `data` global; an immutable `input` global lets a caller pass validated, deeply frozen
+/// arguments that the script cannot mutate or alias.
 #[derive(Debug, Clone)]
 pub enum ScriptInput {
     Data(Value),
     ImmutableInput(Value),
+}
+
+/// Max bytes of a `run_script` source script accepted by the worker.
+pub const MAX_SOURCE_BYTES: usize = 256 * 1024;
+/// Max bytes of a `run_script` `inputSchema`.
+pub const MAX_SCHEMA_BYTES: usize = 64 * 1024;
+const MAX_VALIDATION_ERRORS: usize = 8;
+
+/// Validate an immutable `run_script` `input` against its caller-supplied JSON Schema before
+/// any downstream call runs. Only local `#` references are allowed and the schema must be a
+/// Draft 2020-12 object schema.
+pub fn validate_arguments(schema: &Value, arguments: &Value) -> Result<(), String> {
+    let validator = validate_input_schema(schema)?;
+    let errors: Vec<String> = validator
+        .iter_errors(arguments)
+        .take(MAX_VALIDATION_ERRORS)
+        .map(|error| {
+            format!(
+                "instance {} violates schema {}",
+                error.instance_path(),
+                error.schema_path()
+            )
+        })
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "run_script input is invalid: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+fn reject_external_refs(value: &Value, path: &str) -> Result<(), String> {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let child_path = format!("{path}/{key}");
+                if key == "$ref" {
+                    let reference = child
+                        .as_str()
+                        .ok_or_else(|| format!("inputSchema {child_path} must be a string"))?;
+                    if !reference.starts_with('#') {
+                        return Err(format!(
+                            "inputSchema {child_path} uses an external reference; only local # fragments are allowed"
+                        ));
+                    }
+                }
+                reject_external_refs(child, &child_path)?;
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                reject_external_refs(child, &format!("{path}/{index}"))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_input_schema(schema: &Value) -> Result<jsonschema::Validator, String> {
+    let object = schema
+        .as_object()
+        .ok_or_else(|| "inputSchema must be a JSON object".to_string())?;
+    if object.get("type").and_then(Value::as_str) != Some("object") {
+        return Err("inputSchema root must declare `type: object`".to_string());
+    }
+    if let Some(declared) = object.get("$schema").and_then(Value::as_str) {
+        if !matches!(
+            declared,
+            "https://json-schema.org/draft/2020-12/schema"
+                | "https://json-schema.org/draft/2020-12/schema#"
+        ) {
+            return Err("inputSchema must use JSON Schema Draft 2020-12".to_string());
+        }
+    }
+    let size = serde_json::to_vec(schema).map_err(|e| e.to_string())?.len();
+    if size > MAX_SCHEMA_BYTES {
+        return Err(format!("inputSchema exceeds {MAX_SCHEMA_BYTES} bytes"));
+    }
+    reject_external_refs(schema, "")?;
+    jsonschema::draft202012::meta::validate(schema)
+        .map_err(|e| format!("inputSchema is not valid Draft 2020-12: {e}"))?;
+    jsonschema::draft202012::new(schema)
+        .map_err(|e| format!("inputSchema could not be compiled: {e}"))
 }
 
 /// Resource limits for one script run. All are fail-closed: exceeding any of them aborts
@@ -1321,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn routine_input_is_deeply_immutable_and_has_no_data_alias() {
+    fn immutable_input_is_deeply_immutable_and_has_no_data_alias() {
         let out = returns_with_immutable_input(
             r#"
                 try { input.owner = "changed"; } catch (_) {}
@@ -2329,5 +2416,56 @@ mod tests {
         assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
         assert_eq!(out.calls, 0, "checkpoint must not count against max_calls");
         assert_eq!(out.checkpoint, Some(json!({ "a": 2 })));
+    }
+
+    #[test]
+    fn schema_validation_is_draft_2020_12_and_local_only() {
+        assert!(validate_input_schema(&json!({
+            "type": "object",
+            "$defs": { "value": { "type": "string" } },
+            "properties": { "value": { "$ref": "#/$defs/value" } }
+        }))
+        .is_ok());
+        assert!(validate_input_schema(&json!({
+            "type": "object",
+            "properties": { "value": { "$ref": "https://example.com/schema" } }
+        }))
+        .unwrap_err()
+        .contains("external reference"));
+        assert!(validate_input_schema(&json!({ "type": "string" })).is_err());
+        assert!(validate_input_schema(&json!({ "type": "not-a-type" })).is_err());
+    }
+
+    #[test]
+    fn argument_errors_report_paths_without_values() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "secret": { "type": "integer" } },
+            "required": ["secret"],
+            "additionalProperties": false
+        });
+        let error = validate_arguments(&schema, &json!({ "secret": "do-not-echo" })).unwrap_err();
+        assert!(error.contains("/secret"));
+        assert!(!error.contains("do-not-echo"));
+    }
+
+    #[test]
+    fn argument_errors_are_bounded_and_enforce_object_rules() {
+        let properties = (0..20)
+            .map(|index| (format!("field{index}"), json!({ "type": "integer" })))
+            .collect::<serde_json::Map<_, _>>();
+        let schema = json!({
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": false
+        });
+        let arguments = (0..20)
+            .map(|index| (format!("field{index}"), json!("private-value")))
+            .chain(std::iter::once(("unexpected".to_string(), json!(true))))
+            .collect::<serde_json::Map<_, _>>();
+
+        let error = validate_arguments(&schema, &Value::Object(arguments)).unwrap_err();
+        assert_eq!(error.matches("instance ").count(), MAX_VALIDATION_ERRORS);
+        assert!(!error.contains("private-value"));
     }
 }

@@ -341,153 +341,6 @@ pub fn record_decision(
     ));
 }
 
-/// Record a Routine management outcome without persisting source, schemas, or invocation
-/// arguments. `routine_id` and `content_hash` are stable identifiers safe for governance.
-pub fn record_routine(
-    action: &str,
-    routine_id: &str,
-    content_hash: &str,
-    ok: bool,
-    duration_ms: Option<u64>,
-    error: Option<&str>,
-    client: Option<&str>,
-) {
-    write_line(&routine_entry(
-        action,
-        routine_id,
-        content_hash,
-        ok,
-        duration_ms,
-        error,
-        client,
-    ));
-}
-
-/// Record objective Code Run promotion evidence without retaining source, input, arguments,
-/// intermediate results, final results, or approval tokens.
-/// One advisor hint actually rendered into a tool result. Carries tool names, counts,
-/// and the candidate runId - never argument values or draft source - so hint-shown →
-/// save conversion is measurable from the audit log alone.
-pub fn record_advisor_hint(
-    tier: &str,
-    tool: &str,
-    calls: usize,
-    run_id: Option<&str>,
-    client: Option<&str>,
-) {
-    let mut entry = json!({
-        "ts": epoch_millis() as u64,
-        "server": "toolport",
-        "tool": "routine.advisor.hint_shown",
-        "kind": "routine",
-        "action": "hint_shown",
-        "tier": tier,
-        "patternTool": tool,
-        "calls": calls,
-    });
-    if let Some(run_id) = run_id {
-        entry["runId"] = json!(run_id);
-    }
-    if let Some(client) = client.filter(|client| !client.is_empty()) {
-        entry["client"] = json!(client);
-    }
-    write_line(&entry);
-}
-
-/// A strong candidate was handed to the desktop app's passive suggestion area. The
-/// decision is recorded at publish time (delivery is fire-and-forget), carrying only
-/// identity and counts - never source, schema, or argument values.
-pub fn record_suggestion_published(
-    definition_fingerprint: &str,
-    calls: usize,
-    provenance: crate::routines::EvidenceProvenance,
-    client: Option<&str>,
-) {
-    let mut entry = json!({
-        "ts": epoch_millis() as u64,
-        "server": "toolport",
-        "tool": "routine.suggestion.published",
-        "kind": "routine",
-        "action": "suggestion_published",
-        "definitionFingerprint": definition_fingerprint,
-        "calls": calls,
-        "provenance": provenance,
-    });
-    if let Some(client) = client.filter(|client| !client.is_empty()) {
-        entry["client"] = json!(client);
-    }
-    write_line(&entry);
-}
-
-pub fn record_candidate(
-    assessment: &crate::routine_candidates::CandidateAssessment,
-    calls: usize,
-    duration_ms: u64,
-    client: Option<&str>,
-) {
-    let mut entry = json!({
-        "ts": epoch_millis() as u64,
-        "server": "toolport",
-        "tool": "code.run.candidate_assessed",
-        "kind": "routine",
-        "action": "candidate_assessed",
-        "runId": assessment.run_id,
-        "sourceHash": assessment.source_hash,
-        "eligible": assessment.eligible,
-        "promotionAvailable": assessment.promotion_available,
-        "recommendation": assessment.recommendation,
-        "reasonCodes": assessment.reason_codes,
-        "observedTools": assessment.observed_tools,
-        "riskClass": assessment.risk_class,
-        "provenance": assessment.provenance,
-        "calls": calls,
-        "durationMs": duration_ms,
-    });
-    if let Some(reason) = assessment.promotion_unavailable_reason {
-        entry["promotionUnavailableReason"] = json!(reason);
-    }
-    if let Some(client) = client.filter(|client| !client.is_empty()) {
-        entry["client"] = json!(client);
-    }
-    write_line(&entry);
-}
-
-fn routine_entry(
-    action: &str,
-    routine_id: &str,
-    content_hash: &str,
-    ok: bool,
-    duration_ms: Option<u64>,
-    error: Option<&str>,
-    client: Option<&str>,
-) -> Value {
-    let mut entry = json!({
-        "ts": epoch_millis() as u64,
-        "server": "toolport",
-        "tool": format!("routine.{action}"),
-        "kind": "routine",
-        "action": action,
-        "routineId": routine_id,
-        "contentHash": content_hash,
-        "ok": ok,
-    });
-    if let Some(ms) = duration_ms {
-        entry["durationMs"] = json!(ms);
-    }
-    if let Some(c) = client.filter(|c| !c.is_empty()) {
-        entry["client"] = json!(c);
-    }
-    if !ok {
-        if let Some(error) = error {
-            let trimmed: String = error.trim().chars().take(MAX_AUDIT_ERR_CHARS).collect();
-            if !trimmed.is_empty() {
-                entry["error"] = json!(trimmed);
-            }
-        }
-    }
-    entry
-}
-
 /// A stable SHA-256 (hex) of a call's arguments over a canonical JSON serialization
 /// (object keys sorted recursively), so the same logical call always hashes the same
 /// regardless of key order. This is the content-binding foundation: it proves "the exact
@@ -752,11 +605,11 @@ pub fn read_all() -> std::io::Result<Vec<Value>> {
 ///
 /// `None` means this line is not a tool call and must not increment call or
 /// success counters (SBS-932):
-/// - a missing `ok` is unknown, not success (advisor / suggestion / candidate
-///   writers omit the field)
+/// - a missing `ok` is unknown, not success
 /// - `kind` in {approval, routine, advisor, suggestion, candidate} is a
-///   governance or routine row, even when `ok` is present (`ok:true` on
-///   approval is intentional so a deny stays out of the error-rate numerator)
+///   governance row, including rows written by earlier versions, even when `ok`
+///   is present (`ok:true` on approval is intentional so a deny stays out of the
+///   error-rate numerator)
 pub fn tool_call_ok(entry: &Value) -> Option<bool> {
     let ok = entry.get("ok").and_then(Value::as_bool)?;
     match entry.get("kind").and_then(Value::as_str) {
@@ -1138,44 +991,6 @@ mod tests {
     }
 
     #[test]
-    fn routine_entry_records_duration_without_sensitive_payloads() {
-        let success = routine_entry(
-            "run",
-            "routine-1",
-            "deadbeef",
-            true,
-            Some(37),
-            None,
-            Some("cursor-work"),
-        );
-        assert_eq!(success["server"], "toolport");
-        assert_eq!(success["tool"], "routine.run");
-        assert_eq!(success["kind"], "routine");
-        assert_eq!(success["action"], "run");
-        assert_eq!(success["routineId"], "routine-1");
-        assert_eq!(success["contentHash"], "deadbeef");
-        assert_eq!(success["durationMs"], 37);
-        assert_eq!(success["client"], "cursor-work");
-        assert_eq!(success["ok"], true);
-        assert!(success.get("source").is_none());
-        assert!(success.get("inputSchema").is_none());
-        assert!(success.get("arguments").is_none());
-
-        let failed = routine_entry(
-            "save",
-            "routine-2",
-            "cafebabe",
-            false,
-            None,
-            Some("  validation failed  "),
-            None,
-        );
-        assert!(failed.get("durationMs").is_none());
-        assert!(failed.get("client").is_none());
-        assert_eq!(failed["error"], "validation failed");
-    }
-
-    #[test]
     fn agent_toggle_denial_record_proves_scope_without_leaking() {
         // A scoped client's out-of-scope toggle: the lookup never resolves the target,
         // so the record must carry resolvedServerId=null, decision=unresolved, and a
@@ -1277,7 +1092,7 @@ mod tests {
         assert_eq!(s["servers"].as_array().unwrap().len(), 0);
     }
 
-    /// HITL / routine rows must not inflate Activity "calls logged" or the
+    /// HITL / governance rows must not inflate Activity "calls logged" or the
     /// error-rate denominator. Missing `ok` is unknown, not success (SBS-932).
     #[test]
     fn aggregate_skips_hitl_and_omitted_ok_rows() {
@@ -1286,7 +1101,7 @@ mod tests {
             json!({"server":"github","tool":"wipe","ok":true,"kind":"approval","decision":"denied","held":true,"ts":20}),
             json!({"server":"github","tool":"wipe","ok":true,"kind":"approval","decision":"approved","held":false,"ts":30}),
             json!({"server":"github","tool":"wipe","ok":true,"ts":31,"durationMs":12}),
-            json!({"server":"toolport","tool":"routine.advisor.hint_shown","kind":"routine","action":"hint_shown","ts":40}),
+            json!({"server":"toolport","tool":"advisor.hint_shown","kind":"advisor","action":"hint_shown","ts":40}),
             json!({"server":"github","tool":"get","ok":false,"ts":50,"durationMs":4}),
         ];
         let s = aggregate(&entries);
@@ -1313,7 +1128,7 @@ mod tests {
             None
         );
         assert_eq!(
-            tool_call_ok(&json!({"ok":true,"kind":"routine","action":"save"})),
+            tool_call_ok(&json!({"ok":true,"kind":"advisor","action":"hint_shown"})),
             None
         );
         for kind in ["advisor", "suggestion", "candidate"] {

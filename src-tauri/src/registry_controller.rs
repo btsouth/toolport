@@ -186,7 +186,6 @@ pub struct EssentialSettings {
     pub safety_level: registry::SafetyLevel,
     pub lazy_discovery: bool,
     pub code_mode: bool,
-    pub allow_routine_writes: bool,
     pub allow_agent_control: bool,
     pub live_inspect: bool,
     pub deny_destructive: bool,
@@ -228,7 +227,6 @@ impl EssentialSettings {
             safety_level: registry.safety_level_selected(),
             lazy_discovery: registry.lazy_discovery,
             code_mode: registry.code_mode,
-            allow_routine_writes: registry.allow_routine_writes,
             allow_agent_control: registry.allow_agent_control,
             live_inspect: registry.live_inspect,
             deny_destructive: registry.deny_destructive_effective(),
@@ -252,7 +250,6 @@ impl EssentialSettings {
 pub enum EssentialSetting {
     LazyDiscovery,
     CodeMode,
-    AllowRoutineWrites,
     AllowAgentControl,
     LiveInspect,
     DenyDestructive,
@@ -1056,7 +1053,6 @@ pub fn set_essential_setting(
         match setting {
             EssentialSetting::LazyDiscovery => registry.set_lazy_discovery(enabled),
             EssentialSetting::CodeMode => registry.code_mode = enabled,
-            EssentialSetting::AllowRoutineWrites => registry.allow_routine_writes = enabled,
             EssentialSetting::AllowAgentControl => registry.allow_agent_control = enabled,
             EssentialSetting::LiveInspect => registry.set_live_inspect(enabled),
             EssentialSetting::DenyDestructive => registry.set_deny_destructive(enabled),
@@ -2201,7 +2197,6 @@ mod tests {
         registry.team_forced_pii_redaction = true;
         registry.lazy_discovery = false;
         registry.code_mode = false;
-        registry.allow_routine_writes = true;
         registry.allow_agent_control = true;
         registry.live_inspect = true;
 
@@ -2215,7 +2210,6 @@ mod tests {
         assert!(settings.pii_redaction_forced);
         assert!(!settings.lazy_discovery);
         assert!(!settings.code_mode);
-        assert!(settings.allow_routine_writes);
         assert!(settings.allow_agent_control);
         assert!(settings.live_inspect);
     }

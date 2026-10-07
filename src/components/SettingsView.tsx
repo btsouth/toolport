@@ -24,7 +24,6 @@ import {
   X,
 } from "lucide-react";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
-import { listen } from "@tauri-apps/api/event";
 import { toastError } from "@/lib/toast";
 import { Button } from "@/components/ui/button";
 import {
@@ -32,9 +31,6 @@ import {
   disableAutostart,
   enableAutostart,
   isAutostartEnabled,
-  approveRoutineSuggestion,
-  dismissRoutineSuggestion,
-  listRoutineSuggestions,
   clearInspectLog,
   httpBridgeStatus,
   listAllowedTools,
@@ -45,7 +41,6 @@ import {
   revokeAllowedTool,
   removeHttpClient,
   setAllowAgentControl,
-  setAllowRoutineWrites,
   setCodeMode,
   setSafetyLevel,
   setLazyDiscovery,
@@ -61,13 +56,7 @@ import {
   type HttpBridgeStatus,
   type QuarantinedTool,
 } from "@/lib/api";
-import type {
-  AllowedTool,
-  FolderProfile,
-  Profile,
-  Registry,
-  RoutineSuggestion,
-} from "@/lib/types";
+import type { AllowedTool, FolderProfile, Profile, Registry } from "@/lib/types";
 import { isGatewayServer } from "@/lib/types";
 import { useTheme, type Theme } from "@/lib/theme";
 import { Switch } from "@/components/ui/switch";
@@ -78,229 +67,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-
-/** Strong, repeated orchestration patterns the gateway queued for saving. Passive by
- * design: injection-hardened models measurably ignore save directives placed in tool
- * results (0/7 conversions, 2026-08-13), so the human converts here instead. One click
- * persists - the card carries the same disclosure the approval prompt would, so the
- * click IS the persistence authorization and no second prompt fires. */
-function RoutineSuggestions() {
-  const [suggestions, setSuggestions] = useState<RoutineSuggestion[]>([]);
-  const [names, setNames] = useState<Record<string, string>>({});
-  const [busy, setBusy] = useState<string | null>(null);
-  // SBS-879: a failed invoke is not an empty queue. Keep last-known cards and
-  // surface retry; only a successful read of [] hides the section. "error" is a load
-  // that never succeeded (nothing to show); "stale" is a failed refresh on top of a
-  // queue we already have (keep the cards, say the list may be out of date).
-  const [status, setStatus] = useState<"loading" | "ready" | "error" | "stale">(
-    "loading",
-  );
-  const [refreshing, setRefreshing] = useState(false);
-  // Mount, Retry and the "routine-suggestion" listener all call refresh(), so their
-  // invokes can overlap. Same latest-wins guard loadTools uses below: a slow failure
-  // must never overwrite a newer success (or vice versa).
-  const requestId = useRef(0);
-
-  const refresh = useCallback(async () => {
-    const id = requestId.current + 1;
-    requestId.current = id;
-    setRefreshing(true);
-    try {
-      const next = await listRoutineSuggestions();
-      if (requestId.current !== id) return;
-      setSuggestions(next);
-      setStatus("ready");
-    } catch {
-      if (requestId.current !== id) return;
-      // Only a read that never succeeded is a hard error; anything after one is stale.
-      setStatus((prev) => (prev === "ready" || prev === "stale" ? "stale" : "error"));
-    } finally {
-      if (requestId.current === id) setRefreshing(false);
-    }
-  }, []);
-
-  /** Drop a suggestion the broker already consumed. Refreshing alone is not enough:
-   * if the follow-up list fails we keep the previous queue, which would leave a ghost
-   * card whose Save now fails with "no queued suggestion with that fingerprint". */
-  const forget = useCallback((fingerprint: string) => {
-    // Discard any list started before the broker dropped this fingerprint; it would
-    // resurrect the card. The refresh that follows this call carries the newer id.
-    requestId.current += 1;
-    setSuggestions((prev) => prev.filter((s) => s.definitionFingerprint !== fingerprint));
-    setNames((prev) => {
-      if (!(fingerprint in prev)) return prev;
-      const next = { ...prev };
-      delete next[fingerprint];
-      return next;
-    });
-  }, []);
-
-  useEffect(() => {
-    void refresh();
-    // Event bridge may be absent (tests, plain-browser dev); polling refresh on
-    // mount already covered the initial state, so a failed subscribe is benign.
-    const unlisten = listen("routine-suggestion", () => void refresh()).catch(
-      () => () => {},
-    );
-    return () => {
-      void unlisten.then((stop) => stop());
-    };
-  }, [refresh]);
-
-  async function save(suggestion: RoutineSuggestion) {
-    const fingerprint = suggestion.definitionFingerprint;
-    setBusy(fingerprint);
-    try {
-      await approveRoutineSuggestion(
-        fingerprint,
-        names[fingerprint]?.trim() || suggestion.suggestedName,
-      );
-      forget(fingerprint);
-      await refresh();
-    } catch (e) {
-      toastError(`Couldn't save the routine: ${e}`);
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function dismiss(fingerprint: string) {
-    setBusy(fingerprint);
-    try {
-      await dismissRoutineSuggestion(fingerprint);
-      forget(fingerprint);
-      await refresh();
-    } catch (e) {
-      toastError(`Couldn't dismiss the suggestion: ${e}`);
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  if (status === "loading") return null;
-  if (suggestions.length === 0) {
-    // A successful empty read, or a queue we just drained ourselves, hides the section.
-    // Only a load that never succeeded has something to report.
-    if (status !== "error") return null;
-    return (
-      <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-muted/20 p-3 text-xs text-muted-foreground">
-        <Braces className="size-3.5 shrink-0 text-warning" />
-        <span>Couldn&apos;t load suggested routines.</span>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="ml-auto gap-1.5"
-          disabled={refreshing}
-          onClick={() => void refresh()}
-        >
-          <RefreshCw className="size-3.5" />
-          Retry
-        </Button>
-      </div>
-    );
-  }
-  return (
-    <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
-      <div className="flex items-center gap-2 text-xs">
-        <Braces className="size-3.5 shrink-0 text-warning" />
-        <span className="font-medium">Suggested routines</span>
-        <span className="rounded-full bg-muted px-1.5 py-0.5 text-muted-foreground">
-          {suggestions.length}
-        </span>
-        <span className="ml-auto text-muted-foreground">
-          repeated patterns Toolport verified; saving advertises them to every client
-        </span>
-      </div>
-      {status === "stale" && (
-        <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
-          <span>
-            Couldn&apos;t refresh suggested routines; showing the last loaded queue.
-          </span>
-          <Button
-            size="sm"
-            variant="ghost"
-            className="ml-auto gap-1.5"
-            disabled={refreshing}
-            onClick={() => void refresh()}
-          >
-            <RefreshCw className="size-3.5" />
-            Retry
-          </Button>
-        </div>
-      )}
-      <ul className="mt-2 space-y-2">
-        {suggestions.map((suggestion) => {
-          const fingerprint = suggestion.definitionFingerprint;
-          const synthesized =
-            suggestion.evidence.provenance === "synthesized_from_observed_calls";
-          return (
-            <li
-              key={fingerprint}
-              className="space-y-2 rounded-md border border-border/60 bg-background/60 p-2.5 text-sm"
-            >
-              <input
-                aria-label="Routine name"
-                className="w-full rounded border border-border/60 bg-background px-2 py-1 text-sm font-medium"
-                value={names[fingerprint] ?? suggestion.suggestedName}
-                onChange={(e) =>
-                  setNames((prev) => ({ ...prev, [fingerprint]: e.target.value }))
-                }
-              />
-              {synthesized && (
-                <div className="rounded border border-warning/40 bg-warning/10 px-2 py-1 text-xs leading-relaxed text-warning">
-                  Synthesized by Toolport from observed direct calls: every listed call
-                  really ran, but the surrounding script was generated and statically
-                  validated, not yet executed.
-                </div>
-              )}
-              <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                <span>Risk: {suggestion.evidence.riskClass}</span>
-                <span>Calls: {suggestion.evidence.calls}</span>
-                <span>
-                  Dependencies:{" "}
-                  {suggestion.evidence.observedDependencies
-                    .map((dependency) => dependency.name)
-                    .join(", ")}
-                </span>
-                <span>
-                  ~{Math.max(1, Math.round(suggestion.intermediateBytes / 1024))} KB/run
-                  not returned by Toolport
-                </span>
-              </div>
-              <details>
-                <summary className="cursor-pointer text-xs font-medium text-muted-foreground hover:text-foreground">
-                  Source and schema
-                </summary>
-                <pre className="mt-2 max-h-36 overflow-auto rounded border border-border/60 bg-background/60 p-2 font-mono text-[0.7rem] leading-relaxed">
-                  {suggestion.source}
-                  {"\n\n"}
-                  {JSON.stringify(suggestion.inputSchema, null, 2)}
-                </pre>
-              </details>
-              <div className="flex justify-end gap-2">
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={busy === fingerprint}
-                  onClick={() => void dismiss(fingerprint)}
-                >
-                  Dismiss
-                </Button>
-                <Button
-                  size="sm"
-                  disabled={busy === fingerprint}
-                  onClick={() => void save(suggestion)}
-                >
-                  Save routine
-                </Button>
-              </div>
-            </li>
-          );
-        })}
-      </ul>
-    </div>
-  );
-}
 
 /** The set of tools pinned as lazy-discovery prerequisites, with one-click unpin.
  * Pinning happens contextually (a tool's card in Playground); this is where you see
@@ -533,7 +299,6 @@ type SettingKey =
   | "autostart"
   | "lazy-discovery"
   | "code-mode"
-  | "allow-routine-writes"
   | "deny-destructive"
   | "confirm-destructive"
   | "human-approval"
@@ -548,7 +313,6 @@ type RegistrySettingKey = Exclude<SettingKey, "autostart">;
 const REGISTRY_FIELD_BY_SETTING = {
   "lazy-discovery": "lazyDiscovery",
   "code-mode": "codeMode",
-  "allow-routine-writes": "allowRoutineWrites",
   "deny-destructive": "denyDestructive",
   "confirm-destructive": "confirmDestructive",
   "human-approval": "humanApproval",
@@ -741,7 +505,6 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   const lazyDiscovery = registry?.lazyDiscovery ?? true;
   // Match the registry default when the field is absent or still loading.
   const codeMode = registry?.codeMode ?? false;
-  const allowRoutineWrites = registry?.allowRoutineWrites ?? false;
   const allowAgentControl = registry?.allowAgentControl ?? false;
   const piiRedaction = registry?.piiRedaction ?? false;
   const liveInspect = registry?.liveInspect ?? false;
@@ -1200,11 +963,6 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             />
           </div>
         ) : null}
-        {/* Rendered independently of the writes toggle: a suggestion queued while
-            writes were on stays actionable (the user is the authority here). A
-            successful empty read hides the section; a failed load is a visible
-            error, not an empty queue (SBS-879). */}
-        <RoutineSuggestions />
       </section>
       <section className="flex flex-col gap-2">
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
@@ -1313,17 +1071,6 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             apply("code-mode", setCodeMode),
             "code-mode",
           )}
-          {codeMode
-            ? toggle(
-                Braces,
-                allowRoutineWrites,
-                "text-warning",
-                "Allow routine writes",
-                "Allow agents to request saving persistent routines. Every save still requires your approval.",
-                apply("allow-routine-writes", setAllowRoutineWrites),
-                "allow-routine-writes",
-              )
-            : null}
 
           {toggle(
             EyeOff,

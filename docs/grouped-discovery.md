@@ -4,19 +4,19 @@ Toolport has three tool-discovery modes, selected per client by the
 `TOOLPORT_DISCOVERY` environment variable (falling back to the registry's
 `lazy_discovery` setting when unset):
 
-| Mode             | `tools/list` advertises                                                                                                                                                                                           | Best for                                                                                 |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `lazy` (default) | The core meta-tools (`toolport_status`, `toolport_search_tools`, `toolport_call_tool`, `toolport_fetch_result`), plus the Code Mode and routine tools when those are on (the default exposes the four core tools) | Capable models: minimal, constant context regardless of server count                     |
-| `grouped`        | The core meta-tools **plus** a per-server `help_<server>` browse tool                                                                                                                                             | Weaker / local models: an _enumerable_ server choice instead of inventing a search query |
-| `full`           | `toolport_status`, `toolport_fetch_result`, and the scoped namespaced catalog (`server__tool`)                                                                                                                    | Debugging, or small setups where full schemas are affordable                             |
+| Mode             | `tools/list` advertises                                                                                                                                                                                                  | Best for                                                                                 |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| `lazy` (default) | The core meta-tools (`toolport_status`, `toolport_search_tools`, `toolport_call_tool`, `toolport_fetch_result`), plus the Code Mode tool when it is enabled (off by default, so the default exposes the four core tools) | Capable models: minimal, constant context regardless of server count                     |
+| `grouped`        | The core meta-tools **plus** a per-server `help_<server>` browse tool                                                                                                                                                    | Weaker / local models: an _enumerable_ server choice instead of inventing a search query |
+| `full`           | `toolport_status`, `toolport_fetch_result`, and the scoped namespaced catalog (`server__tool`)                                                                                                                           | Debugging, or small setups where full schemas are affordable                             |
 
-These are the core definitions. Code Mode, routine, confirmation, agent-control,
+These are the core definitions. Code Mode, confirmation, agent-control,
 and negotiated MCP Apps settings can add or change definitions for a particular
 client. The exact measurement uses that client's resulting tool array.
 
-Measured with `tiktoken o200k_base`, the default lazy surface (Code Mode on, seven
-tools) costs about 2,200 tokens including the gateway's instructions, and the core
-four about 940. The floor is flat regardless of server count, so lazy discovery costs
+Measured with `tiktoken o200k_base`, the four core tools measure about 940 tokens
+including the gateway's instructions, and enabling Code Mode adds `toolport_run_script`
+for a surface that stays under 2,000. The floor is flat regardless of server count, so lazy discovery costs
 more than a flat client until the catalog passes roughly 10 to 25 tools.
 
 ## Why grouped exists
@@ -34,7 +34,7 @@ then runs the chosen tool with `toolport_call_tool` using the exact name the
 listing returned.
 
 Context cost is roughly `4 + (number of servers)` tool definitions plus any Code
-Mode or routine tools, so grouped
+Mode tools, so grouped
 mode is the sweet spot for a **handful of tool-heavy servers** (e.g. Stripe's
 587 tools collapse to one `help_stripe`). It is not worth it for many tiny
 servers, where the per-server tools approach the full catalog.

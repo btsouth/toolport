@@ -69,7 +69,7 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
 ///
 /// Calls count every routed tool-call attempt, failed ones included: the
 /// dashboard figure is "tool calls routed through the gateway", and a failed
-/// downstream call was still routed. HITL / routine rows and lines that omit
+/// downstream call was still routed. HITL / governance rows and lines that omit
 /// `ok` are not tool calls (SBS-932). Savings lines carry a `byServer` token
 /// map. Rotated v2 detail becomes explicit `team_daily` buckets keyed by UTC
 /// day, so a lifetime carry timestamp never impersonates a daily usage row.
@@ -175,7 +175,7 @@ mod tests {
             json!({ "ts": TS_A, "server": "github", "tool": "wipe", "ok": true, "kind": "approval", "decision": "denied" }),
             json!({ "ts": TS_A, "server": "github", "tool": "wipe", "ok": true, "kind": "approval", "decision": "approved" }),
             json!({ "ts": TS_B, "server": "github", "tool": "wipe", "ok": true }),
-            json!({ "ts": TS_B, "server": "github", "tool": "routine.advisor.hint_shown", "kind": "routine" }),
+            json!({ "ts": TS_B, "server": "github", "tool": "advisor.hint_shown", "kind": "advisor" }),
             json!({ "ts": TS_B, "server": "github", "tool": "get", "ok": false }),
         ];
         let rows = rollup("2026-07-08", &audit, &[], &team(&["github"]));

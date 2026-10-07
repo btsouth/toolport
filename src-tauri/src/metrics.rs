@@ -280,7 +280,7 @@ mod tests {
             json!({"server":"s1","tool":"wipe","ok":true,"kind":"approval","decision":"denied","held":true,"client":"web"}),
             json!({"server":"s1","tool":"wipe","ok":true,"kind":"approval","decision":"approved","held":false,"client":"web"}),
             json!({"server":"s1","tool":"wipe","ok":true,"durationMs":15,"client":"web"}),
-            json!({"server":"toolport","tool":"routine.advisor.hint_shown","kind":"routine","action":"hint_shown"}),
+            json!({"server":"toolport","tool":"advisor.hint_shown","kind":"advisor","action":"hint_shown"}),
         ];
         let text = render_from_parts(&entries, 0, 0);
         assert!(text.contains(
@@ -289,7 +289,7 @@ mod tests {
         assert!(text.contains(
             r#"toolport_tool_calls_total{server="s1",tool="wipe",client="web",ok="true"} 1"#
         ));
-        assert!(!text.contains(r#"tool="routine.advisor.hint_shown""#));
+        assert!(!text.contains(r#"tool="advisor.hint_shown""#));
         assert!(!text.contains(r#"ok="true"} 2"#));
         // HITL deny is not a confirm-destructive hold.
         assert!(!text.contains("toolport_held_calls_total{"));
