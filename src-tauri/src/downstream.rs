@@ -3766,6 +3766,16 @@ impl StdioTransport {
         self.connect_timeout = timeout;
     }
 
+    /// Test-only: the tail of the child's stderr, so a failed spawn or startup
+    /// can be reported instead of only the symptom.
+    #[cfg(all(test, windows))]
+    pub(crate) fn stderr_tail_for_test(&self) -> String {
+        self.stderr
+            .lock()
+            .map(|b| b.trim().to_string())
+            .unwrap_or_default()
+    }
+
     /// Build a useful error for when the child's stdout closed (it exited or
     /// crashed). Includes the exit status and the tail of stderr when available -
     /// that is where "package not found" or "missing API key" actually shows up.
@@ -7515,15 +7525,29 @@ mod tests {
             std::process::id()
         ));
         let script_file = pid_file.with_extension("ps1");
+        let diag_file = pid_file.with_extension("diag.txt");
         let escaped_pid_file = pid_file.to_string_lossy().replace('\'', "''");
+        let escaped_diag_file = diag_file.to_string_lossy().replace('\'', "''");
         // The parent launches its descendant immediately. The production spawn
         // path must assign the suspended parent before allowing this code to run.
+        // A diag file records what the launcher saw and any Start-Process error, so
+        // a failure names the cause instead of only the missing pid.
         let script = format!(
-            "$grandchild = Start-Process -FilePath 'powershell.exe' \
-               -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60') \
-               -WindowStyle Hidden -PassThru; \
-             [System.IO.File]::WriteAllText('{escaped_pid_file}', [string]$grandchild.Id); \
-             Wait-Process -Id $grandchild.Id"
+            "$ErrorActionPreference = 'Continue'; \
+             $diag = 'PSVersion=' + $PSVersionTable.PSVersion.ToString() + \"`r`n\" + \
+               'PSModulePath=' + $env:PSModulePath + \"`r`n\" + \
+               'Path=' + $env:Path + \"`r`n\" + \
+               'StartProcess=' + [string][bool](Get-Command Start-Process -ErrorAction SilentlyContinue); \
+             [System.IO.File]::WriteAllText('{escaped_diag_file}', $diag); \
+             try {{ \
+               $grandchild = Start-Process -FilePath 'powershell.exe' \
+                 -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60') \
+                 -WindowStyle Hidden -PassThru -ErrorAction Stop; \
+               [System.IO.File]::WriteAllText('{escaped_pid_file}', [string]$grandchild.Id); \
+               Wait-Process -Id $grandchild.Id \
+             }} catch {{ \
+               [System.IO.File]::AppendAllText('{escaped_diag_file}', \"`r`nERROR: \" + ($_ | Out-String)) \
+             }}"
         );
         std::fs::write(&script_file, script).expect("write launcher script");
         let args = vec![
@@ -7553,7 +7577,10 @@ mod tests {
             }
             assert!(
                 Instant::now() < created_deadline,
-                "launcher should record its grandchild pid"
+                "launcher should record its grandchild pid; diag: {}; launcher stderr: {}",
+                std::fs::read_to_string(&diag_file)
+                    .unwrap_or_else(|e| format!("<no diag file: {e}>")),
+                transport.stderr_tail_for_test()
             );
             std::thread::sleep(Duration::from_millis(25));
         };
@@ -7573,6 +7600,7 @@ mod tests {
         );
         let _ = std::fs::remove_file(pid_file);
         let _ = std::fs::remove_file(script_file);
+        let _ = std::fs::remove_file(diag_file);
     }
 
     /// The unix counterpart to `windows_job_terminates_launcher_grandchild`:
