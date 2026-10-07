@@ -2438,6 +2438,23 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             .css_classes(["toolport-muted"])
             .build(),
     );
+    let mode = crate::clients::discovery_capabilities(&client.id)
+        .resolve_mode(client.discovery_mode.as_deref());
+    let discovery_hint = match mode {
+        "full" => "Full tool list. Client per-tool permission rules need Full mode.",
+        "grouped" => {
+            "Browse a server, then call tools. Client per-tool permission rules need Full mode."
+        }
+        _ => "Search, then call tools. Client per-tool permission rules need Full mode.",
+    };
+    copy.append(
+        &gtk::Label::builder()
+            .label(discovery_hint)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["toolport-muted"])
+            .build(),
+    );
     card.append(&copy);
     if client.gateway_state != state::ClientGatewayState::Connected {
         let (status, class) = match client.gateway_state {
@@ -2626,27 +2643,31 @@ fn append_client_discovery_actions(
     );
     for (label, mode, hint) in [
         (
-            "Use global setting",
+            "Auto",
             None,
-            "Follow the global discovery setting",
+            "Choose from this client's search and tool-list refresh capabilities",
         ),
         (
             "Full catalog",
             Some("full"),
-            "Advertises every tool up front. Most tokens, no discovery step.",
+            "Full tool list. Client per-tool permission rules need Full mode.",
         ),
         (
             "Lazy search",
             Some("lazy"),
-            "Advertises a few meta-tools; the client searches, then calls. Fewest tokens.",
+            "Search, then call tools. Client per-tool permission rules need Full mode.",
         ),
         (
             "Grouped search",
             Some("grouped"),
-            "One help tool per server; the client expands a server before calling it.",
+            "Browse a server, then call tools. Client per-tool permission rules need Full mode.",
         ),
     ] {
-        let selected = client.discovery_mode.as_deref() == mode;
+        let selected = match (client.discovery_mode.as_deref(), mode) {
+            (None, None) => true,
+            (Some(stored), Some(mode)) => stored.trim().eq_ignore_ascii_case(mode),
+            _ => false,
+        };
         let button = toolport_menu_choice_button(label, selected);
         button.set_tooltip_text(Some(hint));
         let client_id = client.id.clone();

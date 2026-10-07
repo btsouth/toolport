@@ -21,6 +21,8 @@
 //! `mock-mcp-server` fixture as the downstream. Every wait is bounded, so a
 //! case that hangs fails its own deadline rather than the CI job.
 
+mod discovery_support;
+
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -172,6 +174,11 @@ impl Default for AdapterOptions<'_> {
 
 fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
     let index = NEXT.fetch_add(1, Ordering::Relaxed);
+    let client_id = options
+        .client_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("matrix-{index}"));
+    discovery_support::select_full(dir, &client_id);
     let mut command = Command::new(env!("CARGO_BIN_EXE_toolport-gateway"));
     if !options.default_role {
         command.arg("--stdio-adapter");
@@ -181,13 +188,7 @@ fn spawn_adapter(dir: &Path, options: &AdapterOptions) -> AdapterClient {
         .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
         .env_remove("TOOLPORT_GATEWAY_TOPOLOGY")
         .env_remove("CONDUIT_GATEWAY_TOPOLOGY")
-        .env(
-            "TOOLPORT_CLIENT_ID",
-            options
-                .client_id
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("matrix-{index}")),
-        )
+        .env("TOOLPORT_CLIENT_ID", client_id)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

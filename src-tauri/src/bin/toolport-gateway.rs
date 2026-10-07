@@ -1637,23 +1637,16 @@ fn parse_mode(s: &str) -> Option<DiscoveryMode> {
     }
 }
 
-/// Per-HTTP-client discovery override from `clientDiscovery[<client id>]`. Only
-/// `full` and `lazy` are honored per client: grouped still depends on
-/// host-wide publisher state, so a `grouped` value (or any unrecognized one)
-/// yields `None` and the request uses the host's mode.
+/// The bearer identity uses the same Auto and explicit modes as stdio adapters.
 fn http_client_discovery_override(reg: &Registry, client_id: &str) -> Option<DiscoveryMode> {
-    match reg.client_discovery_mode(client_id).and_then(parse_mode) {
-        Some(DiscoveryMode::Lazy) => Some(DiscoveryMode::Lazy),
-        Some(DiscoveryMode::Full) => Some(DiscoveryMode::Full),
-        _ => None,
-    }
+    parse_mode(conduit_lib::clients::client_discovery_mode(reg, client_id))
 }
 
 /// Resolve this client's discovery mode from a loaded registry + env. See
 /// [`resolve_mode_from`] for the precedence.
 fn discovery_mode_for(reg: &Registry, client_id: Option<&str>) -> DiscoveryMode {
     let env = conduit_lib::brand::env_var("TOOLPORT_DISCOVERY", "CONDUIT_DISCOVERY");
-    let client_mode = client_id.and_then(|id| reg.client_discovery_mode(id));
+    let client_mode = client_id.map(|id| conduit_lib::clients::client_discovery_mode(reg, id));
     let (mode, warning) = resolve_mode_from(
         env.as_deref(),
         client_mode,
@@ -1667,7 +1660,7 @@ fn discovery_mode_for(reg: &Registry, client_id: Option<&str>) -> DiscoveryMode 
 }
 
 /// Pure precedence: an explicit `CONDUIT_DISCOVERY` env var (hand-set in a client's config)
-/// wins, then the per-client override (`registry.client_discovery[client_id]`), then the
+/// wins, then the per-client override or capability-derived Auto for an identified client, then the
 /// registry's global `discovery_mode`, then its `lazy_discovery` bool. A SET env value that
 /// isn't lazy/grouped resolves to Full (exactly the old `env == "lazy" ? lazy : not-lazy`);
 /// an unrecognized per-client/global override is ignored (falls through).
@@ -26680,12 +26673,11 @@ mod tests {
         reg.set_client_discovery("c-claude-code", Some("lazy"));
         assert_eq!(resolve(&reg), Some(DiscoveryMode::Lazy));
 
-        // Grouped still depends on host-wide publisher state, so it is not a
-        // per-client override, and neither is an unset client.
+        // Grouped is scoped to this caller too; absence resolves conservative Auto.
         reg.set_client_discovery("c-claude-code", Some("grouped"));
-        assert_eq!(resolve(&reg), None);
+        assert_eq!(resolve(&reg), Some(DiscoveryMode::Grouped));
         reg.set_client_discovery("c-claude-code", None);
-        assert_eq!(resolve(&reg), None);
+        assert_eq!(resolve(&reg), Some(DiscoveryMode::Lazy));
     }
 
     /// SBS-866: route_of is authoritative; an override-renamed team tool must not
@@ -34671,6 +34663,168 @@ mod tests {
         );
         assert!(!after.starts_with('x'), "did not cut on a line boundary");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn discovery_modes_share_access_safety_and_quarantine_for_list_search_and_call() {
+        let _env = DataDirTestEnv::new("discovery-policy-parity");
+        for mode in [
+            DiscoveryMode::Full,
+            DiscoveryMode::Lazy,
+            DiscoveryMode::Grouped,
+        ] {
+            for policy in [
+                "allow",
+                "server-access",
+                "global-off",
+                "tool-access",
+                "off",
+                "ask",
+                "strict",
+                "quarantine",
+            ] {
+                let host = dispatch_host(false);
+                host.set_discovery_mode(mode);
+                let mut reg = Registry::default();
+                reg.default_access_context_id = Some("default".into());
+                let mut server = stub_server("s", "S");
+                server.enabled = true;
+                reg.servers.push(server);
+                reg.set_client_scope("fixture-client", Some("default"));
+                reg.set_access_server("default", "s", policy != "server-access")
+                    .unwrap();
+                if policy == "global-off" {
+                    reg.set_global_server_enabled("s", false).unwrap();
+                }
+                reg.set_safety_level(match policy {
+                    "ask" => registry::SafetyLevel::Ask,
+                    "strict" => registry::SafetyLevel::Strict,
+                    _ => registry::SafetyLevel::Off,
+                });
+                if policy == "tool-access" {
+                    reg.set_profile_server_tools("default", "s", Some(vec!["another".into()]))
+                        .unwrap();
+                }
+                let (allowed, caller) = resolve_adapter_caller(&reg, "fixture-client", None, None);
+                let (router, calls, _) =
+                    counting_router(matches!(policy, "off" | "ask" | "strict"));
+                let mut router = Arc::try_unwrap(router).ok().unwrap();
+                router.apply_registry_policy(registry_policy(
+                    &reg,
+                    caller.profile.as_deref(),
+                    false,
+                    false,
+                ));
+                if policy == "quarantine" {
+                    router.requarantine(BTreeSet::from(["s__work".into()]));
+                }
+                let catalog = router.aggregated_tools();
+                let run = |request: Value| {
+                    handle_request(
+                        &host,
+                        &request,
+                        &reg,
+                        &router,
+                        &catalog,
+                        mode == DiscoveryMode::Lazy,
+                        Some("default"),
+                        &SearchGuard::default(),
+                        allowed.as_ref(),
+                        Some("fixture-client"),
+                    )
+                    .unwrap()
+                };
+                let visible = !matches!(
+                    policy,
+                    "server-access" | "global-off" | "tool-access" | "strict" | "quarantine"
+                );
+                let listed = run(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
+                if mode == DiscoveryMode::Full {
+                    assert_eq!(
+                        listed["result"]["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|tool| tool["name"] == "s__work"),
+                        visible,
+                        "{mode:?} {policy}"
+                    );
+                } else {
+                    let names: Vec<_> = listed["result"]["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|tool| tool["name"].as_str())
+                        .collect();
+                    assert!(!names.contains(&"s__work"), "{mode:?} {policy}");
+                    if mode == DiscoveryMode::Grouped {
+                        assert_eq!(names.contains(&"help_s"), visible, "{mode:?} {policy}");
+                    }
+                    let name = if mode == DiscoveryMode::Grouped {
+                        "help_s"
+                    } else {
+                        "toolport_search_tools"
+                    };
+                    let search = run(
+                        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":{"query":"work"}}}),
+                    );
+                    assert_eq!(
+                        search.to_string().contains("s__work"),
+                        visible,
+                        "{mode:?} {policy}: {search}"
+                    );
+                }
+                // Raw names must be blocked too, even when not advertised.
+                for wrapped in [false, true] {
+                    let (name, arguments) = if wrapped {
+                        (
+                            "toolport_call_tool",
+                            json!({"name":"s__work","arguments":{}}),
+                        )
+                    } else {
+                        ("s__work", json!({}))
+                    };
+                    let response = run(
+                        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
+                    );
+                    assert_eq!(
+                        response["result"]["isError"],
+                        !matches!(policy, "allow" | "off"),
+                        "{mode:?} {policy}: {response}"
+                    );
+                }
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    if matches!(policy, "allow" | "off") {
+                        2
+                    } else {
+                        0
+                    },
+                    "{mode:?} {policy}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_surface_token_measurement() {
+        let _env = DataDirTestEnv::new("discovery-token-cost");
+        let host = dispatch_host(false);
+        let reg = Registry::default();
+        let router = Router::new();
+        // A fixed small eager-client fixture. This is serialized MCP catalog cost,
+        // not the prompt cost after a vendor's own deferral or caching.
+        let catalog: Vec<Value> = (0..14).map(|i| json!({"name":format!("fixture__read_{i}"),"description":"Read a fixture record by its identifier.","inputSchema":{"type":"object","properties":{"id":{"type":"string","description":"Record identifier"}},"required":["id"]},"annotations":{"readOnlyHint":true}})).collect();
+        for mode in [DiscoveryMode::Lazy, DiscoveryMode::Full] {
+            let tools = tool_surface(&host, &reg, &router, &catalog, None, mode);
+            let serialized = serde_json::to_string(&tools).unwrap();
+            println!("DISCOVERY_COST mode={} fixture_tools=14 exposed_tools={} tokenizer={} tokens={} bytes={} code_mode=false", mode.as_str(), tools.len(), savings::TOKENIZER, savings::count_tokens(&serialized), serialized.len());
+        }
+        let empty_floor = tool_surface(&host, &reg, &router, &[], None, DiscoveryMode::Lazy);
+        assert_eq!(
+            empty_floor,
+            tool_surface(&host, &reg, &router, &catalog, None, DiscoveryMode::Lazy)
+        );
     }
 
     #[test]

@@ -1267,7 +1267,7 @@ pub struct Registry {
     pub folder_profiles: Vec<FolderProfile>,
     /// Per-client discovery-mode override, keyed by stable client id (e.g. "cursor" ->
     /// "grouped"). Value is `"full" | "lazy" | "grouped"`; an absent entry means the client
-    /// inherits the global mode (`discovery_mode`, else `lazy_discovery`). The gateway
+    /// uses Auto from the client capability table. The gateway
     /// resolves it live via `CONDUIT_CLIENT_ID`, so changing it re-applies without
     /// reinstalling the client (same mechanism as `client_scopes`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

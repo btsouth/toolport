@@ -30,6 +30,12 @@ export interface DetectedClient {
   id: string;
   name: string;
   usesConnectors: boolean;
+  /** Backend capability evidence; missing or unknown support resolves to lazy. */
+  discovery?: {
+    nativeToolSearch: boolean | null;
+    toolsListChanged: boolean | null;
+    evidence: string;
+  };
   configPath: string;
   configExists: boolean;
   /** Whether the client app appears installed (its data dir exists), even if it
@@ -548,7 +554,7 @@ export interface Registry {
    * calls in one server-side script. Off by default; opt in under Advanced. */
   codeMode?: boolean;
   /** Per-client discovery-mode override, keyed by client id (e.g. "cursor" ->
-   * "grouped"). Absent = that client inherits the global mode. */
+   * "grouped"). Absent = Auto from the client capability table. */
   clientDiscovery?: Record<string, string>;
   /** Connection to a Toolport Teams server, if joined. Token lives in the keychain. */
   team?: TeamConnection | null;

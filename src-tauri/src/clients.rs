@@ -19,6 +19,8 @@ use crate::registry::{ManagedEntry, ServerEntry};
 mod backup_permissions;
 mod disconnect;
 pub use disconnect::{all as disconnect_all, ClientResult as DisconnectResult};
+mod discovery;
+pub use discovery::DiscoveryCapabilities;
 mod moved;
 mod mutation;
 mod restore;
@@ -63,6 +65,7 @@ pub struct DetectedClient {
     /// (Claude Desktop) rather than the local config file. Their file-based count
     /// is misleading, so the UI shows a connector indicator instead.
     pub uses_connectors: bool,
+    pub discovery: DiscoveryCapabilities,
     pub config_path: String,
     pub config_exists: bool,
     /// Whether the client app appears installed on this machine, independent of
@@ -144,12 +147,27 @@ struct ClientDef {
     id: &'static str,
     name: &'static str,
     format: Format,
+    discovery: DiscoveryCapabilities,
     uses_connectors: bool,
     /// Resolves the absolute config path for the current OS, if determinable.
     path: fn() -> Option<PathBuf>,
     /// Optional scan for servers stored outside the main config file but still
     /// readable (e.g. Cursor plugin manifests).
     plugin_scan: Option<fn() -> Vec<McpServer>>,
+}
+
+/// Resolve Auto without changing serialized per-client overrides. The global default
+/// remains for anonymous connections; identified clients use their capability table.
+pub fn client_discovery_mode(registry: &crate::registry::Registry, id: &str) -> &'static str {
+    let mode = registry.client_discovery_mode(id).or_else(|| {
+        id.strip_prefix("client:")
+            .and_then(|adapter| registry.client_discovery_mode(adapter))
+    });
+    discovery_capabilities(id).resolve_mode(mode)
+}
+
+pub fn discovery_capabilities(id: &str) -> DiscoveryCapabilities {
+    discovery::capabilities(id.strip_prefix("client:").unwrap_or(id))
 }
 
 /// The name Toolport uses for its own entry when installed into a client config.
@@ -1447,6 +1465,7 @@ fn defs() -> Vec<ClientDef> {
     vec![
         ClientDef {
             id: "claude-desktop",
+            discovery: discovery::capabilities("claude-desktop"),
             name: "Claude Desktop",
             format: Format::JsonMcpServers,
             uses_connectors: true,
@@ -1455,6 +1474,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "cursor",
+            discovery: discovery::capabilities("cursor"),
             name: "Cursor",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1463,6 +1483,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "droid",
+            discovery: discovery::capabilities("droid"),
             name: "Factory Droid",
             format: Format::JsonDroidMcpServers,
             uses_connectors: false,
@@ -1471,6 +1492,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "crush",
+            discovery: discovery::capabilities("crush"),
             name: "Crush",
             format: Format::JsonMcp,
             uses_connectors: false,
@@ -1479,6 +1501,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "anythingllm",
+            discovery: discovery::capabilities("anythingllm"),
             name: "AnythingLLM",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1487,6 +1510,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "vscode",
+            discovery: discovery::capabilities("vscode"),
             name: "VS Code",
             format: Format::JsonServers,
             uses_connectors: false,
@@ -1495,6 +1519,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "amp",
+            discovery: discovery::capabilities("amp"),
             name: "Amp",
             format: Format::JsonAmpMcpServers,
             uses_connectors: false,
@@ -1503,6 +1528,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "windsurf",
+            discovery: discovery::capabilities("windsurf"),
             name: "Devin Desktop (Cascade)",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1511,6 +1537,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "devin-cli",
+            discovery: discovery::capabilities("devin-cli"),
             name: "Devin Local / CLI",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1519,6 +1546,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "opencode",
+            discovery: discovery::capabilities("opencode"),
             name: "OpenCode",
             format: Format::JsonOpenCodeMcp,
             uses_connectors: false,
@@ -1529,6 +1557,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "kilo-code",
+            discovery: discovery::capabilities("kilo-code"),
             name: "Kilo Code",
             format: Format::JsonOpenCodeMcp,
             uses_connectors: false,
@@ -1541,6 +1570,7 @@ fn defs() -> Vec<ClientDef> {
             // Grok Build (xAI's terminal coding agent): ~/.grok/config.toml,
             // [mcp_servers.<name>] - same TOML shape as Codex.
             id: "grok",
+            discovery: discovery::capabilities("grok"),
             name: "Grok Build",
             format: Format::TomlMcpServers,
             uses_connectors: false,
@@ -1551,6 +1581,7 @@ fn defs() -> Vec<ClientDef> {
             // The Codex CLI and the Codex desktop app share config.toml under
             // `CODEX_HOME` (default ~/.codex).
             id: "codex",
+            discovery: discovery::capabilities("codex"),
             name: "Codex",
             format: Format::TomlMcpServers,
             uses_connectors: false,
@@ -1559,6 +1590,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "github-copilot-cli",
+            discovery: discovery::capabilities("github-copilot-cli"),
             name: "GitHub Copilot CLI",
             format: Format::JsonCopilotMcpServers,
             uses_connectors: false,
@@ -1567,6 +1599,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "antigravity",
+            discovery: discovery::capabilities("antigravity"),
             name: "Antigravity",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1575,6 +1608,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "claude-code",
+            discovery: discovery::capabilities("claude-code"),
             name: "Claude Code",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1583,6 +1617,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "gemini-cli",
+            discovery: discovery::capabilities("gemini-cli"),
             name: "Gemini CLI",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1591,6 +1626,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "qwen-code",
+            discovery: discovery::capabilities("qwen-code"),
             name: "Qwen Code",
             format: Format::JsonQwenMcpServers,
             uses_connectors: false,
@@ -1599,6 +1635,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "junie",
+            discovery: discovery::capabilities("junie"),
             name: "JetBrains Junie",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1609,6 +1646,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "cline",
+            discovery: discovery::capabilities("cline"),
             name: "Cline",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1617,6 +1655,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "roo-code",
+            discovery: discovery::capabilities("roo-code"),
             name: "Roo Code",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1625,6 +1664,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "warp",
+            discovery: discovery::capabilities("warp"),
             name: "Warp",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1635,6 +1675,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "amazon-q",
+            discovery: discovery::capabilities("amazon-q"),
             name: "Amazon Q",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1646,6 +1687,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "kiro",
+            discovery: discovery::capabilities("kiro"),
             name: "Kiro",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1656,6 +1698,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "kimi-code",
+            discovery: discovery::capabilities("kimi-code"),
             name: "Kimi Code",
             format: Format::JsonKimiMcpServers,
             uses_connectors: false,
@@ -1664,6 +1707,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "zcode",
+            discovery: discovery::capabilities("zcode"),
             name: "ZCode",
             format: Format::JsonZCodeMcp,
             uses_connectors: false,
@@ -1672,6 +1716,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "zed",
+            discovery: discovery::capabilities("zed"),
             name: "Zed",
             format: Format::JsonContextServers,
             uses_connectors: false,
@@ -1683,6 +1728,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "lm-studio",
+            discovery: discovery::capabilities("lm-studio"),
             name: "LM Studio",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1693,6 +1739,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "jan",
+            discovery: discovery::capabilities("jan"),
             name: "Jan",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1705,6 +1752,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "boltai",
+            discovery: discovery::capabilities("boltai"),
             name: "BoltAI",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1713,6 +1761,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "pi",
+            discovery: discovery::capabilities("pi"),
             name: "Pi",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1724,6 +1773,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "omp",
+            discovery: discovery::capabilities("omp"),
             name: "Oh My Pi",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -1734,6 +1784,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "goose",
+            discovery: discovery::capabilities("goose"),
             name: "Goose",
             format: Format::YamlExtensions,
             uses_connectors: false,
@@ -1742,6 +1793,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "hermes",
+            discovery: discovery::capabilities("hermes"),
             name: "Hermes",
             format: Format::YamlMcpServers,
             uses_connectors: false,
@@ -1750,6 +1802,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "continue",
+            discovery: discovery::capabilities("continue"),
             name: "Continue",
             format: Format::YamlMcpServersList,
             uses_connectors: false,
@@ -1758,6 +1811,7 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "witsy",
+            discovery: discovery::capabilities("witsy"),
             name: "Witsy",
             format: Format::JsonMcpServers,
             uses_connectors: false,
@@ -2940,6 +2994,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
             id: def.id.to_string(),
             name: def.name.to_string(),
             uses_connectors: def.uses_connectors,
+            discovery: def.discovery,
             config_path,
             config_exists,
             app_present,
@@ -8699,6 +8754,7 @@ bad = "not-a-table"
             id: id.into(),
             name: id.into(),
             uses_connectors: false,
+            discovery: discovery::capabilities(id),
             config_path: format!("/tmp/{id}.json"),
             config_exists: true,
             app_present: true,

@@ -120,6 +120,12 @@ mockIPC(
         return null;
       case "export_config":
         return JSON.stringify({ servers });
+      case "set_client_discovery":
+        registry.clientDiscovery ??= {};
+        if (args.mode)
+          registry.clientDiscovery[String(args.clientId)] = String(args.mode);
+        else delete registry.clientDiscovery[String(args.clientId)];
+        return { ...registry, clientDiscovery: { ...registry.clientDiscovery } };
       case "get_registry":
         return registry;
       case "detect_clients":
@@ -135,6 +141,11 @@ mockIPC(
             pluginServers: [],
             gatewayInstalled: true,
             entryState: "managed",
+            discovery: {
+              nativeToolSearch: true,
+              toolsListChanged: null,
+              evidence: "fixture",
+            },
             error: null,
           },
         ];

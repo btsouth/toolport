@@ -2047,6 +2047,7 @@ mod tests {
             Self {
                 root,
                 client: clients::DetectedClient {
+                    discovery: clients::discovery_capabilities("fixture"),
                     id: "zcode".into(),
                     name: "ZCode".into(),
                     uses_connectors: false,

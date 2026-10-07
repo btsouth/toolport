@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+#[path = "../discovery_support/mod.rs"]
+mod discovery_support;
+
 pub const GATEWAY: &str = env!("CARGO_BIN_EXE_toolport-gateway");
 pub const MOCK: &str = env!("CARGO_BIN_EXE_mock-mcp-server");
 
@@ -125,7 +128,13 @@ pub fn http_entry(id: &str, url: &str) -> Value {
 /// Write `registry.json` through a temp file and rename, so the gateway's
 /// watcher never reads a half-written document.
 pub fn write_registry(dir: &Path, servers: &[Value], enabled: &[&str]) {
+    let choices = std::fs::read(dir.join("registry.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .map(|registry| registry["clientDiscovery"].clone())
+        .unwrap_or_else(|| json!({}));
     let registry = json!({
+        "clientDiscovery": choices,
         "version": 2,
         "servers": servers,
         "profiles": [{ "id": "default", "name": "Default", "enabledServerIds": enabled }],
@@ -388,6 +397,7 @@ impl Client {
     /// Start an adapter in front of the shared host daemon, and complete the
     /// MCP handshake.
     pub fn start(dir: &Path, tag: &str) -> Self {
+        discovery_support::select_full(dir, tag);
         let mut command = base_gateway_command(dir);
         command.env("TOOLPORT_GATEWAY_TOPOLOGY", "daemon");
         command.env("TOOLPORT_CLIENT_ID", tag);

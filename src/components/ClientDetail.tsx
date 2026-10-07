@@ -65,29 +65,13 @@ interface Props {
   onRegistryChange: (registry: Registry) => void;
 }
 
-/** One-line explainer per discovery mode, shown under the per-client picker. */
+/** Client-side rules can only target downstream names in Full mode. */
 const DISCOVERY_HINT: Record<string, string> = {
-  lazy: "Advertises a few meta-tools; the client searches, then calls. Fewest tokens.",
-  grouped: "One help tool per server; the client expands a server before calling it.",
-  full: "Advertises every tool up front. Most tokens, no discovery step.",
+  lazy: "Search, then call tools. Client per-tool permission rules need Full mode.",
+  grouped:
+    "Browse a server, then call tools. Client per-tool permission rules need Full mode.",
+  full: "Full tool list. Client per-tool permission rules need Full mode.",
 };
-
-// Local-model desktop apps: users often run small / quantized models here that stumble on
-// lazy's multi-step search-then-call chain, yet get flooded by the full catalog. Grouped
-// (one hop per server) is the middle ground. Every other client is a hosted-model or
-// agentic client that handles lazy's savings fine. This drives a RECOMMENDATION only; it
-// never auto-applies, so an explicit user choice is never silently overridden.
-const LOCAL_MODEL_CLIENTS = new Set(["lm-studio", "jan", "anythingllm"]);
-
-/** The mode we suggest for a client, with a one-line why. Advisory, not enforced. */
-function recommendedMode(clientId: string): { mode: string; why: string } {
-  return LOCAL_MODEL_CLIENTS.has(clientId)
-    ? { mode: "grouped", why: "local models do better browsing one server at a time" }
-    : {
-        mode: "lazy",
-        why: "this client handles the search-then-call step and saves the most tokens",
-      };
-}
 
 export function ClientDetail({ client, registry, onChanged, onRegistryChange }: Props) {
   const [busy, setBusy] = useState(false);
@@ -146,14 +130,16 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     });
   }
 
-  // Discovery: the global mode this client falls back to, and its own override (if any).
-  // The gateway resolves env > per-client > global, so an override here applies live.
-  const globalMode =
-    registry?.discoveryMode?.toLowerCase() ||
-    ((registry?.lazyDiscovery ?? true) ? "lazy" : "full");
-  const clientMode = registry?.clientDiscovery?.[client.id] ?? "";
-  const effectiveMode = clientMode || globalMode;
-  const recommended = recommendedMode(client.id);
+  // Absence is Auto; the backend capability table requires native search and
+  // late tool-list refreshes before choosing Full.
+  const autoMode =
+    client.discovery?.nativeToolSearch === true &&
+    client.discovery?.toolsListChanged === true
+      ? "full"
+      : "lazy";
+  const storedMode = registry?.clientDiscovery?.[client.id]?.trim().toLowerCase();
+  const clientMode = storedMode && DISCOVERY_HINT[storedMode] ? storedMode : "";
+  const effectiveMode = clientMode || autoMode;
 
   /** Set or clear this client's discovery-mode override; applies live, no reconnect. */
   async function applyDiscovery(mode: string) {
@@ -164,7 +150,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       toast.success(
         mode
           ? `${client.name} discovery set to "${mode}".`
-          : `${client.name} now inherits the global discovery mode.`,
+          : `${client.name} now uses Auto discovery.`,
       );
     } catch (e) {
       toastError(`${e}`);
@@ -595,42 +581,36 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         </div>
       )}
 
-      {installed && !customized && (
+      {!customized && (
         <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
           <div className="min-w-0">
             <div className="text-xs font-medium text-foreground">
               Discovery mode
               {!clientMode && (
                 <span className="ml-1.5 font-normal text-muted-foreground">
-                  inheriting {globalMode}
+                  Auto: {autoMode}
                 </span>
               )}
             </div>
             <p className="mt-0.5 text-2xs text-muted-foreground">
               {DISCOVERY_HINT[effectiveMode] ?? DISCOVERY_HINT.lazy}
             </p>
-            {effectiveMode === recommended.mode ? (
-              <p className="mt-0.5 text-2xs text-success">
-                Recommended ({recommended.mode}), {recommended.why}.
-              </p>
-            ) : (
-              <p className="mt-0.5 text-2xs text-muted-foreground/80">
-                Recommended:{" "}
-                <span className="font-medium text-foreground">{recommended.mode}</span>,{" "}
-                {recommended.why}.
-              </p>
-            )}
           </div>
           <Select
-            value={clientMode || "__inherit__"}
-            onValueChange={(v) => applyDiscovery(v === "__inherit__" ? "" : v)}
+            value={clientMode || "__auto__"}
+            onValueChange={(v) => applyDiscovery(v === "__auto__" ? "" : v)}
           >
-            <SelectTrigger size="sm" className="w-44 shrink-0" disabled={busy}>
+            <SelectTrigger
+              size="sm"
+              aria-label="Discovery mode"
+              className="w-44 shrink-0"
+              disabled={busy}
+            >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="__inherit__">Inherit ({globalMode})</SelectItem>
-              <SelectItem value="lazy">Lazy · fewest tokens</SelectItem>
+              <SelectItem value="__auto__">Auto ({autoMode})</SelectItem>
+              <SelectItem value="lazy">Lazy · search</SelectItem>
               <SelectItem value="grouped">Grouped · per-server</SelectItem>
               <SelectItem value="full">Full · every tool</SelectItem>
             </SelectContent>
