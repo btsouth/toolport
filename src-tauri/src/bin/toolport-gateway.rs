@@ -25052,8 +25052,8 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    /// WS2-5: corrupt-registry boot must not advertise/run code mode even though
-    /// the fallback [`Registry::default`] has `code_mode: true`.
+    /// A failed registry load must not advertise or run Code Mode, even when
+    /// a later request snapshot contains an explicit opt-in.
     #[test]
     fn code_mode_flag_fails_closed_when_registry_load_fails() {
         // Scratch data dir: while the gate is off every call below is refused before the audit
@@ -25065,10 +25065,11 @@ mod tests {
         // returned true, the host below would advertise and dispatch run_script, which the
         // assertions reject.
         let host = dispatch_host(seed_code_mode_after_registry_load(Err(())));
-        let reg = Registry::default();
+        let mut reg = Registry::default();
+        reg.code_mode = true;
         assert!(
             reg.code_mode,
-            "fallback registry struct still defaults code_mode on"
+            "the request fixture explicitly opts in"
         );
 
         let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
