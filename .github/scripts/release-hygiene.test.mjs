@@ -86,9 +86,20 @@ test("stale fork is synced before branching, failed PR creation retries the same
   assert.equal(await submit(api, "fixture/winget-pkgs", installer, files), "fixture PR");
   assert.deepEqual(calls, ["sync", "branch", "sync", "sync"]);
   assert.equal(attempts, 2);
-  await assert.rejects(
-    submit(api, "fixture/winget-pkgs", installer, [{ ...files[0], content: "tampered" }]),
+  const updatedTemplates = files.map((file) => ({
+    ...file,
+    content: file.content + "\n# template edited later\n",
+  }));
+  assert.equal(
+    await submit(api, "fixture/winget-pkgs", installer, updatedTemplates),
+    "fixture PR",
   );
+  const storedInstaller = entries.find((entry) => entry.path.endsWith(".installer.yaml"));
+  storedInstaller.content = storedInstaller.content.replace(
+    installer.sha256,
+    "0".repeat(64),
+  );
+  await assert.rejects(submit(api, "fixture/winget-pkgs", installer, files), /SHA256/);
 });
 
 test("payload assertions reject test helpers and unexpected binaries on every platform", () => {

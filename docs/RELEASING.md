@@ -80,9 +80,9 @@ release.
 To retry a failed submission, run `winget.yml` manually with the same stable tag.
 It downloads the existing installer, checks its SHA256 against the release asset
 metadata, syncs the token owner's `winget-pkgs` fork from upstream `master`, and
-reuses `toolport-<version>` if its manifest bytes still match. It never builds or
+reuses `toolport-<version>` after checking its saved manifest version, URL and hash. It never builds or
 uploads release assets. An existing open or merged PR is reused; a closed,
-unmerged PR or changed retry manifest fails for operator review. Releases without
+unmerged PR or a retry manifest naming different artifacts fails for operator review. Releases without
 an asset SHA256 digest fail validation rather than inventing a trusted checksum.
 The fork must already exist. Its `master` is reset to upstream; other branches
 are preserved. The checked-in files in `packaging/winget` are templates, with

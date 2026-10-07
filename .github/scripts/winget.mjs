@@ -52,6 +52,34 @@ export function manifests(templates, installer, bytes) {
   });
 }
 
+export function validateManifests(files, installer) {
+  const types = {
+    "Toolport.Toolport.yaml": "version",
+    "Toolport.Toolport.installer.yaml": "installer",
+    "Toolport.Toolport.locale.en-US.yaml": "defaultLocale",
+  };
+  if (files.length !== 3 || new Set(files.map((file) => file.name)).size !== 3)
+    throw new Error("Expected all three winget manifests");
+  for (const { name, content } of files) {
+    const doc = parse(content);
+    if (
+      !types[name] ||
+      doc.ManifestType !== types[name] ||
+      doc.PackageIdentifier !== "Toolport.Toolport" ||
+      doc.PackageVersion !== installer.version
+    )
+      throw new Error("Manifest does not match release version or package");
+    if (
+      doc.ManifestType === "installer" &&
+      (doc.Installers?.length !== 1 ||
+        doc.Installers[0].Architecture !== "x64" ||
+        doc.Installers[0].InstallerUrl !== installer.url ||
+        doc.Installers[0].InstallerSha256?.toUpperCase() !== installer.sha256)
+    )
+      throw new Error("Manifest installer URL or SHA256 differs from release");
+  }
+}
+
 // The adapter is also used by the fixture. It has no release-write operation.
 export async function submit(api, fork, installer, files) {
   await api.sync(fork);
@@ -65,11 +93,16 @@ export async function submit(api, fork, installer, files) {
   }));
   const existing = await api.branch(fork, branch);
   if (existing) {
+    const stored = [];
     for (const entry of entries) {
-      if ((await api.content(fork, branch, entry.path)) !== entry.content)
-        throw new Error("Retry branch differs from immutable release manifest");
+      stored.push({
+        name: entry.path.split("/").at(-1),
+        content: await api.content(fork, branch, entry.path),
+      });
     }
+    validateManifests(stored, installer);
   } else {
+    validateManifests(files, installer);
     await api.createBranch(fork, branch, entries);
   }
   const prs = await api.pullRequests(fork, branch);
