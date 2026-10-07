@@ -363,24 +363,32 @@ fn tool_row(
 
     // Pinning and renaming moved into the row menu, so their state comes back
     // as badges. Both are off for most tools, so most rows show nothing here.
-    let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let title = gtk::Box::new(gtk::Orientation::Vertical, 3);
     title.append(
         &gtk::Label::builder()
             .label(&name)
             .tooltip_text(&name)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
+            .hexpand(true)
             .xalign(0.0)
             .max_width_chars(48)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["heading"])
             .build(),
     );
+    let badges = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .min_children_per_line(1)
+        .max_children_per_line(5)
+        .column_spacing(4)
+        .row_spacing(4)
+        .build();
     let pinned_badge = state_badge("Pinned");
     pinned_badge.set_visible(pinned);
-    title.append(&pinned_badge);
+    badges.insert(&pinned_badge, -1);
     let renamed_badge = state_badge("Renamed");
     renamed_badge.set_visible(exposure_override.is_some());
-    title.append(&renamed_badge);
+    badges.insert(&renamed_badge, -1);
     for (hint, label) in [
         ("readOnlyHint", "Read-only"),
         ("destructiveHint", "Destructive"),
@@ -390,21 +398,23 @@ fn tool_row(
             .and_then(serde_json::Value::as_bool)
             == Some(true)
         {
-            title.append(&state_badge(label));
+            badges.insert(&state_badge(label), -1);
         }
     }
     let enabled_badge = state_badge(if enabled { "Enabled" } else { "Disabled" });
-    title.append(&enabled_badge);
-    title.append(&state_badge(
-        match tool
+    badges.insert(&enabled_badge, -1);
+    badges.insert(
+        &state_badge(match tool
             .get("toolportQuarantine")
             .and_then(serde_json::Value::as_str)
         {
             Some("quarantined") => "Quarantined",
             Some("clear") => "Not quarantined",
             _ => "Quarantine unknown",
-        },
-    ));
+        }),
+        -1,
+    );
+    title.append(&badges);
     copy.append(&title);
 
     copy.append(
