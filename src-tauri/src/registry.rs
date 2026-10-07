@@ -1153,11 +1153,9 @@ pub struct Registry {
     /// Releasable team floor, kept separate from the member's own safety choice.
     #[serde(default = "team_safety_floor_default")]
     pub team_min_safety_level: SafetyLevel,
-    /// The same releasable org-lock treatment as [`team_forced_human_approval`] for the other
-    /// tighten-only screening flags (`denyDestructive`, `forceContentDefense`,
-    /// `forceQuarantineOnDrift`, `forceBlockOnInjection`). Set from the active team's policy,
-    /// recomputed each sync and cleared on leave, so an org lock never permanently overwrites
-    /// the member's own setting. Enforcement reads `*_effective()` (member's own OR team-forced).
+    /// Retained legacy flags are recomputed each sync and cleared on leave.
+    /// In 2.0, team deny does not raise the safety level, and content labeling is always on.
+    /// Quarantine and injection blocking remain independent tighten-only protections.
     #[serde(default)]
     pub team_forced_deny_destructive: bool,
     #[serde(default)]
@@ -2380,15 +2378,17 @@ impl Registry {
     }
 
     pub fn safety_level_team_floor(&self) -> SafetyLevel {
-        self.team_min_safety_level.max(if self.team_forced_human_approval {
-            SafetyLevel::Ask
-        } else {
-            SafetyLevel::Off
-        })
+        self.team_min_safety_level
+            .max(if self.team_forced_human_approval {
+                SafetyLevel::Ask
+            } else {
+                SafetyLevel::Off
+            })
     }
 
     pub fn safety_level_effective(&self) -> SafetyLevel {
-        self.safety_level_selected().max(self.safety_level_team_floor())
+        self.safety_level_selected()
+            .max(self.safety_level_team_floor())
     }
 
     pub fn validate_safety_level(&self, level: SafetyLevel) -> Result<(), String> {
@@ -7871,7 +7871,10 @@ mod safety_level_tests {
                 level.max(SafetyLevel::Ask)
             );
             registry.team_forced_block_on_injection = true;
-            assert_eq!(registry.safety_level_effective(), level.max(SafetyLevel::Ask));
+            assert_eq!(
+                registry.safety_level_effective(),
+                level.max(SafetyLevel::Ask)
+            );
             registry.team_forced_human_approval = false;
             registry.team_forced_block_on_injection = false;
             assert_eq!(registry.safety_level_effective(), level);
@@ -7887,14 +7890,30 @@ mod safety_level_tests {
                     r.set_safety_level(member);
                     r.team_min_safety_level = floor;
                     r.team_forced_human_approval = legacy;
-                    let expected = member.max(floor).max(if legacy { SafetyLevel::Ask } else { SafetyLevel::Off });
+                    let expected = member.max(floor).max(if legacy {
+                        SafetyLevel::Ask
+                    } else {
+                        SafetyLevel::Off
+                    });
                     assert_eq!(r.safety_level_effective(), expected);
-                    assert_eq!(r.deny_destructive_effective(), expected == SafetyLevel::Strict);
-                    assert_eq!(r.requires_human_approval(true, false), expected >= SafetyLevel::Ask);
-                    assert_eq!(r.requires_human_approval(false, true), expected == SafetyLevel::Strict);
+                    assert_eq!(
+                        r.deny_destructive_effective(),
+                        expected == SafetyLevel::Strict
+                    );
+                    assert_eq!(
+                        r.requires_human_approval(true, false),
+                        expected >= SafetyLevel::Ask
+                    );
+                    assert_eq!(
+                        r.requires_human_approval(false, true),
+                        expected == SafetyLevel::Strict
+                    );
                     assert_eq!(r.safety_level_selected(), member);
                     for choice in [SafetyLevel::Off, SafetyLevel::Ask, SafetyLevel::Strict] {
-                        assert_eq!(r.validate_safety_level(choice).is_ok(), choice >= r.safety_level_team_floor());
+                        assert_eq!(
+                            r.validate_safety_level(choice).is_ok(),
+                            choice >= r.safety_level_team_floor()
+                        );
                     }
                     r.team_min_safety_level = SafetyLevel::Off;
                     r.team_forced_human_approval = false;
@@ -7918,16 +7937,30 @@ mod safety_level_tests {
                     r.team_forced_block_on_injection = block;
                     assert_eq!(r.safety_level_team_floor(), SafetyLevel::Off);
                     assert_eq!(r.safety_level_effective(), member);
-                    assert_eq!(r.deny_destructive_effective(), member == SafetyLevel::Strict);
-                    assert_eq!(r.quarantine_on_drift_effective(), member == SafetyLevel::Strict || quarantine);
-                    assert_eq!(r.block_on_injection_effective(), member == SafetyLevel::Strict || block);
+                    assert_eq!(
+                        r.deny_destructive_effective(),
+                        member == SafetyLevel::Strict
+                    );
+                    assert_eq!(
+                        r.quarantine_on_drift_effective(),
+                        member == SafetyLevel::Strict || quarantine
+                    );
+                    assert_eq!(
+                        r.block_on_injection_effective(),
+                        member == SafetyLevel::Strict || block
+                    );
                     assert!(r.content_defense_effective());
                     assert!(r.pii_redaction_effective());
                 }
             }
         }
-        let r: Registry = serde_json::from_value(serde_json::json!({"servers": [], "profiles": []})).unwrap();
-        assert_eq!(r.team_min_safety_level, SafetyLevel::Off, "absent floor has no effect");
+        let r: Registry =
+            serde_json::from_value(serde_json::json!({"servers": [], "profiles": []})).unwrap();
+        assert_eq!(
+            r.team_min_safety_level,
+            SafetyLevel::Off,
+            "absent floor has no effect"
+        );
     }
 
     #[test]

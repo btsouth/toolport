@@ -2213,7 +2213,11 @@ mod tests {
 
     #[test]
     fn essential_safety_control_reports_floor_and_independent_protections() {
-        for floor in [registry::SafetyLevel::Off, registry::SafetyLevel::Ask, registry::SafetyLevel::Strict] {
+        for floor in [
+            registry::SafetyLevel::Off,
+            registry::SafetyLevel::Ask,
+            registry::SafetyLevel::Strict,
+        ] {
             let mut registry = Registry::default();
             registry.set_safety_level(registry::SafetyLevel::Off);
             registry.team_min_safety_level = floor;
@@ -2222,7 +2226,10 @@ mod tests {
             let settings = EssentialSettings::from_registry(&registry);
             assert_eq!(settings.safety_level, floor);
             assert_eq!(settings.team_min_safety_level, floor);
-            assert_eq!(settings.deny_destructive, floor == registry::SafetyLevel::Strict);
+            assert_eq!(
+                settings.deny_destructive,
+                floor == registry::SafetyLevel::Strict
+            );
             assert!(settings.quarantine_on_drift && settings.quarantine_on_drift_forced);
             assert!(settings.block_on_injection && settings.block_on_injection_forced);
         }

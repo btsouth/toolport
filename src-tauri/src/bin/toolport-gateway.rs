@@ -9080,7 +9080,10 @@ fn effective_quarantine(
         let r = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (r.safety_level_effective(), r.quarantine_on_drift_effective())
+        (
+            r.safety_level_effective(),
+            r.quarantine_on_drift_effective(),
+        )
     };
     let stored = if quarantine_on {
         integrity::quarantined_checked(profile)
@@ -29788,10 +29791,6 @@ mod tests {
         );
     }
 
-    /// SEC-01: the startup background build must run the integrity gate BEFORE it
-    /// publishes the catalog and sets `ready`, so a server that reworded a read-only
-    /// tool's description while the gateway was down is quarantined before the first
-    /// `tools/list` rather than on the watcher's first tick.
     #[test]
     fn team_quarantine_at_member_off_enforces_drift_and_survives_watcher_reconciliation() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -29803,7 +29802,11 @@ mod tests {
         integrity::ensure_quarantine_store_for_existing_pins(profile);
         let mut reg = Registry::default();
         reg.set_safety_level(registry::SafetyLevel::Off);
-        conduit_lib::teams::apply_team_config(&mut reg, "t1", &json!({"servers": [], "screeningPolicy": {"forceQuarantineOnDrift": true}}));
+        conduit_lib::teams::apply_team_config(
+            &mut reg,
+            "t1",
+            &json!({"servers": [], "screeningPolicy": {"forceQuarantineOnDrift": true}}),
+        );
         assert_eq!(reg.safety_level_effective(), registry::SafetyLevel::Off);
         assert!(!reg.deny_destructive_effective());
         let registry = Arc::new(Mutex::new(reg));
@@ -29813,13 +29816,26 @@ mod tests {
         assert!(!published.iter().any(|tool| tool["name"] == "srv__read"));
         assert!(drifted.quarantined().contains("srv__read"));
         let read_failed = AtomicBool::new(false);
-        assert!(effective_quarantine(&registry, profile, &read_failed).unwrap().contains("srv__read"));
+        assert!(effective_quarantine(&registry, profile, &read_failed)
+            .unwrap()
+            .contains("srv__read"));
         // Store failures must keep enforced quarantine at Off rather than silently release it.
-        std::fs::write(dir.path().join(format!("quarantine-v2-{}.json", registry::profile_store_key("team-quarantine-off"))), b"corrupt").unwrap();
+        std::fs::write(
+            dir.path().join(format!(
+                "quarantine-v2-{}.json",
+                registry::profile_store_key("team-quarantine-off")
+            )),
+            b"corrupt",
+        )
+        .unwrap();
         assert!(effective_quarantine(&registry, profile, &read_failed).is_none());
         assert!(maybe_check_integrity(&registry, &baseline.aggregated_tools(), profile).is_err());
     }
 
+    /// SEC-01: the startup background build must run the integrity gate BEFORE it
+    /// publishes the catalog and sets `ready`, so a server that reworded a read-only
+    /// tool's description while the gateway was down is quarantined before the first
+    /// `tools/list` rather than on the watcher's first tick.
     #[test]
     fn startup_build_quarantines_readonly_description_drift_before_ready() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

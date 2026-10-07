@@ -5190,7 +5190,9 @@ mod tests {
     #[test]
     fn service_payloads_apply_floors_without_coupling_independent_protections() {
         // GET /config payloads from toolport-teams commit 75f796b on a synthetic database.
-        let cases: Value = serde_json::from_str(include_str!("../tests/fixtures/team-safety-policy.json")).unwrap();
+        let cases: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/team-safety-policy.json"))
+                .unwrap();
         for case in cases.as_array().unwrap() {
             let name = case["name"].as_str().unwrap();
             let floor = match name {
@@ -5198,21 +5200,52 @@ mod tests {
                 "strict" => crate::registry::SafetyLevel::Strict,
                 _ => crate::registry::SafetyLevel::Off,
             };
-            for member in [crate::registry::SafetyLevel::Off, crate::registry::SafetyLevel::Ask, crate::registry::SafetyLevel::Strict] {
+            for member in [
+                crate::registry::SafetyLevel::Off,
+                crate::registry::SafetyLevel::Ask,
+                crate::registry::SafetyLevel::Strict,
+            ] {
                 let mut r = base_registry();
                 r.set_safety_level(member);
                 apply_team_config(&mut r, "t1", &case["config"]);
                 assert_eq!(r.safety_level_effective(), member.max(floor), "{name}");
-                assert_eq!(r.deny_destructive_effective(), member.max(floor) == crate::registry::SafetyLevel::Strict, "{name}");
-                assert_eq!(r.quarantine_on_drift_effective(), member == crate::registry::SafetyLevel::Strict || name == "strict" || name == "quarantine", "{name}");
-                assert_eq!(r.block_on_injection_effective(), member == crate::registry::SafetyLevel::Strict || name == "strict" || name == "injection", "{name}");
-                assert_eq!(build_policy_receipt(&r)["safetyLevel"], serde_json::to_value(member.max(floor)).unwrap());
+                assert_eq!(
+                    r.deny_destructive_effective(),
+                    member.max(floor) == crate::registry::SafetyLevel::Strict,
+                    "{name}"
+                );
+                assert_eq!(
+                    r.quarantine_on_drift_effective(),
+                    member == crate::registry::SafetyLevel::Strict
+                        || name == "strict"
+                        || name == "quarantine",
+                    "{name}"
+                );
+                assert_eq!(
+                    r.block_on_injection_effective(),
+                    member == crate::registry::SafetyLevel::Strict
+                        || name == "strict"
+                        || name == "injection",
+                    "{name}"
+                );
+                assert_eq!(
+                    build_policy_receipt(&r)["safetyLevel"],
+                    serde_json::to_value(member.max(floor)).unwrap()
+                );
                 assert_eq!(r.safety_level_selected(), member);
                 apply_team_config(&mut r, "t1", &json!({"servers": []}));
-                assert_eq!(r.safety_level_effective(), member, "sync releases the floor");
+                assert_eq!(
+                    r.safety_level_effective(),
+                    member,
+                    "sync releases the floor"
+                );
                 apply_team_config(&mut r, "t1", &case["config"]);
                 remove_team(&mut r, "t1");
-                assert_eq!(r.safety_level_effective(), member, "leaving releases the floor");
+                assert_eq!(
+                    r.safety_level_effective(),
+                    member,
+                    "leaving releases the floor"
+                );
             }
         }
     }
@@ -5222,14 +5255,36 @@ mod tests {
         let mut r = base_registry();
         r.set_safety_level(crate::registry::SafetyLevel::Off);
         for level in [json!(null), json!("unknown"), json!(2)] {
-            apply_team_config(&mut r, "t1", &json!({"servers": [], "screeningPolicy": {"minSafetyLevel": level, "forceHumanApproval": true}}));
+            apply_team_config(
+                &mut r,
+                "t1",
+                &json!({"servers": [], "screeningPolicy": {"minSafetyLevel": level, "forceHumanApproval": true}}),
+            );
             assert_eq!(r.team_min_safety_level, crate::registry::SafetyLevel::Off);
-            assert_eq!(r.safety_level_effective(), crate::registry::SafetyLevel::Ask);
+            assert_eq!(
+                r.safety_level_effective(),
+                crate::registry::SafetyLevel::Ask
+            );
         }
-        apply_team_config(&mut r, "t1", &json!({"servers": [], "screeningPolicy": {"forceHumanApproval": true}}));
-        assert_eq!(r.safety_level_effective(), crate::registry::SafetyLevel::Ask);
-        apply_team_config(&mut r, "t1", &json!({"servers": [], "screeningPolicy": {"minSafetyLevel": "off", "forceHumanApproval": true}}));
-        assert_eq!(r.safety_level_effective(), crate::registry::SafetyLevel::Ask, "legacy approval remains tighten-only");
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({"servers": [], "screeningPolicy": {"forceHumanApproval": true}}),
+        );
+        assert_eq!(
+            r.safety_level_effective(),
+            crate::registry::SafetyLevel::Ask
+        );
+        apply_team_config(
+            &mut r,
+            "t1",
+            &json!({"servers": [], "screeningPolicy": {"minSafetyLevel": "off", "forceHumanApproval": true}}),
+        );
+        assert_eq!(
+            r.safety_level_effective(),
+            crate::registry::SafetyLevel::Ask,
+            "legacy approval remains tighten-only"
+        );
     }
 
     #[test]
@@ -5246,7 +5301,10 @@ mod tests {
             "org force recorded separately"
         );
         assert!(!r.deny_destructive, "member's own setting is untouched");
-        assert!(!r.deny_destructive_effective(), "legacy team deny does not raise the level");
+        assert!(
+            !r.deny_destructive_effective(),
+            "legacy team deny does not raise the level"
+        );
         // Org drops the flag -> released, gate follows the member's own (off).
         apply_team_config(&mut r, "t1", &json!({ "servers": [] }));
         assert!(!r.deny_destructive_effective(), "org released the lock");

@@ -1474,8 +1474,10 @@ impl SettingsPage {
             crate::registry::SafetyLevel::Ask => vec!["Ask", "Strict"],
             crate::registry::SafetyLevel::Strict => vec!["Strict"],
         };
-        self.safety_level.set_model(Some(&gtk::StringList::new(&choices)));
-        self.safety_level.set_selected(settings.safety_level as u32 - settings.team_min_safety_level as u32);
+        self.safety_level
+            .set_model(Some(&gtk::StringList::new(&choices)));
+        self.safety_level
+            .set_selected(settings.safety_level as u32 - settings.team_min_safety_level as u32);
         let floor = match settings.team_min_safety_level {
             crate::registry::SafetyLevel::Off => "Off",
             crate::registry::SafetyLevel::Ask => "Ask",
@@ -1489,8 +1491,11 @@ impl SettingsPage {
             policy.push_str(" Team also enforces block on injection.");
         }
         self.safety_policy.set_label(&policy);
-        self.safety_policy.set_visible(settings.team_min_safety_level != crate::registry::SafetyLevel::Off
-            || settings.quarantine_on_drift_forced || settings.block_on_injection_forced);
+        self.safety_policy.set_visible(
+            settings.team_min_safety_level != crate::registry::SafetyLevel::Off
+                || settings.quarantine_on_drift_forced
+                || settings.block_on_injection_forced,
+        );
         self.safety_level.set_sensitive(true);
         set_switch(&self.pii_redaction, settings.pii_redaction);
         set_team_managed(&self.pii_redaction, settings.pii_redaction_forced);

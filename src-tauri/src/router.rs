@@ -5772,15 +5772,30 @@ mod tests {
         ] {
             let mut reg = crate::registry::Registry::default();
             reg.set_safety_level(crate::registry::SafetyLevel::Off);
-            crate::teams::apply_team_config(&mut reg, "t1", &serde_json::json!({"servers": [], "screeningPolicy": policy}));
+            crate::teams::apply_team_config(
+                &mut reg,
+                "t1",
+                &serde_json::json!({"servers": [], "screeningPolicy": policy}),
+            );
             let strict = reg.safety_level_effective() == crate::registry::SafetyLevel::Strict;
             let mut router = Router::with_policy(ToolPolicy {
                 deny_destructive: reg.deny_destructive_effective(),
                 ..Default::default()
             });
             router.add(DownstreamServer::connect("db".into(), Box::new(DestructiveMock)).unwrap());
-            assert_eq!(router.aggregated_tools().iter().any(|t| t["name"] == "db__drop_table"), !strict);
-            assert_eq!(router.route_call("db__drop_table", serde_json::json!({})).is_ok(), !strict);
+            assert_eq!(
+                router
+                    .aggregated_tools()
+                    .iter()
+                    .any(|t| t["name"] == "db__drop_table"),
+                !strict
+            );
+            assert_eq!(
+                router
+                    .route_call("db__drop_table", serde_json::json!({}))
+                    .is_ok(),
+                !strict
+            );
         }
     }
 
