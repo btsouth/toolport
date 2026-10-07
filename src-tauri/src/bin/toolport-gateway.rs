@@ -19676,10 +19676,15 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut router = Router::with_policy(registry_policy(&reg, None, false, false).with_quarantine(BTreeSet::new(), false));
         let connect_calls = Arc::clone(&calls);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
         router.add_supervised(
             "s".into(),
             vec![json!({"name":"work", "description":"fixture", "inputSchema":{"type":"object"}, "annotations":{"destructiveHint":false}})],
             Arc::new(move || {
+                started_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
                 Ok(DownstreamServer::connect(
                     "s".into(),
                     Box::new(CountingRoute {
@@ -19724,11 +19729,13 @@ mod tests {
                     Some(&state.router),
                 )
             });
-            // A completed connection waits for adoption, so the call is still held.
-            wait_for_supervisor_result(&snapshot);
+            // The connector holds the call until its live tool scope is revoked.
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             state.registry.lock().unwrap().profiles[0]
                 .tool_scope
                 .insert("s".into(), Vec::new());
+            release_tx.send(()).unwrap();
+            wait_for_supervisor_result(&snapshot);
             let mut published = (*snapshot).clone();
             published.adopt_ready_reconnects();
             *state.router.lock().unwrap() = Arc::new(published);
