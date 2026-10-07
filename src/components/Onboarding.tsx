@@ -35,6 +35,7 @@ import { HOSTED_TEAMS_URL, TEAMS_MARKETING_URL, teamUrlError } from "@/lib/teamU
 import { Input } from "@/components/ui/input";
 import {
   importableServers,
+  isEnabled,
   isGatewayServer,
   type AuditEntry,
   type DetectedClient,
@@ -567,7 +568,7 @@ function AddServers({
 }) {
   const [busy, setBusy] = useState(false);
   const [importPreview, setImportPreview] = useState<ImportItem[] | null>(null);
-  const [imported, setImported] = useState<number | null>(null);
+  const [imported, setImported] = useState<{ added: number; on: number } | null>(null);
   const [stacks, setStacks] = useState<Stack[]>([]);
   const [stacksLoading, setStacksLoading] = useState(true);
   const [stacksError, setStacksError] = useState(false);
@@ -613,7 +614,12 @@ function AddServers({
     try {
       const next = await importServers(selected);
       onImport(next);
-      setImported(next.servers.filter((s) => !isGatewayServer(s)).length);
+      const before = new Set(registry.servers.map((s) => s.id));
+      const added = next.servers.filter((s) => !isGatewayServer(s) && !before.has(s.id));
+      setImported({
+        added: added.length,
+        on: added.filter((s) => isEnabled(next, s.id)).length,
+      });
       setTouched(true);
       toast.success("Imported servers from your clients");
       setImportPreview(null);
@@ -774,8 +780,7 @@ function AddServers({
         {imported !== null && (
           <div className="flex items-center gap-2 rounded-md bg-success/10 px-3 py-2 text-sm text-success">
             <Check className="size-4" />
-            Imported. Toolport now manages {imported} server
-            {imported === 1 ? "" : "s"}.
+            {importedSummary(imported.added, imported.on)}
           </div>
         )}
 
@@ -890,6 +895,27 @@ function ConnectClients({
   );
 }
 
+function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+/** What an import actually turned on, not just what Toolport now lists (UX-01). */
+function importedSummary(added: number, on: number): string {
+  if (on === added) return `Imported ${plural(added, "server")} and turned them on.`;
+  return `Imported ${plural(added, "server")}, ${on} turned on. Turn on the rest from Servers.`;
+}
+
+/** Count servers that answered the health probe, not every server in the registry (UX-01). */
+function servingSummary(health: ProbeResult[], connectedCount: number): string {
+  const serving = health.filter((r) => r.ok).length;
+  const signIn = health.filter((r) => !r.ok && r.authRequired).length;
+  const tools = plural(connectedCount, "connected tool");
+  const base = `Toolport is serving ${plural(serving, "server")} to ${tools}`;
+  return signIn > 0
+    ? `${base}, and ${signIn} need${signIn === 1 ? "s" : ""} sign-in.`
+    : `${base}.`;
+}
+
 function Done({
   path,
   registry,
@@ -998,13 +1024,11 @@ function Done({
           </>
         ) : ready ? (
           <>
-            Toolport now manages {serverCount} server
-            {serverCount === 1 ? "" : "s"} across {connectedCount} connected tool
-            {connectedCount === 1 ? "" : "s"}. Toggle one on or off and your clients
-            update live, no restart. Each client loads a handful of Toolport meta-tools
-            instead of every downstream tool, up to 91% fewer tokens at the same task
-            success. And Toolport watches every server for tampering and prompt injection,
-            see Activity.
+            {servingSummary(health ?? [], connectedCount)} Toggle one on or off and your
+            clients update live, no restart. Each client loads a handful of Toolport
+            meta-tools instead of every downstream tool, up to 91% fewer tokens at the
+            same task success. And Toolport watches every server for tampering and prompt
+            injection, see Activity.
           </>
         ) : configured && checkingHealth ? (
           <>

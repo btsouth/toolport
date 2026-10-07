@@ -2064,7 +2064,7 @@ impl ClientPage {
             match result {
                 Ok(Ok((_, added))) => {
                     page.refresh_with_confirmation(format!(
-                        "Imported {added} server{}. They remain disabled until reviewed.",
+                        "Imported {added} server{} and turned them on.",
                         if added == 1 { "" } else { "s" }
                     ));
                 }
@@ -2474,7 +2474,7 @@ fn confirm_client_migrate(client: &state::ClientView, button: gtk::Button, page:
     };
     let count = client.movable_server_count;
     let mut body = format!(
-        "Toolport imports the {count} {} this client manages directly (new ones stay disabled until you review them), backs the config up, and rewrites it to contain only the Toolport gateway. Plugin-managed servers are left untouched. Secret values are never read from the client; add them under Credentials after the move.",
+        "Toolport imports the {count} {} this client manages directly, turns them on, backs the config up, and rewrites it to contain only the Toolport gateway. Plugin-managed servers are left untouched. Secret values are never read from the client; add them under Credentials after the move.",
         if count == 1 { "server" } else { "servers" }
     );
     let force = client.gateway_state == state::ClientGatewayState::Customized;
@@ -2880,12 +2880,18 @@ fn run_client_mutation(
         .await;
         button.set_sensitive(true);
         match result {
-            Ok(Ok(_)) => {
+            Ok(Ok(result)) => {
                 // The config write is not live until the client restarts; saying
                 // only "Connected" would misstate what the running client does.
+                let restored = result.outcome.restored.len();
                 page.refresh_with_confirmation(if connect {
                     format!(
                         "Connected {client_name} to Toolport. Restart {client_name} to apply it."
+                    )
+                } else if restored > 0 {
+                    format!(
+                        "Disconnected {client_name} from Toolport and put back {restored} server{} it had moved. Restart {client_name} to apply it.",
+                        if restored == 1 { "" } else { "s" }
                     )
                 } else {
                     format!(
