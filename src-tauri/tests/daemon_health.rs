@@ -269,6 +269,26 @@ impl Client {
         }
     }
 
+    fn finish(mut self) {
+        let pid = self.child.id();
+        self.stdin.take();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let result = self.child.wait();
+            drop(self);
+            let _ = done_tx.send(result);
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(10));
+        if result.is_err() {
+            signal(u64::from(pid), "-KILL");
+        }
+        worker.join().unwrap();
+        assert!(result
+            .expect("adapter shutdown timed out")
+            .expect("wait for adapter")
+            .success());
+    }
+
     fn diagnostics(&self) -> String {
         format!(
             "adapter stderr:\n{}\n{}",
@@ -621,6 +641,10 @@ fn a_wedged_daemon_moves_clients_to_their_own_gateways() {
     assert_eq!(fixture.descriptor(), Some(descriptor));
     assert!(pid_alive(daemon_pid));
 
+    // Close normally so the bounded shutdown barrier publishes queued topology
+    // logs before reading them. A response no longer implies a synchronous append.
+    explicit.finish();
+    attached.finish();
     // Each private gateway ends with its adapter.
     let log = std::fs::read_to_string(fixture.dir.join("gateway.log")).unwrap_or_default();
     let private_pids: Vec<u64> = log
@@ -629,8 +653,6 @@ fn a_wedged_daemon_moves_clients_to_their_own_gateways() {
         .filter_map(|rest| rest.split_whitespace().next()?.parse().ok())
         .collect();
     assert_eq!(private_pids.len(), 2, "{}", log_tail(&fixture.dir));
-    drop(explicit);
-    drop(attached);
     let deadline = Instant::now() + Duration::from_secs(15);
     while private_pids.iter().any(|pid| pid_alive(*pid)) {
         assert!(
