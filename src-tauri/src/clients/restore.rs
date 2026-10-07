@@ -84,6 +84,30 @@ pub(super) fn checkpoint(path: &Path) -> Result<Receipt, String> {
     })
 }
 
+fn retired_hook_count(value: Option<&Value>) -> usize {
+    match value {
+        Some(Value::Object(map)) => {
+            let own = map
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|command| {
+                    command.contains(crate::hooks::HOOK_MARKER)
+                        || command.contains(crate::guard_cleanup::GUARD_MARKER)
+                });
+            usize::from(own)
+                + map
+                    .values()
+                    .map(|value| retired_hook_count(Some(value)))
+                    .sum::<usize>()
+        }
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| retired_hook_count(Some(value)))
+            .sum(),
+        _ => 0,
+    }
+}
+
 /// Persist recovery before publishing the corresponding client revision. If the
 /// process dies between the two writes, the old config cannot match last_written
 /// and the next disconnect takes the conservative merge path.
@@ -96,6 +120,14 @@ pub(super) fn remember(
     disconnecting: bool,
     jsonc_settings: bool,
 ) -> Result<Receipt, String> {
+    // Removing a retired Toolport hook is already a disconnect. Keep provenance
+    // for rollback, but later removal must never resurrect the retired hook.
+    let disconnecting = disconnecting
+        || (jsonc_settings && {
+            let before = mutation::value(format, before)?;
+            let after = mutation::value(format, after)?;
+            retired_hook_count(before.get("hooks")) > retired_hook_count(after.get("hooks"))
+        });
     let file = record_path(client_id, path)?;
     let previous = match std::fs::read_to_string(&file) {
         Ok(text) => Some(text),
@@ -1178,6 +1210,31 @@ mod tests {
                 assert!(restored.contains(if index == 0 { "# keep" } else if moved { "# original note" } else { "# edited note" }), "{restored}");
             }
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn removing_clients_does_not_resurrect_a_retired_toolport_hook() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-retired-hook-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("settings.json");
+        let original = serde_json::json!({"theme":"dark", "hooks":{"PostToolUse":[{"hooks":[{"command":"toolport-gateway --toolport-hook"}, {"command":"user-hook"}]}]}}).to_string();
+        std::fs::write(&path, &original).unwrap();
+        let cleaned = crate::hooks::strip_hooks(&parse_json_value(&original).unwrap());
+        write_settings_json(&path, Some(&original), &cleaned).unwrap();
+        let removed = read_config_file(&path).unwrap();
+        run("claude-code", &path, Format::JsonMcpServers, || {
+            apply("claude-code", Format::JsonMcpServers, &path).map(|_| ())
+        })
+        .unwrap();
+        assert_eq!(read_config_file(&path).unwrap(), removed);
+        assert!(!removed.contains("--toolport-hook"));
+        assert!(removed.contains("user-hook"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
