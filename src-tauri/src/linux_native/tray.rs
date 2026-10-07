@@ -133,6 +133,33 @@ pub(super) fn sni_watcher_present() -> bool {
         .unwrap_or(false)
 }
 
+/// How long a hidden launch waits for a tray host before showing the window.
+/// At login the host (the Omarchy shell, Waybar) often starts in the same
+/// second as Toolport and registers its watcher a moment later.
+pub(super) const HOST_GRACE: Duration = Duration::from_secs(15);
+
+/// A hidden launch found no tray host yet. Keep the window hidden while the host
+/// may still be starting, and present it if none appears within `grace` so the
+/// app never sits running with no way to reach it.
+pub(super) fn present_unless_host_appears(app: &adw::Application, grace: Duration) {
+    let poll = Duration::from_millis(500);
+    let mut remaining = grace.as_millis() / poll.as_millis();
+    let app = app.clone();
+    gtk::glib::timeout_add_local(poll, move || {
+        if sni_watcher_present() {
+            return gtk::glib::ControlFlow::Break;
+        }
+        remaining = remaining.saturating_sub(1);
+        if remaining > 0 {
+            return gtk::glib::ControlFlow::Continue;
+        }
+        if let Some(window) = app.windows().into_iter().next() {
+            window.present();
+        }
+        gtk::glib::ControlFlow::Break
+    });
+}
+
 pub(super) fn start(app: &adw::Application) -> Option<ksni::blocking::Handle<ToolportTray>> {
     let (sender, receiver) = mpsc::channel();
     let handle = ToolportTray {
