@@ -52,7 +52,11 @@ try {
   });
   await page.goto(`${baseURL}/fixtures/`);
   await expect(page.getByText("GitHub", { exact: true })).toBeVisible();
-  await expect(page.getByText("≈41.1k tokens saved")).toBeVisible();
+  await expect(page.getByRole("button", { name: "35.0k tokens saved" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "35.0k tokens saved" })).toHaveAttribute(
+    "title",
+    /cl100k_base.*net of discovery.*once per session/,
+  );
   await page.screenshot({ path: path.join(output, "servers.png") });
   await page.getByRole("button", { name: "Show GitHub details", exact: true }).click();
   await page.getByRole("tab", { name: "Tools", exact: true }).click();
@@ -69,6 +73,8 @@ try {
   await expect(
     page.getByText("Tool definitions kept out of your agent's context"),
   ).toBeVisible();
+  await expect(page.getByRole("main").getByText("35.0k tokens saved")).toBeVisible();
+  await expect(page.getByText(/Historical bytes\/4: ≈41.1k/)).toBeVisible();
   await page.screenshot({ path: path.join(output, "activity.png") });
   const fixture = await page.evaluate(() => window.toolportFixture);
   expect(fixture.missing).toEqual([]);
