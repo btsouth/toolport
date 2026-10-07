@@ -252,6 +252,21 @@ impl SettingsPage {
             "Capture the last 50 tool calls locally for Activity. Turning this off clears the buffer.",
         );
         protection.append(&inspect_row);
+        protection.append(&settings_heading(
+            "Remembered approvals",
+            "Fingerprint-bound exceptions that can skip the human approval prompt.",
+        ));
+        let allowed_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        allowed_list.add_css_class("toolport-settings-group");
+        allowed_list.append(
+            &gtk::Label::builder()
+                .label("Checking remembered approvals…")
+                .halign(gtk::Align::Start)
+                .css_classes(["toolport-muted"])
+                .build(),
+        );
+        protection.append(&allowed_list);
+
         page.append(&protection);
 
         page.append(&settings_heading(
@@ -493,20 +508,6 @@ impl SettingsPage {
         );
         page.append(&quarantine_list);
 
-        page.append(&settings_heading(
-            "Remembered approvals",
-            "Fingerprint-bound exceptions that can skip the human approval prompt.",
-        ));
-        let allowed_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        allowed_list.add_css_class("toolport-settings-group");
-        allowed_list.append(
-            &gtk::Label::builder()
-                .label("Checking remembered approvals…")
-                .halign(gtk::Align::Start)
-                .css_classes(["toolport-muted"])
-                .build(),
-        );
-        page.append(&allowed_list);
 
         scroller.set_child(Some(&page));
         root.append(&scroller);

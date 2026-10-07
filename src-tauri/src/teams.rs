@@ -4307,6 +4307,7 @@ mod tests {
 
     fn base_registry() -> Registry {
         let mut r = Registry::default();
+        r.safety_level = None; // Exercise retained v1 fields and releasable team overlays.
         r.servers.push(ServerEntry {
             inherit_env: false,
             id: "mine".into(),
@@ -5234,7 +5235,7 @@ mod tests {
 
         // Org dropping the policy releases both to the member's own (off), no permanent lock.
         apply_team_config(&mut r, "t1", &json!({ "servers": [] }));
-        assert!(!r.content_defense_effective(), "content defense released");
+        assert!(r.content_defense_effective(), "labeling stays on after the team lock releases");
         assert!(
             !r.quarantine_on_drift_effective(),
             "drift-quarantine released"
@@ -5281,7 +5282,7 @@ mod tests {
         assert!(
             !r.human_approval_effective()
                 && !r.deny_destructive_effective()
-                && !r.content_defense_effective()
+                && r.content_defense_effective()
                 && !r.quarantine_on_drift_effective()
                 && !r.block_on_injection_effective(),
             "no team -> every flag follows the member's own (off) settings"
@@ -5439,7 +5440,7 @@ mod tests {
             receipt["forceContentDefense"], true,
             "org force makes content defense effective"
         );
-        assert_eq!(receipt["forceQuarantineOnDrift"], false);
+        assert_eq!(receipt["forceQuarantineOnDrift"], true);
         assert_eq!(receipt["forceHumanApproval"], true);
         assert_eq!(
             receipt["forceBlockOnInjection"], true,

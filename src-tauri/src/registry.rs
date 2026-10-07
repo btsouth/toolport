@@ -5065,6 +5065,7 @@ mod tests {
     #[test]
     fn remove_server_cleans_up_server_state() {
         let mut r = Registry::default();
+        r.set_safety_level(SafetyLevel::Strict);
         let id = r.add_server(sample_server("Github MCP"));
         // `tool_overrides` / `pinned_tools` are keyed by the RAW registry id, while
         // `injection_block_exempt` / `result_budgets` / the allow-list are keyed by
