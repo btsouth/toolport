@@ -1911,6 +1911,7 @@ fn matrix_pooling_integrity_pins_are_independent_per_root() {
     let path = dir.join("registry.json");
     let mut reg = registry::load_from(&path).unwrap();
     reg.integrity_check = true;
+    reg.set_safety_level(registry::SafetyLevel::Strict);
     reg.quarantine_on_drift = true;
     registry::save_to(&path, &reg).unwrap();
     let mut a = spawn_adapter(
@@ -1976,6 +1977,7 @@ fn matrix_pooling_quarantine_reaches_every_cached_root_view() {
     let registry_path = dir.join("registry.json");
     let mut registry_value: Registry =
         serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+    registry_value.set_safety_level(registry::SafetyLevel::Strict);
     registry_value.quarantine_on_drift = true;
     registry::save_to(&registry_path, &registry_value).unwrap();
 
