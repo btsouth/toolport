@@ -99,6 +99,46 @@ try {
     path: path.join(output, "settings-advanced.png"),
     fullPage: true,
   });
+  await page.goto(`${baseURL}/fixtures/?long-names=1`);
+  await page.setViewportSize({ width: 480, height: 360 });
+  const longServer = "A".repeat(70);
+  await expect(page.getByTitle(longServer, { exact: true })).toBeVisible();
+  await page
+    .getByRole("button", { name: `Show ${longServer} details`, exact: true })
+    .click();
+  await page.getByRole("tab", { name: "Tools", exact: true }).click();
+  await expect(page.getByTitle("t".repeat(70), { exact: true })).toBeVisible();
+  expect(
+    await page.evaluate(() =>
+      [
+        ...document.querySelectorAll(
+          "main [role=button], main button, main [role=switch]",
+        ),
+      ]
+        .filter((element) => element.getBoundingClientRect().width > 0)
+        .every((element) => element.getBoundingClientRect().right <= innerWidth),
+    ),
+  ).toBe(true);
+  await page.getByRole("button", { name: "Add server", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByText("Give the server a name.", { exact: true })).toHaveCount(
+    0,
+  );
+  const footer = dialog.locator('[data-slot="dialog-footer"]');
+  await page.evaluate(() =>
+    Promise.all(
+      document.getAnimations().map((animation) => animation.finished.catch(() => {})),
+    ),
+  );
+  const footerBefore = await footer.boundingBox();
+  await dialog.locator('[data-slot="dialog-body"]').evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  expect(await footer.boundingBox()).toEqual(footerBefore);
+  expect(footerBefore.y + footerBefore.height).toBeLessThanOrEqual(360);
+  await expect(dialog.getByRole("button", { name: "Cancel", exact: true })).toBeVisible();
+  await page.screenshot({ path: path.join(output, "short-add-server.png") });
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
   const fixture = await page.evaluate(() => window.toolportFixture);
   expect(fixture.missing).toEqual([]);
   expect(errors).toEqual([]);

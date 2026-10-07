@@ -367,6 +367,7 @@ fn tool_row(
     title.append(
         &gtk::Label::builder()
             .label(&name)
+            .tooltip_text(&name)
             .halign(gtk::Align::Start)
             .xalign(0.0)
             .max_width_chars(48)

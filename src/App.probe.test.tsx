@@ -102,6 +102,9 @@ function deferred<T>() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  setServerEnabled.mockReset();
+  setAllEnabled.mockReset();
+  probeServers.mockReset();
   localStorage.clear();
   captured.onProbe = null;
   getRegistry.mockResolvedValue({
@@ -187,9 +190,9 @@ describe("App health visibility", () => {
     render(<App />);
 
     expect(
-      await screen.findByRole("button", { name: /checking 1/i }),
+      await screen.findByRole("status", { name: "Checking connection" }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: /^Ready,/i })).not.toBeInTheDocument();
   });
 
   it("drops stale health when a server is re-enabled", async () => {
@@ -234,19 +237,20 @@ describe("App health visibility", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: /ready 1/i })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("status", { name: /^Ready, 1 tool$/i }),
+    ).toBeInTheDocument();
     await userEvent.click(screen.getByLabelText("Toggle Example"));
     await waitFor(() =>
       expect(setServerEnabled).toHaveBeenCalledWith("default", "server-1", false, false),
     );
 
-    await userEvent.click(screen.getByRole("button", { name: /disabled 1/i }));
     await userEvent.click(screen.getByLabelText("Toggle Example"));
 
     expect(
-      await screen.findByRole("button", { name: /checking 1/i }),
+      await screen.findByRole("status", { name: "Checking connection" }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: /^Ready,/i })).not.toBeInTheDocument();
     expect(
       screen.queryByText(/1 of 1 enabled servers reachable/i),
     ).not.toBeInTheDocument();
@@ -294,7 +298,9 @@ describe("App health visibility", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: /ready 1/i })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("status", { name: /^Ready, 1 tool$/i }),
+    ).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "More actions" }));
     await userEvent.click(screen.getByText("Disable all"));
     await waitFor(() => expect(setAllEnabled).toHaveBeenCalledWith("default", false));
@@ -303,9 +309,9 @@ describe("App health visibility", () => {
     await userEvent.click(screen.getByText("Enable all"));
 
     expect(
-      await screen.findByRole("button", { name: /checking 1/i }),
+      await screen.findByRole("status", { name: "Checking connection" }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: /^Ready,/i })).not.toBeInTheDocument();
   });
 
   it("invalidates health and probes after changing default access", async () => {
@@ -345,14 +351,16 @@ describe("App health visibility", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("button", { name: /ready 1/i })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("status", { name: /^Ready, 1 tool$/i }),
+    ).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Change default access" }));
 
     await waitFor(() => expect(probeServers).toHaveBeenCalledTimes(2));
     expect(
-      await screen.findByRole("button", { name: /checking 1/i }),
+      await screen.findByRole("status", { name: "Checking connection" }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: /^Ready,/i })).not.toBeInTheDocument();
   });
 });
 
