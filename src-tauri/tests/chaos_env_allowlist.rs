@@ -1,5 +1,5 @@
 //! P1.7 chaos: a spawned MCP server must not inherit the gateway's ambient
-//! credentials. Tracked by `#1013`, which clears the child environment and
+//! credentials. #1013 clears the child environment and
 //! passes only an allowlist plus the server's own configured env.
 //!
 //! Unix only: the fixture is a `/bin/sh` wrapper, which needs no mock knob.
@@ -14,7 +14,6 @@ use chaos_support::{start_daemon_with_env, write_registry, Client, Scratch, MOCK
 use serde_json::json;
 
 #[test]
-#[ignore = "needs #1013"]
 fn a_spawned_server_does_not_inherit_ambient_credentials() {
     let scratch = Scratch::new("env-allowlist");
     let dump = scratch.join("child-env.txt");
