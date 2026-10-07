@@ -92,6 +92,9 @@ try {
     page.getByRole("combobox", { name: "Default access", exact: true }),
   ).toBeVisible();
   await expect(page.getByText("Access sets", { exact: true })).toBeVisible();
+  await page
+    .getByText("Advanced", { exact: true })
+    .evaluate((element) => element.scrollIntoView({ block: "start" }));
   await page.screenshot({
     path: path.join(output, "settings-advanced.png"),
     fullPage: true,
