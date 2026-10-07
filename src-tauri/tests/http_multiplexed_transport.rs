@@ -485,68 +485,74 @@ fn http_responses_with_another_requests_id_are_rejected() {
     wire.join().unwrap();
 }
 
+fn failed_forced_refresh_probe(concurrent: bool) {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", server.server_addr());
+    let wire = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let Some(mut request) = server.recv_timeout(Duration::from_secs(3)).unwrap() else {
+                break;
+            };
+            let fresh = request
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("Authorization") && h.value.as_str() == "Bearer fresh");
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body).unwrap();
+            let body: Value = serde_json::from_str(&body).unwrap();
+            let response = if fresh {
+                tiny_http::Response::from_string(
+                    json!({"jsonrpc":"2.0","id":body["id"],"result":{"ok":true}}).to_string(),
+                )
+            } else {
+                tiny_http::Response::from_string("revoked").with_status_code(401)
+            };
+            request.respond(response).unwrap();
+        }
+    });
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let forced = Arc::clone(&attempts);
+    let refresh: RefreshFn = Box::new(move |force| {
+        if !force {
+            return Ok(None);
+        }
+        if forced.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err("temporary lock timeout".into())
+        } else {
+            Ok(Some("fresh".into()))
+        }
+    });
+    let mut transport = HttpTransport::with_auth_refresh(&url, Some("stale".into()), Some(refresh));
+    let handle = transport.concurrent().unwrap();
+    let mut call = || {
+        if concurrent {
+            handle.request_with_cancel("echo", json!({}), None)
+        } else {
+            transport.request("echo", json!({}))
+        }
+    };
+    assert!(call()
+        .unwrap_err()
+        .to_string()
+        .contains("temporary lock timeout"));
+    let second = call();
+    wire.join().unwrap();
+    assert_eq!(
+        second.unwrap(),
+        json!({"ok":true}),
+        "concurrent={concurrent}"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
 #[test]
-fn failed_forced_refresh_recovers_on_the_next_call() {
-    for concurrent in [false, true] {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/", server.server_addr());
-        let wire = std::thread::spawn(move || {
-            for _ in 0..3 {
-                let Some(mut request) = server.recv_timeout(Duration::from_secs(3)).unwrap() else {
-                    break;
-                };
-                let fresh = request
-                    .headers()
-                    .iter()
-                    .any(|h| h.field.equiv("Authorization") && h.value.as_str() == "Bearer fresh");
-                let mut body = String::new();
-                request.as_reader().read_to_string(&mut body).unwrap();
-                let body: Value = serde_json::from_str(&body).unwrap();
-                let response = if fresh {
-                    tiny_http::Response::from_string(
-                        json!({"jsonrpc":"2.0","id":body["id"],"result":{"ok":true}}).to_string(),
-                    )
-                } else {
-                    tiny_http::Response::from_string("revoked").with_status_code(401)
-                };
-                request.respond(response).unwrap();
-            }
-        });
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let forced = Arc::clone(&attempts);
-        let refresh: RefreshFn = Box::new(move |force| {
-            if !force {
-                return Ok(None);
-            }
-            if forced.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err("temporary lock timeout".into())
-            } else {
-                Ok(Some("fresh".into()))
-            }
-        });
-        let mut transport =
-            HttpTransport::with_auth_refresh(&url, Some("stale".into()), Some(refresh));
-        let handle = transport.concurrent().unwrap();
-        let mut call = || {
-            if concurrent {
-                handle.request_with_cancel("echo", json!({}), None)
-            } else {
-                transport.request("echo", json!({}))
-            }
-        };
-        assert!(call()
-            .unwrap_err()
-            .to_string()
-            .contains("temporary lock timeout"));
-        let second = call();
-        wire.join().unwrap();
-        assert_eq!(
-            second.unwrap(),
-            json!({"ok":true}),
-            "concurrent={concurrent}"
-        );
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    }
+fn failed_forced_refresh_recovers_on_the_next_serial_call() {
+    failed_forced_refresh_probe(false);
+}
+
+#[test]
+fn failed_forced_refresh_recovers_on_the_next_concurrent_call() {
+    failed_forced_refresh_probe(true);
 }
 
 #[test]

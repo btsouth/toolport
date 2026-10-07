@@ -14496,13 +14496,56 @@ mod tests {
                 pending,
             ),
         );
-        let result = transport
-            .concurrent()
-            .unwrap()
-            .request_with_cancel("echo", json!({}), None);
+        let handle = transport.concurrent().unwrap();
+        let (send_result, receive_result) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            send_result
+                .send(handle.request_with_cancel("echo", json!({}), None))
+                .unwrap();
+        });
+        let result = receive_result.recv_timeout(std::time::Duration::from_millis(500));
         release.send(()).unwrap();
         wire.join().unwrap();
-        assert_eq!(result.unwrap(), json!({"ok":true}));
+        caller.join().unwrap();
+        assert_eq!(
+            result.expect("next call waited on retirement").unwrap(),
+            json!({"ok":true})
+        );
+    }
+
+    #[test]
+    fn http_watchers_read_state_without_creating_call_snapshots() {
+        struct NoSnapshot;
+        impl Transport for NoSnapshot {
+            fn request(&mut self, _: &str, _: Value) -> Result<Value, TransportError> {
+                unreachable!()
+            }
+            fn notify(&mut self, _: &str, _: Value) -> Result<(), TransportError> {
+                unreachable!()
+            }
+            fn concurrent(&self) -> Option<Arc<dyn super::ConcurrentTransport>> {
+                panic!("watcher cloned the transport")
+            }
+        }
+        let mut server = DownstreamServer::stopped("watcher".into(), vec![]);
+        server.transport = Box::new(NoSnapshot);
+        assert_eq!(server.connection_closed(), None);
+        assert_eq!(server.suspended_calls(), 0);
+        let transport = HttpTransport::new("http://127.0.0.1:1/");
+        let shared = Arc::clone(&transport.concurrency);
+        server.transport = Box::new(transport);
+        assert_eq!(server.connection_closed(), Some(false));
+        let pending = pending_http_probe();
+        shared.pending.lock().unwrap().insert(
+            pending.common.token.clone(),
+            (std::time::Instant::now(), pending),
+        );
+        assert_eq!(server.suspended_calls(), 1);
+        shared.pending.lock().unwrap().clear();
+        shared
+            .closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(server.connection_closed(), Some(true));
     }
 
     #[test]
