@@ -530,11 +530,18 @@ async fn uninstall_gateway(
             reg.clear_client_managed_entry(&client_id);
             Ok(())
         })?;
-        clients::finish_uninstall(&client_id, &outcome);
+        clients::finish_uninstall(&client_id, &outcome)?;
         Ok(outcome)
     })
     .await
     .map_err(|e| format!("uninstall task join failed: {e}"))?
+}
+
+#[tauri::command]
+async fn disconnect_all_clients() -> Result<Vec<clients::DisconnectResult>, String> {
+    tauri::async_runtime::spawn_blocking(|| clients::disconnect_all(false))
+        .await
+        .map_err(|e| format!("disconnect task join failed: {e}"))?
 }
 
 /// 24 random bytes (192 bits) as hex, for a bearer token or a unique id.
@@ -3874,6 +3881,7 @@ pub fn run() {
             set_profile_server_tools,
             install_gateway,
             uninstall_gateway,
+            disconnect_all_clients,
             migrate_client,
             set_secret,
             set_launch_secret,

@@ -942,3 +942,14 @@ export function teamUseManaged(serverId: string): Promise<Registry> {
 export function setSafetyLevel(level: "off" | "ask" | "strict"): Promise<Registry> {
   return invoke<Registry>("set_safety_level", { level });
 }
+
+export interface DisconnectResult {
+  clientId: string;
+  path: string;
+  dryRun: boolean;
+  error: string | null;
+}
+
+export function disconnectAllClients(): Promise<DisconnectResult[]> {
+  return invoke("disconnect_all_clients");
+}

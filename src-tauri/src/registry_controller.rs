@@ -257,30 +257,42 @@ pub enum EssentialSetting {
 struct ClientConfigReceipt {
     target: PathBuf,
     backup: Option<PathBuf>,
-    written: Vec<u8>,
+    written: Option<Vec<u8>>,
+    recovery_path: Option<PathBuf>,
 }
 
 impl ClientConfigReceipt {
     fn capture(outcome: &WriteOutcome) -> Result<Self, String> {
         let target = PathBuf::from(&outcome.path);
-        let written = std::fs::read(&target)
-            .map_err(|error| format!("could not verify the updated client config: {error}"))?;
+        let written = match std::fs::read(&target) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("could not verify the updated client config: {e}")),
+        };
+        if outcome.recovery_path.is_some() && written.as_deref().map(|bytes| registry::sha256_hex(std::str::from_utf8(bytes).unwrap_or(""))) != outcome.revision {
+            return Err("the client config changed after the operation; newer edits were left untouched".into());
+        }
         Ok(Self {
             target,
             backup: outcome.backup.as_deref().map(PathBuf::from),
             written,
+            recovery_path: outcome.recovery_path.clone(),
         })
     }
 
     fn rollback(&self) -> Result<(), String> {
-        let dir = registry::conduit_dir().ok_or("Could not resolve data dir")?;
+        let dir = self.recovery_path.as_deref().and_then(std::path::Path::parent).and_then(std::path::Path::parent).and_then(std::path::Path::parent)
+            .or_else(|| self.target.parent()).ok_or("Could not resolve mutation lock dir")?;
         let _lock = registry::lock_at(&dir.join("client-config-mutation"))?;
         let revision = registry::client_file::read(&self.target)?;
-        if revision.text.as_deref().map(str::as_bytes) != Some(self.written.as_slice()) {
+        if revision.text.as_deref().map(str::as_bytes) != self.written.as_deref() {
             return Err("the client config changed again, so Toolport left the newer file untouched".into());
         }
         let original = self.backup.as_ref().map(std::fs::read_to_string).transpose().map_err(|e| e.to_string())?;
-        registry::client_file::commit(&self.target, &revision, original.as_deref())
+        registry::client_file::commit(&self.target, &revision, original.as_deref())?;
+        if let Some(file) = &self.recovery_path { clients::record_config_rollback(file, &self.target, original.as_deref())?; }
+        Ok(())
+
     }
 }
 
@@ -874,7 +886,7 @@ pub fn disconnect_client_stdio_with(
     let _lock = acquire_auth_lock(&format!("client-config:{client_id}"))?;
     let outcome = clients::uninstall_gateway(client_id)?;
     let result = finish_client_config_mutation(outcome, write_registry)?;
-    clients::finish_uninstall(client_id, &result.outcome);
+    clients::finish_uninstall(client_id, &result.outcome)?;
     Ok(result)
 }
 
@@ -1373,8 +1385,12 @@ fn revoke_client_http_token(client_id: &str) -> Result<(), String> {
     crate::secrets::delete_secret(CLIENT_HTTP_VAULT_SERVER, client_id)
 }
 
+pub(crate) fn registry_for_disconnect() -> Result<Registry, String> {
+    read_registry_exact_or_default()
+}
+
 pub fn disconnect_client(client_id: &str) -> Result<ClientMutationResult, String> {
-    let current = read_registry_exact()?;
+    let current = read_registry_exact_or_default()?;
     let http_id = format!("client:{client_id}");
     let has_shared_http_token = current
         .http_clients
@@ -1399,7 +1415,7 @@ pub fn disconnect_client(client_id: &str) -> Result<ClientMutationResult, String
         registry.clear_client_managed_entry(client_id);
         Ok(())
     })?;
-    clients::finish_uninstall(client_id, &outcome);
+    clients::finish_uninstall(client_id, &outcome)?;
     Ok(ClientMutationResult { registry, outcome })
 }
 
@@ -1502,7 +1518,11 @@ pub fn set_client_credentials(
     scope: Option<&str>,
 ) -> Result<Registry, String> {
     let _mutation = acquire_auth_lock(server_id)?;
-    if crate::local_auth::owner(server_id)? != server_id { return Err("Edit the personal original to change the shared local sign-in configuration.".into()); }
+    if crate::local_auth::owner(server_id)? != server_id {
+        return Err(
+            "Edit the personal original to change the shared local sign-in configuration.".into(),
+        );
+    }
     let client_id = client_id.trim().to_string();
     if client_id.is_empty() {
         return Err("a client id is required for client-credentials auth".into());
@@ -1560,7 +1580,11 @@ pub fn set_client_credentials(
 
 pub fn clear_client_credentials(server_id: &str) -> Result<Registry, String> {
     let _mutation = acquire_auth_lock(server_id)?;
-    if crate::local_auth::owner(server_id)? != server_id { return Err("Edit the personal original to change the shared local sign-in configuration.".into()); }
+    if crate::local_auth::owner(server_id)? != server_id {
+        return Err(
+            "Edit the personal original to change the shared local sign-in configuration.".into(),
+        );
+    }
     crate::remote::reset_client_credentials(server_id)?;
     let (registry, ()) = registry::update(|registry| {
         let Some(server) = registry
@@ -2713,6 +2737,8 @@ mod tests {
             managed: None,
             restored: Vec::new(),
             used_move_record: false,
+            revision: None,
+            recovery_path: None,
         };
 
         let error = finish_client_config_mutation(outcome, |_| Err("registry full".into()))
@@ -2742,6 +2768,8 @@ mod tests {
             managed: None,
             restored: Vec::new(),
             used_move_record: false,
+            revision: None,
+            recovery_path: None,
         };
 
         let error = finish_client_config_mutation(outcome, |_| Err("registry full".into()))
@@ -2773,6 +2801,8 @@ mod tests {
             managed: None,
             restored: Vec::new(),
             used_move_record: false,
+            revision: None,
+            recovery_path: None,
         };
         let target_for_write = target.clone();
 

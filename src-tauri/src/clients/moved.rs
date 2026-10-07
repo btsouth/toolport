@@ -140,6 +140,60 @@ pub(super) fn record(client_id: &str, format: Format, path: &Path) -> Result<(),
     Ok(())
 }
 
+pub(super) fn toml_entry(
+    client_id: &str,
+    path: &Path,
+    name: &str,
+) -> Result<Option<toml_edit::Item>, String> {
+    let Some(record) = load(client_id)? else {
+        return Ok(None);
+    };
+    if record.config_path != path.to_string_lossy() {
+        return Ok(None);
+    }
+    let Some(entry) = record.entries.iter().find(|entry| entry.name == name) else {
+        return Ok(None);
+    };
+    let Raw::Toml { text } = &entry.raw else {
+        return Ok(None);
+    };
+    let doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| e.to_string())?;
+    Ok(doc
+        .get("mcp_servers")
+        .and_then(|table| table.get(name))
+        .cloned())
+}
+
+pub(super) fn missing_names(
+    client_id: &str,
+    format: Format,
+    path: &Path,
+) -> Result<Vec<String>, String> {
+    let Some(record) = load(client_id)? else {
+        return Ok(Vec::new());
+    };
+    if record.config_path != path.to_string_lossy() {
+        return Ok(Vec::new());
+    }
+    let existing = if mutation::exists(path) {
+        extract(container(format), &read_config_file(path)?)?
+    } else {
+        Vec::new()
+    };
+    Ok(record
+        .entries
+        .into_iter()
+        .filter(|entry| {
+            !existing
+                .iter()
+                .any(|current| current.name.eq_ignore_ascii_case(&entry.name))
+        })
+        .map(|entry| entry.name)
+        .collect())
+}
+
 /// What [`restore`] put back.
 pub(super) struct Restored {
     pub names: Vec<String>,
@@ -166,9 +220,12 @@ pub(super) fn restore(
 }
 
 /// Drop the client's record once Disconnect has finished with it.
-pub(super) fn forget(client_id: &str) {
-    if let Ok(path) = record_path(client_id) {
-        let _ = std::fs::remove_file(path);
+pub(super) fn forget(client_id: &str) -> Result<(), String> {
+    let path = record_path(client_id)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Could not remove client move record: {e}")),
     }
 }
 

@@ -24,9 +24,20 @@ import {
 } from "lucide-react";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 import { toastError } from "@/lib/toast";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import {
   addHttpClient,
+  disconnectAllClients,
+  getRegistry,
+  type DisconnectResult,
   disableAutostart,
   enableAutostart,
   isAutostartEnabled,
@@ -525,6 +536,21 @@ function ProfileToolScope({
  * they live here rather than in each server’s Tools tab. */
 export function SettingsView({ registry, onRegistryChange }: Props) {
   const { theme, setTheme } = useTheme();
+  const [removeOpen, setRemoveOpen] = useState(false);
+  const [removeBusy, setRemoveBusy] = useState(false);
+  const [removeResults, setRemoveResults] = useState<DisconnectResult[] | null>(null);
+  const removeAll = async () => {
+    setRemoveBusy(true);
+    try {
+      setRemoveResults(await disconnectAllClients());
+      setRemoveOpen(false);
+      onRegistryChange(await getRegistry());
+    } catch (error) {
+      toastError(`Could not remove client connections: ${error}`);
+    } finally {
+      setRemoveBusy(false);
+    }
+  };
   const lazyDiscovery = registry?.lazyDiscovery ?? true;
   // Match the registry default when the field is absent or still loading.
   const codeMode = registry?.codeMode ?? false;
@@ -847,6 +873,71 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
 
   return (
     <div className="mx-auto flex max-w-2xl flex-col gap-6">
+      <section className="flex flex-col gap-2">
+        <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+          Client connections
+        </h2>
+        <p className="text-sm text-muted-foreground">
+          Restore client configurations before removing Toolport.
+        </p>
+        <Button
+          variant="outline"
+          className="self-start"
+          disabled={removeBusy}
+          onClick={() => setRemoveOpen(true)}
+        >
+          Remove Toolport from all clients
+        </Button>
+        {removeResults && (
+          <ul className="text-sm" aria-live="polite">
+            {removeResults.length === 0 ? (
+              <li>No client connections to remove.</li>
+            ) : (
+              removeResults.map((result) => (
+                <li
+                  key={`${result.clientId}:${result.path}`}
+                  className={result.error ? "text-destructive" : "text-muted-foreground"}
+                >
+                  {result.clientId}: {result.error ?? "Client configuration restored"}
+                </li>
+              ))
+            )}
+          </ul>
+        )}
+        <Dialog
+          open={removeOpen}
+          onOpenChange={(open) => {
+            if (!removeBusy) setRemoveOpen(open);
+          }}
+        >
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Remove Toolport from all clients?</DialogTitle>
+              <DialogDescription>
+                Unchanged configs return to their original bytes. If you edited a config,
+                Toolport preserves your edits and restores entries it moved. Each client
+                result is reported here.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                disabled={removeBusy}
+                onClick={() => setRemoveOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={removeBusy}
+                onClick={() => void removeAll()}
+              >
+                {removeBusy ? "Removing…" : "Remove from all clients"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </section>
       <section className="flex flex-col gap-2">
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
           General

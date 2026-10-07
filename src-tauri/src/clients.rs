@@ -15,8 +15,12 @@ use serde::Serialize;
 
 use crate::registry::{ManagedEntry, ServerEntry};
 
+mod disconnect;
+pub use disconnect::{all as disconnect_all, ClientResult as DisconnectResult};
 mod moved;
 mod mutation;
+mod restore;
+pub(crate) use restore::after_rollback as record_config_rollback;
 mod zcode;
 
 /// One MCP server, normalized across every client format.
@@ -79,7 +83,7 @@ pub struct DetectedClient {
 }
 
 /// How a given client stores its server list.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, serde::Deserialize)]
 enum Format {
     /// JSON with a top-level `mcpServers` object (Claude Desktop, Cursor, Windsurf).
     JsonMcpServers,
@@ -2179,9 +2183,7 @@ fn parse_json_snippet(
                 .get("command")
                 .is_some_and(|command| command.is_string() || command.is_array())
                 && !servers.get("url").is_some_and(serde_json::Value::is_string)
-                && !servers
-                    .get("type")
-                    .is_some_and(serde_json::Value::is_string)
+                && !servers.get("type").is_some_and(serde_json::Value::is_string)
                 && !servers
                     .get("enabled")
                     .is_some_and(serde_json::Value::is_boolean)
@@ -3157,6 +3159,22 @@ pub struct WriteOutcome {
     /// [`finish_uninstall`] once the whole Disconnect has succeeded.
     #[serde(skip)]
     pub used_move_record: bool,
+    #[serde(skip)]
+    pub revision: Option<String>,
+    #[serde(skip)]
+    pub recovery_path: Option<PathBuf>,
+}
+
+fn revision_outcome(client_id: &str, result: Result<WriteOutcome, String>) -> Result<WriteOutcome, String> {
+    let mut outcome = result?;
+    let path = Path::new(&outcome.path);
+    outcome.recovery_path = Some(restore::record_path(client_id, path)?);
+    outcome.revision = if mutation::exists(path) {
+        Some(crate::registry::sha256_hex(&read_config_file(path)?))
+    } else {
+        None
+    };
+    Ok(outcome)
 }
 
 /// Result of launch-time re-point (SOU-405/406).
@@ -3261,6 +3279,17 @@ fn backup_file(client_id: &str, path: &Path) -> Result<Option<PathBuf>, String> 
     backup_file_named(client_id, path, name)
 }
 
+fn secure_backup_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn backup_file_named(
     client_id: &str,
     path: &Path,
@@ -3285,7 +3314,7 @@ fn backup_file_named(
         }
     }
     let dir = backup_dir(client_id).ok_or("Could not resolve backup dir")?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    secure_backup_dir(&dir)?;
     let mut stamp = epoch_millis();
     let dest = loop {
         let candidate = dir.join(format!("{stamp}-{backup_name}"));
@@ -3294,7 +3323,7 @@ fn backup_file_named(
         }
         stamp += 1;
     };
-    std::fs::copy(path, &dest).map_err(|e| e.to_string())?;
+    crate::registry::atomic_write(&dest, &read_config_file(path)?)?;
     prune_backups(&dir, backup_name);
     Ok(Some(dest))
 }
@@ -5294,7 +5323,7 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
-        write_servers_inner(client_id, servers)
+        revision_outcome(client_id, write_servers_inner(client_id, servers))
     })
 }
 
@@ -5303,23 +5332,7 @@ fn write_servers_inner(client_id: &str, servers: &[ServerEntry]) -> Result<Write
     let path = resolved_definition_path(&def)?;
     let backup = backup_file(client_id, &path)?;
     let lenient = config_is_whole_app_state(client_id);
-    match def.format {
-        Format::JsonMcpServers => write_json(&path, "mcpServers", servers, lenient)?,
-        Format::JsonCopilotMcpServers => write_copilot_json(&path, servers)?,
-        Format::JsonDroidMcpServers => write_droid_json(&path, servers)?,
-        Format::JsonAmpMcpServers => write_json(&path, "amp.mcpServers", servers, true)?,
-        Format::JsonQwenMcpServers => write_qwen_json(&path, servers)?,
-        Format::JsonKimiMcpServers => write_kimi_json(&path, servers)?,
-        Format::JsonZCodeMcp => zcode::write_servers(&path, servers)?,
-        Format::JsonServers => write_json(&path, "servers", servers, lenient)?,
-        Format::JsonMcp => write_crush_json(&path, servers)?,
-        Format::JsonOpenCodeMcp => write_opencode_json(&path, servers)?,
-        Format::JsonContextServers => write_json(&path, "context_servers", servers, true)?,
-        Format::TomlMcpServers => write_toml(&path, servers)?,
-        Format::YamlExtensions => write_yaml_extensions(&path, servers)?,
-        Format::YamlMcpServers => write_hermes_yaml_servers(&path, servers)?,
-        Format::YamlMcpServersList => write_continue_yaml_servers(&path, servers)?,
-    }
+    write_format(def.format, &path, servers, lenient)?;
     // migrate_to_gateway writes a single gateway entry; capture ownership when so.
     let managed = servers
         .iter()
@@ -5333,7 +5346,35 @@ fn write_servers_inner(client_id: &str, servers: &[ServerEntry]) -> Result<Write
         managed,
         restored: Vec::new(),
         used_move_record: false,
+        revision: None,
+        recovery_path: None,
     })
+}
+
+fn write_format(
+    format: Format,
+    path: &Path,
+    servers: &[ServerEntry],
+    lenient: bool,
+) -> Result<(), String> {
+    match format {
+        Format::JsonMcpServers => write_json(path, "mcpServers", servers, lenient)?,
+        Format::JsonCopilotMcpServers => write_copilot_json(path, servers)?,
+        Format::JsonDroidMcpServers => write_droid_json(path, servers)?,
+        Format::JsonAmpMcpServers => write_json(path, "amp.mcpServers", servers, true)?,
+        Format::JsonQwenMcpServers => write_qwen_json(path, servers)?,
+        Format::JsonKimiMcpServers => write_kimi_json(path, servers)?,
+        Format::JsonZCodeMcp => zcode::write_servers(path, servers)?,
+        Format::JsonServers => write_json(path, "servers", servers, lenient)?,
+        Format::JsonMcp => write_crush_json(path, servers)?,
+        Format::JsonOpenCodeMcp => write_opencode_json(path, servers)?,
+        Format::JsonContextServers => write_json(path, "context_servers", servers, true)?,
+        Format::TomlMcpServers => write_toml(path, servers)?,
+        Format::YamlExtensions => write_yaml_extensions(path, servers)?,
+        Format::YamlMcpServers => write_hermes_yaml_servers(path, servers)?,
+        Format::YamlMcpServersList => write_continue_yaml_servers(path, servers)?,
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -5909,7 +5950,7 @@ fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<Wri
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
-        install_or_remove_inner(client_id, entry)
+        revision_outcome(client_id, install_or_remove_inner(client_id, entry))
     })
 }
 
@@ -5924,30 +5965,42 @@ fn install_or_remove_inner(
     // Build the snapshot before writing so the ownership record matches the bytes
     // we put on disk (SOU-406). Strip secrets for the registry record.
     let managed = entry.map(ManagedEntry::from_gateway_entry);
-    match def.format {
-        Format::JsonMcpServers => edit_json_gateway(&path, "mcpServers", entry, lenient)?,
-        Format::JsonCopilotMcpServers => edit_copilot_json_gateway(&path, entry)?,
-        Format::JsonDroidMcpServers => edit_droid_json_gateway(&path, entry)?,
-        Format::JsonAmpMcpServers => edit_json_gateway(&path, "amp.mcpServers", entry, true)?,
-        Format::JsonQwenMcpServers => edit_qwen_json_gateway(&path, entry)?,
-        Format::JsonKimiMcpServers => edit_kimi_json_gateway(&path, entry)?,
-        Format::JsonZCodeMcp => zcode::edit_gateway(&path, entry)?,
-        Format::JsonServers => edit_json_gateway(&path, "servers", entry, lenient)?,
-        Format::JsonMcp => edit_crush_gateway(&path, entry)?,
-        Format::JsonOpenCodeMcp => edit_opencode_gateway(&path, entry)?,
-        Format::JsonContextServers => edit_json_gateway(&path, "context_servers", entry, true)?,
-        Format::TomlMcpServers => edit_toml_gateway(&path, entry)?,
-        Format::YamlExtensions => edit_yaml_gateway(&path, entry)?,
-        Format::YamlMcpServers => edit_hermes_yaml_gateway(&path, entry)?,
-        Format::YamlMcpServersList => edit_continue_yaml_gateway(&path, entry)?,
-    }
+    edit_format(def.format, &path, entry, lenient)?;
     Ok(WriteOutcome {
         path: path.display().to_string(),
         backup: backup.map(|b| b.display().to_string()),
         managed,
         restored: Vec::new(),
         used_move_record: false,
+        revision: None,
+        recovery_path: None,
     })
+}
+
+fn edit_format(
+    format: Format,
+    path: &Path,
+    entry: Option<&ServerEntry>,
+    lenient: bool,
+) -> Result<(), String> {
+    match format {
+        Format::JsonMcpServers => edit_json_gateway(path, "mcpServers", entry, lenient)?,
+        Format::JsonCopilotMcpServers => edit_copilot_json_gateway(path, entry)?,
+        Format::JsonDroidMcpServers => edit_droid_json_gateway(path, entry)?,
+        Format::JsonAmpMcpServers => edit_json_gateway(path, "amp.mcpServers", entry, true)?,
+        Format::JsonQwenMcpServers => edit_qwen_json_gateway(path, entry)?,
+        Format::JsonKimiMcpServers => edit_kimi_json_gateway(path, entry)?,
+        Format::JsonZCodeMcp => zcode::edit_gateway(path, entry)?,
+        Format::JsonServers => edit_json_gateway(path, "servers", entry, lenient)?,
+        Format::JsonMcp => edit_crush_gateway(path, entry)?,
+        Format::JsonOpenCodeMcp => edit_opencode_gateway(path, entry)?,
+        Format::JsonContextServers => edit_json_gateway(path, "context_servers", entry, true)?,
+        Format::TomlMcpServers => edit_toml_gateway(path, entry)?,
+        Format::YamlExtensions => edit_yaml_gateway(path, entry)?,
+        Format::YamlMcpServers => edit_hermes_yaml_gateway(path, entry)?,
+        Format::YamlMcpServersList => edit_continue_yaml_gateway(path, entry)?,
+    }
+    Ok(())
 }
 
 /// Add Toolport's stdio gateway entry to a client's config (preserves existing servers).
@@ -5964,14 +6017,39 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
-        uninstall_gateway_inner(client_id)
+        revision_outcome(client_id, uninstall_gateway_inner(client_id))
     })
 }
 
 fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
+    let backup = backup_file(client_id, &path)?;
+    let restored_names = moved::missing_names(client_id, def.format, &path)?;
+    if restore::apply(client_id, def.format, &path)? {
+        moved::restore(client_id, def.format, &path)?;
+        return Ok(WriteOutcome {
+            path: path.display().to_string(),
+            backup: backup.map(|p| p.display().to_string()),
+            managed: None,
+            restored: restored_names,
+            used_move_record: true,
+            revision: None,
+        recovery_path: None,
+        });
+    }
     let restored = moved::restore(client_id, def.format, &path)?;
+    if restored.is_none() && (!mutation::exists(&path) || !read_client(&def).gateway_installed) {
+        return Ok(WriteOutcome {
+            path: path.display().to_string(),
+            backup: backup.map(|p| p.display().to_string()),
+            managed: None,
+            restored: Vec::new(),
+            used_move_record: false,
+            revision: None,
+        recovery_path: None,
+        });
+    }
     let mut outcome = install_or_remove(client_id, None)?;
     if let Some(restored) = restored {
         // A rollback must undo the restore too, so point at the copy taken before it.
@@ -5987,10 +6065,18 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
 /// Drop the move record a Disconnect used. Call it only after the registry
 /// update succeeded: a failed update rolls the config back to before the restore,
 /// and the record is then the only copy of the moved entries.
-pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) {
+pub fn finish_uninstall(client_id: &str, outcome: &WriteOutcome) -> Result<(), String> {
+    let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
+    let _lock = crate::registry::lock_at(&dir.join("client-config-mutation"))?;
+    restore::finish(
+        client_id,
+        Path::new(&outcome.path),
+        outcome.revision.as_deref(),
+    )?;
     if outcome.used_move_record {
-        moved::forget(client_id);
+        moved::forget(client_id)?;
     }
+    Ok(())
 }
 
 /// Replace a client's entire server list with just the Toolport gateway. Used by
@@ -6002,7 +6088,7 @@ pub fn migrate_to_gateway(client_id: &str, profile: Option<&str>) -> Result<Writ
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     mutation::run(client_id, &path, def.format, || {
-        migrate_to_gateway_inner(client_id, profile)
+        revision_outcome(client_id, migrate_to_gateway_inner(client_id, profile))
     })
 }
 

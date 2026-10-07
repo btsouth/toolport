@@ -133,3 +133,21 @@ All enabled servers in Settings. The default integrity store remains the same.
 Shared HTTP tokens keep their existing full connected set when no access set is
 selected. Named access sets narrow their servers; tool restrictions apply to
 stdio clients. This preserves HTTP access during the upgrade.
+### Disconnect and original configs
+
+Before its first edit, Toolport saves exact original bytes or a file-absent record
+under its data directory's `backups/<client>/original-<path hash>.json`. The record
+includes the path, content hash, capture time and Toolport version. It is separate
+from the rotating backups and uses owner-only permissions on Unix.
+
+Disconnect restores exact original bytes when the config still matches Toolport's
+last write and no intervening native edits were observed. Otherwise it preserves
+your edits and reverses Toolport's changes, restoring moved entries without
+replacing entries you re-added. A snapshot first captured after an older Toolport
+install uses this merge path and the existing move record. The original pre-install
+bytes of that older installation may be unavailable.
+
+Settings offers **Remove Toolport from all clients**, with confirmation and
+per-client results. The same operation is available through the gateway CLI; see
+[headless usage](headless.md#remove-client-connections). Package uninstall hooks
+are separate from this command.

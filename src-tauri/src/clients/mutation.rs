@@ -13,6 +13,7 @@ struct Pending {
     output: Option<String>,
     auxiliary: BTreeMap<PathBuf, String>,
     strict_json: bool,
+    remove: bool,
 }
 
 thread_local! {
@@ -31,7 +32,11 @@ pub(super) fn read(path: &Path) -> Option<Option<String>> {
         let slot = slot.borrow();
         let pending = slot.as_ref()?;
         if path == pending.path {
-            Some(pending.output.clone().or_else(|| pending.original.clone()))
+            Some(if pending.remove {
+                None
+            } else {
+                pending.output.clone().or_else(|| pending.original.clone())
+            })
         } else {
             pending.auxiliary.get(path).cloned().map(Some)
         }
@@ -58,6 +63,7 @@ pub(super) fn write(path: &Path, contents: &str) -> Result<(), String> {
         };
         if path == pending.path {
             pending.output = Some(contents.into());
+            pending.remove = false;
         } else {
             let dir = crate::registry::conduit_dir().ok_or("Could not resolve data dir")?;
             let parent = path.parent().ok_or("Auxiliary path has no parent")?;
@@ -92,6 +98,22 @@ pub(super) fn write(path: &Path, contents: &str) -> Result<(), String> {
         )
     }
 }
+
+pub(super) fn remove(path: &Path) -> Result<(), String> {
+    PENDING.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let pending = slot
+            .as_mut()
+            .ok_or("Config removal must hold mutation lock")?;
+        if pending.path != path {
+            return Err("Unexpected config removal path".into());
+        }
+        pending.remove = true;
+        pending.output = None;
+        Ok(())
+    })
+}
+
 
 pub(super) fn value(format: Format, text: Option<&str>) -> Result<Value, String> {
     let Some(text) = text.filter(|text| !text.trim().is_empty()) else {
@@ -149,30 +171,6 @@ fn unrelated(
     Ok(!ours
         .iter()
         .any(|a| theirs.iter().any(|b| a.starts_with(b) || b.starts_with(a))))
-}
-
-struct AuxiliaryReceipt {
-    path: PathBuf,
-    previous: Option<String>,
-}
-fn checkpoint(path: &Path) -> Result<AuxiliaryReceipt, String> {
-    let previous = match std::fs::read_to_string(path) {
-        Ok(text) => Some(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.to_string()),
-    };
-    Ok(AuxiliaryReceipt {
-        path: path.into(),
-        previous,
-    })
-}
-impl AuxiliaryReceipt {
-    fn rollback(self) -> Result<(), String> {
-        match self.previous {
-            Some(text) => crate::registry::atomic_write(&self.path, &text),
-            None => std::fs::remove_file(self.path).map_err(|e| e.to_string()),
-        }
-    }
 }
 
 pub(super) fn run<T>(
@@ -238,9 +236,17 @@ fn run_inner<T>(
         let result = edit()?;
         let pending = PENDING.with(|slot| slot.borrow_mut().take().unwrap());
         drop(clear);
-        let Some(output) = pending.output else {
+        if pending.output.is_none() && !pending.remove {
+            super::restore::remember(
+                client_id,
+                path,
+                format,
+                original.as_deref(),
+                original.as_deref(),
+            )?;
             return Ok(result);
-        };
+        }
+        let output = pending.output;
         #[cfg(test)]
         before_commit(path);
         let current_revision = crate::registry::client_file::read(path)?;
@@ -249,7 +255,7 @@ fn run_inner<T>(
             if !unrelated(
                 format,
                 original.as_deref(),
-                Some(output.as_str()),
+                output.as_deref(),
                 current.as_deref(),
             )? {
                 return Err(format!("Client config conflict at {}: native edits overlap this operation. Config unchanged.", path.display()));
@@ -263,10 +269,22 @@ fn run_inner<T>(
         let mut auxiliary_recovery = Vec::new();
         let commit = (|| {
             for (auxiliary, text) in pending.auxiliary {
-                auxiliary_recovery.push(checkpoint(&auxiliary)?);
+                auxiliary_recovery.push(super::restore::checkpoint(&auxiliary)?);
                 crate::registry::atomic_write(&auxiliary, &text)?;
             }
-            crate::registry::client_file::commit(path, &revision, Some(&output))
+            let recovery = super::restore::remember(
+                client_id,
+                path,
+                format,
+                original.as_deref(),
+                output.as_deref(),
+            )?;
+            let commit = crate::registry::client_file::commit(path, &revision, output.as_deref());
+            if commit.is_err() {
+                recovery.rollback()?;
+            }
+            commit
+
         })();
         if commit.is_err() {
             for receipt in auxiliary_recovery.into_iter().rev() {
@@ -281,7 +299,7 @@ fn run_inner<T>(
                 if !unrelated(
                     format,
                     original.as_deref(),
-                    Some(output.as_str()),
+                    output.as_deref(),
                     current.as_deref(),
                 )? {
                     return Err(format!(

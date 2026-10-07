@@ -400,3 +400,15 @@ headless and Docker configs do not break on upgrade.
   hits the same scope and approval gates. Shared multi-tenant gateways that do
   not want the surface should set `"codeMode": false` in the registry.
 - Open WebUI details: [openwebui.md](./openwebui.md).
+
+## Remove client connections
+
+Run `toolport-gateway --disconnect-all` before removing the gateway binary. The
+app does not need to be running. The command prints one JSON result per client
+and exits with status 1 if any client fails, while continuing with the others.
+`--disconnect-all --dry-run` lists the affected paths without writing them.
+
+Unchanged configs return to their original bytes, including an originally absent
+file. Native or user edits are preserved when Toolport reverses its entries. A
+concurrent edit to the same entry stops that client with a conflict. Review any
+failed result before continuing an uninstall.
