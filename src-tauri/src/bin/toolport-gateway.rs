@@ -728,7 +728,7 @@ fn gateway_capabilities(
         extensions.insert(
             TOOLPORT_GATEWAY_EXTENSION.to_string(),
             json!({
-                "version": "1.0.0",
+                "version": "2.0.0",
                 "discoveryMode": mode.as_str(),
                 "codeMode": host.code_mode_enabled(),
                 "humanApproval": reg.human_approval_effective()
@@ -26568,7 +26568,7 @@ mod tests {
         // one client's answer for another.
         assert_eq!(result["cacheScope"], "private");
         let toolport = &result["capabilities"]["extensions"][TOOLPORT_GATEWAY_EXTENSION];
-        assert_eq!(toolport["version"], "1.0.0");
+        assert_eq!(toolport["version"], "2.0.0");
         assert_eq!(toolport["discoveryMode"], "lazy");
         assert!(toolport["codeMode"].is_boolean());
         assert_eq!(toolport["humanApproval"], true);
@@ -26967,7 +26967,7 @@ mod tests {
         );
         assert_eq!(
             response["result"]["capabilities"]["extensions"][TOOLPORT_GATEWAY_EXTENSION]["version"],
-            "1.0.0"
+            "2.0.0"
         );
         assert!(response["result"]["capabilities"]["extensions"]
             .get("app.toolport/other")
@@ -32225,6 +32225,61 @@ mod tests {
         assert!(
             !reg.confirm_destructive,
             "enabling deny must turn off confirm"
+        );
+    }
+
+    #[test]
+    fn legacy_confirm_destructive_requires_human_approval_on_direct_call() {
+        // A registry written by 1.x can carry confirm_destructive with no explicit safety
+        // level. The gateway must read the legacy flag live and derive Ask, so a direct
+        // destructive call still needs a human and fails closed when no approval service is
+        // reachable. The downstream call must never happen.
+        let _data_env = DataDirTestEnv::new(
+            "legacy_confirm_destructive_requires_human_approval_on_direct_call",
+        );
+        let host = dispatch_host(false);
+        // No explicit level and a legacy confirm flag: the derived level must be Ask.
+        let reg = Registry {
+            safety_level: None,
+            confirm_destructive: true,
+            ..Registry::default()
+        };
+        assert_eq!(reg.safety_level_selected(), registry::SafetyLevel::Ask);
+        let (router, calls, catalog) = counting_router(true);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "toolport_call_tool",
+                "arguments": { "name": "s__work", "arguments": {} }
+            }
+        });
+        let response = handle_request(
+            &host,
+            &request,
+            &reg,
+            &router,
+            &catalog,
+            true,
+            None,
+            &SearchGuard::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("approval service was unreachable"),
+            "{response}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the destructive downstream call must not run without approval"
         );
     }
 
