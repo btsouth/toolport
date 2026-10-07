@@ -13746,14 +13746,37 @@ fn adapter_live_view(
     reg: &Registry,
     profile: &str,
     root: Option<String>,
+    client: Option<&str>,
 ) -> LiveRouterResolver {
+    let folder_profile = root.as_deref().and_then(|root| reg.profile_for_root(root));
+    let client_binding = client.map(|id| (id.to_string(), reg.client_scopes.get(id).cloned()));
     let expected = Arc::new((reg.resolve_profile_id(profile), root));
+    let context_stale = {
+        let expected = Arc::clone(&expected);
+        Arc::new(move |current: &Registry, current_root: Option<String>| {
+            let (_, root) = &*expected;
+            current_root != *root
+                || client_binding.as_ref().is_some_and(|(client, binding)| {
+                    current.client_scopes.get(client) != binding.as_ref()
+                })
+                || root
+                    .as_deref()
+                    .and_then(|root| current.profile_for_root(root))
+                    != folder_profile
+        })
+    };
     let stale = {
         let host = Arc::clone(host);
         let expected = Arc::clone(&expected);
+        let context_stale = Arc::clone(&context_stale);
         Arc::new(move |router: &Router, target: DispatchTarget<'_>| {
-            let (profile, root) = &*expected;
-            if host.active_adapter_root() != *root {
+            let (profile, _) = &*expected;
+            let root = host.active_adapter_root();
+            let current = host
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if context_stale(&current, root) {
                 return true;
             }
             let (server, tool) = match target {
@@ -13763,10 +13786,6 @@ fn adapter_live_view(
                 },
                 DispatchTarget::Server(server) => (server, None),
             };
-            let current = host
-                .registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !current
                 .enabled_servers_for(profile)
                 .iter()
@@ -13787,14 +13806,15 @@ fn adapter_live_view(
     let host = Arc::clone(host);
     let resolve = Arc::new(move || {
         let (profile, root) = &*expected;
-        if host.active_adapter_root() != *root {
-            return stale_live_view();
-        }
+        let current_root = host.active_adapter_root();
         let current = host
             .registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        if context_stale(&current, current_root) {
+            return stale_live_view();
+        }
         let scope = current
             .enabled_servers_for(profile)
             .iter()
@@ -14186,8 +14206,9 @@ fn process_request(
         return handle_resource_subscription(state, &router, req, allowed, cancel.as_ref(), method);
     }
     let live_view: Option<LiveRouterResolver> = if state.daemon_mode.load(Ordering::SeqCst) {
-        adapter_profile
-            .map(|profile| adapter_live_view(&state.host, &reg, profile, adapter_root.clone()))
+        adapter_profile.map(|profile| {
+            adapter_live_view(&state.host, &reg, profile, adapter_root.clone(), client)
+        })
     } else {
         None
     };
@@ -26482,8 +26503,14 @@ mod tests {
             .iter()
             .map(|server| server.id.clone())
             .collect();
-        let _live_view =
-            LiveRouterResolverGuard::enter(Some(adapter_live_view(&host, &reg, "p", None)));
+        let _root = AdapterRootGuard::enter(Some("/work/flake".into()));
+        let _live_view = LiveRouterResolverGuard::enter(Some(adapter_live_view(
+            &host,
+            &reg,
+            "p",
+            Some("/work/flake".into()),
+            Some("test"),
+        )));
         let snapshot = host.router.lock().unwrap().clone();
         let cached = snapshot.aggregated_tools();
         let call = |name: &str| {
@@ -26561,6 +26588,49 @@ mod tests {
         {
             let mut live = host.router.lock().unwrap();
             Arc::make_mut(&mut live).requarantine(BTreeSet::new());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        host.registry
+            .lock()
+            .unwrap()
+            .client_scopes
+            .insert("other".into(), "q".into());
+        assert!(recheck_live_policy(
+            &snapshot,
+            Some(&host.router),
+            DispatchTarget::Tool("x__work")
+        )
+        .is_ok());
+
+        // A rebind of this client must not keep dispatching under P's old scope.
+        host.registry
+            .lock()
+            .unwrap()
+            .client_scopes
+            .insert("test".into(), "q".into());
+        let denied = call("x__work");
+        assert_eq!(denied["isError"], true, "got {denied}");
+        assert!(clone_live_router(Some(&host.router))
+            .unwrap()
+            .route_of("x__work")
+            .is_none());
+        host.registry.lock().unwrap().client_scopes.remove("test");
+        host.registry
+            .lock()
+            .unwrap()
+            .folder_profiles
+            .push(registry::FolderProfile {
+                path: "/work/flake".into(),
+                profile: "q".into(),
+            });
+        let denied = call("x__work");
+        assert_eq!(denied["isError"], true, "got {denied}");
+        host.registry.lock().unwrap().folder_profiles.clear();
+        {
+            let _changed_root = AdapterRootGuard::enter(Some("/work/elsewhere".into()));
+            let denied = call("x__work");
+            assert_eq!(denied["isError"], true, "got {denied}");
         }
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
