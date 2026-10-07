@@ -2,7 +2,7 @@
 //! credentials. #1013 clears the child environment and
 //! passes only an allowlist plus the server's own configured env.
 //!
-//! Unix only: the fixture is a `/bin/sh` wrapper, which needs no mock knob.
+//! Unix only: the fixture is a shell launcher script, which needs no mock knob.
 
 #![cfg(unix)]
 
@@ -18,14 +18,25 @@ fn a_spawned_server_does_not_inherit_ambient_credentials() {
     let scratch = Scratch::new("env-allowlist");
     let dump = scratch.join("child-env.txt");
     // Snapshot this server process's own environment, then become the mock so
-    // the gateway still completes its handshake.
-    let script = format!("env > '{}'; exec '{}'", dump.display(), MOCK);
+    // the gateway still completes its handshake. A launcher file, not `sh -c`:
+    // the spawn guard refuses inline eval.
+    let launcher = scratch.join("launcher.sh");
+    std::fs::write(
+        &launcher,
+        format!("#!/bin/sh\nenv > '{}'\nexec '{}'\n", dump.display(), MOCK),
+    )
+    .expect("write launcher");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+            .expect("make launcher executable");
+    }
     let server = json!({
         "id": "wrapped",
         "name": "wrapped",
         "transport": "stdio",
-        "command": "/bin/sh",
-        "args": ["-c", script],
+        "command": launcher.display().to_string(),
+        "args": [],
         "env": [{ "key": "CONFIGURED_KEY", "value": "present", "secret": false }],
         "source": "manual",
         "disabledTools": []
