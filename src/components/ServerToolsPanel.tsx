@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   Check,
   CheckCircle2,
@@ -24,8 +24,6 @@ import {
   listServerPrompts,
   listServerResources,
   listServerTools,
-  listQuarantined,
-  type QuarantinedTool,
   readResource,
   setToolEnabled,
   setToolPinned,
@@ -72,7 +70,6 @@ function ToolOverrideEditor({
 }: {
   serverId: string;
   tool: McpTool;
-  serverId: string;
   registry: Registry | null;
   onRegistryChange: (r: Registry) => void;
 }) {
@@ -240,7 +237,7 @@ interface FieldProps {
 /** One argument input, shaped by the property's JSON-schema type. */
 function ArgField({ name, schema, required, value, onChange }: FieldProps) {
   const t = primaryType(schema);
-  const id = `arg-${name}`;
+  const id = useId();
   const enumVals = schema.enum;
 
   let control;
@@ -614,13 +611,16 @@ interface ServerToolsProps {
   onRegistryChange: (registry: Registry) => void;
 }
 
-export function ServerToolsPanel({ serverId, registry, onRegistryChange }: ServerToolsProps) {
+export function ServerToolsPanel({
+  serverId,
+  registry,
+  onRegistryChange,
+}: ServerToolsProps) {
   const servers = registry?.servers ?? [];
   const denyDestructive = registry?.denyDestructive ?? false;
 
   const [tab, setTab] = useState<"tools" | "resources" | "prompts">("tools");
   const [policyBusy, setPolicyBusy] = useState(false);
-  const [quarantined, setQuarantined] = useState<QuarantinedTool[] | null>(null);
   const [tools, setTools] = useState<McpTool[] | null>(null);
   const [loadingTools, setLoadingTools] = useState(false);
   const [toolsError, setToolsError] = useState<string | null>(null);
@@ -681,8 +681,6 @@ export function ServerToolsPanel({ serverId, registry, onRegistryChange }: Serve
     setToolFilter("");
     setResult(null);
     setCallError(null);
-    setQuarantined(null);
-    listQuarantined().then((q) => alive && setQuarantined(q)).catch(() => alive && setQuarantined(null));
     listServerTools(serverId)
       .then((t) => alive && setTools(t))
       .catch((e) => alive && setToolsError(String(e)))
@@ -847,7 +845,7 @@ export function ServerToolsPanel({ serverId, registry, onRegistryChange }: Serve
 
   // Stop waiting on an in-flight call: invalidate its id so the eventual result is
   // dropped, and reset the UI. A Tauri invoke can't be aborted, so this is NOT an
-  // abort — the downstream tool keeps executing and its side effects still happen.
+  // abort: the downstream tool keeps executing and its side effects still happen.
   // Stopping the wait does not cancel a pending approval or downstream call.
   function cancelCall() {
     callSeq.current++;
@@ -873,7 +871,9 @@ export function ServerToolsPanel({ serverId, registry, onRegistryChange }: Serve
 
   return (
     <div className="flex max-w-3xl flex-col gap-5">
-      <p className="text-xs text-muted-foreground">Calls follow the active profile and gateway policy, including approval gates.</p>
+      <p className="text-xs text-muted-foreground">
+        Calls follow the active profile and gateway policy, including approval gates.
+      </p>
 
       {serverId && (
         <div className="flex w-fit gap-1 rounded-lg border bg-muted/30 p-1 text-sm">
@@ -1117,9 +1117,19 @@ export function ServerToolsPanel({ serverId, registry, onRegistryChange }: Serve
                             )}
                             <span className="truncate font-mono text-sm">{t.name}</span>
                             {destructive && <Badge variant="warning">destructive</Badge>}
-                            {t.annotations?.readOnlyHint && <Badge variant="secondary">read-only</Badge>}
-                            <span className="text-xs text-muted-foreground">{perToolOff ? "Disabled" : "Enabled"}</span>
-                            <span className="text-xs text-muted-foreground">{quarantined === null ? "Quarantine unknown" : quarantined.some((q) => q.server === serverId && (q.tool === t.name || q.tool.endsWith(`__${t.name}`))) ? "Quarantined" : "Not quarantined"}</span>
+                            {t.annotations?.readOnlyHint === true && (
+                              <Badge variant="secondary">read-only</Badge>
+                            )}
+                            <span className="text-xs text-muted-foreground">
+                              {perToolOff ? "Disabled" : "Enabled"}
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                              {t.toolportQuarantine === "quarantined"
+                                ? "Quarantined"
+                                : t.toolportQuarantine === "clear"
+                                  ? "Not quarantined"
+                                  : "Quarantine unknown"}
+                            </span>
                             {!exposed && (
                               <span className="text-xs text-muted-foreground">
                                 hidden

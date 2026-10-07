@@ -24,7 +24,6 @@ pub(super) struct ServerToolsPanel {
 struct ToolPolicy {
     disabled: std::collections::HashSet<String>,
     pinned: std::collections::HashSet<String>,
-    quarantined: std::collections::HashSet<String>,
     overrides: std::collections::HashMap<String, crate::registry::ToolOverride>,
 }
 
@@ -139,18 +138,6 @@ impl ServerToolsPanel {
                     .get(&server_id)
                     .map(|tools| tools.iter().cloned().collect())
                     .unwrap_or_default();
-                let quarantined = crate::integrity::all_quarantined()?
-                    .into_iter()
-                    .filter(|q| {
-                        q.get("server").and_then(serde_json::Value::as_str)
-                            == Some(server_id.as_str())
-                    })
-                    .filter_map(|q| {
-                        q.get("tool")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    })
-                    .collect();
                 let overrides = registry
                     .tool_overrides
                     .get(&server_id)
@@ -162,7 +149,6 @@ impl ServerToolsPanel {
                         disabled,
                         pinned,
                         overrides,
-                        quarantined,
                     },
                 ))
             })
@@ -264,10 +250,6 @@ impl ServerToolsPanel {
             shown += 1;
             self.tools.append(&tool_row(
                 tool.clone(),
-                policy.quarantined.iter().any(|alias| {
-                    alias == &name
-                        || alias.ends_with(&format!("__{}", crate::router::sanitize_segment(&name)))
-                }),
                 !policy.disabled.contains(&name),
                 policy.pinned.contains(&name),
                 policy.overrides.get(&name).cloned(),
@@ -354,7 +336,6 @@ fn state_badge(text: &str) -> gtk::Label {
 
 fn tool_row(
     tool: serde_json::Value,
-    quarantined: bool,
     enabled: bool,
     pinned: bool,
     exposure_override: Option<crate::registry::ToolOverride>,
@@ -412,11 +393,16 @@ fn tool_row(
         }
     }
     title.append(&state_badge(if enabled { "Enabled" } else { "Disabled" }));
-    title.append(&state_badge(if quarantined {
-        "Quarantined"
-    } else {
-        "Not quarantined"
-    }));
+    title.append(&state_badge(
+        match tool
+            .get("toolportQuarantine")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("quarantined") => "Quarantined",
+            Some("clear") => "Not quarantined",
+            _ => "Quarantine unknown",
+        },
+    ));
     copy.append(&title);
 
     copy.append(

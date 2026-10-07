@@ -10,7 +10,6 @@ mod http_bridge;
 mod notify;
 mod onboarding;
 mod pairing;
-mod tools;
 mod settings;
 mod state;
 mod teams;
@@ -20,7 +19,6 @@ mod tray;
 use adw::prelude::*;
 use catalog::CatalogPage;
 use gtk::glib::prelude::ToValue;
-use tools::ServerToolsPanel;
 use settings::SettingsPage;
 use teams::TeamsPage;
 
@@ -722,10 +720,20 @@ fn build_sidebar(
     let tools_action = gtk::gio::SimpleAction::new("show-server-tools", None);
     let page_for_tools = server_page.clone();
     tools_action.connect_activate(move |_, _| {
-        if let Some(server) = page_for_tools.last_snapshot.borrow().as_ref().and_then(|snapshot| snapshot.servers.first()) {
+        if let Some(server) = page_for_tools
+            .last_snapshot
+            .borrow()
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .servers
+                    .iter()
+                    .find(|server| server.enabled)
+                    .or_else(|| snapshot.servers.first())
+            })
+        {
             open_server_details(server, &page_for_tools, true);
         }
-
     });
     app.add_action(&tools_action);
     let mut buttons = Vec::new();
@@ -1386,7 +1394,6 @@ fn show_native_page(
         activity_page.refresh();
     } else if target == "catalog" {
         catalog_page.refresh();
-
     } else if target == "teams" {
         teams_page.refresh();
     } else if target == "settings" {
@@ -6857,8 +6864,13 @@ fn server_health_rank(
 }
 
 fn open_server_details(server: &state::ServerView, page: &ServerPage, show_tools: bool) {
-    let window = adw::Window::builder().application(&page.app).title(&server.name)
-        .default_width(1000).default_height(760).modal(true).build();
+    let window = adw::Window::builder()
+        .application(&page.app)
+        .title(&server.name)
+        .default_width(1000)
+        .default_height(760)
+        .modal(true)
+        .build();
     window.set_transient_for(page.app.active_window().as_ref());
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = adw::HeaderBar::new();
@@ -6867,21 +6879,37 @@ fn open_server_details(server: &state::ServerView, page: &ServerPage, show_tools
     let stack = gtk::Stack::new();
     stack.set_vexpand(true);
     let overview = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    overview.set_margin_top(20); overview.set_margin_start(20); overview.set_margin_end(20);
+    overview.set_margin_top(20);
+    overview.set_margin_start(20);
+    overview.set_margin_end(20);
     for text in [&server.name, &server.origin_label, &server.transport] {
-        overview.append(&gtk::Label::builder().label(text).xalign(0.0).wrap(true).build());
+        overview.append(
+            &gtk::Label::builder()
+                .label(text)
+                .xalign(0.0)
+                .wrap(true)
+                .build(),
+        );
     }
     let tools = ServerToolsPanel::new(&page.app, &server.id);
     stack.add_titled(&overview, Some("overview"), "Overview");
     stack.add_titled(&tools.root, Some("tools"), "Tools");
-    let switcher = gtk::StackSwitcher::new(); switcher.set_stack(Some(&stack));
-    switcher.set_halign(gtk::Align::Center); root.append(&switcher); root.append(&stack);
+    let switcher = gtk::StackSwitcher::new();
+    switcher.set_stack(Some(&stack));
+    switcher.set_halign(gtk::Align::Center);
+    root.append(&switcher);
+    root.append(&stack);
     let tools_for_tab = tools.clone();
     stack.connect_visible_child_name_notify(move |stack| {
-        if stack.visible_child_name().as_deref() == Some("tools") { tools_for_tab.refresh(); }
+        if stack.visible_child_name().as_deref() == Some("tools") {
+            tools_for_tab.refresh();
+        }
     });
-    if show_tools { stack.set_visible_child_name("tools"); }
-    window.set_content(Some(&root)); window.present();
+    if show_tools {
+        stack.set_visible_child_name("tools");
+    }
+    window.set_content(Some(&root));
+    window.present();
 }
 
 fn server_card(
@@ -6900,18 +6928,26 @@ fn server_card(
 
     let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
     text.set_hexpand(true);
+    let details = gtk::Button::builder()
+        .label(&server.name)
+        .halign(gtk::Align::Start)
+        .css_classes(["flat", "heading"])
+        .tooltip_text("Open server details")
+        .build();
+    let server_for_details = server.clone();
+    let page_for_details = page.clone();
+    details.connect_clicked(move |_| {
+        open_server_details(&server_for_details, &page_for_details, false)
+    });
+    text.append(&details);
     text.append(
         &gtk::Label::builder()
-            .label(&server.name)
+            .label(&server.origin_label)
             .halign(gtk::Align::Start)
             .ellipsize(gtk::pango::EllipsizeMode::End)
-            .tooltip_text(&server.name)
-            .css_classes(["heading"])
+            .css_classes(["toolport-muted"])
             .build(),
     );
-    text.append(&gtk::Label::builder().label(&server.origin_label)
-        .halign(gtk::Align::Start).ellipsize(gtk::pango::EllipsizeMode::End)
-        .css_classes(["toolport-muted"]).build());
     // Transport and health share one line: a card per server is already the
     // densest thing on the page, and a third stacked line made each row read as
     // a paragraph.

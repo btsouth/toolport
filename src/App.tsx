@@ -786,30 +786,30 @@ function App() {
                     ? "Activity"
                     : view === "catalog"
                       ? "Browse catalog"
-                        : view === "teams"
-                          ? "Teams"
-                          : view === "settings"
-                            ? "Settings"
-                            : view === "clients"
-                              ? (selectedClient?.name ?? "Clients")
-                              : "Servers"}
+                      : view === "teams"
+                        ? "Teams"
+                        : view === "settings"
+                          ? "Settings"
+                          : view === "clients"
+                            ? (selectedClient?.name ?? "Clients")
+                            : "Servers"}
                 </h1>
                 <p className="truncate text-sm text-muted-foreground">
                   {view === "activity"
                     ? "Tool calls routed through Toolport"
                     : view === "catalog"
                       ? "Add MCP servers from the registry"
-                        : view === "teams"
-                          ? "Share one MCP server set across your team"
-                          : view === "settings"
-                            ? "Global discovery and security policy"
-                            : view === "clients"
-                              ? selectedClient
-                                ? "MCP client"
-                                : "Manage Toolport in your installed AI tools"
-                              : loading || !registry
-                                ? "Loading…"
-                                : "One gateway in front of every MCP server you run"}
+                      : view === "teams"
+                        ? "Share one MCP server set across your team"
+                        : view === "settings"
+                          ? "Global discovery and security policy"
+                          : view === "clients"
+                            ? selectedClient
+                              ? "MCP client"
+                              : "Manage Toolport in your installed AI tools"
+                            : loading || !registry
+                              ? "Loading…"
+                              : "One gateway in front of every MCP server you run"}
                 </p>
               </div>
             </div>
@@ -1077,7 +1077,11 @@ function App() {
             onProbe={reprobe}
             onOpenTools={() => {
               setShowOnboarding(false);
-              setToolsServerId(registry?.servers[0]?.id ?? null);
+              setToolsServerId(
+                registry?.servers.find((server) => isEnabled(registry, server.id))?.id ??
+                  registry?.servers[0]?.id ??
+                  null,
+              );
               selectView("servers");
             }}
             onFinish={finishOnboarding}

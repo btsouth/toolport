@@ -1017,7 +1017,7 @@ async fn probe_servers(
 
 /// List the tools one server exposes (raw MCP tool objects: name, description,
 /// inputSchema). Connects on demand and disconnects when the connection drops.
-/// Powers the tool playground's tool picker.
+/// Powers the server detail Tools tab.
 #[tauri::command]
 async fn list_server_tools(
     _state: State<'_, RegistryState>,
@@ -1047,7 +1047,7 @@ async fn call_tool(
 
 /// List the resources a server advertises (uri, name, mimeType). Connects on
 /// demand; empty if the server declares no resources capability. Powers the
-/// playground's Resources tab.
+/// server detail Resources panel.
 #[tauri::command]
 async fn list_server_resources(
     _state: State<'_, RegistryState>,
@@ -1060,7 +1060,7 @@ async fn list_server_resources(
 
 /// List the prompts a server advertises (name, description, arguments). Connects
 /// on demand; empty if the server declares no prompts capability. Powers the
-/// playground's Prompts tab.
+/// server detail Prompts panel.
 #[tauri::command]
 async fn list_server_prompts(
     _state: State<'_, RegistryState>,
@@ -1072,7 +1072,7 @@ async fn list_server_prompts(
 }
 
 /// Read one resource by its uri and return the raw MCP result (`{ contents }`).
-/// Connects on demand. Playground.
+/// Connects on demand from server detail.
 #[tauri::command]
 async fn read_resource(
     _state: State<'_, RegistryState>,
@@ -1085,7 +1085,7 @@ async fn read_resource(
 }
 
 /// Get one prompt by name with arguments, returning the raw MCP result
-/// (`{ messages }`). Connects on demand. Playground.
+/// (`{ messages }`). Connects on demand from server detail.
 #[tauri::command]
 async fn get_prompt(
     _state: State<'_, RegistryState>,

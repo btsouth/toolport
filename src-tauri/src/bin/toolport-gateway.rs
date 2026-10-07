@@ -6571,9 +6571,18 @@ fn handle_request_with_cancel(
                     let server = target.get("serverId").and_then(Value::as_str).unwrap_or("");
                     let tool = target.get("tool").and_then(Value::as_str).unwrap_or("");
                     let Some(alias) = router.exposed_tool_name(server, tool) else {
-                        return Some(success(id, json!({"content": [{"type": "text", "text": "Tool unavailable in the active profile or blocked by gateway policy."}], "isError": true})));
+                        return Some(success(
+                            id,
+                            json!({"content": [{"type": "text", "text": "Tool unavailable in the active profile or blocked by gateway policy."}], "isError": true}),
+                        ));
                     };
-                    (alias.to_string(), arguments.get("arguments").cloned().unwrap_or_else(|| json!({})))
+                    (
+                        alias.to_string(),
+                        arguments
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or_else(|| json!({})),
+                    )
                 } else {
                     unwrap_call_tool(&arguments)
                 }
@@ -28523,11 +28532,43 @@ mod tests {
         let _lock = registry::data_dir_test_lock();
         let dir = std::env::temp_dir().join(format!("tools-tab-{}", new_correlation_id()));
         let _data = registry::DataDirOverride::set(&dir);
+        struct ToolsTabRoute(MockRoute);
+        impl conduit_lib::downstream::Transport for ToolsTabRoute {
+            fn request(
+                &mut self,
+                method: &str,
+                params: Value,
+            ) -> Result<Value, conduit_lib::downstream::TransportError> {
+                if method == "tools/call" {
+                    assert_eq!(params["name"], "read-item");
+                    return Ok(
+                        json!({"content":[{"type":"text", "text":"Tools tab result"}], "isError":false}),
+                    );
+                }
+                self.0.request(method, params)
+            }
+            fn notify(
+                &mut self,
+                method: &str,
+                params: Value,
+            ) -> Result<(), conduit_lib::downstream::TransportError> {
+                self.0.notify(method, params)
+            }
+        }
         let mut routed = Router::new();
-        routed.add(DownstreamServer::connect("alpha".into(), Box::new(MockRoute {
-            tools: vec![json!({"name": "read-item", "inputSchema": {"type":"object"}})],
-        })).unwrap());
-        let reg = Registry { safety_level: None, ..Registry::default() };
+        routed.add(
+            DownstreamServer::connect(
+                "alpha".into(),
+                Box::new(ToolsTabRoute(MockRoute {
+                    tools: vec![json!({"name": "read-item", "inputSchema": {"type":"object"}})],
+                })),
+            )
+            .unwrap(),
+        );
+        let reg = Registry {
+            safety_level: None,
+            ..Registry::default()
+        };
         let host = dispatch_host(false);
         let req = json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params": {
             "name":"toolport_call_tool", "arguments": {
@@ -28535,16 +28576,79 @@ mod tests {
             }
         }});
         let denied = std::collections::HashSet::from(["beta".to_string()]);
-        let result = handle_request(&host, &req, &reg, &routed, &[], true, None,
-            &SearchGuard::default(), Some(&denied), None).unwrap();
+        let result = handle_request(
+            &host,
+            &req,
+            &reg,
+            &routed,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            Some(&denied),
+            None,
+        )
+        .unwrap();
         assert_eq!(result["result"]["isError"], true, "{result}");
-        let result = handle_request(&host, &req, &reg, &routed, &[], true, None,
-            &SearchGuard::default(), None, None).unwrap();
-        assert_ne!(result["result"]["isError"], true, "{result}");
+        let result = handle_request(
+            &host,
+            &req,
+            &reg,
+            &routed,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result["result"]["isError"], false, "{result}");
+        assert_eq!(result["result"]["content"][0]["text"], "Tools tab result");
         let mut missing = req.clone();
         missing["params"]["arguments"]["_toolportTarget"]["tool"] = json!("missing");
-        let result = handle_request(&host, &missing, &reg, &routed, &[], true, None,
-            &SearchGuard::default(), None, None).unwrap();
+        let result = handle_request(
+            &host,
+            &missing,
+            &reg,
+            &routed,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result["result"]["isError"], true, "{result}");
+        let mut blocked = Router::with_policy(conduit_lib::router::ToolPolicy {
+            deny_destructive: true,
+            ..Default::default()
+        });
+        blocked.add(
+            DownstreamServer::connect(
+                "alpha".into(),
+                Box::new(MockRoute {
+                    tools: vec![
+                        json!({"name":"read-item", "annotations":{"destructiveHint":true}}),
+                    ],
+                }),
+            )
+            .unwrap(),
+        );
+        let result = handle_request(
+            &host,
+            &req,
+            &reg,
+            &blocked,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(result["result"]["isError"], true, "{result}");
         let _ = std::fs::remove_dir_all(dir);
     }

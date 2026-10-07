@@ -59,7 +59,7 @@ try {
   await expect(page.getByText("get_issue", { exact: true })).toBeVisible();
   await expect(page.getByText("read-only", { exact: true })).toBeVisible();
   await expect(page.getByText("destructive", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: /get_issue/ }).click();
+  await page.getByRole("button", { name: /^get_issue / }).click();
   await page.getByLabel("number", { exact: false }).fill("42");
   await page.getByRole("button", { name: "Call tool", exact: true }).click();
   await expect(page.getByText(/Fixture result:/)).toBeVisible();
