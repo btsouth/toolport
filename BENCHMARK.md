@@ -61,11 +61,11 @@ full and lazy modes and pass the JSON responses to
 `tiktoken o200k_base` (the GPT-4o/GPT-5 family tokenizer) on a registry of up to 20
 servers, 416 tools in full mode:
 
-| Advertised set               | Tools | Tools + instructions (o200k) |
-| ---------------------------- | ----- | ---------------------------- |
-| Full catalog (20 servers)    | 416   | ≈38,800                      |
-| Lazy, Code Mode on           | 5     | ≈870                         |
-| Lazy, core four (default)    | 4     | ≈500                         |
+| Advertised set            | Tools | Tools + instructions (o200k) |
+| ------------------------- | ----- | ---------------------------- |
+| Full catalog (20 servers) | 416   | ≈38,800                      |
+| Lazy, Code Mode on        | 5     | ≈870                         |
+| Lazy, core four (default) | 4     | ≈500                         |
 
 The lazy floor is flat: about 500 tokens with Code Mode off (about 870 with it on), whether one server or twenty are connected.
 Because the floor is fixed, lazy discovery only pays off once the catalog it replaces is
