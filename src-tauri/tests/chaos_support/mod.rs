@@ -345,8 +345,12 @@ pub fn start_daemon(dir: &Path) -> ChildGuard {
 
 /// Start the daemon with extra environment, for cases that need to control what
 /// the spawned servers could inherit (the env-allowlist case).
+///
+/// Returns once the descriptor names this daemon. A client started before then
+/// finds no daemon, elects and spawns a second one, and a case that later kills
+/// "the daemon" by its descriptor would kill the wrong process.
 pub fn start_daemon_with_env(dir: &Path, env: &[(&str, &str)]) -> ChildGuard {
-    ChildGuard(
+    let guard = ChildGuard(
         base_gateway_command(dir)
             .envs(env.iter().copied())
             .arg("--daemon")
@@ -355,7 +359,12 @@ pub fn start_daemon_with_env(dir: &Path, env: &[(&str, &str)]) -> ChildGuard {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn the daemon"),
-    )
+    );
+    let pid = u64::from(guard.0.id());
+    wait_for("the daemon to publish its descriptor", RESPONSE_TIMEOUT, || {
+        daemon_pids(dir).contains(&pid)
+    });
+    guard
 }
 
 // ---------------------------------------------------------------------------
