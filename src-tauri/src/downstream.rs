@@ -5817,9 +5817,9 @@ impl HttpTransport {
         self.server_handler.as_ref().and_then(|handler| handler(v))
     }
 
-    /// Try to replace a token nearing expiry. Lock and persistence failures must
-    /// reach the caller without a forced second exchange. Other failures may use
-    /// the current token throughout the safety window, with one refresh on 401/403.
+    /// Try to replace a token nearing expiry. Contention keeps the current token
+    /// through the safety window; a forced refresh after 401 still reports it.
+    /// Persistence failures reach the caller without an unlocked exchange.
     fn refresh_before_send(&mut self) -> Result<(), TransportError> {
         if let Some(refresh) = &self.refresh {
             if let Ok(refresh) = refresh.lock() {
@@ -5830,7 +5830,10 @@ impl HttpTransport {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
                     }
-                    Err(e) if crate::remote::is_refresh_storage_or_lock_error(&e) => {
+                    Err(e)
+                        if crate::remote::is_refresh_storage_or_lock_error(&e)
+                            && !crate::remote::is_refresh_lock_error(&e) =>
+                    {
                         return Err(TransportError::Fatal(e));
                     }
                     _ => {}
