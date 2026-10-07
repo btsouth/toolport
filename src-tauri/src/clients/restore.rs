@@ -517,7 +517,18 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
         }
         Format::YamlExtensions | Format::YamlMcpServers | Format::YamlMcpServersList => {
             let root = serde_yaml::to_value(&latest).map_err(|e| e.to_string())?;
-            atomic_write_yaml_config(path, current.as_deref(), &root, key)?;
+            if let (Some(current), Some(value)) = (current.as_deref(), root.get(key)) {
+                let output = rewrite_yaml_key_preserving_seed(
+                    current,
+                    key,
+                    value,
+                    record.original.as_deref(),
+                )?;
+                parse_existing_yaml_content(&output)?;
+                atomic_write(path, &output)?;
+            } else {
+                atomic_write_yaml_config(path, current.as_deref(), &root, key)?;
+            }
         }
         _ => {
             let original_root = record.baseline.clone();
@@ -1135,6 +1146,38 @@ mod tests {
         .unwrap();
         disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
         assert_eq!(read_config_file(&path).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn yaml_removal_and_list_restore_keep_native_and_original_annotations() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-yaml-annotations-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        for (index, (format, original)) in [
+            (Format::YamlMcpServers, "# user's setting\ntheme: dark # keep\n"),
+            (Format::YamlMcpServersList, "# header\nname: Example\nmcpServers:\n  - name: native\n    command: native # original note\n"),
+        ].into_iter().enumerate() {
+            for moved in [false, true] {
+                let path = dir.join(format!("config-{index}-{moved}"));
+                std::fs::write(&path, original).unwrap();
+                mutation::run("fixture", &path, format, || {
+                    if moved { moved::record("fixture", format, &path)?; write_format(format, &path, &[entry()], true) }
+                    else { edit_format(format, &path, Some(&entry()), true) }
+                }).unwrap();
+                let current = read_config_file(&path).unwrap();
+                let edited = format!("{}session: 2 # native note\n", current.replace("command: native # original note", "command: native # edited note"));
+                std::fs::write(&path, edited).unwrap();
+                disconnect("fixture", &path, format).unwrap();
+                let restored = read_config_file(&path).unwrap();
+                assert!(restored.contains("# native note"));
+                assert!(restored.contains(if index == 0 { "# keep" } else if moved { "# original note" } else { "# edited note" }), "{restored}");
+            }
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
