@@ -5830,7 +5830,7 @@ impl HttpTransport {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
                     }
-                    Err(e) if crate::remote::is_retriable_refresh_error(&e) => {
+                    Err(e) if crate::remote::is_refresh_storage_or_lock_error(&e) => {
                         return Err(TransportError::Fatal(e));
                     }
                     _ => {}
@@ -5873,7 +5873,7 @@ impl HttpTransport {
             Ok(None) => Err(TransportError::Fatal(format!(
                 "HTTP {code} (needs authentication): token refresh returned no token"
             ))),
-            Err(e) if crate::remote::is_retriable_refresh_error(&e) => Err(TransportError::Fatal(e)),
+            Err(e) if crate::remote::is_refresh_storage_or_lock_error(&e) => Err(TransportError::Fatal(e)),
             Err(e) => Err(TransportError::Fatal(format!(
                 "HTTP {code} (needs authentication): token refresh failed: {e}"
             ))),

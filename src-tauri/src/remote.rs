@@ -455,6 +455,8 @@ const OAUTH_REFRESH_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::fro
 const OAUTH_REFRESH_LOCK_ERROR: &str =
     "OAuth refresh is busy or its cross-process lock is unavailable; try again.";
 const OAUTH_REFRESH_SAVE_ERROR: &str = "OAuth refresh succeeded but could not save";
+const OAUTH_REFRESH_STATE_SAVE_ERROR: &str =
+    "OAuth refresh succeeded but could not save the rotated refresh token";
 
 fn lock_oauth_refresh_for(
     server_id: &str,
@@ -645,7 +647,7 @@ fn refresh_token_with_lock(
     };
     let json = serde_json::to_string(&new_state).map_err(|e| e.to_string())?;
     secrets::set_secret(server_id, STATE_KEY, &json).map_err(|_| {
-        format!("{OAUTH_REFRESH_SAVE_ERROR} the rotated refresh token; the previous refresh token may no longer be valid. Restore secret storage before trying again.")
+        format!("{OAUTH_REFRESH_STATE_SAVE_ERROR}; the previous refresh token may no longer be valid. Restore secret storage before trying again.")
     })?;
     secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, &tokens.access_token).map_err(|_| {
         format!("{OAUTH_REFRESH_SAVE_ERROR} the access token; the rotated refresh token was saved. Restore secret storage and try again.")
@@ -749,7 +751,7 @@ fn mentions_status(s: &str, code: &str) -> bool {
     })
 }
 
-pub(crate) fn is_retriable_refresh_error(e: &str) -> bool {
+pub(crate) fn is_refresh_storage_or_lock_error(e: &str) -> bool {
     e == OAUTH_REFRESH_LOCK_ERROR || e.starts_with(OAUTH_REFRESH_SAVE_ERROR)
 }
 
@@ -808,7 +810,9 @@ fn authed_transport(
     // The request path and the background subscription listener can refresh or
     // step up concurrently. Serialize credential-changing flows so an older
     // refresh result cannot overwrite a newer interactive authorization state.
-    let credential_update = Arc::new(Mutex::new(()));
+    // If rotated metadata cannot be saved, this transport must not retry the old
+    // refresh token. A successful interactive authorization clears the failure.
+    let credential_update = Arc::new(Mutex::new(None::<String>));
     let refresh: Option<RefreshFn> = if token.is_some() {
         let sid = server_id.to_string();
         // Keep the proactive deadline in memory. This avoids a keychain read on
@@ -816,9 +820,12 @@ fn authed_transport(
         let next_refresh_at = Arc::clone(&next_refresh_at);
         let credential_update = Arc::clone(&credential_update);
         Some(Box::new(move |force| {
-            let _update = credential_update
+            let mut update = credential_update
                 .lock()
                 .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
+            if let Some(error) = update.as_ref() {
+                return Err(error.clone());
+            }
             if !force {
                 let deadline = *next_refresh_at
                     .lock()
@@ -832,6 +839,9 @@ fn authed_transport(
             let refreshed = match refresh_token_with_expiry(&sid) {
                 Ok(refreshed) => refreshed,
                 Err(e) => {
+                    if e.starts_with(OAUTH_REFRESH_STATE_SAVE_ERROR) {
+                        *update = Some(e.clone());
+                    }
                     if !force {
                         *next_refresh_at
                             .lock()
@@ -839,7 +849,7 @@ fn authed_transport(
                             Some(now_epoch_seconds().saturating_add(PROACTIVE_REFRESH_RETRY_SECS));
                     }
                     // A locked keychain is not "please sign in again" (SBS-840).
-                    if is_retriable_refresh_error(&e)
+                    if is_refresh_storage_or_lock_error(&e)
                         || e.contains("could not read the vaulted")
                         || e.contains("could not parse the vaulted")
                     {
@@ -868,10 +878,11 @@ fn authed_transport(
         let next_refresh_at = Arc::clone(&next_refresh_at);
         let credential_update = Arc::clone(&credential_update);
         Some(Box::new(move |scope| {
-            let _update = credential_update
+            let mut update = credential_update
                 .lock()
                 .map_err(|_| "OAuth credential-update lock poisoned".to_string())?;
             let token = reauthorize_for_scope(&sid, &resource, scope)?;
+            *update = None;
             let deadline = token
                 .expires_at
                 .map(|expires_at| expires_at.saturating_sub(PROACTIVE_REFRESH_SKEW_SECS));
@@ -1496,7 +1507,7 @@ mod tests {
                         .unwrap();
                     endpoint.release.send(()).unwrap();
                     let error = worker.join().unwrap().unwrap_err();
-                    assert!(is_retriable_refresh_error(&error), "{error}");
+                    assert!(is_refresh_storage_or_lock_error(&error), "{error}");
                     assert!(!is_auth_error(&error), "{error}");
                     assert!(!error.contains("rt-1"));
                     assert_eq!(endpoint.count(), 1);
@@ -1528,6 +1539,39 @@ mod tests {
             assert_eq!(error, OAUTH_REFRESH_LOCK_ERROR);
             assert!(!is_auth_error(&error));
             assert_eq!(endpoint.count(), 0);
+        });
+    }
+
+    #[test]
+    fn oauth_refresh_does_not_retry_an_unsaved_rotated_token() {
+        use crate::downstream::Transport;
+        secrets::tests::with_isolated_vault(|| {
+            let endpoint = RotatingEndpoint::new();
+            endpoint.seed();
+            let mut transport = authed_transport(
+                &endpoint.url,
+                Some("token-0".into()),
+                "rotation",
+                false,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            endpoint.release.send(()).unwrap();
+            let error = secrets::tests::with_failed_write(STATE_KEY, || {
+                transport
+                    .request("tools/list", serde_json::json!({}))
+                    .unwrap_err()
+            });
+            assert!(error
+                .to_string()
+                .starts_with(OAUTH_REFRESH_STATE_SAVE_ERROR));
+            // Restoring the vault does not make RT0 valid again. This transport
+            // must report the saved failure, not silently spend it a second time.
+            let repeated = transport
+                .request("tools/list", serde_json::json!({}))
+                .unwrap_err();
+            assert_eq!(repeated.to_string(), error.to_string());
+            assert_eq!(endpoint.count(), 1);
         });
     }
 
