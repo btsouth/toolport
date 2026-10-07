@@ -34,6 +34,13 @@
 //! - `MOCK_MCP_PID_FILE=<path>` appends this process's pid at start, and
 //!   `MOCK_MCP_IGNORE_EOF=1` keeps it running after stdin closes, like a server
 //!   holding a listener or a pool, so a test can see whether it was orphaned.
+//! - `MOCK_MCP_START_DELAY_MS=<ms>` — the process stays silent this long before
+//!   it reads its first request, modeling a server that is slow to come up.
+//! - `MOCK_MCP_GARBAGE_STDOUT_MS=<ms>` — emit a non-JSON line to stdout this
+//!   often (a server that logs to stdout, which MCP forbids), so the gateway's
+//!   framing has to tolerate it.
+//! - `MOCK_MCP_STDERR_FLOOD=1` — write to stderr in a tight loop, so a test can
+//!   check that a chatty server's stderr neither blocks it nor breaks the gateway.
 //!
 //! The default configuration (no env set) is byte-identical to the pre-SOU-443
 //! fixture apart from the added `echo_meta` tool, so `list_changed`,
@@ -110,6 +117,9 @@ struct Config {
     strict: bool,
     transcript: Option<String>,
     call_delay: Option<std::time::Duration>,
+    start_delay: Option<std::time::Duration>,
+    garbage_stdout: Option<std::time::Duration>,
+    stderr_flood: bool,
 }
 
 impl Config {
@@ -124,6 +134,15 @@ impl Config {
                 .ok()
                 .and_then(|raw| raw.trim().parse().ok())
                 .map(std::time::Duration::from_millis),
+            start_delay: std::env::var("MOCK_MCP_START_DELAY_MS")
+                .ok()
+                .and_then(|raw| raw.trim().parse().ok())
+                .map(std::time::Duration::from_millis),
+            garbage_stdout: std::env::var("MOCK_MCP_GARBAGE_STDOUT_MS")
+                .ok()
+                .and_then(|raw| raw.trim().parse().ok())
+                .map(std::time::Duration::from_millis),
+            stderr_flood: std::env::var("MOCK_MCP_STDERR_FLOOD").as_deref() == Ok("1"),
         }
     }
 }
@@ -774,6 +793,43 @@ fn main() {
 fn serve_stdio() {
     fail_start_if_configured();
     let cfg = Config::from_env();
+    if let Some(delay) = cfg.start_delay {
+        std::thread::sleep(delay);
+    }
+    // A server that logs to stdout breaks MCP framing; the gateway must skip the
+    // noise and keep serving. Write on a second handle to the same pipe (the main
+    // loop holds the locked stdout for its whole life), one whole line per write,
+    // so a real response cannot be spliced into the middle of a garbage line.
+    let garbage_stdout = cfg.garbage_stdout;
+    #[cfg(unix)]
+    if let Some(period) = garbage_stdout {
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let Ok(mut out) = std::fs::OpenOptions::new().write(true).open("/dev/stdout") else {
+                return;
+            };
+            loop {
+                let _ = out.write_all(b"DEBUG: hello from console.log {not json}\n");
+                let _ = out.flush();
+                std::thread::sleep(period);
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = garbage_stdout;
+    // A server that floods stderr must not wedge: its own stderr is not the
+    // gateway's stdin, and the gateway must bound what it retains.
+    if cfg.stderr_flood {
+        std::thread::spawn(|| {
+            use std::io::Write;
+            let line = "x".repeat(1000);
+            loop {
+                let mut err = std::io::stderr();
+                let _ = writeln!(err, "{line}");
+                let _ = err.flush();
+            }
+        });
+    }
     if std::env::var("MOCK_MCP_HTTP").as_deref() == Ok("1") {
         serve_http(&cfg);
         return;

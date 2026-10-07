@@ -1,0 +1,62 @@
+name: Chaos nightly
+
+# The P1.7 chaos suite as a required gate on Linux lives in ci.yml. These cases
+# are process-level and platform-sensitive, so they also run nightly on macOS
+# and Windows to catch drift the Linux gate cannot see. The cases that need
+# Linux process introspection or signals are `#[cfg]`-gated out on other
+# platforms, so those runs exercise the portable subset.
+on:
+  schedule:
+    - cron: "0 7 * * *" # nightly, 07:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chaos-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  chaos:
+    name: Chaos suite (${{ matrix.os }})
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+          key: ci-chaos-nightly
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # `cargo test` has no glob for `--test`, so each chaos binary is named.
+      - name: Chaos suite (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          for test in chaos_concurrency chaos_env_allowlist chaos_faulty_servers chaos_process_kill chaos_registry; do
+            cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --test "$test"
+          done
+
+      - name: Chaos suite (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          foreach ($test in @(
+            "chaos_concurrency", "chaos_env_allowlist", "chaos_faulty_servers",
+            "chaos_process_kill", "chaos_registry"
+          )) {
+            cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --test $test
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }

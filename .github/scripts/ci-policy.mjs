@@ -55,7 +55,7 @@ export function requireResults(needs) {
   const selected = needs.changes.outputs?.rust;
   if (selected !== "true" && selected !== "false")
     throw new Error("Rust selection is missing or invalid");
-  for (const job of ["build-test", "cross-platform-rust", "linux-native"]) {
+  for (const job of ["build-test", "cross-platform-rust", "linux-native", "chaos"]) {
     const expected = selected === "true" ? "success" : "skipped";
     if (needs[job]?.result !== expected)
       throw new Error(`${job}: expected ${expected}, got ${needs[job]?.result}`);
