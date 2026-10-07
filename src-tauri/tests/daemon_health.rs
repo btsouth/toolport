@@ -611,9 +611,16 @@ fn spawn_http(fixture: &Fixture, cap: Option<&str>) -> (ChildGuard, u16) {
         command.env("TOOLPORT_HTTP_MAX_CONNECTIONS", cap);
     }
     let child = ChildGuard(command.spawn().expect("spawn the HTTP gateway"));
+    // Wait for a whole answer, so no readiness connection still holds a slot.
     let deadline = Instant::now() + RESPONSE_TIMEOUT;
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "HTTP gateway never listened");
+    loop {
+        let answered = ureq::get(&format!("http://127.0.0.1:{port}/"))
+            .timeout(Duration::from_secs(5))
+            .call();
+        if !matches!(answered, Err(ureq::Error::Transport(_))) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "HTTP gateway never answered");
         std::thread::sleep(Duration::from_millis(50));
     }
     (child, port)
@@ -673,6 +680,16 @@ fn the_http_bridge_takes_a_burst_and_sheds_only_past_its_cap() {
         })
         .collect();
     std::thread::sleep(Duration::from_millis(300));
+    for mut stream in &held {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut scratch = [0u8; 64];
+        assert!(
+            stream.read(&mut scratch).is_err(),
+            "a client within the cap must not be answered while it is still sending"
+        );
+    }
     let mut third = TcpStream::connect(("127.0.0.1", capped_port)).unwrap();
     third
         .set_read_timeout(Some(Duration::from_secs(5)))
