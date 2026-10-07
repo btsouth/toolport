@@ -3512,12 +3512,11 @@ fn quarantine_unreadable(path: &Path, content: &str) -> Result<PathBuf, String> 
     let mut name = path.as_os_str().to_owned();
     name.push(format!(".unreadable-sha256-{}", sha256_hex(content)));
     let dest = PathBuf::from(name);
-    if dest.exists() {
-        if !std::fs::symlink_metadata(&dest).is_ok_and(|metadata| metadata.file_type().is_file())
-            || !std::fs::read_to_string(&dest).is_ok_and(|saved| saved == content)
-        {
-            return Err(format!("Could not preserve corrupt registry at {}: an incompatible copy already exists. Move it aside and try again.", dest.display()));
-        }
+    if dest.exists()
+        && (!std::fs::symlink_metadata(&dest).is_ok_and(|metadata| metadata.file_type().is_file())
+            || !std::fs::read_to_string(&dest).is_ok_and(|saved| saved == content))
+    {
+        return Err(format!("Could not preserve corrupt registry at {}: an incompatible copy already exists. Move it aside and try again.", dest.display()));
     }
     let dir = path
         .parent()
