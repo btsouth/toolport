@@ -1,12 +1,11 @@
 //! Local MCP catalog exposure measurements and legacy estimates.
 //!
-//! Every lazy/grouped `tools/list` writes the exact serialized full and exposed
-//! tool-array byte sizes for that client. Discovery search response bytes are
-//! recorded separately. `tokensSaved` remains a compatibility estimate and
-//! preserves old v1 rows without manufacturing exact bytes for them.
+//! Distinct lazy/grouped catalog exposures are counted once per session. The
+//! telemetry writer tokenizes full/exposed arrays and discovery text offline.
+//! The headline is their signed net; historical estimates stay separate.
 //!
-//! v1 gateways retain ownership of `savings.jsonl`. New events go to
-//! `savings-v2.jsonl`, which old gateways cannot rotate. Its append and rotation
+//! Old gateways retain ownership of `savings.jsonl` and `savings-v2.jsonl`.
+//! Tokenized events go to `savings-v3.jsonl`. Its append and rotation
 //! share a cross-process lock.
 
 use std::collections::BTreeMap;
@@ -14,8 +13,42 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::sync::{Mutex, OnceLock};
 
-/// Rotate v2 detail once it passes this size. Lifetime and daily aggregates
+pub const TOKENIZER: &str = "cl100k_base";
+
+/// Owned by a client session, never shared across stdio/legacy HTTP sessions.
+/// Sessionless HTTP uses its listener guard, keyed additionally by client label.
+#[derive(Default)]
+pub struct CatalogSession {
+    seen: Mutex<std::collections::HashSet<[u8; 32]>>,
+}
+
+impl CatalogSession {
+    fn first_exposure(&self, client: Option<&str>, full: &str, exposed: &str) -> bool {
+        let mut hash = Sha256::new();
+        for text in [client.unwrap_or(""), full, exposed] {
+            hash.update((text.len() as u64).to_le_bytes());
+            hash.update(text.as_bytes());
+        }
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(hash.finalize().into())
+    }
+}
+
+/// Special-token-like strings in schemas are ordinary text. No runtime IO.
+pub fn count_tokens(text: &str) -> u64 {
+    static TOKENIZER: OnceLock<tiktoken_rs::CoreBPE> = OnceLock::new();
+    TOKENIZER
+        .get_or_init(|| tiktoken_rs::cl100k_base().expect("bundled cl100k_base vocabulary"))
+        .encode_ordinary(text)
+        .len() as u64
+}
+
+/// Rotate tokenized detail once it passes this size. Lifetime and daily aggregates
 /// remain durable even if their own total eventually exceeds the detail budget.
 const MAX_SAVINGS_BYTES: u64 = 1024 * 1024;
 /// Recent detail lines kept on rotation; older lines collapse into one carry line
@@ -32,7 +65,11 @@ fn v2_path() -> Option<PathBuf> {
     Some(crate::registry::conduit_dir()?.join("savings-v2.jsonl"))
 }
 
-/// Delete both savings logs, including carry-forward aggregates (called when the
+fn v3_path() -> Option<PathBuf> {
+    Some(crate::registry::conduit_dir()?.join("savings-v3.jsonl"))
+}
+
+/// Delete all savings logs, including carry-forward aggregates (called when the
 /// user clears retained activity). Returns `Err` only on a real removal failure; a
 /// missing file (nothing to clear) is success. Local and irreversible; the running
 /// total resets to zero and the next serve starts a fresh file.
@@ -40,7 +77,7 @@ pub fn try_clear() -> std::io::Result<()> {
     // Write anything queued before deleting, so a queued line cannot reappear.
     crate::telemetry::flush();
     let mut first_error = None;
-    for path in [savings_path(), v2_path()].into_iter().flatten() {
+    for path in [savings_path(), v2_path(), v3_path()].into_iter().flatten() {
         let _lock = match crate::registry::lock_at(&path) {
             Ok(lock) => lock,
             Err(error) => {
@@ -80,7 +117,11 @@ pub fn surface_bytes(tools: &[Value]) -> u64 {
 
 /// Serialize the array once while exposing each element's exact byte length to
 /// attribution. This produces the same bytes as serde_json::to_vec(tools).
-fn serialize_surface(tools: &[Value], mut on_tool: impl FnMut(&Value, u64)) -> u64 {
+fn serialize_surface(tools: &[Value], on_tool: impl FnMut(&Value, u64)) -> u64 {
+    serialize_surface_text(tools, on_tool).len() as u64
+}
+
+fn serialize_surface_text(tools: &[Value], mut on_tool: impl FnMut(&Value, u64)) -> String {
     let mut bytes = Vec::new();
     bytes.push(b'[');
     for (index, tool) in tools.iter().enumerate() {
@@ -92,7 +133,7 @@ fn serialize_surface(tools: &[Value], mut on_tool: impl FnMut(&Value, u64)) -> u
         on_tool(tool, (bytes.len() - start) as u64);
     }
     bytes.push(b']');
-    bytes.len() as u64
+    String::from_utf8(bytes).expect("JSON is UTF-8")
 }
 
 pub fn estimated_tokens(bytes: u64) -> u64 {
@@ -114,9 +155,10 @@ pub fn estimate_tokens(tools: &[Value]) -> u64 {
 /// Record the exact surfaces returned by this gateway and by full mode for the
 /// same client. `by_server_bytes` is exact omitted downstream definition bytes;
 /// its sum need not equal the global difference, which includes meta tools and
-/// JSON array punctuation. The legacy team token estimate is apportioned from
-/// the global positive avoided estimate, so it never credits extra exposure.
+/// JSON array punctuation. Team attribution is apportioned from the positive
+/// tokenizer catalog delta, so it never credits extra exposure.
 pub fn record_catalog(
+    session: &CatalogSession,
     mode: &str,
     client: Option<&str>,
     full: &[Value],
@@ -128,7 +170,7 @@ pub fn record_catalog(
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect();
     let mut by_server_bytes = BTreeMap::<String, u64>::new();
-    let full_bytes = serialize_surface(full, |tool, bytes| {
+    let full_text = serialize_surface_text(full, |tool, bytes| {
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
             return;
         };
@@ -140,38 +182,24 @@ pub fn record_catalog(
         };
         *by_server_bytes.entry(server).or_default() += bytes;
     });
-    let exposed_bytes = surface_bytes(exposed);
+    let exposed_text = serialize_surface_text(exposed, |_, _| {});
+    if !session.first_exposure(client, &full_text, &exposed_text) {
+        return;
+    }
+    let full_bytes = full_text.len() as u64;
+    let exposed_bytes = exposed_text.len() as u64;
     let avoided = full_bytes.saturating_sub(exposed_bytes);
     let extra = exposed_bytes.saturating_sub(full_bytes);
-    let attributable: u128 = by_server_bytes.values().map(|bytes| *bytes as u128).sum();
-    let estimated = estimated_tokens(avoided);
-    let mut remaining = estimated;
-    let server_count = by_server_bytes.len();
-    let by_server: BTreeMap<String, u64> = by_server_bytes
-        .iter()
-        .enumerate()
-        .map(|(index, (server, bytes))| {
-            let share = if attributable == 0 {
-                0
-            } else if index + 1 == server_count {
-                remaining
-            } else {
-                ((estimated as u128 * *bytes as u128) / attributable) as u64
-            };
-            remaining = remaining.saturating_sub(share);
-            (server.clone(), share)
-        })
-        .collect();
     let mut row = json!({
-        "v": 2, "kind": "catalog_exposure", "ts": epoch_millis() as u64,
+        "v": 3, "kind": "catalog_exposure", "ts": epoch_millis() as u64,
         "mode": mode, "fullToolCount": full.len(), "exposedToolCount": exposed.len(),
         "fullSurfaceBytes": full_bytes, "exposedSurfaceBytes": exposed_bytes,
         "avoidedSurfaceBytes": avoided,
         "extraExposedSurfaceBytes": extra,
         "surfaceDeltaBytes": full_bytes as i64 - exposed_bytes as i64,
-        "estimatedTokensAvoided": estimated,
-        "estimateMethod": ESTIMATE_METHOD,
-        "byServerBytes": by_server_bytes, "byServer": by_server,
+        "tokenizer": TOKENIZER,
+        "_fullText": full_text, "_exposedText": exposed_text,
+        "byServerBytes": by_server_bytes,
     });
     if let Some(client) = client.filter(|client| !client.is_empty()) {
         row["client"] = json!(client);
@@ -180,13 +208,12 @@ pub fn record_catalog(
 }
 
 /// Search content is measured after composing the text returned by tools/call.
-pub fn record_discovery(content_bytes: u64, matched_schema_bytes: u64) {
+pub fn record_discovery(text: &str, matched_schema_bytes: u64) {
     append_line(&json!({
-        "v": 2, "kind": "discovery_response", "ts": epoch_millis() as u64,
-        "responseContentBytes": content_bytes,
+        "v": 3, "kind": "discovery_response", "ts": epoch_millis() as u64,
+        "responseContentBytes": text.len() as u64,
         "matchedSchemaBytes": matched_schema_bytes,
-        "estimatedResponseTokens": estimated_tokens(content_bytes),
-        "estimateMethod": ESTIMATE_METHOD,
+        "tokenizer": TOKENIZER, "_discoveryText": text,
     }));
 }
 
@@ -211,7 +238,7 @@ pub fn record_orchestration(round_trips_saved: u64) {
 /// Append one JSON entry under the v2 lock. The lock covers both append and
 /// any rotation; an old gateway never opens this versioned path.
 fn append_line(entry: &Value) {
-    if let Some(path) = v2_path() {
+    if let Some(path) = v3_path() {
         crate::telemetry::record(
             &path,
             &entry.to_string(),
@@ -253,7 +280,56 @@ pub(crate) fn append_lines_at(
     max_bytes: u64,
     keep_lines: usize,
 ) -> Result<(), String> {
-    append_lines_at_with_hook(path, lines, max_bytes, keep_lines, None)
+    // Deferred texts exist only in the bounded in-memory queue, never on disk.
+    let lines: Vec<String> = lines.iter().map(|line| tokenize_line(line)).collect();
+    append_lines_at_with_hook(path, &lines, max_bytes, keep_lines, None)
+}
+
+fn tokenize_line(line: &str) -> String {
+    let Ok(mut row) = serde_json::from_str::<Value>(line) else {
+        return line.to_owned();
+    };
+    for (text_key, count_key) in [
+        ("_fullText", "fullTokens"),
+        ("_exposedText", "exposedTokens"),
+        ("_discoveryText", "discoveryTokens"),
+    ] {
+        if let Some(text) = row.as_object_mut().and_then(|obj| obj.remove(text_key)) {
+            if let Some(text) = text.as_str() {
+                row[count_key] = json!(count_tokens(text));
+            }
+        }
+    }
+    if row["kind"] == "catalog_exposure" && row["tokenizer"] == TOKENIZER {
+        let avoided = row["fullTokens"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_sub(row["exposedTokens"].as_u64().unwrap_or(0));
+        // Team attribution remains catalog-only, apportioned by omitted bytes.
+        let weights = row["byServerBytes"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let total: u128 = weights
+            .values()
+            .map(|n| n.as_u64().unwrap_or(0) as u128)
+            .sum();
+        let mut remaining = avoided;
+        let mut shares = BTreeMap::new();
+        for (index, (server, weight)) in weights.iter().enumerate() {
+            let share = if total == 0 {
+                0
+            } else if index + 1 == weights.len() {
+                remaining
+            } else {
+                (avoided as u128 * weight.as_u64().unwrap_or(0) as u128 / total) as u64
+            };
+            remaining = remaining.saturating_sub(share);
+            shares.insert(server.clone(), share);
+        }
+        row["byServer"] = json!(shares);
+    }
+    row.to_string()
 }
 
 fn append_lines_at_with_hook(
@@ -368,6 +444,10 @@ fn merge_team_bucket(buckets: &mut BTreeMap<String, BTreeMap<String, u64>>, row:
 /// line: it preserves the saved total, the load count, the peak catalog, and the
 /// earliest timestamp.
 fn fold(entries: &[Value]) -> Value {
+    let mut tokenized_loads = 0u64;
+    let mut full_tokens = 0u64;
+    let mut exposed_tokens = 0u64;
+    let mut discovery_tokens = 0u64;
     let mut saved = 0u64;
     let mut v2_estimated = 0u64;
     let mut loads = 0u64;
@@ -394,6 +474,16 @@ fn fold(entries: &[Value]) -> Value {
         let is_carry = kind == Some("carry");
         let is_catalog = kind == Some("catalog_exposure");
         let is_discovery = kind == Some("discovery_response");
+        if is_carry || e["tokenizer"] == TOKENIZER {
+            full_tokens = full_tokens.saturating_add(number("fullTokens"));
+            exposed_tokens = exposed_tokens.saturating_add(number("exposedTokens"));
+            discovery_tokens = discovery_tokens.saturating_add(number("discoveryTokens"));
+            tokenized_loads = tokenized_loads.saturating_add(if is_catalog {
+                1
+            } else {
+                number("tokenizedLoads")
+            });
+        }
         // v1 rows and v1 carry records both store their estimate in `saved`.
         // v2 carry records store only that legacy component in `saved`.
         saved = saved.saturating_add(number("saved"));
@@ -469,7 +559,9 @@ fn fold(entries: &[Value]) -> Value {
             since = ts;
         }
     }
-    json!({ "v": 2, "kind": "carry", "ts": since, "saved": saved, "legacyTokensSaved": saved, "tools": peak, "loads": loads, "roundTripsSaved": round_trips,
+    json!({ "v": 3, "kind": "carry",
+        "fullTokens": full_tokens, "exposedTokens": exposed_tokens,
+        "discoveryTokens": discovery_tokens, "tokenizedLoads": tokenized_loads, "ts": since, "saved": saved, "legacyTokensSaved": saved, "tools": peak, "loads": loads, "roundTripsSaved": round_trips,
         "fullSurfaceBytes": full_bytes, "exposedSurfaceBytes": exposed_bytes, "avoidedSurfaceBytes": avoided_bytes,
         "extraExposedSurfaceBytes": extra_bytes,
         "estimatedTokensAvoided": v2_estimated, "measuredLoads": measured_loads,
@@ -524,7 +616,7 @@ pub fn try_entries() -> io::Result<Vec<Value>> {
             "unexpected v2 telemetry in legacy savings.jsonl",
         ));
     }
-    if let Some(path) = v2_path() {
+    for path in [v2_path(), v3_path()].into_iter().flatten() {
         let _lock = crate::registry::lock_at(&path).map_err(io::Error::other)?;
         old.extend(read_lines(Some(path))?);
     }
@@ -548,8 +640,17 @@ pub fn try_summary() -> io::Result<Value> {
 /// A normal line counts as one load; a carry line carries its own `loads`.
 fn aggregate(entries: &[Value]) -> Value {
     let folded = fold(entries);
+    let number = |key| folded[key].as_u64().unwrap_or(0) as i128;
+    let delta = number("fullTokens") - number("exposedTokens");
+    let signed = |n: i128| n.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     json!({
-        "tokensSaved": folded["saved"].as_u64().unwrap_or(0).saturating_add(folded["estimatedTokensAvoided"].as_u64().unwrap_or(0)),
+        "tokensSaved": signed(delta - number("discoveryTokens")),
+        "catalogTokenDelta": signed(delta),
+        "fullTokens": folded["fullTokens"],
+        "exposedTokens": folded["exposedTokens"],
+        "discoveryTokens": folded["discoveryTokens"],
+        "tokenizedLoads": folded["tokenizedLoads"],
+        "tokenizer": TOKENIZER,
         "listLoads": folded.get("loads").and_then(Value::as_u64).unwrap_or(0),
         "peakCatalog": folded.get("tools").and_then(Value::as_u64).unwrap_or(0),
         "sinceTs": folded.get("ts").and_then(Value::as_u64).unwrap_or(0),
@@ -582,6 +683,115 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn tokenizer_matches_known_cl100k_vectors() {
+        assert_eq!(count_tokens("hello world"), 2);
+        assert_eq!(count_tokens("こんにちは世界"), 4);
+        assert_eq!(count_tokens(""), 0);
+        assert_eq!(count_tokens("<|endoftext|>"), 7);
+    }
+
+    #[test]
+    fn concurrent_reloads_count_once_and_changes_and_sessions_count_separately() {
+        let _guard = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("toolport-net-savings-{}", std::process::id()));
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let session = std::sync::Arc::new(CatalogSession::default());
+        let full = vec![json!({"name":"alpha__tool","description":"read a file".repeat(100)})];
+        let exposed = vec![json!({"name":"toolport_search_tools"})];
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let session = &session;
+                let full = &full;
+                let exposed = &exposed;
+                scope.spawn(move || {
+                    record_catalog(session, "lazy", Some("client"), full, exposed, |_| {
+                        Some("alpha".into())
+                    })
+                });
+            }
+        });
+        let full_count = count_tokens(&serde_json::to_string(&full).unwrap());
+        let exposed_count = count_tokens(&serde_json::to_string(&exposed).unwrap());
+        record_discovery("hello world", 0);
+        let first = summary();
+        assert_eq!(first["tokenizedLoads"], 1);
+        assert_eq!(
+            first["tokensSaved"],
+            full_count as i64 - exposed_count as i64 - 2
+        );
+        assert_eq!(first["legacyEstimatedTokensAvoided"], 0);
+        assert_eq!(first["estimatedTokensAvoided"], 0);
+        let disk = std::fs::read_to_string(v3_path().unwrap()).unwrap();
+        assert!(!disk.contains("_fullText"));
+        assert!(!disk.contains("_discoveryText"));
+        let mut changed = full.clone();
+        changed[0]["description"] = json!("changed description");
+        record_catalog(&session, "lazy", Some("client"), &changed, &exposed, |_| {
+            None
+        });
+        record_catalog(&session, "lazy", Some("client"), &full, &exposed, |_| None);
+        assert_eq!(summary()["tokenizedLoads"], 2);
+        record_catalog(
+            &CatalogSession::default(),
+            "lazy",
+            Some("client"),
+            &full,
+            &exposed,
+            |_| None,
+        );
+        record_catalog(
+            &session,
+            "lazy",
+            Some("other-client"),
+            &full,
+            &exposed,
+            |_| None,
+        );
+        assert_eq!(summary()["tokenizedLoads"], 4);
+        try_clear().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn net_can_be_negative_and_mixed_carries_preserve_tokenizer_and_estimates() {
+        let rows = [
+            json!({"ts":1,"saved":900,"tools":50}),
+            json!({"v":2,"kind":"catalog_exposure","ts":2,"estimatedTokensAvoided":800}),
+            json!({"v":2,"kind":"discovery_response","ts":3,"estimatedResponseTokens":200}),
+            json!({"v":3,"kind":"catalog_exposure","ts":4,"tokenizer":TOKENIZER,"fullTokens":10,"exposedTokens":20}),
+            json!({"v":3,"kind":"catalog_exposure","ts":5,"tokenizer":TOKENIZER,"fullTokens":100,"exposedTokens":10}),
+            json!({"v":3,"kind":"discovery_response","ts":6,"tokenizer":TOKENIZER,"discoveryTokens":90}),
+        ];
+        let before = aggregate(&rows);
+        assert_eq!(before["tokensSaved"], -10);
+        assert_eq!(before["tokenizedLoads"], 2);
+        assert_eq!(before["legacyEstimatedTokensAvoided"], 900);
+        assert_eq!(before["estimatedTokensAvoided"], 800);
+        assert_eq!(before["estimatedDiscoveryTokens"], 200);
+        assert_eq!(aggregate(&[fold(&rows[..3]), fold(&rows[3..])]), before);
+        assert_eq!(aggregate(&[fold(&[fold(&rows)])]), before);
+    }
+
+    #[test]
+    fn v2_store_is_read_only_and_clear_removes_all_three_eras() {
+        let _guard = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("toolport-v2-readonly-{}", std::process::id()));
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let v2 = v2_path().unwrap();
+        let old = "{\"v\":2,\"kind\":\"catalog_exposure\",\"estimatedTokensAvoided\":1000}\n";
+        std::fs::write(&v2, old).unwrap();
+        record_discovery("hello world", 0);
+        assert_eq!(summary()["tokensSaved"], -2);
+        assert_eq!(summary()["estimatedTokensAvoided"], 1000);
+        assert_eq!(std::fs::read_to_string(&v2).unwrap(), old);
+        try_clear().unwrap();
+        assert!(!v2.exists());
+        assert!(!v3_path().unwrap().exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn estimate_is_serialized_len_over_four() {
         // {"name":"x"} is 12 chars -> ceil(12/4) = 3.
         let tools = vec![json!({ "name": "x" })];
@@ -597,7 +807,8 @@ mod tests {
             json!({ "ts": 300, "saved": 40, "tools": 30 }),
         ];
         let s = aggregate(&entries);
-        assert_eq!(s["tokensSaved"], 200); // 100 + 60 + 40
+        assert_eq!(s["tokensSaved"], 0); // Historical estimates are excluded.
+        assert_eq!(s["legacyEstimatedTokensAvoided"], 200);
         assert_eq!(s["listLoads"], 3);
         assert_eq!(s["peakCatalog"], 80); // biggest catalog collapsed
         assert_eq!(s["sinceTs"], 100); // earliest
@@ -615,7 +826,7 @@ mod tests {
         let carry = fold(&detail[..2]); // collapse the first two
         let after = vec![carry, detail[2].clone()];
         let s = aggregate(&after);
-        assert_eq!(s["tokensSaved"], 300); // total survives the fold
+        assert_eq!(s["tokensSaved"], 0); // Historical estimates stay outside the headline.
         assert_eq!(s["listLoads"], 3); // 2 folded + 1 fresh
         assert_eq!(s["peakCatalog"], 90);
         assert_eq!(s["sinceTs"], 10);
@@ -640,7 +851,7 @@ mod tests {
             json!({ "ts": 300, "kind": "orchestration", "roundTripsSaved": 3, "loads": 0 }),
         ];
         let s = aggregate(&entries);
-        assert_eq!(s["tokensSaved"], 60);
+        assert_eq!(s["tokensSaved"], 0);
         assert_eq!(s["listLoads"], 1); // only the list serve
         assert_eq!(s["roundTripsSaved"], 8); // 5 + 3
         assert_eq!(s["peakCatalog"], 80);
@@ -656,7 +867,7 @@ mod tests {
         ];
         let carry = fold(&detail);
         let s = aggregate(&[carry]);
-        assert_eq!(s["tokensSaved"], 100);
+        assert_eq!(s["tokensSaved"], 0);
         assert_eq!(s["listLoads"], 1);
         assert_eq!(s["roundTripsSaved"], 7);
     }
@@ -694,10 +905,7 @@ mod tests {
         let after = aggregate(&[fold(&rows)]);
         assert_eq!(before, after);
         assert_eq!(after["legacyEstimatedTokensAvoided"], 1_342_400);
-        assert_eq!(
-            after["tokensSaved"],
-            1_342_400 + estimated_tokens(full_bytes - exposed_bytes)
-        );
+        assert_eq!(after["tokensSaved"], 0);
         assert_eq!(after["listLoads"], 2);
         assert_eq!(after["measuredLoads"], 1);
         assert_eq!(after["discoveryCount"], 1);
@@ -712,7 +920,7 @@ mod tests {
     fn v1_carry_stays_legacy_and_never_becomes_exact_bytes() {
         let old = json!({"ts":1, "saved":3_692_944_923u64, "loads":2751, "tools":1725});
         let summary = aggregate(&[old]);
-        assert_eq!(summary["tokensSaved"], 3_692_944_923u64);
+        assert_eq!(summary["tokensSaved"], 0);
         assert_eq!(summary["legacyEstimatedTokensAvoided"], 3_692_944_923u64);
         assert_eq!(summary["avoidedSurfaceBytes"], 0);
         assert_eq!(summary["listLoads"], 2751);
@@ -724,7 +932,7 @@ mod tests {
             "fullToolCount":5, "fullSurfaceBytes":1000, "exposedSurfaceBytes":200,
             "avoidedSurfaceBytes":800, "estimatedTokensAvoided":200})];
         let s = aggregate(&rows);
-        assert_eq!(s["tokensSaved"], 200);
+        assert_eq!(s["tokensSaved"], 0);
         assert_eq!(s["estimatedTokensAvoided"], 200);
         assert_eq!(s["legacyEstimatedTokensAvoided"], 0);
         assert_eq!(s["avoidedSurfaceBytes"], 800);
@@ -738,6 +946,7 @@ mod tests {
             std::env::temp_dir().join(format!("toolport-extra-exposure-{}", std::process::id()));
         let _override = crate::registry::DataDirOverride::set(&dir);
         record_catalog(
+            &CatalogSession::default(),
             "lazy",
             None,
             &[json!({"name":"a"})],
@@ -749,7 +958,7 @@ mod tests {
         assert!(row["extraExposedSurfaceBytes"].as_u64().unwrap() > 0);
         assert!(row["surfaceDeltaBytes"].as_i64().unwrap() < 0);
         assert_eq!(row["byServer"]["server"], 0);
-        assert_eq!(summary()["tokensSaved"], 0);
+        assert!(summary()["tokensSaved"].as_i64().unwrap() < 0);
         assert_eq!(summary()["listLoads"], 1);
         try_clear().unwrap();
         assert_eq!(summary()["listLoads"], 0);
@@ -767,16 +976,17 @@ mod tests {
         let legacy = savings_path().unwrap();
         std::fs::write(&legacy, "{\"ts\":1,\"saved\":300,\"tools\":10}\n").unwrap();
         record_catalog(
+            &CatalogSession::default(),
             "lazy",
             Some("new"),
             &[json!({"name":"alpha__x","description":"long"})],
             &[json!({"name":"toolport_status"})],
             |_| Some("alpha".into()),
         );
-        record_discovery(101, 50);
+        record_discovery("hello world", 50);
         // The background writer owns the append now: land it before reading v2 directly.
         crate::telemetry::flush();
-        let v2 = v2_path().unwrap();
+        let v2 = v3_path().unwrap();
         let v2_before = std::fs::read(&v2).unwrap();
         let initial = try_summary().unwrap();
         assert_eq!(initial["listLoads"], 2);
@@ -831,7 +1041,7 @@ mod tests {
         assert_eq!(try_summary().unwrap()["tokensSaved"], 0);
         assert!(!legacy.exists());
         assert!(!v2.exists());
-        record_discovery(44, 12);
+        record_discovery("hello world", 12);
         assert_eq!(try_summary().unwrap()["discoveryCount"], 1);
         assert_eq!(try_summary().unwrap()["listLoads"], 0);
         assert!(v2.exists());
@@ -860,7 +1070,7 @@ mod tests {
         let _override = crate::registry::DataDirOverride::set(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let legacy = savings_path().unwrap();
-        let v2 = v2_path().unwrap();
+        let v2 = v3_path().unwrap();
         assert_eq!(try_summary().unwrap()["listLoads"], 0);
         std::fs::write(&legacy, "{\"ts\":1,\"saved\":80,\"tools\":5}\n").unwrap();
         assert!(!v2.exists());
@@ -868,6 +1078,7 @@ mod tests {
         assert_eq!(try_summary().unwrap()["measuredLoads"], 0);
         std::fs::remove_file(&legacy).unwrap();
         record_catalog(
+            &CatalogSession::default(),
             "lazy",
             None,
             &[json!({"name":"alpha__long","description":"long"})],
@@ -891,7 +1102,7 @@ mod tests {
             std::env::temp_dir().join(format!("toolport-savings-corrupt-{}", std::process::id()));
         let _override = crate::registry::DataDirOverride::set(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let v2 = v2_path().unwrap();
+        let v2 = v3_path().unwrap();
         std::fs::write(&v2, "{broken\n").unwrap();
         assert_eq!(
             try_summary().unwrap_err().kind(),
@@ -930,7 +1141,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("toolport-savings-days-{}", std::process::id()));
         let _override = crate::registry::DataDirOverride::set(&dir);
-        let path = v2_path().unwrap();
+        let path = v3_path().unwrap();
         let day1 = 1_783_470_600_000u64;
         let day2 = day1 + 86_400_000;
         let rows = [

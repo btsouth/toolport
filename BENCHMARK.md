@@ -72,7 +72,9 @@ Because the floor is fixed, lazy discovery only pays off once the catalog it rep
 large enough. The same sweep measured 78% fewer tool-definition tokens at 5 servers, 90%
 at 10, and 95% at 20; savings start at roughly 10 to 25 tools, and a single small server
 (fetch or time) costs slightly more with lazy mode than without it. The in-app Activity
-figure is a separate bytes/4 estimate; the table above is tokenizer output.
+figure uses cl100k_base, net of discovery responses and counted once per session
+and catalog hash. Historical bytes/4 estimates are excluded; the table above
+is tokenizer output.
 
 ## Latency: the gateway is not the bottleneck
 

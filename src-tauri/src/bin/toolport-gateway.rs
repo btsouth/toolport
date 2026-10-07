@@ -2980,30 +2980,24 @@ fn fmt_tokens(n: u64) -> String {
 /// (a fresh install, or non-lazy mode where nothing is recorded).
 fn savings_line() -> String {
     let s = savings::summary();
-    let saved = s.get("tokensSaved").and_then(Value::as_u64).unwrap_or(0);
+    let saved = s.get("tokensSaved").and_then(Value::as_i64).unwrap_or(0);
     let round_trips = s
         .get("roundTripsSaved")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if saved == 0 && round_trips == 0 {
+    let tokenized = s["tokenizedLoads"].as_u64().unwrap_or(0);
+    if tokenized == 0 && s["discoveryTokens"].as_u64().unwrap_or(0) == 0 && round_trips == 0 {
         return String::new();
     }
     let mut line = String::from("\n");
-    if saved > 0 {
-        let loads = s.get("listLoads").and_then(Value::as_u64).unwrap_or(0);
-        let peak = s.get("peakCatalog").and_then(Value::as_u64).unwrap_or(0);
+    if tokenized > 0 || saved != 0 {
+        let sign = if saved < 0 { "-" } else { "" };
         line.push_str(&format!(
-            "Toolport kept ≈{} tokens of MCP tool definitions out of context across \
-             {loads} load(s). Estimated at UTF-8 bytes / 4; actual model usage depends \
-             on client transformations, gating, and caching",
-            fmt_tokens(saved)
+            "{sign}{} tokens saved. cl100k_base, net of discovery responses and extra catalog exposure; \
+             counted once per session and scoped catalog hash. Historical estimates excluded; \
+             client transformations and caching affect actual model usage.\n",
+            fmt_tokens(saved.unsigned_abs())
         ));
-        if peak > 4 {
-            line.push_str(&format!(
-                "; peak full catalog surface contained {peak} tools"
-            ));
-        }
-        line.push_str(".\n");
     }
     if round_trips > 0 {
         // Code mode's second savings headline: round-trips (and their intermediate results)
@@ -3034,6 +3028,7 @@ fn savings_line() -> String {
 /// brief bookkeeping below.
 #[derive(Default)]
 struct SearchGuard {
+    catalog: savings::CatalogSession,
     inner: Mutex<SearchState>,
 }
 
@@ -6241,6 +6236,7 @@ fn handle_request_with_cancel(
             if mode != DiscoveryMode::Full {
                 let full = tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Full);
                 savings::record_catalog(
+                    &guard.catalog,
                     if mode == DiscoveryMode::Lazy {
                         "lazy"
                     } else {
@@ -6350,7 +6346,9 @@ fn handle_request_with_cancel(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if let Err(message) = validate_search_query(query) {
-                    savings::record_discovery(message.len() as u64, savings::surface_bytes(&[]));
+                    if mode != DiscoveryMode::Full {
+                        savings::record_discovery(&message, savings::surface_bytes(&[]));
+                    }
                     return Some(success(
                         id,
                         json!({
@@ -6613,7 +6611,9 @@ fn handle_request_with_cancel(
                 let response_content_bytes = text.len() as u64;
                 let matched_schema_bytes = savings::surface_bytes(&matches);
                 let catalog_schema_bytes = savings::surface_bytes(source);
-                savings::record_discovery(response_content_bytes, matched_schema_bytes);
+                if mode != DiscoveryMode::Full {
+                    savings::record_discovery(&text, matched_schema_bytes);
+                }
                 // Record exact UTF-8 returned text and schema-array bytes. Legacy
                 // token fields remain reference estimates for existing readers.
                 let returned_names: Vec<String> = matches
@@ -24432,6 +24432,7 @@ mod tests {
             std::env::temp_dir().join(format!("toolport-status-scope-{}", std::process::id()));
         let _override = registry::DataDirOverride::set(&dir);
         savings::record_catalog(
+            &savings::CatalogSession::default(),
             "lazy",
             Some("alpha-client"),
             &[json!({"name":"alpha__secret","description":"alpha-only-schema"})],
@@ -24470,7 +24471,7 @@ mod tests {
         let full = enabled_summary(&host, &reg, &cached, None, None);
         assert!(full.contains("alpha"));
         assert!(!full.contains("bravo")); // not in the active profile
-        assert!(full.contains("tokens of MCP tool definitions out of context"));
+        assert!(full.contains("tokens saved"));
         // Scoped to bravo: shows bravo (its real scope) even though bravo isn't in
         // the active profile, and never leaks alpha's name/command/tool count.
         let allowed: HashSet<String> = ["bravo".to_string()].into_iter().collect();
@@ -24478,7 +24479,7 @@ mod tests {
         assert!(scoped.contains("bravo"));
         assert!(!scoped.contains("alpha"));
         assert!(!scoped.contains("alpha-cmd"));
-        assert!(!scoped.contains("tokens of MCP tool definitions out of context"));
+        assert!(!scoped.contains("tokens saved"));
         assert!(!scoped.contains("alpha-only-schema"));
         assert!(!scoped.contains("peak full catalog"));
         assert!(!scoped.contains("load(s)"));
@@ -24496,7 +24497,7 @@ mod tests {
         ).unwrap();
         let rpc_text = rpc["result"]["content"][0]["text"].as_str().unwrap();
         assert!(rpc_text.contains("bravo"));
-        assert!(!rpc_text.contains("tokens of MCP tool definitions out of context"));
+        assert!(!rpc_text.contains("tokens saved"));
         // The status line reports the mode of the host it is asked about.
         host.set_discovery_mode(DiscoveryMode::Grouped);
         let grouped = enabled_summary(&host, &reg, &cached, None, None);

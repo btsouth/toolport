@@ -56,26 +56,47 @@ servers, where the per-server tools approach the full catalog.
 
 ## Catalog exposure measurements
 
-For each lazy or grouped `tools/list`, Toolport builds the full and exposed tool
-arrays under the same client scope, profile, policy filters, and MCP Apps
-visibility rules. It records their exact serialized UTF-8 byte sizes, tool
-counts, and the byte difference locally in `savings-v2.jsonl` (legacy estimates
-remain in `savings.jsonl`). The Activity page
-shows these exact bytes alongside an estimated token equivalent (bytes divided
-by four). Existing pre-v2 rows remain as legacy estimates and are never
-presented as exact byte measurements.
+The headline says **tokens saved**. Hover it for the method: offline
+`cl100k_base` tokenization of the serialized full and exposed MCP tool arrays
+under the same client scope and policy, minus every recorded discovery response.
+The signed total includes extra catalog exposure and can be negative on small
+catalogs or after many searches. It describes this MCP boundary, not provider
+billing, prompt-cache savings, or savings over a client's native tool search.
 
-The two files coexist during upgrades. Older gateways continue writing and
-rotating only `savings.jsonl`; they cannot touch new exact records in
-`savings-v2.jsonl`. New writers lock append and rotation together. Rotation
-preserves lifetime counters and separate UTC-day/server buckets for Team usage;
-unattributed legacy carries remain unattributed. Clearing Activity removes both.
+A distinct scoped full/exposed catalog hash is counted once per client session,
+even when `tools/list` is reloaded concurrently. A changed surface earns a new
+exposure; returning to a previously seen surface does not. Stdio connections and
+HTTP session records own their counters. Session expiry/reconnection starts a
+new counter. Sessionless modern HTTP conservatively counts once per listener
+lifetime and client label plus scoped catalog hash because it has no conversation
+session. This counts catalog exposure, not inferred conversation turns.
 
-Each discovery search separately records the UTF-8 size of the complete MCP
-response text, including lead and guidance text. These search bytes are
-not subtracted from the catalog exposure figure. MCP clients may transform or
-gate tools, reuse a cached list, and providers may cache prompts, so neither
-number is an exact model-token or billing measurement.
+Counts use the actual compact serialized arrays, including JSON punctuation;
+there is no fixed per-tool average. Tokenization and vocabulary initialization run on the existing background
+telemetry writer. The bundled vocabulary needs no runtime download. The request
+thread serializes and hashes the catalog, or queues the discovery text; repeated
+catalogs skip tokenization. The existing bounded queue's synchronous fallback
+also applies if the writer is unavailable or overloaded. Raw text used for
+tokenization is removed before persistence.
+
+New rows have `v: 3` in `savings-v3.jsonl`. Exact byte measurements and signed
+token totals survive rotation. Old pre-2.0 `savings.jsonl` estimates and
+`savings-v2.jsonl` bytes/4 estimates still load, but are shown separately and
+excluded from the headline. They cannot be reconstructed as tokenizer measurements.
+Older gateways can rotate their historical files without touching new records.
+Clearing Activity removes all three files; it does not credit another reload in
+an existing session. Team server attribution remains a catalog-only allocation, not net savings.
+
+Discovery response text includes its lead and guidance text. Every response
+recorded by `record_discovery` is subtracted; a full-mode session does not incur
+lazy discovery costs. Tool-result retrieval is ordinary task output rather than
+catalog discovery and is not treated as avoided definitions.
+
+Prometheus exposes the headline as the signed `toolport_tokens_saved` gauge,
+with `tokenizer="cl100k_base"` and `method="net_of_discovery"` labels. Its
+component token counters are separate. The existing `toolport_tokens_saved_total`
+and `toolport_tool_definition_tokens_estimated_avoided_total` retain historical
+estimates; neither includes new tokenizer measurements.
 
 ## Enabling it
 
@@ -93,3 +114,25 @@ enhancement ("dynamic drill-in") could, for clients that reliably honor
 activation so weak models call them with top-level arguments. That is gated on
 verified client support because a client that caches `tools/list` for the
 session would break it; grouped mode works everywhere today.
+
+## Tokenizer cost
+
+On the shared Linux x64 devbox, matching release builds on the supervisor base
+grew from 30,285,720 to 32,199,592 bytes (+1,913,872 bytes, 6.3%). A release probe
+initialized the bundled cl100k_base vocabulary in 38.2 ms on the telemetry worker;
+a preserved 150,558-byte catalog capture took 6.1 ms to count. This is the trimmed
+audit capture, not a reconstruction of the audit's full 166,913-byte response.
+All 15 preserved compact catalog captures matched Python tiktoken with the same
+bundled vocabulary offline.
+
+Five paired 200-iteration gateway runs had median tools/list latency 0.284 to
+0.271 ms, search 0.344 to 0.374 ms, and routed calls 0.243 to 0.241 ms. All paired
+warm p95 values remained below 0.5 ms. Median handshake time was 52.3 to 52.4 ms;
+cold catalog-ready time was 347 to 311 ms. Shared-machine load makes startup
+differences noisy, not evidence of a tokenizer speedup. Both variants prime cold
+discovery with tools/list, as the supervisor requires.
+
+The 10,000-row debug audit benchmark's cached aggregation median was 0.460 to
+0.527 ms (uncached: 52.1 to 55.5 ms; record enqueue: 5.472 to 5.482 microseconds).
+The binary growth is acceptable for offline measurements, with vocabulary
+initialization and counting deferred to the telemetry worker.

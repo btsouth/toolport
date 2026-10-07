@@ -591,3 +591,30 @@ describe("AppSidebar open data folder", () => {
     });
   });
 });
+
+it("shows negative net savings with the tokenizer method and excludes legacy estimates", async () => {
+  getSavingsSummary.mockResolvedValue({
+    tokensSaved: -12_340,
+    tokenizedLoads: 1,
+    listLoads: 99,
+    peakCatalog: 80,
+    sinceTs: 0,
+    legacyEstimatedTokensAvoided: 1_000_000,
+  });
+  render(
+    <TooltipProvider>
+      <AppSidebar
+        registry={null}
+        onRegistryChange={vi.fn()}
+        view="servers"
+        onSelectView={vi.fn()}
+        onReplayOnboarding={vi.fn()}
+      />
+    </TooltipProvider>,
+  );
+  const badge = await screen.findByRole("button", { name: "-12.3k tokens saved" });
+  expect(badge).toHaveAttribute("title", expect.stringContaining("cl100k_base"));
+  expect(badge).toHaveAttribute("title", expect.stringContaining("net of discovery"));
+  expect(badge).toHaveAttribute("title", expect.stringContaining("once per session"));
+  expect(badge).not.toHaveTextContent("1.0M");
+});

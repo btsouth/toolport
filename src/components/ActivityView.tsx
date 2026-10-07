@@ -516,15 +516,14 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
   const measured = (savings.measuredLoads ?? 0) > 0;
   const discovered = (savings.discoveryCount ?? 0) > 0;
   const avoided = savings.avoidedSurfaceBytes ?? 0;
-  const legacy =
-    savings.legacyEstimatedTokensAvoided ?? (measured ? 0 : savings.tokensSaved);
+  const legacy = savings.legacyEstimatedTokensAvoided ?? 0;
+  const oldV2 = savings.estimatedTokensAvoided ?? 0;
+  const method =
+    "cl100k_base tokenizer; net of discovery responses and extra catalog exposure; counted once per session and scoped full/exposed catalog hash (sessionless HTTP: per listener/client). Historical estimates excluded. Client transformations and caching mean this is not model billing.";
   const since = savings.sinceTs > 0 ? fmtTs(savings.sinceTs, "monthDay") : null;
   const details = [
-    hasCatalog
-      ? `across ${savings.listLoads.toLocaleString()} tool-list load${savings.listLoads === 1 ? "" : "s"}`
-      : null,
-    hasCatalog
-      ? `≈${fmtTokens(Math.round(savings.tokensSaved / savings.listLoads))} per load`
+    (savings.tokenizedLoads ?? 0) > 0
+      ? `${savings.tokenizedLoads!.toLocaleString()} counted catalog exposure${savings.tokenizedLoads === 1 ? "" : "s"}`
       : null,
     hasCatalog && savings.peakCatalog > 4
       ? `peak catalog ${savings.peakCatalog.toLocaleString()} tools`
@@ -534,7 +533,7 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
 
   const share = async () => {
     const text = hasCatalog
-      ? `Toolport kept ≈${fmtTokens(savings.tokensSaved)} tokens of MCP tool definitions out of my agent's context across ${savings.listLoads.toLocaleString()} loads. Estimated from serialized size (UTF-8 bytes / 4), not model billing. toolport.app`
+      ? `Toolport recorded ${fmtTokens(savings.tokensSaved)} tokens saved, net of discovery responses. Counted with cl100k_base once per session and catalog hash, not model billing. toolport.app`
       : `Toolport recorded ${savings.discoveryCount ?? 0} discovery searches returning ${fmtBytes(savings.discoveryResponseBytes ?? 0)} of text at its MCP boundary. toolport.app`;
     try {
       await navigator.clipboard.writeText(text);
@@ -555,9 +554,9 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
         </span>
       </div>
       <div className="mt-2 flex flex-wrap items-end gap-x-6 gap-y-1">
-        <span className="text-3xl font-semibold tabular-nums text-success">
+        <span className="text-3xl font-semibold tabular-nums text-success" title={method}>
           {hasCatalog
-            ? `≈ ${fmtTokens(savings.tokensSaved)}`
+            ? fmtTokens(savings.tokensSaved)
             : fmtBytes(savings.discoveryResponseBytes ?? 0)}{" "}
           <span className="text-base font-normal text-muted-foreground">
             {hasCatalog ? "tokens saved" : "discovery text"}
@@ -603,11 +602,12 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
           ? `${(savings.discoveryCount ?? 0).toLocaleString()} searches returned ${fmtBytes(savings.discoveryResponseBytes ?? 0)} of discovery text. `
           : ""}
         {legacy > 0
-          ? `Includes ≈${fmtTokens(legacy)} from older estimated records. `
+          ? `Historical: ≈${fmtTokens(legacy)} from older estimated records, excluded. `
           : ""}
-        {hasCatalog
-          ? "Estimate: serialized UTF-8 bytes ÷ 4. Actual model usage depends on the client, model, and caching."
-          : "Exact text bytes at Toolport's MCP boundary; model token usage may differ."}
+        {oldV2 > 0
+          ? `Historical bytes/4: ≈${fmtTokens(oldV2)} estimated tokens, excluded. `
+          : ""}
+        <span title={method}>Counting method</span>
       </p>
     </div>
   );

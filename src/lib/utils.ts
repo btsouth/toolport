@@ -12,6 +12,7 @@ export function cn(...inputs: ClassValue[]) {
  * Sidebar, share text, ...) shows the same rounded figure for the same number.
  */
 export function fmtTokens(n: number): string {
+  if (n < 0) return `-${fmtTokens(-n)}`;
   if (n >= 999_950_000_000) return `${(n / 1_000_000_000_000).toFixed(1)}T`;
   if (n >= 999_950_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
   if (n >= 999_950) return `${(n / 1_000_000).toFixed(1)}M`;
