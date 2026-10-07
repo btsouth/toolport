@@ -722,20 +722,35 @@ fn build_sidebar(
     let tools_action = gtk::gio::SimpleAction::new("show-server-tools", None);
     let page_for_tools = server_page.clone();
     tools_action.connect_activate(move |_, _| {
-        if let Some(server) = page_for_tools
-            .last_snapshot
-            .borrow()
-            .as_ref()
-            .and_then(|snapshot| {
-                snapshot
-                    .servers
-                    .iter()
-                    .find(|server| server.enabled)
-                    .or_else(|| snapshot.servers.first())
+        let page = page_for_tools.clone();
+        gtk::glib::spawn_future_local(async move {
+            // Onboarding may have just added the first server. Read the current
+            // registry rather than the Servers page's pre-onboarding snapshot.
+            let result = gtk::gio::spawn_blocking(|| {
+                crate::registry::load().map(state::RegistrySnapshot::from_registry)
             })
-        {
-            open_server_details(server, &page_for_tools, true);
-        }
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => {
+                    let server = snapshot
+                        .servers
+                        .iter()
+                        .find(|server| server.enabled)
+                        .or_else(|| snapshot.servers.first())
+                        .cloned();
+                    page.render(state::RegistryState::Ready(snapshot));
+                    if let Some(server) = server {
+                        open_server_details(&server, &page, true);
+                    } else {
+                        page.show_confirmation("Add a server to try its tools.");
+                    }
+                }
+                Ok(Err(error)) => page.restore_after_error(&error),
+                Err(_) => {
+                    page.restore_after_error("Could not load server tools: the operation stopped")
+                }
+            }
+        });
     });
     app.add_action(&tools_action);
     let mut buttons = Vec::new();
