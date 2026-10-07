@@ -16587,6 +16587,34 @@ fn respond_http_overloaded(request: tiny_http::Request) {
     let _ = request.respond(response);
 }
 
+/// Data-less paths that must answer without a bearer token.
+///
+/// A container HEALTHCHECK has no way to read the operator's `TOOLPORT_HTTP_TOKEN`,
+/// so the readiness probe has to sit outside the auth gate, exactly like the
+/// data-less OPTIONS preflight. Everything reachable here must therefore carry no
+/// registry data, version, tool names, or counts: only a status code.
+fn path_is_public_probe(path: &str) -> bool {
+    path == "/healthz"
+}
+
+/// The readiness response for a [`path_is_public_probe`] path: a status code and
+/// nothing else.
+///
+/// `200` once the live registry is a faithful copy of what is on disk; `503` when
+/// the boot load failed, which is the host-owned bind-mount case where the runtime
+/// user (uid 10001) cannot create the registry lock and the gateway serves the
+/// cached catalog only. Listener liveness alone must not read as ready, or the
+/// degraded container stays "healthy" in Docker.
+fn healthz_out(state: &GatewayState, method: &str) -> HttpOut {
+    if method != "GET" && method != "HEAD" {
+        HttpOut::new(405, "text/plain; charset=utf-8", String::new())
+    } else if state.registry_trusted.load(Ordering::SeqCst) {
+        HttpOut::new(200, "text/plain; charset=utf-8", String::new())
+    } else {
+        HttpOut::new(503, "text/plain; charset=utf-8", String::new())
+    }
+}
+
 /// Handle one accepted HTTP request end to end: parse, CORS, auth/scope, dispatch,
 /// and respond. A pure function of the request plus the shared state and guards, so
 /// it is safe to run on many worker threads concurrently.
@@ -16698,6 +16726,20 @@ fn handle_connection(
             .unwrap_or(&state.http_bind_host),
         &state.http_allowed_origins,
     );
+
+    // Readiness probe: answered before the auth gate so a container HEALTHCHECK
+    // needs no token, and data-free so a probe can never read registry contents,
+    // a version, or a tool count. See [`healthz_out`].
+    if path_is_public_probe(&path) {
+        let out = if forbidden {
+            HttpOut::json_err(403, "cross-site browser requests are not allowed")
+        } else {
+            healthz_out(state, &method)
+        };
+        let response = tiny_http::Response::from_string(out.body).with_status_code(out.status);
+        let _ = request.respond(response);
+        return;
+    }
 
     // Auth + scope gate: resolve the bearer to (authorized, allowed-servers).
     // OPTIONS is the data-less preflight, always allowed and unscoped. Else the
@@ -25857,6 +25899,37 @@ mod tests {
         assert_eq!(out.status, 200);
         assert!(out.body.contains("POST /mcp"), "body={}", out.body);
         assert!(out.body.contains("/openapi.json"));
+    }
+
+    #[test]
+    fn public_probe_paths_are_exactly_healthz() {
+        assert!(path_is_public_probe("/healthz"));
+        assert!(!path_is_public_probe("/"));
+        assert!(!path_is_public_probe("/openapi.json"));
+        assert!(!path_is_public_probe("/mcp"));
+        assert!(!path_is_public_probe("/healthz/"));
+    }
+
+    #[test]
+    fn healthz_reports_registry_readiness_and_carries_no_data() {
+        let state = http_state(true);
+        let ok = healthz_out(&state, "GET");
+        assert_eq!(ok.status, 200);
+        assert!(
+            ok.body.is_empty(),
+            "readiness must not leak data: {:?}",
+            ok.body
+        );
+
+        // A failed boot load (the host-owned bind mount where uid 10001 cannot
+        // create the registry lock) must read as not ready, not as healthy.
+        state.registry_trusted.store(false, Ordering::SeqCst);
+        let degraded = healthz_out(&state, "GET");
+        assert_eq!(degraded.status, 503);
+        assert!(degraded.body.is_empty());
+
+        let wrong_method = healthz_out(&state, "POST");
+        assert_eq!(wrong_method.status, 405);
     }
 
     #[test]
