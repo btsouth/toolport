@@ -273,7 +273,7 @@ impl Client {
         let pid = self.child.id();
         self.stdin.take();
         let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let worker = thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             let result = self.child.wait();
             drop(self);
             let _ = done_tx.send(result);
