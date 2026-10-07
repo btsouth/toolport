@@ -479,7 +479,8 @@ mod tests {
             "args": [],
             "env": {"TOOLPORT_CLIENT_ID": "claude-desktop"},
             "transport": "sharedHttp",
-            "url": "http://127.0.0.1:8765/mcp"
+            "url": "http://127.0.0.1:8765/mcp",
+            "updatedAt": 1790000000000
         }
     },
     "ruleSets": [
@@ -545,7 +546,9 @@ mod tests {
 
     #[test]
     fn brandon_like_v1_registry_migrates_to_v2() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("brandon");
         let _override = DataDirOverride::set(&dir);
@@ -752,7 +755,9 @@ mod tests {
 
     #[test]
     fn migration_is_idempotent() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("idempotent");
         let _override = DataDirOverride::set(&dir);
@@ -811,7 +816,9 @@ mod tests {
 
     #[test]
     fn backup_and_exports_are_written_before_the_primary() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("ordering");
         let _override = DataDirOverride::set(&dir);
@@ -828,7 +835,9 @@ mod tests {
 
     #[test]
     fn a_failure_mid_migration_leaves_the_v1_file_intact() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("mid-failure");
         let _override = DataDirOverride::set(&dir);
@@ -859,7 +868,9 @@ mod tests {
 
     #[test]
     fn a_migrated_registry_is_refused_by_a_v1_build() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("refused");
         let _override = DataDirOverride::set(&dir);
@@ -880,7 +891,9 @@ mod tests {
     /// `v2.json` what the real migration writes for `v1.json`.
     #[test]
     fn rollback_fixture_is_a_real_migration() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _env = REGISTRY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("rollback-fixture");
         let _override = DataDirOverride::set(&dir);

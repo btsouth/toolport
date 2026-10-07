@@ -43,7 +43,8 @@
       "args": [],
       "env": {"TOOLPORT_CLIENT_ID": "claude-desktop"},
       "transport": "sharedHttp",
-      "url": "http://127.0.0.1:8765/mcp"
+      "url": "http://127.0.0.1:8765/mcp",
+      "updatedAt": 1790000000000
     }
   },
   "ruleSets": [
