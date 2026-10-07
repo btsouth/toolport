@@ -175,6 +175,7 @@ fn write_registry(dir: &Path, extra_env: &[(&str, &str)]) {
         request_timeout_ms: None,
         initialize_timeout_ms: None,
         launch: None,
+        inherit_env: false,
         unknown_fields: serde_json::Map::new(),
     };
     let mut registry_value = Registry::default();
