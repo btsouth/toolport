@@ -24787,8 +24787,10 @@ mod tests {
             });
         }
         // The migrated default is pinned to alpha; Billing can see bravo.
+        reg.set_access_server("default", "alpha", true).unwrap();
         reg.set_server_enabled("default", "alpha", true).unwrap();
         let billing = reg.add_profile("Billing");
+        reg.set_access_server(&billing, "bravo", true).unwrap();
         reg.set_server_enabled(&billing, "bravo", true).unwrap();
         reg.default_access_profile_id = Some("default".into());
         let cached = vec![json!({ "name": "alpha__x" }), json!({ "name": "bravo__y" })];
@@ -26432,6 +26434,8 @@ mod tests {
         reg.servers.push(stub_server("team-slack", "Team Slack"));
         reg.servers.push(stub_server("team_slack", "slack"));
         let personal = reg.add_profile("Personal");
+        reg.set_access_server(&personal, "team-slack", true).unwrap();
+        reg.set_access_server("default", "team_slack", true).unwrap();
         reg.set_server_enabled(&personal, "team-slack", true)
             .unwrap();
         reg.set_server_enabled("default", "team_slack", true)

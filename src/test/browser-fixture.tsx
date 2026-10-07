@@ -185,6 +185,8 @@ mockIPC(
         return false;
       case "http_bridge_status":
         return { running: false, port: null, url: null, token: null };
+      case "stop_stale_gateways":
+        return { killed: [], failed: [], needsRestart: [] };
       case "clients_needing_restart":
       case "list_allowed_tools":
       case "list_quarantined":
