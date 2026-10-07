@@ -29694,7 +29694,7 @@ mod tests {
         assert_eq!(toolport["discoveryMode"], "lazy");
         assert!(toolport["codeMode"].is_boolean());
         assert_eq!(toolport["agentControl"], false);
-        assert_eq!(toolport["destructiveConfirmation"], false);
+        assert_eq!(toolport["destructiveConfirmation"], true);
         assert_eq!(toolport["humanApproval"], false);
     }
 
@@ -31537,7 +31537,7 @@ mod tests {
     #[test]
     fn lazy_tools_list_returns_only_meta_tools() {
         let host = dispatch_host(false);
-        // The exact tool count of 4 assumes run_script is not advertised, and the flag on
+        // The exact tool count of 5 assumes run_script is not advertised, and the flag on
         // the host this test dispatches with is the only thing that decides that.
         host.set_code_mode(false);
 
@@ -31564,9 +31564,10 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str())
             .collect();
-        // Default registry has agent control off, so it's the four core
+        // Default registry adds destructive confirmation to the four core
         // meta-tools: status, search, call, fetch_result (no downstream tools).
-        assert_eq!(names.len(), 4);
+        assert_eq!(names.len(), 5);
+        assert!(names.contains(&"toolport_confirm"));
         assert!(names.contains(&"toolport_status"));
         assert!(names.contains(&"toolport_search_tools"));
         assert!(names.contains(&"toolport_call_tool"));
