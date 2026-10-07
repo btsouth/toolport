@@ -1871,6 +1871,17 @@ const DESC_W: f64 = 1.0;
 /// over a longer sibling that merely contains the same words. Small: it only tips
 /// near-ties toward the more specific tool, never overrides a stronger keyword signal.
 const NAME_SPECIFICITY_W: f64 = 0.35;
+/// A synonym ("show" for "list") is weaker evidence than the word itself, so when
+/// `list_projects` and `get_project` both match "list projects", the exact verb wins.
+const SYNONYM_W: f64 = 0.6;
+/// A query that names the service ("in Linear", "on GitHub") means that server's
+/// tools, so they outrank another server's tool that shares the other words.
+const SERVER_NAMED_BOOST: f64 = 0.5;
+/// A plural object ("list my buckets") asks for a collection: tips a `list_bucket`
+/// versus `get_bucket` near-tie toward the list tool.
+const PLURAL_LIST_BOOST: f64 = 0.1;
+/// Tools whose description says they are deprecated rank below their replacement.
+const DEPRECATED_PENALTY: f64 = 0.5;
 /// Below these normalized scores the ranker has too little evidence to hide the
 /// rest of the scoped catalog. Hybrid scores are already normalized to 0..=1;
 /// lexical scores are normalized against an ideal all-name-hit score below.
@@ -2030,6 +2041,10 @@ const STOPWORDS: &[&str] = &[
     "while",
     "both",
     "either",
+    "me",
+    "my",
+    "mine",
+    "please",
     // MCP-description boilerplate
     "purpose",
     "returns",
@@ -2065,6 +2080,55 @@ fn index_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Query tokens: `index_tokens`, except that a camelCase word the catalog knows as
+/// one token stays whole, so "GitHub" matches the `github` server instead of
+/// splitting into "git" + "hub" and matching the `git` server.
+fn query_tokens(query: &str, known: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for word in query.split(|c: char| !c.is_alphanumeric()) {
+        let parts = split_camel(word);
+        if parts.len() > 1 {
+            let whole = stem_token(word);
+            if known(&whole) {
+                out.push(whole);
+                continue;
+            }
+        }
+        out.extend(
+            parts
+                .into_iter()
+                .filter(|t| t.len() > 1 && !is_stopword(t))
+                .map(|t| stem_token(&t)),
+        );
+    }
+    out
+}
+
+/// Stemmed query words written in the plural ("buckets"), which ask for a list.
+fn plural_query_tokens(query: &str) -> HashSet<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .flat_map(split_camel)
+        .filter(|t| t.len() > 3 && t.ends_with('s') && !t.ends_with("ss") && !is_stopword(t))
+        .map(|t| stem_token(&t))
+        .collect()
+}
+
+/// Initialisms of two or three consecutive query words ("direct message" -> "dm"),
+/// so a tool named `send_dm` matches the spelled-out request.
+fn query_initialisms(q_tokens: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for width in 2..=3 {
+        for window in q_tokens.windows(width) {
+            let initials: String = window.iter().filter_map(|t| t.chars().next()).collect();
+            if !q_tokens.contains(&initials) && !out.contains(&initials) {
+                out.push(initials);
+            }
+        }
+    }
+    out
+}
+
 /// Synonym group for a (stemmed) token, bridging common MCP vocabulary so e.g.
 /// "mail" finds an "email" tool and "get" finds a "list" tool. Empty if none.
 fn synonym_group(token: &str) -> &'static [&'static str] {
@@ -2072,7 +2136,7 @@ fn synonym_group(token: &str) -> &'static [&'static str] {
         &[
             "list", "get", "fetch", "show", "read", "find", "search", "view",
         ],
-        &["create", "add", "new", "make", "insert"],
+        &["create", "add", "new", "make", "insert", "save", "store"],
         &["delete", "remove", "destroy", "drop"],
         &["update", "edit", "modify", "change", "set"],
         &["email", "mail", "message"],
@@ -2082,6 +2146,8 @@ fn synonym_group(token: &str) -> &'static [&'static str] {
         &["schedule", "calendar", "meeting", "appointment"],
         &["dispute", "chargeback"],
         &["token", "tokenize"],
+        &["send", "post"],
+        &["filesystem", "disk", "fs"],
     ];
     GROUPS
         .iter()
@@ -2313,7 +2379,12 @@ fn search_catalog_indexed(
         let n = pool.len().max(1) as f64;
         let idf = |tok: &str| ((n + 1.0) / (*df.get(tok).unwrap_or(&0) as f64 + 1.0)).ln() + 1.0;
 
-        let q_tokens = index_tokens(query);
+        let q_tokens = query_tokens(query, |token| df.contains_key(token));
+        let q_set: HashSet<&str> = q_tokens.iter().map(String::as_str).collect();
+        let plurals = plural_query_tokens(query);
+        let initialisms = query_initialisms(&q_tokens);
+        // Per server: its prefix tokens, and whether the query names it.
+        let mut servers: HashMap<&str, (Vec<String>, bool)> = HashMap::new();
         // Lexical score for EVERY doc (0 if no hit), kept so optional semantic
         // re-ranking can also surface tools the keywords missed entirely.
         let lex: Vec<(f64, &Value)> = pool
@@ -2321,18 +2392,35 @@ fn search_catalog_indexed(
             .filter_map(|position| {
                 let doc = index.documents.get(*position)?;
                 let tool = cached.get(*position)?;
+                let (server_tokens, named) = servers
+                    .entry(doc.server_prefix.as_str())
+                    .or_insert_with(|| {
+                        let tokens = search_tokens(&doc.server_prefix);
+                        let named = tokens.iter().any(|t| q_set.contains(t.as_str()));
+                        (tokens, named)
+                    });
                 let mut score = 0.0_f64;
+                for initials in &initialisms {
+                    if doc.name_tokens.contains(initials) && !server_tokens.contains(initials) {
+                        score += NAME_W * idf(initials);
+                    }
+                }
                 for qt in &q_tokens {
                     // Best field hit across the query token and its synonyms; name
-                    // beats description, and the matched token's IDF sets the weight.
+                    // beats description, the matched token's IDF sets the weight, and
+                    // a synonym counts for less than the word itself.
                     let mut best = 0.0_f64;
-                    let cands =
-                        std::iter::once(qt.as_str()).chain(synonym_group(qt).iter().copied());
-                    for c in cands {
+                    let cands = std::iter::once((qt.as_str(), 1.0)).chain(
+                        synonym_group(qt)
+                            .iter()
+                            .filter(|c| **c != qt.as_str())
+                            .map(|c| (*c, SYNONYM_W)),
+                    );
+                    for (c, weight) in cands {
                         if doc.name_tokens.contains(c) {
-                            best = best.max(NAME_W * idf(c));
+                            best = best.max(weight * NAME_W * idf(c));
                         } else if doc.description_tokens.contains(c) {
-                            best = best.max(DESC_W * idf(c));
+                            best = best.max(weight * DESC_W * idf(c));
                         }
                     }
                     // Prefix fallback for partial words ("proj" -> "project").
@@ -2364,6 +2452,24 @@ fn search_catalog_indexed(
                         .count();
                     let coverage = explained as f64 / doc.name_tokens.len() as f64;
                     score *= 1.0 + NAME_SPECIFICITY_W * coverage;
+                    if *named {
+                        score *= 1.0 + SERVER_NAMED_BOOST;
+                    }
+                    if doc.description_tokens.contains("deprecated") {
+                        score *= DEPRECATED_PENALTY;
+                    }
+                    if !plurals.is_empty() && doc.name_tokens.contains("list") {
+                        let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+                        let action = name.split_once("__").map_or(name, |(_, rest)| rest);
+                        let mut words = search_tokens(action)
+                            .into_iter()
+                            .filter(|t| !server_tokens.contains(t));
+                        if words.next().as_deref() == Some("list")
+                            && words.any(|t| plurals.contains(&t))
+                        {
+                            score *= 1.0 + PLURAL_LIST_BOOST;
+                        }
+                    }
                 }
                 Some((score, tool))
             })
@@ -2610,18 +2716,22 @@ fn neutralize_listed_tools(tools: &mut [Value]) {
 /// Project selected tools to search results, bounding the total size of their
 /// (sometimes enormous) input schemas. Lazy discovery exists to keep the agent's
 /// context small, so one server's giant schemas must not blow it up: the top
-/// result always carries its full schema; past a byte budget the rest return the
-/// name and a short description only, flagged `schemaOmitted` so the agent can
-/// fetch a tool's full schema by searching its exact name (or scoping with `server`).
+/// result always carries its full schema and the runner-up carries a small one;
+/// the rest return the name and a short description only, flagged `schemaOmitted`
+/// so the agent can fetch a tool's full schema by searching its exact name (or
+/// scoping with `server`).
 fn project_budgeted(tools: &[&Value]) -> Vec<Value> {
     // Only the top result carries a full schema and a longer description - it's the
-    // one we tell the model to call. Every other result is a compact menu entry:
-    // name plus a one-line description, no schema. A 25-result response then stays a
-    // few KB instead of tens, which matters because a (slow, local) model re-reads
-    // the whole thing on every turn. Full schema/text for any other tool comes from
-    // a scoped or exact-name search, as the response text explains.
+    // one we tell the model to call. The runner-up keeps its schema when that is
+    // small, so a close second choice is callable without another search. Every
+    // other result is a compact menu entry: name plus a one-line description, no
+    // schema. A 25-result response then stays a few KB instead of tens, which
+    // matters because a (slow, local) model re-reads the whole thing on every turn.
+    // Full schema/text for any other tool comes from a scoped or exact-name search,
+    // as the response text explains.
     const TOP_DESC_MAX: usize = 500;
     const MENU_DESC_MAX: usize = 140;
+    const SECOND_SCHEMA_MAX_BYTES: usize = 1_536;
     let truncate = |d: Option<&Value>, max: usize| match d.and_then(|v| v.as_str()) {
         Some(s) => {
             // Search is a delivery path for tool descriptions (SBS-896).
@@ -2646,6 +2756,17 @@ fn project_budgeted(tools: &[&Value]) -> Vec<Value> {
                 json!({
                     "name": name,
                     "description": truncate(t.get("description"), TOP_DESC_MAX),
+                    "inputSchema": schema,
+                })
+            } else if let Some(schema) = t
+                .get("inputSchema")
+                .filter(|schema| i == 1 && schema.to_string().len() <= SECOND_SCHEMA_MAX_BYTES)
+            {
+                let mut schema = schema.clone();
+                integrity::neutralize_value_strings(&mut schema);
+                json!({
+                    "name": name,
+                    "description": truncate(t.get("description"), MENU_DESC_MAX),
                     "inputSchema": schema,
                 })
             } else {
@@ -6355,11 +6476,11 @@ fn handle_request_with_cancel(
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false)
                 });
-                // Note only clarifies the OMITTED (non-top) results need a follow-up;
-                // the first result always carries its schema, so it never does.
+                // Note only clarifies the OMITTED results need a follow-up; the first
+                // result always carries its schema, so it never does.
                 let schema_note = if omitted {
-                    " Results after the first may omit large input schemas (schemaOmitted); to call \
-                     one of those instead, search its exact name or pass `server` to get its schema."
+                    " Results flagged schemaOmitted have no input schema here; to call one, \
+                     search its exact name or pass `server` to get its schema."
                 } else {
                     ""
                 };
@@ -31098,20 +31219,25 @@ mod tests {
 
     #[test]
     fn menu_entries_are_compact_after_the_top() {
-        // Past the top result, entries are name + a one-line description and no schema,
-        // so a big result set stays small for a local model to re-read each turn.
+        // Past the top two results, entries are name + a one-line description and no
+        // schema, so a big result set stays small for a local model to re-read each turn.
         let cat = vec![
             json!({ "name": "a__one", "description": "x".repeat(5000), "inputSchema": { "type": "object" } }),
             json!({ "name": "a__two", "description": "y".repeat(5000), "inputSchema": { "type": "object" } }),
+            json!({ "name": "a__three", "description": "z".repeat(5000), "inputSchema": { "type": "object" } }),
         ];
         let (hits, _) = search_catalog(&cat, "", Some("a"), 10);
         // Top: keeps schema and the longer description.
         assert!(hits[0].get("inputSchema").is_some());
         assert!(hits[0]["description"].as_str().unwrap().chars().count() <= 501);
-        // Menu: no schema, short description.
-        assert!(hits[1].get("inputSchema").is_none());
-        assert_eq!(hits[1]["schemaOmitted"], json!(true));
+        // Runner-up: keeps its small schema, short description.
+        assert_eq!(hits[1]["inputSchema"], json!({ "type": "object" }));
+        assert!(hits[1].get("schemaOmitted").is_none());
         assert!(hits[1]["description"].as_str().unwrap().chars().count() <= 141);
+        // Menu: no schema, short description.
+        assert!(hits[2].get("inputSchema").is_none());
+        assert_eq!(hits[2]["schemaOmitted"], json!(true));
+        assert!(hits[2]["description"].as_str().unwrap().chars().count() <= 141);
     }
 
     #[test]
