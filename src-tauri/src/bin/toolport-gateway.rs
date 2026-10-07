@@ -9576,6 +9576,18 @@ fn router_relevant(reg: &Registry) -> Value {
     if let Some(obj) = v.as_object_mut() {
         obj.remove("team");
         obj.remove("gatewayInstructions");
+        // From v2 on the 1.x safety toggles only mirror `safetyLevel` for 1.x readers.
+        if reg.version >= 2 {
+            for key in [
+                "denyDestructive",
+                "confirmDestructive",
+                "humanApproval",
+                "quarantineOnDrift",
+                "blockOnInjection",
+            ] {
+                obj.remove(key);
+            }
+        }
         if let Some(profiles) = obj.get_mut("profiles").and_then(Value::as_array_mut) {
             for profile in profiles.iter_mut().filter_map(Value::as_object_mut) {
                 profile.remove("instructions");
@@ -19035,8 +19047,8 @@ mod tests {
         reg.gateway_instructions = None;
         reg.profiles[0].instructions = None;
 
-        // A policy flag lives OUTSIDE the team block: a real change the router must rebuild for.
-        reg.deny_destructive = !reg.deny_destructive;
+        // A policy change lives OUTSIDE the team block: a real change the router must rebuild for.
+        reg.set_safety_level(registry::SafetyLevel::Strict);
         assert_ne!(
             router_relevant(&reg),
             base,
