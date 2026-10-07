@@ -1261,7 +1261,9 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                 onRegistryChange(reconciled);
               } catch (error) {
                 toastError(`Couldn't update safety: ${error}`);
-              } finally { setSafetyBusy(false); }
+              } finally {
+                setSafetyBusy(false);
+              }
             }}
           >
             <option value="off">Off</option>
