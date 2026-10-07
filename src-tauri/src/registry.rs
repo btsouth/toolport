@@ -4113,8 +4113,17 @@ const DEFAULT_REGISTRY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::
 /// An env override rather than `cfg!(test)` because the rate-limit repro spawns real child
 /// processes, which are not test builds and inherit only the environment.
 fn registry_lock_timeout() -> std::time::Duration {
-    crate::brand::env_var("TOOLPORT_LOCK_TIMEOUT_MS", "CONDUIT_LOCK_TIMEOUT_MS")
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
+    parse_lock_timeout(
+        crate::brand::env_var("TOOLPORT_LOCK_TIMEOUT_MS", "CONDUIT_LOCK_TIMEOUT_MS").as_deref(),
+    )
+}
+
+/// Parse a `TOOLPORT_LOCK_TIMEOUT_MS` value. Missing, blank, non-numeric and zero
+/// values fall back to the production deadline rather than expiring instantly.
+/// Pure on purpose: parsing must never mutate the process-global env a live
+/// [`LockTimeoutOverride`] is holding (SBS-895).
+fn parse_lock_timeout(raw: Option<&str>) -> std::time::Duration {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|ms| *ms > 0)
         .map(std::time::Duration::from_millis)
         .unwrap_or(DEFAULT_REGISTRY_LOCK_TIMEOUT)
@@ -4837,39 +4846,40 @@ mod tests {
     /// they would go on flaking under load with nothing to point at.
     #[test]
     fn lock_timeout_honors_the_env_override_and_ignores_junk() {
-        let _env = REGISTRY_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var_os("TOOLPORT_LOCK_TIMEOUT_MS");
-        std::env::remove_var("TOOLPORT_LOCK_TIMEOUT_MS");
-
-        assert_eq!(registry_lock_timeout(), DEFAULT_REGISTRY_LOCK_TIMEOUT);
-
-        {
-            let _guard = LockTimeoutOverride::generous();
-            assert_eq!(
-                registry_lock_timeout(),
-                std::time::Duration::from_millis(60_000),
-                "the override must actually reach the lock, or the concurrency tests \
-                 silently keep the production budget"
-            );
-        }
-        // Dropping the guard restores, so one test cannot leak a long budget into another.
-        assert_eq!(registry_lock_timeout(), DEFAULT_REGISTRY_LOCK_TIMEOUT);
-
-        // Junk and zero fall back rather than producing a 0ms (instantly-expiring) budget.
+        // Junk and zero fall back rather than producing a 0ms (instantly-expiring)
+        // budget. Parsed through the pure helper, NOT by setting the process-global
+        // `TOOLPORT_LOCK_TIMEOUT_MS`: a concurrent `LockTimeoutOverride` (the rules
+        // concurrency test holds one for seconds) is live on that variable, and a
+        // sibling test poking it stripped the override back to the 5s production
+        // deadline mid-flight, which is what flaked the rules test (SBS-895).
         for bad in ["", "   ", "abc", "0", "-5", "9999999999999999999999"] {
-            std::env::set_var("TOOLPORT_LOCK_TIMEOUT_MS", bad);
             assert_eq!(
-                registry_lock_timeout(),
+                parse_lock_timeout(Some(bad)),
                 DEFAULT_REGISTRY_LOCK_TIMEOUT,
                 "{bad:?} must fall back to the default, not disable locking"
             );
+            assert_eq!(parse_lock_timeout(None), DEFAULT_REGISTRY_LOCK_TIMEOUT);
         }
+        assert_eq!(
+            parse_lock_timeout(Some("250")),
+            std::time::Duration::from_millis(250)
+        );
 
-        match previous {
-            Some(value) => std::env::set_var("TOOLPORT_LOCK_TIMEOUT_MS", value),
-            None => std::env::remove_var("TOOLPORT_LOCK_TIMEOUT_MS"),
+        // The refcounted override must actually reach the lock, or the concurrency
+        // tests silently keep the production budget. Parsing junk above must not
+        // have disturbed this guard.
+        let _guard = LockTimeoutOverride::generous();
+        assert_eq!(
+            registry_lock_timeout(),
+            std::time::Duration::from_millis(60_000)
+        );
+        for bad in ["", "abc", "0", "-5"] {
+            assert_eq!(parse_lock_timeout(Some(bad)), DEFAULT_REGISTRY_LOCK_TIMEOUT);
+            assert_eq!(
+                registry_lock_timeout(),
+                std::time::Duration::from_millis(60_000),
+                "parsing {bad:?} must not disturb a live override"
+            );
         }
     }
 
