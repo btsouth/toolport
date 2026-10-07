@@ -886,6 +886,14 @@ export function deleteProfile(id: string): Promise<Registry> {
   return invoke<Registry>("delete_profile", { id });
 }
 
+export function setDefaultAccess(profile: string | null): Promise<Registry> {
+  return invoke<Registry>("set_default_access", { profile });
+}
+
+export function setAccessServer(profileId: string, serverId: string, included: boolean): Promise<Registry> {
+  return invoke<Registry>("set_access_server", { profileId, serverId, included });
+}
+
 export function setActiveProfile(id: string): Promise<Registry> {
   return invoke<Registry>("set_active_profile", { id });
 }

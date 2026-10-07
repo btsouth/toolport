@@ -11,6 +11,7 @@ if (!import.meta.env.DEV) throw new Error("Fixtures require the development serv
 const servers: ServerEntry[] = ["GitHub", "Linear", "Stripe"].map((name, i) => ({
   id: `fixture-${i}`,
   name,
+  enabled: true,
   transport: "stdio",
   command: "fixture-only",
   args: [],
@@ -19,12 +20,15 @@ const servers: ServerEntry[] = ["GitHub", "Linear", "Stripe"].map((name, i) => (
   source: "manual",
 }));
 const registry: Registry = {
-  version: 1,
+  version: 3,
   servers,
   profiles: [
     { id: "local", name: "Local fixture", enabledServerIds: servers.map((s) => s.id) },
+    { id: "work", name: "Work", enabledServerIds: [servers[0].id] },
   ],
   activeProfileId: "local",
+  defaultAccessContextId: "local",
+  clientScopes: { codex: "" },
 };
 const auditRows = Array.from({ length: 200 }, (_, i) => ({
   ts: 1_700_000_000_000 - i * 1000,
@@ -66,6 +70,24 @@ mockIPC(
   (command, payload) => {
     calls[command] = (calls[command] ?? 0) + 1;
     switch (command) {
+      case "set_default_access":
+        registry.defaultAccessProfileId = payload?.profile as string | null;
+        return registry;
+      case "set_access_server": {
+        const profile = registry.profiles.find((p) => p.id === payload?.profileId)!;
+        profile.enabledServerIds = profile.enabledServerIds.filter((id) => id !== payload?.serverId);
+        if (payload?.included) profile.enabledServerIds.push(payload.serverId as string);
+        return registry;
+      }
+      case "create_profile":
+        registry.profiles.push({ id: String(payload?.name).toLowerCase(), name: String(payload?.name), enabledServerIds: [] });
+        return registry;
+      case "delete_profile":
+        registry.profiles = registry.profiles.filter((p) => p.id !== payload?.id);
+        return registry;
+      case "install_gateway":
+        registry.clientScopes = { ...registry.clientScopes, [String(payload?.clientId)]: String(payload?.profile || "") };
+        return registry;
       case "get_registry":
         return registry;
       case "detect_clients":

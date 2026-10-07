@@ -37,6 +37,7 @@ pub(super) struct SettingsPage {
     restart_list: gtk::Box,
     http_client_list: gtk::Box,
     add_http_client: gtk::Button,
+    access_list: gtk::Box,
     folder_list: gtk::Box,
     folder_button: gtk::Button,
     quarantine_list: gtk::Box,
@@ -261,6 +262,27 @@ impl SettingsPage {
         protection.append(&allowed_list);
 
         page.append(&protection);
+        let access_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        page.append(&access_list);
+        let folder_button = gtk::Button::with_label("Add folder mapping");
+        folder_button.add_css_class("toolport-secondary-action");
+        folder_button.set_valign(gtk::Align::Center);
+        page.append(&settings_heading_with_action(
+            "Project folder routing",
+            "Automatically use the matching access set when an MCP client reports a project root. The longest matching folder wins.",
+            &folder_button,
+        ));
+        let folder_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        folder_list.add_css_class("toolport-settings-group");
+        folder_list.append(
+            &gtk::Label::builder()
+                .label("Checking folder mappings…")
+                .halign(gtk::Align::Start)
+                .css_classes(["toolport-muted"])
+                .build(),
+        );
+        page.append(&folder_list);
+
 
         page.append(&settings_heading(
             "Desktop",
@@ -341,24 +363,6 @@ impl SettingsPage {
         desktop.append(&updates);
         page.append(&desktop);
 
-        let folder_button = gtk::Button::with_label("Add folder mapping");
-        folder_button.add_css_class("toolport-secondary-action");
-        folder_button.set_valign(gtk::Align::Center);
-        page.append(&settings_heading_with_action(
-            "Project folder routing",
-            "Automatically use the matching server profile when an MCP client reports a project root. The longest matching folder wins.",
-            &folder_button,
-        ));
-        let folder_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        folder_list.add_css_class("toolport-settings-group");
-        folder_list.append(
-            &gtk::Label::builder()
-                .label("Checking folder mappings…")
-                .halign(gtk::Align::Start)
-                .css_classes(["toolport-muted"])
-                .build(),
-        );
-        page.append(&folder_list);
 
         page.append(&settings_heading(
             "Diagnostics",
@@ -525,6 +529,7 @@ impl SettingsPage {
             restart_list: restart_list.clone(),
             http_client_list,
             add_http_client,
+            access_list,
             folder_list,
             folder_button,
             quarantine_list,
@@ -721,6 +726,78 @@ impl SettingsPage {
                 }
                 Ok(Err(error)) => page.show_error(&error),
                 Err(_) => page.show_error("the endpoint operation stopped unexpectedly"),
+            }
+        });
+    }
+
+    fn render_access_sets(&self, registry: crate::registry::Registry) {
+        while let Some(child) = self.access_list.first_child() { self.access_list.remove(&child); }
+        self.access_list.append(&settings_heading("Access sets", "Narrow enabled servers and tools per client. Servers that are off are hidden everywhere."));
+        let mut labels = vec!["All enabled servers".to_string()];
+        labels.extend(registry.profiles.iter().map(|p| p.name.clone()));
+        let default = gtk::DropDown::from_strings(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+        default.set_tooltip_text(Some("Default access for clients without an explicit access set"));
+        default.set_selected(registry.profiles.iter().position(|p| Some(&p.id) == registry.default_access_profile_id.as_ref()).map(|i| i as u32 + 1).unwrap_or(0));
+        let profiles = registry.profiles.clone();
+        let page = self.clone();
+        default.connect_selected_notify(move |dropdown| {
+            let profile = dropdown.selected().checked_sub(1).and_then(|i| profiles.get(i as usize)).map(|p| p.id.clone());
+            page.mutate_access(move || crate::registry_controller::set_default_access(profile.as_deref()));
+        });
+        self.access_list.append(&default);
+        let creator = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let name = gtk::Entry::builder().placeholder_text("Access set name").hexpand(true).build();
+        let add = gtk::Button::with_label("Create access set");
+        let page = self.clone();
+        let entry = name.clone();
+        add.connect_clicked(move |_| {
+            let name = entry.text().to_string();
+            page.mutate_access(move || crate::registry_controller::create_profile(&name));
+        });
+        creator.append(&name); creator.append(&add); self.access_list.append(&creator);
+        for profile in &registry.profiles {
+            let expander = gtk::Expander::builder().label(&profile.name).build();
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+            for server in registry.servers.iter().filter(|s| !crate::clients::is_gateway_server(s)) {
+                let included = gtk::CheckButton::with_label(&format!("{}{}", server.name, if server.enabled { "" } else { " (off)" }));
+                included.set_active(profile.enabled_server_ids.contains(&server.id));
+                let (pid, sid, page) = (profile.id.clone(), server.id.clone(), self.clone());
+                included.connect_toggled(move |button| {
+                    let (pid, sid, included) = (pid.clone(), sid.clone(), button.is_active());
+                    page.mutate_access(move || crate::registry_controller::set_access_server(&pid, &sid, included));
+                });
+                content.append(&included);
+                if profile.enabled_server_ids.contains(&server.id) {
+                    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                    let tools = gtk::Entry::builder().placeholder_text("All tools, or comma-separated tool names").hexpand(true).build();
+                    tools.set_text(&profile.tool_scope.get(&server.id).map(|tools| tools.join(", ")).unwrap_or_default());
+                    let save = gtk::Button::with_label("Save tools");
+                    let (pid, sid, page, entry) = (profile.id.clone(), server.id.clone(), self.clone(), tools.clone());
+                    save.connect_clicked(move |_| {
+                        let text = entry.text();
+                        let tools = (!text.trim().is_empty()).then(|| text.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect());
+                        let (pid, sid) = (pid.clone(), sid.clone());
+                        page.mutate_access(move || crate::registry_controller::set_profile_server_tools(&pid, &sid, tools));
+                    });
+                    row.append(&tools); row.append(&save); content.append(&row);
+                }
+            }
+            let delete = gtk::Button::with_label("Delete access set");
+            delete.set_sensitive(registry.profiles.len() > 1 && Some(&profile.id) != registry.default_access_profile_id.as_ref() && Some(&profile.id) != registry.default_access_context_id.as_ref());
+            let (pid, page) = (profile.id.clone(), self.clone());
+            delete.connect_clicked(move |_| { let pid = pid.clone(); page.mutate_access(move || crate::registry_controller::delete_profile(&pid)); });
+            content.append(&delete); expander.set_child(Some(&content)); self.access_list.append(&expander);
+        }
+    }
+
+    fn mutate_access(&self, operation: impl FnOnce() -> Result<crate::registry::Registry, String> + Send + 'static) {
+        self.mutation_generation.set(self.mutation_generation.get().wrapping_add(1));
+        let page = self.clone();
+        gtk::glib::spawn_future_local(async move {
+            match gtk::gio::spawn_blocking(operation).await {
+                Ok(Ok(registry)) => page.render_access_sets(registry),
+                Ok(Err(error)) => page.show_error(&error),
+                Err(_) => page.show_error("The access update stopped unexpectedly"),
             }
         });
     }
@@ -1290,7 +1367,8 @@ impl SettingsPage {
                     match result {
                         Ok(Ok(settings)) => {
                             if page.mutation_generation.get() == generation {
-                                page.render_settings(settings);
+                                page.render_access_sets(access_registry);
+                    page.render_settings(settings);
                             } else {
                                 switch.set_sensitive(true);
                             }
@@ -1408,6 +1486,7 @@ impl SettingsPage {
                     crate::registry_controller::http_client_settings()?,
                     crate::registry_controller::pinned_prerequisites()?,
                     bridge.restart_advice(),
+                    crate::registry::load()?,
                 ))
             })
             .await;
@@ -1422,6 +1501,7 @@ impl SettingsPage {
                     http_clients,
                     pinned,
                     restart_advice,
+                    access_registry,
                 ))) => {
                     // A toggle landed while this read was in flight, so the
                     // snapshot is already out of date. Rendering it would put
@@ -1431,6 +1511,7 @@ impl SettingsPage {
                         page.refresh_button.set_sensitive(true);
                         return;
                     }
+                    page.render_access_sets(access_registry);
                     page.render_settings(settings);
                     page.render_restart_advice(restart_advice);
                     page.updating.set(true);

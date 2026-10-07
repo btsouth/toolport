@@ -5420,6 +5420,7 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
         env.push(env_var(crate::brand::PROFILE, p));
     }
     Ok(ServerEntry {
+        enabled: false,
         inherit_env: false,
         id: GATEWAY_ENTRY_NAME.to_string(),
         name: GATEWAY_ENTRY_NAME.to_string(),
@@ -6861,6 +6862,7 @@ mod tests {
             });
         }
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: GATEWAY_ENTRY_NAME.to_string(),
             name: GATEWAY_ENTRY_NAME.to_string(),
@@ -6999,6 +7001,7 @@ mod tests {
 
     fn stdio(name: &str) -> ServerEntry {
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: name.to_string(),
             name: name.to_string(),
@@ -7028,6 +7031,7 @@ mod tests {
 
     fn remote(name: &str, transport: &str) -> ServerEntry {
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: name.to_string(),
             name: name.to_string(),

@@ -345,6 +345,7 @@ pub fn apply_add_server(registry: &mut Registry, fields: ServerFields) -> Result
     Ok(apply_add_entry(
         registry,
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: String::new(),
             name: fields.name,
@@ -371,6 +372,7 @@ pub fn apply_add_entry(registry: &mut Registry, entry: ServerEntry) -> String {
 
 pub(crate) fn server_from_detected(server: &clients::McpServer, client_id: &str) -> ServerEntry {
     ServerEntry {
+        enabled: false,
         inherit_env: false,
         id: String::new(),
         name: server.name.clone(),
@@ -606,6 +608,7 @@ pub fn add_snippet_server(
 
 fn catalog_server(entry: crate::catalog::CatalogEntry) -> ServerEntry {
     ServerEntry {
+        enabled: false,
         inherit_env: false,
         id: String::new(),
         name: entry.name,
@@ -693,6 +696,7 @@ pub fn server_entry_for_probe(
         None => {
             let fields = fields.normalized()?;
             Ok(ServerEntry {
+                enabled: false,
                 inherit_env: false,
                 id: "native-connection-test".into(),
                 name: fields.name,
@@ -746,6 +750,14 @@ pub fn create_profile(name: &str) -> Result<Registry, String> {
 pub fn delete_profile(profile_id: &str) -> Result<Registry, String> {
     let (registry, ()) = registry::update(|registry| apply_delete_profile(registry, profile_id))?;
     Ok(registry)
+}
+
+pub fn set_default_access(profile: Option<&str>) -> Result<Registry, String> {
+    registry::update(|r| r.set_default_access(profile)).map(|(r, ())| r)
+}
+
+pub fn set_access_server(profile_id: &str, server_id: &str, included: bool) -> Result<Registry, String> {
+    registry::update(|r| r.set_access_server(profile_id, server_id, included)).map(|(r, ())| r)
 }
 
 pub fn set_active_profile(profile_id: &str) -> Result<Registry, String> {
@@ -1860,7 +1872,8 @@ pub fn apply_server_enabled(
             server.check_enable_allowed(reviewed)?;
         }
     }
-    registry.set_server_enabled(profile_id, server_id, enabled)
+    if registry.version >= 3 { registry.set_global_server_enabled(server_id, enabled) }
+    else { registry.set_server_enabled(profile_id, server_id, enabled) }
 }
 
 pub fn set_server_enabled(
@@ -2118,6 +2131,7 @@ mod tests {
 
     fn server(id: &str) -> ServerEntry {
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: id.into(),
             name: id.into(),

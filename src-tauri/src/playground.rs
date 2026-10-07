@@ -11,7 +11,7 @@ fn server(server_id: &str) -> Result<ServerEntry, String> {
         .cloned()
         .ok_or_else(|| format!("server '{server_id}' not found"))?;
     // Connecting runs the server, so an unreviewed team server must already be on.
-    if !registry.is_enabled(&registry.active_profile_id(), &server.id) {
+    if !registry.is_enabled(&registry.default_access_id(), &server.id) {
         server.check_enable_allowed(false)?;
     }
     Ok(server)
@@ -36,7 +36,7 @@ fn annotate_quarantine(server_id: &str, tools: &mut [serde_json::Value]) -> Resu
         tools,
         registry.tool_overrides.clone(),
     );
-    let quarantined = crate::integrity::quarantined_checked(Some(&registry.active_profile_id()));
+    let quarantined = crate::integrity::quarantined_checked(Some(&registry.default_access_id()));
     for tool in tools {
         let alias = tool
             .get("name")
@@ -110,7 +110,7 @@ pub fn call_tool(
                 .to_string_lossy()
                 .into_owned(),
         ),
-        ("TOOLPORT_PROFILE".to_string(), registry.active_profile_id()),
+        ("TOOLPORT_PROFILE".to_string(), registry.default_access_id()),
     ];
     let transport = crate::downstream::StdioTransport::spawn(
         &gateway.to_string_lossy(),

@@ -1287,7 +1287,7 @@ fn report_activation(conn: &TeamConnection, token: &str) -> Result<(), String> {
                     .get(&c.id)
                     .filter(|s| !s.is_empty())
                     .cloned()
-                    .unwrap_or_else(|| reg.active_profile_id());
+                    .unwrap_or_else(|| reg.default_access_id());
                 reg.enabled_servers_for(&scope)
                     .iter()
                     .any(|s| s.id == server.id)
@@ -2284,6 +2284,7 @@ fn apply_use_managed(reg: &mut Registry, managed_id: &str, profile: &str) -> Res
     if !p.enabled_server_ids.iter().any(|id| id == managed_id) {
         p.enabled_server_ids.push(managed_id.into());
     }
+    reg.set_server_enabled(profile, managed_id, true)?;
     reg.set_server_enabled(profile, &personal.id, false)?;
     reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
     Ok(())
@@ -2986,6 +2987,7 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
         .filter(|server| saved_team_original_id(server).is_none())
         .map(|server| (server.id.clone(), plain_launch_values(server)))
         .collect();
+    let previous_global: HashMap<String, bool> = reg.servers.iter().map(|s| (s.id.clone(), s.enabled)).collect();
     let prev_enabled_by_profile: std::collections::HashMap<
         String,
         std::collections::HashSet<String>,
@@ -3142,6 +3144,12 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
             if was_enabled(id) && consent_holds(id) && !p.enabled_server_ids.contains(id) {
                 p.enabled_server_ids.push(id.clone());
             }
+        }
+    }
+    if reg.version >= 3 {
+        for server in reg.servers.iter_mut().filter(|s| is_team_server(s, &tag)) {
+            let in_access_set = reg.profiles.iter().any(|p| p.enabled_server_ids.contains(&server.id));
+            server.enabled = in_access_set && previous_global.get(&server.id).copied().unwrap_or(true);
         }
     }
     // What the member still has to look at: review servers that are OFF in the active
@@ -3480,6 +3488,7 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         None => None,
     };
     let mut entry = ServerEntry {
+        enabled: false,
         inherit_env: false,
         id,
         name: name.to_string(),
@@ -4334,6 +4343,7 @@ mod tests {
         r.version = 1;
         r.safety_level = None;
         r.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "mine".into(),
             name: "Mine".into(),
@@ -4996,6 +5006,7 @@ mod tests {
         // sync would overwrite the member's own server's secrets/profile/tool routing.
         let mut r = base_registry();
         r.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "team_github".into(),
             name: "My own".into(),
@@ -5137,6 +5148,7 @@ mod tests {
         let mut r = base_registry();
         // Occupy the natural team id so the team server gets a stable alternate id.
         r.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "team_github".into(),
             name: "Local GitHub".into(),
@@ -5735,6 +5747,7 @@ mod tests {
     fn team_id_never_collides_with_a_local_id_under_sanitize() {
         let mut r = base_registry();
         r.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "team-acme-crm".into(),
             name: "Team Acme CRM".into(),
@@ -6228,6 +6241,7 @@ mod tests {
         let mut r = base_registry(); // has "mine" (manual)
                                      // Toolport's own gateway entry: infra, must never be pushed to the team.
         r.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "toolport".into(),
             name: "Toolport".into(),
@@ -6249,6 +6263,7 @@ mod tests {
         });
         // A team-sourced server: excluded too (don't echo the team's own set back).
         r.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "shared".into(),
             name: "Shared".into(),
@@ -6694,6 +6709,7 @@ mod tests {
     #[test]
     fn consent_fingerprint_tracks_only_what_runs() {
         let base = ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "team_x".into(),
             name: "X".into(),

@@ -93,7 +93,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   // Snapshotted at dialog-open time so a registry-changed event mid-review can't
   // reshuffle `toImport` out from under the indices the user already confirmed.
   const [bulkImportServers, setBulkImportServers] = useState<McpServer[] | null>(null);
-  // "" = follow the active profile; else scope to one.
+  // Empty uses the default access; named access sets narrow enabled servers.
   const [profile, setProfile] = useState("");
   const [migrateOpen, setMigrateOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
@@ -172,37 +172,20 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     }
   }
 
-  /** How many servers a given scope ("" = active profile, else a named profile)
-   * resolves to, for the "scoped to X · N servers" summary. */
-  function scopeServerCount(scopeRef: string): number {
-    const target = scopeRef
-      ? profiles.find(
-          (p) => p.id === scopeRef || p.name.toLowerCase() === scopeRef.toLowerCase(),
-        )
-      : (profiles.find((p) => p.id === registry?.activeProfileId) ?? profiles[0]);
-    if (!target) return 0;
-    // Exclude Toolport's own gateway entry so the count matches the Servers list (which
-    // filters it out) instead of over-counting by one.
-    const ids = new Set(
-      (registry?.servers ?? []).filter((s) => !isGatewayServer(s)).map((s) => s.id),
-    );
-    return target.enabledServerIds.filter((id) => ids.has(id)).length;
+  function scopeServers(scopeRef: string): { id: string; name: string }[] {
+    const ref = scopeRef || registry?.defaultAccessProfileId || "@all-enabled";
+    const target = profiles.find((p) => p.id === ref || p.name.toLowerCase() === ref.toLowerCase());
+    return (registry?.servers ?? [])
+      .filter((s) => s.enabled && !isGatewayServer(s) &&
+        (ref === "@all-enabled" || target?.enabledServerIds.includes(s.id)))
+      .map((s) => ({ id: s.id, name: s.name }));
   }
 
-  /** The actual servers a scope resolves to, so a connected client shows WHAT it can
-   * reach, not just a count. */
-  function scopeServers(scopeRef: string): { id: string; name: string }[] {
-    const target = scopeRef
-      ? profiles.find(
-          (p) => p.id === scopeRef || p.name.toLowerCase() === scopeRef.toLowerCase(),
-        )
-      : (profiles.find((p) => p.id === registry?.activeProfileId) ?? profiles[0]);
-    if (!target) return [];
-    const enabled = new Set(target.enabledServerIds);
-    // Never surface the gateway's own entry as a reachable server.
-    return (registry?.servers ?? [])
-      .filter((s) => enabled.has(s.id) && !isGatewayServer(s))
-      .map((s) => ({ id: s.id, name: s.name }));
+  function scopeServerCount(scopeRef: string): number { return scopeServers(scopeRef).length; }
+  function accessLabel(scopeRef: string): string {
+    const ref = scopeRef || registry?.defaultAccessProfileId;
+    return !ref || ref === "@all-enabled" ? "All enabled servers" :
+      profiles.find((p) => p.id === ref || p.name === ref)?.name ?? ref;
   }
 
   /** Re-apply a scope to an already-connected client (overwrites its gateway
@@ -222,7 +205,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       toast.success(
         profile
           ? `${client.name} scoped to "${scopeName}".`
-          : `${client.name} now follows the active profile.`,
+          : `${client.name} now uses the default access.`,
         { description: clientRestartHint(client.name) },
       );
       noteRestartNeeded("applied");
@@ -443,7 +426,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             <p className="mt-1 text-xs text-muted-foreground">
               Sees{" "}
               <span className="font-medium text-foreground">
-                {currentScope ? `the "${currentScope}" profile` : "the active profile"}
+                {accessLabel(currentScope)}
               </span>{" "}
               · {scopeServerCount(currentScope)} server
               {scopeServerCount(currentScope) === 1 ? "" : "s"}
@@ -456,19 +439,20 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          {profiles.length > 1 && !customized && (
+          {!customized && (
             <Select
-              value={profile || "__all__"}
-              onValueChange={(v) => setProfile(v === "__all__" ? "" : v)}
+              value={profile || "__default__"}
+              onValueChange={(v) => setProfile(v === "__default__" ? "" : v)}
             >
-              <SelectTrigger size="sm" className="w-52">
+              <SelectTrigger aria-label="Access" size="sm" className="w-52">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="__all__">Follow active profile</SelectItem>
+                <SelectItem value="__default__">Default: {accessLabel("")}</SelectItem>
+                <SelectItem value="@all-enabled">All enabled servers</SelectItem>
                 {profiles.map((p) => (
                   <SelectItem key={p.id} value={p.id}>
-                    Only: {p.name}
+                    {p.name}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -477,7 +461,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           {installed && !customized && profile !== currentScope && (
             <Button size="sm" onClick={applyScope} disabled={busy}>
               <Check className="size-4" />
-              Apply scope
+              Apply access
             </Button>
           )}
           {customized && (
@@ -810,17 +794,18 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                   Scope this client to
                 </span>
                 <Select
-                  value={profile || "__all__"}
-                  onValueChange={(v) => setProfile(v === "__all__" ? "" : v)}
+                  value={profile || "__default__"}
+                  onValueChange={(v) => setProfile(v === "__default__" ? "" : v)}
                 >
-                  <SelectTrigger size="sm" className="w-52">
+                  <SelectTrigger aria-label="Access" size="sm" className="w-52">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="__all__">Follow active profile</SelectItem>
+                    <SelectItem value="__default__">Default: {accessLabel("")}</SelectItem>
+                <SelectItem value="@all-enabled">All enabled servers</SelectItem>
                     {profiles.map((p) => (
                       <SelectItem key={p.id} value={p.id}>
-                        Only: {p.name}
+                        {p.name}
                       </SelectItem>
                     ))}
                   </SelectContent>

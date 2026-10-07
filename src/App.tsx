@@ -219,11 +219,10 @@ function App() {
   const applyRegistryChange = useCallback(
     (next: Registry) => {
       const activeId = (value: Registry | null) =>
-        value?.activeProfileId ?? value?.profiles[0]?.id;
+        value?.defaultAccessProfileId ?? value?.defaultAccessContextId;
       const enabledIds = (value: Registry | null) =>
         new Set(
-          value?.profiles.find((profile) => profile.id === activeId(value))
-            ?.enabledServerIds ?? [],
+          value?.servers.filter((server) => server.enabled).map((server) => server.id) ?? [],
         );
       const previous = registryRef.current;
       const previousProfileId = activeId(previous);
@@ -517,7 +516,7 @@ function App() {
   }, [load]);
 
   const profileId = registry
-    ? (registry.activeProfileId ?? registry.profiles[0]?.id)
+    ? (registry.defaultAccessProfileId ?? registry.profiles[0]?.id)
     : undefined;
   // The gateway entry is Toolport itself, not a server it proxies - never list it.
   const servers = (registry?.servers ?? []).filter((s) => !isGatewayServer(s));

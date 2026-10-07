@@ -24,9 +24,13 @@ use serde::{Deserialize, Serialize};
 pub(crate) static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 mod v2_migration;
+mod v3_migration;
 
 /// The newest registry schema version this build knows how to load and write.
-const REGISTRY_VERSION: u32 = 2;
+const REGISTRY_VERSION: u32 = 3;
+
+/// Explicit per-client access to all globally enabled servers.
+pub const ALL_ENABLED_ACCESS: &str = "@all-enabled";
 
 /// One ordered schema migration: it rewrites a registry document at version N
 /// into version N+1. The loader stamps the `version` field after each step, so
@@ -62,7 +66,7 @@ impl MigrationContext {
 /// The shipped `vN -> vN+1` pipeline, in order. Its length must stay
 /// `REGISTRY_VERSION - 1` (asserted by a test), so a step can neither be
 /// silently skipped nor applied twice.
-const MIGRATIONS: &[Migration] = &[v2_migration::migrate_v1_to_v2];
+const MIGRATIONS: &[Migration] = &[v2_migration::migrate_v1_to_v2, v3_migration::migrate_v2_to_v3];
 
 /// A registry that could not be loaded or safely written because of its schema
 /// version. Kept distinct from the generic corruption error so version skew (an
@@ -741,6 +745,8 @@ pub(crate) fn validate_initialize_timeout_ms(milliseconds: u64) -> Result<u64, S
 #[serde(rename_all = "camelCase")]
 pub struct ServerEntry {
     #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
     pub id: String,
     pub name: String,
     /// "stdio" | "http" | "sse"
@@ -1072,6 +1078,12 @@ pub struct Registry {
     pub profiles: Vec<Profile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_profile_id: Option<String>,
+    /// Pinned legacy default when its server set was narrower than the union.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_access_profile_id: Option<String>,
+    /// Stable legacy policy and integrity context for unscoped clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_access_context_id: Option<String>,
     /// The 1.x safety toggles (`denyDestructive`, `confirmDestructive`, `humanApproval`,
     /// `quarantineOnDrift`, `blockOnInjection`). In a v1 registry they select the safety
     /// level (see [`Registry::safety_level_selected`]). From v2 on they are a write-only
@@ -1499,6 +1511,8 @@ impl Default for Registry {
                 unknown_fields: Default::default(),
             }],
             active_profile_id: Some(DEFAULT_PROFILE_ID.to_string()),
+            default_access_profile_id: None,
+            default_access_context_id: None,
             safety_level: Some(SafetyLevel::Ask),
             deny_destructive: false,
             confirm_destructive: false,
@@ -1556,7 +1570,12 @@ pub(crate) fn slugify(s: &str) -> String {
 /// A filesystem-safe, collision-resistant key for a stable profile id.
 /// Every id uses the same SHA-256 domain so no readable/non-readable branch can
 /// collide with another id's literal text (SBS-715).
+pub fn access_integrity_id(id: &str) -> &str {
+    id.strip_prefix("@default-access:").or_else(|| id.strip_prefix("@all-enabled:")).unwrap_or(id)
+}
+
 pub fn profile_store_key(profile_id: &str) -> String {
+    let profile_id = access_integrity_id(profile_id);
     sha256_hex(&format!("toolport-profile-id-v1:{profile_id}"))
 }
 
@@ -1564,6 +1583,7 @@ pub fn profile_store_key(profile_id: &str) -> String {
 /// for this profile. Live reads must fail closed rather than treat that as a
 /// first run (SBS-715).
 pub fn unmigrated_legacy_profile_store(profile: &str, pins: bool) -> bool {
+    let profile = access_integrity_id(profile);
     let Some(dir) = conduit_dir() else {
         return false;
     };
@@ -1892,6 +1912,7 @@ impl Registry {
     /// Resolve a user/API supplied profile reference to a stable id, rejecting
     /// stale and ambiguous names instead of creating another name-keyed binding.
     pub fn canonical_profile_id(&self, profile_ref: &str) -> Result<String, String> {
+        if profile_ref == ALL_ENABLED_ACCESS { return Ok(ALL_ENABLED_ACCESS.to_string()); }
         self.profile_id_for_ref(profile_ref)
             .ok_or_else(|| format!("No unique profile matches '{profile_ref}'"))
     }
@@ -1906,6 +1927,7 @@ impl Registry {
             if profile_ref.is_empty() {
                 return None;
             }
+            if profile_ref == ALL_ENABLED_ACCESS { return Some(ALL_ENABLED_ACCESS.to_string()); }
             if let Some(profile) = profiles.iter().find(|p| p.id == profile_ref) {
                 return Some(profile.id.clone());
             }
@@ -2003,7 +2025,54 @@ impl Registry {
             .unwrap_or_else(|| DEFAULT_PROFILE_ID.to_string())
     }
 
+    /// The default server access and its legacy tool/integrity policy are separate.
+    pub fn default_access_id(&self) -> String {
+        if self.version < 3 { return self.active_profile_id(); }
+        self.default_access_profile_id.clone().unwrap_or_else(|| {
+            format!("@default-access:{}", self.default_access_context_id.as_deref().unwrap_or(""))
+        })
+    }
+
+    pub fn all_access_id(&self) -> String {
+        format!("@all-enabled:{}", self.default_access_context_id.as_deref().unwrap_or(""))
+    }
+
+    pub fn access_profile(&self, id: &str) -> Option<&Profile> {
+        let id = id.strip_prefix("@default-access:").unwrap_or(id);
+        self.profiles.iter().find(|p| p.id == id)
+    }
+
+    pub fn server_enabled(&self, server_id: &str) -> bool {
+        self.servers.iter().any(|s| s.id == server_id && s.enabled)
+    }
+
+    pub fn set_global_server_enabled(&mut self, server_id: &str, enabled: bool) -> Result<(), String> {
+        let server = self.servers.iter_mut().find(|s| s.id == server_id)
+            .ok_or_else(|| format!("No server with id '{server_id}'"))?;
+        if enabled && server.launch.is_some() { crate::launch_inputs::resolve_args(server)?; }
+        server.enabled = enabled;
+        Ok(())
+    }
+
+    pub fn set_access_server(&mut self, profile: &str, server: &str, included: bool) -> Result<(), String> {
+        if !self.servers.iter().any(|s| s.id == server) { return Err(format!("No server with id '{server}'")); }
+        let profile = self.profiles.iter_mut().find(|p| p.id == profile).ok_or("Access set not found")?;
+        if included && !profile.enabled_server_ids.iter().any(|id| id == server) { profile.enabled_server_ids.push(server.to_string()); }
+        if !included { profile.enabled_server_ids.retain(|id| id != server); }
+        Ok(())
+    }
+
+    pub fn set_default_access(&mut self, profile: Option<&str>) -> Result<(), String> {
+        self.default_access_profile_id = profile.filter(|p| !p.is_empty())
+            .map(|p| self.canonical_profile_id(p)).transpose()?;
+        Ok(())
+    }
+
     pub fn is_enabled(&self, profile_id: &str, server_id: &str) -> bool {
+        if self.version >= 3 {
+            if !self.server_enabled(server_id) { return false; }
+            if profile_id.starts_with("@default-access:") || profile_id.starts_with("@all-enabled:") || profile_id == ALL_ENABLED_ACCESS { return true; }
+        }
         self.profiles
             .iter()
             .find(|p| p.id == profile_id)
@@ -2037,10 +2106,14 @@ impl Registry {
         } else if !enabled && present {
             profile.enabled_server_ids.retain(|s| s != server_id);
         }
+        if self.version >= 3 {
+            let globally_enabled = self.profiles.iter().any(|p| p.enabled_server_ids.iter().any(|id| id == server_id));
+            self.set_global_server_enabled(server_id, globally_enabled)?;
+        }
         Ok(())
     }
 
-    /// Enable or disable every server in a profile at once.
+    /// Enable or disable every server globally at once.
     ///
     /// Enabling skips team-review servers (local command / LAN URL / changed remote). Those stay
     /// as they were so Enable all cannot bypass the Teams confirm, and so a
@@ -2056,19 +2129,16 @@ impl Registry {
         } else {
             Vec::new()
         };
-        let profile = self
-            .profiles
-            .iter_mut()
-            .find(|p| p.id == profile_id)
-            .ok_or_else(|| format!("No profile with id '{profile_id}'"))?;
-        if enabled {
-            for id in ids {
-                if !profile.enabled_server_ids.contains(&id) {
-                    profile.enabled_server_ids.push(id);
-                }
+        if self.version >= 3 {
+            for server in &mut self.servers {
+                if !enabled || ids.contains(&server.id) { server.enabled = enabled; }
             }
         } else {
-            profile.enabled_server_ids = Vec::new();
+            let profile = self.profiles.iter_mut().find(|p| p.id == profile_id)
+                .ok_or_else(|| format!("No profile with id '{profile_id}'"))?;
+            if enabled {
+                for id in ids { if !profile.enabled_server_ids.contains(&id) { profile.enabled_server_ids.push(id); } }
+            } else { profile.enabled_server_ids.clear(); }
         }
         Ok(())
     }
@@ -2391,7 +2461,7 @@ impl Registry {
 
     /// Servers enabled in the active profile - what the gateway should expose.
     pub fn enabled_servers(&self) -> Vec<&ServerEntry> {
-        let active = self.active_profile_id();
+        let active = self.default_access_id();
         self.servers
             .iter()
             .filter(|s| self.is_enabled(&active, &s.id))
@@ -2409,8 +2479,10 @@ impl Registry {
     /// never on a dangling reference.
     pub fn resolve_profile_id(&self, profile_ref: &str) -> String {
         if profile_ref.trim().is_empty() {
-            return self.active_profile_id();
+            return self.default_access_id();
         }
+        if profile_ref == ALL_ENABLED_ACCESS { return self.all_access_id(); }
+        if profile_ref == self.default_access_id() || profile_ref == self.all_access_id() { return profile_ref.to_string(); }
         self.profile_id_for_ref(profile_ref)
             .unwrap_or_else(|| profile_ref.to_string())
     }
@@ -2432,9 +2504,7 @@ impl Registry {
     /// built-in text. An empty or whitespace-only result means send no instructions.
     pub fn configured_instructions(&self, profile_ref: Option<&str>) -> Option<&str> {
         let id = self.resolve_profile_id(profile_ref.unwrap_or(""));
-        self.profiles
-            .iter()
-            .find(|profile| profile.id == id)
+        self.access_profile(&id)
             .and_then(|profile| profile.instructions.as_deref())
             .or(self.gateway_instructions.as_deref())
     }
@@ -2485,7 +2555,7 @@ impl Registry {
         use std::collections::HashSet;
         let base_id = match base {
             Some(p) => self.resolve_profile_id(p),
-            None => self.active_profile_id(),
+            None => self.default_access_id(),
         };
         let mut profile_ids: Vec<String> = vec![base_id];
         for c in &self.http_clients {
@@ -4766,6 +4836,7 @@ mod tests {
 
     fn sample_server(name: &str) -> ServerEntry {
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: String::new(),
             name: name.to_string(),
@@ -6788,6 +6859,7 @@ mod tests {
 
         let mut reg = Registry::default();
         reg.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "s1".into(),
             name: "s1".into(),
@@ -7388,6 +7460,7 @@ mod registry_version_tests {
 
     fn simple_server(name: &str) -> ServerEntry {
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: String::new(),
             name: name.to_string(),

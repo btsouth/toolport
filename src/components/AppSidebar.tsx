@@ -38,7 +38,6 @@ import {
 } from "@/lib/updater";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { ProfileBar } from "@/components/ProfileBar";
 import { ShareDialog } from "@/components/ShareDialog";
 
 const FOCUS_RING =
@@ -550,14 +549,7 @@ export function AppSidebar({
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
-        {registry && (
-          <div className="px-3 pb-2">
-            <div className="px-2.5 pb-1.5 text-xs font-medium tracking-wide text-muted-foreground uppercase">
-              Profile
-            </div>
-            <ProfileBar registry={registry} onChange={onRegistryChange} />
-          </div>
-        )}
+
 
         <nav aria-label="Views" className="flex flex-col gap-0.5 px-3 pt-2">
           {navItem(Layers, "Servers", view === "servers", () => onSelectView("servers"))}

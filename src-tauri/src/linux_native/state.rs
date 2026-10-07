@@ -403,6 +403,7 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
             .filter(|scope| !scope.is_empty())
             .cloned();
         client.scope_name = client.scope_id.as_ref().and_then(|scope| {
+            if scope == crate::registry::ALL_ENABLED_ACCESS { return Some("All enabled servers".into()); }
             registry
                 .profiles
                 .iter()
@@ -506,7 +507,7 @@ impl RegistrySnapshot {
             .servers
             .iter()
             .map(|server| {
-                let enabled = registry.is_enabled(&active_profile_id, &server.id);
+                let enabled = registry.server_enabled(&server.id);
                 ServerView {
                     origin_label: if server.source.as_deref().unwrap_or("").starts_with("team:") {
                         format!("Team · {}", registry.team.as_ref().and_then(|t| t.team_name.as_deref()).unwrap_or("Shared"))
@@ -776,6 +777,7 @@ mod tests {
 
     fn server(id: &str, name: &str, transport: &str) -> ServerEntry {
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: id.to_string(),
             name: name.to_string(),

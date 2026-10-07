@@ -375,6 +375,7 @@ export interface LaunchConfig {
 }
 
 export interface ServerEntry {
+  enabled?: boolean;
   id: string;
   name: string;
   transport: Transport;
@@ -486,6 +487,8 @@ export interface Registry {
   servers: ServerEntry[];
   profiles: Profile[];
   activeProfileId: string | null;
+  defaultAccessProfileId?: string | null;
+  defaultAccessContextId?: string | null;
   /** Folder -> profile auto-routing mappings. Absent/empty = no folder routing. */
   folderProfiles?: FolderProfile[];
   /** Per-tool exposure overrides (rename / re-describe), keyed by server id then original tool name. */
@@ -615,7 +618,8 @@ export function activeProfile(registry: Registry): Profile | undefined {
 }
 
 export function isEnabled(registry: Registry, serverId: string): boolean {
-  return activeProfile(registry)?.enabledServerIds.includes(serverId) ?? false;
+  if (registry.version < 3) return activeProfile(registry)?.enabledServerIds.includes(serverId) ?? false;
+  return registry.servers.find((s) => s.id === serverId)?.enabled ?? false;
 }
 
 /** Whether a registry entry is Toolport's own gateway. It's infrastructure, not a

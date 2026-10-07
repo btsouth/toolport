@@ -618,7 +618,7 @@ export function ServerToolsPanel({
 }: ServerToolsProps) {
   const servers = registry?.servers ?? [];
   const denyDestructive = registry?.denyDestructive ?? false;
-  const activeProfileId = registry?.activeProfileId;
+  const activeProfileId = `${registry?.defaultAccessProfileId}:${registry?.defaultAccessContextId}`;
   const overrideVersion = JSON.stringify(registry?.toolOverrides?.[serverId] ?? {});
 
   const [tab, setTab] = useState<"tools" | "resources" | "prompts">("tools");

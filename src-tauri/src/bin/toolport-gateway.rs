@@ -2794,7 +2794,7 @@ fn enabled_summary(
 ) -> String {
     let active = match profile {
         Some(p) => reg.resolve_profile_id(p),
-        None => reg.active_profile_id(),
+        None => reg.default_access_id(),
     };
     let profile_name = reg
         .profiles
@@ -3551,7 +3551,7 @@ struct HttpCaller {
 /// one-client gateway does, then use the HTTP bridge's per-request scope gate.
 fn adapter_tool_scope(reg: &Registry, profile: &str) -> Vec<(String, Vec<String>)> {
     let resolved = reg.resolve_profile_id(profile);
-    let Some(profile) = reg.profiles.iter().find(|entry| entry.id == resolved) else {
+    let Some(profile) = reg.access_profile(&resolved) else {
         return Vec::new();
     };
     let mut scope: Vec<(String, Vec<String>)> = profile
@@ -3575,7 +3575,7 @@ fn resolve_adapter_caller(
     root: Option<&str>,
 ) -> (Option<std::collections::HashSet<String>>, HttpCaller) {
     let profile = effective_profile(reg, Some(client_id), &env_profile.map(str::to_string), root)
-        .unwrap_or_else(|| reg.active_profile_id());
+        .unwrap_or_else(|| reg.default_access_id());
     let allowed: std::collections::HashSet<String> = reg
         .enabled_servers_for(&profile)
         .iter()
@@ -7349,10 +7349,7 @@ fn daemon_root_servers(reg: &Registry) -> Vec<ServerEntry> {
         .filter(|server| {
             !clients::is_gateway_server(server)
                 && server_uses_project_root(server)
-                && reg
-                    .profiles
-                    .iter()
-                    .any(|profile| reg.is_enabled(&profile.id, &server.id))
+                && reg.server_enabled(&server.id)
         })
         .cloned()
         .collect()
@@ -7409,9 +7406,7 @@ fn router_servers<'a>(
         reg.servers
             .iter()
             .filter(|server| {
-                reg.profiles
-                    .iter()
-                    .any(|profile| reg.is_enabled(&profile.id, &server.id))
+                reg.server_enabled(&server.id)
             })
             .collect()
     } else if http_mode {
@@ -7457,8 +7452,8 @@ fn registry_policy(
         let mut allow = std::collections::HashMap::new();
         let pid = profile
             .map(|p| reg.resolve_profile_id(p))
-            .unwrap_or_else(|| reg.active_profile_id());
-        if let Some(prof) = reg.profiles.iter().find(|p| p.id == pid) {
+            .unwrap_or_else(|| reg.default_access_id());
+        if let Some(prof) = reg.access_profile(&pid) {
             for (server_id, tools) in &prof.tool_scope {
                 allow.insert(server_id.clone(), tools.iter().cloned().collect());
             }
@@ -9699,14 +9694,14 @@ fn resolve_live_profile(
     env_profile: &Option<String>,
 ) -> Option<String> {
     let profile_ref = match client_id.and_then(|id| reg.client_scopes.get(id)) {
-        Some(p) if p.trim().is_empty() => return Some(reg.active_profile_id()),
+        Some(p) if p.trim().is_empty() => return Some(reg.default_access_id()),
         Some(p) => Some(p.as_str()),
         None => env_profile.as_deref(),
     };
     Some(
         profile_ref
             .map(|profile| reg.resolve_profile_id(profile))
-            .unwrap_or_else(|| reg.active_profile_id()),
+            .unwrap_or_else(|| reg.default_access_id()),
     )
 }
 
@@ -11570,7 +11565,7 @@ impl HostState {
         profile: &str,
     ) -> (Arc<Router>, Arc<CatalogSnapshot>) {
         let resolved = reg.resolve_profile_id(profile);
-        if !reg.profiles.iter().any(|entry| entry.id == resolved) {
+        if !resolved.starts_with("@all-enabled:") && reg.access_profile(&resolved).is_none() {
             let catalog = Arc::new(CatalogSnapshot::new(base.aggregated_tools()));
             return (base, catalog);
         }
@@ -14027,10 +14022,7 @@ fn process_request(
             !reg.servers.iter().any(|server| {
                 !clients::is_gateway_server(server)
                     && !server_uses_project_root(server)
-                    && reg
-                        .profiles
-                        .iter()
-                        .any(|profile| reg.is_enabled(&profile.id, &server.id))
+                    && reg.server_enabled(&server.id)
             })
         })
     {
@@ -20602,7 +20594,7 @@ mod tests {
         let env_profile = Some("Default".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            Some(reg.active_profile_id())
+            Some(reg.default_access_id())
         );
     }
 
@@ -20618,7 +20610,7 @@ mod tests {
         let env_profile = Some("Billing".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            Some(reg.active_profile_id())
+            Some(reg.default_access_id())
         );
     }
 
@@ -20629,7 +20621,7 @@ mod tests {
         let env_profile = Some("Default".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            Some(reg.active_profile_id())
+            Some(reg.default_access_id())
         );
     }
 
@@ -20642,7 +20634,7 @@ mod tests {
         reg.set_client_scope("cursor", Some("Billing"));
         assert_eq!(
             resolve_live_profile(&reg, None, &None),
-            Some(reg.active_profile_id())
+            Some(reg.default_access_id())
         );
     }
 
@@ -24631,6 +24623,7 @@ mod tests {
         let mut reg = Registry::default();
         for id in ["alpha", "bravo"] {
             reg.servers.push(ServerEntry {
+                enabled: false,
                 inherit_env: false,
                 id: id.into(),
                 name: id.into(),
@@ -24699,6 +24692,7 @@ mod tests {
         let mut reg = Registry::default();
         for id in ["github", "atlassian"] {
             reg.servers.push(ServerEntry {
+                enabled: false,
                 inherit_env: false,
                 id: id.into(),
                 name: id.into(),
@@ -24783,6 +24777,7 @@ mod tests {
         // the hint must stay silent - otherwise every server reads as "0 tools".
         let mut reg = Registry::default();
         reg.servers.push(ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: "github".into(),
             name: "github".into(),
@@ -26264,6 +26259,7 @@ mod tests {
 
     fn stub_server(id: &str, name: &str) -> ServerEntry {
         ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: id.into(),
             name: name.into(),
@@ -30214,6 +30210,7 @@ mod tests {
         let host = dispatch_host(false);
         let mut reg = Registry::default();
         let id = reg.add_server(registry::ServerEntry {
+            enabled: false,
             inherit_env: false,
             id: String::new(),
             name: "github".to_string(),

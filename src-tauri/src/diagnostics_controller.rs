@@ -29,7 +29,7 @@ pub fn gather() -> String {
 pub(crate) fn registry_summary(registry: &Registry) -> String {
     use std::fmt::Write as _;
     let mut output = String::new();
-    let active = registry.active_profile_id();
+    let active = registry.default_access_id();
     let _ = writeln!(output, "\nsettings:");
     let _ = writeln!(output, "  lazy discovery: {}", registry.lazy_discovery);
     let global_mode = registry

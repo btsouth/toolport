@@ -188,6 +188,7 @@ fn write_registry(scratch: &Scratch, wrapped: bool) {
         request_timeout_ms: None,
         initialize_timeout_ms: None,
         launch: None,
+        enabled: false,
         inherit_env: false,
         unknown_fields: serde_json::Map::new(),
     };
