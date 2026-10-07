@@ -1,12 +1,8 @@
-import { AlertTriangle, Ban, Check, Clock, Minus, Pencil } from "lucide-react";
+import { AlertTriangle, Ban, Check, Clock, Minus } from "lucide-react";
 import type { InstructionsApplyState } from "@/lib/types";
 
 /**
- * How each per-client rules state renders. Shared by the Teams tab (org instructions, spec W4)
- * and the Rules tab (the user's own sets): both run through the same writer and report the same
- * `ApplyState`, so they must read identically. A user seeing "Not applied yet" in one place and
- * different wording for the same on-disk situation in the other would reasonably think they were
- * different problems.
+ * How each per-client instructions state renders in the Teams tab (org instructions, spec W4).
  */
 const RULE_STATE_META: Record<
   InstructionsApplyState,
@@ -30,7 +26,6 @@ const RULE_STATE_META: Record<
     Icon: Minus,
   },
   error: { label: "Write error", className: "text-destructive", Icon: AlertTriangle },
-  drifted: { label: "Edited on disk", className: "text-warning", Icon: Pencil },
 };
 
 /** Why a client is in this state, in one sentence. Surfaced as the badge's tooltip. */
@@ -43,8 +38,6 @@ const EXPLANATION: Record<InstructionsApplyState, string> = {
   unsupported:
     "This client has no global rules file Toolport can write. Paste the rules in by hand.",
   error: "The rules file could not be read or written. It was left untouched.",
-  drifted:
-    "Toolport wrote this block and it has been changed in the file since. Toolport leaves it alone until you pull the change into the set or overwrite it.",
 };
 
 /** The state badge for one client, icon + label. */

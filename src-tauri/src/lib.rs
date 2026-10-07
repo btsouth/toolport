@@ -48,7 +48,6 @@ pub mod routine_catalog;
 #[cfg(any(feature = "desktop", feature = "gtk-desktop"))]
 pub mod routine_controller;
 pub mod routines;
-pub mod rules;
 pub mod savings;
 pub mod searchtrace;
 pub mod secrets;

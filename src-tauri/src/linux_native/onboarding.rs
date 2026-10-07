@@ -132,11 +132,10 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
         .transition_duration(180)
         .vexpand(true)
         .build();
-    let rules_path = Rc::new(Cell::new(false));
 
     let welcome = wizard_page(
         "Welcome to Toolport",
-        "Set up servers and rules once, then share them with every supported AI client on this machine.",
+        "Set up servers once, then share them with every supported AI client on this machine.",
     );
     let benefits = gtk::Box::new(gtk::Orientation::Vertical, 8);
     benefits.add_css_class("toolport-settings-group");
@@ -175,9 +174,6 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
     let choose_mcp = gtk::Button::with_label("Set up MCP servers");
     choose_mcp.add_css_class("suggested-action");
     welcome_actions.append(&choose_mcp);
-    let choose_rules = gtk::Button::with_label("Write rules for my agents");
-    choose_rules.add_css_class("toolport-secondary-action");
-    welcome_actions.append(&choose_rules);
     let choose_team = gtk::Button::with_label("Join a team");
     choose_team.add_css_class("toolport-secondary-action");
     welcome_actions.append(&choose_team);
@@ -333,19 +329,8 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
     skip.connect_clicked(move |_| finish_window(&window_for_skip, &feedback_for_skip));
 
     let stack_for_mcp = stack.clone();
-    let rules_for_mcp = rules_path.clone();
     choose_mcp.connect_clicked(move |_| {
-        rules_for_mcp.set(false);
         stack_for_mcp.set_visible_child_name("add");
-    });
-    let stack_for_rules = stack.clone();
-    let rules_for_rules = rules_path.clone();
-    let list_for_rules = connect_list.clone();
-    let feedback_for_rules = connect_feedback.clone();
-    choose_rules.connect_clicked(move |_| {
-        rules_for_rules.set(true);
-        load_clients(&list_for_rules, &feedback_for_rules);
-        stack_for_rules.set_visible_child_name("connect");
     });
 
     let app_for_team = app.clone();
@@ -388,26 +373,16 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
     let feedback_for_rescan = connect_feedback.clone();
     rescan.connect_clicked(move |_| load_clients(&list_for_rescan, &feedback_for_rescan));
     let stack_for_back_connect = stack.clone();
-    let rules_for_back = rules_path.clone();
     back_connect.connect_clicked(move |_| {
-        stack_for_back_connect.set_visible_child_name(if rules_for_back.get() {
-            "welcome"
-        } else {
-            "add"
-        });
+        stack_for_back_connect.set_visible_child_name("add");
     });
     let stack_for_done = stack.clone();
     let summary_for_done = summary.clone();
     let destination_for_done = destination.clone();
-    let rules_for_done = rules_path.clone();
     let health_for_done = check_health.clone();
     let verifier_for_done = call_verifier.clone();
     continue_connect.connect_clicked(move |_| {
-        destination_for_done.set_label(if rules_for_done.get() {
-            "Set up agent rules"
-        } else {
-            "Open Playground"
-        });
+        destination_for_done.set_label("Open Playground");
         refresh_summary(&summary_for_done);
         stack_for_done.set_visible_child_name("done");
         health_for_done.emit_clicked();
@@ -418,17 +393,9 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
     let app_for_destination = app.clone();
     let window_for_destination = window.clone();
     let summary_for_destination = summary.clone();
-    let rules_for_destination = rules_path.clone();
     destination.connect_clicked(move |_| {
         if complete_and_close(&window_for_destination, &summary_for_destination) {
-            activate_page(
-                &app_for_destination,
-                if rules_for_destination.get() {
-                    "show-rules"
-                } else {
-                    "show-playground"
-                },
-            );
+            activate_page(&app_for_destination, "show-playground");
         }
     });
     let window_for_finish = window.clone();

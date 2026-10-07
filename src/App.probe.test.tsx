@@ -15,8 +15,7 @@ const setAllEnabled = vi.fn();
 // invoke onProbe exactly the way the Done step does.
 const captured: {
   onProbe: (() => Promise<ProbeResult[]>) | null;
-  onOpenRules: (() => void) | null;
-} = { onProbe: null, onOpenRules: null };
+} = { onProbe: null };
 
 vi.mock("@/lib/api", () => ({
   teamPairState: vi.fn(() => Promise.resolve(null)),
@@ -80,12 +79,8 @@ vi.mock("@/components/PendingApprovals", () => ({ PendingApprovals: () => null }
 vi.mock("@/components/QuarantineAlert", () => ({ QuarantineAlert: () => null }));
 
 vi.mock("@/components/Onboarding", () => ({
-  Onboarding: (props: {
-    onProbe: () => Promise<ProbeResult[]>;
-    onOpenRules: () => void;
-  }) => {
+  Onboarding: (props: { onProbe: () => Promise<ProbeResult[]> }) => {
     captured.onProbe = props.onProbe;
-    captured.onOpenRules = props.onOpenRules;
     return null;
   },
 }));
@@ -102,7 +97,6 @@ beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   captured.onProbe = null;
-  captured.onOpenRules = null;
   getRegistry.mockResolvedValue({
     version: 1,
     servers: [],
@@ -146,26 +140,6 @@ describe("App onboarding probe wiring", () => {
     // ...and no trailing probeServers pass was queued behind it.
     await act(async () => {});
     expect(probeServers).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe("App onboarding exit (SBS-826)", () => {
-  // SBS-826 review: `onOpenRules` must FINISH onboarding, not merely hide the wizard.
-  // Onboarding.paths.test.tsx can only assert the callback fired - the persistence lives
-  // here, so a handler that dropped `finishOnboarding()` (the way `onOpenPlayground`
-  // deliberately does) would send a rules user who skipped Connect back through the
-  // whole wizard on the next launch with nothing failing.
-  it("marks onboarding done when a rules user leaves for the Rules tab", async () => {
-    render(<App />);
-
-    await waitFor(() => expect(captured.onOpenRules).not.toBeNull());
-    expect(localStorage.getItem("toolport.onboarded")).toBeNull();
-
-    act(() => {
-      captured.onOpenRules!();
-    });
-
-    expect(localStorage.getItem("toolport.onboarded")).toBe("1");
   });
 });
 

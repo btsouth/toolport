@@ -89,9 +89,6 @@ const CatalogView = lazy(() =>
 const PlaygroundView = lazy(() =>
   import("@/components/PlaygroundView").then((m) => ({ default: m.PlaygroundView })),
 );
-const RulesView = lazy(() =>
-  import("@/components/RulesView").then((m) => ({ default: m.RulesView })),
-);
 const HooksView = lazy(() =>
   import("@/components/HooksView").then((m) => ({ default: m.HooksView })),
 );
@@ -795,17 +792,15 @@ function App() {
                       ? "Browse catalog"
                       : view === "playground"
                         ? "Playground"
-                        : view === "rules"
-                          ? "Agent rules"
-                          : view === "hooks"
-                            ? "Agent activity"
-                            : view === "teams"
-                              ? "Teams"
-                              : view === "settings"
-                                ? "Settings"
-                                : view === "clients"
-                                  ? (selectedClient?.name ?? "Clients")
-                                  : "Servers"}
+                        : view === "hooks"
+                          ? "Agent activity"
+                          : view === "teams"
+                            ? "Teams"
+                            : view === "settings"
+                              ? "Settings"
+                              : view === "clients"
+                                ? (selectedClient?.name ?? "Clients")
+                                : "Servers"}
                 </h1>
                 <p className="truncate text-sm text-muted-foreground">
                   {view === "activity"
@@ -814,21 +809,19 @@ function App() {
                       ? "Add MCP servers from the registry"
                       : view === "playground"
                         ? "Invoke a server's tools and see the raw result"
-                        : view === "rules"
-                          ? "Write your rules once, apply them to every AI client"
-                          : view === "hooks"
-                            ? "See what your agents do outside Toolport"
-                            : view === "teams"
-                              ? "Share one MCP server set across your team"
-                              : view === "settings"
-                                ? "Global discovery and security policy"
-                                : view === "clients"
-                                  ? selectedClient
-                                    ? "MCP client"
-                                    : "Manage Toolport in your installed AI tools"
-                                  : loading || !registry
-                                    ? "Loading…"
-                                    : "One gateway in front of every MCP server you run"}
+                        : view === "hooks"
+                          ? "See what your agents do outside Toolport"
+                          : view === "teams"
+                            ? "Share one MCP server set across your team"
+                            : view === "settings"
+                              ? "Global discovery and security policy"
+                              : view === "clients"
+                                ? selectedClient
+                                  ? "MCP client"
+                                  : "Manage Toolport in your installed AI tools"
+                                : loading || !registry
+                                  ? "Loading…"
+                                  : "One gateway in front of every MCP server you run"}
                 </p>
               </div>
             </div>
@@ -987,8 +980,6 @@ function App() {
                       registry={registry}
                       onRegistryChange={applyRegistryChange}
                     />
-                  ) : view === "rules" ? (
-                    <RulesView />
                   ) : view === "hooks" ? (
                     <HooksView refreshKey={activityKey} />
                   ) : view === "teams" ? (
@@ -1097,13 +1088,6 @@ function App() {
             onOpenPlayground={() => {
               setShowOnboarding(false);
               selectView("playground");
-            }}
-            onOpenRules={() => {
-              // Mark onboarding done, not merely hidden: someone who finished the rules
-              // path IS set up, and re-showing the wizard on next launch because they
-              // never added a server would be the same MCP assumption again (SBS-826).
-              finishOnboarding();
-              selectView("rules");
             }}
             onFinish={finishOnboarding}
           />
