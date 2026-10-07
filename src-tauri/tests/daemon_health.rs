@@ -452,7 +452,11 @@ fn a_saturated_daemon_still_answers_its_probe_and_is_never_duplicated() {
         if ready {
             break;
         }
-        assert!(Instant::now() < deadline, "catalog never built\n{}", log_tail(&fixture.dir));
+        assert!(
+            Instant::now() < deadline,
+            "catalog never built\n{}",
+            log_tail(&fixture.dir)
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 
@@ -461,8 +465,12 @@ fn a_saturated_daemon_still_answers_its_probe_and_is_never_duplicated() {
     let shed = Arc::new(AtomicUsize::new(0));
     let callers: Vec<_> = (0..6)
         .map(|index| {
-            let (endpoint, token, session, shed) =
-                (endpoint.clone(), token.clone(), session.clone(), Arc::clone(&shed));
+            let (endpoint, token, session, shed) = (
+                endpoint.clone(),
+                token.clone(),
+                session.clone(),
+                Arc::clone(&shed),
+            );
             std::thread::spawn(move || {
                 let result = post_mcp(
                     &endpoint,
@@ -481,11 +489,14 @@ fn a_saturated_daemon_still_answers_its_probe_and_is_never_duplicated() {
     std::thread::sleep(Duration::from_millis(700));
 
     let started = Instant::now();
-    let identity = ureq::get(&format!("http://{endpoint}{}", conduit_lib::daemon::IDENTITY_PATH))
-        .set("Authorization", &format!("Bearer {token}"))
-        .timeout(Duration::from_secs(2))
-        .call()
-        .map_err(|error| error.to_string());
+    let identity = ureq::get(&format!(
+        "http://{endpoint}{}",
+        conduit_lib::daemon::IDENTITY_PATH
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .timeout(Duration::from_secs(2))
+    .call()
+    .map_err(|error| error.to_string());
     assert!(
         identity.is_ok(),
         "a saturated daemon must answer its probe: {identity:?}\n{}",
@@ -561,7 +572,11 @@ fn a_wedged_daemon_moves_clients_to_their_own_gateways() {
     // The attached client notices the silence on its own and moves its session.
     let deadline = Instant::now() + RESPONSE_TIMEOUT;
     while !fixture.log_contains("moving to a private gateway") {
-        assert!(Instant::now() < deadline, "no wedge detected\n{}", attached.diagnostics());
+        assert!(
+            Instant::now() < deadline,
+            "no wedge detected\n{}",
+            attached.diagnostics()
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(attached.echo("after").contains("after"));
@@ -584,7 +599,10 @@ fn a_wedged_daemon_moves_clients_to_their_own_gateways() {
     drop(attached);
     let deadline = Instant::now() + Duration::from_secs(15);
     while private_pids.iter().any(|pid| pid_alive(*pid)) {
-        assert!(Instant::now() < deadline, "a private gateway outlived its adapter");
+        assert!(
+            Instant::now() < deadline,
+            "a private gateway outlived its adapter"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -675,7 +693,9 @@ fn the_http_bridge_takes_a_burst_and_sheds_only_past_its_cap() {
     let held: Vec<TcpStream> = (0..2)
         .map(|_| {
             let mut stream = TcpStream::connect(("127.0.0.1", capped_port)).unwrap();
-            stream.write_all(b"POST /mcp HTTP/1.1\r\nHost: x\r\n").unwrap();
+            stream
+                .write_all(b"POST /mcp HTTP/1.1\r\nHost: x\r\n")
+                .unwrap();
             stream
         })
         .collect();

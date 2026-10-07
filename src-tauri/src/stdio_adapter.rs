@@ -178,7 +178,10 @@ pub fn run_stdio_adapter() -> ! {
                     finish_stdio_adapter(rendezvous, descriptor, Some(child))
                 }
                 Err(detail) => {
-                    eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: {}; {detail}", error.detail);
+                    eprintln!(
+                        "toolport-gateway {STDIO_ADAPTER_FLAG}: {}; {detail}",
+                        error.detail
+                    );
                     std::process::exit(1);
                 }
             }
@@ -259,9 +262,7 @@ fn spawn_daemon() -> Result<(), String> {
 /// Start this client's own gateway beside a wedged shared daemon. It is never
 /// advertised, so no other client can elect it, and it lives exactly as long as
 /// the returned child's stdin stays open. `why` is logged with it.
-fn start_private_gateway(
-    why: &str,
-) -> Result<(std::process::Child, DaemonDescriptor), String> {
+fn start_private_gateway(why: &str) -> Result<(std::process::Child, DaemonDescriptor), String> {
     let exe = std::env::current_exe()
         .map_err(|error| format!("could not locate this executable: {error}"))?;
     let mut child = Command::new(exe)

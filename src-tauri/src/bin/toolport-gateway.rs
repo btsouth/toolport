@@ -25653,7 +25653,9 @@ mod tests {
 
         let probe = |bearer: &str| {
             let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             write!(
                 stream,
                 "GET {} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n\r\n",
@@ -25692,7 +25694,10 @@ mod tests {
 
     #[test]
     fn http_connection_cap_is_configurable_and_never_zero() {
-        assert_eq!(parse_http_max_connections(None), DEFAULT_HTTP_MAX_CONNECTIONS);
+        assert_eq!(
+            parse_http_max_connections(None),
+            DEFAULT_HTTP_MAX_CONNECTIONS
+        );
         assert_eq!(parse_http_max_connections(Some(" 32 ")), 32);
         assert_eq!(
             parse_http_max_connections(Some("0")),
