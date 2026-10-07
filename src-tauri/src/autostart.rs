@@ -137,8 +137,9 @@ pub fn rewrite_desktop_exec(contents: &str, app_path: &Path, args: &[&str]) -> S
     out
 }
 
-/// Rewrite when the existing Exec is a FUSE mount, missing, or (if `$APPIMAGE`
-/// is in play) not the persistent AppImage path.
+/// Rewrite when the existing Exec is a FUSE mount, missing, an absolute path
+/// that no longer exists, or (if `$APPIMAGE` is in play) not the persistent
+/// AppImage path.
 pub fn should_repair_desktop_exec(
     current_exec: Option<&Path>,
     resolved: &Path,
@@ -147,6 +148,7 @@ pub fn should_repair_desktop_exec(
     match current_exec {
         None => true,
         Some(p) if is_ephemeral_fuse_mount(p) => true,
+        Some(p) if p.is_absolute() && !p.exists() => true,
         Some(p) if appimage_set && p != resolved => true,
         _ => false,
     }
@@ -212,7 +214,8 @@ pub fn is_enabled_linux(app_name: &str) -> Result<bool, String> {
     Ok(dest.is_file())
 }
 
-/// If launch-at-login is already on, rewrite a FUSE-mount Exec to `$APPIMAGE`.
+/// If launch-at-login is already on, rewrite a FUSE-mount Exec to `$APPIMAGE`
+/// and a deleted binary to the running one.
 pub fn repair_linux(app_name: &str) {
     let Ok(app_path) = resolve_autostart_app_path_from_env() else {
         return;
@@ -315,11 +318,32 @@ mod tests {
     fn repair_leaves_non_appimage_current_exe_alone() {
         let dir = unique_dir("leave");
         let dest = dir.join("Toolport.desktop");
-        let exe = Path::new("/usr/bin/toolport");
-        write_linux_autostart(&dest, "Toolport", exe, AUTOSTART_ARGS).unwrap();
-        assert!(!repair_linux_autostart_file(&dest, exe, AUTOSTART_ARGS, false).unwrap());
+        let exe = dir.join("toolport");
+        std::fs::write(&exe, "").unwrap();
+        write_linux_autostart(&dest, "Toolport", &exe, AUTOSTART_ARGS).unwrap();
+        assert!(!repair_linux_autostart_file(&dest, &exe, AUTOSTART_ARGS, false).unwrap());
         let exec = desktop_exec_command(&std::fs::read_to_string(&dest).unwrap()).unwrap();
-        assert_eq!(exec, "/usr/bin/toolport");
+        assert_eq!(Path::new(&exec), exe.as_path());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A launch-at-login entry left pointing at a deleted binary (an old
+    /// AppImage under /tmp, a removed install) silently stops autostart.
+    #[test]
+    fn repair_rewrites_deleted_exec_to_running_binary() {
+        let dir = unique_dir("deleted");
+        let dest = dir.join("Toolport.desktop");
+        let exe = dir.join("toolport-gtk");
+        std::fs::write(&exe, "").unwrap();
+        let gone = dir.join("release").join("Toolport_1.21.2_amd64.AppImage");
+        write_linux_autostart(&dest, "Toolport", &gone, AUTOSTART_ARGS).unwrap();
+        assert!(repair_linux_autostart_file(&dest, &exe, AUTOSTART_ARGS, false).unwrap());
+        let contents = std::fs::read_to_string(&dest).unwrap();
+        assert_eq!(
+            desktop_exec_command(&contents).map(PathBuf::from),
+            Some(exe.clone())
+        );
+        assert!(contents.contains(" --hidden"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
