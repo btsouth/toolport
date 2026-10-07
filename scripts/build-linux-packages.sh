@@ -21,3 +21,5 @@ nfpm_bin=${NFPM_BIN:-nfpm}
   --target "$outdir/Toolport_${TOOLPORT_PACKAGE_VERSION}_amd64.deb"
 "$nfpm_bin" package --config packaging/linux/native/nfpm.yaml --packager rpm \
   --target "$outdir/Toolport_${TOOLPORT_PACKAGE_VERSION}_x86_64.rpm"
+
+node .github/scripts/package-contents.mjs "$outdir"/*.deb "$outdir"/*.rpm

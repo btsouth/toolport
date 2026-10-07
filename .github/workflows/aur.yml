@@ -137,7 +137,9 @@ jobs:
             namcap PKGBUILD || true
             pkg=$(ls -1 *.pkg.tar.*)
             echo "built $pkg"
-            bsdtar -tf "$pkg" > contents.txt
+            bsdtar -tf "$pkg" | tee contents.txt
+            unexpected=$(grep -E "^usr/bin/" contents.txt | grep -Ev "^usr/bin/(toolport-gtk|toolport-gateway|toolport|conduit)$" || true)
+            test -z "$unexpected" || { echo "::error::Unexpected binaries: $unexpected"; exit 1; }
             for want in usr/bin/toolport-gtk usr/bin/toolport-gateway usr/bin/toolport usr/bin/conduit usr/share/applications/com.tsout.Toolport.desktop usr/share/metainfo/com.tsout.Toolport.metainfo.xml usr/share/toolport/agent-plugin/toolport-agent-plugin.zip usr/share/toolport/toolport-preview-rollback.sh usr/share/licenses/toolport/LICENSE usr/share/licenses/toolport-bin/LICENSE; do
               grep -qx "$want" contents.txt || { echo "::error::$want missing from $pkg"; exit 1; }
             done

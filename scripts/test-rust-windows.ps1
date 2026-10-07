@@ -20,6 +20,7 @@ if ($resolvedGateway) {
 
 $cargoArgs = @(
   "test",
+  "--features", "test-support",
   "--manifest-path", (Join-Path $repoRoot "src-tauri\Cargo.toml"),
   "--lib",
   "--bins",

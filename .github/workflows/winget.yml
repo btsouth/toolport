@@ -1,91 +1,45 @@
 name: winget
 
-# Submits a manifest update to microsoft/winget-pkgs after a release is PUBLISHED.
-#
-# Not on the version tag, deliberately: release.yml builds into a DRAFT release,
-# and winget's validation downloads the installer URL, which 404s while the
-# release is still a draft. `released` fires when the draft is published, which
-# is also the first moment the asset is fetchable.
+# Retry publication independently of builds and release asset uploads.
 on:
   release:
     types: [released]
-  # Manual catch-up, because `release` fires exactly once per release and the
-  # submission can fail for a reason that resolves later. A NEW package waits in
-  # a moderation queue at winget-pkgs (community volunteers approve it), and
-  # `wingetcreate update` cannot run until that manifest is actually in the repo.
-  # So the approval can land days after the release whose job already failed,
-  # with no way to retry it. That is exactly what happened to 1.14.0 (SBS-903).
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to submit, e.g. v1.14.0"
+        description: "Published stable release tag to submit"
         required: true
         type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: winget-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
   submit:
-    # Backstop only - GitHub defaults to 360 minutes. Manifest submission is network-bound and small.
     timeout-minutes: 20
-    # Prereleases are not what `winget install` should hand people. On a manual
-    # run `github.event.release` is null, so the tag is checked below instead.
-    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
-    runs-on: windows-latest
+    if: ${{ (github.event_name == 'workflow_dispatch' || !github.event.release.prerelease) && !contains(github.event.release.tag_name || inputs.tag, '-') }}
+    runs-on: ubuntu-24.04
     env:
-      # A PAT with `public_repo`, because GITHUB_TOKEN cannot push to the
-      # winget-pkgs fork this submits from. Until the secret exists the step
-      # below no-ops, so adding this workflow cannot fail a release. Same
-      # gating style as the Azure signing steps in release.yml.
       WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
-      # The release trigger cannot fire for a draft or a prerelease, but a manual
-      # run can name any tag, so it gets the check the trigger gave us for free.
-      - name: Check the tag is a published, non-prerelease release
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          $release = gh release view $env:TAG --repo ${{ github.repository }} --json isDraft,isPrerelease | ConvertFrom-Json
-          if ($release.isDraft) {
-            throw "$env:TAG is still a draft. winget validation downloads the installer URL, which 404s until the release is published."
-          }
-          if ($release.isPrerelease) {
-            throw "$env:TAG is a prerelease, which is not what ``winget install`` should hand people."
-          }
-          Write-Output "$env:TAG is published and is not a prerelease."
-
-      - name: Submit the manifest update
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Validate release and submit or resume manifest PR
         if: ${{ env.WINGET_TOKEN != '' }}
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $version = $env:TAG -replace '^v', ''
-          $url = "https://github.com/${{ github.repository }}/releases/download/$env:TAG/Toolport_${version}_x64-setup.exe"
-
-          # Fail before touching winget-pkgs if the asset is not actually there,
-          # so a rename in release.yml surfaces here rather than as a rejected
-          # upstream PR days later.
-          $head = Invoke-WebRequest -Uri $url -Method Head -MaximumRedirection 5 -SkipHttpErrorCheck
-          if ($head.StatusCode -ne 200) {
-            throw "Installer not downloadable ($($head.StatusCode)): $url"
-          }
-
-          # wingetcreate is Microsoft's own tool, so this adds no third-party
-          # action to a workflow that holds a push token.
-          Invoke-WebRequest -Uri https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
-          .\wingetcreate.exe update Toolport.Toolport `
-            --version $version `
-            --urls "$url|x64|user" `
-            --submit `
-            --token $env:WINGET_TOKEN
-
+        run: node .github/scripts/winget.mjs
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
       - name: Say why nothing was submitted
         if: ${{ env.WINGET_TOKEN == '' }}
-        shell: pwsh
-        run: |
-          Write-Output "::warning::WINGET_TOKEN is not set, so no winget manifest was submitted for $env:TAG. Add the secret (PAT with public_repo) to enable this, or submit by hand from packaging/winget."
+        run: echo "::warning::WINGET_TOKEN is not set; no winget manifest was submitted."

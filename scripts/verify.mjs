@@ -40,6 +40,8 @@ if (!args.has("--frontend")) {
       "--manifest-path",
       "src-tauri/Cargo.toml",
       "--no-default-features",
+      "--features",
+      "test-support",
       "--lib",
       "--bins",
       "--tests",

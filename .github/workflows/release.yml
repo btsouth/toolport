@@ -220,7 +220,7 @@ jobs:
           Write-Host "Windows signing enabled:`n$conf"
 
       - name: Build installer
-        run: npx tauri build --config src-tauri/tauri.bundle.conf.json ${{ steps.winsign.outputs.config_arg }} --bundles ${{ matrix.bundles }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+        run: npx tauri build --config src-tauri/tauri.bundle.conf.json ${{ steps.winsign.outputs.config_arg }} --bundles ${{ matrix.bundles }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }} -- --bin conduit
         env:
           # When set, prepare-sidecar builds the gateway for this target; empty on
           # Windows/Linux, which build for the host.
@@ -320,6 +320,17 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Assert shipped archive contents (also used by Homebrew)
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = windows-latest ]; then
+            node .github/scripts/package-contents.mjs src-tauri/target/release/bundle/nsis/*-setup.exe
+          elif [ "${{ matrix.os }}" = ubuntu-22.04 ]; then
+            node .github/scripts/package-contents.mjs src-tauri/target/release/bundle/appimage/*.AppImage
+          else
+            node .github/scripts/package-contents.mjs src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
+          fi
 
       # Use the changelog entry we actually wrote. `generate_release_notes` produces a
       # flat list of every PR title with no grouping and no explanation, which for a
