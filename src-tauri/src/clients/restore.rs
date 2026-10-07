@@ -19,6 +19,7 @@ struct Snapshot {
     created_parents: Vec<PathBuf>,
     exact_eligible: bool,
     preexisting_gateways: Vec<String>,
+    disconnected: bool,
 }
 
 pub(super) fn record_path(client_id: &str, path: &Path) -> Result<PathBuf, String> {
@@ -87,6 +88,7 @@ pub(super) fn remember(
     format: Format,
     before: Option<&str>,
     after: Option<&str>,
+    disconnecting: bool,
 ) -> Result<Receipt, String> {
     let file = record_path(client_id, path)?;
     let previous = match std::fs::read_to_string(&file) {
@@ -118,6 +120,7 @@ pub(super) fn remember(
                 created_parents,
                 exact_eligible: preexisting_gateways.is_empty(),
                 preexisting_gateways,
+                disconnected: false,
             }
         }
     };
@@ -136,6 +139,10 @@ pub(super) fn remember(
             rebase_value(&mut record.baseline, &native, &path);
         }
     }
+    if disconnecting {
+        record.baseline = mutation::value(format, after)?;
+    }
+    record.disconnected = disconnecting;
     record.last_written = after.map(str::to_string);
     record.last_written_hash = after.map(crate::registry::sha256_hex);
     let file = record_path(client_id, path)?;
@@ -314,6 +321,10 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
     let Some(record) = load(client_id, path)? else {
         return Ok(false);
     };
+    mutation::disconnecting();
+    if record.disconnected {
+        return Ok(true);
+    }
     let current = if mutation::exists(path) {
         Some(read_config_file(path)?)
     } else {
@@ -550,6 +561,7 @@ pub(crate) fn after_rollback(
     if record.config_path != target.to_string_lossy() {
         return Err("Client rollback recovery path mismatch".into());
     }
+    record.disconnected = false;
     record.last_written = written.map(str::to_string);
     record.last_written_hash = written.map(crate::registry::sha256_hex);
     crate::registry::atomic_write(

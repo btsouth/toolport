@@ -6027,6 +6027,7 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
 }
 
 fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
+    mutation::disconnecting();
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     let backup = backup_file(client_id, &path)?;

@@ -14,6 +14,7 @@ struct Pending {
     auxiliary: BTreeMap<PathBuf, String>,
     strict_json: bool,
     remove: bool,
+    disconnecting: bool,
 }
 
 thread_local! {
@@ -97,6 +98,14 @@ pub(super) fn write(path: &Path, contents: &str) -> Result<(), String> {
             Some(contents),
         )
     }
+}
+
+pub(super) fn disconnecting() {
+    PENDING.with(|slot| {
+        if let Some(pending) = slot.borrow_mut().as_mut() {
+            pending.disconnecting = true;
+        }
+    });
 }
 
 pub(super) fn remove(path: &Path) -> Result<(), String> {
@@ -243,6 +252,7 @@ fn run_inner<T>(
                 format,
                 original.as_deref(),
                 original.as_deref(),
+                pending.disconnecting,
             )?;
             return Ok(result);
         }
@@ -278,6 +288,7 @@ fn run_inner<T>(
                 format,
                 original.as_deref(),
                 output.as_deref(),
+                pending.disconnecting,
             )?;
             let commit = crate::registry::client_file::commit(path, &revision, output.as_deref());
             if commit.is_err() {

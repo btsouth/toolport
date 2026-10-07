@@ -49,6 +49,7 @@ pub fn all(dry_run: bool) -> Result<Vec<ClientResult>, String> {
             Ok(())
         } else {
             mutation::run(&id, &path, format, || {
+                mutation::disconnecting();
                 backup_file(&id, &path)?;
                 restore::apply(&id, format, &path)?;
                 Ok(())
