@@ -1091,6 +1091,7 @@ mod tests {
         assert!(!should_offer(&registry, &connected));
 
         registry.servers.push(crate::registry::ServerEntry {
+            inherit_env: false,
             id: "real-server".into(),
             name: "Real server".into(),
             transport: "http".into(),

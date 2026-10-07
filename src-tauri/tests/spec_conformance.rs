@@ -120,7 +120,8 @@ fn spawn_http_fixture(revision: &str, strict: bool, transcript: Option<&str>) ->
 /// test can drive the handshake itself and observe era behaviour directly.
 fn raw_transport(env: &[(String, String)]) -> StdioTransport {
     let dirty = Arc::new(AtomicU8::new(0));
-    StdioTransport::spawn_watched(mock_bin(), &[], env, None, dirty, None).expect("spawn fixture")
+    StdioTransport::spawn_watched(mock_bin(), &[], env, None, false, dirty, None)
+        .expect("spawn fixture")
 }
 
 /// JSON-RPC error objects are carried structurally by `TransportError::Rpc`
@@ -347,7 +348,7 @@ fn downstream_transcript_pins_current_wire_format() {
     let env = env_for(None, false, Some(&path.to_string_lossy()));
 
     let dirty = Arc::new(AtomicU8::new(0));
-    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, false, dirty, None)
         .expect("spawn fixture");
     let mut server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
@@ -413,7 +414,7 @@ fn downstream_transcript_pins_current_wire_format() {
 /// Ask the fixture to reflect back whatever `_meta` reached it.
 fn relayed_meta(client_meta: &Value) -> Value {
     let dirty = Arc::new(AtomicU8::new(0));
-    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &[], None, dirty, None)
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &[], None, false, dirty, None)
         .expect("spawn fixture");
     let mut server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
@@ -503,8 +504,9 @@ fn progress_token_reaches_downstream_server() {
 #[test]
 fn downstream_progress_notification_reaches_the_bound_sink() {
     let dirty = Arc::new(AtomicU8::new(0));
-    let mut transport = StdioTransport::spawn_watched(mock_bin(), &[], &[], None, dirty, None)
-        .expect("spawn fixture");
+    let mut transport =
+        StdioTransport::spawn_watched(mock_bin(), &[], &[], None, false, dirty, None)
+            .expect("spawn fixture");
 
     let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_seen = Arc::clone(&seen);
@@ -554,7 +556,7 @@ fn gateway_connects_to_a_modern_server() {
     let env = env_for(Some(MODERN), true, Some(&path.to_string_lossy()));
 
     let dirty = Arc::new(AtomicU8::new(0));
-    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, false, dirty, None)
         .expect("spawn fixture");
     let mut server = DownstreamServer::connect("mock".to_string(), Box::new(transport))
         .expect("a dual-era gateway must connect to a modern server");
@@ -631,7 +633,7 @@ fn legacy_client_is_shimmed_across_a_modern_mrtr_server() {
     let _ = std::fs::remove_file(&path);
     let env = env_for(Some(MODERN), true, Some(&path.to_string_lossy()));
     let dirty = Arc::new(AtomicU8::new(0));
-    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, false, dirty, None)
         .expect("spawn fixture");
     let mut server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
@@ -681,7 +683,7 @@ fn modern_client_controls_native_mrtr_retry_fields() {
     let _ = std::fs::remove_file(&path);
     let env = env_for(Some(MODERN), true, Some(&path.to_string_lossy()));
     let dirty = Arc::new(AtomicU8::new(0));
-    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, false, dirty, None)
         .expect("spawn fixture");
     let mut server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
@@ -735,7 +737,7 @@ fn modern_client_resumes_legacy_stdio_hitl_without_replaying_the_tool() {
     let _ = std::fs::remove_file(&path);
     let env = env_for(Some("2025-11-25"), true, Some(&path.to_string_lossy()));
     let dirty = Arc::new(AtomicU8::new(0));
-    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, false, dirty, None)
         .expect("spawn legacy fixture");
     let mut server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
@@ -953,7 +955,7 @@ fn legacy_server_that_rejects_initialize_still_fails_fast() {
     // Sending a bad `initialize` makes it error, then go silent on the probe.
     let dirty = Arc::new(AtomicU8::new(0));
     let env = env_for(Some("2025-06-18"), true, None);
-    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, false, dirty, None)
         .expect("spawn fixture");
 
     let started = std::time::Instant::now();
@@ -990,7 +992,7 @@ fn legacy_servers_see_no_era_detection_traffic() {
     let env = env_for(Some("2025-06-18"), true, Some(&path.to_string_lossy()));
 
     let dirty = Arc::new(AtomicU8::new(0));
-    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, false, dirty, None)
         .expect("spawn fixture");
     let mut server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
@@ -1054,7 +1056,7 @@ fn the_gateway_forwards_icons_through_tool_aggregation() {
 
     let env = env_for(Some("2025-11-25"), false, None);
     let dirty = Arc::new(AtomicU8::new(0));
-    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, false, dirty, None)
         .expect("spawn fixture");
     let server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
@@ -1103,7 +1105,7 @@ fn a_legacy_server_sees_client_meta_relayed_but_never_protocol_meta() {
     let env = env_for(Some("2025-06-18"), true, Some(&path.to_string_lossy()));
 
     let dirty = Arc::new(AtomicU8::new(0));
-    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, false, dirty, None)
         .expect("spawn fixture");
     let mut server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
@@ -1241,8 +1243,9 @@ fn legacy_era_pins_the_version_the_server_actually_answered() {
         );
         let env = env_for(Some(revision), true, None);
         let dirty = Arc::new(AtomicU8::new(0));
-        let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
-            .expect("spawn fixture");
+        let transport =
+            StdioTransport::spawn_watched(mock_bin(), &[], &env, None, false, dirty, None)
+                .expect("spawn fixture");
         let server = DownstreamServer::connect("mock".to_string(), Box::new(transport))
             .unwrap_or_else(|e| panic!("connect to a {revision} server: {e}"));
 

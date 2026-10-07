@@ -183,9 +183,14 @@ fn catalog_values_survive_vault_reload_probe_sharing_and_gateway_launch() {
         // Exercise the exact prewarm resolver and a real child handshake too.
         let args = launch_inputs::resolve_args_for_prewarm(server).unwrap();
         if name == "Twilio" {
-            let transport =
-                conduit_lib::downstream::StdioTransport::spawn("node", &args.args, &[], None)
-                    .unwrap();
+            let transport = conduit_lib::downstream::StdioTransport::spawn(
+                "node",
+                &args.args,
+                &[],
+                None,
+                false,
+            )
+            .unwrap();
             assert_eq!(
                 conduit_lib::downstream::DownstreamServer::connect(id.clone(), Box::new(transport))
                     .unwrap()

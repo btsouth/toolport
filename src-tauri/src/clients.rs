@@ -5419,6 +5419,7 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
         env.push(env_var(crate::brand::PROFILE, p));
     }
     Ok(ServerEntry {
+        inherit_env: false,
         id: GATEWAY_ENTRY_NAME.to_string(),
         name: GATEWAY_ENTRY_NAME.to_string(),
         transport: "stdio".to_string(),
@@ -5506,6 +5507,7 @@ pub fn gateway_entry_shared_http(
         // Bridge form (Claude Desktop, etc.): third-party mcp-remote is opt-in
         // only when the user chooses Shared HTTP in Integrations (SOU-407).
         ServerEntry {
+            inherit_env: false,
             id: GATEWAY_ENTRY_NAME.to_string(),
             name: GATEWAY_ENTRY_NAME.to_string(),
             transport: "stdio".to_string(),
@@ -5548,6 +5550,7 @@ pub fn gateway_entry_shared_http(
             });
         }
         ServerEntry {
+            inherit_env: false,
             id: GATEWAY_ENTRY_NAME.to_string(),
             name: GATEWAY_ENTRY_NAME.to_string(),
             transport: "http".to_string(),
@@ -6985,6 +6988,7 @@ mod tests {
             });
         }
         ServerEntry {
+            inherit_env: false,
             id: GATEWAY_ENTRY_NAME.to_string(),
             name: GATEWAY_ENTRY_NAME.to_string(),
             transport: "stdio".to_string(),
@@ -7122,6 +7126,7 @@ mod tests {
 
     fn stdio(name: &str) -> ServerEntry {
         ServerEntry {
+            inherit_env: false,
             id: name.to_string(),
             name: name.to_string(),
             transport: "stdio".to_string(),
@@ -7149,6 +7154,7 @@ mod tests {
 
     fn remote(name: &str, transport: &str) -> ServerEntry {
         ServerEntry {
+            inherit_env: false,
             id: name.to_string(),
             name: name.to_string(),
             transport: transport.to_string(),

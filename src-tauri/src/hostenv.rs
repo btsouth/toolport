@@ -176,6 +176,54 @@ pub fn strip_bundled_env(cmd: &mut Command) {
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 pub fn strip_bundled_env(_cmd: &mut Command) {}
 
+/// Whether `name` is one of the AppImage bundle variables above.
+///
+/// The host daemon is a re-exec of our own bundled payload, so it keeps these
+/// (clearing them would leave it unable to find the bundle's libraries at
+/// dynamic-link time). A third-party MCP child never gets them, because it
+/// inherits neither the allowlist nor this set (SEC-04).
+pub fn is_bundled_env_name(name: &str) -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        BUNDLED_VARS
+            .iter()
+            .any(|key| key.eq_ignore_ascii_case(name))
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+/// [`strip_bundled_env`] applied to an environment map rather than a [`Command`].
+///
+/// The map counterpart exists because a spawned child now starts from a cleared
+/// environment and receives an explicit allowlist, so the bundled variables can
+/// leak back in through that map (in practice `XDG_DATA_DIRS`, which `AppRun`
+/// prepends to). Call it on the copied subset, before merging the server's own
+/// `env`, so a deliberately configured bundled variable still wins. A no-op
+/// outside an AppImage.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn strip_bundled_from_env(env: &mut std::collections::BTreeMap<String, String>) {
+    let Ok(appdir) = std::env::var("APPDIR") else {
+        return;
+    };
+    for key in BUNDLED_VARS {
+        env.remove(*key);
+    }
+    if let Some(dirs) = env.get("XDG_DATA_DIRS") {
+        let kept: Vec<&str> = dirs
+            .split(':')
+            .filter(|p| !p.is_empty() && !p.starts_with(&appdir))
+            .collect();
+        env.insert("XDG_DATA_DIRS".to_string(), kept.join(":"));
+    }
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+pub fn strip_bundled_from_env(_env: &mut std::collections::BTreeMap<String, String>) {}
+
 /// The half of [`strip_bundled_env`] that does not read the process environment,
 /// so it can be tested without mutating it.
 #[cfg(all(unix, not(target_os = "macos")))]

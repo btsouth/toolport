@@ -353,6 +353,7 @@ pub fn apply_add_server(registry: &mut Registry, fields: ServerFields) -> Result
     Ok(apply_add_entry(
         registry,
         ServerEntry {
+            inherit_env: false,
             id: String::new(),
             name: fields.name,
             transport: fields.transport,
@@ -378,6 +379,7 @@ pub fn apply_add_entry(registry: &mut Registry, entry: ServerEntry) -> String {
 
 pub(crate) fn server_from_detected(server: &clients::McpServer, client_id: &str) -> ServerEntry {
     ServerEntry {
+        inherit_env: false,
         id: String::new(),
         name: server.name.clone(),
         transport: server.transport.clone(),
@@ -611,6 +613,7 @@ pub fn add_snippet_server(
 
 fn catalog_server(entry: crate::catalog::CatalogEntry) -> ServerEntry {
     ServerEntry {
+        inherit_env: false,
         id: String::new(),
         name: entry.name,
         transport: entry.transport,
@@ -696,6 +699,7 @@ pub fn server_entry_for_probe(
         None => {
             let fields = fields.normalized()?;
             Ok(ServerEntry {
+                inherit_env: false,
                 id: "native-connection-test".into(),
                 name: fields.name,
                 transport: fields.transport,
@@ -2200,6 +2204,7 @@ mod tests {
 
     fn server(id: &str) -> ServerEntry {
         ServerEntry {
+            inherit_env: false,
             id: id.into(),
             name: id.into(),
             transport: "stdio".into(),
