@@ -138,7 +138,8 @@ stdio clients. This preserves HTTP access during the upgrade.
 Before its first edit, Toolport saves exact original bytes or a file-absent record
 under its data directory's `backups/<client>/original-<path hash>.json`. The record
 includes the path, content hash, capture time and Toolport version. It is separate
-from the rotating backups and uses owner-only permissions on Unix.
+from the rotating backups and uses owner-only permissions (Unix modes or a
+private Windows ACL).
 
 Disconnect restores exact original bytes when the config still matches Toolport's
 last write and no intervening native edits were observed. Otherwise it preserves

@@ -15,6 +15,8 @@ use serde::Serialize;
 
 use crate::registry::{ManagedEntry, ServerEntry};
 
+#[cfg(windows)]
+mod backup_permissions;
 mod disconnect;
 pub use disconnect::{all as disconnect_all, ClientResult as DisconnectResult};
 mod moved;
@@ -3286,6 +3288,8 @@ fn backup_file(client_id: &str, path: &Path) -> Result<Option<PathBuf>, String> 
 
 fn secure_backup_dir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    backup_permissions::secure(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
