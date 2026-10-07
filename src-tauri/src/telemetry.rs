@@ -340,6 +340,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn activity_reads_shared_gateway_counters_and_reports_unknown_health() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = scratch("activity-health");
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        let compat =
+            crate::topology::CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string());
+        for remote in [
+            Some(Health {
+                queue_dropped: 7,
+                ..Health::default()
+            }),
+            None,
+        ] {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let endpoint = server.server_addr().to_ip().unwrap().to_string();
+            let mut descriptor =
+                crate::daemon::DaemonDescriptor::new(endpoint, "test-only-token".into(), &compat);
+            descriptor.pid = 0;
+            crate::daemon::write_descriptor(
+                &crate::daemon::descriptor_path(&dir, &compat),
+                &descriptor,
+            )
+            .unwrap();
+            let body = serde_json::json!({"compat": compat.fingerprint(), "telemetry": remote});
+            let server_thread = std::thread::spawn(move || {
+                let request = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(request.url(), crate::daemon::IDENTITY_PATH);
+                assert!(request
+                    .headers()
+                    .iter()
+                    .any(|header| header.field.equiv("Authorization")
+                        && header.value.as_str() == "Bearer test-only-token"));
+                request
+                    .respond(tiny_http::Response::from_string(body.to_string()))
+                    .unwrap();
+            });
+            let status = activity_health();
+            server_thread.join().unwrap();
+            if remote.is_some() {
+                assert!(status["queueDropped"].as_u64().unwrap() >= 7);
+                assert_ne!(status["unavailable"], true);
+            } else {
+                assert_eq!(status["unavailable"], true);
+                assert!(activity_notices(&status)
+                    .iter()
+                    .any(|note| note.contains("health is unavailable")));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn fixture_record(n: u64) -> Record {
         Record {
             path: PathBuf::from("unused"),

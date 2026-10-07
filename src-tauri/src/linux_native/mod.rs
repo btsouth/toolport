@@ -137,7 +137,10 @@ pub fn run() {
             action.activate(Some(&uri.to_variant()));
         }
     });
-    app.connect_shutdown(|_| crate::oauth_controller::cancel_all_attempts());
+    app.connect_shutdown(|_| {
+        crate::oauth_controller::cancel_all_attempts();
+        crate::telemetry::shutdown();
+    });
     app.run_with_args(&args);
     if let Some(tray) = tray {
         tray.shutdown().wait();

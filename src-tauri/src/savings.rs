@@ -694,7 +694,8 @@ mod tests {
             std::fs::write(&path, old).unwrap();
             let result = with_atomic_failure(step, || super::append_lines_at(&path, &[old.trim().into()], 1, 1));
             assert!(result.is_err());
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), old.repeat(2));
+            let appended = serde_json::from_str::<serde_json::Value>(old).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{old}{appended}\n"));
         }
         super::append_lines_at(&path, &[old.trim().into()], 1, 1).unwrap();
         std::fs::remove_dir_all(root).unwrap();

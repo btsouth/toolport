@@ -151,7 +151,9 @@ fn finish_stdio_adapter(
     descriptor: DaemonDescriptor,
     private: Option<std::process::Child>,
 ) -> ! {
-    match proxy_stdio(rendezvous, descriptor, private) {
+    let result = proxy_stdio(rendezvous, descriptor, private);
+    crate::telemetry::shutdown();
+    match result {
         Ok(()) => std::process::exit(0),
         Err(error) => {
             eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: {error}");
@@ -207,7 +209,8 @@ pub fn run_selected_stdio_adapter() {
             unresponsive: true,
             ..
         }) => {
-            crate::gatewaylog::append("topology: role=standalone reason=daemon-unresponsive");
+            crate::gatewaylog::set_role(crate::gatewaylog::Role::Private);
+            crate::gatewaylog::append("topology: role=private reason=daemon-unresponsive");
             crate::daemon::add_status_note(IN_PROCESS_FALLBACK_NOTE);
             eprintln!(
                 "toolport-gateway: the host daemon is not answering ({detail}); \
@@ -219,7 +222,8 @@ pub fn run_selected_stdio_adapter() {
             safe_to_fallback: true,
             ..
         }) => {
-            crate::gatewaylog::append("topology: role=standalone reason=daemon-startup-fallback");
+            crate::gatewaylog::set_role(crate::gatewaylog::Role::Private);
+            crate::gatewaylog::append("topology: role=private reason=daemon-startup-fallback");
             eprintln!(
                 "toolport-gateway: host daemon could not be launched ({detail}); \
                  using the in-process gateway"
