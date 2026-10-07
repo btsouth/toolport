@@ -13861,9 +13861,19 @@ fn process_request(
     } else {
         base_router
     };
-    // Root-specific uncached discovery has the same bounded first-list wait as
-    // ordinary servers. A cached rooted catalog remains immediately readable.
-    if method == "tools/list" && daemon_adapter && rooted_router.aggregated_tools().is_empty() {
+    // Rooted prompt/resource catalogs are not on disk either. Demand them and
+    // use the same bounded first-list wait as ordinary servers.
+    let rooted_list = matches!(
+        method,
+        "resources/list" | "resources/templates/list" | "prompts/list"
+    );
+    if daemon_adapter && rooted_list {
+        rooted_router
+            .demand_servers(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)));
+    }
+    if daemon_adapter
+        && (rooted_list || method == "tools/list" && rooted_router.aggregated_tools().is_empty())
+    {
         let deadline = Instant::now() + Duration::from_secs(30);
         while rooted_router
             .any_starting(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
@@ -19306,6 +19316,68 @@ mod tests {
                     "{method} returned the tools-only cache"
                 );
             });
+        }
+    }
+
+    #[test]
+    fn supervisor_rooted_prompts_and_resources_wait_even_with_cached_tools() {
+        let _env = DataDirTestEnv::new("supervisor-rooted-lists");
+        for (method, field) in [
+            ("prompts/list", "prompts"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+        ] {
+            let state = http_state(false);
+            state.daemon_mode.store(true, Ordering::SeqCst);
+            let root = _env.dir.display().to_string();
+            let _context = ActiveRequestContextGuard::enter(ActiveRequestContext {
+                adapter_root: Some(root.clone()),
+                ..ActiveRequestContext::default()
+            });
+            let mut server = stub_server("cache", "Cache");
+            server.cwd = Some("${ROOT}".into());
+            let mut reg = Registry::default();
+            reg.servers.push(server);
+            reg.set_server_enabled("default", "cache", true).unwrap();
+            *state.registry.lock().unwrap() = reg.clone();
+            let keys = root_launch_keys(&daemon_root_servers(&reg), &root, 0);
+            let view = Arc::new(cached_supervisor());
+            let subs = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
+            {
+                let mut pool = state.root_launch_pool.lock().unwrap();
+                pool.specs = daemon_root_servers(&reg);
+                pool.base = Some(state.router.lock().unwrap().clone());
+                pool.launches.insert(
+                    keys[0].clone(),
+                    RootLaunch {
+                        slot: view.server_slot("cache").unwrap(),
+                        subscriptions: Arc::clone(&subs),
+                        subscription_key: ("cache".into(), root.clone()),
+                        active: Arc::new(AtomicBool::new(true)),
+                    },
+                );
+                pool.subscriptions.insert(("cache".into(), root), subs);
+                pool.views.insert(keys, view);
+            }
+            let reply = process_request(
+                &state,
+                &json!({"jsonrpc":"2.0","id":1,"method":method}),
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                None,
+                Some("default"),
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .unwrap();
+            assert_eq!(
+                reply["result"][field].as_array().unwrap().len(),
+                1,
+                "{method} returned the rooted tools-only cache"
+            );
         }
     }
 
