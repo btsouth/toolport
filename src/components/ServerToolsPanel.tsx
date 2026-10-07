@@ -618,7 +618,7 @@ export function ServerToolsPanel({
 }: ServerToolsProps) {
   const servers = registry?.servers ?? [];
   const denyDestructive = registry?.denyDestructive ?? false;
-  const activeProfileId = `${registry?.defaultAccessProfileId}:${registry?.defaultAccessContextId}`;
+  const defaultAccessKey = `${registry?.defaultAccessProfileId}:${registry?.defaultAccessContextId}:${registry?.defaultAccessLegacyPolicy}`;
   const overrideVersion = JSON.stringify(registry?.toolOverrides?.[serverId] ?? {});
 
   const [tab, setTab] = useState<"tools" | "resources" | "prompts">("tools");
@@ -690,7 +690,7 @@ export function ServerToolsPanel({
     return () => {
       alive = false;
     };
-  }, [serverId, activeProfileId, overrideVersion]);
+  }, [serverId, defaultAccessKey, overrideVersion]);
 
   const tool = useMemo(
     () => tools?.find((t) => t.name === selectedTool) ?? null,
@@ -874,7 +874,7 @@ export function ServerToolsPanel({
   return (
     <div className="flex max-w-3xl flex-col gap-5">
       <p className="text-xs text-muted-foreground">
-        Calls follow the active profile and gateway policy, including approval gates.
+        Calls use the default access and gateway policy, including approval gates.
       </p>
 
       {serverId && (

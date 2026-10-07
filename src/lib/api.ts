@@ -258,7 +258,7 @@ export function clearActivityLogs(): Promise<void> {
 }
 
 /** Every pinned tool's verifiable identity (alias -> server/profiles + fingerprint +
- * first-seen/last-changed) for the active profile. Empty until a baseline is pinned. */
+ * first-seen/last-changed) for the default access. Empty until a baseline is pinned. */
 export function getToolIdentities(): Promise<ToolIdentity[]> {
   return invoke<ToolIdentity[]>("list_tool_identities");
 }

@@ -173,7 +173,7 @@ export interface ProbeResult {
 
 /** A tool as advertised by a downstream MCP server (raw `tools/list` entry). */
 export interface McpTool {
-  /** Retained quarantine state for the active profile, supplied by Toolport. */
+  /** Retained quarantine state for the default access, supplied by Toolport. */
   toolportQuarantine?: "quarantined" | "clear" | "unknown";
   name: string;
   description?: string;
@@ -543,7 +543,7 @@ export interface Registry {
    * global default; 0 = never shape (full fidelity); n = cap that server at n bytes. */
   resultBudgets?: Record<string, number>;
   /** Which profile each client was connected with, keyed by client id (e.g.
-   * "cursor" -> "Billing"). Absent = that client follows the active profile. */
+   * "cursor" -> "Billing"). Absent = that client uses the default access. */
   clientScopes?: Record<string, string>;
   /** What Toolport last wrote into each client config as its gateway entry
    * (SOU-406 ownership record). Absent key = pre-ownership install. */

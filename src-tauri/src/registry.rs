@@ -3726,6 +3726,7 @@ fn migrate_curated_legacy(registry: &mut Registry) -> bool {
             server.name.as_str(),
             "Twilio" | "PostgreSQL" | "Filesystem" | "Browserbase" | "Qdrant" | "AWS"
         ) {
+            server.enabled = false;
             for profile in &mut registry.profiles {
                 profile.enabled_server_ids.retain(|id| id != &server.id);
             }

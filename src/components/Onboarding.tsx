@@ -408,8 +408,8 @@ function JoinTeam({
     return (
       <>
         <StepHeader icon={<Check className="size-5" />} title="You're on the team">
-          Your team's shared servers were added to your active profile. Local and LAN
-          servers stay off until you review and enable them.
+          Your team's shared servers were added to Toolport. Local and LAN servers stay
+          off until you review and enable them.
         </StepHeader>
         <Button onClick={onFinish} className="self-start">
           Finish setup

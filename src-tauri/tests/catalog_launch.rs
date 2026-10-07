@@ -360,6 +360,8 @@ fn legacy_twilio_migration_keeps_vault_keys_and_requires_missing_account_setup()
     let migrated = registry::load().unwrap();
     assert_eq!(migrated.servers[1], edited);
     assert!(!migrated.is_enabled("default", "twilio-work"));
+    assert!(!migrated.server_enabled("twilio-work"));
+    assert!(!migrated.is_enabled(&migrated.default_access_id(), "twilio-work"));
     assert!(migrated.is_enabled("default", "twilio-custom"));
     assert!(launch_inputs::resolve_args(&migrated.servers[0])
         .unwrap_err()
