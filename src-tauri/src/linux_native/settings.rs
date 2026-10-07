@@ -180,7 +180,6 @@ impl SettingsPage {
             "Code mode",
             "Off by default. Enable agents to combine scoped tool calls in one sandboxed server-side script. TOOLPORT_CODE_MODE=1 forces it on.",
         );
-        capabilities.append(&code_row);
         page.append(&capabilities);
 
         let pinned_section = gtk::Box::new(gtk::Orientation::Vertical, 8);
