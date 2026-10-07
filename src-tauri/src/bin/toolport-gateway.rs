@@ -17908,6 +17908,8 @@ fn spawn_daemon_idle_watchdog(
             continue;
         }
         glog("daemon: idle exit");
+        // Land any queued audit/savings/search-trace lines before the process exits.
+        conduit_lib::telemetry::flush();
         std::process::exit(0);
     });
 }
@@ -18022,6 +18024,8 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
         conduit_lib::daemon::idle_grace(),
     );
     serve_http_loop_with_inflight(server, state, Some(token), search, confirm, false, inflight);
+    // Land any queued telemetry before returning; the process exits right after.
+    conduit_lib::telemetry::flush();
     conduit_lib::daemon::clear_descriptor(&descriptor_path);
     std::process::exit(0);
 }
@@ -18362,6 +18366,8 @@ fn serve_http_proxy(port: u16) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(20));
     }
     state.release();
+    // stdin closed: land any queued telemetry before returning from the proxy loop.
+    conduit_lib::telemetry::flush();
     Ok(())
 }
 
@@ -19769,6 +19775,9 @@ fn main() {
     for worker in stdio_workers {
         let _ = worker.join();
     }
+    // Client disconnected (stdin EOF or a broken pipe): land any queued
+    // audit/savings/search-trace lines before this gateway exits.
+    conduit_lib::telemetry::flush();
 }
 
 #[cfg(test)]
@@ -22206,6 +22215,8 @@ mod tests {
         assert_eq!(executed["isError"], false);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
+        // The audit append is asynchronous now: land it before reading the file.
+        conduit_lib::telemetry::flush();
         let audit = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
         let run_entries: Vec<Value> = audit
             .lines()
@@ -24356,6 +24367,8 @@ mod tests {
             note(&observe("f", false)).is_none(),
             "repetition must stay silent toward the model"
         );
+        // The audit append is asynchronous now: land it before reading the file.
+        conduit_lib::telemetry::flush();
         let audit_log = std::fs::read_to_string(dir.join("audit.jsonl")).expect("audit log exists");
         let published: Vec<&str> = audit_log
             .lines()
@@ -24829,6 +24842,8 @@ mod tests {
         );
         assert_eq!(routines::list().unwrap().len(), 1);
 
+        // The audit append is asynchronous now: land it before reading the file.
+        conduit_lib::telemetry::flush();
         let audit = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
         assert!(!audit.contains("SOURCE_MARKER"));
         assert!(!audit.contains("ARGUMENT_MARKER"));
@@ -26574,6 +26589,8 @@ mod tests {
 
         assert_eq!(call.status, 200, "body={}", call.body);
 
+        // The audit append is asynchronous now: land it before reading the file.
+        conduit_lib::telemetry::flush();
         let audit = std::fs::read_to_string(dir.join("audit.jsonl")).expect("audit log exists");
 
         let entry: Value = audit

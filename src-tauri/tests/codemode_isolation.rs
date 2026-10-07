@@ -211,6 +211,22 @@ impl Gateway {
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
     }
+
+    /// The audit log, polled until `ready` holds or a short deadline passes.
+    ///
+    /// The gateway now queues audit lines on a background writer (P1.6), so a row
+    /// can land up to one flush interval (250 ms) after the response that produced
+    /// it. Tests that read the file the instant a call returns must tolerate that.
+    fn audit_until(&self, mut ready: impl FnMut(&[Value]) -> bool) -> Vec<Value> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let entries = self.audit();
+            if ready(&entries) || Instant::now() >= deadline {
+                return entries;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
 }
 
 impl Drop for Gateway {
@@ -292,9 +308,19 @@ fn allocating_scripts_fail_without_killing_stdio_gateway() {
         let recovery = gateway.run(json!({ "script": "return 7;" }));
         assert_eq!(recovery["isError"], false, "next worker failed: {recovery}");
     }
+    let memory_failures = gateway.audit_until(|entries| {
+        entries
+            .iter()
+            .filter(|entry| {
+                entry["server"] == "toolport"
+                    && entry["tool"] == "run_script"
+                    && entry["error"] == "code_mode_memory_budget"
+            })
+            .count()
+            == 2
+    });
     assert_eq!(
-        gateway
-            .audit()
+        memory_failures
             .iter()
             .filter(|entry| entry["server"] == "toolport"
                 && entry["tool"] == "run_script"
@@ -330,8 +356,14 @@ fn script_error_text_cannot_impersonate_memory_exhaustion() {
         );
         assert_eq!(metadata["checkpoint"]["step"], 1, "{failure}");
     }
-    let failures: Vec<Value> = gateway
-        .audit()
+    let run_scripts = gateway.audit_until(|entries| {
+        entries
+            .iter()
+            .filter(|entry| entry["server"] == "toolport" && entry["tool"] == "run_script")
+            .count()
+            == 4
+    });
+    let failures: Vec<Value> = run_scripts
         .into_iter()
         .filter(|entry| entry["server"] == "toolport" && entry["tool"] == "run_script")
         .collect();
@@ -490,8 +522,12 @@ fn isolated_host_call_cannot_skip_human_approval() {
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .any(|req| req["method"] == "tools/call"));
-    assert!(gateway
-        .audit()
+    let audit = gateway.audit_until(|entries| {
+        entries
+            .iter()
+            .any(|entry| entry["server"] == "s" && entry["decision"] == "unreachable")
+    });
+    assert!(audit
         .iter()
         .any(|entry| entry["server"] == "s" && entry["decision"] == "unreachable"));
 }

@@ -28,6 +28,9 @@ pub fn audit_path() -> Option<PathBuf> {
 /// success, so the caller can honestly confirm the log is gone rather than report a
 /// false "cleared". Local and irreversible; the next call re-creates the file.
 pub fn try_clear() -> std::io::Result<()> {
+    // Write anything queued before deleting, so a line already accepted by a
+    // `record_*` call cannot reappear after the clear.
+    crate::telemetry::flush();
     let Some(path) = audit_path() else {
         return Ok(());
     };
@@ -639,27 +642,41 @@ fn write_line_at(path: &Path, entry: &Value) {
 /// Append one audit line, trimming to [`KEEP_LINES`] once the log passes
 /// [`MAX_AUDIT_BYTES`].
 ///
-/// The locked append and the rotation live in [`crate::registry::append_line_locked`],
+/// The locked append and the rotation live in [`crate::registry::append_lines_locked`],
 /// shared with the agent-hook sensor log so both files keep the same cross-process
 /// guarantees by construction rather than by two copies staying in step (#708,
-/// SBS-868, SBS-869).
+/// SBS-868, SBS-869). Normal writes queue on the background telemetry writer so the
+/// lock and any rotation stay off the call path ([`crate::telemetry`]).
 fn write_line_at_with_rotation_hook(
     path: &Path,
     entry: &Value,
     after_snapshot: Option<&mut dyn FnMut()>,
 ) {
-    if let Err(error) = crate::registry::append_line_locked(
+    // The rotation hook is a cross-process test seam and must run on the calling
+    // thread, so a hook forces the synchronous path.
+    if after_snapshot.is_some() {
+        if let Err(error) = crate::registry::append_line_locked(
+            path,
+            &entry.to_string(),
+            MAX_AUDIT_BYTES,
+            KEEP_LINES,
+            after_snapshot,
+        ) {
+            eprintln!(
+                "toolport: audit record dropped for '{}': {error}",
+                path.display()
+            );
+        }
+        return;
+    }
+    crate::telemetry::record(
         path,
         &entry.to_string(),
-        MAX_AUDIT_BYTES,
-        KEEP_LINES,
-        after_snapshot,
-    ) {
-        eprintln!(
-            "toolport: audit record dropped for '{}': {error}",
-            path.display()
-        );
-    }
+        crate::telemetry::Rotation::TrimTail {
+            max_bytes: MAX_AUDIT_BYTES,
+            keep_lines: KEEP_LINES,
+        },
+    );
 }
 
 /// The most recent `limit` entries, newest first.
@@ -669,6 +686,10 @@ fn write_line_at_with_rotation_hook(
 /// "no tool calls" / Protection active (SBS-873). Unparseable lines are skipped
 /// — a mid-write or corrupt line is not an IO failure.
 pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
+    // This process may have accepted audit lines that are still queued for the
+    // background writer; land them before reading so a caller never misses its own
+    // writes.
+    crate::telemetry::flush();
     let Some(path) = audit_path() else {
         return Ok(Vec::new());
     };
@@ -710,6 +731,8 @@ fn latency(durs: &mut [u64]) -> (Option<u64>, Option<u64>) {
 ///
 /// Same empty-vs-unreadable contract as [`read_recent`] (SBS-873).
 pub fn read_all() -> std::io::Result<Vec<Value>> {
+    // Land this process's queued audit lines before reading (see `read_recent`).
+    crate::telemetry::flush();
     let Some(path) = audit_path() else {
         return Ok(Vec::new());
     };
@@ -747,6 +770,8 @@ pub fn tool_call_ok(entry: &Value) -> Option<bool> {
 /// retained (the byte cap bounds it), not a fixed window, so the error rate stays consistent
 /// with the call count instead of being taken over an arbitrary slice.
 pub fn stats() -> std::io::Result<Value> {
+    // Land this process's queued audit lines before aggregating (see `read_recent`).
+    crate::telemetry::flush();
     // Read on every request: metadata alone can miss equal-length replacements,
     // coarse timestamps, and changes from another gateway process.
     let content = match audit_path().map(std::fs::read_to_string) {
@@ -1309,6 +1334,7 @@ mod tests {
         ));
         let path = root.join("nested").join("audit.jsonl");
         write_line_at(&path, &json!({"server":"fixture","ok":true}));
+        crate::telemetry::flush();
         let content = std::fs::read_to_string(&path).expect("audit line");
         assert!(content.ends_with('\n'));
         assert_eq!(content.lines().count(), 1);
@@ -1343,6 +1369,7 @@ mod tests {
             Path::new(&path),
             &json!({"server":"sentinel","marker":"between-snapshot-and-replace"}),
         );
+        crate::telemetry::flush();
         std::fs::write(done, "done").expect("signal sentinel append complete");
     }
 
@@ -1441,6 +1468,9 @@ mod tests {
                     &json!({"server":"stress","newId":format!("{child_id}-{seq}")}),
                 );
             }
+            // The parent reads only after this process exits, so land every queued
+            // line here instead of relying on the writer's next interval.
+            crate::telemetry::flush();
             return;
         }
 

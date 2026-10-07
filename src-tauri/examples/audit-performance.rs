@@ -113,11 +113,23 @@ fn main() {
         },
         20,
     );
+    // Call-path cost of recording one audit line. Before P1.6 this took the
+    // cross-process lock, wrote and (past the cap) rotated inline; now it formats
+    // the line and hands it to the background writer, so this is the number a
+    // routed call actually pays for telemetry.
+    let record_call = measure(
+        || {
+            audit::record_timed("server-0", "tool-0", true, Some(1), None, None);
+        },
+        10_000,
+    );
+    conduit_lib::telemetry::flush();
     println!(
         "{}",
         json!({"profile": if cfg!(debug_assertions) {"debug"} else {"release"},
         "rows": 10_000, "bytes": content.len(), "recent_200": recent,
         "stats_uncached": uncached, "stats_unchanged": unchanged,
-        "rewrite_and_uncached_stats": changing_uncached, "rewrite_and_stats": changing})
+        "rewrite_and_uncached_stats": changing_uncached, "rewrite_and_stats": changing,
+        "record_call": record_call})
     );
 }

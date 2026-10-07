@@ -62,6 +62,7 @@ pub mod stdio_adapter;
 pub mod team_activity;
 pub mod teams;
 pub mod teams_plan;
+pub mod telemetry;
 pub mod topology;
 pub mod usage_report;
 pub mod vendors;
