@@ -3392,11 +3392,7 @@ struct TeamPairEvent {
 
 impl TeamPairEvent {
     fn new(state: &'static str) -> Self {
-        Self {
-            state,
-            check: None,
-            message: None,
-        }
+        Self { state, check: None, message: None }
     }
 }
 
