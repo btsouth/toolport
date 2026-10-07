@@ -19389,6 +19389,16 @@ fn main() {
         }
         ArgAction::Run => {}
     }
+    let legacy_registry = registry::load_resolved_with_source()
+        .ok()
+        .filter(|(_, source)| source.is_authoritative())
+        .is_some_and(|(reg, _)| reg.gateway_topology == Some(registry::GatewayTopology::Legacy));
+    let legacy_env =
+        conduit_lib::brand::env_var("TOOLPORT_GATEWAY_TOPOLOGY", "CONDUIT_GATEWAY_TOPOLOGY")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("legacy"));
+    if legacy_registry || legacy_env {
+        glog("Legacy gateway topology was retired in 2.0; using the host daemon. Existing client entries are unchanged.");
+    }
     if let Some(index) = cli_args.iter().position(|arg| arg == "--http-proxy") {
         let port = match cli_args.get(index + 1) {
             Some(value) => match value.parse::<u16>() {
@@ -19405,16 +19415,6 @@ fn main() {
             std::process::exit(1);
         }
         return;
-    }
-    let legacy_registry = registry::load_resolved_with_source()
-        .ok()
-        .filter(|(_, source)| source.is_authoritative())
-        .is_some_and(|(reg, _)| reg.gateway_topology == Some(registry::GatewayTopology::Legacy));
-    let legacy_env =
-        conduit_lib::brand::env_var("TOOLPORT_GATEWAY_TOPOLOGY", "CONDUIT_GATEWAY_TOPOLOGY")
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("legacy"));
-    if legacy_registry || legacy_env {
-        glog("Legacy gateway topology was retired in 2.0; using the host daemon. Existing client entries are unchanged.");
     }
     if conduit_lib::stdio_adapter::adapter_requested(&cli_args) {
         conduit_lib::stdio_adapter::run_stdio_adapter();
