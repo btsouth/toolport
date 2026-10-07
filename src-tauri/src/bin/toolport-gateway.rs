@@ -17732,10 +17732,13 @@ fn main() {
     }
     conduit_lib::gatewaylog::set_role(if daemon_requested(&cli_args) {
         conduit_lib::gatewaylog::Role::Daemon
-    } else if cli_args.iter().any(|arg| arg == "--private-gateway") {
-        conduit_lib::gatewaylog::Role::Private
-    } else {
+    } else if conduit_lib::stdio_adapter::adapter_requested(&cli_args) || {
+        use std::io::IsTerminal;
+        selected_adapter_requested(&cli_args, !std::io::stdin().is_terminal())
+    } {
         conduit_lib::gatewaylog::Role::Adapter
+    } else {
+        conduit_lib::gatewaylog::Role::Private
     });
     if let Some(index) = cli_args.iter().position(|arg| arg == "--http-proxy") {
         let port = match cli_args.get(index + 1) {

@@ -253,7 +253,7 @@ export interface TelemetryHealth {
   queueDropped: number;
   writeFailedRecords: number;
   writeFailures: number;
-  flushTimeouts: number;
+  incompleteFlushes: number;
   unavailable?: boolean;
 }
 

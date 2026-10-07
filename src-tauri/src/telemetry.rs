@@ -19,6 +19,7 @@ const SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Rotation {
+    Gateway,
     TrimTail { max_bytes: u64, keep_lines: usize },
     Savings { max_bytes: u64, keep_lines: usize },
 }
@@ -39,7 +40,7 @@ struct Counters {
     queue_dropped: AtomicU64,
     write_failed_records: AtomicU64,
     write_failures: AtomicU64,
-    flush_timeouts: AtomicU64,
+    incomplete_flushes: AtomicU64,
 }
 
 /// Counters since this process started, not durable totals. A failed batch may
@@ -50,7 +51,7 @@ pub struct Health {
     pub queue_dropped: u64,
     pub write_failed_records: u64,
     pub write_failures: u64,
-    pub flush_timeouts: u64,
+    pub incomplete_flushes: u64,
 }
 
 impl Health {
@@ -59,8 +60,8 @@ impl Health {
             return None;
         }
         Some(format!(
-            "Activity and savings may be incomplete: {} records dropped, {} records with unconfirmed writes, {} write failures, {} flush timeouts since gateway start.",
-            self.queue_dropped, self.write_failed_records, self.write_failures, self.flush_timeouts
+            "Activity, savings and diagnostics may be incomplete: {} records dropped, {} records with unconfirmed writes, {} write failures, {} incomplete flushes since gateway start.",
+            self.queue_dropped, self.write_failed_records, self.write_failures, self.incomplete_flushes
         ))
     }
 
@@ -70,7 +71,9 @@ impl Health {
             .write_failed_records
             .saturating_add(other.write_failed_records);
         self.write_failures = self.write_failures.saturating_add(other.write_failures);
-        self.flush_timeouts = self.flush_timeouts.saturating_add(other.flush_timeouts);
+        self.incomplete_flushes = self
+            .incomplete_flushes
+            .saturating_add(other.incomplete_flushes);
     }
 }
 
@@ -80,7 +83,7 @@ impl Counters {
             queue_dropped: self.queue_dropped.load(Ordering::Relaxed),
             write_failed_records: self.write_failed_records.load(Ordering::Relaxed),
             write_failures: self.write_failures.load(Ordering::Relaxed),
-            flush_timeouts: self.flush_timeouts.load(Ordering::Relaxed),
+            incomplete_flushes: self.incomplete_flushes.load(Ordering::Relaxed),
         }
     }
 }
@@ -124,14 +127,18 @@ impl Writer {
 
     fn flush(&self, budget: Duration) -> bool {
         let Some(tx) = &self.tx else {
-            self.counters.flush_timeouts.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .incomplete_flushes
+                .fetch_add(1, Ordering::Relaxed);
             return false;
         };
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         if tx.try_send(Msg::Flush(done_tx)).is_ok() && done_rx.recv_timeout(budget).is_ok() {
             return true;
         }
-        self.counters.flush_timeouts.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .incomplete_flushes
+            .fetch_add(1, Ordering::Relaxed);
         false
     }
 }
@@ -283,16 +290,19 @@ fn deliver(
                 .write_failed_records
                 .fetch_add(lines.len() as u64, Ordering::Relaxed);
             // Fixed text: paths and OS/downstream errors can contain credentials.
-            // Only the writer logs, so even a blocked gateway log cannot stall admission.
-            crate::gatewaylog::append(
-                "telemetry batch persistence failed; Activity and savings may be incomplete",
-            );
+            // Do not enqueue diagnostics about a failed diagnostic write recursively.
+            if rotation != Rotation::Gateway {
+                crate::gatewaylog::append("telemetry batch persistence failed; Activity, savings and diagnostics may be incomplete");
+            } else {
+                eprintln!("toolport: gateway diagnostic write failed");
+            }
         }
     }
 }
 
 fn append_batch(path: &Path, lines: &[String], rotation: Rotation) -> Result<(), String> {
     match rotation {
+        Rotation::Gateway => crate::gatewaylog::append_batch_to(path, lines),
         Rotation::TrimTail {
             max_bytes,
             keep_lines,
@@ -379,7 +389,7 @@ mod tests {
         let (health, flushed) = result.expect("admission stalled behind the slow writer");
         assert!(!flushed);
         assert_eq!(health.queue_dropped, 1);
-        assert_eq!(health.flush_timeouts, 1);
+        assert_eq!(health.incomplete_flushes, 1);
         let status = serde_json::to_value(&health).unwrap();
         assert_eq!(status["queueDropped"], 1);
         assert!(health.notice().unwrap().contains("1 records dropped"));
@@ -431,6 +441,7 @@ mod tests {
                     .contains("2 records with unconfirmed writes"));
             }
         }
+        assert!(flush());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

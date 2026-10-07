@@ -821,16 +821,31 @@ function CallRow({ e }: { e: AuditEntry }) {
 export function TelemetryNotice({ stats }: { stats: AuditStats | null }) {
   const health = stats?.telemetry;
   const messages = [...(stats?.gatewayNotes ?? [])];
-  if (health && (health.queueDropped || health.writeFailedRecords || health.writeFailures || health.flushTimeouts)) {
-    messages.push(`Activity and savings may be incomplete: ${health.queueDropped} records dropped, ${health.writeFailedRecords} records with unconfirmed writes, ${health.writeFailures} write failures, ${health.flushTimeouts} flush timeouts since gateway start.`);
+  if (
+    health &&
+    (health.queueDropped ||
+      health.writeFailedRecords ||
+      health.writeFailures ||
+      health.incompleteFlushes)
+  ) {
+    messages.push(
+      `Activity, savings and diagnostics may be incomplete: ${health.queueDropped} records dropped, ${health.writeFailedRecords} records with unconfirmed writes, ${health.writeFailures} write failures, ${health.incompleteFlushes} incomplete flushes since gateway start.`,
+    );
   }
   if (health?.unavailable) {
-    messages.push("Gateway telemetry health is unavailable. Activity and savings may be incomplete.");
+    messages.push(
+      "Gateway telemetry health is unavailable. Activity and savings may be incomplete.",
+    );
   }
   if (messages.length === 0) return null;
   return (
-    <div role="status" className="mb-4 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs">
-      {messages.map((message) => <p key={message}>{message}</p>)}
+    <div
+      role="status"
+      className="mb-4 rounded-lg border border-warning/40 bg-warning/5 px-4 py-2.5 text-xs"
+    >
+      {messages.map((message) => (
+        <p key={message}>{message}</p>
+      ))}
     </div>
   );
 }

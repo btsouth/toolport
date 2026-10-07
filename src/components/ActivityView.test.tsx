@@ -627,13 +627,20 @@ describe("ActivityView live inspector", () => {
   });
 });
 
-
 describe("telemetry health", () => {
   it("shows dropped records and partial persistence even with no calls", async () => {
     getAuditLog.mockResolvedValue([]);
     getAuditStats.mockResolvedValue({
-      total: 0, errors: 0, errorRate: 0, servers: [],
-      telemetry: { queueDropped: 3, writeFailedRecords: 2, writeFailures: 1, flushTimeouts: 1 },
+      total: 0,
+      errors: 0,
+      errorRate: 0,
+      servers: [],
+      telemetry: {
+        queueDropped: 3,
+        writeFailedRecords: 2,
+        writeFailures: 1,
+        incompleteFlushes: 1,
+      },
       gatewayNotes: ["Client configs updated, but ownership state was not saved."],
     });
     render(<ActivityView />);
@@ -643,10 +650,21 @@ describe("telemetry health", () => {
 
   it("shows unavailable shared gateway health instead of healthy zero counters", async () => {
     getAuditStats.mockResolvedValue({
-      total: 0, errors: 0, errorRate: 0, servers: [],
-      telemetry: { queueDropped: 0, writeFailedRecords: 0, writeFailures: 0, flushTimeouts: 0, unavailable: true },
+      total: 0,
+      errors: 0,
+      errorRate: 0,
+      servers: [],
+      telemetry: {
+        queueDropped: 0,
+        writeFailedRecords: 0,
+        writeFailures: 0,
+        incompleteFlushes: 0,
+        unavailable: true,
+      },
     });
     render(<ActivityView />);
-    expect(await screen.findByText(/Gateway telemetry health is unavailable/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Gateway telemetry health is unavailable/),
+    ).toBeInTheDocument();
   });
 });

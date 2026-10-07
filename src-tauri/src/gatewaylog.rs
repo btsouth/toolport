@@ -55,8 +55,8 @@ fn format_line(msg: &str, millis: u64, pid: u32, role: &str) -> String {
 /// it grows past this, so a long-running client can't let it grow without limit.
 pub const GATEWAY_LOG_CAP: u64 = 256 * 1024;
 
-/// Append one line to the gateway log. Best-effort: logging must never take down
-/// a connection, so every failure here is swallowed.
+/// Queue one formatted line without disk IO. Overload and persistence failures
+/// share the telemetry health counters; logging never blocks a connection.
 pub fn append(msg: &str) {
     let Some(path) = crate::registry::gateway_log_path() else {
         return;
@@ -70,7 +70,11 @@ pub fn append(msg: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
-    append_to(&path, &format_line(msg, millis, std::process::id(), role));
+    crate::telemetry::record(
+        &path,
+        &format_line(msg, millis, std::process::id(), role),
+        crate::telemetry::Rotation::Gateway,
+    );
 }
 
 /// How long an append waits for the shared log lock before writing without it.
@@ -105,43 +109,39 @@ fn lock_wait() -> std::time::Duration {
 /// both so a concurrent writer cannot land a line that this process's stale
 /// trim snapshot then overwrites (SBS-869). A lock we cannot take degrades to
 /// an unlocked append rather than to a lost line.
+#[cfg(test)]
 pub(crate) fn append_to(path: &Path, msg: &str) {
+    let _ = append_batch_to(path, &[msg.to_string()]);
+}
+
+pub(crate) fn append_batch_to(path: &Path, lines: &[String]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    // Atomic replacement protects readers from an empty window, but only this
-    // shared cross-process critical section prevents a stale trim snapshot
-    // from replacing a line another gateway just appended (SBS-869).
     match crate::registry::lock_at_for(path, lock_wait()) {
         Ok(_lock) => {
-            append_line(path, msg);
-            trim_log_if_large(path);
+            for line in lines {
+                append_line(path, line)?;
+            }
+            try_trim_log_if_large(path)
         }
-        // Never trade a line for the lock. This log exists so a diagnostics
-        // bundle still shows the connect failure, and before SBS-869 the append
-        // ran with no lock at all - so a stale lock file or a contended
-        // deadline must not make us quieter than the code we replaced. Write
-        // the line and skip only the trim, which is the half that is unsafe
-        // unserialized; the next append that does win the lock re-bounds the
-        // file.
-        Err(error) => {
-            eprintln!(
-                "toolport: appending to '{}' without the gateway log lock ({error}); trim deferred",
-                path.display()
-            );
-            append_line(path, msg);
+        // A contended diagnostic lock defers only rotation. No caller waits here:
+        // this runs on the telemetry writer, with each whole line in one append.
+        Err(_) => {
+            for line in lines {
+                append_line(path, line)?;
+            }
+            Ok(())
         }
     }
 }
 
 /// One `O_APPEND` write of the whole record, so even the unlocked fallback
 /// cannot interleave half a line with another writer's.
-fn append_line(path: &Path, msg: &str) {
-    // Owner-only from creation: this log carries the broker's bound HITL port
-    // (SBS-868).
-    if let Ok(mut f) = crate::registry::open_append_private(path) {
-        let _ = f.write_all(format!("{msg}\n").as_bytes());
-    }
+fn append_line(path: &Path, msg: &str) -> Result<(), String> {
+    let mut file = crate::registry::open_append_private(path).map_err(|error| error.to_string())?;
+    file.write_all(format!("{msg}\n").as_bytes())
+        .map_err(|error| error.to_string())
 }
 
 /// Trim the log to roughly its back half once it exceeds [`GATEWAY_LOG_CAP`],
@@ -154,15 +154,17 @@ fn append_line(path: &Path, msg: &str) {
 /// `append`) keep it across this replace; the function still works without
 /// that lock so the gateway binary's existing trim test can call it directly.
 pub fn trim_log_if_large(path: &Path) {
+    let _ = try_trim_log_if_large(path);
+}
+
+fn try_trim_log_if_large(path: &Path) -> Result<(), String> {
     let over = std::fs::metadata(path)
         .map(|m| m.len() > GATEWAY_LOG_CAP)
         .unwrap_or(false);
     if !over {
-        return;
+        return Ok(());
     }
-    let Ok(data) = std::fs::read(path) else {
-        return;
-    };
+    let data = std::fs::read(path).map_err(|error| error.to_string())?;
     let keep_from = data.len().saturating_sub((GATEWAY_LOG_CAP / 2) as usize);
     let start = data[keep_from..]
         .iter()
@@ -171,7 +173,7 @@ pub fn trim_log_if_large(path: &Path) {
         .unwrap_or(keep_from);
     // Lossy so a non-UTF-8 byte cannot skip the trim: atomic_write takes &str.
     let kept = String::from_utf8_lossy(&data[start..]);
-    let _ = crate::registry::atomic_write(path, &kept);
+    crate::registry::atomic_write(path, &kept)
 }
 
 #[cfg(test)]
