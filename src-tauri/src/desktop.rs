@@ -3513,7 +3513,13 @@ fn tray_host_present() -> bool {
 fn tray_host_present() -> bool {
     let class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
     // Windows owns this class for Explorer's notification area.
-    unsafe { !windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(class.as_ptr(), std::ptr::null()).is_null() }
+    unsafe {
+        !windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(
+            class.as_ptr(),
+            std::ptr::null(),
+        )
+        .is_null()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3962,9 +3968,8 @@ pub fn run() {
             is_launch_at_login_enabled,
             open_external,
         ])
-        // Close-to-tray: the window's X hides it instead of quitting, so the gateway and
-        // approval broker keep running (HITL only works while the app is alive). Quit is
-        // explicit, from the tray menu. A one-time notification explains it the first time.
+        // Only a usable tray can keep a closed window reachable. Without one,
+        // close exits through the normal run-loop cleanup.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
