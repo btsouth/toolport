@@ -3350,6 +3350,14 @@ pub(crate) const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "NPM_CONFIG_PREFIX",
     "npm_config_cache",
     "DENO_DIR",
+    // Container CLIs, so `docker run`/`podman run` servers reach the user's
+    // engine or remote context. Locators only; credentials stay in their files.
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_CONFIG",
+    "DOCKER_CERT_PATH",
+    "DOCKER_TLS_VERIFY",
+    "CONTAINER_HOST",
     // Proxies, in both the conventional and the lowercase tool conventions.
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -7732,6 +7740,7 @@ mod tests {
             ("LC_ALL", "en_US.UTF-8"),
             ("XDG_RUNTIME_DIR", "/run/user/1000"),
             ("HTTPS_PROXY", "http://proxy:8080"),
+            ("DOCKER_HOST", "unix:///run/user/1000/podman/podman.sock"),
             ("AWS_SECRET_ACCESS_KEY", "aws-secret"),
             ("GITHUB_TOKEN", "ghp_secret"),
             ("OPENAI_API_KEY", "sk-secret"),
@@ -7748,6 +7757,10 @@ mod tests {
         assert_eq!(
             env.get("HTTPS_PROXY").map(String::as_str),
             Some("http://proxy:8080")
+        );
+        assert!(
+            env.contains_key("DOCKER_HOST"),
+            "a container server must reach the user's engine"
         );
         assert!(
             !env.contains_key("AWS_SECRET_ACCESS_KEY"),
