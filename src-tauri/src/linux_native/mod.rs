@@ -6,7 +6,6 @@
 mod branding;
 mod catalog;
 mod health;
-mod hooks;
 mod http_bridge;
 mod notify;
 mod onboarding;
@@ -21,7 +20,6 @@ mod tray;
 use adw::prelude::*;
 use catalog::CatalogPage;
 use gtk::glib::prelude::ToValue;
-use hooks::HooksPage;
 use playground::PlaygroundPage;
 use settings::SettingsPage;
 use teams::TeamsPage;
@@ -299,7 +297,6 @@ fn build_window(
     let catalog_page = CatalogPage::new(server_page.clone());
     let playground_page = PlaygroundPage::new(app);
     let teams_page = TeamsPage::new(app);
-    let hooks_page = HooksPage::new(app);
     let settings_page = SettingsPage::new(bridge, broker);
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
@@ -313,7 +310,6 @@ fn build_window(
     stack.add_named(&catalog_page.root, Some("catalog"));
     stack.add_named(&playground_page.root, Some("playground"));
     stack.add_named(&teams_page.root, Some("teams"));
-    stack.add_named(&hooks_page.root, Some("hooks"));
     stack.add_named(&settings_page.root, Some("settings"));
     let (sidebar, quarantine_badge) = build_sidebar(
         app,
@@ -325,7 +321,6 @@ fn build_window(
         catalog_page.clone(),
         playground_page.clone(),
         teams_page.clone(),
-        hooks_page.clone(),
         settings_page.clone(),
     );
     // The Settings tab must not go stale while open: quarantine, remembered
@@ -582,7 +577,7 @@ fn run_startup_maintenance() {
             repoint.failed.len()
         );
     }
-    crate::hooks::apply_on_startup();
+    crate::hooks::cleanup_on_startup();
     // One-time removal of the retired agent guard hook entries (see `guard_cleanup`).
     crate::guard_cleanup::run_once();
 }
@@ -655,7 +650,6 @@ fn build_sidebar(
     catalog_page: CatalogPage,
     playground_page: PlaygroundPage,
     teams_page: TeamsPage,
-    hooks_page: HooksPage,
     settings_page: SettingsPage,
 ) -> (gtk::Box, gtk::Label) {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -697,7 +691,6 @@ fn build_sidebar(
         ("catalog", "Catalog", "system-software-install-symbolic"),
         ("playground", "Playground", "applications-science-symbolic"),
         ("teams", "Teams", "system-users-symbolic"),
-        ("hooks", "Agent activity", "media-record-symbolic"),
         ("settings", "Settings", "emblem-system-symbolic"),
     ] {
         let button = gtk::Button::new();
@@ -734,7 +727,6 @@ fn build_sidebar(
         let catalog_page = catalog_page.clone();
         let playground_page = playground_page.clone();
         let teams_page = teams_page.clone();
-        let hooks_page = hooks_page.clone();
         let settings_page = settings_page.clone();
         button.connect_clicked(move |_| {
             show_native_page(
@@ -748,7 +740,6 @@ fn build_sidebar(
                 &catalog_page,
                 &playground_page,
                 &teams_page,
-                &hooks_page,
                 &settings_page,
             );
         });
@@ -766,7 +757,6 @@ fn build_sidebar(
         let catalog_page = catalog_page.clone();
         let playground_page = playground_page.clone();
         let teams_page = teams_page.clone();
-        let hooks_page = hooks_page.clone();
         let settings_page = settings_page.clone();
         action.connect_activate(move |_, _| {
             show_native_page(
@@ -780,7 +770,6 @@ fn build_sidebar(
                 &catalog_page,
                 &playground_page,
                 &teams_page,
-                &hooks_page,
                 &settings_page,
             );
         });
@@ -1322,7 +1311,6 @@ fn show_native_page(
     catalog_page: &CatalogPage,
     playground_page: &PlaygroundPage,
     teams_page: &TeamsPage,
-    hooks_page: &HooksPage,
     settings_page: &SettingsPage,
 ) {
     stack.set_visible_child_name(target);
@@ -1346,8 +1334,6 @@ fn show_native_page(
         playground_page.refresh();
     } else if target == "teams" {
         teams_page.refresh();
-    } else if target == "hooks" {
-        hooks_page.refresh();
     } else if target == "settings" {
         settings_page.refresh();
     }

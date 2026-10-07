@@ -2230,46 +2230,11 @@ async fn team_instructions_status() -> Option<teams::InstructionsStatusView> {
         .flatten()
 }
 
-// --- Agent hook sensor (SBS-822) -------------------------------------------
+// --- Agent hook sensor (SBS-822), retired -------------------------------------
 //
-// Same shape and the same reasons as the rules commands above: every one of these
-// reads or writes an agent settings file, so none of them may run on the UI thread,
-// and none of them needs the gateway or any configured MCP server.
-
-/// The hook sensor's state: the opt-in, the events it registers, and every Claude Code
-/// profile found with whether the sensor is currently in it. Read-only.
-#[tauri::command]
-async fn hooks_view() -> Result<hooks::HooksView, String> {
-    tauri::async_runtime::spawn_blocking(hooks::view)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Turn the sensor on or off. Turning it off removes it from every profile we wrote.
-#[tauri::command]
-async fn hooks_set_enabled(enabled: bool) -> Result<hooks::HooksView, String> {
-    tauri::async_runtime::spawn_blocking(move || hooks::set_enabled(enabled))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-/// Dry-run the write for every profile, so the UI can show the exact before/after
-/// before the sensor touches a settings file. Never writes.
-#[tauri::command]
-async fn hooks_preview() -> Result<Vec<hooks::HooksPreview>, String> {
-    tauri::async_runtime::spawn_blocking(hooks::preview)
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-/// The most recent sensor rows, newest first. The read half SBS-823 builds on.
-#[tauri::command]
-async fn hooks_recent(limit: usize) -> Result<Vec<serde_json::Value>, String> {
-    tauri::async_runtime::spawn_blocking(move || hooks::read_recent(limit))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())
-}
+// 2.0 removed the sensor. `hooks::cleanup_on_startup` (called on the launch thread
+// below) does the one-time removal of entries an earlier release installed; no IPC
+// command remains.
 
 /// Leave the team: remove its merged servers, clear the connection and the token.
 #[tauri::command]
@@ -4204,10 +4169,6 @@ pub fn run() {
             team_sync_wait,
             main_window_visible,
             team_instructions_status,
-            hooks_view,
-            hooks_set_enabled,
-            hooks_preview,
-            hooks_recent,
             team_disconnect,
             team_push_preview,
             team_pair_state,
@@ -4408,13 +4369,11 @@ pub fn run() {
                                 .join(", ")
                         );
                     }
-                    // Same launch thread, same reason, for the agent hook sensor (SBS-822).
-                    // This one additionally repairs the binary path after an update: the
-                    // published gateway is versioned and the reaper prunes superseded
-                    // builds, so hooks written before an update would name a binary that
-                    // no longer exists. Returns immediately when the sensor was never
-                    // turned on.
-                    hooks::apply_on_startup();
+                    // Remove the retired agent activity sensor's hook entries once. 2.0
+                    // cut the feature; entries an earlier release installed stay harmless
+                    // (the subcommand is a no-op) but should go. Guarded by a data-dir
+                    // marker, so this scans once ever.
+                    hooks::cleanup_on_startup();
                     // One-time removal of the retired agent guard hook entries, then the
                     // marker file stops it running again.
                     guard_cleanup::run_once();

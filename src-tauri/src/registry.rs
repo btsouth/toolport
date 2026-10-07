@@ -150,7 +150,7 @@ pub(crate) fn trimmed_tail(content: &str, keep: usize) -> String {
 /// lock for that path, then trim to `keep_lines` once the file passes `max_bytes`.
 ///
 /// Thin wrapper over [`append_lines_locked`] for the callers whose writes stay on
-/// the calling thread: the agent-hook sensor log and the integrity pin store. The
+/// the calling thread, such as the integrity pin store. The
 /// audit, savings and search-trace logs go through [`append_lines_locked`] on the
 /// background writer instead (see [`crate::telemetry`]).
 pub(crate) fn append_line_locked(
@@ -174,11 +174,10 @@ pub(crate) fn append_line_locked(
 /// acquisition of the path's cross-process lock, then trim to `keep_lines` once
 /// the file passes `max_bytes`.
 ///
-/// Shared by the tool-call audit log ([`crate::audit`]), the search-trace log
-/// ([`crate::searchtrace`]) and the agent-hook sensor log ([`crate::hooks`]).
-/// They are appended to by several independent processes at once - every client's
-/// gateway, and one short-lived process per hook event - so an in-process mutex is
-/// not enough. Atomic replacement protects readers from partial files, but only
+/// Shared by the tool-call audit log ([`crate::audit`]) and the search-trace log
+/// ([`crate::searchtrace`]). They are appended to by several independent processes
+/// at once - every client's gateway and the app - so an in-process mutex is not
+/// enough. Atomic replacement protects readers from partial files, but only
 /// this shared critical section prevents a stale rotation snapshot from replacing
 /// an append that completed in another process (#708).
 ///
@@ -290,10 +289,10 @@ const RENAME_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis
 /// open, and something usually does: Defender, the search indexer, a backup agent. The handle is
 /// released within milliseconds, so the operation was never impossible - only early.
 ///
-/// This is not hypothetical. `hooks::tests::preview_text_is_the_bytes_install_actually_writes`
-/// failed one Windows CI run with `install_at` returning `Err`, while the identical test passed
-/// on every other host and on every other run. Users hit the same edge writing `settings.json`
-/// on a machine with antivirus running; CI just reports it more visibly.
+/// This is not hypothetical. A client-config write failed one Windows CI run with a rename
+/// returning `Err`, while the identical test passed on every other host and on every other run.
+/// Users hit the same edge writing `settings.json` on a machine with antivirus running; CI just
+/// reports it more visibly.
 ///
 /// Unix needs none of this: `rename(2)` is atomic against open handles, so a failure there is a
 /// real permission or layout problem and retrying only delays the report.
@@ -1375,14 +1374,15 @@ pub struct Registry {
     /// policy changes strip exactly these. Same role as `hook_targets` / `rules_targets`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub agent_permission_targets: HashMap<String, Vec<PermissionRule>>,
-    /// Whether the native-agent hook sensor is installed. OFF until the user opts in:
-    /// it writes into a settings file they own and it observes every native tool call
-    /// their agent makes. See [`crate::hooks`].
+    /// Whether the native-agent hook sensor is installed. The sensor was removed in
+    /// 2.0; the field stays so a v1 registry still deserializes.
+    // 2.0: unused, dropped by the v2 migration
     #[serde(default)]
     pub hooks_enabled: bool,
-    /// Absolute paths of the agent settings files we have written hooks into, so
-    /// removal touches exactly what we created. Same role as `rules_targets`, and the
-    /// reason a profile that disappears between apply and remove is not an error.
+    /// Absolute paths of the agent settings files the hook sensor wrote into, so
+    /// removal touched exactly what it created. The sensor was removed in 2.0; the
+    /// field stays so a v1 registry still deserializes.
+    // 2.0: unused, dropped by the v2 migration
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hook_targets: Vec<String>,
     /// Top-level fields THIS build doesn't know, preserved verbatim across

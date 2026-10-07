@@ -555,16 +555,16 @@ fn claude_settings_path(config_dir: &Path) -> PathBuf {
 ///
 /// Same discovery, and the same reason, as [`claude_code_config_paths`]: a machine
 /// routinely has `~/.claude` beside `~/.claude-work`, chosen per shell by
-/// `CLAUDE_CONFIG_DIR`. A hook sensor installed into only the profile Toolport
-/// resolved today is blind to every session run under any other one, and would
-/// under-report silently rather than visibly (SBS-822).
+/// `CLAUDE_CONFIG_DIR`. A caller that writes into only the profile Toolport resolved
+/// today is blind to every session run under any other one, and would under-report
+/// silently rather than visibly (SBS-822).
 ///
 /// Two deliberate differences from the config list:
 ///
 ///   * The default lives at `~/.claude/settings.json`, a file inside the profile
 ///     directory, not `~/.claude.json` at the home root.
 ///   * Paths are kept when the file does not exist yet, because a profile that has
-///     never had settings written still needs the sensor; the caller creates it.
+///     never had settings written still needs an entry point; the caller creates it.
 ///     What IS required is that the profile directory exists, so a stale
 ///     `CLAUDE_CONFIG_DIR` cannot make Toolport conjure a profile that Claude Code
 ///     has never used.
