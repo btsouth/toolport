@@ -120,7 +120,7 @@ export function removeHttpClient(id: string): Promise<Registry> {
   return invoke<Registry>("remove_http_client", { id });
 }
 
-/** List the tools one server exposes (connects on demand). Server > Tools picker. */
+/** List the tools one server exposes (connects on demand). Server detail Tools tab. */
 export function listServerTools(serverId: string): Promise<McpTool[]> {
   return invoke<McpTool[]>("list_server_tools", { serverId });
 }

@@ -495,7 +495,7 @@ function ProfileToolScope({
 }
 
 /** Global discovery + security policy. These apply to every client uniformly, so
- * they live here rather than in the per-server the server’s Tools tab. */
+ * they live here rather than in each server’s Tools tab. */
 export function SettingsView({ registry, onRegistryChange }: Props) {
   const { theme, setTheme } = useTheme();
   const lazyDiscovery = registry?.lazyDiscovery ?? true;
