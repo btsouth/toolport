@@ -1,10 +1,13 @@
 import { Buffer } from "node:buffer";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { releaseInstaller, manifests, submit } from "./winget.mjs";
-import { assertContents } from "./package-contents.mjs";
+import { assertContents, listContents } from "./package-contents.mjs";
 import { parse } from "yaml";
 const bytes = Buffer.from("immutable signed installer fixture");
 const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -96,4 +99,23 @@ test("payload assertions reject test helpers and unexpected binaries on every pl
     if (root) assert.throws(() => assertContents([root + "surprise"]));
   }
   assertContents(["conduit.exe", "toolport-gateway.exe", "uninstall.exe"]);
+});
+
+test("archive inspection lists a real payload and rejects an added helper", () => {
+  const root = mkdtempSync(join(tmpdir(), "toolport-payload-"));
+  try {
+    const bin = join(root, "Toolport.app/Contents/MacOS");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, "conduit"), "app");
+    writeFileSync(join(bin, "toolport-gateway"), "gateway");
+    const archive = join(root, "app.tar.gz");
+    const pack = () => execFileSync("tar", ["-czf", archive, "-C", root, "Toolport.app"]);
+    pack();
+    assertContents(listContents(archive));
+    writeFileSync(join(bin, "mock-mcp-server"), "test helper");
+    pack();
+    assert.throws(() => assertContents(listContents(archive)), /Test artifact/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

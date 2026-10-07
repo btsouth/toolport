@@ -102,7 +102,7 @@ jobs:
             echo "built $pkg"
             namcap "$pkg" || true
             bsdtar -tf "$pkg" | tee contents.txt
-            unexpected=$(grep -E "^usr/bin/" contents.txt | grep -Ev "^usr/bin/(toolport-gtk|toolport-gateway)$" || true)
+            unexpected=$(grep -E "^usr/bin/[^/]+$" contents.txt | grep -Ev "^usr/bin/(toolport-gtk|toolport-gateway)$" || true)
             test -z "$unexpected" || { echo "::error::Unexpected binaries: $unexpected"; exit 1; }
             for want in usr/bin/toolport-gtk usr/bin/toolport-gateway; do
               grep -qx "$want" contents.txt || { echo "::error::$want missing from $pkg"; exit 1; }

@@ -24,7 +24,7 @@ jobs:
     if: ${{ (github.event_name == 'workflow_dispatch' || !github.event.release.prerelease) && !contains(github.event.release.tag_name || inputs.tag, '-') }}
     runs-on: ubuntu-24.04
     env:
-      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+      WINGET_CONFIGURED: ${{ secrets.WINGET_TOKEN != '' }}
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -36,10 +36,10 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Validate release and submit or resume manifest PR
-        if: ${{ env.WINGET_TOKEN != '' }}
+        if: ${{ env.WINGET_CONFIGURED == 'true' }}
         run: node .github/scripts/winget.mjs
         env:
           GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
       - name: Say why nothing was submitted
-        if: ${{ env.WINGET_TOKEN == '' }}
+        if: ${{ env.WINGET_CONFIGURED != 'true' }}
         run: echo "::warning::WINGET_TOKEN is not set; no winget manifest was submitted."
