@@ -80,6 +80,11 @@ jobs:
     timeout-minutes: 30
     name: build + push image
     needs: build-gateway
+    # A preview tag such as v2.0.0-preview.1 must never publish an image (and so
+    # can never publish `latest`). Release tags stay plain vX.Y.Z, so any tag name
+    # with a prerelease suffix skips the publish job; PR builds and main pushes
+    # are unchanged. The build job still runs for every trigger.
+    if: ${{ !(github.ref_type == 'tag' && contains(github.ref_name, '-')) }}
     runs-on: ubuntu-22.04
     permissions:
       contents: read

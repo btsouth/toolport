@@ -1120,9 +1120,10 @@ pub struct Registry {
     /// One toggle to keep agents read-only across every connected server.
     #[serde(default)]
     pub deny_destructive: bool,
-    /// Legacy per-call confirmation for destructive tools. Toolport 2.0 removed
-    /// the agent-token confirm flow, so this is retained only so the v2 migration
-    /// can map an existing true value to the Ask safety level.
+    /// Legacy per-call confirmation for destructive tools. Toolport 2.0 removed the
+    /// agent-token confirm flow, so no confirmation step reads it. It is still read
+    /// live to derive the safety level: with no explicit level and no blocking gate,
+    /// a true value selects Ask (see `safety_level_selected`).
     #[serde(default)]
     pub confirm_destructive: bool,
     /// Human-in-the-loop approval: when true, a *gated* tool call (destructive-hinted, or
@@ -2334,9 +2335,10 @@ impl Registry {
         }
     }
 
-    /// Set per-call confirmation mode for destructive tools. When enabled,
-    /// `deny_destructive` is forced off (they're mutually exclusive: deny hides
-    /// tools entirely, confirm intercepts them with a preview).
+    /// Set the legacy per-call confirmation flag for destructive tools. Toolport 2.0
+    /// removed the agent-token confirm flow, so this only feeds `safety_level_selected`:
+    /// it clears the explicit level, and a true value then derives Ask when no blocking
+    /// gate is on. Mutually exclusive with `deny_destructive`, which hides gated tools.
     pub fn set_confirm_destructive(&mut self, confirm: bool) {
         self.safety_level = None;
         self.confirm_destructive = confirm;
@@ -2345,9 +2347,10 @@ impl Registry {
         }
     }
 
-    /// Turn human-in-the-loop approval on or off. Independent of deny/confirm: `deny`
-    /// hides tools, `confirm` has the agent re-confirm, `human_approval` holds the call
-    /// for a person. When it gates a tool it takes precedence over `confirm_destructive`.
+    /// Turn human-in-the-loop approval on or off. Clears the explicit `safety_level` so
+    /// the derived level follows: like a legacy `confirm_destructive`, a true value maps
+    /// to Ask, which holds a gated call for a person. Independent of `deny_destructive`,
+    /// which hides gated tools entirely.
     pub fn set_human_approval(&mut self, on: bool) {
         self.safety_level = None;
         self.human_approval = on;

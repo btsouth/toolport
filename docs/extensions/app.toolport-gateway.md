@@ -1,6 +1,6 @@
 # `app.toolport/gateway` MCP extension
 
-Version: `1.0.0`
+Version: `2.0.0`
 
 Toolport advertises this third-party extension in the `extensions` object of its
 modern `server/discover` capability response. The vendor prefix is the reverse of
@@ -14,7 +14,7 @@ extension retain the same behavior.
 
 ```json
 {
-  "version": "1.0.0",
+  "version": "2.0.0",
   "discoveryMode": "lazy",
   "codeMode": true,
   "humanApproval": true
@@ -31,6 +31,15 @@ Servers implementing this extension MUST return all four fields. Clients MUST NO
 treat any `true` value as permission to bypass Toolport policy; the ordinary tool
 call remains the enforcement point. Clients SHOULD treat an unknown `version` as
 unsupported and continue through core MCP discovery and tool calls.
+
+## Version history
+
+- `2.0.0`: current settings schema. Removed the `agentControl` and
+  `destructiveConfirmation` fields along with the agent-token confirm flow and
+  agent-facing server enable/disable tools, so servers now return the four
+  fields listed above.
+- `1.0.0`: introduced the extension with `agentControl` and
+  `destructiveConfirmation` in addition to the current fields.
 
 ## Graceful degradation
 

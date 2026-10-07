@@ -1156,8 +1156,8 @@ fn set_deny_destructive(state: State<RegistryState>, deny: bool) -> Result<Regis
 }
 
 /// Legacy setter for the removed agent-token confirmation mode. Retained so an
-/// existing client call still round-trips; the v2 migration maps the stored value
-/// to the Ask safety level.
+/// existing client call still round-trips; the stored value is still read live to
+/// derive the Ask safety level for a registry with no explicit level.
 #[tauri::command]
 fn set_confirm_destructive(state: State<RegistryState>, confirm: bool) -> Result<Registry, String> {
     let (reg, _) = write_registry(state.inner(), |reg| {
