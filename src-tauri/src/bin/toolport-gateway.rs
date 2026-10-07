@@ -9488,6 +9488,8 @@ fn build_router(
     integrity::ensure_quarantine_store_for_existing_pins(profile);
     let stored = if reg.quarantine_on_drift_effective() {
         integrity::quarantined(profile)
+    } else if reg.safety_level_effective() != registry::SafetyLevel::Off {
+        integrity::mandatory_quarantined(profile)
     } else {
         Ok(BTreeSet::new())
     };
@@ -10898,7 +10900,7 @@ fn cleanup_root_resource_subs_for_session(state: &GatewayState, session: &str) {
 /// the registry's `integrity_check`, on by default). Any drift is recorded to the
 /// security log inside `integrity::check`; here we also surface it in the gateway
 /// log so it's visible in "Copy diagnostics". Ordinary drift blocks only when its
-/// policy is enabled; baseline loss always blocks because the trust root is gone.
+/// policy is enabled; baseline loss blocks at Ask and Strict because the trust root is gone.
 /// Returns the newly quarantined names when the caller must re-filter the router this cycle.
 /// Store/lock failures stay distinct so the caller can keep the router's currently enforced
 /// catalog rather than publishing a stale unfiltered list.
@@ -10929,15 +10931,15 @@ fn maybe_check_integrity(
     tools: &[Value],
     profile: Option<&str>,
 ) -> Result<Option<BTreeSet<String>>, IntegrityCheckFailure> {
-    let (enabled, quarantine_on) = {
+    let (blocking, quarantine_on) = {
         let r = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (true, r.quarantine_on_drift_effective())
+        (
+            r.safety_level_effective() != registry::SafetyLevel::Off,
+            r.quarantine_on_drift_effective(),
+        )
     };
-    if !enabled {
-        return Ok(None);
-    }
     let result = (|| {
         #[cfg(test)]
         observe_integrity_gate();
@@ -10970,8 +10972,8 @@ fn maybe_check_integrity(
         ));
             eprintln!("toolport: SECURITY tool drift ({change}) {tool}");
         }
-        // Only Strict blocks. Off and Ask retain findings without enforcing quarantine.
-        if quarantine_on {
+        // Drift quarantine is Strict-only; baseline tamper also blocks at Ask.
+        if quarantine_on || (blocking && integrity::baseline_tamper_detected(&events)) {
             let pending = integrity::quarantine_candidates(tools, &events);
             integrity::apply_quarantine(profile, tools, &events)
                 .map_err(|e| (e, pending.clone()))?;
@@ -10981,14 +10983,14 @@ fn maybe_check_integrity(
             integrity::accept_quarantined_pins(profile).map_err(|e| (e, pending.clone()))?;
             Ok((!pending.is_empty()).then_some(pending))
         } else {
-            // Record and advance pins without blocking at Off or Ask.
+            // Record ordinary drift at Ask, and all findings at Off, without blocking.
             integrity::accept_staged_pins(profile, tools, &events)
                 .map_err(|e| (e, BTreeSet::new()))?;
             Ok(None)
         }
     })();
     match result {
-        Err((error, _)) if !quarantine_on => {
+        Err((error, _)) if !blocking => {
             glog(&format!("SECURITY: integrity recording failed: {error}"));
             Ok(None)
         }
@@ -11099,21 +11101,23 @@ fn fail_closed_integrity_catalog(
 }
 
 /// The quarantine set the router SHOULD be enforcing right now, mirroring how the
-/// initial build gates on the feature flag: when quarantine-on-drift is off, nothing is
-/// blocked even though the persisted set survives on disk for when it's turned back on.
+/// initial build gates on safety: Strict enforces all entries, Ask enforces baseline
+/// tamper entries, and Off leaves the persisted findings unenforced.
 fn effective_quarantine(
     registry: &Arc<Mutex<Registry>>,
     profile: Option<&str>,
     read_failed: &AtomicBool,
 ) -> Option<BTreeSet<String>> {
-    let on = {
+    let level = {
         let r = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        r.quarantine_on_drift_effective()
+        r.safety_level_effective()
     };
-    let stored = if on {
+    let stored = if level == registry::SafetyLevel::Strict {
         integrity::quarantined_checked(profile)
+    } else if level == registry::SafetyLevel::Ask {
+        integrity::mandatory_quarantined_checked(profile)
     } else {
         Ok(BTreeSet::new())
     };
@@ -33742,7 +33746,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_pin_root_keeps_live_fail_closed_set_while_optional_quarantine_is_off() {
+    fn integrity_ask_corrupt_pin_root_keeps_live_fail_closed_set() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "toolport-corrupt-pins-live-q-{}",
@@ -33774,6 +33778,27 @@ mod tests {
 
         assert_eq!(
             effective_quarantine(&registry, profile, &AtomicBool::new(false)),
+            None
+        );
+        assert!(!reconcile_quarantine(
+            &registry,
+            &router,
+            &stdio,
+            profile,
+            None,
+            &AtomicBool::new(false)
+        ));
+        assert_eq!(
+            router.lock().unwrap().quarantined(),
+            &set_of(&["srv__wipe"]),
+            "Ask preserves the live blocks while the trust root is corrupt"
+        );
+        registry
+            .lock()
+            .unwrap()
+            .set_safety_level(registry::SafetyLevel::Off);
+        assert_eq!(
+            effective_quarantine(&registry, profile, &AtomicBool::new(false)),
             Some(BTreeSet::new())
         );
         assert!(reconcile_quarantine(
@@ -33784,16 +33809,12 @@ mod tests {
             None,
             &AtomicBool::new(false)
         ));
-        assert_eq!(
-            router.lock().unwrap().quarantined(),
-            &BTreeSet::new(),
-            "Ask clears blocks while retaining the integrity findings"
-        );
+        assert!(router.lock().unwrap().quarantined().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn baseline_tamper_is_recorded_without_blocking_at_ask() {
+    fn integrity_ask_baseline_tamper_quarantines() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("toolport-mandatory-q-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -33819,6 +33840,49 @@ mod tests {
         reg.integrity_check = true;
         reg.quarantine_on_drift = false;
         let registry = Arc::new(Mutex::new(reg));
+        assert_eq!(
+            maybe_check_integrity(&registry, &tools, profile).unwrap(),
+            Some(set_of(&["srv__read"]))
+        );
+        assert_eq!(
+            effective_quarantine(&registry, profile, &AtomicBool::new(false)),
+            Some(set_of(&["srv__read"]))
+        );
+        assert!(integrity::read_recent(20)
+            .unwrap()
+            .iter()
+            .any(|event| event["change"] == "tamper"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn integrity_off_baseline_tamper_records_without_blocking() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("toolport-off-mandatory-q-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        let profile = Some("off-baseline-tamper");
+        std::fs::write(
+            dir.join(format!(
+                "tool-pins-v2-{}.json",
+                conduit_lib::registry::profile_store_key("off-baseline-tamper")
+            )),
+            "{ corrupt baseline",
+        )
+        .unwrap();
+        let tools = vec![json!({
+            "name": "srv__read",
+            "description": "Read records.",
+            "inputSchema": {"type": "object"}
+        })];
+
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Off);
+        reg.quarantine_on_drift = false;
+        let registry = Arc::new(Mutex::new(reg));
         assert!(maybe_check_integrity(&registry, &tools, profile)
             .unwrap()
             .is_none());
@@ -33830,6 +33894,62 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event["change"] == "tamper"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn integrity_store_error_fails_closed_at_ask_and_logs_at_off() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-safety-store-error-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        let profile = Some("safety-store-error");
+        // An unreadable quarantine store fails recovery after check_staged.
+        std::fs::write(
+            dir.join(format!(
+                "quarantine-v2-{}.json",
+                registry::profile_store_key("safety-store-error")
+            )),
+            "{ corrupt quarantine",
+        )
+        .unwrap();
+        let tools =
+            vec![json!({"name": "srv__read", "description": "Read records.", "inputSchema": {}})];
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        assert!(maybe_check_integrity(&registry, &tools, profile).is_err());
+        let mut built = Router::new();
+        assert!(requarantine_if_needed(&registry, &mut built, tools.clone(), profile).is_empty());
+        assert!(built.catalog_fail_closed());
+        assert_eq!(
+            effective_quarantine(&registry, profile, &AtomicBool::new(false)),
+            None
+        );
+
+        registry
+            .lock()
+            .unwrap()
+            .set_safety_level(registry::SafetyLevel::Off);
+        assert_eq!(
+            maybe_check_integrity(&registry, &tools, profile).unwrap(),
+            None
+        );
+        let mut built = Router::new();
+        assert_eq!(
+            requarantine_if_needed(&registry, &mut built, tools.clone(), profile),
+            tools
+        );
+        assert!(!built.catalog_fail_closed());
+        assert_eq!(
+            effective_quarantine(&registry, profile, &AtomicBool::new(false)),
+            Some(BTreeSet::new())
+        );
+        assert!(std::fs::read_to_string(dir.join("gateway.log"))
+            .unwrap()
+            .contains("SECURITY: integrity recording failed:"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
