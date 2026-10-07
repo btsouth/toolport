@@ -309,16 +309,20 @@ impl SettingsPage {
                 .css_classes(["heading"])
                 .build(),
         );
-        updates_copy.append(
-            &gtk::Label::builder()
-                .label(super::package_updates::update_advice())
-                .halign(gtk::Align::Fill)
-                .xalign(0.0)
-                .wrap(true)
+        let update_advice = gtk::Label::builder()
+            .label(super::package_updates::generic_advice())
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
             .hexpand(true)
-                .css_classes(["toolport-muted"])
-                .build(),
-        );
+            .css_classes(["toolport-muted"])
+            .build();
+        updates_copy.append(&update_advice);
+        gtk::glib::spawn_future_local(async move {
+            if let Ok(advice) = gtk::gio::spawn_blocking(super::package_updates::update_advice).await {
+                update_advice.set_label(advice);
+            }
+        });
         updates_copy.append(
             &gtk::LinkButton::builder()
                 .label("Open release page")

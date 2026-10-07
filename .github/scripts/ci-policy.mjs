@@ -42,11 +42,34 @@ export function needsRust(event, files) {
   );
 }
 
+export function needsLinuxPackages(event, files) {
+  return (
+    !["pull_request", "push"].includes(event) ||
+    files.length === 0 ||
+    files.some(
+      (file) =>
+        /^src-tauri\/.*\.rs$/.test(file) ||
+        /(^|\/)Cargo\.(toml|lock)$/.test(file) ||
+        file.startsWith("packaging/") ||
+        file.startsWith(".github/workflows/") ||
+        file.startsWith(".github/scripts/ci-policy.") ||
+        [
+          "scripts/build-linux-packages.sh",
+          "scripts/test-linux-packages.sh",
+          "scripts/install-nfpm.sh",
+          "scripts/render-aur.sh",
+          "scripts/ci-apt-install.sh",
+          "scripts/toolport-preview-rollback.sh",
+          "src/test/linux-packaging.test.ts",
+        ].includes(file),
+    )
+  );
+}
+
 export function requireResults(needs) {
   for (const job of [
     "changes",
     "frontend",
-    "linux-packages",
     "installer-script",
     "installer-script-bash",
     "pinned-install-urls",
@@ -61,6 +84,14 @@ export function requireResults(needs) {
     if (needs[job]?.result !== expected)
       throw new Error(`${job}: expected ${expected}, got ${needs[job]?.result}`);
   }
+  const packages = needs.changes.outputs?.linux_packages;
+  if (packages !== "true" && packages !== "false")
+    throw new Error("Linux package selection is missing or invalid");
+  const expected = packages === "true" ? "success" : "skipped";
+  if (needs["linux-packages"]?.result !== expected)
+    throw new Error(
+      `linux-packages: expected ${expected}, got ${needs["linux-packages"]?.result}`,
+    );
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
@@ -69,18 +100,25 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     console.log("All selected checks passed");
   } else if (process.argv[2] === "select") {
     let files = [];
-    if (process.env.CI_EVENT === "pull_request") {
+    const event = process.env.CI_EVENT;
+    if (event === "pull_request" || event === "push") {
       const refs = [process.env.CI_BASE_SHA, process.env.CI_HEAD_SHA];
       if (refs.some((ref) => !/^[a-f0-9]{40}$/.test(ref ?? "")))
-        throw new Error("Invalid pull request source revision");
-      files = execFileSync("git", ["diff", "--name-only", "-z", ...refs], {
-        encoding: "utf8",
-      })
-        .split("\0")
-        .filter(Boolean);
+        throw new Error("Invalid source revision");
+      // The first push has no before commit. Select checks conservatively.
+      if (refs[0] !== "0".repeat(40)) {
+        files = execFileSync("git", ["diff", "--name-only", "-z", ...refs], {
+          encoding: "utf8",
+        })
+          .split("\0")
+          .filter(Boolean);
+      }
     }
     const rust = needsRust(process.env.CI_EVENT, files);
     appendFileSync(process.env.GITHUB_OUTPUT, `rust=${rust}\n`);
+    const packages = needsLinuxPackages(event, files);
+    appendFileSync(process.env.GITHUB_OUTPUT, `linux_packages=${packages}\n`);
+    console.log(`Linux packages ${packages ? "selected" : "unchanged"}`);
     console.log(`Native checks ${rust ? "selected" : "unchanged"}`);
   } else throw new Error("Expected select or gate");
 }

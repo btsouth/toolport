@@ -12,8 +12,9 @@
 //    `undefined symbol: wl_fixes_interface`. The window then never paints.
 // GTK system packages replace the Tauri .deb; the AppImage remains a fallback.
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse } from "yaml";
@@ -41,6 +42,8 @@ function workflow(name: string): Workflow {
   return parse(read(".github", "workflows", name)) as Workflow;
 }
 
+const AUR_ED25519_FINGERPRINT = "SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4";
+
 const PATCH_SCRIPT = "scripts/patch-appimage.sh";
 const patchScript = read(...PATCH_SCRIPT.split("/"));
 
@@ -66,6 +69,20 @@ function hasGnuSed(): boolean {
   }
 }
 const gnuSed = hasGnuSed();
+
+// The workflow assertions below run real shell out of aur.yml. Needs bash and
+// ssh-keygen; CI runs the frontend tests on ubuntu-22.04, which has both.
+function hasBashTools(): boolean {
+  try {
+    execFileSync("bash", ["-c", "command -v ssh-keygen && command -v sort"], {
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+const bashTools = hasBashTools();
 
 function applyScriptSed(input: string): string {
   const dir = mkdtempSync(join(tmpdir(), "toolport-gdk-"));
@@ -204,6 +221,254 @@ describe("release.yml runs the AppImage patch and re-signs", () => {
       (s) => s.name === "Install Linux build dependencies",
     );
     expect(deps?.run).toContain("squashfs-tools");
+  });
+});
+
+describe("the AUR package ships to Arch", () => {
+  it.skipIf(!bashTools)(
+    "renders the GTK deb with matching checksums and Arch metadata",
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), "toolport-aur-render-"));
+      try {
+        const deb = join(dir, "Toolport_2.0.0_amd64.deb");
+        const license = join(dir, "LICENSE");
+        writeFileSync(deb, "GTK deb fixture");
+        writeFileSync(license, "license fixture");
+        const out = join(dir, "aur");
+        execFileSync("bash", ["scripts/render-aur.sh", "v2.0.0", out], {
+          env: {
+            ...process.env,
+            AUR_DEB_FILE: deb,
+            AUR_LICENSE_FILE: license,
+            AUR_PKGREL: "2",
+          },
+          stdio: "pipe",
+        });
+        const pkg = readFileSync(join(out, "PKGBUILD"), "utf8");
+        const info = readFileSync(join(out, ".SRCINFO"), "utf8");
+        expect(pkg).toContain("pkgname=toolport-bin");
+        expect(pkg).toContain("pkgver=2.0.0");
+        expect(pkg).toContain("pkgrel=2");
+        expect(pkg).toContain("Toolport_2.0.0_amd64.deb");
+        for (const dep of [
+          "gtk4>=4.14",
+          "libadwaita>=1.5",
+          "glib2>=2.80",
+          "glibc>=2.39",
+          "gcc-libs",
+          "dbus",
+          "hicolor-icon-theme",
+        ]) {
+          expect(pkg).toContain(`'${dep}'`);
+          expect(info).toContain(`depends = ${dep}\n`);
+        }
+        expect(pkg).not.toMatch(/webkit2gtk|gtk3|xdotool|libayatana/);
+        expect(pkg).toContain("provides=('toolport')");
+        expect(pkg).toContain("conflicts=('toolport')");
+        expect(pkg).toContain('bsdtar -xf "$srcdir"/data.tar.* -C "$pkgdir"');
+        for (const file of [deb, license]) {
+          const sha = createHash("sha256").update(readFileSync(file)).digest("hex");
+          expect(pkg).toContain(sha);
+          expect(info).toContain(`sha256sums = ${sha}`);
+        }
+        expect(() =>
+          execFileSync("bash", ["scripts/render-aur.sh", "2.0.0-preview.1", out], {
+            stdio: "pipe",
+          }),
+        ).toThrow();
+        expect(() =>
+          execFileSync("bash", ["scripts/render-aur.sh", "2.0.0", out], {
+            env: { ...process.env, AUR_PKGREL: "0" },
+            stdio: "pipe",
+          }),
+        ).toThrow();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("keeps dry runs from publishing", () => {
+    const push = workflow("aur.yml").jobs?.publish?.steps?.find(
+      (s) => s.name === "Publish to the AUR",
+    );
+    expect(push?.if).toContain("inputs.dry_run != true");
+  });
+
+  const aur = workflow("aur.yml");
+  const publish = aur.jobs?.publish;
+  const steps = publish?.steps ?? [];
+  // By name, not by matching a URL substring in the script body: a substring
+  // test against a URL is exactly the shape CodeQL flags, and the step name is
+  // the stabler handle anyway.
+  const byName = (name: string) => steps.find((s) => s.name === name);
+
+  it("waits for the release to be published, like winget does", () => {
+    // Draft assets 404, so checksums computed against them would be wrong.
+    const on = aur.on as { release?: { types?: string[] } };
+    expect(on.release?.types).toEqual(["released"]);
+  });
+
+  it("skips prereleases", () => {
+    // An Arch pkgver cannot carry `-rc.1`, and a prerelease is not what
+    // `pacman -S` should hand people.
+    expect(publish?.if).toContain("!github.event.release.prerelease");
+  });
+
+  it("build-tests the package before pushing", () => {
+    const build = byName("Build and validate the package in an Arch container");
+    expect(build, "no Arch container build step").toBeDefined();
+    expect(build!.run).toContain("makepkg");
+    expect(build!.run).toContain("usr/bin/toolport");
+  });
+
+  it("cannot let the build container alter what gets published", () => {
+    // `archlinux:base-devel` is a moving tag. The control is not pinning it, it
+    // is that the container gets the PKGBUILD read-only and its .SRCINFO lands
+    // in a scratch mount that is only diffed, never published.
+    const build = byName("Build and validate the package in an Arch container");
+    expect(build!.run).toContain('-v "$PWD/aur:/pkg:ro"');
+    expect(build!.run).toContain("--printsrcinfo > /out/.SRCINFO");
+    expect(build!.run).toMatch(/diff -u .*srcinfo-out\/\.SRCINFO/);
+    // A mismatch must fail the release, not be quietly adopted.
+    expect(build!.run).toContain("exit 1");
+    expect(build!.env?.AUR_SSH_PRIVATE_KEY).toBeUndefined();
+  });
+
+  it.skipIf(!bashTools)("reads one key as one key when the host is dual-stack", () => {
+    // ssh-keyscan walks every getaddrinfo result, so an A and an AAAA record for
+    // the same host write the SAME key twice. Without the unique step the
+    // comparison sees two concatenated fingerprints and fails closed forever.
+    const push = byName("Publish to the AUR")!;
+    const got = push.run!.match(/^got=\$\(.*$/m)?.[0];
+    const uniq = push.run!.match(/^unique=.*$/m)?.[0];
+    expect(got, "no host-key fingerprint line").toBeDefined();
+    expect(uniq, "no unique-count line").toBeDefined();
+
+    const dir = mkdtempSync(join(tmpdir(), "toolport-hostkey-"));
+    try {
+      const key = join(dir, "k");
+      execFileSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", key]);
+      // A known_hosts line is "<host> <type> <base64>", i.e. the .pub without
+      // its trailing comment.
+      const pub = readFileSync(`${key}.pub`, "utf8").trim().split(/\s+/);
+      const line = `aur.archlinux.org ${pub[0]} ${pub[1]}\n`;
+      const kh = join(dir, "known_hosts");
+      writeFileSync(kh, line + line); // the dual-stack case: same key, twice
+
+      const script = `${got!.replace("~/.ssh/known_hosts", JSON.stringify(kh))}\n${uniq}\nprintf '%s|%s' "$unique" "$got"`;
+      const out = execFileSync("bash", ["-c", script], { encoding: "utf8" });
+      const [unique, fingerprint] = out.split("|");
+      expect(unique, `two copies of one key read as ${unique} keys`).toBe("1");
+      expect(fingerprint).toMatch(/^SHA256:/);
+      expect(fingerprint).not.toContain("\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(!bashTools)("refuses to publish an older version over a newer one", () => {
+    // The concurrency group serialises pushes but does not order them by
+    // version, so a workflow_dispatch catch-up for an old tag could overwrite a
+    // newer AUR package and start handing out the older release.
+    const push = byName("Publish to the AUR")!;
+    const start = push.run!.indexOf('new_full="${TAG#v}-${AUR_PKGREL}"');
+    const end = push.run!.indexOf("cp aur/PKGBUILD");
+    expect(start, "no downgrade guard").toBeGreaterThan(-1);
+    const guard = push.run!.slice(start, end);
+
+    // onAur / pushing are "<pkgver>-<pkgrel>", the pair pacman actually orders by.
+    const run = (onAur: string, pushing: string) => {
+      const dir = mkdtempSync(join(tmpdir(), "toolport-aurver-"));
+      const [haveVer, haveRel] = onAur.split("-");
+      const [wantVer, wantRel] = pushing.split("-");
+      try {
+        mkdirSync(join(dir, "aur-repo"));
+        writeFileSync(
+          join(dir, "aur-repo", "PKGBUILD"),
+          `pkgver=${haveVer}\npkgrel=${haveRel}\n`,
+        );
+        return execFileSync(
+          "bash",
+          [
+            "-c",
+            `cd ${JSON.stringify(dir)}\nTAG=v${wantVer}\nAUR_PKGREL=${wantRel}\n${guard}\necho PROCEEDED`,
+          ],
+          { encoding: "utf8" },
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+
+    expect(run("1.16.0-1", "1.15.0-1")).toContain("Not downgrading");
+    expect(run("1.16.0-1", "1.15.0-1")).not.toContain("PROCEEDED");
+    // pkgrel is the other half of the ordering. Re-dispatching the same tag
+    // defaults pkgrel back to 1, so a pkgver-only guard would push 1.15.0-1
+    // over a 1.15.0-2 that fixed the PKGBUILD, and nobody on -2 would upgrade.
+    expect(run("1.15.0-2", "1.15.0-1")).toContain("Not downgrading");
+    expect(run("1.15.0-2", "1.15.0-1")).not.toContain("PROCEEDED");
+    expect(run("1.15.0-1", "1.15.0-2")).toContain("PROCEEDED");
+    expect(run("1.14.0-1", "1.15.0-1")).toContain("PROCEEDED");
+    expect(run("1.15.0-1", "1.15.0-1")).toContain("PROCEEDED"); // identical, porcelain skips
+    // Not lexical: 1.9.0 must not read as newer than 1.10.0.
+    expect(run("1.9.0-1", "1.10.0-1")).toContain("PROCEEDED");
+  });
+
+  it("can bump pkgrel so a same-version PKGBUILD fix actually upgrades", () => {
+    // pacman compares pkgver-pkgrel; re-publishing a fixed PKGBUILD at the same
+    // pkgrel reads as "already installed" everywhere it matters.
+    const raw = read(".github", "workflows", "aur.yml");
+    expect(raw).toContain("pkgrel:");
+    expect(publish?.env?.AUR_PKGREL).toBe("${{ inputs.pkgrel || '1' }}");
+    const renderer = read("scripts", "render-aur.sh");
+    expect(renderer).toContain("pkgrel=${AUR_PKGREL:-1}");
+    expect(renderer).toContain("AUR_PKGREL must be a positive integer");
+  });
+
+  it("gates the AUR push on the secret and keeps the key step-scoped", () => {
+    const push = byName("Publish to the AUR");
+    expect(push, "no AUR push step").toBeDefined();
+    expect(push!.if).toContain("env.AUR_KEY_CONFIGURED == 'true'");
+    expect(publish?.env?.AUR_KEY_CONFIGURED).toBe(
+      "${{ secrets.AUR_SSH_PRIVATE_KEY != '' }}",
+    );
+    // The push key must not be visible to the container step above it.
+    expect(push!.env?.AUR_SSH_PRIVATE_KEY).toContain("secrets.AUR_SSH_PRIVATE_KEY");
+    for (const s of steps) {
+      if (s !== push) expect(s.env?.AUR_SSH_PRIVATE_KEY, s.name).toBeUndefined();
+    }
+    // The fetched host key is checked against the fingerprint AUR publishes, so
+    // this is not trust-on-first-use. A keyscan with no comparison would be.
+    expect(push!.run).toContain(AUR_ED25519_FINGERPRINT);
+    expect(push!.run).toMatch(/ssh-keygen -lf/);
+    expect(push!.run).toMatch(/\[ "\$got" != "\$AUR_ED25519_FINGERPRINT" \]/);
+  });
+
+  it("does not track a generated PKGBUILD, which pins one release's checksum", () => {
+    const ignored = read(".gitignore");
+    expect(ignored).toContain("/packaging/linux/aur/PKGBUILD");
+    expect(ignored).toContain("/packaging/linux/aur/.SRCINFO");
+  });
+
+  it("serialises pushes so two releases cannot race a non-fast-forward", () => {
+    const raw = read(".github", "workflows", "aur.yml");
+    expect(raw).toContain("group: aur-publish");
+    expect(raw).toContain("cancel-in-progress: false");
+  });
+
+  it("does a full sync before installing into the rolling Arch image", () => {
+    // `pacman -Sy` is a partial upgrade: it can pull a namcap whose deps are
+    // newer than the image, or leave archlinux-keyring too old to verify.
+    const build = byName("Build and validate the package in an Arch container");
+    expect(build!.run).toContain("pacman -Syu");
+    expect(build!.run).not.toMatch(/pacman -Sy\s/);
+  });
+
+  it("normalises a dispatch tag typed without the leading v", () => {
+    const norm = byName("Normalise the tag");
+    expect(norm, "no tag normalisation step").toBeDefined();
+    expect(norm!.run).toContain("v${TAG#v}");
   });
 });
 

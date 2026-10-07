@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 
 pub(super) const RELEASE_PAGE: &str = "https://github.com/btsouth/toolport/releases";
 
@@ -8,6 +9,7 @@ enum PackageType {
     Deb,
     Rpm,
     Pacman,
+    Aur,
 }
 
 fn advice(package: Option<PackageType>) -> &'static str {
@@ -19,6 +21,9 @@ fn advice(package: Option<PackageType>) -> &'static str {
             "Download the new .rpm from the release page, then run sudo dnf install ./<file>.rpm."
         }
         Some(PackageType::Pacman) => "Update Toolport with sudo pacman -Syu.",
+        Some(PackageType::Aur) => {
+            "Update toolport-bin with your AUR helper, or rebuild it from the AUR."
+        }
         None => {
             "Open the release page for the latest Toolport package and installation instructions."
         }
@@ -43,7 +48,11 @@ fn installed_type(
                 owner.split(':').next() == Some("toolport") && Path::new(path) == executable
             }),
             PackageType::Rpm | PackageType::Pacman => output.trim() == "toolport",
+            PackageType::Aur => unreachable!(),
         };
+        if package == PackageType::Pacman && output.trim() == "toolport-bin" {
+            return Some(PackageType::Aur);
+        }
         if owned {
             return Some(package);
         }
@@ -51,13 +60,31 @@ fn installed_type(
     None
 }
 
+pub(super) fn generic_advice() -> &'static str {
+    advice(None)
+}
+
+// Called on a blocking worker; concurrent Settings pages share one detection.
 pub(super) fn update_advice() -> &'static str {
+    static ADVICE: OnceLock<&'static str> = OnceLock::new();
+    cached_advice(&ADVICE, detect_advice)
+}
+
+fn cached_advice(
+    cache: &OnceLock<&'static str>,
+    detect: impl FnOnce() -> &'static str,
+) -> &'static str {
+    cache.get_or_init(detect)
+}
+
+fn detect_advice() -> &'static str {
     let package = std::env::current_exe().ok().and_then(|executable| {
         installed_type(&executable, |package, executable| {
             let (command, args): (&str, &[&str]) = match package {
                 PackageType::Deb => ("dpkg-query", &["--search"]),
                 PackageType::Rpm => ("rpm", &["-qf", "--qf", "%{NAME}"]),
                 PackageType::Pacman => ("pacman", &["-Qqo"]),
+                PackageType::Aur => unreachable!(),
             };
             let output = Command::new(command)
                 .args(args)
@@ -76,6 +103,27 @@ pub(super) fn update_advice() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detection_is_cached_even_when_no_package_is_found() {
+        let cache = OnceLock::new();
+        assert_eq!(cached_advice(&cache, generic_advice), generic_advice());
+        assert_eq!(
+            cached_advice(&cache, || panic!("must not query package managers again")),
+            generic_advice()
+        );
+    }
+
+    #[test]
+    fn aur_ownership_uses_an_aur_upgrade_path() {
+        let executable = Path::new("/usr/bin/toolport-gtk");
+        let package = installed_type(executable, |package, _| {
+            (package == PackageType::Pacman).then(|| "toolport-bin\n".into())
+        });
+        assert_eq!(package, Some(PackageType::Aur));
+        assert!(advice(package).contains("AUR helper"));
+        assert!(!advice(package).contains("pacman -Syu"));
+    }
 
     #[test]
     fn advice_uses_downloaded_files_for_deb_and_rpm_and_the_pacman_repo() {

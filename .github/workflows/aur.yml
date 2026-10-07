@@ -1,0 +1,243 @@
+name: aur
+
+# Publishes the `toolport-bin` AUR package after a release is PUBLISHED.
+#
+# Preserve upgrades for existing toolport-bin users with the official GTK .deb.
+# It links host GTK4 and libadwaita and keeps the native package's file layout.
+#
+# Not on the version tag, deliberately: release.yml builds into a DRAFT release
+# and PKGBUILD's sha256sums must be computed from the assets people will actually
+# download, which 404 until the draft is published. Same reason winget.yml waits.
+on:
+  release:
+    types: [released]
+  # Manual catch-up: `release` fires exactly once, and a push to the AUR can fail
+  # for a reason that resolves later (a maintainer account that is not set up
+  # yet, an AUR outage). This is also how the very first publish is done.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, e.g. v1.15.0"
+        required: true
+        type: string
+      dry_run:
+        description: "Render and build-test only; do not push to the AUR"
+        type: boolean
+        default: false
+      pkgrel:
+        # pacman compares pkgver-pkgrel. Re-publishing the same tag after fixing
+        # render-aur.sh (wrong depends, moved source URL) with pkgrel still 1
+        # looks "already installed" to every machine that took the broken
+        # package; only fresh installs get the fix. Bumping this is deliberate,
+        # an operator choice, which is why it is an input and not automatic.
+        description: "Arch package revision; bump when re-publishing the SAME version with a fixed PKGBUILD"
+        required: false
+        type: string
+        default: "1"
+
+# Two published releases close together (or a release plus a workflow_dispatch
+# catch-up) would otherwise clone, commit and `git push` the same AUR repo at the
+# same time, and the loser gets a non-fast-forward rejection. Queue instead of
+# cancelling: the second push has real work to do.
+concurrency:
+  group: aur-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    # A prerelease is not what `pacman -S` should hand people, and an Arch pkgver
+    # cannot carry the `-rc.1` suffix anyway. On a manual run
+    # `github.event.release` is null, so the tag is re-checked below.
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      # Until this secret exists the publish step no-ops with a warning, so
+      # adding this workflow can never fail a release. Same gating style as
+      # WINGET_TOKEN and the Azure signing steps in release.yml.
+      AUR_KEY_CONFIGURED: ${{ secrets.AUR_SSH_PRIVATE_KEY != '' }}
+      # Empty on the `release` trigger, where `inputs` does not exist.
+      AUR_PKGREL: ${{ inputs.pkgrel || '1' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      # `inputs.tag` is whatever a human typed in the dispatch box. The hint says
+      # `v1.15.0`, but `1.15.0` gets typed, and then `gh release view 1.15.0`
+      # fails on a release that exists. Normalise once, here, so every step below
+      # sees the same tag. (render-aur.sh already strips its own leading v.)
+      - name: Normalise the tag
+        run: |
+          normalised="v${TAG#v}"
+          if [ "$normalised" != "$TAG" ]; then
+            echo "tag '$TAG' normalised to '$normalised'"
+          fi
+          echo "TAG=$normalised" >> "$GITHUB_ENV"
+
+      # The release trigger cannot fire for a draft or a prerelease; a manual run
+      # can name any tag, so it gets the same check explicitly.
+      - name: Check the tag is a published, non-prerelease release
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          state=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease)
+          echo "$state"
+          if [ "$(echo "$state" | jq -r .isDraft)" = "true" ]; then
+            echo "::error::$TAG is still a draft; its assets 404, so the checksums would be wrong."
+            exit 1
+          fi
+          if [ "$(echo "$state" | jq -r .isPrerelease)" = "true" ]; then
+            echo "::error::$TAG is a prerelease; the AUR package is stable-only."
+            exit 1
+          fi
+
+      - name: Render PKGBUILD and .SRCINFO from the published assets
+        run: |
+          mkdir -p aur
+          bash scripts/render-aur.sh "${TAG#v}" aur
+          cat aur/PKGBUILD
+
+      # Actually build the package rather than hoping the PKGBUILD is right. This
+      # verifies the checksums against the published .deb, that the ar/tar
+      # unwrapping works, and that the binaries land where the .desktop file
+      # expects. `--nodeps` skips installing GTK4 et al: those are runtime
+      # dependencies this container never has to satisfy to prove packaging works.
+      #
+      # The container REPORTS, it does not produce. `aur/` is mounted read-only
+      # and the files pushed to the AUR are the ones scripts/render-aur.sh wrote
+      # on the runner; the container's `makepkg --printsrcinfo` goes to a separate
+      # scratch mount and is only DIFFED against them. So `archlinux:base-devel`
+      # being a moving tag can fail this job but cannot put a byte into what is
+      # published, which is a stronger property than pinning the tag by digest -
+      # a pinned digest still writes to whatever it is given. (Pin one here as
+      # well if you want a frozen toolchain, but verify the digest yourself; do
+      # not paste one you have not checked.) The step holds no secrets: the AUR
+      # push key is scoped to the step below.
+      - name: Build and validate the package in an Arch container
+        run: |
+          mkdir -p srcinfo-out
+          docker run --rm \
+            -v "$PWD/aur:/pkg:ro" -v "$PWD/srcinfo-out:/out" \
+            -w /build archlinux:base-devel bash -euc '
+            # -Syu, not -Sy: a partial sync on a rolling image can pull a namcap whose
+            # deps are newer than the image, or leave archlinux-keyring too old to
+            # verify current signatures. Either way makepkg dies before the push.
+            pacman -Syu --noconfirm --needed archlinux-keyring namcap > /dev/null
+            useradd -m builder
+            cp /pkg/PKGBUILD /build/
+            chown -R builder /build /out
+            sudo -u builder makepkg --nodeps --noconfirm --nocheck
+            sudo -u builder makepkg --printsrcinfo > /out/.SRCINFO
+            namcap PKGBUILD || true
+            pkg=$(ls -1 *.pkg.tar.*)
+            echo "built $pkg"
+            bsdtar -tf "$pkg" > contents.txt
+            for want in usr/bin/toolport-gtk usr/bin/toolport-gateway usr/bin/toolport usr/bin/conduit usr/share/applications/com.tsout.Toolport.desktop usr/share/metainfo/com.tsout.Toolport.metainfo.xml usr/share/toolport/agent-plugin/toolport-agent-plugin.zip usr/share/toolport/toolport-preview-rollback.sh usr/share/licenses/toolport/LICENSE usr/share/licenses/toolport-bin/LICENSE; do
+              grep -qx "$want" contents.txt || { echo "::error::$want missing from $pkg"; exit 1; }
+            done
+            grep -q "^usr/share/applications/" contents.txt || { echo "::error::no .desktop file in $pkg"; exit 1; }
+          '
+          # Line order in .SRCINFO carries no meaning, so compare sorted: this is
+          # asking "does the renderer say the same thing makepkg would", not
+          # "did it emit the bytes in the same sequence".
+          norm() { sed '/^[[:space:]]*$/d' "$1" | sort; }
+          if ! diff -u <(norm aur/.SRCINFO) <(norm srcinfo-out/.SRCINFO); then
+            echo "::error::scripts/render-aur.sh disagrees with makepkg --printsrcinfo (left: rendered, right: makepkg). Fix the renderer."
+            exit 1
+          fi
+          echo "--- .SRCINFO (matches makepkg --printsrcinfo) ---"
+          cat aur/.SRCINFO
+
+      - name: Publish to the AUR
+        if: ${{ env.AUR_KEY_CONFIGURED == 'true' && inputs.dry_run != true }}
+        env:
+          # Step-scoped: the Arch container above runs code from a mutable image
+          # tag and has no business being able to read the AUR push key.
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          # Fetch the host key, then REFUSE it unless its SHA256 matches the
+          # fingerprint AUR publishes under "SSH Fingerprints" at
+          # https://aur.archlinux.org/. That is the same guarantee as pasting the
+          # base64 key in here (the fingerprint IS the hash of the key blob) and
+          # it is checkable against the published page, which a wall of base64 is
+          # not. Bare `ssh-keyscan` would be trust-on-first-use against whatever
+          # answers on the day; this fails closed instead.
+          #
+          # If AUR rotates the key this step stops with the mismatch printed.
+          # Re-read the fingerprint from that page before touching the line below.
+          AUR_ED25519_FINGERPRINT='SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4'
+          ssh-keyscan -t ed25519 aur.archlinux.org > ~/.ssh/known_hosts 2>/dev/null || true
+          # `sort -u`, because ssh-keyscan walks every getaddrinfo result: on a
+          # dual-stack runner it writes the SAME key once for A and once for AAAA,
+          # and two identical fingerprints must not read as a mismatch. Requiring
+          # exactly one unique value keeps the check strict - two DIFFERENT keys
+          # still fail, which is the case that matters.
+          got=$(ssh-keygen -lf ~/.ssh/known_hosts 2>/dev/null | awk '{ print $2 }' | sort -u)
+          unique=$(printf '%s' "$got" | grep -c . || true)
+          if [ "$unique" != "1" ] || [ "$got" != "$AUR_ED25519_FINGERPRINT" ]; then
+            echo "::error::aur.archlinux.org host key does not match the published fingerprint."
+            echo "  expected exactly one key with $AUR_ED25519_FINGERPRINT"
+            echo "  got ($unique unique) ${got:-<nothing>}"
+            exit 1
+          fi
+          echo "host key verified: $got"
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+
+          # AUR serves an empty repo for a package that does not exist yet, so
+          # the first release creates `toolport-bin` by pushing to it.
+          git clone ssh://aur@aur.archlinux.org/toolport-bin.git aur-repo
+
+          # The concurrency group serialises pushes; it does not order them by
+          # version. A workflow_dispatch catch-up for an OLD tag - the documented
+          # retry path - would otherwise happily overwrite a newer pkgver, and
+          # `paru -S toolport-bin` would start handing out the older release while
+          # already-upgraded machines stay put. Read what is there and refuse to
+          # go backwards.
+          #
+          # Compare pkgver-pkgrel, not pkgver. pkgrel is the other half of what
+          # pacman orders by, and the documented retry - dispatch the same tag
+          # again - defaults pkgrel back to 1. Against an AUR already carrying
+          # 1.15.0-2 from a PKGBUILD fix, a pkgver-only comparison finds them
+          # equal, skips the guard, and pushes 1.15.0-1 over it: machines on -2
+          # never upgrade and new installs get the older revision.
+          new_full="${TAG#v}-${AUR_PKGREL}"
+          existing_ver=$(sed -n 's/^pkgver=//p' aur-repo/PKGBUILD 2>/dev/null | head -1)
+          existing_rel=$(sed -n 's/^pkgrel=//p' aur-repo/PKGBUILD 2>/dev/null | head -1)
+          if [ -n "$existing_ver" ]; then
+            existing_full="$existing_ver-${existing_rel:-1}"
+            newest=$(printf '%s\n%s\n' "$existing_full" "$new_full" | sort -V | tail -1)
+            if [ "$existing_full" != "$new_full" ] && [ "$newest" != "$new_full" ]; then
+              echo "::notice::The AUR carries $existing_full, which is newer than $new_full. Not downgrading."
+              exit 0
+            fi
+          fi
+
+          cp aur/PKGBUILD aur/.SRCINFO aur-repo/
+          cd aur-repo
+          git config user.name "toolport release"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "The AUR already carries $new_full; nothing to push."
+            exit 0
+          fi
+          git add PKGBUILD .SRCINFO
+          git commit -m "toolport-bin $new_full"
+          git push origin HEAD:master
+
+      - name: Say why nothing was published
+        if: ${{ env.AUR_KEY_CONFIGURED != 'true' || inputs.dry_run == true }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "::notice::dry_run was set: the package built and validated, but nothing was pushed."
+          else
+            echo "::warning::AUR_SSH_PRIVATE_KEY is not set, so toolport-bin was not published for $TAG. See packaging/linux/aur/README.md for the one-time setup, or push the rendered files by hand."
+          fi

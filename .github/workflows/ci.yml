@@ -17,6 +17,8 @@ permissions:
 jobs:
   linux-packages:
     name: GTK deb and rpm install tests
+    needs: changes
+    if: needs.changes.outputs.linux_packages == 'true'
     uses: ./.github/workflows/linux-packages.yml
 
   changes:
@@ -25,6 +27,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.select.outputs.rust }}
+      linux_packages: ${{ steps.select.outputs.linux_packages }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -39,8 +42,8 @@ jobs:
         id: select
         env:
           CI_EVENT: ${{ github.event_name }}
-          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: node .github/scripts/ci-policy.mjs select
 
   frontend:
