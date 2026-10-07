@@ -6035,9 +6035,13 @@ fn uninstall_gateway_inner(client_id: &str) -> Result<WriteOutcome, String> {
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = resolved_definition_path(&def)?;
     let backup = backup_file(client_id, &path)?;
-    let restored_names = moved::missing_names(client_id, def.format, &path)?;
+    let mut restored_names = moved::missing_names(client_id, def.format, &path)?;
     if restore::apply(client_id, def.format, &path)? {
-        moved::restore(client_id, def.format, &path)?;
+        if restore::needs_moved(client_id, &path)? {
+            moved::restore(client_id, def.format, &path)?;
+        }
+        let restored = read_client(&def).servers;
+        restored_names.retain(|name| restored.iter().any(|server| server.name.eq_ignore_ascii_case(name)));
         return Ok(WriteOutcome {
             path: path.display().to_string(),
             backup: backup.map(|p| p.display().to_string()),

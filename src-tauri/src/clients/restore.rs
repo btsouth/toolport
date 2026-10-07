@@ -338,6 +338,10 @@ fn named_list(root: &mut Value, key: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub(super) fn needs_moved(client_id: &str, path: &Path) -> Result<bool, String> {
+    Ok(load(client_id, path)?.is_none_or(|record| !record.preexisting_gateways.is_empty()))
+}
+
 pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool, String> {
     let Some(record) = load(client_id, path)? else {
         return Ok(false);
@@ -699,7 +703,9 @@ mod tests {
     fn disconnect(id: &str, path: &Path, format: Format) -> Result<(), String> {
         mutation::run(id, path, format, || {
             assert!(apply(id, format, path)?);
-            moved::restore(id, format, path)?;
+            if needs_moved(id, path)? {
+                moved::restore(id, format, path)?;
+            }
             Ok(())
         })?;
         let revision = if path.exists() {
@@ -1104,6 +1110,29 @@ mod tests {
                 assert_eq!(restored, original);
             }
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn exact_original_wins_over_a_stale_move_record() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-stale-move-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"mcpServers":{"stale":{"command":"stale"}}}"#).unwrap();
+        moved::record("fixture", Format::JsonMcpServers, &path).unwrap();
+        let original = r#"{ "mcpServers": {"native":{"command":"native"}} }"#;
+        std::fs::write(&path, original).unwrap();
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            edit_format(Format::JsonMcpServers, &path, Some(&entry()), true)
+        })
+        .unwrap();
+        disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
+        assert_eq!(read_config_file(&path).unwrap(), original);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
