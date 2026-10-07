@@ -1149,7 +1149,7 @@ impl ResourceSubscriptionTable {
             .unwrap_or_default()
     }
 
-    /// Every tracked `(uri, owner)` pair for re-subscribe after rebuild.
+    #[cfg(test)]
     fn tracked_uri_owners(&self) -> Vec<(String, String)> {
         self.uri_owner
             .iter()
@@ -1171,6 +1171,7 @@ impl ResourceSubscriptionTable {
         self.uri_owner.get(uri).map(String::as_str)
     }
 
+    #[cfg(test)]
     fn set_owner(&mut self, uri: &str, owner: &str) {
         if self.uri_owner.contains_key(uri) {
             self.uri_owner.insert(uri.to_string(), owner.to_string());

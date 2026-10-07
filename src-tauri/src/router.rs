@@ -819,17 +819,16 @@ impl ServerSlot {
         if status.needs_auth {
             format!("server '{}' {}", self.id, status.describe())
         } else {
-            let ever_ready = self
+            let state = self
                 .supervisor
                 .as_ref()
                 .unwrap()
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .ever_ready;
-            let reason = if ever_ready {
-                "is restarting"
-            } else {
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let reason = if !state.ever_ready && state.state == SupervisorState::Backoff {
                 "has not connected yet"
+            } else {
+                "is restarting"
             };
             format!(
                 "server '{}' {reason}, retry in {}s ({})",
