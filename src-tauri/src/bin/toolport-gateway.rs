@@ -32748,3 +32748,93 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// Regression gate for `toolport_search_tools` ranking: 66 natural-language intents
+/// against a 20-server, 411-tool catalog (seven reference MCP servers captured live,
+/// thirteen realistic mock catalogs). The fixture lives under `tests/fixtures/search-eval`.
+#[cfg(test)]
+mod search_eval {
+    use super::*;
+
+    const CATALOG: &str = include_str!("../../tests/fixtures/search-eval/catalog.json");
+    const INTENTS: &str = include_str!("../../tests/fixtures/search-eval/intents.json");
+    const TOP1_MIN: f64 = 0.85;
+    const TOP3_MIN: f64 = 0.88;
+
+    fn catalog() -> Vec<Value> {
+        let doc: Value = serde_json::from_str(CATALOG).expect("catalog fixture parses");
+        let shared = doc["sharedInputSchema"].clone();
+        let mut tools: Vec<Value> = doc["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| {
+                let mut tool = tool.clone();
+                if tool.get("inputSchema").is_none() {
+                    tool["inputSchema"] = shared.clone();
+                }
+                tool
+            })
+            .collect();
+        // The live catalog snapshot is name-sorted; ties rank in that order.
+        tools.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        tools
+    }
+
+    #[test]
+    fn search_eval_meets_top1_target_at_twenty_servers() {
+        let tools = catalog();
+        let servers: HashSet<String> = tools.iter().map(tool_prefix).collect();
+        assert_eq!(servers.len(), 20);
+        let intents: Vec<Value> = serde_json::from_str(INTENTS).expect("intents fixture parses");
+        assert_eq!(intents.len(), 66);
+        let index = CatalogSearchIndex::build(&tools);
+
+        let (mut top1, mut top3) = (0usize, 0usize);
+        let mut misses = Vec::new();
+        let started = Instant::now();
+        for intent in &intents {
+            let query = intent["query"].as_str().unwrap();
+            let expected = intent["expected"].as_str().unwrap();
+            let outcome = search_catalog_indexed(&tools, query, None, 3, None, Some(&index));
+            let names: Vec<&str> = outcome
+                .matches
+                .iter()
+                .filter_map(|hit| hit["name"].as_str())
+                .collect();
+            match names.iter().position(|name| *name == expected) {
+                Some(0) => {
+                    top1 += 1;
+                    top3 += 1;
+                }
+                rank => {
+                    if rank.is_some() {
+                        top3 += 1;
+                    }
+                    misses.push(format!(
+                        "  rank {} | {query} | want {expected} | got {}",
+                        rank.map(|r| (r + 1).to_string()).unwrap_or("-".into()),
+                        names.join(", ")
+                    ));
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+        let n = intents.len() as f64;
+        let summary = format!(
+            "search eval: top-1 {top1}/{} ({:.1}%), top-3 {top3}/{} ({:.1}%), {:.0} us/query over {} tools\n{}",
+            intents.len(),
+            100.0 * top1 as f64 / n,
+            intents.len(),
+            100.0 * top3 as f64 / n,
+            elapsed.as_secs_f64() * 1e6 / n,
+            tools.len(),
+            misses.join("\n")
+        );
+        eprintln!("{summary}");
+        assert!(
+            top1 as f64 / n >= TOP1_MIN && top3 as f64 / n >= TOP3_MIN,
+            "{summary}"
+        );
+    }
+}
