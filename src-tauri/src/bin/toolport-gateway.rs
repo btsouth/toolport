@@ -5897,9 +5897,8 @@ fn execute_script_dispatch(
     // (SBS-881). Run the defense here, before the script's own result is returned,
     // so nothing unscanned reaches the model. The failure envelope was defended
     // part by part above and is all Toolport text now.
-    if result["isError"] != true {
-        defend_script_aggregate(reg, client, &owner, &mut result);
-    }
+    let untrusted = result["isError"] != true
+        && !defend_script_aggregate(reg, client, &owner, &mut result);
 
     // Intermediate calls were not shaped (full bodies stayed in the sandbox). The
     // script's aggregate can still blow the transport/context budget, so shape only
@@ -5915,6 +5914,9 @@ fn execute_script_dispatch(
         client,
         protected_failure_prefix_bytes,
     );
+    if untrusted {
+        integrity::label_untrusted_result(&owner.label, &mut result);
+    }
     result
 }
 
@@ -5953,7 +5955,7 @@ fn defend_script_aggregate(
             return true;
         }
     }
-    integrity::label_untrusted_result(&owner.label, result);
+    integrity::label_untrusted_result_with_notice(&owner.label, result, false);
     false
 }
 
