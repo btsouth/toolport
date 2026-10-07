@@ -2941,7 +2941,7 @@ mod tests {
         let mut names = registry
             .servers
             .iter()
-            .filter(|server| registry.is_enabled(profile, &server.id))
+            .filter(|server| registry.is_enabled(&registry.resolve_profile_id(profile), &server.id))
             .map(|server| server.name.clone())
             .collect::<Vec<_>>();
         names.sort();

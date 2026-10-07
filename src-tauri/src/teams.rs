@@ -4345,6 +4345,24 @@ mod tests {
         assert_eq!(merged["github"], [5, 50]);
     }
 
+    #[test]
+    fn v3_reviewed_global_enable_keeps_consent_and_global_off_survives_sync() {
+        let mut registry = Registry::default();
+        let config = json!({"servers":[{"id":"reviewed","name":"Reviewed","transport":"stdio","command":"fixture-only","args":[],"env":[]}]});
+        apply_team_config(&mut registry, "t1", &config);
+        let id = registry.servers[0].id.clone();
+        assert!(!registry.server_enabled(&id));
+        crate::registry_controller::apply_server_enabled(&mut registry, "default", &id, true, true)
+            .unwrap();
+        assert!(registry.profiles[0].enabled_server_ids.contains(&id));
+        apply_team_config(&mut registry, "t1", &config);
+        assert!(registry.server_enabled(&id));
+        registry.set_global_server_enabled(&id, false).unwrap();
+        apply_team_config(&mut registry, "t1", &config);
+        assert!(!registry.server_enabled(&id));
+        assert!(registry.profiles[0].enabled_server_ids.contains(&id));
+    }
+
     fn base_registry() -> Registry {
         let mut r = Registry::default();
         // Exercise retained v1 fields and releasable team overlays.

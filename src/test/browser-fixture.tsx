@@ -68,7 +68,10 @@ localStorage.setItem("toolport.onboarded", "1");
 
 mockIPC(
   (command, payload) => {
-    const args = payload && !Array.isArray(payload) ? payload : {};
+    const args: Record<string, unknown> =
+      payload && !Array.isArray(payload) && !(payload instanceof ArrayBuffer)
+        ? payload
+        : {};
     calls[command] = (calls[command] ?? 0) + 1;
     switch (command) {
       case "set_default_access":

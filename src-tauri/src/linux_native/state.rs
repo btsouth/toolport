@@ -1044,7 +1044,7 @@ mod tests {
         assert!(initial.servers.is_empty());
 
         registry.servers.push(server("files", "Files", "stdio"));
-        registry.profiles[0].enabled_server_ids.push("files".into());
+        registry.set_global_server_enabled("files", true).unwrap();
         std::fs::write(&path, serde_json::to_vec(&registry).unwrap()).unwrap();
 
         let RegistryState::Ready(updated) = load_read_only(Some(&path)) else {
