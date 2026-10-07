@@ -84,6 +84,16 @@ pub(super) fn checkpoint(path: &Path) -> Result<Receipt, String> {
     })
 }
 
+fn missing_parents(path: &Path) -> Vec<PathBuf> {
+    let mut parents = Vec::new();
+    let mut parent = path.parent();
+    while let Some(dir) = parent.filter(|dir| !dir.exists()) {
+        parents.push(dir.into());
+        parent = dir.parent();
+    }
+    parents
+}
+
 fn retired_hook_count(value: Option<&Value>) -> usize {
     match value {
         Some(Value::Object(map)) => {
@@ -137,12 +147,7 @@ pub(super) fn remember(
     let mut record = match load(client_id, path)? {
         Some(record) => record,
         None => {
-            let mut created_parents = Vec::new();
-            let mut parent = path.parent();
-            while let Some(dir) = parent.filter(|dir| !dir.exists()) {
-                created_parents.push(dir.into());
-                parent = dir.parent();
-            }
+            let created_parents = missing_parents(path);
             let preexisting_gateways = original_gateways(client_id, format, path, before)?;
             Snapshot {
                 version: 1,
@@ -164,6 +169,10 @@ pub(super) fn remember(
             }
         }
     };
+    let released = record.disconnected && record.disconnect_before.is_none();
+    if released && !disconnecting {
+        record.created_parents = missing_parents(path);
+    }
     if previous.is_some() && before.map(crate::registry::sha256_hex) != record.last_written_hash {
         record.exact_eligible = false;
         let previous_written = mutation::value(format, record.last_written.as_deref())?;
@@ -182,7 +191,7 @@ pub(super) fn remember(
     if disconnecting {
         record.baseline = mutation::value(format, after)?;
     }
-    record.disconnect_before = if disconnecting {
+    record.disconnect_before = if disconnecting && !released {
         before.map(str::to_string)
     } else {
         None
@@ -370,8 +379,16 @@ fn named_list(root: &mut Value, key: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub(super) fn released(client_id: &str, path: &Path) -> Result<bool, String> {
+    Ok(load(client_id, path)?
+        .is_some_and(|record| record.disconnected && record.disconnect_before.is_none()))
+}
+
 pub(super) fn needs_moved(client_id: &str, path: &Path) -> Result<bool, String> {
-    Ok(load(client_id, path)?.is_none_or(|record| !record.preexisting_gateways.is_empty()))
+    Ok(load(client_id, path)?.is_none_or(|record| {
+        !(record.disconnected && record.disconnect_before.is_none())
+            && !record.preexisting_gateways.is_empty()
+    }))
 }
 
 pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool, String> {
@@ -379,6 +396,9 @@ pub(super) fn apply(client_id: &str, format: Format, path: &Path) -> Result<bool
         return Ok(false);
     };
     mutation::disconnecting();
+    if record.disconnected && record.disconnect_before.is_none() {
+        return Ok(true);
+    }
     let current = if mutation::exists(path) {
         Some(read_config_file(path)?)
     } else {
@@ -639,11 +659,18 @@ pub(super) fn run<T>(
 
 pub(super) fn finish(client_id: &str, path: &Path, expected: Option<&str>) -> Result<(), String> {
     check_finished(client_id, path, expected)?;
-    if let Some(record) = load(client_id, path)? {
-        for parent in record.created_parents {
+    if let Some(mut record) = load(client_id, path)? {
+        for parent in &record.created_parents {
             let _ = std::fs::remove_dir(parent);
         } // Empty directories only.
-        std::fs::remove_file(record_path(client_id, path)?).map_err(|e| e.to_string())?;
+          // Keep immutable original provenance and a completed-removal marker.
+          // A later uninstaller/retry must not claim the restored native entries.
+        record.disconnected = true;
+        record.disconnect_before = None;
+        crate::registry::atomic_write(
+            &record_path(client_id, path)?,
+            &serde_json::to_string(&record).map_err(|e| e.to_string())?,
+        )?;
     }
     Ok(())
 }
@@ -659,8 +686,10 @@ pub(crate) fn after_rollback(
     if record.config_path != target.to_string_lossy() {
         return Err("Client rollback recovery path mismatch".into());
     }
-    record.disconnected = false;
-    record.disconnect_before = None;
+    if written.map(crate::registry::sha256_hex) != record.last_written_hash {
+        record.disconnected = false;
+        record.disconnect_before = None;
+    }
     record.last_written = written.map(str::to_string);
     record.last_written_hash = written.map(crate::registry::sha256_hex);
     crate::registry::atomic_write(
@@ -705,11 +734,14 @@ pub(super) fn recorded_paths() -> Vec<(String, PathBuf, Result<Format, String>)>
                         .map_err(|_| "Client recovery record is invalid".to_string())
                 });
             match parsed {
-                Ok(record) => paths.push((
-                    def.id.into(),
-                    PathBuf::from(record.config_path),
-                    Ok(record.format),
-                )),
+                Ok(record) => {
+                    let path = PathBuf::from(record.config_path);
+                    match released(def.id, &path) {
+                        Ok(true) => {}
+                        Ok(false) => paths.push((def.id.into(), path, Ok(record.format))),
+                        Err(error) => paths.push((def.id.into(), file, Err(error))),
+                    }
+                }
                 Err(error) => paths.push((def.id.into(), file, Err(error))),
             }
         }
@@ -1144,6 +1176,13 @@ mod tests {
             }
             disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
             let restored = read_config_file(&path).unwrap();
+            assert!(released("fixture", &path).unwrap());
+            disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
+            assert_eq!(read_config_file(&path).unwrap(), restored);
+            assert_eq!(
+                load("fixture", &path).unwrap().unwrap().original.as_deref(),
+                Some(original)
+            );
             if edited {
                 let root = parse_json_value(&restored).unwrap();
                 assert_eq!(root["session"], 2);
@@ -1235,6 +1274,29 @@ mod tests {
         assert_eq!(read_config_file(&path).unwrap(), removed);
         assert!(!removed.contains("--toolport-hook"));
         assert!(removed.contains("user-hook"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn repeated_disconnect_preserves_native_edits_after_release() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-released-native-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = crate::registry::DataDirOverride::set(dir.join("data"));
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        mutation::run("fixture", &path, Format::JsonMcpServers, || {
+            edit_format(Format::JsonMcpServers, &path, Some(&entry()), true)
+        })
+        .unwrap();
+        disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
+        let native = r#"{ "session": 2, "mcpServers": {"toolport":{"command":"/custom/toolport-gateway","args":["--profile","custom"]}} }"#;
+        std::fs::write(&path, native).unwrap();
+        disconnect("fixture", &path, Format::JsonMcpServers).unwrap();
+        assert_eq!(read_config_file(&path).unwrap(), native);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

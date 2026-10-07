@@ -139,7 +139,8 @@ Before its first edit, Toolport saves exact original bytes or a file-absent reco
 under its data directory's `backups/<client>/original-<path hash>.json`. The record
 includes the path, content hash, capture time and Toolport version. It is separate
 from the rotating backups and uses owner-only permissions (Unix modes or a
-private Windows ACL).
+private Windows ACL). Original provenance is retained after disconnect, so
+repeated removal and a later uninstaller preserve the restored config.
 
 Disconnect restores exact original bytes when the config still matches Toolport's
 last write and no intervening native edits were observed. Otherwise it preserves

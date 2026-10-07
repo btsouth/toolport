@@ -88,6 +88,10 @@ fn record_path(client_id: &str) -> Result<PathBuf, String> {
         .join(RECORD_FILE))
 }
 
+pub(super) fn has_record(client_id: &str) -> bool {
+    record_path(client_id).is_ok_and(|path| path.exists())
+}
+
 fn load(client_id: &str) -> Result<Option<Record>, String> {
     let path = record_path(client_id)?;
     match std::fs::read_to_string(&path) {

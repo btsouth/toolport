@@ -15,9 +15,10 @@ pub fn all(dry_run: bool) -> Result<Vec<ClientResult>, String> {
     let mut clients = detect_clients();
     apply_entry_states(&mut clients, &current.client_managed_entries);
     let targets = clients.into_iter().filter(|client| {
-        client.gateway_installed
+        (client.gateway_installed
+            && !restore::released(&client.id, Path::new(&client.config_path)).unwrap_or(false))
             || current.client_managed_entries.contains_key(&client.id)
-            || backup_dir(&client.id).is_some_and(|dir| dir.exists())
+            || moved::has_record(&client.id)
     });
     let mut results = run(
         targets.map(|client| (client.id, client.config_path)),
