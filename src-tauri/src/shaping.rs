@@ -416,7 +416,9 @@ pub fn fetch_result(
             }
         };
 
-        return text_result(serde_json::to_string(value).unwrap_or_default(), false);
+        let mut result = text_result(serde_json::to_string(value).unwrap_or_default(), false);
+        crate::integrity::label_untrusted_result("cached result", &mut result);
+        return result;
     }
     let total = c.body.chars().count();
     if offset >= total {
@@ -468,7 +470,9 @@ pub fn fetch_result(
     } else {
         format!("\n\n[Toolport: end of result ({total} characters).]")
     };
-    text_result(format!("{slice}{footer}"), false)
+    let mut result = text_result(format!("{slice}{footer}"), false);
+    crate::integrity::label_untrusted_result("cached result", &mut result);
+    result
 }
 
 #[cfg(test)]

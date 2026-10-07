@@ -249,7 +249,7 @@ function Welcome({
     {
       icon: ShieldCheck,
       title: "Watched for tampering",
-      body: "Every server is checked for rug-pulls and prompt injection.",
+      body: "Tool definitions are screened for suspicious changes. All returned content is labeled as untrusted data.",
     },
   ];
   return (

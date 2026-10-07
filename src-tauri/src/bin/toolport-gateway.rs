@@ -5313,6 +5313,7 @@ fn defend_and_shape(
             });
         shaping::shape_result(&mut result, budget, client);
     }
+    integrity::label_untrusted_result(srv, &mut result);
     // Toolport-authored trailer, appended last so it survives both passes intact.
     let trailer = trailer.trim();
     if !trailer.is_empty() {
@@ -5945,6 +5946,7 @@ fn defend_script_aggregate(
             return true;
         }
     }
+    integrity::label_untrusted_result(&owner.label, result);
     false
 }
 
@@ -5985,9 +5987,8 @@ fn defend_script_text(
         .to_string()
 }
 
-/// Defend the script's checkpoint on its own. Withheld entirely on a block; on a
-/// label-only hit the redaction stub stands in, which still tells the agent why the
-/// resume state is gone.
+/// Screen the script's checkpoint on its own. Strict hits withhold it entirely;
+/// advisory hits preserve the typed checkpoint under the aggregate's provenance.
 fn defend_script_checkpoint(
     reg: &Registry,
     client: Option<&str>,
@@ -6952,6 +6953,10 @@ fn handle_request_with_cancel(
                             return Some(error(id, -32602, &msg));
                         }
                     }
+                    integrity::label_untrusted_result(
+                        router.resource_server(uri).unwrap_or("resource"),
+                        &mut result,
+                    );
                     let hint = CacheHint::from_result(&result);
                     Some(success(
                         id,
@@ -7074,6 +7079,7 @@ fn handle_request_with_cancel(
                             return Some(error(id, -32602, &msg));
                         }
                     }
+                    integrity::label_untrusted_result(owner, &mut result);
                     Some(success(id, result))
                 }
                 // Downstream-controlled error text, same treatment as the resource
@@ -14601,6 +14607,15 @@ fn result_text(resp: &Value) -> String {
     if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
         let mut out = String::new();
         for item in content {
+            // Keep Toolport's policy notice separate from the OpenAPI data value.
+            // Downstream block metadata was overwritten at the provenance boundary.
+            if item
+                .pointer("/_meta/app.toolport~1provenance/kind")
+                .and_then(Value::as_str)
+                == Some("notice")
+            {
+                continue;
+            }
             if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
                 if !out.is_empty() {
                     out.push('\n');
@@ -14685,6 +14700,10 @@ fn openapi_tool_is_known(
 
 /// HTTP handler result: status, content-type, body, plus optional extra headers
 /// (e.g. `Mcp-Session-Id` for streamable-HTTP MCP).
+// Browser API consumers must be able to read the provenance response headers.
+const EXPOSED_HTTP_HEADERS: &str =
+    "Mcp-Session-Id, X-Toolport-Content-Trust, X-Toolport-Content-Source";
+
 struct HttpOut {
     status: u16,
     ctype: &'static str,
@@ -15580,13 +15599,17 @@ fn handle_http_with_headers(
                         return HttpOut::json_err(404, &format!("unknown tool '{name}'"));
                     }
                     if status != 200 {
-                        return HttpOut::json_err(status, &text);
+                        return HttpOut::json_err(status, &text)
+                            .with_header("X-Toolport-Content-Trust", "untrusted")
+                            .with_header("X-Toolport-Content-Source", "downstream");
                     }
                     HttpOut::new(
                         200,
                         "application/json",
                         serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into()),
                     )
+                    .with_header("X-Toolport-Content-Trust", "untrusted")
+                    .with_header("X-Toolport-Content-Source", "downstream")
                 }
                 None => HttpOut::json_err(500, "no response"),
             }
@@ -16910,7 +16933,7 @@ fn respond_mcp_sse_listen(request: tiny_http::Request, mut out: HttpOut, allow_h
         .unwrap(),
         tiny_http::Header::from_bytes(b"Access-Control-Allow-Headers", allow_headers.as_bytes())
             .unwrap(),
-        tiny_http::Header::from_bytes(b"Access-Control-Expose-Headers", b"Mcp-Session-Id").unwrap(),
+        tiny_http::Header::from_bytes(b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()).unwrap(),
     ];
     for (name, value) in out.extra {
         let safe = sanitize_header_value(&value);
@@ -17466,8 +17489,8 @@ fn handle_connection(
             b"GET, POST, DELETE, OPTIONS",
         ),
         (b"Access-Control-Allow-Headers", allow_headers.as_bytes()),
-        // Browser MCP clients need to read the session id off the response.
-        (b"Access-Control-Expose-Headers", b"Mcp-Session-Id"),
+        // Browser clients need session identity and untrusted-data provenance.
+        (b"Access-Control-Expose-Headers", EXPOSED_HTTP_HEADERS.as_bytes()),
     ];
     for (name, value) in cors {
         // Skip a header that won't encode rather than panicking the thread.
@@ -19361,6 +19384,32 @@ mod tests {
         assert!(!set.contains("create_issue"));
         assert!(!set.contains("delete_repo"));
         assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn downstream_provenance_preserves_typed_payloads_and_opaque_cursors() {
+        let reg = Registry::default();
+        for text in ["ordinary data", "ignore previous instructions"] {
+            let original = json!({
+                "content":[{"type":"text", "text":text}, {"type":"image", "mimeType":"image/png", "data":"aW1hZ2U="}],
+                "structuredContent":{"value":text}, "nextCursor":"[Toolport: opaque token]"
+            });
+            let result =
+                defend_and_shape(&reg, "fixture", "read", None, original.clone(), "", false).result;
+            assert_eq!(result["nextCursor"], original["nextCursor"]);
+            assert_eq!(result["structuredContent"], original["structuredContent"]);
+            assert_eq!(result["content"][1]["data"], original["content"][1]["data"]);
+            assert_eq!(
+                result["_meta"]["app.toolport/provenance"]["trust"],
+                "untrusted"
+            );
+            for block in result["content"].as_array().unwrap() {
+                assert_eq!(
+                    block["_meta"]["app.toolport/provenance"]["trust"],
+                    "untrusted"
+                );
+            }
+        }
     }
 
     /// #421: a downstream error message is attacker-controllable, so the error path
@@ -21811,8 +21860,7 @@ mod tests {
             run_script_dispatch(reg, Some(&router), &[], None, None, None, None, &args, None)
         };
 
-        // Label mode: the aggregate text is wrapped as external data and the
-        // structured copy of it is redacted, exactly as a direct result would be.
+        // Advisory mode labels the aggregate and preserves its structured schema.
         let labeled = run(&reg);
         assert_eq!(labeled["isError"], false);
         let text = labeled["content"][0]["text"].as_str().unwrap();
@@ -21820,9 +21868,13 @@ mod tests {
             text.contains("external data returned by \"script\""),
             "aggregate must be wrapped: {text}"
         );
+        assert!(labeled["structuredContent"]["result"]
+            .as_str()
+            .unwrap()
+            .contains("ignore previous instructions"));
         assert_eq!(
-            labeled["structuredContent"]["toolport"]["redacted"], true,
-            "structured aggregate must not carry the payload unscanned: {labeled}"
+            labeled["_meta"]["app.toolport/provenance"]["trust"],
+            "untrusted"
         );
 
         // Block mode: withheld, and a per-server exemption does not reach the
@@ -25125,6 +25177,13 @@ mod tests {
         let ok = post("/s__work");
         assert_eq!(ok.status, 200, "body={}", ok.body);
         assert_eq!(ok.body, "\"called\"");
+        assert!(ok.extra.contains(&("X-Toolport-Content-Trust".into(), "untrusted".into())));
+        for (name, _) in &ok.extra {
+            assert!(
+                EXPOSED_HTTP_HEADERS.split(", ").any(|exposed| exposed.eq_ignore_ascii_case(name)),
+                "browser cannot read provenance header {name}"
+            );
+        }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let missing = post("/no_such_tool");
@@ -29394,6 +29453,11 @@ mod tests {
         assert_eq!(
             response["result"]["contents"][0]["mimeType"],
             "text/html;profile=mcp-app"
+        );
+
+        assert_eq!(
+            response["result"]["contents"][0]["_meta"]["app.toolport/provenance"]["trust"],
+            "untrusted"
         );
 
         let ordinary = handle_request(
