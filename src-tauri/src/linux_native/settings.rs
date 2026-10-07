@@ -231,7 +231,7 @@ impl SettingsPage {
         page.append(&safety);
         page.append(&settings_heading(
             "Advanced",
-            "Personal data, inspection and remembered approvals.",
+            "Client access, folder routing, personal data and inspection.",
         ));
         let protection = gtk::Box::new(gtk::Orientation::Vertical, 0);
         protection.add_css_class("toolport-settings-group");
@@ -733,6 +733,13 @@ impl SettingsPage {
             self.access_list.remove(&child);
         }
         self.access_list.append(&settings_heading("Access sets", "Narrow enabled servers and tools per client. Servers that are off are hidden everywhere."));
+        self.access_list.append(
+            &gtk::Label::builder()
+                .label("Default access")
+                .halign(gtk::Align::Start)
+                .css_classes(["heading"])
+                .build(),
+        );
         let mut labels = vec!["All enabled servers".to_string()];
         labels.extend(registry.profiles.iter().map(|p| p.name.clone()));
         let default =
@@ -870,7 +877,7 @@ impl SettingsPage {
             .set_sensitive(!settings.profiles.is_empty());
         if settings.profiles.is_empty() {
             self.folder_list.append(&empty_state(
-                "Create a access set before adding project folder routing.",
+                "Create an access set before adding project folder routing.",
             ));
             return;
         }
