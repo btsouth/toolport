@@ -5,10 +5,12 @@ pub mod audit;
 pub mod autostart;
 pub mod brand;
 pub mod catalog;
+pub mod child_ledger;
 pub mod clients;
 pub mod codemode;
 pub mod codemode_worker;
 pub mod daemon;
+pub mod daemon_log;
 #[cfg(feature = "desktop")]
 mod desktop;
 pub mod diagnostics_controller;

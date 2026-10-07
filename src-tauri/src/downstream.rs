@@ -3665,9 +3665,8 @@ impl StdioTransport {
         }
         #[cfg(windows)]
         let job = WindowsJob::new()?;
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("failed to spawn '{command}': {e}"))?;
+        let mut child =
+            spawn_server(cmd).map_err(|e| format!("failed to spawn '{command}': {e}"))?;
         #[cfg(windows)]
         if let Err(error) = job.assign(&child).and_then(|_| WindowsJob::resume(&child)) {
             let _ = child.kill();
@@ -4069,6 +4068,84 @@ impl Transport for StdioTransport {
     }
 }
 
+/// Spawn a downstream server and record it in [`crate::child_ledger`], so a
+/// gateway that starts after this one was killed can stop what it left behind.
+///
+/// On Linux the server also gets SIGTERM the moment the gateway dies
+/// (`PR_SET_PDEATHSIG`), so a killed gateway does not leave it running until the
+/// next start. That signal fires when the *thread* that spawned the child ends,
+/// not the process, so every server is spawned from one thread that lives as
+/// long as the process. It reaches only the direct child: a launcher's own
+/// children stay in its process group for the next start to reap.
+#[cfg(target_os = "linux")]
+fn spawn_server(mut cmd: Command) -> std::io::Result<Child> {
+    use std::os::unix::process::CommandExt;
+    let tag = crate::child_ledger::new_tag();
+    cmd.env(crate::child_ledger::TAG_VAR, &tag);
+    use std::sync::mpsc;
+    type Job = (Command, mpsc::Sender<std::io::Result<Child>>);
+    static SPAWNER: std::sync::OnceLock<Option<Mutex<mpsc::Sender<Job>>>> =
+        std::sync::OnceLock::new();
+    let spawner = SPAWNER.get_or_init(|| {
+        let (sender, jobs) = mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("toolport-server-spawner".to_string())
+            .spawn(move || {
+                for (mut cmd, reply) in jobs {
+                    let _ = reply.send(cmd.spawn());
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(sender))
+    });
+    let Some(spawner) = spawner else {
+        // No long-lived thread to bind the signal to: spawn without it.
+        return record_spawned(cmd.spawn(), &tag);
+    };
+    let parent = std::process::id() as libc::pid_t;
+    // SAFETY: prctl, getppid and _exit are async-signal-safe, as pre_exec requires.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The gateway died between fork and prctl, so the signal never comes.
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+    let (reply, spawned) = mpsc::channel();
+    spawner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .send((cmd, reply))
+        .map_err(|_| std::io::Error::other("the server spawner thread is gone"))?;
+    record_spawned(
+        spawned
+            .recv()
+            .map_err(|_| std::io::Error::other("the server spawner thread is gone"))?,
+        &tag,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_server(mut cmd: Command) -> std::io::Result<Child> {
+    let tag = crate::child_ledger::new_tag();
+    cmd.env(crate::child_ledger::TAG_VAR, &tag);
+    record_spawned(cmd.spawn(), &tag)
+}
+
+/// The tag lets the next gateway prove a leftover process is this server's
+/// even after the server itself is gone; see [`crate::child_ledger`].
+fn record_spawned(spawned: std::io::Result<Child>, tag: &str) -> std::io::Result<Child> {
+    if let Ok(child) = &spawned {
+        crate::child_ledger::record(child.id(), tag);
+    }
+    spawned
+}
+
 /// Kill the whole process group a downstream server was spawned into, so
 /// `npx`->node (and `uvx`->python) grandchildren die with the wrapper instead of
 /// leaking on every server toggle and router rebuild. The Windows counterpart is
@@ -4121,6 +4198,7 @@ impl Drop for StdioTransport {
         // Reaps the direct child. Grandchildren were signalled above but are not
         // ours to reap; they are reparented to init, which reaps them.
         let _ = self.child.wait();
+        crate::child_ledger::forget(self.child.id());
     }
 }
 

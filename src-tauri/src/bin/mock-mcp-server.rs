@@ -31,6 +31,9 @@
 //!   count how often the gateway retried.
 //! - `MOCK_MCP_CALL_DELAY_MS=<ms>` — every `tools/call` waits this long before
 //!   answering, so a test can hold the gateway's request workers busy.
+//! - `MOCK_MCP_PID_FILE=<path>` appends this process's pid at start, and
+//!   `MOCK_MCP_IGNORE_EOF=1` keeps it running after stdin closes, like a server
+//!   holding a listener or a pool, so a test can see whether it was orphaned.
 //!
 //! The default configuration (no env set) is byte-identical to the pre-SOU-443
 //! fixture apart from the added `echo_meta` tool, so `list_changed`,
@@ -750,6 +753,25 @@ fn fail_start_if_configured() {
 }
 
 fn main() {
+    if let Ok(path) = std::env::var("MOCK_MCP_PID_FILE") {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{}", std::process::id());
+        }
+    }
+    serve_stdio();
+    if std::env::var("MOCK_MCP_IGNORE_EOF").as_deref() == Ok("1") {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+}
+
+fn serve_stdio() {
     fail_start_if_configured();
     let cfg = Config::from_env();
     if std::env::var("MOCK_MCP_HTTP").as_deref() == Ok("1") {

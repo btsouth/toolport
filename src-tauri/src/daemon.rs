@@ -190,6 +190,60 @@ fn restrict_to_owner(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Remove descriptors, from any build, whose daemon process is gone, so dead
+/// daemons do not accumulate pointers in the data directory. A descriptor whose
+/// pid is in use stays: the rendezvous probe, not a pid, decides whether it is
+/// live. Lock files stay too. They are advisory locks the OS releases when
+/// their holder exits and carry no owner, and deleting one another process has
+/// open would break the mutual exclusion it provides. Returns how many went.
+pub fn clear_dead_descriptors(data_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return 0;
+    };
+    let mut cleared = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_descriptor = path.extension().is_some_and(|ext| ext == "json")
+            && path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("daemon-"));
+        if !is_descriptor {
+            continue;
+        }
+        let Some(seen) = read_descriptor(&path) else {
+            continue;
+        };
+        if process_exists(seen.pid) {
+            continue;
+        }
+        let Ok(_descriptor_lock) = registry::lock_at_for(&path, DESCRIPTOR_LOCK_TIMEOUT) else {
+            continue;
+        };
+        if read_descriptor(&path).as_ref() == Some(&seen) {
+            clear_descriptor_locked(&path);
+            cleared += 1;
+        }
+    }
+    cleared
+}
+
+/// Whether any process has `pid`. Where that cannot be asked, assume one does,
+/// so nothing is removed.
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: signal 0 only checks that the pid exists and may be signalled.
+    let signalled = unsafe { libc::kill(pid, 0) } == 0;
+    signalled || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn process_exists(_pid: u32) -> bool {
+    true
+}
+
 /// A fresh bearer for the internal endpoint.
 pub fn new_token() -> Result<String, String> {
     let mut bytes = [0u8; 32];
@@ -788,6 +842,24 @@ mod tests {
             attempt_identity_probe(&refused),
             Err(ProbeFailure::Answered(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_daemons_descriptors_are_cleared_and_live_ones_kept() {
+        let dir = temp_dir("dead-descriptors");
+        let live = DaemonDescriptor::new("127.0.0.1:9", "live", &compat("1.0.0", &dir));
+        let mut dead = DaemonDescriptor::new("127.0.0.1:9", "dead", &compat("0.9.0", &dir));
+        // Far above any real pid_max, so no process can have it.
+        dead.pid = 999_999_999;
+        let live_path = descriptor_path(&dir, &compat("1.0.0", &dir));
+        let dead_path = descriptor_path(&dir, &compat("0.9.0", &dir));
+        write_descriptor(&live_path, &live).unwrap();
+        write_descriptor(&dead_path, &dead).unwrap();
+        assert_eq!(clear_dead_descriptors(&dir), 1);
+        assert!(!dead_path.exists());
+        assert_eq!(read_descriptor(&live_path), Some(live));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

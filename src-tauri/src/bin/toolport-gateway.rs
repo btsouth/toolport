@@ -3094,11 +3094,15 @@ fn enabled_summary(
         Some(_) => "Servers available to this client".to_string(),
         None => format!("Profile '{profile_name}'"),
     };
+    // A daemon that replaced one which crashed says so first.
+    let crash = conduit_lib::daemon_log::previous_exit_note()
+        .map(|note| format!("{note}\n\n"))
+        .unwrap_or_default();
     if servers.is_empty() {
-        return format!("{header}: no servers enabled.");
+        return format!("{crash}{header}: no servers enabled.");
     }
 
-    let mut out = format!("{header} has {} enabled server(s):\n", servers.len());
+    let mut out = format!("{crash}{header} has {} enabled server(s):\n", servers.len());
     for s in &servers {
         let target = match (&s.command, &s.url) {
             (Some(cmd), _) => format!("{} {}", cmd, s.args.join(" ")),
@@ -17911,6 +17915,9 @@ fn spawn_daemon_idle_watchdog(
         glog("daemon: idle exit");
         // Land any queued audit/savings/search-trace lines before the process exits.
         conduit_lib::telemetry::flush();
+        if let Some(dir) = descriptor_path.parent() {
+            conduit_lib::daemon_log::end_run_cleanly(dir);
+        }
         std::process::exit(0);
     });
 }
@@ -18005,6 +18012,15 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
         conduit_lib::telemetry::flush();
         std::process::exit(0);
     }
+    // Learn how the previous daemon ended and drop pointers to dead ones
+    // before advertising this one.
+    if let Some(previous) = conduit_lib::daemon_log::begin_run(&dir) {
+        glog(&format!(
+            "daemon: previous daemon pid {} ended without a clean shutdown: {}",
+            previous.pid, previous.reason
+        ));
+    }
+    conduit_lib::daemon::clear_dead_descriptors(&dir);
     // Set the mode before publishing, so the first adapter to probe the
     // descriptor already sees the identity route.
     state.daemon_mode.store(true, Ordering::SeqCst);
@@ -18031,6 +18047,7 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
     // Land any queued telemetry before returning; the process exits right after.
     conduit_lib::telemetry::flush();
     conduit_lib::daemon::clear_descriptor(&descriptor_path);
+    conduit_lib::daemon_log::end_run_cleanly(&dir);
     std::process::exit(0);
 }
 
@@ -19301,6 +19318,18 @@ fn main() {
         // Share downstream 429 backoff windows across gateway processes
         // (issue #874) until the host daemon lands. Missing state = no backoff.
         conduit_lib::downstream_backoff::bind_data_dir(&dir);
+        // Record the servers this gateway starts, and stop the ones a killed or
+        // crashed gateway left behind.
+        conduit_lib::child_ledger::bind_data_dir(&dir);
+        let reaped = conduit_lib::child_ledger::reap_orphans(&dir);
+        if reaped > 0 {
+            glog(&format!(
+                "stopped {reaped} server process group(s) left by a gateway that is gone"
+            ));
+        }
+        if daemon_requested(&cli_args) {
+            conduit_lib::daemon_log::install_panic_hook(dir.clone());
+        }
     }
     // Diagnostic: `toolport-gateway --selftest-secrets` reads every vaulted secret
     // from THIS (gateway) process and reports. Used to validate the macOS keychain

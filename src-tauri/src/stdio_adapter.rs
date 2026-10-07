@@ -296,7 +296,7 @@ fn spawn_daemon() -> Result<(), String> {
         .arg("--daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(daemon_stderr());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -362,6 +362,15 @@ fn start_private_gateway(why: &str) -> Result<(std::process::Child, DaemonDescri
             Err(error)
         }
     }
+}
+
+/// The daemon's stderr goes to its rotating log in the data directory, so what
+/// it reports is kept rather than lost with its detached terminal.
+fn daemon_stderr() -> Stdio {
+    registry::conduit_dir()
+        .and_then(|dir| crate::daemon_log::stderr_file(&dir))
+        .map(Stdio::from)
+        .unwrap_or_else(Stdio::null)
 }
 
 /// The exact error the daemon sends when it refuses a session id. Missing,
