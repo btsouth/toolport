@@ -36,6 +36,8 @@ upgrade and compare file hashes, modes and owners. Debian 13 and Fedora get
 fresh installs. All three compare the installed GTK binary to the build, check
 desktop metadata and library resolution, and run `toolport-gateway --version`.
 Containers and image aliases are task-owned and cleaned after testing.
+If the build host blocks Docker bridge DNS, set
+`TOOLPORT_PACKAGE_TEST_NETWORK=host` for the test command. Tests expose no ports.
 
 These are package installation and headless smoke checks, not GTK display or
 live Secret Service acceptance. Credential fixtures prove byte preservation;

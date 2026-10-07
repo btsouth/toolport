@@ -124,7 +124,7 @@ for mode in ubuntu debian fedora; do
   timeout 300 docker pull "$image"
   alias_image="$prefix-$mode:latest"
   docker tag "$image" "$alias_image"
-  if timeout 900 docker run --name "$prefix-$mode" --network bridge \
+  if timeout 900 docker run --name "$prefix-$mode" --network "${TOOLPORT_PACKAGE_TEST_NETWORK:-bridge}" \
     -v "$tmp:/packages:ro" "$alias_image" bash /packages/test.sh --container "$mode" "$version"; then
     docker rm "$prefix-$mode" >/dev/null
     docker image rm "$alias_image" >/dev/null
