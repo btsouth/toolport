@@ -6224,9 +6224,9 @@ impl HttpTransport {
         self.server_handler.as_ref().and_then(|handler| handler(v))
     }
 
-    /// Proactive work skips a busy auth gate. Lock and persistence failures must
-    /// reach the caller without a second exchange; other failures may keep using
-    /// the current token throughout its safety window.
+    /// Proactive work skips a busy auth gate. Contention keeps the current token;
+    /// storage failures reach the caller. Both leave later calls free to reread
+    /// the vault and recover without an unlocked exchange.
     fn refresh_before_send(&mut self) -> Result<(), TransportError> {
         if let Some(refresh) = &self.refresh {
             let mut busy = match self.auth_gate.busy.try_lock() {
@@ -6266,7 +6266,9 @@ impl HttpTransport {
                 }
                 Err(error) => {
                     self.record_refresh_failure(current, error.clone());
-                    if crate::remote::is_refresh_storage_or_lock_error(&error) {
+                    if crate::remote::is_refresh_storage_or_lock_error(&error)
+                        && !crate::remote::is_refresh_lock_error(&error)
+                    {
                         return Err(TransportError::Fatal(error));
                     }
                 }
@@ -14636,6 +14638,11 @@ mod tests {
             for proactive in [false, true] {
                 const BUSY: &str =
                     "OAuth refresh is busy or its cross-process lock is unavailable; try again.";
+                let failure = if proactive {
+                    "could not read the vaulted OAuth state: temporarily locked"
+                } else {
+                    BUSY
+                };
                 let owner = "refresh-vault-recovery";
                 secrets::set_secret(owner, secrets::HTTP_AUTH_KEY, "old").unwrap();
                 let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
@@ -14671,7 +14678,7 @@ mod tests {
                     Some(Box::new(move |force| {
                         if force || proactive {
                             attempts.fetch_add(1, Ordering::SeqCst);
-                            Err(BUSY.into())
+                            Err(failure.into())
                         } else {
                             Ok(None)
                         }
@@ -14679,7 +14686,7 @@ mod tests {
                 );
                 transport.set_server_id(owner);
                 let error = transport.request("echo", json!({})).unwrap_err();
-                assert_eq!(error.to_string(), BUSY);
+                assert_eq!(error.to_string(), failure);
                 assert!(!crate::remote::is_auth_error(&error.to_string()));
                 secrets::set_secret(owner, secrets::HTTP_AUTH_KEY, "winner").unwrap();
                 assert_eq!(
