@@ -99,9 +99,11 @@ const SECURITY_DISMISSED_KEY_LEGACY = "conduit.security.dismissed";
 
 /** High-signal, interrupting events vs benign, quiet-history churn. The backend now
  * tags a `severity`; for events written before that (no field) we classify by type:
- * poison / injected-result / lost-baseline are high, a plain tool_drift is benign. */
+ * poison / injected-result / lost-baseline are high, a plain tool_drift is benign.
+ * `warn` (SEC-01 definition-content drift) rides the actionable tier for display. */
 function eventSeverity(e: SecurityEvent): "high" | "info" {
-  if (e.severity === "high" || e.severity === "info") return e.severity;
+  if (e.severity === "high" || e.severity === "warn") return "high";
+  if (e.severity === "info") return "info";
   if (
     e.type === "tool_poison_flag" ||
     e.type === "result_injection" ||
@@ -113,15 +115,23 @@ function eventSeverity(e: SecurityEvent): "high" | "info" {
   return "info";
 }
 
+/** The identity severity: the recorded tier when present, else the display tier. Keeps
+ * a `warn` definition-content drift distinct from a later `high` event on the same tool. */
+function severityIdentity(e: SecurityEvent): string {
+  return e.severity ?? eventSeverity(e);
+}
+
 /** Durable per-event key for dismissal: identity (type, server, tool, change, severity),
  * NOT the timestamp. A benign drift that re-flags later (e.g. RevenueCat revising a beta
  * tool again) collapses to the same key, so dismissing it once keeps it dismissed instead
  * of returning as a brand-new, undismissable notice. Server + change are kept so tool-less
- * events (e.g. pins_load_failed) don't collide and dismiss each other. Severity is kept so
- * dismissing a tool's benign change never masks a later HIGH-severity change on that same
- * tool (e.g. it turns destructive) - that must still interrupt. */
+ * events (e.g. pins_load_failed) don't collide and dismiss each other. The RECORDED
+ * severity is kept (not the display tier) so dismissing a tool's benign change never
+ * masks a later HIGH-severity change on that same tool (e.g. it turns destructive) -
+ * that must still interrupt. */
 function securityKey(e: SecurityEvent): string {
-  return `${e.type}:${e.server ?? ""}:${e.tool ?? ""}:${e.change}:${eventSeverity(e)}`;
+  const severity = severityIdentity(e);
+  return `${e.type}:${e.server ?? ""}:${e.tool ?? ""}:${e.change}:${severity}`;
 }
 
 /** Unique React list key. `securityKey` is deliberately timestamp-free (so dismissal is
@@ -148,7 +158,7 @@ function dedupeSecurity(events: SecurityEvent[]): SecurityEvent[] {
         k.server === e.server &&
         k.tool === e.tool &&
         k.change === e.change &&
-        eventSeverity(k) === eventSeverity(e) &&
+        severityIdentity(k) === severityIdentity(e) &&
         Math.abs(k.ts - e.ts) <= WINDOW_MS,
     );
     if (!dupe) kept.push(e);

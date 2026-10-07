@@ -185,13 +185,21 @@ fn annotation_downgrade(old: &Pin, tool: &Value) -> bool {
 ///   server set `destructiveHint: false` — SBS-875), or a safety annotation
 ///   was downgraded. These interrupt the user (badge + notice) and drive
 ///   quarantine-on-drift.
-/// - `info`: everything else (a non-destructive tool's description/schema was
-///   revised with its safety hints intact). Recorded to a quiet, viewable
-///   history, no badge.
+/// - `warn`: a non-destructive tool's description or schema was rewritten with its
+///   safety hints intact (SEC-01). Definition CONTENT is the prompt-injection
+///   surface even on a read-only tool, so this tier is quarantine-worthy under
+///   quarantine-on-drift and stays a visible warning when that setting is off.
+/// - `info`: everything else, i.e. annotation/title-only cosmetic churn. Recorded
+///   to a quiet, viewable history, no badge.
 const SEV_HIGH: &str = "high";
+const SEV_WARN: &str = "warn";
 const SEV_INFO: &str = "info";
 
-fn drift_severity(tool: &Value, annotation_downgrade: bool) -> &'static str {
+fn drift_severity(
+    tool: &Value,
+    annotation_downgrade: bool,
+    definition_content_changed: bool,
+) -> &'static str {
     let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
     // Call-time [`crate::router::is_destructive`] lets an explicit `false` hint
     // win. Drift tiering must not: MCP annotations are untrusted unless the
@@ -201,9 +209,28 @@ fn drift_severity(tool: &Value, annotation_downgrade: bool) -> &'static str {
         || annotation_downgrade
     {
         SEV_HIGH
+    } else if definition_content_changed {
+        SEV_WARN
     } else {
         SEV_INFO
     }
+}
+
+/// Whether a drift rewrote definition CONTENT (description or a schema) rather than
+/// only annotations. Content is what an agent reads before calling: a reworded
+/// description can carry instructions, so it is quarantine-worthy under
+/// quarantine-on-drift and a visible warning otherwise, even on a read-only tool.
+/// Purely annotation/title churn is cosmetic and stays on the quiet tier.
+fn definition_content_changed(old: &Pin, new: &Pin) -> bool {
+    let (Some(old), Some(new)) = (&old.parts, &new.parts) else {
+        // A legacy pin keeps no per-field detail, and a version-mismatched pin is
+        // re-baselined before this is consulted. Treat anything else as content so
+        // an upgrade can never hide a rewrite.
+        return true;
+    };
+    old.description != new.description
+        || old.input_schema != new.input_schema
+        || old.output_schema != new.output_schema
 }
 
 const MAX_SECURITY_BYTES: u64 = 1024 * 1024;
@@ -641,7 +668,11 @@ fn check_inner_with(
                 // algorithm version; a version mismatch is our format upgrade, not the
                 // tool's, so re-baseline quietly (no event, no re-scan).
                 Some(old) if old.fp != pin.fp && fp_version(&old.fp) == fp_version(&pin.fp) => {
-                    let sev = drift_severity(t, annotation_downgrade(old, t));
+                    let sev = drift_severity(
+                        t,
+                        annotation_downgrade(old, t),
+                        definition_content_changed(old, &pin),
+                    );
                     // Capture prior annotation flags on the event *before* re-baseline
                     // overwrites the pin (SOU-305). apply_quarantine stores them on the
                     // quarantine record so the UI can say "readOnlyHint: true → false"
@@ -650,7 +681,12 @@ fn check_inner_with(
                     scan = true;
                 }
                 None => {
-                    events.push(event(server, name, "added", drift_severity(t, false)));
+                    events.push(event(
+                        server,
+                        name,
+                        "added",
+                        drift_severity(t, false, false),
+                    ));
                     scan = true;
                 }
                 _ => {}
@@ -1587,9 +1623,12 @@ pub fn quarantine_list(profile: Option<&str>) -> Vec<Value> {
 /// `profile` tag is what `release` takes back to clear the right store.
 /// Effective severity of a retained security event: explicit severity when the
 /// record carries one, else by type. Mirrors `eventSeverity` in the dashboard.
+/// `warn` (SEC-01 definition-content drift) surfaces on the loud/actionable tier,
+/// so it reads as `high` here while `security_key` keeps its own identity.
 pub fn event_severity(event: &Value) -> &'static str {
     match event.get("severity").and_then(Value::as_str) {
         Some("high") => return "high",
+        Some("warn") => return "high",
         Some("info") => return "info",
         _ => {}
     }
@@ -1608,15 +1647,24 @@ pub fn event_severity(event: &Value) -> &'static str {
 /// collapsing: type, server, tool, change, and severity - deliberately NOT the
 /// timestamp, so a re-flagged benign drift stays dismissed, while a later
 /// HIGH-severity change on the same tool still interrupts.
+///
+/// The recorded severity is used verbatim (not `event_severity`) so a `warn`
+/// definition-content drift keeps its own identity instead of collapsing into a
+/// `high` event on the same tool; events written before severity tiering fall back
+/// to the type-based classification.
 pub fn security_key(event: &Value) -> String {
     let field = |key: &str| event.get(key).and_then(Value::as_str).unwrap_or("");
+    let severity = match event.get("severity").and_then(Value::as_str) {
+        Some(severity) => severity,
+        None => event_severity(event),
+    };
     format!(
         "{}:{}:{}:{}:{}",
         field("type"),
         field("server"),
         field("tool"),
         field("change"),
-        event_severity(event)
+        severity
     )
 }
 
@@ -1934,9 +1982,10 @@ fn release_all_inner(
 }
 
 /// From `check`'s drift `events` and the `current` tool list, quarantine the HIGH-RISK
-/// drifts: any tool whose new definition scanned as poisoned, plus a destructive tool
-/// whose definition changed or newly appeared. A benign change to a non-destructive
-/// tool is left exposed (detection still logged it). Returns whether anything new was
+/// drifts: any tool whose new definition scanned as poisoned, plus a destructive or
+/// write-named tool whose definition changed, an annotation downgrade, and (SEC-01) a
+/// description/schema rewrite on any tool. Annotation/title-only cosmetic churn is left
+/// exposed (detection still logged it). Returns whether anything new was
 /// blocked. (High-risk-by-auth — a drift on a credential-bearing server — is a later
 /// pass; it needs server-secret context the integrity layer doesn't hold here.) Store/lock
 /// failures are returned distinctly so the gateway can retain its live blocked set.
@@ -1954,11 +2003,13 @@ pub fn apply_quarantine(
 }
 
 fn is_high_risk_drift(event: &Value) -> bool {
-    event.get("severity").and_then(Value::as_str) == Some(SEV_HIGH)
-        && matches!(
-            event.get("change").and_then(Value::as_str),
-            Some("changed" | "poison")
-        )
+    matches!(
+        event.get("severity").and_then(Value::as_str),
+        Some(SEV_HIGH | SEV_WARN)
+    ) && matches!(
+        event.get("change").and_then(Value::as_str),
+        Some("changed" | "poison")
+    )
 }
 
 /// Tool names an integrity failure must keep blocked in memory until their quarantine record is
@@ -2074,10 +2125,11 @@ fn apply_quarantine_inner_with(
         ) else {
             continue;
         };
-        // Only high-severity drift is blocked. `check` already tagged severity.
-        // A "changed" that reached `high` without `is_destructive` is either an
+        // `high` and `warn` drift is blocked (SEC-01). `check` already tagged severity.
+        // A `changed` that reached `high` without `is_destructive` is either an
         // annotation downgrade or a write-named tool whose `destructiveHint:
-        // false` we refused to trust for this tier (SBS-875). A poison flag is
+        // false` we refused to trust for this tier (SBS-875). A `warn` is a
+        // description/schema rewrite on a non-destructive tool. A poison flag is
         // always high.
         if !is_high_risk_drift(e) {
             continue;
@@ -2089,6 +2141,9 @@ fn apply_quarantine_inner_with(
             }
             "changed" if crate::router::name_looks_destructive(tool) => {
                 "a write-named tool's definition changed"
+            }
+            "changed" if e.get("severity").and_then(Value::as_str) == Some(SEV_WARN) => {
+                "a tool's description or schema changed"
             }
             "changed" => "a tool dropped a readOnly/destructive safety annotation",
             // A new tool APPEARING is not a rug-pull (nothing was approved to change from),
@@ -3257,7 +3312,9 @@ pub fn baseline_tamper_detected(events: &[Value]) -> bool {
 }
 
 /// A tool-definition drift event tagged with its `severity` (`high` = loud/actionable,
-/// `info` = benign churn for the quiet history). See `drift_severity`.
+/// `warn` = definition-content drift that quarantine-on-drift acts on and the app shows
+/// on its actionable tier, `info` = cosmetic churn for the quiet history). See
+/// `drift_severity`.
 fn event(server: &str, tool: &str, change: &str, severity: &str) -> Value {
     json!({
         "ts": epoch_millis(),
@@ -3472,6 +3529,18 @@ mod tests {
         let event = |kind: &str, tool: &str, change: &str, ts: i64| json!({"type": kind, "server": "github", "tool": tool, "change": change, "ts": ts});
         // Severity: explicit wins, then type.
         assert_eq!(event_severity(&json!({"severity": "high"})), "high");
+        // SEC-01: a warn definition-content drift surfaces on the actionable tier...
+        assert_eq!(event_severity(&json!({"severity": "warn"})), "high");
+        // ...but keeps its own identity so it cannot collapse into a later high event.
+        let warn = json!({
+            "type": "tool_drift", "server": "s", "tool": "t",
+            "change": "changed", "severity": "warn"
+        });
+        let high = json!({
+            "type": "tool_drift", "server": "s", "tool": "t",
+            "change": "changed", "severity": "high"
+        });
+        assert_ne!(security_key(&warn), security_key(&high));
         assert_eq!(
             event_severity(&event("tool_poison_flag", "t", "changed", 0)),
             "high"
@@ -6138,9 +6207,10 @@ mod tests {
 
     #[test]
     fn drift_severity_tiers_loud_vs_benign() {
-        // The alert-fatigue case: a non-destructive tool's description is revised
-        // server-side (RevenueCat's beta churn), safety hints intact -> `info`, quiet
-        // history, no badge.
+        // SEC-01: a non-destructive tool's description is revised server-side
+        // (RevenueCat's beta churn), safety hints intact -> `warn`, not quiet info:
+        // definition content is the prompt-injection surface, so it is
+        // quarantine-worthy under quarantine-on-drift and a visible warning otherwise.
         let pins: Pins = [(
             "rc__edit_paywall_ai".to_string(),
             pin(&tool("rc__edit_paywall_ai", "Edit a paywall.")),
@@ -6152,8 +6222,8 @@ mod tests {
         assert_eq!(d.len(), 1);
         assert_eq!(d[0]["change"], "changed");
         assert_eq!(
-            d[0]["severity"], SEV_INFO,
-            "benign non-destructive churn is info"
+            d[0]["severity"], SEV_WARN,
+            "definition-content churn is a warning, not quiet info"
         );
 
         // A destructive tool's definition changing is loud.
@@ -6171,6 +6241,63 @@ mod tests {
             d[0]["severity"], SEV_HIGH,
             "a destructive tool's change is high"
         );
+    }
+
+    /// SEC-01: annotation/title-only churn is cosmetic and stays on the quiet tier.
+    #[test]
+    fn annotation_only_change_stays_info() {
+        let born = json!({
+            "name": "rc__edit_paywall_ai",
+            "description": "Edit a paywall.",
+            "inputSchema": {"type": "object"},
+            "annotations": { "readOnlyHint": true, "title": "Edit paywall" }
+        });
+        let retitled = json!({
+            "name": "rc__edit_paywall_ai",
+            "description": "Edit a paywall.",
+            "inputSchema": {"type": "object"},
+            "annotations": { "readOnlyHint": true, "title": "Edit a paywall (v2)" }
+        });
+        let pins: Pins = [("rc__edit_paywall_ai".to_string(), pin(&born))]
+            .into_iter()
+            .collect();
+        let d = diff(&pins, std::slice::from_ref(&retitled));
+        assert_eq!(d.len(), 1);
+        assert_eq!(
+            d[0]["severity"], SEV_INFO,
+            "a title-only change is cosmetic churn"
+        );
+    }
+
+    /// SEC-01: a `warn` definition-content drift is quarantined whenever the gateway
+    /// runs the quarantine step (quarantine-on-drift on), and its record explains the
+    /// content change rather than claiming an annotation was dropped.
+    #[test]
+    fn read_only_description_drift_quarantines_with_content_reason() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let _data_dir = TestDataDir::new("sec01-warn-quarantine");
+        let profile = Some("sec01-warn-quarantine");
+        if let Some(p) = quarantine_path(profile) {
+            let _ = std::fs::remove_file(p);
+        }
+        let old_tool = tool("srv__read", "Read a record.");
+        let current = vec![tool("srv__read", "Read a record. Summary updated.")];
+        let old = pin_of(&old_tool);
+        let new = pin_of(&current[0]);
+        let events = vec![changed_event("srv", "srv__read", SEV_WARN, &old, &new)];
+        assert!(apply_quarantine(profile, &current, &events).unwrap());
+        let rec = quarantine_list(profile)
+            .into_iter()
+            .find(|r| r.get("tool").and_then(Value::as_str) == Some("srv__read"))
+            .expect("quarantine record for a read-only description drift");
+        assert_eq!(
+            rec["reason"].as_str(),
+            Some("a tool's description or schema changed"),
+            "the card must name the content change, not an annotation drop"
+        );
+        if let Some(p) = quarantine_path(profile) {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     /// SBS-875: a tool born with `destructiveHint: false` can still rug-pull.
@@ -6201,7 +6328,7 @@ mod tests {
     }
 
     #[test]
-    fn sbs875_non_write_name_false_hint_stays_info() {
+    fn sbs875_non_write_name_false_hint_content_drift_is_warn_not_high() {
         let born = write_named_false_hint("srv__search", "Search.");
         let pins: Pins = [("srv__search".to_string(), pin(&born))]
             .into_iter()
@@ -6210,8 +6337,8 @@ mod tests {
         let d = diff(&pins, std::slice::from_ref(&drifted));
         assert_eq!(d.len(), 1);
         assert_eq!(
-            d[0]["severity"], SEV_INFO,
-            "a read-named tool with destructiveHint false is still benign churn"
+            d[0]["severity"], SEV_WARN,
+            "a read-named tool with destructiveHint false is content drift, not high"
         );
     }
 
@@ -6873,14 +7000,18 @@ mod tests {
             let new = &now[name];
             match pins.get(name) {
                 Some(old) if old.fp != new.fp && fp_version(&old.fp) == fp_version(&new.fp) => {
-                    let sev = drift_severity(t, annotation_downgrade(old, t));
+                    let sev = drift_severity(
+                        t,
+                        annotation_downgrade(old, t),
+                        definition_content_changed(old, new),
+                    );
                     drifts.push(changed_event(server_of(name), name, sev, old, new))
                 }
                 None => drifts.push(event(
                     server_of(name),
                     name,
                     "added",
-                    drift_severity(t, false),
+                    drift_severity(t, false, false),
                 )),
                 _ => {}
             }
