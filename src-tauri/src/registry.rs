@@ -3518,18 +3518,21 @@ fn quarantine_unreadable(path: &Path, content: &str) -> Result<PathBuf, String> 
         {
             return Err(format!("Could not preserve corrupt registry at {}: an incompatible copy already exists. Move it aside and try again.", dest.display()));
         }
-    } else {
-        atomic_write(&dest, content).map_err(|error| {
-            format!("Could not preserve corrupt registry at {}: {error}. Check the data directory's permissions and free space, then try again.", dest.display())
-        })?;
     }
-    let (Some(dir), Some(base)) = (path.parent(), path.file_name().and_then(|f| f.to_str())) else {
-        return Ok(dest);
-    };
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            "Could not identify registry evidence copies: invalid file name".to_string()
+        })?;
     let prefix = format!("{base}.unreadable-");
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Ok(dest);
-    };
+    let entries = std::fs::read_dir(dir).map_err(|error| {
+        format!("Could not list preserved registry copies in {}: {error}. Check directory permissions, then try again.", dir.display())
+    })?;
     let mut quarantined: Vec<(std::time::SystemTime, PathBuf)> = entries
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
@@ -3552,8 +3555,18 @@ fn quarantine_unreadable(path: &Path, content: &str) -> Result<PathBuf, String> 
     quarantined.sort();
     // Always keep the evidence for the primary being recovered, even if it is
     // an older copy being reused. Reuse does not rewrite its bytes or timestamp.
+    // Make room before creating a new copy. If listing or pruning fails, stop
+    // recovery instead of allowing each distinct corrupt load to grow the set.
     while quarantined.len() >= KEEP {
-        let _ = std::fs::remove_file(quarantined.remove(0).1);
+        let oldest = quarantined.remove(0).1;
+        std::fs::remove_file(&oldest).map_err(|error| {
+            format!("Could not prune registry evidence at {}: {error}. Check directory permissions, then try again.", oldest.display())
+        })?;
+    }
+    if !dest.exists() {
+        atomic_write(&dest, content).map_err(|error| {
+            format!("Could not preserve corrupt registry at {}: {error}. Check the data directory's permissions and free space, then try again.", dest.display())
+        })?;
     }
     Ok(dest)
 }
@@ -7299,6 +7312,32 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_listing_failure_does_not_create_unbounded_copies() {
+        use std::os::unix::fs::PermissionsExt;
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("reg-quarantine-listing");
+        let path = dir.join("registry.json");
+        let corrupt = "{ cannot list copies";
+        std::fs::write(&path, corrupt).unwrap();
+        let good = serde_json::to_string_pretty(&Registry::default()).unwrap();
+        std::fs::write(backup_path(&path), &good).unwrap();
+        // Creation and named-file access work, but enumeration is prohibited.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let result = load_from(&path);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("Could not list preserved registry copies"),
+            "{error}"
+        );
+        assert!(quarantine_files(&path).is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+        assert_eq!(std::fs::read_to_string(backup_path(&path)).unwrap(), good);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn quarantine_prunes_to_the_newest_three() {
         let _data = data_dir_test_lock();
@@ -7339,8 +7378,15 @@ pub(crate) mod tests {
             "three copies plus the owner note"
         );
         for i in 0..5 {
-            let dest = dir.join(format!("registry.json.unreadable-sha256-{}", sha256_hex(&format!("junk-{i}"))));
-            assert_eq!(dest.exists(), i >= 2, "only the newest three copies survive");
+            let dest = dir.join(format!(
+                "registry.json.unreadable-sha256-{}",
+                sha256_hex(&format!("junk-{i}"))
+            ));
+            assert_eq!(
+                dest.exists(),
+                i >= 2,
+                "only the newest three copies survive"
+            );
         }
         assert_eq!(migration_backup_files(&path), migration_backups);
         for backup in migration_backups {
