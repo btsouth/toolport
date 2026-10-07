@@ -3375,9 +3375,12 @@ pub(crate) const CHILD_ENV_ALLOWLIST_PREFIXES: &[&str] = &["LC_", "XDG_", "MISE_
 
 /// Windows additionally needs the system, shell and profile locators the OS and
 /// its launchers read. Matched case-insensitively there (Windows environment
-/// names are case-insensitive); kept separate because none of them exist on the
-/// other platforms.
+/// names are case-insensitive); kept separate because the Unix allowlist does
+/// not use them.
 pub(crate) const CHILD_ENV_ALLOWLIST_WINDOWS: &[&str] = &[
+    // OS and shell locating: where Windows and its command processor live, and
+    // the extensions a `.cmd`/`.bat` shim runs under. A child that cannot locate
+    // the OS cannot start anything at all.
     "SystemRoot",
     "SYSTEMROOT",
     "SystemDrive",
@@ -3385,22 +3388,45 @@ pub(crate) const CHILD_ENV_ALLOWLIST_WINDOWS: &[&str] = &[
     "WINDIR",
     "ComSpec",
     "PATHEXT",
+    // Per-user and shared application-data roots. Tools and PowerShell providers
+    // read these to find their cache, config and staged files; ALLUSERSPROFILE is
+    // the legacy name for PROGRAMDATA and PUBLIC is the shared user profile.
     "APPDATA",
     "LOCALAPPDATA",
     "PROGRAMDATA",
+    "ALLUSERSPROFILE",
+    "PUBLIC",
+    // Program-file roots, including the 32-bit and 64-bit common-component
+    // directories a native launcher searches for shared runtime DLLs, and the
+    // driver data directory the OS stages driver files in.
     "ProgramFiles",
     "ProgramFiles(x86)",
     "ProgramW6432",
     "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "CommonProgramW6432",
+    "DriverData",
+    // User profile locators.
     "USERPROFILE",
     "USERNAME",
     "USERDOMAIN",
     "HOMEDRIVE",
     "HOMEPATH",
-    "PUBLIC",
+    "COMPUTERNAME",
+    // Machine and CPU descriptors Windows sets for every process; native modules
+    // and the .NET runtime probe them.
     "NUMBER_OF_PROCESSORS",
     "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
     "OS",
+    // PowerShell locates the modules that define its own cmdlets (`Start-Process`,
+    // `Wait-Process`, ...) through this list, and a child PowerShell started with
+    // it absent does not reliably discover the modules shipped with it, so a
+    // PowerShell shim or launcher fails on its own cmdlets. The parent's value is
+    // the same module path list the pre-SEC-04 child inherited.
+    "PSModulePath",
 ];
 
 /// Whether `name` may be copied from the gateway's environment into a spawned
@@ -7855,6 +7881,38 @@ mod tests {
             !super::is_allowed_child_env_name_with("SystemRoot", false),
             "the Windows-only locators are not allowlisted on Unix"
         );
+    }
+
+    /// The Windows system and PowerShell locators a spawned shim needs must
+    /// survive SEC-04, and must not seed a Unix child. `PSModulePath` is the one
+    /// that broke the Job Object launcher test: without it a child PowerShell
+    /// cannot discover the modules defining its own cmdlets (`Start-Process`).
+    #[test]
+    fn windows_system_and_powershell_locators_are_allowlisted() {
+        for name in [
+            "PSModulePath",
+            "ALLUSERSPROFILE",
+            "COMPUTERNAME",
+            "PROCESSOR_IDENTIFIER",
+            "PROCESSOR_LEVEL",
+            "PROCESSOR_REVISION",
+            "DriverData",
+            "CommonProgramFiles(x86)",
+            "CommonProgramW6432",
+        ] {
+            assert!(
+                super::is_allowed_child_env_name_with(name, true),
+                "{name} must reach a Windows child"
+            );
+            assert!(
+                super::is_allowed_child_env_name_with(&name.to_lowercase(), true),
+                "{name} must match case-insensitively on Windows"
+            );
+            assert!(
+                !super::is_allowed_child_env_name_with(name, false),
+                "{name} is a Windows locator and must not seed a Unix child"
+            );
+        }
     }
 
     /// End-to-end over a real spawned child: a secret-like variable set in the
