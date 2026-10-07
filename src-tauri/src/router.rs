@@ -6998,15 +6998,12 @@ mod tests {
         assert!(router.servers[0]
             .unavailable()
             .contains("has not connected yet"));
-        let last_attempt = router.servers[0]
-            .supervisor
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .last_attempt;
+        let (last_attempt, retry_at) = {
+            let state = router.servers[0].supervisor.as_ref().unwrap().lock().unwrap();
+            (state.last_attempt, state.next_attempt)
+        };
         assert!(!router.servers[0].start_at(true, last_attempt));
-        assert!(router.servers[0].start_at(false, last_attempt + Duration::from_secs(1)));
+        assert!(router.servers[0].start_at(false, retry_at));
         ready_supervisor(&mut router);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         let auth_calls = Arc::new(AtomicU64::new(0));
