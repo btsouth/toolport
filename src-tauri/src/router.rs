@@ -865,6 +865,11 @@ fn client_safe_error(error: &str) -> String {
         }
     } else if lower.contains("failed to spawn") {
         "the server command could not be started".to_string()
+    } else if lower.contains("broken pipe")
+        || lower.contains("eof")
+        || lower.contains("closed")
+    {
+        "the server closed the connection".to_string()
     } else if lower.contains("vault") || lower.contains("keychain") || lower.contains("keyring") {
         "its stored credentials could not be read".to_string()
     } else if lower.contains("name resolution")
@@ -5602,6 +5607,7 @@ mod tests {
             ),
             ("failed to spawn 'npx': No such file", "the server command could not be started"),
             ("timed out waiting for 'initialize' response", "the server did not answer in time"),
+            ("write failed: Broken pipe (os error 32)", "the server closed the connection"),
             ("mock said: hunter2", "the connection failed"),
         ] {
             let shown = client_safe_error(raw);

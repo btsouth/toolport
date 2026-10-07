@@ -573,7 +573,9 @@ fn calls_do_not_respawn_servers_that_are_waiting_to_retry() {
             );
             let (is_error, text) = gateway.call("down__echo");
             assert!(is_error, "{text}");
-            assert!(text.contains("exited (status 3)"), "{text}");
+            // The failure class depends on when the child's exit is noticed (an exit
+            // status, or a closed pipe), so only the shape is checked here.
+            assert!(text.contains("has not connected yet"), "{text}");
             assert!(!text.contains("failing starts"), "{text}");
         }
         assert_eq!(
