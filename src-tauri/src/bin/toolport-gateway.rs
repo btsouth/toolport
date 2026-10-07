@@ -9019,6 +9019,7 @@ fn publish_built_router(
     let mut live = router
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    live.retire_replaced_supervisors(&built);
     *live = Arc::new(built);
     live.activate_supervisors();
     tools
@@ -10307,6 +10308,7 @@ impl RootLaunchPool {
         for key in keys {
             if let Some(launch) = self.launches.remove(&key) {
                 launch.active.store(false, Ordering::SeqCst);
+                launch.slot.retire();
                 retired.insert(key, launch);
             }
         }
@@ -10319,6 +10321,7 @@ impl RootLaunchPool {
     fn retire_launches(&mut self) -> BTreeMap<LaunchKey, RootLaunch> {
         for launch in self.launches.values() {
             launch.active.store(false, Ordering::SeqCst);
+            launch.slot.retire();
         }
         std::mem::take(&mut self.launches)
     }
@@ -10847,6 +10850,7 @@ impl HostState {
                 retained_launches.insert(key, launch);
             } else {
                 launch.active.store(false, Ordering::SeqCst);
+                launch.slot.retire();
                 retired_launches.push(launch);
             }
         }
@@ -11320,6 +11324,7 @@ impl HostState {
             for (_, launch) in &connected {
                 if let Some(launch) = launch {
                     launch.active.store(false, Ordering::SeqCst);
+                    launch.slot.retire();
                 }
             }
             return base;
@@ -11330,6 +11335,7 @@ impl HostState {
             if pool.launches.contains_key(&key) {
                 if let Some(launch) = launch {
                     launch.active.store(false, Ordering::SeqCst);
+                    launch.slot.retire();
                     discarded.push(launch);
                 }
                 continue;
@@ -13646,6 +13652,11 @@ fn adapter_live_view(
     LiveRouterResolver { stale, resolve }
 }
 
+/// First prompt and resource lists answer with what has loaded by then. A
+/// server that is slower, or hangs in initialize, announces its catalog later
+/// with list_changed instead of holding every list for the full startup wait.
+const FIRST_CATALOG_WAIT: Duration = Duration::from_secs(2);
+
 /// One request in, one response out: wait for a cold cache / live router when
 /// the method needs it, self-heal an empty router on a call, then dispatch.
 /// Shared by the stdio loop and the HTTP server so they can't diverge.
@@ -13756,7 +13767,12 @@ fn process_request(
     // Tools can use their disk cache immediately. Other first lists wait for
     // startup because the disk cache contains tools only. A cold tools/list
     // waits for every first catalog, not just the first server to publish.
-    // Warm lists stay fast.
+    // Prompt and resource lists share one short bound. Warm lists stay fast.
+    let catalog_list = matches!(
+        method,
+        "resources/list" | "resources/templates/list" | "prompts/list"
+    );
+    let catalog_deadline = Instant::now() + FIRST_CATALOG_WAIT;
     if matches!(
         method,
         "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
@@ -13768,7 +13784,11 @@ fn process_request(
             .tools
             .is_empty())
     {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = if catalog_list {
+            catalog_deadline
+        } else {
+            Instant::now() + Duration::from_secs(30)
+        };
         while Instant::now() < deadline {
             let live = state
                 .router
@@ -13782,6 +13802,14 @@ fn process_request(
             }
             std::thread::sleep(Duration::from_millis(25));
         }
+        // A server becomes Ready inside its publication, before that publication
+        // refreshes the tool cache. Let an in-flight publication finish first.
+        drop(
+            state
+                .rebuild_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     }
 
     // Snapshot the live-updated profile once: the watcher may swap it mid-request,
@@ -13896,11 +13924,8 @@ fn process_request(
         base_router
     };
     // Rooted prompt/resource catalogs are not on disk either. Demand them and
-    // use the same bounded first-list wait as ordinary servers.
-    let rooted_list = matches!(
-        method,
-        "resources/list" | "resources/templates/list" | "prompts/list"
-    );
+    // share the same bounded first-list wait as ordinary servers.
+    let rooted_list = catalog_list;
     if daemon_adapter && rooted_list {
         rooted_router
             .demand_servers(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)));
@@ -13908,7 +13933,11 @@ fn process_request(
     if daemon_adapter
         && (rooted_list || method == "tools/list" && rooted_router.aggregated_tools().is_empty())
     {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = if rooted_list {
+            catalog_deadline
+        } else {
+            Instant::now() + Duration::from_secs(30)
+        };
         while rooted_router
             .any_discovering(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
             && Instant::now() < deadline
@@ -19647,6 +19676,103 @@ mod tests {
             );
         }
         assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    fn hanging_supervisor(router: &mut Router, id: &str) -> std::sync::mpsc::Sender<()> {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        router.add_supervised(
+            id.into(),
+            Vec::new(),
+            Arc::new(move || {
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+                Err(ConnectFailure {
+                    message: "initialize timed out".into(),
+                    needs_auth: false,
+                })
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        release_tx
+    }
+
+    #[test]
+    fn supervisor_first_lists_do_not_wait_out_a_hanging_server() {
+        let _env = DataDirTestEnv::new("supervisor-hanging-first-list");
+        let state = http_state(false);
+        let mut router =
+            counting_cache_supervisor("cache", Vec::new(), &Arc::new(AtomicUsize::new(0)));
+        router.prepare_lazy_use("cache");
+        wait_for_supervisor_result(&router);
+        let release = hanging_supervisor(&mut router, "hang");
+        *state.router.lock().unwrap() = Arc::new(router);
+        adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
+        for (method, field) in [
+            ("prompts/list", "prompts"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+        ] {
+            let started = Instant::now();
+            let reply = process_request(
+                &state,
+                &json!({"jsonrpc":"2.0","id":1,"method":method}),
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .unwrap();
+            let waited = started.elapsed();
+            assert!(
+                waited < FIRST_CATALOG_WAIT + Duration::from_secs(2),
+                "{method} waited {waited:?} for a hanging server"
+            );
+            assert_eq!(
+                reply["result"][field].as_array().unwrap().len(),
+                1,
+                "{method} lost the ready server's entries"
+            );
+        }
+        assert!(state.router.lock().unwrap().lazy_starting("hang"));
+        drop(release);
+    }
+
+    #[test]
+    fn supervisor_publication_fails_waiters_on_a_replaced_start_fast() {
+        let _env = DataDirTestEnv::new("supervisor-replaced-start");
+        let state = http_state(false);
+        let mut old = Router::new();
+        let release = hanging_supervisor(&mut old, "hang");
+        let old = Arc::new(old);
+        *state.router.lock().unwrap() = Arc::clone(&old);
+        let waiter = {
+            let old = Arc::clone(&old);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                (old.wait_for_server("hang", None, false), started.elapsed())
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !old.lazy_starting("hang") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A config edit replaces the server while its first start hangs.
+        let mut replacement = Router::new();
+        let _replacement_release = hanging_supervisor(&mut replacement, "hang");
+        publish_built_router(&state.registry, &state.router, replacement, None);
+        let (result, waited) = waiter.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("reconfigured while starting"), "{error}");
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+        drop(release);
     }
 
     #[test]

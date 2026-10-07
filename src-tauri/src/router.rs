@@ -13,7 +13,7 @@
 //! map so `tools/call` still forwards the server's real, hyphenated tool name.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -600,6 +600,9 @@ struct ServerSlot {
     handle_calls: AtomicUsize,
     reconnect_gate: Mutex<()>,
     supervisor: Option<Mutex<Supervisor>>,
+    /// Set when a rebuild replaced or removed this supervisor. It finishes
+    /// active calls but never starts again, and its waiters fail fast.
+    retired: AtomicBool,
 }
 
 impl ServerSlot {
@@ -616,6 +619,7 @@ impl ServerSlot {
             handle_calls: AtomicUsize::new(0),
             reconnect_gate: Mutex::new(()),
             supervisor: None,
+            retired: AtomicBool::new(false),
         }
     }
 
@@ -717,6 +721,14 @@ impl ServerSlot {
         slot
     }
 
+    fn retire(&self) {
+        let _lifecycle = self
+            .supervisor
+            .as_ref()
+            .map(|s| s.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        self.retired.store(true, Ordering::Release);
+    }
+
     /// A published connection loaded the full catalog, and stopping keeps it.
     fn catalog_complete(&self) -> bool {
         self.supervisor.as_ref().is_none_or(|s| {
@@ -750,6 +762,9 @@ impl ServerSlot {
         let Some(supervisor) = &self.supervisor else {
             return false;
         };
+        if self.retired.load(Ordering::Acquire) {
+            return false;
+        }
         let connect = {
             let mut state = supervisor
                 .lock()
@@ -788,6 +803,12 @@ impl ServerSlot {
                         .unwrap()
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // Retirement is set under this lock, so a replaced start
+                    // can never hand its connection to an obsolete slot.
+                    if slot.retired.load(Ordering::Acquire) {
+                        state.state = SupervisorState::Stopped;
+                        return;
+                    }
                     match result {
                         Ok(server) => {
                             state.ready = Some(server);
@@ -854,6 +875,12 @@ impl ServerSlot {
                 state.last_use = Instant::now();
                 return Ok(());
             }
+            if self.retired.load(Ordering::Acquire) {
+                return Err(format!(
+                    "server '{}' was reconfigured while starting; send the request again",
+                    self.id
+                ));
+            }
             let starting = state.state == SupervisorState::Starting;
             drop(state);
             if !starting || Instant::now() >= deadline {
@@ -882,7 +909,13 @@ impl ServerSlot {
             format!(
                 "server '{}' {reason}, retry in {}s ({})",
                 self.id,
-                status.retry_in.map_or(1, |delay| delay.as_secs() + 1),
+                // A demand retries after 15 seconds even on a longer schedule.
+                state
+                    .next_attempt
+                    .min(state.last_attempt + Duration::from_secs(15))
+                    .saturating_duration_since(Instant::now())
+                    .as_secs()
+                    + 1,
                 client_safe_error(&status.last_error)
             )
         }
@@ -1068,6 +1101,11 @@ pub struct SharedServerSlot(Arc<ServerSlot>);
 impl SharedServerSlot {
     pub fn maintain(&self) {
         self.0.maintain(Instant::now());
+    }
+
+    /// Retire a removed launch without interrupting its active calls.
+    pub fn retire(&self) {
+        self.0.retire();
     }
 
     pub fn ptr_eq(&self, other: &Self) -> bool {
@@ -1954,6 +1992,19 @@ impl Router {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .subscription_use = Some(used);
+            }
+        }
+    }
+
+    /// Retire every supervisor `next` replaced or removed, so a waiter on an
+    /// obsolete startup fails fast instead of waiting out its deadline.
+    pub fn retire_replaced_supervisors(&self, next: &Router) {
+        for slot in &self.servers {
+            if next
+                .server_slot(&slot.id)
+                .is_none_or(|current| !Arc::ptr_eq(slot, &current.0))
+            {
+                slot.retire();
             }
         }
     }
@@ -3656,6 +3707,23 @@ impl Router {
         uri: &str,
     ) -> Result<Value, String> {
         let slot = self.slot_for(server_id)?;
+        if let Some(supervisor) = &slot.supervisor {
+            // Best-effort cleanup never starts a connection. A stopped server
+            // has no subscription left, and `attempt` rechecks readiness.
+            if supervisor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .state
+                != SupervisorState::Ready
+            {
+                return Ok(json!({}));
+            }
+            return Self::attempt(&slot, SlotAccess::Locked, None, &mut |server| {
+                locked_server(server)?.unsubscribe_resource(uri)
+            })
+            .0
+            .map_err(|error| error.to_string());
+        }
         self.call_with_retry(
             &slot,
             None,
@@ -7207,15 +7275,96 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_unsubscribe_never_starts_a_stopped_server() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let router = supervised_fixture(flaky_connect("s", 0, Arc::clone(&calls)));
+        let started = Instant::now();
+        assert!(router
+            .unsubscribe_resource_on_server("s", "s://readme")
+            .is_ok());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!router.any_starting(|_| true));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn supervisor_waiter_on_a_replaced_start_fails_fast_and_discards_its_result() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let calls = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&calls);
+        let old = supervised_fixture(Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+            Ok(mock_server("s"))
+        }));
+        let waiter = {
+            let old = old.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                (old.wait_for_server("s", None, false), started.elapsed())
+            })
+        };
+        assert!(wait_until(|| old.lazy_starting("s")));
+        let replacement = supervised_fixture(flaky_connect("s", 0, Arc::new(AtomicU64::new(0))));
+        old.retire_replaced_supervisors(&replacement);
+        let (result, waited) = waiter.join().unwrap();
+        assert!(
+            result.unwrap_err().contains("reconfigured while starting"),
+            "waiter did not fail fast"
+        );
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+        release_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!old.has_ready_reconnects(), "a retired start published");
+        assert!(
+            !old.servers[0].start(true),
+            "a retired supervisor started again"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn supervisor_unavailable_message_matches_the_demand_retry() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let router = supervised_fixture(flaky_connect("s", 1, Arc::clone(&calls)));
+        let slot = Arc::clone(&router.servers[0]);
+        slot.supervisor.as_ref().unwrap().lock().unwrap().backoff = ReconnectBackoff {
+            base: Duration::from_secs(300),
+            cap: Duration::from_secs(300),
+        };
+        slot.start(true);
+        assert!(wait_until(|| slot.status().unwrap().failures == 1));
+        let message = slot.unavailable();
+        let seconds: u64 = message
+            .split("retry in ")
+            .nth(1)
+            .and_then(|rest| rest.split('s').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no retry delay in {message}"));
+        assert!(
+            (1..=15).contains(&seconds),
+            "message promised the background schedule: {message}"
+        );
+    }
+
+    #[test]
     fn supervisor_results_wait_for_integrity_publication_and_removed_starts_are_discarded() {
         let mut router = supervised_fixture(flaky_connect("s", 0, Arc::new(AtomicU64::new(0))));
         router.servers[0].start(true);
         assert!(wait_until(|| router.has_ready_reconnects()));
         router.adopt_ready_reconnects();
-        assert!(router
-            .route_call("s__echo", json!({}))
-            .unwrap_err()
-            .contains("restarting"));
+        // An adopted, unpublished slot refuses dispatch without waiting.
+        let (result, _) = Router::attempt(
+            &router.servers[0],
+            SlotAccess::Shared,
+            None,
+            &mut |_| Ok(()),
+        );
+        assert!(result.unwrap_err().to_string().contains("restarting"));
         router.activate_supervisors();
         assert!(router.route_call("s__echo", json!({})).is_ok());
         let (started_tx, started_rx) = std::sync::mpsc::channel();
