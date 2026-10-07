@@ -13431,17 +13431,18 @@ fn finish_startup_build(
         (**guard).clone()
     };
     let tools = publish_built_router(&host.registry, &host.router, built, profile);
+    // Snapshot the just-published live router for the post-ready persistence below.
     let live = host
         .router
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    save_server_catalogs(&live, profile);
 
     host.invalidate_root_views();
     host.invalidate_tool_scope_views();
     // Read AFTER the integrity gate: it can newly quarantine a tool or keep a
     // fail-closed catalog, so a pre-gate read would persist the wrong state.
+    let mut persisted_tools: Option<Vec<Value>> = None;
     if router_is_fail_closed(&host.router) {
         clear_catalog_for_fail_closed(&host.cached_tools, profile);
     } else if !tools.is_empty() {
@@ -13470,11 +13471,20 @@ fn finish_startup_build(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Arc::new(CatalogSnapshot::new(tools.clone()));
-        save_tool_cache(&tools, profile);
+        persisted_tools = Some(tools);
     } else {
         glog("background build was empty; keeping previous tool cache");
     }
+    // Mark ready as soon as the in-memory catalog is published: the first tools/list
+    // reads that catalog, not disk. The catalog/cache files below only seed the next
+    // process, so ready must not wait on their fsync. Persistence stays after the
+    // integrity gate (SEC-01) and after ready, all still under the build thread's
+    // rebuild_lock, so no concurrent rebuild reads a half-written file.
     host.ready.store(true, Ordering::SeqCst);
+    save_server_catalogs(&live, profile);
+    if let Some(tools) = persisted_tools {
+        save_tool_cache(&tools, profile);
+    }
     notify_tools_changed(stdio, Some(&host.mcp_sessions));
 }
 
@@ -13941,9 +13951,12 @@ fn process_request(
     }
 
     // Tools can use their disk cache immediately. Other first lists wait for
-    // startup because the disk cache contains tools only. A cold tools/list
-    // waits for every first catalog, not just the first server to publish.
-    // Prompt and resource lists share one short bound. Warm lists stay fast.
+    // startup because the disk cache contains tools only. Every first list,
+    // including a cold tools/list, shares one short bound: a hanging start or a
+    // backoff retry is answered with whatever has loaded, and a server that
+    // connects later announces its catalog with list_changed. A server that has
+    // already connected and is being published is still awaited past the bound.
+    // Warm lists stay fast.
     let catalog_list = matches!(
         method,
         "resources/list" | "resources/templates/list" | "prompts/list"
@@ -13969,9 +13982,7 @@ fn process_request(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             if !live.any_discovering(visible)
-                || catalog_list
-                    && Instant::now() >= catalog_deadline
-                    && !live.any_publishing_first_catalog(visible)
+                || Instant::now() >= catalog_deadline && !live.any_publishing_first_catalog(visible)
             {
                 break;
             }
@@ -19967,6 +19978,182 @@ mod tests {
         }
         assert!(state.router.lock().unwrap().lazy_starting("hang"));
         drop(release);
+    }
+
+    /// A cold tools/list (empty cache) shares the short first-catalog bound: a start
+    /// that hangs is answered with an empty list, and the server that connects later
+    /// reaches the client through the publish path's `tools/list_changed` instead of
+    /// holding the first list for the full 30 s.
+    #[test]
+    fn supervisor_cold_tools_list_does_not_wait_out_a_hanging_start() {
+        let _env = DataDirTestEnv::new("supervisor-cold-tools-list");
+        let state = http_state(false);
+        let mut router = Router::new();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        router.add_supervised(
+            "late".into(),
+            Vec::new(),
+            Arc::new(move || {
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+                let mut server = DownstreamServer::connect("late".into(), Box::new(CacheRoute))
+                    .expect("the cache route connects");
+                server.load_resources_prompts();
+                Ok(server)
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        *state.router.lock().unwrap() = Arc::new(router);
+
+        let started = Instant::now();
+        let reply = process_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            &SearchGuard::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            DiscoveryMode::Full,
+        )
+        .unwrap();
+        let waited = started.elapsed();
+        assert!(
+            waited < FIRST_CATALOG_WAIT + Duration::from_secs(2),
+            "a cold tools/list waited {waited:?} for a hanging start"
+        );
+        assert!(
+            !reply["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "late__cached"),
+            "the cold list must answer before the hanging server's catalog loads"
+        );
+        assert!(state.router.lock().unwrap().lazy_starting("late"));
+
+        // The start finishes later; the publish path announces the new catalog.
+        release_tx.send(()).unwrap();
+        let live = state.router.lock().unwrap().clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !live.has_ready_reconnects() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            live.has_ready_reconnects(),
+            "the late server never connected"
+        );
+        adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
+        assert_eq!(
+            deferred_count(&state.stdio_upstream, "notifications/tools/list_changed"),
+            1,
+            "the later catalog must reach the client as tools/list_changed"
+        );
+    }
+
+    /// A server in backoff is still demand-retried by a cold tools/list (the retry is
+    /// due), but the list must not wait on that retry past the short bound.
+    #[test]
+    fn supervisor_cold_tools_list_does_not_wait_on_a_backoff_retry() {
+        let _env = DataDirTestEnv::new("supervisor-backoff-tools-list");
+        let state = http_state(false);
+        let calls = Arc::new(AtomicU64::new(0));
+        let attempts = Arc::clone(&calls);
+        let mut router = Router::new();
+        router.add_supervised(
+            "flaky".into(),
+            Vec::new(),
+            Arc::new(move || {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(ConnectFailure {
+                        message: "Temporary failure in name resolution".into(),
+                        needs_auth: false,
+                    });
+                }
+                // The demand retry hangs rather than answering.
+                std::thread::sleep(Duration::from_secs(10));
+                Err(ConnectFailure {
+                    message: "initialize timed out".into(),
+                    needs_auth: false,
+                })
+            }),
+            ReconnectBackoff {
+                base: Duration::from_millis(5),
+                cap: Duration::from_millis(5),
+            },
+            json!({"revision":1}),
+        );
+        // First connect fails and leaves the server in backoff.
+        router.prepare_lazy_use("flaky");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while router.pending_statuses().iter().all(|s| s.failures == 0) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            router.pending_statuses().iter().any(|s| s.failures > 0),
+            "the flaky server never entered backoff"
+        );
+        *state.router.lock().unwrap() = Arc::new(router);
+        // Let the short backoff elapse so the list's demand retry is due.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        let _reply = process_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            &SearchGuard::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            DiscoveryMode::Full,
+        )
+        .unwrap();
+        let waited = started.elapsed();
+        assert!(
+            waited < FIRST_CATALOG_WAIT + Duration::from_secs(2),
+            "a cold tools/list waited {waited:?} on a backoff retry"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "the list must still demand-retry the backoff server, without waiting on it"
+        );
+    }
+
+    /// The startup build still writes the catalog and tool cache. Moving persistence
+    /// after `ready` must not drop it: the files seed the next process.
+    #[test]
+    fn startup_build_still_persists_the_catalog_after_ready() {
+        let _env = DataDirTestEnv::new("startup-persist-after-ready");
+        let state = http_state(false);
+        let profile = Some("startup-persist-after-ready");
+        state.host.ready.store(false, Ordering::SeqCst);
+
+        finish_startup_build(&state.host, cache_router(), profile, &state.stdio_upstream);
+
+        assert!(
+            state.host.ready.load(Ordering::SeqCst),
+            "the startup build must set ready"
+        );
+        assert!(
+            load_tool_cache(profile)
+                .iter()
+                .any(|tool| tool["name"] == "cache__cached"),
+            "the tool cache must still be written after ready"
+        );
+        assert!(
+            load_server_catalogs(profile).contains_key("cache"),
+            "the server catalogs must still be written after ready"
+        );
     }
 
     #[test]
@@ -26634,6 +26821,7 @@ mod tests {
             .push(registry::FolderProfile {
                 path: "/work/flake".into(),
                 profile: "q".into(),
+                unknown_fields: Default::default(),
             });
         let denied = call("x__work");
         assert_eq!(denied["isError"], true, "got {denied}");

@@ -35,16 +35,45 @@ fn install_request_context_provider() {
 }
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "toolport-multiplexed-{tag}-{}-{}",
-        std::process::id(),
+    temp_dir_at(
+        tag,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos()
+            .as_nanos(),
+    )
+}
+
+fn temp_dir_at(tag: &str, timestamp: u128) -> std::path::PathBuf {
+    static NEXT_SCRATCH_DIR_ID: AtomicUsize = AtomicUsize::new(0);
+    // Parallel discovery tests share a tag, and the clock can repeat a timestamp.
+    let dir = std::env::temp_dir().join(format!(
+        "toolport-multiplexed-{tag}-{}-{timestamp}-{}",
+        std::process::id(),
+        NEXT_SCRATCH_DIR_ID.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::create_dir(&dir).expect("temp dir");
     dir
+}
+
+#[test]
+fn same_timestamp_discovery_fixtures_keep_transcripts_separate() {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let first = temp_dir_at("roots-before-list", timestamp);
+    let second = temp_dir_at("roots-before-list", timestamp);
+    assert_ne!(first, second, "discovery fixtures must have unique paths");
+    std::fs::write(first.join("transcript.jsonl"), "sole client").unwrap();
+    std::fs::write(second.join("transcript.jsonl"), "no client").unwrap();
+    std::fs::remove_dir_all(&first).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(second.join("transcript.jsonl")).unwrap(),
+        "no client",
+        "one discovery fixture must not overwrite or delete another's transcript"
+    );
+    std::fs::remove_dir_all(&second).unwrap();
 }
 
 fn concurrent_mock_router() -> Arc<Router> {
