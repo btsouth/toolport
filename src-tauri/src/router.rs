@@ -635,6 +635,37 @@ impl ServerSlot {
 /// Discovery from an existing catalog does not count as use.
 pub const SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Counts supervisor startups that produced a connection, so the gateway can
+/// publish one without waiting for its next watcher tick.
+static SUPERVISOR_RESULTS: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
+
+pub fn started_supervisors() -> u64 {
+    *SUPERVISOR_RESULTS
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Wait until a startup after `seen` produced a connection, or until
+/// `deadline`. Returns the latest count.
+pub fn wait_for_started_supervisor(seen: u64, deadline: Instant) -> u64 {
+    let (count, signal) = &SUPERVISOR_RESULTS;
+    let mut current = count
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *current == seen {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        current = signal
+            .wait_timeout(current, deadline - now)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+    *current
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SupervisorState {
     Stopped,
@@ -684,6 +715,15 @@ impl ServerSlot {
             publishing: false,
         }));
         slot
+    }
+
+    /// A published connection loaded the full catalog, and stopping keeps it.
+    fn catalog_complete(&self) -> bool {
+        self.supervisor.as_ref().is_none_or(|s| {
+            s.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ever_ready
+        })
     }
 
     fn status(&self) -> Option<PendingStatus> {
@@ -749,7 +789,16 @@ impl ServerSlot {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     match result {
-                        Ok(server) => state.ready = Some(server),
+                        Ok(server) => {
+                            state.ready = Some(server);
+                            drop(state);
+                            let (count, signal) = &SUPERVISOR_RESULTS;
+                            let mut count = count
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            *count = count.wrapping_add(1);
+                            signal.notify_all();
+                        }
                         Err(failure) => {
                             state.failures = state.failures.saturating_add(1);
                             state.last_error = failure.message;
@@ -1954,17 +2003,31 @@ impl Router {
         })
     }
 
+    /// Starts only servers whose full catalog was never loaded. An idle stop
+    /// keeps prompts and resources, so later lists do not restart the server.
     pub fn demand_servers(&self, visible: impl Fn(&str) -> bool) {
         for slot in &self.servers {
-            if visible(&slot.id) {
+            if visible(&slot.id) && !slot.catalog_complete() {
                 slot.start(true);
             }
         }
     }
 
+    /// Whether a visible server is starting to load its first full catalog.
+    pub fn any_discovering(&self, visible: impl Fn(&str) -> bool) -> bool {
+        self.servers.iter().any(|slot| {
+            visible(&slot.id)
+                && slot.supervisor.as_ref().is_some_and(|s| {
+                    let state = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.state == SupervisorState::Starting && !state.ever_ready
+                })
+        })
+    }
+
     pub fn discover_uncached(&self, visible: impl Fn(&str) -> bool) {
         for slot in &self.servers {
             if visible(&slot.id)
+                && !slot.catalog_complete()
                 && slot
                     .inner
                     .lock()
@@ -1979,7 +2042,15 @@ impl Router {
 
     /// Called only after the fresh catalog passed the gateway integrity gate.
     pub fn activate_supervisors(&self) {
+        self.activate_supervisors_for(|_| true);
+    }
+
+    /// [`Router::activate_supervisors`] limited to the servers this view owns.
+    pub fn activate_supervisors_for(&self, owned: impl Fn(&str) -> bool) {
         for slot in &self.servers {
+            if !owned(&slot.id) {
+                continue;
+            }
             if let Some(supervisor) = &slot.supervisor {
                 let mut state = supervisor
                     .lock()
@@ -1996,8 +2067,13 @@ impl Router {
     }
 
     pub fn maintain_supervisors(&self) {
+        self.maintain_supervisors_at(Instant::now());
+    }
+
+    /// [`Router::maintain_supervisors`] as of `now`, for idle shutdown checks.
+    pub fn maintain_supervisors_at(&self, now: Instant) {
         for slot in &self.servers {
-            slot.maintain(Instant::now());
+            slot.maintain(now);
         }
     }
 
@@ -2080,22 +2156,37 @@ impl Router {
 
     /// Whether a retry connected and is waiting for [`Router::adopt_ready_reconnects`].
     pub fn has_ready_reconnects(&self) -> bool {
+        self.has_ready_reconnects_for(|_| true)
+    }
+
+    /// [`Router::has_ready_reconnects`] limited to the servers this view owns.
+    pub fn has_ready_reconnects_for(&self, owned: impl Fn(&str) -> bool) -> bool {
         self.pending
             .iter()
-            .any(|p| !p.is_cancelled() && p.lock().ready.is_some())
+            .any(|p| owned(&p.id) && !p.is_cancelled() && p.lock().ready.is_some())
             || self.servers.iter().any(|slot| {
-                slot.supervisor.as_ref().is_some_and(|s| {
-                    let state = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    state.ready.is_some() || state.publishing
-                })
+                owned(&slot.id)
+                    && slot.supervisor.as_ref().is_some_and(|s| {
+                        let state = s.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.ready.is_some() || state.publishing
+                    })
             })
     }
 
     /// Move every pending server whose retry connected into a live slot, in the
     /// position a cold build would have given it. Returns the adopted ids.
     pub fn adopt_ready_reconnects(&mut self) -> Vec<String> {
+        self.adopt_ready_reconnects_for(|_| true)
+    }
+
+    /// Adopt only the servers this view owns. A rooted view shares the base
+    /// router's slots, and those must pass the base integrity gate instead.
+    pub fn adopt_ready_reconnects_for(&mut self, owned: impl Fn(&str) -> bool) -> Vec<String> {
         let mut adopted = Vec::new();
         for slot in &self.servers {
+            if !owned(&slot.id) {
+                continue;
+            }
             if let Some(supervisor) = &slot.supervisor {
                 let mut state = supervisor
                     .lock()
@@ -2122,7 +2213,7 @@ impl Router {
         }
         let mut still_pending = Vec::new();
         for pending in std::mem::take(&mut self.pending) {
-            let ready = if pending.is_cancelled() {
+            let ready = if pending.is_cancelled() || !owned(&pending.id) {
                 None
             } else {
                 pending.lock().ready.take()
@@ -7051,6 +7142,68 @@ mod tests {
         slot.start(true);
         ready_supervisor(&mut router);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn supervisor_idle_stop_keeps_prompts_and_resources_without_rediscovery() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut router = supervised_fixture(flaky_connect("s", 0, Arc::clone(&calls)));
+        router.servers[0].start(true);
+        ready_supervisor(&mut router);
+        // A prompts and resources only server has no tools to cache.
+        router.servers[0].inner.lock().unwrap().tools.clear();
+        let slot = Arc::clone(&router.servers[0]);
+        let last_use = slot.supervisor.as_ref().unwrap().lock().unwrap().last_use;
+        router.maintain_supervisors_at(last_use + SERVER_IDLE_TIMEOUT);
+        router.demand_servers(|_| true);
+        router.discover_uncached(|_| true);
+        assert_eq!(
+            slot.supervisor.as_ref().unwrap().lock().unwrap().state,
+            SupervisorState::Stopped,
+            "a list restarted an idle server with a complete catalog"
+        );
+        assert!(!router.any_discovering(|_| true));
+        assert!(!router.aggregated_prompts().is_empty());
+        assert!(!router.aggregated_resources().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A server that never published still loads its first full catalog.
+        let fresh = supervised_fixture(flaky_connect("s", 0, Arc::new(AtomicU64::new(0))));
+        fresh.demand_servers(|_| true);
+        assert!(fresh.any_discovering(|_| true));
+    }
+
+    #[test]
+    fn supervisor_startup_result_wakes_a_waiting_publisher() {
+        let router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
+        let mut seen = started_supervisors();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(5);
+        router.servers[0].start(true);
+        while !router.has_ready_reconnects() && Instant::now() < deadline {
+            seen = wait_for_started_supervisor(seen, deadline);
+        }
+        assert!(router.has_ready_reconnects());
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the publisher waited for its timeout instead of the result"
+        );
+    }
+
+    #[test]
+    fn supervisor_scoped_adoption_leaves_other_servers_to_their_owner() {
+        let mut router = supervised_fixture(Arc::new(|| Ok(mock_server("s"))));
+        router.servers[0].start(true);
+        assert!(wait_until(|| router.has_ready_reconnects()));
+        assert!(!router.has_ready_reconnects_for(|id| id == "other"));
+        assert!(router
+            .adopt_ready_reconnects_for(|id| id == "other")
+            .is_empty());
+        router.activate_supervisors_for(|id| id == "other");
+        assert!(router.has_ready_reconnects_for(|id| id == "s"));
+        assert_eq!(router.adopt_ready_reconnects_for(|id| id == "s"), vec!["s"]);
+        router.activate_supervisors_for(|id| id == "s");
+        assert!(router.pending_statuses().is_empty());
     }
 
     #[test]

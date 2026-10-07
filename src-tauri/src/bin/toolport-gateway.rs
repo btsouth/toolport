@@ -47,8 +47,9 @@ use conduit_lib::remote;
 #[cfg(test)]
 use conduit_lib::router::ToolPolicy;
 use conduit_lib::router::{
-    is_destructive, sanitize_segment, Connect, ConnectFailure, DispatchTarget, PendingHandle,
-    ReconnectBackoff, RegistryPolicy, Router, SharedServerSlot, SERVER_IDLE_TIMEOUT,
+    is_destructive, sanitize_segment, started_supervisors, wait_for_started_supervisor, Connect,
+    ConnectFailure, DispatchTarget, PendingHandle, ReconnectBackoff, RegistryPolicy, Router,
+    SharedServerSlot, SERVER_IDLE_TIMEOUT,
 };
 use conduit_lib::savings;
 use conduit_lib::searchtrace;
@@ -1149,7 +1150,6 @@ impl ResourceSubscriptionTable {
             .unwrap_or_default()
     }
 
-    #[cfg(test)]
     fn tracked_uri_owners(&self) -> Vec<(String, String)> {
         self.uri_owner
             .iter()
@@ -3756,6 +3756,7 @@ fn prepare_dispatch(
     continuation: bool,
 ) -> Result<(), String> {
     recheck_live_policy(router, live_router, target)?;
+    router.authorize(target)?;
     let owner = match target {
         DispatchTarget::Tool(name) => router.route_of(name).map(|(owner, _)| owner),
         DispatchTarget::Server(owner) => Some(owner),
@@ -3961,7 +3962,8 @@ fn execute_call(
         return json!({"content": [{"type": "text", "text": STALE_LIVE_VIEW}], "isError": true});
     }
     // Resolve a cold owner only through the collision-safe registry map. Scope
-    // is checked before demand so a rejected call cannot spawn another server.
+    // and tool policy are checked before demand so a rejected call cannot spawn
+    // a server; a blocked tool falls through to the usual policy refusal.
     let mut fresh = clone_live_router(live_router);
     if let Some(view) = &fresh {
         if let Some(owner) = owner_of_exposed_tool(Some(view), &unique_prefix_owners(reg), name) {
@@ -3970,10 +3972,12 @@ fn execute_call(
                     "Toolport: '{}' is not available to this client.", sanitize_segment(&owner)
                 )}], "isError": true});
             }
-            if let Err(message) = view.wait_for_server(&owner, cancel.as_ref(), false) {
-                return json!({"content": [{"type": "text", "text": format!("Toolport: {message}")}], "isError": true});
+            if view.authorize(DispatchTarget::Tool(name)).is_ok() {
+                if let Err(message) = view.wait_for_server(&owner, cancel.as_ref(), false) {
+                    return json!({"content": [{"type": "text", "text": format!("Toolport: {message}")}], "isError": true});
+                }
+                fresh = clone_live_router(live_router);
             }
-            fresh = clone_live_router(live_router);
         }
     }
     let router = fresh.as_deref().unwrap_or(router);
@@ -8746,6 +8750,25 @@ fn keep_subscribed_server_warm(
     }
 }
 
+/// After a rebuild, drop local tracking for URIs whose owner is no longer in
+/// the router. Kept and replaced servers restore their own subscriptions.
+fn drop_orphaned_resource_subscriptions(
+    router: &Router,
+    subs: &Arc<Mutex<ResourceSubscriptionTable>>,
+) {
+    let mut table = subs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (uri, owner) in table.tracked_uri_owners() {
+        if router.server_slot(&owner).is_none() {
+            eprintln!(
+                "toolport: resource '{uri}' owner '{owner}' was removed by a rebuild; dropping subscriptions"
+            );
+            table.clear_uri(&uri);
+        }
+    }
+}
+
 /// After reconnecting one downstream, re-subscribe URIs that server owns.
 /// Fail closed: if the fresh connection rejects a re-subscribe, drop local
 /// holders for that URI so clients are not left half-subscribed (asymmetric
@@ -9648,8 +9671,19 @@ fn watch_registry(
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         ),
     };
+    let mut seen = started_supervisors();
     loop {
-        std::thread::sleep(Duration::from_millis(1000));
+        // A started server is published as soon as it connects, through the
+        // same gated path as the tick, so a first lazy call does not wait for it.
+        let tick = Instant::now() + Duration::from_millis(1000);
+        loop {
+            let latest = wait_for_started_supervisor(seen, tick);
+            if latest == seen {
+                break;
+            }
+            seen = latest;
+            drive_reconnects(&host, &stdio, &profile);
+        }
         let _ = watch_tick(
             &path,
             &stdio,
@@ -9691,7 +9725,7 @@ fn drive_reconnects(host: &HostState, stdio: &SessionState, profile: &Arc<Mutex<
         slot.maintain();
     }
     for (keys, view) in root_views {
-        if view.has_ready_reconnects() {
+        if view.has_ready_reconnects_for(|id| keys.iter().any(|key| key.server == id)) {
             host.reconcile_rooted_view(&keys, view);
         }
     }
@@ -10028,6 +10062,9 @@ fn watch_tick(
             prior_quarantine_from_router(&previous_router),
             Some(&previous_router),
         );
+        if let Some(subs) = resource_subs {
+            drop_orphaned_resource_subscriptions(&new_router, subs);
+        }
         let server_count = new_router.server_count();
         // The registry and its trust verdict were already published together,
         // through `publish_registry`, before the rebuild (SBS-900).
@@ -10963,6 +11000,8 @@ impl HostState {
     }
 
     fn reconcile_rooted_view(&self, keys: &[LaunchKey], cached: Arc<Router>) -> Arc<Router> {
+        // Base slots shared by this view publish only through the base router.
+        let rooted = |id: &str| keys.iter().any(|key| key.server == id);
         let mut cached = cached;
         loop {
             let scope = {
@@ -10972,9 +11011,9 @@ impl HostState {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 pool.root_scopes.get(keys).cloned()
             };
-            if cached.has_ready_reconnects() {
+            if cached.has_ready_reconnects_for(rooted) {
                 let mut updated = (*cached).clone();
-                updated.adopt_ready_reconnects();
+                updated.adopt_ready_reconnects_for(rooted);
                 if let Some(scope) = &scope {
                     self.check_rooted_integrity(&mut updated, scope, keys);
                 }
@@ -10986,7 +11025,7 @@ impl HostState {
                 if let Some(current) = pool.views.get_mut(keys) {
                     if Arc::ptr_eq(current, &cached) {
                         *current = Arc::clone(&updated);
-                        updated.activate_supervisors();
+                        updated.activate_supervisors_for(rooted);
                         return updated;
                     }
                 }
@@ -11330,7 +11369,7 @@ impl HostState {
             &format!("root:{}", registry::sha256_hex(root)),
             &keys,
         );
-        view.activate_supervisors();
+        view.activate_supervisors_for(|id| keys.iter().any(|key| key.server == id));
         let view = Arc::new(view);
         let mut pool = self
             .root_launch_pool
@@ -13124,6 +13163,7 @@ fn rebuild_router_for_root(state: &GatewayState) {
         prior_quarantine_from_router(&previous_router),
         Some(&previous_router),
     );
+    drop_orphaned_resource_subscriptions(&new_router, &state.resource_subs);
     let tools = publish_built_router(
         &state.registry,
         &state.router,
@@ -13160,6 +13200,7 @@ fn finish_self_heal_build(
     if built.server_count() == 0 {
         return;
     }
+    drop_orphaned_resource_subscriptions(&built, &state.resource_subs);
     let tools = publish_built_router(&state.registry, &state.router, built, profile);
     let live = state
         .router
@@ -13742,9 +13783,9 @@ fn process_request(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            if !live
-                .any_starting(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
-            {
+            if !live.any_discovering(|id| {
+                allowed.is_none_or(|scope| server_in_allowed_scope(id, scope))
+            }) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -13877,7 +13918,7 @@ fn process_request(
     {
         let deadline = Instant::now() + Duration::from_secs(30);
         while rooted_router
-            .any_starting(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
+            .any_discovering(|id| allowed.is_none_or(|scope| server_in_allowed_scope(id, scope)))
             && Instant::now() < deadline
         {
             if cancel
@@ -19487,6 +19528,214 @@ mod tests {
                 .get(&keys)
                 .unwrap()
         ));
+    }
+
+    fn counting_cache_supervisor(id: &str, tools: Vec<Value>, starts: &Arc<AtomicUsize>) -> Router {
+        let starts = Arc::clone(starts);
+        let server_id = id.to_string();
+        let mut router = Router::new();
+        router.add_supervised(
+            id.into(),
+            tools,
+            Arc::new(move || {
+                starts.fetch_add(1, Ordering::SeqCst);
+                let mut server =
+                    DownstreamServer::connect(server_id.clone(), Box::new(CacheRoute)).unwrap();
+                server.load_resources_prompts();
+                Ok(server)
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        router
+    }
+
+    #[test]
+    fn supervisor_rooted_view_leaves_shared_base_servers_to_the_base_gate() {
+        let _env = DataDirTestEnv::new("supervisor-rooted-base-gate");
+        let state = http_state(false);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let base = Arc::new(counting_cache_supervisor(
+            "base",
+            vec![json!({"name":"stale"})],
+            &starts,
+        ));
+        *state.router.lock().unwrap() = Arc::clone(&base);
+        let keys = root_launch_keys(&[stub_server("cache", "Cache")], "/project", 0);
+        let rooted = cached_supervisor();
+        let view = Arc::new(base.with_shared_server_slot(&rooted.server_slot("cache").unwrap()));
+        {
+            let mut pool = state.root_launch_pool.lock().unwrap();
+            pool.base = Some(Arc::clone(&base));
+            pool.views.insert(keys.clone(), Arc::clone(&view));
+            pool.root_scopes.insert(
+                keys.clone(),
+                format!("root:{}", registry::sha256_hex("/project")),
+            );
+        }
+        // A rooted client lazily starts both its own server and a shared base one.
+        view.prepare_lazy_use("cache");
+        view.prepare_lazy_use("base");
+        wait_for_supervisor_result(&base);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !view.has_ready_reconnects_for(|id| id == "cache") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drive_reconnects(&state.host, &state.stdio_upstream, &state.profile);
+        let published = state.root_launch_pool.lock().unwrap().views[&keys].clone();
+        let names = |router: &Router| {
+            let mut names: Vec<String> = router
+                .aggregated_tools()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(&published),
+            vec!["base__stale".to_string(), "cache__cached".to_string()],
+            "the rooted view published a base server without the base gate"
+        );
+        // The base router adopted its own server through publish_built_router.
+        let live = state.router.lock().unwrap().clone();
+        assert!(
+            !Arc::ptr_eq(&live, &base),
+            "the base router never adopted it"
+        );
+        assert_eq!(names(&live), vec!["base__cached".to_string()]);
+        assert!(live.pending_statuses().is_empty());
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn supervisor_lists_after_idle_stop_keep_the_catalog_without_restarting() {
+        let _env = DataDirTestEnv::new("supervisor-idle-lists");
+        let state = http_state(false);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let router = counting_cache_supervisor("cache", Vec::new(), &starts);
+        router.prepare_lazy_use("cache");
+        wait_for_supervisor_result(&router);
+        *state.router.lock().unwrap() = Arc::new(router);
+        adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
+        let live = state.router.lock().unwrap().clone();
+        live.maintain_supervisors_at(Instant::now() + SERVER_IDLE_TIMEOUT);
+        assert!(live.pending_statuses().is_empty());
+        for (method, field) in [
+            ("prompts/list", "prompts"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+            ("tools/list", "tools"),
+        ] {
+            let started = Instant::now();
+            let reply = process_request(
+                &state,
+                &json!({"jsonrpc":"2.0","id":1,"method":method}),
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .unwrap();
+            assert!(
+                !reply["result"][field].as_array().unwrap().is_empty(),
+                "{method} lost the stopped server's catalog"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{method} waited"
+            );
+            assert!(
+                !live.any_starting(|_| true),
+                "{method} restarted the server"
+            );
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn supervisor_blocked_tool_call_does_not_start_its_server() {
+        let _env = DataDirTestEnv::new("supervisor-blocked-call");
+        let reg = Registry {
+            safety_level: Some(registry::SafetyLevel::Off),
+            servers: vec![stub_server("cache", "Cache")],
+            ..Registry::default()
+        };
+        for reason in ["quarantine", "disabled"] {
+            let starts = Arc::new(AtomicUsize::new(0));
+            let mut router = counting_cache_supervisor(
+                "cache",
+                vec![json!({"name":"cached"}), json!({"name":"other"})],
+                &starts,
+            );
+            if reason == "quarantine" {
+                router.requarantine_from_store(BTreeSet::from(["cache__cached".to_string()]));
+            } else {
+                router.apply_registry_policy(RegistryPolicy {
+                    disabled: HashMap::from([(
+                        "cache".to_string(),
+                        HashSet::from(["cached".to_string()]),
+                    )]),
+                    ..RegistryPolicy::default()
+                });
+            }
+            let snapshot = Arc::new(router);
+            let live = Arc::new(Mutex::new(Arc::clone(&snapshot)));
+            let reply = execute_call(
+                &reg,
+                &snapshot,
+                &snapshot.aggregated_tools(),
+                Some("test"),
+                None,
+                None,
+                None,
+                "cache__cached",
+                json!({}),
+                None,
+                None,
+                CallOpts {
+                    direct: true,
+                    shape: false,
+                    allow_app_only: true,
+                },
+                Some(&live),
+            );
+            assert_eq!(reply["isError"], true, "got {reply}");
+            assert!(reply.to_string().contains(reason), "got {reply}");
+            assert!(
+                !snapshot.any_starting(|_| true),
+                "{reason} call started the server"
+            );
+            assert_eq!(starts.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn rebuild_drops_subscriptions_whose_owner_was_removed() {
+        let _env = DataDirTestEnv::new("supervisor-orphaned-subscriptions");
+        let state = http_state(false);
+        {
+            let mut subs = state.resource_subs.lock().unwrap();
+            subs.add("subscriber", "fixture://kept", "cache").unwrap();
+            subs.add("subscriber", "fixture://gone", "removed").unwrap();
+        }
+        let built = counting_cache_supervisor(
+            "cache",
+            vec![json!({"name":"cached"})],
+            &Arc::new(AtomicUsize::new(0)),
+        );
+        finish_self_heal_build(&state, built, &Router::new(), None);
+        let subs = state.resource_subs.lock().unwrap();
+        assert_eq!(
+            subs.tracked_uri_owners(),
+            vec![("fixture://kept".to_string(), "cache".to_string())]
+        );
+        assert!(subs.sessions_for_uri("fixture://gone").is_empty());
+        assert_eq!(subs.total_count(), 1);
     }
 
     #[test]
