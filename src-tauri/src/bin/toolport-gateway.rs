@@ -13982,8 +13982,7 @@ fn process_request(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             if !live.any_discovering(visible)
-                || Instant::now() >= catalog_deadline
-                    && !live.any_publishing_first_catalog(visible)
+                || Instant::now() >= catalog_deadline && !live.any_publishing_first_catalog(visible)
             {
                 break;
             }
@@ -20046,7 +20045,10 @@ mod tests {
         while !live.has_ready_reconnects() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(live.has_ready_reconnects(), "the late server never connected");
+        assert!(
+            live.has_ready_reconnects(),
+            "the late server never connected"
+        );
         adopt_reconnected_servers(&state.host, &state.stdio_upstream, &state.profile);
         assert_eq!(
             deferred_count(&state.stdio_upstream, "notifications/tools/list_changed"),
@@ -20090,7 +20092,8 @@ mod tests {
         // First connect fails and leaves the server in backoff.
         router.prepare_lazy_use("flaky");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while router.pending_statuses().iter().all(|s| s.failures == 0) && Instant::now() < deadline {
+        while router.pending_statuses().iter().all(|s| s.failures == 0) && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(
