@@ -5175,6 +5175,18 @@ fn relative_activity_time(timestamp_ms: u64) -> String {
     }
 }
 
+/// The badge label and CSS class for one client's instructions state (shared with the Teams page).
+fn rule_apply_state(state: crate::instructions::ApplyState) -> (&'static str, &'static str) {
+    match state {
+        crate::instructions::ApplyState::Applied => ("Applied", "success"),
+        crate::instructions::ApplyState::Stale => ("Needs update", "review"),
+        crate::instructions::ApplyState::Unsupported => ("Unsupported", "disabled"),
+        crate::instructions::ApplyState::BlockedOverride => ("Blocked by override", "review"),
+        crate::instructions::ApplyState::TooLong => ("Too long", "review"),
+        crate::instructions::ApplyState::Error => ("Could not apply", "disabled"),
+    }
+}
+
 #[derive(Clone)]
 struct ApprovalPage {
     root: gtk::Box,
