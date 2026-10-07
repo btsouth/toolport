@@ -176,7 +176,7 @@ fn render_with_savings(
     for (metric, help, key) in [
         (
             "toolport_tool_definition_bytes_avoided_total",
-            "Exact serialized MCP tool-definition array bytes avoided by v2 catalog loads",
+            "Exact serialized MCP array bytes avoided by counted catalog exposures, including historical v2 loads",
             "avoidedSurfaceBytes",
         ),
         (
@@ -191,17 +191,17 @@ fn render_with_savings(
         ),
         (
             "toolport_tool_list_loads_total",
-            "Non-full tool-list loads, including legacy rows",
+            "Counted catalog exposures plus historical non-full tool-list loads",
             "listLoads",
         ),
         (
             "toolport_discovery_response_bytes_total",
-            "Exact UTF-8 text bytes returned by v2 search responses",
+            "Exact UTF-8 text bytes returned by recorded discovery responses",
             "discoveryResponseBytes",
         ),
         (
             "toolport_discovery_searches_total",
-            "Measured v2 discovery search responses",
+            "Recorded discovery search responses",
             "discoveryCount",
         ),
     ] {
