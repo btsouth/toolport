@@ -9047,6 +9047,8 @@ mod tests {
             config_error: false,
         };
         let mut registry = crate::registry::Registry::default();
+        registry.profiles[0].id = "work".into();
+        registry.profiles[0].name = "Work".into();
         registry.set_client_scope(&client.id, client.scope_id.as_deref());
         let scope = client_reset_scope(&client);
         crate::registry_controller::apply_client_stdio_update(

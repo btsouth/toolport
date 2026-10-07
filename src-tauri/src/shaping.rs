@@ -536,6 +536,8 @@ mod tests {
                 .unwrap()
                 .contains("from github;"));
         }
+        crate::integrity::label_untrusted_result("github", &mut result);
+        assert!(value_size(&result) <= 2048, "notice must fit within the original budget");
         let cursor = stash_payload("Toolport-owned data".into(), None, None);
         let fetched = fetch_result(&cursor, 0, 100, None, None);
         assert!(fetched.get("_meta").is_none());
