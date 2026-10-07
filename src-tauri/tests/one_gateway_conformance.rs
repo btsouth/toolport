@@ -2479,6 +2479,7 @@ fn matrix_pooling_root_restarts_only_when_its_effective_spec_changes() {
         key: "ROOT_LAUNCH_REVISION".into(),
         value: Some("2".into()),
         secret: false,
+        unknown_fields: Default::default(),
     });
     registry::save_to(&path, &reg).expect("change root launch spec");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -2551,6 +2552,7 @@ fn matrix_pooling_rooted_subscription_survives_an_effective_spec_change() {
         key: "ROOT_LAUNCH_REVISION".into(),
         value: Some("2".into()),
         secret: false,
+        unknown_fields: Default::default(),
     });
     registry::save_to(&path, &reg).expect("rotate secret generation");
     let deadline = Instant::now() + Duration::from_secs(10);
