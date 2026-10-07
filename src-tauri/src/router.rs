@@ -651,6 +651,7 @@ struct Supervisor {
     connect: Connect,
     backoff: ReconnectBackoff,
     failures: u32,
+    ever_ready: bool,
     last_error: String,
     next_attempt: Instant,
     last_use: Instant,
@@ -673,6 +674,7 @@ impl ServerSlot {
             connect,
             backoff,
             failures: 0,
+            ever_ready: false,
             last_error: String::new(),
             next_attempt: Instant::now(),
             last_use: Instant::now(),
@@ -817,8 +819,20 @@ impl ServerSlot {
         if status.needs_auth {
             format!("server '{}' {}", self.id, status.describe())
         } else {
+            let ever_ready = self
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .ever_ready;
+            let reason = if ever_ready {
+                "is restarting"
+            } else {
+                "has not connected yet"
+            };
             format!(
-                "server '{}' is restarting, retry in {}s ({})",
+                "server '{}' {reason}, retry in {}s ({})",
                 self.id,
                 status.retry_in.map_or(1, |delay| delay.as_secs() + 1),
                 client_safe_error(&status.last_error)
@@ -1974,6 +1988,7 @@ impl Router {
                 if state.publishing {
                     state.publishing = false;
                     state.state = SupervisorState::Ready;
+                    state.ever_ready = true;
                     state.failures = 0;
                     state.last_error.clear();
                 }
@@ -6981,6 +6996,9 @@ mod tests {
         assert!(wait_until(
             || router.servers[0].status().unwrap().failures == 1
         ));
+        assert!(router.servers[0]
+            .unavailable()
+            .contains("has not connected yet"));
         let last_attempt = router.servers[0]
             .supervisor
             .as_ref()
@@ -7032,6 +7050,7 @@ mod tests {
             slot.supervisor.as_ref().unwrap().lock().unwrap().state,
             SupervisorState::Stopped
         );
+        assert!(slot.unavailable().contains("is restarting"));
         assert!(!router.aggregated_tools().is_empty());
         slot.start(true);
         ready_supervisor(&mut router);
