@@ -183,7 +183,7 @@ fn a_slow_call_does_not_block_a_fast_call_to_the_same_server() {
     let _ = slow;
 }
 
-/// REL-01: all four clients must overlap, and all one hundred calls must succeed.
+/// REL-01: at least four calls must overlap, and all one hundred calls must succeed.
 #[test]
 fn one_hundred_parallel_calls_to_one_server_overlap() {
     let scratch = Scratch::new("load-one");
