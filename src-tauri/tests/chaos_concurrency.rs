@@ -144,7 +144,6 @@ fn one_hundred_calls_spread_across_servers_all_succeed() {
 /// REL-01: while one call to a server is in flight, a second call to the SAME
 /// server must come back at once. Tracked by `#1019`.
 #[test]
-#[ignore = "needs #1019"]
 fn a_slow_call_does_not_block_a_fast_call_to_the_same_server() {
     let scratch = Scratch::new("hol");
     write_registry(
@@ -184,7 +183,6 @@ fn a_slow_call_does_not_block_a_fast_call_to_the_same_server() {
 /// REL-01: one hundred parallel 200 ms calls to one server must overlap. Tracked
 /// by `#1019`.
 #[test]
-#[ignore = "needs #1019"]
 fn one_hundred_parallel_calls_to_one_server_overlap() {
     let scratch = Scratch::new("load-one");
     write_registry(
