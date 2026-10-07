@@ -11,6 +11,7 @@ vi.mock("@/lib/toast", () => ({ toastError: vi.fn() }));
 
 const existing: Registry = {
   version: 1,
+  activeProfileId: null,
   servers: [],
   profiles: [],
   confirmDestructive: false,
