@@ -223,9 +223,12 @@ fn drift_severity(
 /// Purely annotation/title churn is cosmetic and stays on the quiet tier.
 fn definition_content_changed(old: &Pin, new: &Pin) -> bool {
     let (Some(old), Some(new)) = (&old.parts, &new.parts) else {
-        // A legacy pin keeps no per-field detail, and a version-mismatched pin is
-        // re-baselined before this is consulted. Treat anything else as content so
-        // an upgrade can never hide a rewrite.
+        // A pin without per-field detail cannot rule a content rewrite out. Two shapes
+        // reach here with a SAME-version fingerprint: the legacy bare-string pin, and a
+        // `v2:` pin written before `parts` was recorded (adding per-field detail did not
+        // change `fingerprint`'s hashed field set, so it did not bump `FP_VERSION`). A
+        // version-mismatched pin is re-baselined before this is consulted. Fail safe:
+        // treat a missing side as content so an upgrade can never hide a rewrite.
         return true;
     };
     old.description != new.description

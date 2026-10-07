@@ -134,6 +134,33 @@ function securityKey(e: SecurityEvent): string {
   return `${e.type}:${e.server ?? ""}:${e.tool ?? ""}:${e.change}:${severity}`;
 }
 
+/** Durable key written when a notice is dismissed. Mirrors the GTK shell's
+ * `security_dismissal_key`: the loud/actionable tier (high AND warn, per `eventSeverity`)
+ * records the instance's timestamp too, so clearing one description rewrite does not also
+ * silence a later, different rewrite of the same tool. The quiet tier keeps the
+ * identity-only key so routine vendor churn stays dismissed. */
+function dismissalKey(e: SecurityEvent): string {
+  const identity = securityKey(e);
+  return eventSeverity(e) === "high" ? `${identity}@${e.ts}` : identity;
+}
+
+/** Whether the user has already reviewed `e`. Loud events are reviewed through a
+ * timestamp: a recorded marker for the same identity covers this instance when it
+ * reviewed that timestamp or a later one, matching the GTK shell. A genuinely later
+ * rewrite (a larger `ts`) therefore reappears instead of staying permanently hidden.
+ * Quiet events are dismissed by identity alone. */
+function isDismissed(e: SecurityEvent, dismissed: Set<string>): boolean {
+  const identity = securityKey(e);
+  if (eventSeverity(e) !== "high") return dismissed.has(identity);
+  const prefix = `${identity}@`;
+  for (const marker of dismissed) {
+    if (!marker.startsWith(prefix)) continue;
+    const reviewedThrough = Number(marker.slice(prefix.length));
+    if (Number.isFinite(reviewedThrough) && reviewedThrough >= e.ts) return true;
+  }
+  return false;
+}
+
 /** Unique React list key. `securityKey` is deliberately timestamp-free (so dismissal is
  * durable), but two un-collapsed instances of the same drift can be on screen at once,
  * so the render key still needs the timestamp to stay unique. */
@@ -1718,7 +1745,7 @@ export function ActivityView({
   }
 
   const liveSecurity = dedupeSecurity(security).filter(
-    (e) => !dismissed.has(securityKey(e)),
+    (e) => !isDismissed(e, dismissed),
   );
   // Split loud/actionable signal from benign churn so vendor revisions don't bury a real
   // poison or privilege-escalation flag (the failure this whole surface exists to avoid).
@@ -1741,12 +1768,12 @@ export function ActivityView({
     (e) => eventSeverity(e) !== "high" || isNewTool(e),
   );
   const dismissSecurity = (e: SecurityEvent) => {
-    setDismissed((prev) => addDismissed(prev, [securityKey(e)]));
+    setDismissed((prev) => addDismissed(prev, [dismissalKey(e)]));
   };
   // Clear a whole batch at once (the quiet lane can hold dozens of first-sightings after
   // a re-baseline; making the user dismiss each would just recreate the noise problem).
   const dismissAllSecurity = (events: SecurityEvent[]) => {
-    setDismissed((prev) => addDismissed(prev, events.map(securityKey)));
+    setDismissed((prev) => addDismissed(prev, events.map(dismissalKey)));
   };
 
   const banner = (
