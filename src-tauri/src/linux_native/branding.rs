@@ -3,7 +3,6 @@ use adw::prelude::*;
 // Card text can wrap into several lines when tiled. Keep the badge's
 // allocation independent of the row height, including transport fallbacks.
 fn centered_logo(image: gtk::Image) -> gtk::Image {
-    image.set_size_request(32, 32);
     image.set_halign(gtk::Align::Center);
     image.set_valign(gtk::Align::Center);
     image

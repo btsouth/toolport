@@ -883,8 +883,9 @@ button.toolport-activity-filter {{
 }}
 
 .toolport-card-icon {{
-  min-width: 28px;
-  min-height: 28px;
+  min-width: 32px;
+  min-height: 32px;
+  margin: 1px;
   border-radius: 9px;
   background-color: alpha(@toolport_accent, 0.12);
   color: @toolport_accent;

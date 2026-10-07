@@ -3509,7 +3509,14 @@ fn tray_host_present() -> bool {
     .unwrap_or(false)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn tray_host_present() -> bool {
+    let class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
+    // Windows owns this class for Explorer's notification area.
+    unsafe { !windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(class.as_ptr(), std::ptr::null()).is_null() }
+}
+
+#[cfg(target_os = "macos")]
 fn tray_host_present() -> bool {
     true
 }

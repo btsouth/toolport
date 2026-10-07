@@ -116,7 +116,7 @@ try {
         ),
       ]
         .filter((element) => element.getBoundingClientRect().width > 0)
-        .every((element) => element.getBoundingClientRect().right <= innerWidth),
+        .every((element) => element.getBoundingClientRect().right <= window.innerWidth),
     ),
   ).toBe(true);
   await page.getByRole("button", { name: "Add server", exact: true }).click();

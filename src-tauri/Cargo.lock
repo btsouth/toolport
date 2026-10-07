@@ -858,9 +858,9 @@ dependencies = [
  "chacha20poly1305",
  "core-foundation 0.10.1",
  "dirs 5.0.1",
- "gio 0.18.4",
  "fs2",
  "getrandom 0.2.17",
+ "gio 0.18.4",
  "gtk4",
  "hmac",
  "httpdate",
@@ -1813,7 +1813,6 @@ dependencies = [
  "cairo-rs 0.18.5",
  "gdk-pixbuf 0.18.5",
  "gdk-sys",
- "gio 0.18.4",
  "glib 0.18.5",
  "libc",
  "pango 0.18.3",
@@ -1826,7 +1825,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50e1f5f1b0bfb830d6ccc8066d18db35c487b1b2b1e8589b5dfe9f07e8defaec"
 dependencies = [
  "gdk-pixbuf-sys 0.18.0",
- "gio 0.18.4",
  "glib 0.18.5",
  "libc",
  "once_cell",
@@ -1941,7 +1939,6 @@ checksum = "3caa00e14351bebbc8183b3c36690327eb77c49abc2268dd4bd36b856db3fbfe"
 dependencies = [
  "gdk",
  "gdkx11-sys",
- "gio 0.18.4",
  "glib 0.18.5",
  "libc",
  "x11",
@@ -2250,7 +2247,6 @@ dependencies = [
  "futures-channel",
  "gdk",
  "gdk-pixbuf 0.18.5",
- "gio 0.18.4",
  "glib 0.18.5",
  "gtk-sys",
  "gtk3-macros",
@@ -3688,7 +3684,6 @@ version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ca27ec1eb0457ab26f3036ea52229edbdb74dee1edd29063f5b9b010e7ebee4"
 dependencies = [
- "gio 0.18.4",
  "glib 0.18.5",
  "libc",
  "once_cell",
@@ -4972,7 +4967,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "471f924a40f31251afc77450e781cb26d55c0b650842efafc9c6cbd2f7cc4f9f"
 dependencies = [
  "futures-channel",
- "gio 0.18.4",
  "glib 0.18.5",
  "libc",
  "soup3-sys",
@@ -6481,7 +6475,6 @@ dependencies = [
  "cairo-rs 0.18.5",
  "gdk",
  "gdk-sys",
- "gio 0.18.4",
  "gio-sys 0.18.1",
  "glib 0.18.5",
  "glib-sys 0.18.1",
