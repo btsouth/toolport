@@ -20,6 +20,7 @@ const SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Rotation {
     Gateway,
+    TeamActivity,
     TrimTail { max_bytes: u64, keep_lines: usize },
     Savings { max_bytes: u64, keep_lines: usize },
 }
@@ -60,7 +61,7 @@ impl Health {
             return None;
         }
         Some(format!(
-            "Activity, savings and diagnostics may be incomplete: {} records dropped, {} records with unconfirmed writes, {} write failures, {} incomplete flushes since gateway start.",
+            "Activity, savings, Teams reporting and diagnostics may be incomplete: {} records dropped, {} records with unconfirmed writes, {} write failures, {} incomplete flushes since gateway start.",
             self.queue_dropped, self.write_failed_records, self.write_failures, self.incomplete_flushes
         ))
     }
@@ -155,6 +156,11 @@ pub(crate) fn record(path: &Path, line: &str, rotation: Rotation) {
 /// pending or the writer is unavailable; callers must not claim a complete read.
 pub fn flush() -> bool {
     WRITER.get().is_none_or(|writer| writer.flush(FLUSH_BUDGET))
+}
+
+#[cfg(test)]
+pub(crate) fn flush_for_test(budget: Duration) -> bool {
+    WRITER.get().is_none_or(|writer| writer.flush(budget))
 }
 
 /// Drain on orderly gateway exit for at most two seconds. Never joins a writer
@@ -294,7 +300,7 @@ fn deliver(
             if rotation != Rotation::Gateway {
                 // Keep diagnostics beside the failed record's captured path, even
                 // if a test override or data directory migration has since changed.
-                crate::gatewaylog::queue_at(&path.with_file_name("gateway.log"), "telemetry batch persistence failed; Activity, savings and diagnostics may be incomplete");
+                crate::gatewaylog::queue_at(&path.with_file_name("gateway.log"), "telemetry batch persistence failed; Activity, savings, Teams reporting and diagnostics may be incomplete");
             } else {
                 eprintln!("toolport: gateway diagnostic write failed");
             }
@@ -305,6 +311,7 @@ fn deliver(
 fn append_batch(path: &Path, lines: &[String], rotation: Rotation) -> Result<(), String> {
     match rotation {
         Rotation::Gateway => crate::gatewaylog::append_batch_to(path, lines),
+        Rotation::TeamActivity => crate::team_activity::append_records_at(path, lines),
         Rotation::TrimTail {
             max_bytes,
             keep_lines,
@@ -473,6 +480,7 @@ mod tests {
         let _data = crate::registry::DataDirOverride::set(dir.join("current"));
         for rotation in [
             trimmed(1024, 100),
+            Rotation::TeamActivity,
             Rotation::Savings {
                 max_bytes: 1024,
                 keep_lines: 100,

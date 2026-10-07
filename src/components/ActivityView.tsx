@@ -829,7 +829,7 @@ export function TelemetryNotice({ stats }: { stats: AuditStats | null }) {
       health.incompleteFlushes)
   ) {
     messages.push(
-      `Activity, savings and diagnostics may be incomplete: ${health.queueDropped} records dropped, ${health.writeFailedRecords} records with unconfirmed writes, ${health.writeFailures} write failures, ${health.incompleteFlushes} incomplete flushes since gateway start.`,
+      `Activity, savings, Teams reporting and diagnostics may be incomplete: ${health.queueDropped} records dropped, ${health.writeFailedRecords} records with unconfirmed writes, ${health.writeFailures} write failures, ${health.incompleteFlushes} incomplete flushes since gateway start.`,
     );
   }
   if (health?.unavailable) {

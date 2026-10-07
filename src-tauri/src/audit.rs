@@ -1073,7 +1073,9 @@ mod tests {
             Path::new(&path),
             &json!({"server":"sentinel","marker":"between-snapshot-and-replace"}),
         );
-        crate::telemetry::flush();
+        // This storage-content test must confirm its FIFO barrier before claiming
+        // completion. It does not exercise the interactive reader's 500ms budget.
+        assert!(crate::telemetry::flush_for_test(std::time::Duration::from_secs(5)));
         std::fs::write(done, "done").expect("signal sentinel append complete");
     }
 
@@ -1174,7 +1176,7 @@ mod tests {
             }
             // The parent reads only after this process exits, so land every queued
             // line here instead of relying on the writer's next interval.
-            crate::telemetry::flush();
+            assert!(crate::telemetry::flush_for_test(std::time::Duration::from_secs(5)));
             return;
         }
 
