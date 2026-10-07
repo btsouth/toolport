@@ -8864,8 +8864,8 @@ fn cleanup_root_resource_subs_for_session(state: &GatewayState, session: &str) {
 /// momentarily unreachable server would otherwise wipe the cache and leave the
 /// client showing only toolport_status); the emit still fires so the client
 /// re-fetches from cache.
-/// Run tool-definition integrity detection on a freshly built catalog (gated by
-/// the registry's `integrity_check`, on by default). Any drift is recorded to the
+/// Run tool-definition integrity detection on a freshly built catalog (always on
+/// in 2.0). Any drift is recorded to the
 /// security log inside `integrity::check`; here we also surface it in the gateway
 /// log so it's visible in "Copy diagnostics". Ordinary drift blocks only when its
 /// policy is enabled; baseline loss blocks at Ask and Strict because the trust root is gone.
@@ -17191,14 +17191,12 @@ fn main() {
             conduit_lib::stdio_adapter::run_selected_stdio_adapter();
         }
     }
-    let legacy_registry = registry::load_resolved_with_source()
-        .ok()
-        .filter(|(_, source)| source.is_authoritative())
-        .is_some_and(|(reg, _)| reg.gateway_topology == Some(registry::GatewayTopology::Legacy));
+    // The registry's legacy topology field is dropped by the v2 migration; only the
+    // environment override can still ask for it.
     let legacy_env =
         conduit_lib::brand::env_var("TOOLPORT_GATEWAY_TOPOLOGY", "CONDUIT_GATEWAY_TOPOLOGY")
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("legacy"));
-    if (legacy_registry || legacy_env)
+    if legacy_env
         && registry::conduit_dir().is_some_and(|dir| {
             std::fs::create_dir_all(&dir).is_ok()
                 && std::fs::OpenOptions::new()
@@ -18958,7 +18956,6 @@ mod tests {
             safety_level: None,
             ..Registry::default()
         };
-        reg.content_defense = false;
         reg.team_forced_content_defense = false;
         reg.block_on_injection = true;
         assert!(reg.content_defense_effective());
@@ -20126,7 +20123,6 @@ mod tests {
             safety_level: None,
             ..Registry::default()
         };
-        reg.content_defense = true;
         reg.block_on_injection = false;
         let router = Arc::new(paging_router("quarterly numbers".to_string()));
         let args = json!({
@@ -20192,7 +20188,6 @@ mod tests {
             safety_level: None,
             ..Registry::default()
         };
-        reg.content_defense = true;
         reg.block_on_injection = true;
         let router = Arc::new(paging_router("quarterly numbers".to_string()));
         let run = |args: &Value| {
@@ -29815,7 +29810,6 @@ mod tests {
         let state = http_state(false);
         {
             let mut reg = state.registry.lock().unwrap();
-            reg.integrity_check = true;
             reg.set_safety_level(registry::SafetyLevel::Strict);
             reg.quarantine_on_drift = true;
         }
@@ -29879,7 +29873,6 @@ mod tests {
         let state = http_state(false);
         {
             let mut reg = state.registry.lock().unwrap();
-            reg.integrity_check = true;
             reg.set_safety_level(registry::SafetyLevel::Strict);
             reg.quarantine_on_drift = true;
         }
@@ -29928,7 +29921,6 @@ mod tests {
         let state = http_state(false);
         {
             let mut reg = state.registry.lock().unwrap();
-            reg.integrity_check = true;
             reg.quarantine_on_drift = false;
         }
 
@@ -29996,7 +29988,6 @@ mod tests {
         let state = http_state(false);
         {
             let mut reg = state.registry.lock().unwrap();
-            reg.integrity_check = true;
             reg.set_safety_level(registry::SafetyLevel::Strict);
             reg.quarantine_on_drift = true;
         }
@@ -30183,7 +30174,6 @@ mod tests {
         })];
 
         let mut reg = Registry::default();
-        reg.integrity_check = true;
         reg.quarantine_on_drift = false;
         let registry = Arc::new(Mutex::new(reg));
         assert_eq!(

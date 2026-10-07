@@ -5209,7 +5209,6 @@ mod tests {
     #[test]
     fn forced_content_defense_and_drift_quarantine_are_releasable() {
         let mut r = base_registry();
-        r.content_defense = false;
         r.quarantine_on_drift = false;
 
         apply_team_config(
@@ -5228,10 +5227,6 @@ mod tests {
             r.quarantine_on_drift_effective(),
             "org forced drift-quarantine on"
         );
-        assert!(
-            !r.content_defense,
-            "member's own content-defense is untouched"
-        );
 
         // Org dropping the policy releases both to the member's own (off), no permanent lock.
         apply_team_config(&mut r, "t1", &json!({ "servers": [] }));
@@ -5245,11 +5240,9 @@ mod tests {
     #[test]
     fn leaving_a_team_releases_every_forced_safety_lock() {
         let mut r = base_registry();
-        // Member's OWN settings all off, so "effective" is driven purely by the org lock
-        // (content_defense defaults on, so set it explicitly to isolate the forced overlay).
+        // Member's OWN settings all off, so "effective" is driven purely by the org lock.
         r.human_approval = false;
         r.deny_destructive = false;
-        r.content_defense = false;
         r.quarantine_on_drift = false;
         r.block_on_injection = false;
         apply_team_config(
@@ -5413,7 +5406,6 @@ mod tests {
         // overlay, so an admin sees what is actually enforced on the member's machine.
         let mut r = base_registry();
         r.deny_destructive = true; // member's own on
-        r.content_defense = false;
         r.quarantine_on_drift = false;
         r.human_approval = false;
         r.block_on_injection = false;

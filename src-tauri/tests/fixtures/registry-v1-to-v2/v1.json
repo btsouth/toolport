@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "servers": [
+    {
+      "id": "github",
+      "name": "GitHub",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": [{"key": "GITHUB_TOKEN", "secret": true}],
+      "source": "manual",
+      "disabledTools": ["delete_repository"]
+    }
+  ],
+  "profiles": [
+    {
+      "id": "default",
+      "name": "Default",
+      "enabledServerIds": ["github"],
+      "toolScope": {"github": ["search_code"]}
+    }
+  ],
+  "activeProfileId": "default",
+  "gatewayTopology": "legacy",
+  "denyDestructive": false,
+  "confirmDestructive": false,
+  "humanApproval": false,
+  "humanApprovalAllow": ["github/search_code"],
+  "toolOverrides": {"github": {"create_issue": {"description": "Open an issue"}}},
+  "pinnedTools": {"github": ["get_me"]},
+  "quarantineOnDrift": false,
+  "lazyDiscovery": true,
+  "codeMode": true,
+  "allowRoutineWrites": true,
+  "allowAgentControl": true,
+  "integrityCheck": true,
+  "contentDefense": true,
+  "blockOnInjection": false,
+  "clientScopes": {"cursor": "default"},
+  "clientManagedEntries": {
+    "claude-desktop": {
+      "command": "toolport-gateway",
+      "args": [],
+      "env": {"TOOLPORT_CLIENT_ID": "claude-desktop"},
+      "transport": "sharedHttp",
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  },
+  "ruleSets": [
+    {"id": "personal", "name": "Personal", "content": "Always run the tests.\n", "revision": 2}
+  ],
+  "activeRuleSetId": "personal",
+  "rulesClients": {"claude-code": true},
+  "rulesTargets": ["/nonexistent-toolport-fixture/.claude/CLAUDE.md"],
+  "hooksEnabled": true,
+  "hookTargets": ["/nonexistent-toolport-fixture/.claude/settings.json"]
+}

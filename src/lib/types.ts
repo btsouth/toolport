@@ -527,8 +527,6 @@ export interface Registry {
   /** Per-client discovery-mode override, keyed by client id (e.g. "cursor" ->
    * "grouped"). Absent = that client inherits the global mode. */
   clientDiscovery?: Record<string, string>;
-  /** Opt-in: let an agent enable/disable servers via the gateway's control tools. */
-  allowAgentControl?: boolean;
   /** Connection to a Toolport Teams server, if joined. Token lives in the keychain. */
   team?: TeamConnection | null;
   /** Per-server result-shaping budgets in bytes, keyed by server id. Absent =

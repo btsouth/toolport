@@ -23,19 +23,46 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 pub(crate) static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+mod v2_migration;
+
 /// The newest registry schema version this build knows how to load and write.
-const REGISTRY_VERSION: u32 = 1;
+const REGISTRY_VERSION: u32 = 2;
 
 /// One ordered schema migration: it rewrites a registry document at version N
 /// into version N+1. The loader stamps the `version` field after each step, so
-/// a step only transforms data. Index `i` migrates v(i+1) -> v(i+2).
-pub type Migration = fn(&mut serde_json::Value) -> Result<(), String>;
+/// a step only transforms data, plus any export it must write before data is
+/// dropped. Index `i` migrates v(i+1) -> v(i+2).
+pub type Migration = fn(&mut serde_json::Value, &MigrationContext) -> Result<(), String>;
 
-/// The shipped `vN -> vN+1` pipeline, in order. Empty while the schema is still
-/// v1; every later schema change appends the next step here. Its length must
-/// stay `REGISTRY_VERSION - 1` (asserted by a test), so a step can neither be
+/// What a migration step may need beyond the document: where to put exports of
+/// user data a schema change drops. Steps run after the pre-migration backup
+/// and before the migrated registry is written.
+pub struct MigrationContext {
+    /// The directory holding the registry being migrated.
+    pub data_dir: PathBuf,
+    /// Today's UTC date as `YYYY-MM-DD`, used in export file names.
+    pub date: String,
+}
+
+impl MigrationContext {
+    fn for_registry(path: &Path) -> Self {
+        let data_dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let days = (now_ms() / 86_400_000) as i64;
+        let (year, month, day) = crate::usage_report::civil_from_days(days);
+        MigrationContext {
+            data_dir,
+            date: format!("{year:04}-{month:02}-{day:02}"),
+        }
+    }
+}
+
+/// The shipped `vN -> vN+1` pipeline, in order. Its length must stay
+/// `REGISTRY_VERSION - 1` (asserted by a test), so a step can neither be
 /// silently skipped nor applied twice.
-const MIGRATIONS: &[Migration] = &[];
+const MIGRATIONS: &[Migration] = &[v2_migration::migrate_v1_to_v2];
 
 /// A registry that could not be loaded or safely written because of its schema
 /// version. Kept distinct from the generic corruption error so version skew (an
@@ -882,98 +909,6 @@ pub struct Profile {
     pub instructions: Option<String>,
 }
 
-/// One named set of the user's own agent rules (CLAUDE.md / AGENTS.md / GEMINI.md content).
-/// Several sets can exist so a user can switch between, say, "Work" and "Personal"; exactly one
-/// is active at a time.
-///
-/// `(id, revision)` is what the personal sentinel marker carries, standing in for the team
-/// scope's `(team_id, version)` — see [`crate::instructions::Scope`]. `revision` therefore only
-/// moves when `content` actually changes, so a rename is not a rewrite of every client's file.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RuleSet {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub content: String,
-    #[serde(default)]
-    pub revision: i64,
-}
-
-/// What Claude Code should do with a native tool call that matches a rule (SBS-1058). The
-/// names are Claude Code's own `permissions` list names, so a rule maps to one list.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionAction {
-    Allow,
-    Ask,
-    Deny,
-}
-
-impl PermissionAction {
-    /// The key under `permissions` this action writes to.
-    pub fn list_key(self) -> &'static str {
-        match self {
-            PermissionAction::Allow => "allow",
-            PermissionAction::Ask => "ask",
-            PermissionAction::Deny => "deny",
-        }
-    }
-}
-
-/// How a guard hook acts on the permission rules (SBS-1059).
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GuardMode {
-    /// Hook not installed.
-    #[default]
-    Off,
-    /// Hook installed; every call is evaluated and the decision recorded, but the answer is
-    /// always "allow". For seeing what a policy WOULD do before letting it act.
-    Observe,
-    /// Hook installed; deny and ask rules take effect.
-    Enforce,
-}
-
-impl GuardMode {
-    pub fn is_off(&self) -> bool {
-        *self == GuardMode::Off
-    }
-}
-
-/// One native permission rule: a pattern in Claude Code's rule syntax (`Bash(rm -rf *)`,
-/// `Read(./.env)`, `WebFetch(domain:example.com)`, `mcp__server__tool`) and what to do.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "camelCase")]
-pub struct PermissionRule {
-    pub pattern: String,
-    pub action: PermissionAction,
-}
-
-/// One registered project folder for project-level agent rules (SBS-1037). The consent unit
-/// inside it is a FILE, not a client: at project level nearly every client reads the root
-/// `AGENTS.md`, Gemini reads `GEMINI.md`, Claude Code and VS Code read `.claude/rules/`, so
-/// `files` maps each of those (by key) to whether the user switched it on. Off means never
-/// written.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RulesProject {
-    pub id: String,
-    /// Absolute path of the folder, as the user picked it.
-    pub path: String,
-    /// Display name; defaults to the folder name.
-    pub name: String,
-    /// The rule set applied to this project, if any. Independent of the global active set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub set_id: Option<String>,
-    /// Per-file opt-in, keyed by file key. Absent means off.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub files: HashMap<String, bool>,
-    /// Absolute paths this project's applies have written, so removal touches exactly those.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub targets: Vec<String>,
-}
-
 /// Maps a project folder to a profile, so the gateway can auto-scope a client to the right
 /// server set based on the working directory (MCP `root`) it reports, instead of a manual
 /// profile switch. A client whose reported root is `path` or a descendant of it resolves to
@@ -1074,17 +1009,6 @@ pub struct ToolOverride {
     pub description: Option<String>,
 }
 
-/// Startup topology for client-spawned stdio gateways. An absent registry value
-/// follows the release default; an explicit value survives future default flips.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GatewayTopology {
-    Legacy,
-    Daemon,
-}
-
-pub const DEFAULT_GATEWAY_TOPOLOGY: GatewayTopology = GatewayTopology::Daemon;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SafetyLevel {
@@ -1112,9 +1036,6 @@ pub struct Registry {
     pub profiles: Vec<Profile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_profile_id: Option<String>,
-    // 2.0: unused, dropped by the v2 migration
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gateway_topology: Option<GatewayTopology>,
     /// Global safety switch: when true, the gateway hides and blocks any tool a
     /// server annotates with `destructiveHint: true` (deletes, drops, writes).
     /// One toggle to keep agents read-only across every connected server.
@@ -1210,26 +1131,6 @@ pub struct Registry {
     /// `CONDUIT_CODE_MODE`) still force-enables regardless of the toggle.
     #[serde(default)]
     pub code_mode: bool,
-    // 2.0: unused, dropped by the v2 migration
-    #[serde(default)]
-    pub allow_routine_writes: bool,
-    // 2.0: unused, dropped by the v2 migration
-    #[serde(default)]
-    pub allow_agent_control: bool,
-    /// Tool-definition integrity: fingerprint each connected tool and flag when a
-    /// previously-approved tool's definition changes (a rug-pull signal) or a known
-    /// server quietly adds a tool. Detection only, it records a security event and
-    /// never blocks. On by default.
-    // 2.0: unused, dropped by the v2 migration
-    #[serde(default = "default_true")]
-    pub integrity_check: bool,
-    /// Content defense (anti-agentjacking): scan untrusted tool RESULTS for injection
-    /// and label flagged content as data, not instructions, before the agent sees it.
-    /// Detection + labeling. On by default. Pair with [`block_on_injection`] to fail closed
-    /// on high-confidence hits (SOU-345).
-    // 2.0: unused, dropped by the v2 migration
-    #[serde(default = "default_true")]
-    pub content_defense: bool,
     /// Replace PII in tool results with stable pseudonyms before they reach the model,
     /// re-hydrating them on the way back out (SBS-346). OFF by default: it rewrites tool
     /// output, and unlike content defense a missed value fails OPEN, so it is a reduction
@@ -1314,82 +1215,6 @@ pub struct Registry {
     /// the rest of the registry JSON is unchanged.
     #[serde(default)]
     pub secrets_generation: u64,
-    // 2.0: unused, dropped by the v2 migration.
-    /// The user's own agent rule sets. Several can exist; `active_rule_set_id` picks the one
-    /// written to clients.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rule_sets: Vec<RuleSet>,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Which of `rule_sets` is currently applied. `None` = none; every file we wrote is removed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_rule_set_id: Option<String>,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Per-client opt-in for personal rules, keyed by client id. ABSENT MEANS OFF: writing into
-    /// someone's `~/.claude/rules` or `AGENTS.md` is not something to do unasked, so a client
-    /// only receives rules once the user turns it on.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub rules_clients: HashMap<String, bool>,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Absolute paths of the personal-rules files we have written, so cleanup after a set
-    /// switch / client opt-out / uninstall touches exactly what we created and nothing else.
-    /// Same role as `TeamConnection::team_instructions_targets`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rules_targets: Vec<String>,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Project folders the user registered for project-level agent rules (SBS-1037). Nothing
-    /// is ever discovered: a folder is here because the user added it, and its files are
-    /// written only by an explicit Apply for that project, never at startup.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rules_projects: Vec<RulesProject>,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Cursor guard hook (SBS-1059): how the `--toolport-guard cursor` hook Toolport installs
-    /// into `~/.cursor/hooks.json` treats the same permission rules. `Off` = not installed.
-    #[serde(default, skip_serializing_if = "GuardMode::is_off")]
-    pub guard_cursor_mode: GuardMode,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Cursor guard, when enforcing: route an "ask first" rule through Toolport's approval
-    /// window instead of Cursor's own prompt (SBS-1059). Off = Cursor prompts.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub guard_cursor_ask_via_toolport: bool,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Claude Code guard (SBS-1059): the `--toolport-guard claude-code` PreToolUse hook.
-    /// Claude Code enforces deny and allow natively, so this hook's one job is asks:
-    /// `Enforce` moves the ask rules it can judge (shell commands, file reads, MCP tools)
-    /// out of `settings.json` and into Toolport's approval window. `Observe` installs the
-    /// hook and records what it would decide; the native rules stay as they are.
-    #[serde(default, skip_serializing_if = "GuardMode::is_off")]
-    pub guard_claude_mode: GuardMode,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Absolute paths of the hooks files the guard has been written into, for exact cleanup.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub guard_targets: Vec<String>,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Native permission policy for Claude Code (SBS-1058): rules in Claude Code's own
-    /// `permissions` syntax that Toolport wrote into every profile's `settings.json`.
-    /// The written entries are the user's policy and were left in place when the feature
-    /// was removed in 2.0.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub agent_permissions_enabled: bool,
-    // 2.0: unused, dropped by the v2 migration.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub agent_permission_rules: Vec<PermissionRule>,
-    // 2.0: unused, dropped by the v2 migration.
-    /// Per settings file, exactly the rule strings Toolport ADDED there (a rule the user
-    /// already had is not added and not recorded, so it is never removed). Removal and
-    /// policy changes strip exactly these. Same role as `hook_targets` / `rules_targets`.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub agent_permission_targets: HashMap<String, Vec<PermissionRule>>,
-    /// Whether the native-agent hook sensor is installed. The sensor was removed in
-    /// 2.0; the field stays so a v1 registry still deserializes.
-    // 2.0: unused, dropped by the v2 migration
-    #[serde(default)]
-    pub hooks_enabled: bool,
-    /// Absolute paths of the agent settings files the hook sensor wrote into, so
-    /// removal touched exactly what it created. The sensor was removed in 2.0; the
-    /// field stays so a v1 registry still deserializes.
-    // 2.0: unused, dropped by the v2 migration
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hook_targets: Vec<String>,
     /// Top-level fields THIS build doesn't know, preserved verbatim across
     /// load -> save. The registry is shared by mixed versions of the app and
     /// long-running gateways (a dev build, the installed release, and gateways
@@ -1630,7 +1455,6 @@ impl Default for Registry {
                 instructions: None,
             }],
             active_profile_id: Some(DEFAULT_PROFILE_ID.to_string()),
-            gateway_topology: None,
             safety_level: Some(SafetyLevel::Ask),
             deny_destructive: false,
             confirm_destructive: false,
@@ -1650,10 +1474,6 @@ impl Default for Registry {
             gateway_instructions: None,
             discovery_mode: None,
             code_mode: false,
-            allow_routine_writes: false,
-            allow_agent_control: false,
-            integrity_check: true,
-            content_defense: true,
             block_on_injection: false,
             injection_block_exempt: HashMap::new(),
             live_inspect: false,
@@ -1668,20 +1488,6 @@ impl Default for Registry {
             http_bridge_enabled: false,
             http_bridge_port: None,
             secrets_generation: 0,
-            rule_sets: Vec::new(),
-            active_rule_set_id: None,
-            rules_clients: HashMap::new(),
-            rules_targets: Vec::new(),
-            rules_projects: Vec::new(),
-            guard_cursor_mode: GuardMode::Off,
-            guard_cursor_ask_via_toolport: false,
-            guard_claude_mode: GuardMode::Off,
-            guard_targets: Vec::new(),
-            agent_permissions_enabled: false,
-            agent_permission_rules: Vec::new(),
-            agent_permission_targets: HashMap::new(),
-            hooks_enabled: false,
-            hook_targets: Vec::new(),
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -2017,10 +1823,6 @@ pub(crate) fn unique_id(base: &str, existing: &[String]) -> String {
 }
 
 impl Registry {
-    pub fn gateway_topology_effective(&self) -> GatewayTopology {
-        DEFAULT_GATEWAY_TOPOLOGY
-    }
-
     fn profile_id_for_ref(&self, profile_ref: &str) -> Option<String> {
         let profile_ref = profile_ref.trim();
         if profile_ref.is_empty() {
@@ -3260,6 +3062,7 @@ fn run_migration_steps(
     value: &mut serde_json::Value,
     migrations: &[Migration],
     target_version: u32,
+    context: &MigrationContext,
 ) -> Result<(), String> {
     let mut version = document_version(value);
     while version < target_version {
@@ -3269,7 +3072,7 @@ fn run_migration_steps(
                 version + 1
             )
         })?;
-        step(value).map_err(|error| {
+        step(value, context).map_err(|error| {
             format!(
                 "Registry migration from schema v{version} to v{} failed: {error}",
                 version + 1
@@ -3296,7 +3099,12 @@ fn migrate_document(
         return Ok(());
     }
     write_migration_backup(path, original, from_version)?;
-    run_migration_steps(value, migrations, target_version)
+    run_migration_steps(
+        value,
+        migrations,
+        target_version,
+        &MigrationContext::for_registry(path),
+    )
 }
 
 /// Recover the registry from the backups `save_to` maintains, newest-first by
@@ -3371,7 +3179,8 @@ fn restore_from_backup(
             if write_migration_backup(path, &content, from_version).is_err() {
                 continue;
             }
-            if run_migration_steps(&mut value, migrations, target_version).is_err() {
+            let context = MigrationContext::for_registry(path);
+            if run_migration_steps(&mut value, migrations, target_version, &context).is_err() {
                 continue;
             }
         }
@@ -3523,7 +3332,7 @@ fn load_from_inner(path: &Path) -> Result<(Registry, LoadSource), String> {
 
 /// [`load_from_inner`] with an explicit pipeline, so tests can prove the
 /// framework with a migration that has not shipped yet. Production always calls
-/// the empty [`MIGRATIONS`] against [`REGISTRY_VERSION`].
+/// [`MIGRATIONS`] against [`REGISTRY_VERSION`].
 fn load_from_inner_with(
     path: &Path,
     migrations: &[Migration],
@@ -4725,26 +4534,6 @@ mod tests {
 
     static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    #[test]
-    fn legacy_gateway_topology_is_retired_without_changing_v1_bytes() {
-        let mut reg = Registry::default();
-        assert_eq!(reg.gateway_topology_effective(), GatewayTopology::Daemon);
-        let absent = serde_json::to_value(&reg).unwrap();
-        assert!(absent.get("gatewayTopology").is_none());
-        reg.gateway_topology = Some(GatewayTopology::Daemon);
-        let opted_in = serde_json::to_value(&reg).unwrap();
-        assert_eq!(opted_in["gatewayTopology"], "daemon");
-        let loaded: Registry = serde_json::from_value(opted_in).unwrap();
-        assert_eq!(loaded.gateway_topology_effective(), GatewayTopology::Daemon);
-        reg.gateway_topology = Some(GatewayTopology::Legacy);
-        assert_eq!(reg.gateway_topology_effective(), GatewayTopology::Daemon);
-        assert_eq!(
-            serde_json::to_value(&reg).unwrap()["gatewayTopology"],
-            "legacy",
-            "the v2 migration owns removal of the stored field"
-        );
-    }
-
     /// SBS-890: an error body is the downstream server's own words. It has been
     /// through the injection scan and the PII pass, and neither is a credential
     /// test, so the redactor is what keeps a key out of `audit.jsonl`.
@@ -4944,9 +4733,9 @@ mod tests {
         let path = dir.join("registry.json");
         save_to(&path, &Registry::default()).unwrap();
 
-        // Simulate a concurrent external writer flipping `allow_agent_control` on disk.
+        // Simulate a concurrent external writer flipping `live_inspect` on disk.
         let mut disk = load_from(&path).unwrap();
-        disk.allow_agent_control = true;
+        disk.live_inspect = true;
         save_to(&path, &disk).unwrap();
 
         // Our update touches a different field. Loading fresh must keep the concurrent change.
@@ -4957,12 +4746,12 @@ mod tests {
         .unwrap();
         assert!(out.deny_destructive, "our change applied");
         assert!(
-            out.allow_agent_control,
+            out.live_inspect,
             "the concurrent write was NOT reverted"
         );
 
         let reloaded = load_from(&path).unwrap();
-        assert!(reloaded.deny_destructive && reloaded.allow_agent_control);
+        assert!(reloaded.deny_destructive && reloaded.live_inspect);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -6275,9 +6064,9 @@ mod tests {
         let path = dir.join("registry.json");
 
         let mut stale = Registry::default();
-        stale.allow_agent_control = false;
+        stale.live_inspect = false;
         let mut latest = Registry::default();
-        latest.allow_agent_control = true;
+        latest.live_inspect = true;
         atomic_write(
             &backup_path(&path),
             &serde_json::to_string_pretty(&stale).unwrap(),
@@ -6306,13 +6095,13 @@ mod tests {
 
         let loaded = reader.join().unwrap().expect("reader loads newest primary");
         assert!(
-            loaded.allow_agent_control,
+            loaded.live_inspect,
             "reader must not return the stale backup"
         );
         let persisted: Registry =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(
-            persisted.allow_agent_control,
+            persisted.live_inspect,
             "recovery must not overwrite the newer primary after the writer releases"
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -7460,14 +7249,20 @@ mod tests {
 mod registry_version_tests {
     use super::*;
 
-    /// A migration that only exists for tests, proving the framework can run a
-    /// v1 -> v2 step without shipping a real schema change.
-    fn test_migration_v1_to_v2(value: &mut serde_json::Value) -> Result<(), String> {
+    /// A migration that only exists for tests, proving the framework runs a
+    /// pipeline independently of the shipped steps.
+    fn test_migration_v1_to_v2(
+        value: &mut serde_json::Value,
+        _context: &MigrationContext,
+    ) -> Result<(), String> {
         value["testMigrated"] = serde_json::Value::Bool(true);
         Ok(())
     }
 
-    fn failing_migration_v1_to_v2(_value: &mut serde_json::Value) -> Result<(), String> {
+    fn failing_migration_v1_to_v2(
+        _value: &mut serde_json::Value,
+        _context: &MigrationContext,
+    ) -> Result<(), String> {
         Err("boom".to_string())
     }
 
@@ -7583,12 +7378,17 @@ mod registry_version_tests {
         let path = resolved_path().unwrap();
         std::fs::write(&path, MISSING_VERSION).unwrap();
 
+        let value: serde_json::Value = serde_json::from_str(MISSING_VERSION).unwrap();
+        assert_eq!(document_version(&value), 1, "a missing version is read as v1");
         let registry = load().unwrap();
-        assert_eq!(registry.version, 1, "a missing version is read as v1");
-        assert!(
-            migration_backup_files(&path).is_empty(),
-            "a current-version load must not migrate or back up"
-        );
+        assert_eq!(registry.version, REGISTRY_VERSION, "and migrated from v1");
+        let backups = migration_backup_files(&path);
+        assert_eq!(backups.len(), 1);
+        assert!(backups[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("registry.json.v1-"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -7606,7 +7406,7 @@ mod registry_version_tests {
         let before = std::fs::read(&path).unwrap();
 
         let loaded = load().unwrap();
-        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.version, REGISTRY_VERSION);
         assert_eq!(loaded.servers.len(), 1);
         assert_eq!(
             std::fs::read(&path).unwrap(),
@@ -7803,7 +7603,7 @@ mod registry_version_tests {
         for (label, document) in fixtures {
             std::fs::write(&path, document).unwrap();
             let registry = load().unwrap_or_else(|error| panic!("{label} failed to load: {error}"));
-            assert_eq!(registry.version, 1, "{label} is a v1 document");
+            assert_eq!(registry.version, REGISTRY_VERSION, "{label} migrates from v1");
             assert!(!registry.servers.is_empty(), "{label} has a server");
             assert!(
                 registry

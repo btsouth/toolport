@@ -348,9 +348,8 @@ headless and Docker configs do not break on upgrade.
 - **Client config writers** (Cursor/Claude local JSON) still need the desktop
   app or a one-time manual URL in the client config, which is what sandboxed
   setups usually want anyway.
-- **Code Mode** (`toolport_run_script`) is **off by default** for new registries
-  and absent values. Existing explicit `"codeMode"` values remain unchanged until
-  the v2 migration. Enable it under Advanced in Settings, with `"codeMode": true`,
+- **Code Mode** (`toolport_run_script`) is **off by default**. The 2.0 upgrade
+  turns it off for existing registries too. Enable it under Advanced in Settings, with `"codeMode": true`,
   or with `TOOLPORT_CODE_MODE=1`. It is not a security boundary:
   agents supply JS that can call many tools in one round-trip; each call still
   hits the same scope and approval gates. Shared multi-tenant gateways that do

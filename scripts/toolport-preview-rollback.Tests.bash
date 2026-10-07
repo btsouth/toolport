@@ -73,6 +73,23 @@ aside="$(find "$TOOLPORT_DATA_DIR" -name 'registry.json.v2-rollback-*')"
 [ -f "$TOOLPORT_DATA_DIR/registry.json.v1-1791000000000.bak" ] && pass "backup itself kept" || fail "backup consumed"
 echo "$out" | grep -q "restored registry.json.v1-1791000000000.bak" && pass "restore reported" || fail "output: $out"
 
+# A registry the real v1 -> v2 migration wrote (the Rust test
+# rollback_fixture_is_a_real_migration keeps v2.json equal to its output for
+# v1.json): the exact v1 file comes back and the exports stay.
+setup v2-migrated
+fixtures="$repo_root/src-tauri/tests/fixtures/registry-v1-to-v2"
+cp "$fixtures/v2.json" "$TOOLPORT_DATA_DIR/registry.json"
+cp "$fixtures/v1.json" "$TOOLPORT_DATA_DIR/registry.json.v1-1791000000000.bak"
+mkdir -p "$TOOLPORT_DATA_DIR/exports"
+printf 'Always run the tests.\n' > "$TOOLPORT_DATA_DIR/exports/rules-2026-10-07.md"
+touch "$TOOLPORT_ROLLBACK_PKG_CACHE/toolport-1.24.0-1-x86_64.pkg.tar.zst"
+out="$(rollback)"
+cmp -s "$fixtures/v1.json" "$TOOLPORT_DATA_DIR/registry.json" && pass "migrated registry rolled back to the exact v1 file" || fail "restored: $(head -c 200 "$TOOLPORT_DATA_DIR/registry.json")"
+aside="$(find "$TOOLPORT_DATA_DIR" -name 'registry.json.v2-rollback-*')"
+[ -n "$aside" ] && cmp -s "$fixtures/v2.json" "$aside" && pass "migrated registry kept aside" || fail "no exact v2 copy kept"
+[ -f "$TOOLPORT_DATA_DIR/exports/rules-2026-10-07.md" ] && pass "exports left in place" || fail "exports removed"
+echo "$out" | grep -q "Registry: version 2 moved to" && pass "migrated version reported" || fail "output: $out"
+
 # v2 registry with no v1 backup: refuses and changes nothing.
 setup v2-no-backup
 printf '{"version": 2}\n' > "$TOOLPORT_DATA_DIR/registry.json"

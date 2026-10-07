@@ -1367,8 +1367,6 @@ fn matrix_rollout_default_selects_the_shared_daemon() {
     );
     let path = dir.join("registry.json");
     let mut reg = registry::load_from(&path).expect("load registry");
-    assert!(reg.gateway_topology.is_none(), "default must be absent on disk");
-    assert_eq!(reg.gateway_topology_effective(), registry::GatewayTopology::Daemon);
     reg.http_clients.push(registry::HttpClient {
         id: "probe-client".into(),
         label: "Probe client".into(),
@@ -1650,9 +1648,6 @@ fn matrix_retired_legacy_override_uses_shared_daemon() {
         vec![mock_server_entry("mock", &transcript, None)],
         vec![],
     );
-    let path = dir.join("registry.json");
-    let reg = registry::load_from(&path).expect("load registry");
-    assert!(reg.gateway_topology.is_none(), "legacy override tests the default");
 
     let options = AdapterOptions {
         default_role: true,
@@ -1689,10 +1684,13 @@ fn matrix_retired_legacy_registry_uses_shared_daemon() {
         vec![mock_server_entry("mock", &transcript, None)],
         vec![],
     );
+    // A 1.x registry that pinned the legacy topology. The v2 migration drops it.
     let path = dir.join("registry.json");
-    let mut reg = registry::load_from(&path).expect("load registry");
-    reg.gateway_topology = Some(registry::GatewayTopology::Legacy);
-    registry::save_to(&path, &reg).expect("save explicit legacy topology");
+    let mut document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    document["version"] = json!(1);
+    document["gatewayTopology"] = json!("legacy");
+    std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
 
     let mut client = spawn_adapter(
         &dir,
@@ -1713,8 +1711,10 @@ fn matrix_retired_legacy_registry_uses_shared_daemon() {
         "retired legacy must use the daemon"
     );
     assert_eq!(transcript_initialize_count(&transcript), 1);
-    let log = std::fs::read_to_string(dir.join("gateway.log")).unwrap();
-    assert!(log.contains("Legacy gateway topology was retired in 2.0"));
+    let migrated: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(migrated["version"], 2);
+    assert!(migrated.get("gatewayTopology").is_none());
 }
 
 #[test]
@@ -1925,7 +1925,6 @@ fn matrix_pooling_integrity_pins_are_independent_per_root() {
     );
     let path = dir.join("registry.json");
     let mut reg = registry::load_from(&path).unwrap();
-    reg.integrity_check = true;
     reg.set_safety_level(registry::SafetyLevel::Strict);
     reg.quarantine_on_drift = true;
     registry::save_to(&path, &reg).unwrap();
