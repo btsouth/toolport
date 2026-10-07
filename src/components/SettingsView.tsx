@@ -243,7 +243,7 @@ function FolderRouting({
       )}
       {profiles.length === 0 ? (
         <p className="mt-2 text-xs text-muted-foreground">
-          Create a profile first, then map a folder to it here.
+          Create an access set first, then map a folder to it here.
         </p>
       ) : (
         <div className="mt-2 flex items-center gap-2">
@@ -269,7 +269,7 @@ function FolderRouting({
           </button>
           <Select value={profile} onValueChange={setProfile}>
             <SelectTrigger className="h-7 w-32 text-xs">
-              <SelectValue placeholder="Profile" />
+              <SelectValue placeholder="Access set" />
             </SelectTrigger>
             <SelectContent>
               {profiles.map((p) => (
