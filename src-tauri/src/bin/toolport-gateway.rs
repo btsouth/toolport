@@ -8940,7 +8940,7 @@ fn maybe_check_integrity(
         ));
             eprintln!("toolport: SECURITY tool drift ({change}) {tool}");
         }
-        // Drift quarantine is Strict-only; baseline tamper also blocks at Ask.
+        // Drift quarantine is Strict or team-forced; baseline tamper also blocks at Ask.
         if quarantine_on || (blocking && integrity::baseline_tamper_detected(&events)) {
             let pending = integrity::quarantine_candidates(tools, &events);
             integrity::apply_quarantine(profile, tools, &events)
@@ -8958,7 +8958,7 @@ fn maybe_check_integrity(
         }
     })();
     match result {
-        Err((error, _)) if !blocking => {
+        Err((error, _)) if !blocking && !quarantine_on => {
             glog(&format!("SECURITY: integrity recording failed: {error}"));
             Ok(None)
         }
@@ -9069,20 +9069,23 @@ fn fail_closed_integrity_catalog(
 }
 
 /// The quarantine set the router SHOULD be enforcing right now, mirroring how the
-/// initial build gates on safety: Strict enforces all entries, Ask enforces baseline
-/// tamper entries, and Off leaves the persisted findings unenforced.
+/// initial build gates on safety: Strict or team-forced drift quarantine enforces all
+/// entries. Otherwise Ask enforces baseline tamper and Off leaves findings unenforced.
 fn effective_quarantine(
     registry: &Arc<Mutex<Registry>>,
     profile: Option<&str>,
     read_failed: &AtomicBool,
 ) -> Option<BTreeSet<String>> {
-    let level = {
+    let (level, quarantine_on) = {
         let r = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        r.safety_level_effective()
+        (
+            r.safety_level_effective(),
+            r.quarantine_on_drift_effective(),
+        )
     };
-    let stored = if level == registry::SafetyLevel::Strict {
+    let stored = if quarantine_on {
         integrity::quarantined_checked(profile)
     } else if level == registry::SafetyLevel::Ask {
         integrity::mandatory_quarantined_checked(profile)
@@ -16584,6 +16587,34 @@ fn respond_http_overloaded(request: tiny_http::Request) {
     let _ = request.respond(response);
 }
 
+/// Data-less paths that must answer without a bearer token.
+///
+/// A container HEALTHCHECK has no way to read the operator's `TOOLPORT_HTTP_TOKEN`,
+/// so the readiness probe has to sit outside the auth gate, exactly like the
+/// data-less OPTIONS preflight. Everything reachable here must therefore carry no
+/// registry data, version, tool names, or counts: only a status code.
+fn path_is_public_probe(path: &str) -> bool {
+    path == "/healthz"
+}
+
+/// The readiness response for a [`path_is_public_probe`] path: a status code and
+/// nothing else.
+///
+/// `200` once the live registry is a faithful copy of what is on disk; `503` when
+/// the boot load failed, which is the host-owned bind-mount case where the runtime
+/// user (uid 10001) cannot create the registry lock and the gateway serves the
+/// cached catalog only. Listener liveness alone must not read as ready, or the
+/// degraded container stays "healthy" in Docker.
+fn healthz_out(state: &GatewayState, method: &str) -> HttpOut {
+    if method != "GET" && method != "HEAD" {
+        HttpOut::new(405, "text/plain; charset=utf-8", String::new())
+    } else if state.registry_trusted.load(Ordering::SeqCst) {
+        HttpOut::new(200, "text/plain; charset=utf-8", String::new())
+    } else {
+        HttpOut::new(503, "text/plain; charset=utf-8", String::new())
+    }
+}
+
 /// Handle one accepted HTTP request end to end: parse, CORS, auth/scope, dispatch,
 /// and respond. A pure function of the request plus the shared state and guards, so
 /// it is safe to run on many worker threads concurrently.
@@ -16695,6 +16726,20 @@ fn handle_connection(
             .unwrap_or(&state.http_bind_host),
         &state.http_allowed_origins,
     );
+
+    // Readiness probe: answered before the auth gate so a container HEALTHCHECK
+    // needs no token, and data-free so a probe can never read registry contents,
+    // a version, or a tool count. See [`healthz_out`].
+    if path_is_public_probe(&path) {
+        let out = if forbidden {
+            HttpOut::json_err(403, "cross-site browser requests are not allowed")
+        } else {
+            healthz_out(state, &method)
+        };
+        let response = tiny_http::Response::from_string(out.body).with_status_code(out.status);
+        let _ = request.respond(response);
+        return;
+    }
 
     // Auth + scope gate: resolve the bearer to (authorized, allowed-servers).
     // OPTIONS is the data-less preflight, always allowed and unscoped. Else the
@@ -18952,15 +18997,17 @@ mod tests {
         // Label mode does not set isError on a success that was only labeled.
         assert!(out.get("isError").is_none() || out["isError"] == false);
 
-        // Block on with contentDefense off must still scan and block (otherwise an org
-        // forceBlockOnInjection alone would be a no-op).
-        let mut reg = Registry {
-            safety_level: None,
-            ..Registry::default()
-        };
+        // A team injection flag at member Off must withhold results without raising the level.
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Off);
         reg.content_defense = false;
-        reg.team_forced_content_defense = false;
-        reg.block_on_injection = true;
+        conduit_lib::teams::apply_team_config(
+            &mut reg,
+            "t1",
+            &json!({"servers": [], "screeningPolicy": {"forceBlockOnInjection": true}}),
+        );
+        assert_eq!(reg.safety_level_effective(), registry::SafetyLevel::Off);
+        assert!(!reg.deny_destructive_effective());
         assert!(reg.content_defense_effective());
         assert!(reg.block_on_injection_effective());
         let result = json!({
@@ -25855,6 +25902,37 @@ mod tests {
     }
 
     #[test]
+    fn public_probe_paths_are_exactly_healthz() {
+        assert!(path_is_public_probe("/healthz"));
+        assert!(!path_is_public_probe("/"));
+        assert!(!path_is_public_probe("/openapi.json"));
+        assert!(!path_is_public_probe("/mcp"));
+        assert!(!path_is_public_probe("/healthz/"));
+    }
+
+    #[test]
+    fn healthz_reports_registry_readiness_and_carries_no_data() {
+        let state = http_state(true);
+        let ok = healthz_out(&state, "GET");
+        assert_eq!(ok.status, 200);
+        assert!(
+            ok.body.is_empty(),
+            "readiness must not leak data: {:?}",
+            ok.body
+        );
+
+        // A failed boot load (the host-owned bind mount where uid 10001 cannot
+        // create the registry lock) must read as not ready, not as healthy.
+        state.registry_trusted.store(false, Ordering::SeqCst);
+        let degraded = healthz_out(&state, "GET");
+        assert_eq!(degraded.status, 503);
+        assert!(degraded.body.is_empty());
+
+        let wrong_method = healthz_out(&state, "POST");
+        assert_eq!(wrong_method.status, 405);
+    }
+
+    #[test]
     fn initialize_echoes_protocol_and_advertises_tools() {
         let host = dispatch_host(false);
         let reg = Registry::default();
@@ -29786,6 +29864,50 @@ mod tests {
             &set_of(&["srv__already_blocked", "srv__new_drift"]),
             "a post-write read error must preserve live blocks and enforce the new candidate"
         );
+    }
+
+    #[test]
+    fn team_quarantine_at_member_off_enforces_drift_and_survives_watcher_reconciliation() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("toolport-team-quarantine-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        let profile = Some("team-quarantine-off");
+        let baseline = readonly_router("srv", "Read a record.");
+        integrity::check_staged(profile, &baseline.aggregated_tools()).unwrap();
+        integrity::ensure_quarantine_store_for_existing_pins(profile);
+        let mut reg = Registry::default();
+        reg.set_safety_level(registry::SafetyLevel::Off);
+        conduit_lib::teams::apply_team_config(
+            &mut reg,
+            "t1",
+            &json!({"servers": [], "screeningPolicy": {"forceQuarantineOnDrift": true}}),
+        );
+        assert_eq!(reg.safety_level_effective(), registry::SafetyLevel::Off);
+        assert!(!reg.deny_destructive_effective());
+        let registry = Arc::new(Mutex::new(reg));
+        let mut drifted = readonly_router("srv", "Read a record. Summary text updated.");
+        let tools = drifted.aggregated_tools();
+        let published = requarantine_if_needed(&registry, &mut drifted, tools, profile);
+        assert!(!published.iter().any(|tool| tool["name"] == "srv__read"));
+        assert!(drifted.quarantined().contains("srv__read"));
+        let read_failed = AtomicBool::new(false);
+        assert!(effective_quarantine(&registry, profile, &read_failed)
+            .unwrap()
+            .contains("srv__read"));
+        // Store failures must keep enforced quarantine at Off rather than silently release it.
+        std::fs::write(
+            dir.join(format!(
+                "quarantine-v2-{}.json",
+                registry::profile_store_key("team-quarantine-off")
+            )),
+            b"corrupt",
+        )
+        .unwrap();
+        assert!(effective_quarantine(&registry, profile, &read_failed).is_none());
+        assert!(maybe_check_integrity(&registry, &baseline.aggregated_tools(), profile).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// SEC-01: the startup background build must run the integrity gate BEFORE it

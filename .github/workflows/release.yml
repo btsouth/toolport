@@ -29,6 +29,23 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # INST-06: fail before any build when the tag does not match the version baked
+  # into every artifact. Without this, one forgotten bump ships a release whose
+  # filename and updater version say vX.Y.Z while the binaries still carry the
+  # previous version, producing a false or repeated update.
+  version-check:
+    # Backstop only - GitHub defaults to 360 minutes. Reads a handful of files.
+    timeout-minutes: 5
+    name: check tag against embedded versions
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check the tag matches every version source
+        run: node scripts/check-release-version.mjs "$GITHUB_REF_NAME"
+
   linux-packages:
     uses: ./.github/workflows/linux-packages.yml
 
@@ -53,6 +70,7 @@ jobs:
           fail_on_unmatched_files: true
 
   build:
+    needs: version-check
     # Backstop only - GitHub defaults to 360 minutes. Deliberately generous: bundles Tauri on four targets and waits on Apple notarisation.
     # A tight limit here would kill a legitimate release, which costs more than a hang.
     timeout-minutes: 90

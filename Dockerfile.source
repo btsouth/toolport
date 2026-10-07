@@ -31,9 +31,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /data
 COPY --from=build /src/src-tauri/target/release/toolport-gateway /usr/local/bin/toolport-gateway
-RUN useradd --system --uid 10001 --home-dir /data toolport \
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 755 /usr/local/bin/toolport-gateway /usr/local/bin/docker-entrypoint.sh \
+    && useradd --system --uid 10001 --home-dir /data toolport \
     && chown toolport:toolport /data
 
+# The runtime user is fixed at uid 10001; a host-owned bind mount must be owned
+# by that uid (the entrypoint says so) or the registry cannot load. See
+# Dockerfile and docker-compose.example.yml.
 USER toolport
 # HTTP mode comes from the `--http` flag on the ENTRYPOINT below, not from the
 # environment: the gateway ignores TOOLPORT_HTTP/CONDUIT_HTTP when its stdin is a
@@ -44,4 +49,8 @@ ENV CONDUIT_REGISTRY=/data/registry.json
 EXPOSE 8765
 VOLUME ["/data"]
 
-ENTRYPOINT ["toolport-gateway", "--http", "8765"]
+# Readiness, not liveness: 200 only once the registry loaded (INST-02).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS -o /dev/null http://127.0.0.1:8765/healthz || exit 1
+
+ENTRYPOINT ["docker-entrypoint.sh", "toolport-gateway", "--http", "8765"]

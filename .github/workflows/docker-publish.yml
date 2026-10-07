@@ -118,7 +118,12 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            # INST-08: `latest` tracks a published release, never main. A push to
+            # the default branch publishes `edge` (unreleased tip), and only a tag
+            # push can set `latest`. The publish job's `if` above already drops
+            # prerelease tags, so `latest` is a plain vX.Y.Z release only.
+            type=raw,value=edge,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
             type=ref,event=tag
             type=sha,format=short
 

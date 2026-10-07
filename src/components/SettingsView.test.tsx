@@ -303,6 +303,101 @@ it("selects and persists one safety level", async () => {
   ).not.toBeInTheDocument();
 });
 
+it.each([
+  ["ask", "off"],
+  ["strict", "off"],
+  ["strict", "ask"],
+] as const)("shows the %s team floor and rejects selecting %s", async (floor, below) => {
+  const user = userEvent.setup();
+  vi.mocked(setSafetyLevel).mockReset();
+  render(
+    <ThemeProvider>
+      <SettingsView
+        registry={{ ...registry, safetyLevel: "off", teamMinSafetyLevel: floor }}
+        onRegistryChange={vi.fn()}
+      />
+    </ThemeProvider>,
+  );
+  const control = screen.getByRole("combobox", { name: "Safety" });
+  expect(control).toHaveValue(floor);
+  expect(
+    screen.getByRole("option", { name: below === "off" ? "Off" : "Ask" }),
+  ).toBeDisabled();
+  await user.selectOptions(control, below);
+  expect(control).toHaveValue(floor);
+  expect(setSafetyLevel).not.toHaveBeenCalled();
+  expect(
+    screen.getByText(
+      `Team minimum safety level: ${floor === "ask" ? "Ask" : "Strict"}. Choices below this floor are unavailable.`,
+    ),
+  ).toBeInTheDocument();
+});
+
+it("uses legacy approval as an Ask floor without hiding the Strict choice", () => {
+  render(
+    <ThemeProvider>
+      <SettingsView
+        registry={{
+          ...registry,
+          safetyLevel: "off",
+          teamMinSafetyLevel: "off",
+          teamForcedHumanApproval: true,
+        }}
+        onRegistryChange={vi.fn()}
+      />
+    </ThemeProvider>,
+  );
+  expect(screen.getByRole("combobox", { name: "Safety" })).toHaveValue("ask");
+  expect(screen.getByRole("option", { name: "Off" })).toBeDisabled();
+  expect(screen.getByRole("option", { name: "Strict" })).not.toBeDisabled();
+});
+
+it("independent team flags leave Off selected and all levels available", () => {
+  render(
+    <ThemeProvider>
+      <SettingsView
+        registry={{
+          ...registry,
+          safetyLevel: "off",
+          teamForcedDenyDestructive: true,
+          teamForcedQuarantineOnDrift: true,
+          teamForcedBlockOnInjection: true,
+        }}
+        onRegistryChange={vi.fn()}
+      />
+    </ThemeProvider>,
+  );
+  expect(screen.getByRole("combobox", { name: "Safety" })).toHaveValue("off");
+  expect(screen.getByRole("option", { name: "Off" })).not.toBeDisabled();
+  expect(
+    screen.getByText(/Team also enforces: quarantine on drift, block on injection/),
+  ).toBeInTheDocument();
+  expect(screen.queryByText(/Team minimum safety level/)).not.toBeInTheDocument();
+});
+
+it("keeps a stronger member choice when the team lowers its floor", () => {
+  const change = vi.fn();
+  const { rerender } = render(
+    <ThemeProvider>
+      <SettingsView
+        registry={{ ...registry, safetyLevel: "strict", teamMinSafetyLevel: "ask" }}
+        onRegistryChange={change}
+      />
+    </ThemeProvider>,
+  );
+  expect(screen.getByRole("combobox", { name: "Safety" })).toHaveValue("strict");
+  rerender(
+    <ThemeProvider>
+      <SettingsView
+        registry={{ ...registry, safetyLevel: "strict", teamMinSafetyLevel: "off" }}
+        onRegistryChange={change}
+      />
+    </ThemeProvider>,
+  );
+  expect(screen.getByRole("combobox", { name: "Safety" })).toHaveValue("strict");
+  expect(screen.getByRole("option", { name: "Off" })).not.toBeDisabled();
+});
+
 it("keeps Code Mode off by default under Advanced and persists opt-in", async () => {
   const user = userEvent.setup();
   const onRegistryChange = vi.fn();

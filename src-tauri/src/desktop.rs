@@ -1140,6 +1140,7 @@ fn set_safety_level(
     level: registry::SafetyLevel,
 ) -> Result<Registry, String> {
     let (reg, _) = write_registry(state.inner(), |reg| {
+        reg.validate_safety_level(level)?;
         reg.set_safety_level(level);
         Ok(())
     })?;
@@ -2167,8 +2168,8 @@ fn popular_catalog() -> Vec<catalog::CatalogEntry> {
     catalog::popular()
 }
 
-/// Curated stacks: role-based bundles of catalog servers (each resolved to full
-/// entries with credential hints) for the guided one-flow setup.
+/// Curated Collections: groups of catalog servers (each resolved to full entries
+/// with credential hints) for the guided one-flow setup.
 #[tauri::command]
 fn list_stacks() -> Vec<stacks::Stack> {
     stacks::stacks()

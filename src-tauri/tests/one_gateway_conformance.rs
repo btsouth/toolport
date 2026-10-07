@@ -784,9 +784,80 @@ fn compat_for(dir: &Path) -> CompatKey {
     CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string())
 }
 
-/// Live daemon processes for this build. Counting a delta around a case makes
-/// the number immune to daemons leaked by other runs on the same machine.
-fn daemon_process_count() -> usize {
+/// Live daemons started for `dir`. The daemon inherits `TOOLPORT_DATA_DIR` from
+/// the adapter that spawned it, so scoping the count to that value keeps a
+/// concurrent suite in another worktree, or a leaked daemon from an earlier
+/// binary, from shifting a case's delta assertion.
+#[cfg(target_os = "linux")]
+fn daemon_process_count(dir: &Path) -> usize {
+    fixture_daemon_rows(dir).len()
+}
+
+/// Whether `pid` was started with `TOOLPORT_DATA_DIR` set to exactly `dir`. The
+/// daemon is spawned with the adapter's environment, so this is what pins a
+/// process to this case's fixture rather than any other run's.
+#[cfg(target_os = "linux")]
+fn process_data_dir_is(pid: u32, dir: &Path) -> bool {
+    let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
+    let wanted = format!("TOOLPORT_DATA_DIR={}", dir.display());
+    environ
+        .split(|byte| *byte == 0)
+        .any(|entry| entry == wanted.as_bytes())
+}
+
+/// Live `--daemon` processes whose environment names this case's data dir.
+#[cfg(target_os = "linux")]
+fn fixture_daemon_rows(dir: &Path) -> Vec<(u32, String)> {
+    process_rows()
+        .into_iter()
+        .filter(|(pid, command)| {
+            command.contains("toolport-gateway")
+                && command.contains("--daemon")
+                && process_data_dir_is(*pid, dir)
+        })
+        .collect()
+}
+
+/// Daemon process-table lines for `dir`, for the panic message a failed
+/// election writes.
+#[cfg(target_os = "linux")]
+fn daemon_process_report(dir: &Path) -> Vec<String> {
+    fixture_daemon_rows(dir)
+        .into_iter()
+        .map(|(pid, command)| format!("pid={pid} command={command}"))
+        .collect()
+}
+
+/// Platforms without `/proc` cannot scope by environment, so the report stays
+/// machine-wide as it was before.
+#[cfg(not(target_os = "linux"))]
+fn daemon_process_report(_dir: &Path) -> Vec<String> {
+    process_report("--daemon")
+}
+
+/// Pids paired with their command lines, for a `/proc` lookup of the
+/// environment each was started with.
+#[cfg(target_os = "linux")]
+fn process_rows() -> Vec<(u32, String)> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .expect("run ps");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, command) = line.trim_start().split_once(' ')?;
+            Some((pid.parse().ok()?, command.trim_start().to_string()))
+        })
+        .collect()
+}
+
+/// Live daemon processes for this build. Platforms without `/proc` keep the
+/// machine-wide count as it was before; Linux scopes it to `dir`.
+#[cfg(not(target_os = "linux"))]
+fn daemon_process_count(_dir: &Path) -> usize {
     process_command_lines()
         .iter()
         .filter(|line| line.contains("toolport-gateway") && line.contains("--daemon"))
@@ -1034,7 +1105,7 @@ fn matrix_cold_start_twenty_simultaneous_adapters_elect_exactly_one_daemon() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (_fixture, dir) = Fixture::new("cold-start");
-    let before = daemon_process_count();
+    let before = daemon_process_count(&dir);
 
     // Spawn every adapter first, then drive them: the rendezvous race happens
     // at process start, before any of them reads stdin, so this is the
@@ -1074,16 +1145,17 @@ fn matrix_cold_start_twenty_simultaneous_adapters_elect_exactly_one_daemon() {
     // daemon. Deliberately one-shot: a double election under load leaves the
     // loser serving its sessions until its idle grace, so waiting for the
     // count to converge would only mask the defect this row exists to catch.
-    // The panic carries the whole process table so a failure is evidence.
+    // The panic carries this case's daemon processes so a failure is evidence.
     let elected_pid = &descriptor["pid"];
-    let after = daemon_process_count();
+    let after = daemon_process_count(&dir);
     assert_eq!(
         after.saturating_sub(before),
         1,
         "twenty simultaneous adapters must elect exactly one daemon \
-         (elected pid {elected_pid}, {before} before, {after} after); \
-         matching processes:\n{}",
-        process_report("--daemon").join("\n")
+         (elected pid {elected_pid}, {before} before, {after} after, \
+         data dir {}); matching processes:\n{}",
+        dir.display(),
+        daemon_process_report(&dir).join("\n")
     );
 
     // Scoped teardown: the clients drop first (their adapters die), then the

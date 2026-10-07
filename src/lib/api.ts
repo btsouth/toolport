@@ -32,7 +32,7 @@ export function popularCatalog(): Promise<CatalogEntry[]> {
   return invoke<CatalogEntry[]>("popular_catalog");
 }
 
-/** Curated stacks: role-based server bundles for one-flow setup (offline). */
+/** Curated Collections: groups of catalog servers to add in one flow (offline). */
 export function listStacks(): Promise<Stack[]> {
   return invoke<Stack[]>("list_stacks");
 }

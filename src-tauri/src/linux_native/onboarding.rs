@@ -186,9 +186,9 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
 
     let add = wizard_page(
         "Add your first servers",
-        "Choose a starter stack, import servers already configured in a client, or continue to the full catalog.",
+        "Choose a Collection, import servers already configured in a client, or continue to the full catalog.",
     );
-    let stack_feedback = feedback_label("Choose a stack or continue when you are ready.");
+    let stack_feedback = feedback_label("Choose a Collection or continue when you are ready.");
     add.append(&stack_feedback);
     let stack_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
     stack_list.add_css_class("toolport-settings-group");
@@ -216,7 +216,7 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
                 .build(),
         );
         row.append(&copy);
-        let add_stack = gtk::Button::with_label("Add stack");
+        let add_stack = gtk::Button::with_label("Add Collection");
         add_stack.add_css_class("toolport-secondary-action");
         let entries = starter.servers;
         let name = starter.name;
@@ -246,7 +246,7 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
                         );
                     }
                     Ok(Err(error)) => show_error(&feedback, &error),
-                    Err(_) => show_error(&feedback, "the stack setup task stopped unexpectedly"),
+                    Err(_) => show_error(&feedback, "the collection setup task stopped unexpectedly"),
                 }
             });
         });

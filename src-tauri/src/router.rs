@@ -5763,6 +5763,43 @@ mod tests {
     }
 
     #[test]
+    fn team_feature_protections_keep_destructive_tools_exposed_and_callable() {
+        for policy in [
+            serde_json::json!({"forceQuarantineOnDrift": true}),
+            serde_json::json!({"forceBlockOnInjection": true}),
+            serde_json::json!({"minSafetyLevel": "ask"}),
+            serde_json::json!({"minSafetyLevel": "strict"}),
+        ] {
+            let mut reg = crate::registry::Registry::default();
+            reg.set_safety_level(crate::registry::SafetyLevel::Off);
+            crate::teams::apply_team_config(
+                &mut reg,
+                "t1",
+                &serde_json::json!({"servers": [], "screeningPolicy": policy}),
+            );
+            let strict = reg.safety_level_effective() == crate::registry::SafetyLevel::Strict;
+            let mut router = Router::with_policy(ToolPolicy {
+                deny_destructive: reg.deny_destructive_effective(),
+                ..Default::default()
+            });
+            router.add(DownstreamServer::connect("db".into(), Box::new(DestructiveMock)).unwrap());
+            assert_eq!(
+                router
+                    .aggregated_tools()
+                    .iter()
+                    .any(|t| t["name"] == "db__drop_table"),
+                !strict
+            );
+            assert_eq!(
+                router
+                    .route_call("db__drop_table", serde_json::json!({}))
+                    .is_ok(),
+                !strict
+            );
+        }
+    }
+
+    #[test]
     fn deny_destructive_hides_flagged_tools() {
         let policy = ToolPolicy {
             deny_destructive: true,

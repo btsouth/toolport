@@ -14,8 +14,15 @@ services:
     ports:
       - "8765:8765"
     volumes:
-      # Seed once: cp data/registry.json.example data/registry.json
-      - ./data:/data
+      # Recommended: a named volume. Docker seeds it from the image, where /data
+      # is owned by the runtime user (uid 10001), so the gateway can write the
+      # registry and its locks with no host chown.
+      #
+      # A host bind mount also works, but it must be owned by uid 10001 or the
+      # gateway starts without loading the registry:
+      #   mkdir -p data && sudo chown -R 10001:10001 data
+      #   then replace the line below with: - ./data:/data
+      - toolport-data:/data
     env_file:
       - .env
     environment:
@@ -32,9 +39,18 @@ services:
       TOOLPORT_ALLOW_BARE_SECRET_ENV: "1"
     restart: unless-stopped
     healthcheck:
+      # Readiness, not just liveness: 200 once the registry loaded, 503 when the
+      # gateway is serving the cached catalog only. Unauthenticated and data-free.
       test:
-        - CMD-SHELL
-        - 'curl -fsS -H "Authorization: Bearer $$TOOLPORT_HTTP_TOKEN" http://127.0.0.1:8765/'
+        - CMD
+        - curl
+        - -fsS
+        - -o
+        - /dev/null
+        - http://127.0.0.1:8765/healthz
       interval: 30s
       timeout: 5s
       retries: 3
+
+volumes:
+  toolport-data:
