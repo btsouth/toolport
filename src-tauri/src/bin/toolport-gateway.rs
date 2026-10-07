@@ -32238,9 +32238,12 @@ mod tests {
             "legacy_confirm_destructive_requires_human_approval_on_direct_call",
         );
         let host = dispatch_host(false);
-        let mut reg = Registry::default();
-        assert_eq!(reg.safety_level, None);
-        reg.set_confirm_destructive(true);
+        // No explicit level and a legacy confirm flag: the derived level must be Ask.
+        let reg = Registry {
+            safety_level: None,
+            confirm_destructive: true,
+            ..Registry::default()
+        };
         assert_eq!(reg.safety_level_selected(), registry::SafetyLevel::Ask);
         let (router, calls, catalog) = counting_router(true);
         let request = json!({
