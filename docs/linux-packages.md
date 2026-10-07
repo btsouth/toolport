@@ -5,7 +5,8 @@ Fedora, and Arch. Debian and RPM packages share one release build from Ubuntu
 24.04 x86_64, packaged with pinned nFPM and one
 [`nfpm.yaml`](../packaging/linux/native/nfpm.yaml). Runtime dependencies are
 listed for that build's GTK 4.14, libadwaita 1.5, GLib 2.80 and glibc 2.39 floor.
-Arch uses the native PKGBUILD. The Tauri AppImage is still built on Ubuntu 22.04
+Arch offers the native PKGBUILD and AUR `toolport-bin`, which repackages the GTK
+deb with Arch dependencies. The Tauri AppImage is still built on Ubuntu 22.04
 for older distributions and keeps its in-app updater.
 
 The `.deb` keeps the 1.x Tauri package name `toolport`. Its higher 2.0 version
@@ -17,11 +18,14 @@ there are no maintainer scripts that rewrite user data or access a keyring.
 For a `.deb` update, download the new file from the release page and run
 `sudo apt install ./<file>.deb`; for an `.rpm`, run
 `sudo dnf install ./<file>.rpm`. There is no Toolport apt or dnf repository.
-Arch users update from the pacman repository with `sudo pacman -Syu`.
+Arch repository users update with `sudo pacman -Syu`; `toolport-bin` users update
+with their AUR helper or rebuild the AUR package.
 React uses Tauri's bundle type for package guidance. GTK queries dpkg, rpm and
 pacman for ownership of its running executable, so installing a manager on a
 different distro does not select its advice. GTK does not check for new releases;
-Settings links to the release page. Development builds get generic instructions.
+Settings links to the release page. Detection runs off the GTK main thread and
+is cached for the process lifetime; generic instructions appear until it returns.
+Development builds get generic instructions.
 
 ## Build and test
 
@@ -35,8 +39,10 @@ gh release download v1.24.0 -R btsouth/toolport -p '*.deb' -D .verify/native-pac
 scripts/test-linux-packages.sh .verify/native-packages/*.deb .verify/native-packages/*.rpm .verify/native-packages/old/*.deb
 ```
 
-The reusable `linux-packages.yml` job runs these steps on PRs, main and next/2.0
-pushes, and release tags. Release jobs attach only tested packages to a draft.
+The reusable `linux-packages.yml` job runs these steps for relevant Rust, Cargo,
+packaging, package script and workflow changes on PRs and main/next/2.0 pushes.
+The merge gate accepts an intentional skip for unrelated changes. Release tags
+always run the job and attach only tested packages to a draft.
 Container tests install the published v1.24.0 `.deb` on Ubuntu 24.04, seed a
 registry/server, client configuration and opaque credential fixtures, then apt
 upgrade and compare file hashes, modes and owners. Debian 13 and Fedora get
