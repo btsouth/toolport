@@ -4575,7 +4575,7 @@ fn execute_call(
             confirmed = true;
         }
         let gate_reason = (!confirmed)
-            .then(|| approval::gate_reason(true, is_dest, untrusted))
+            .then(|| approval::gate_reason(true, is_dest, untrusted && reg.safety_level_effective() == conduit_lib::registry::SafetyLevel::Strict))
             .flatten()
             .or_else(|| {
                 resuming_modern_hitl
@@ -10928,7 +10928,7 @@ fn maybe_check_integrity(
         let r = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (r.integrity_check, r.quarantine_on_drift_effective())
+        (true, r.quarantine_on_drift_effective())
     };
     if !enabled {
         return Ok(None);

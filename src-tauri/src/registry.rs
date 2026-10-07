@@ -1085,9 +1085,19 @@ pub enum GatewayTopology {
 
 pub const DEFAULT_GATEWAY_TOPOLOGY: GatewayTopology = GatewayTopology::Daemon;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SafetyLevel {
+    Off,
+    Ask,
+    Strict,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Registry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_level: Option<SafetyLevel>,
     /// Schema version. Historically optional; a document with no `version` is a
     /// v1 file, which is what [`legacy_registry_version`] supplies.
     #[serde(default = "legacy_registry_version")]
@@ -1626,6 +1636,7 @@ impl Default for Registry {
             }],
             active_profile_id: Some(DEFAULT_PROFILE_ID.to_string()),
             gateway_topology: None,
+            safety_level: Some(SafetyLevel::Ask),
             deny_destructive: false,
             confirm_destructive: false,
             human_approval: false,
@@ -2322,6 +2333,7 @@ impl Registry {
     /// Set the global destructive-tool deny switch. Mutually exclusive with
     /// `confirm_destructive`: enabling deny clears confirm.
     pub fn set_deny_destructive(&mut self, deny: bool) {
+        self.safety_level = None;
         self.deny_destructive = deny;
         if deny {
             self.confirm_destructive = false;
@@ -2332,6 +2344,7 @@ impl Registry {
     /// `deny_destructive` is forced off (they're mutually exclusive: deny hides
     /// tools entirely, confirm intercepts them with a preview).
     pub fn set_confirm_destructive(&mut self, confirm: bool) {
+        self.safety_level = None;
         self.confirm_destructive = confirm;
         if confirm {
             self.deny_destructive = false;
@@ -2342,6 +2355,7 @@ impl Registry {
     /// hides tools, `confirm` has the agent re-confirm, `human_approval` holds the call
     /// for a person. When it gates a tool it takes precedence over `confirm_destructive`.
     pub fn set_human_approval(&mut self, on: bool) {
+        self.safety_level = None;
         self.human_approval = on;
     }
 
@@ -2349,28 +2363,60 @@ impl Registry {
     /// policy. The gate reads this instead of `human_approval` directly so an org lock stays
     /// releasable (it lives in `team_forced_human_approval`, cleared on leave) rather than
     /// permanently overwriting the member's own choice.
+    pub fn safety_level_selected(&self) -> SafetyLevel {
+        // Legacy blocking flags map to Strict, approval/confirmation to Ask,
+        // and no blocking gates to Off. Labeling and recording never block.
+        self.safety_level.unwrap_or_else(|| {
+            if self.deny_destructive || self.quarantine_on_drift || self.block_on_injection {
+                SafetyLevel::Strict
+            } else if self.human_approval || self.confirm_destructive {
+                SafetyLevel::Ask
+            } else {
+                SafetyLevel::Off
+            }
+        })
+    }
+
+    pub fn safety_level_effective(&self) -> SafetyLevel {
+        let team = if self.team_forced_deny_destructive
+            || self.team_forced_quarantine_on_drift
+            || self.team_forced_block_on_injection
+        {
+            SafetyLevel::Strict
+        } else if self.team_forced_human_approval {
+            SafetyLevel::Ask
+        } else {
+            SafetyLevel::Off
+        };
+        self.safety_level_selected().max(team)
+    }
+
+    pub fn set_safety_level(&mut self, level: SafetyLevel) {
+        self.safety_level = Some(level);
+    }
+
     pub fn human_approval_effective(&self) -> bool {
-        self.human_approval || self.team_forced_human_approval
+        self.safety_level_effective() >= SafetyLevel::Ask
     }
 
     /// Effective (member's own OR team-forced) values for the other tighten-only safety flags,
     /// so an org lock is releasable on leave instead of permanently overwriting the member's own.
     pub fn deny_destructive_effective(&self) -> bool {
-        self.deny_destructive || self.team_forced_deny_destructive
+        self.safety_level_effective() == SafetyLevel::Strict
     }
     pub fn content_defense_effective(&self) -> bool {
-        self.content_defense || self.team_forced_content_defense
+        true
     }
     /// Member's own OR team-forced PII pseudonymization (SBS-346).
     pub fn pii_redaction_effective(&self) -> bool {
         self.pii_redaction || self.team_forced_pii_redaction
     }
     pub fn quarantine_on_drift_effective(&self) -> bool {
-        self.quarantine_on_drift || self.team_forced_quarantine_on_drift
+        self.safety_level_effective() == SafetyLevel::Strict
     }
     /// Member's own OR team-forced fail-closed injection block (SOU-345).
     pub fn block_on_injection_effective(&self) -> bool {
-        self.block_on_injection || self.team_forced_block_on_injection
+        self.safety_level_effective() == SafetyLevel::Strict
     }
     /// Whether this server should fail closed on a high-confidence injection hit:
     /// block mode effective, and the server is not on the exempt list.
@@ -7764,5 +7810,68 @@ mod registry_version_tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod safety_level_tests {
+    use super::*;
+
+    #[test]
+    fn levels_and_team_policy_only_tighten() {
+        for level in [SafetyLevel::Off, SafetyLevel::Ask, SafetyLevel::Strict] {
+            let mut registry = Registry::default();
+            registry.set_safety_level(level);
+            assert_eq!(
+                registry.human_approval_effective(),
+                level >= SafetyLevel::Ask
+            );
+            assert_eq!(
+                registry.deny_destructive_effective(),
+                level == SafetyLevel::Strict
+            );
+            assert_eq!(
+                registry.quarantine_on_drift_effective(),
+                level == SafetyLevel::Strict
+            );
+            assert_eq!(
+                registry.block_on_injection_effective(),
+                level == SafetyLevel::Strict
+            );
+            assert!(registry.content_defense_effective());
+            registry.team_forced_human_approval = true;
+            assert_eq!(
+                registry.safety_level_effective(),
+                level.max(SafetyLevel::Ask)
+            );
+            registry.team_forced_block_on_injection = true;
+            assert_eq!(registry.safety_level_effective(), SafetyLevel::Strict);
+            registry.team_forced_human_approval = false;
+            registry.team_forced_block_on_injection = false;
+            assert_eq!(registry.safety_level_effective(), level);
+        }
+    }
+
+    #[test]
+    fn legacy_fields_derive_nearest_level_and_new_registry_asks() {
+        assert_eq!(
+            Registry::default().safety_level_effective(),
+            SafetyLevel::Ask
+        );
+        for (field, level) in [
+            ("denyDestructive", SafetyLevel::Strict),
+            ("quarantineOnDrift", SafetyLevel::Strict),
+            ("blockOnInjection", SafetyLevel::Strict),
+            ("humanApproval", SafetyLevel::Ask),
+            ("confirmDestructive", SafetyLevel::Ask),
+        ] {
+            let mut value = serde_json::json!({"servers": [], "profiles": []});
+            value[field] = serde_json::json!(true);
+            let registry: Registry = serde_json::from_value(value).unwrap();
+            assert_eq!(registry.safety_level_effective(), level);
+        }
+        let registry: Registry =
+            serde_json::from_value(serde_json::json!({"servers": [], "profiles": []})).unwrap();
+        assert_eq!(registry.safety_level_effective(), SafetyLevel::Off);
     }
 }

@@ -18,7 +18,6 @@ import {
   Power,
   RefreshCw,
   ShieldAlert,
-  ShieldCheck,
   ShieldX,
   Sun,
   Trash2,
@@ -48,16 +47,12 @@ import {
   removeHttpClient,
   setAllowAgentControl,
   setAllowRoutineWrites,
-  setConfirmDestructive,
-  setDenyDestructive,
   setCodeMode,
-  setHumanApproval,
+  setSafetyLevel,
   setLazyDiscovery,
   setFolderProfiles,
   setLiveInspect,
-  setBlockOnInjection,
   setPiiRedaction,
-  setQuarantineOnDrift,
   setToolPinned,
   startHttpBridge,
   stopHttpBridge,
@@ -565,67 +560,6 @@ const REGISTRY_FIELD_BY_SETTING = {
   "live-inspect": "liveInspect",
 } as const satisfies Record<RegistrySettingKey, keyof Registry>;
 
-/** A one-line security posture readout at the top of the Security section, so the user can
- * tell at a glance whether they're protected instead of mentally AND-ing every toggle. */
-function PostureSummary({
-  denyDestructive,
-  confirmDestructive,
-  humanApproval,
-  quarantineOnDrift,
-  blockOnInjection,
-}: {
-  denyDestructive: boolean;
-  confirmDestructive: boolean;
-  humanApproval: boolean;
-  quarantineOnDrift: boolean;
-  blockOnInjection: boolean;
-}) {
-  const active = [
-    humanApproval && "human approval on",
-    denyDestructive && "destructive tools denied",
-    confirmDestructive && "destructive calls ask first",
-    quarantineOnDrift && "changed tools paused",
-    blockOnInjection && "injection-like output blocked",
-  ].filter(Boolean) as string[];
-  // A hard gate (block or human-approval) = guarded; softer measures alone = partial.
-  const gated = humanApproval || denyDestructive || blockOnInjection;
-  const state = gated ? "guarded" : active.length > 0 ? "partial" : "open";
-  const meta = {
-    guarded: {
-      Icon: ShieldCheck,
-      ring: "border-success/30 bg-success/5",
-      tint: "text-success",
-      label: "Guardrails active",
-    },
-    partial: {
-      Icon: ShieldAlert,
-      ring: "border-warning/35 bg-warning/5",
-      tint: "text-warning",
-      label: "Some guardrails active",
-    },
-    open: {
-      Icon: ShieldAlert,
-      ring: "border-warning/35 bg-warning/5",
-      tint: "text-warning",
-      label: "Approval gates are off",
-    },
-  }[state];
-  const { Icon } = meta;
-  return (
-    <div className={`flex items-start gap-3 rounded-lg border p-3 ${meta.ring}`}>
-      <Icon className={`mt-0.5 size-4 shrink-0 ${meta.tint}`} />
-      <p className="text-sm">
-        <span className={`font-medium ${meta.tint}`}>{meta.label}.</span>{" "}
-        <span className="text-muted-foreground">
-          {state === "open"
-            ? "Tool calls run without a Toolport approval or blocking gate."
-            : `Active: ${active.join(", ")}.`}
-        </span>
-      </p>
-    </div>
-  );
-}
-
 /** Tool-granular scope for one profile (SOU-189): per enabled server, expand to pick exactly
  * which tools the profile exposes. All-checked = the whole server (no narrowing); unchecking
  * writes an allow-list that tools/list, search, and the call guard all honor. Tools load
@@ -810,12 +744,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   // during a partial load, match the registry serde default.
   const codeMode = registry?.codeMode ?? true;
   const allowRoutineWrites = registry?.allowRoutineWrites ?? false;
-  const denyDestructive = registry?.denyDestructive ?? false;
-  const confirmDestructive = registry?.confirmDestructive ?? false;
-  const humanApproval = registry?.humanApproval ?? false;
   const allowAgentControl = registry?.allowAgentControl ?? false;
-  const quarantineOnDrift = registry?.quarantineOnDrift ?? false;
-  const blockOnInjection = registry?.blockOnInjection ?? false;
   const piiRedaction = registry?.piiRedaction ?? false;
   const liveInspect = registry?.liveInspect ?? false;
   const [busySettings, setBusySettings] = useState<ReadonlySet<SettingKey>>(
@@ -1303,58 +1232,23 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
           Security
         </h2>
-        <PostureSummary
-          denyDestructive={denyDestructive}
-          confirmDestructive={confirmDestructive}
-          humanApproval={humanApproval}
-          quarantineOnDrift={quarantineOnDrift}
-          blockOnInjection={blockOnInjection}
-        />
-        {toggle(
-          ShieldAlert,
-          denyDestructive,
-          "text-warning",
-          "Block destructive tools",
-          "Hide any tool the server marks as able to delete or change data, from every client",
-          apply("deny-destructive", setDenyDestructive),
-          "deny-destructive",
-        )}
-        {toggle(
-          ShieldCheck,
-          confirmDestructive,
-          "text-info",
-          "Confirm destructive tools",
-          "Hold each destructive call for the agent to confirm before it runs",
-          apply("confirm-destructive", setConfirmDestructive),
-          "confirm-destructive",
-        )}
-        {toggle(
-          UserCheck,
-          humanApproval,
-          "text-info",
-          "Require human approval",
-          "Hold destructive or untrusted-server calls until you approve them in the app",
-          apply("human-approval", setHumanApproval),
-          "human-approval",
-        )}
-        {toggle(
-          ShieldX,
-          quarantineOnDrift,
-          "text-destructive",
-          "Quarantine changed high-risk tools",
-          "Block a destructive or poisoned tool that changes from its approved version, until you re-approve it",
-          apply("quarantine-on-drift", setQuarantineOnDrift),
-          "quarantine-on-drift",
-        )}
-        {toggle(
-          ShieldAlert,
-          blockOnInjection,
-          "text-destructive",
-          "Block high-confidence injection",
-          "Fail a tool call when content defense finds a high-confidence prompt-injection hit, instead of only labeling the text. Off by default; medium-confidence hits still label only",
-          apply("block-on-injection", setBlockOnInjection),
-          "block-on-injection",
-        )}
+        <label className="flex items-center gap-3 text-sm">
+          Safety
+          <select aria-label="Safety" value={registry?.safetyLevel ?? (registry?.denyDestructive || registry?.quarantineOnDrift || registry?.blockOnInjection ? "strict" : registry?.humanApproval || registry?.confirmDestructive ? "ask" : "off")}
+            onChange={async (event) => {
+              try {
+                const updated = await setSafetyLevel(event.target.value as "off" | "ask" | "strict");
+                const reconciled = { ...latestRegistry.current!, safetyLevel: updated.safetyLevel };
+                latestRegistry.current = reconciled;
+                onRegistryChange(reconciled);
+              } catch (error) { toastError(`Couldn't update safety: ${error}`); }
+            }}>
+            <option value="off">Off</option><option value="ask">Ask</option><option value="strict">Strict</option>
+          </select>
+        </label>
+        <p className="text-xs text-muted-foreground">Off runs without approval or blocking. Ask holds destructive calls for human approval. Strict hides destructive tools, quarantines risky drift, blocks high-confidence injection and asks before untrusted calls. Labeling and integrity recording stay on.</p>
+        {(registry?.teamForcedHumanApproval || registry?.teamForcedDenyDestructive || registry?.teamForcedQuarantineOnDrift || registry?.teamForcedBlockOnInjection) && <p className="text-xs">Team policy raises the effective safety level.</p>}
+        <details><summary>Advanced</summary>
         {toggle(
           EyeOff,
           piiRedaction,
@@ -1458,6 +1352,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             </ul>
           </div>
         )}
+        </details>
       </section>
       <section className="flex flex-col gap-2">
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">

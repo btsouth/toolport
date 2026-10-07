@@ -512,6 +512,11 @@ export interface Registry {
   /** Tools pinned as lazy-discovery prerequisites, keyed by server id -> original tool names. */
   pinnedTools?: Record<string, string[]>;
   /** Global switch: hide and block every destructive-hinted tool. */
+  safetyLevel?: "off" | "ask" | "strict";
+  teamForcedHumanApproval?: boolean;
+  teamForcedDenyDestructive?: boolean;
+  teamForcedQuarantineOnDrift?: boolean;
+  teamForcedBlockOnInjection?: boolean;
   denyDestructive?: boolean;
   /** Per-call confirmation: intercept destructive tools with a preview + token. */
   confirmDestructive?: boolean;

@@ -183,6 +183,7 @@ pub struct PinnedPrerequisite {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EssentialSettings {
+    pub safety_level: registry::SafetyLevel,
     pub lazy_discovery: bool,
     pub code_mode: bool,
     pub allow_routine_writes: bool,
@@ -224,6 +225,7 @@ pub struct AddedHttpClient {
 impl EssentialSettings {
     fn from_registry(registry: &Registry) -> Self {
         Self {
+            safety_level: registry.safety_level_selected(),
             lazy_discovery: registry.lazy_discovery,
             code_mode: registry.code_mode,
             allow_routine_writes: registry.allow_routine_writes,
@@ -1579,7 +1581,11 @@ pub fn set_client_credentials(
     scope: Option<&str>,
 ) -> Result<Registry, String> {
     let _mutation = acquire_auth_lock(server_id)?;
-    if crate::local_auth::owner(server_id)? != server_id { return Err("Edit the personal original to change the shared local sign-in configuration.".into()); }
+    if crate::local_auth::owner(server_id)? != server_id {
+        return Err(
+            "Edit the personal original to change the shared local sign-in configuration.".into(),
+        );
+    }
     let client_id = client_id.trim().to_string();
     if client_id.is_empty() {
         return Err("a client id is required for client-credentials auth".into());
@@ -1637,7 +1643,11 @@ pub fn set_client_credentials(
 
 pub fn clear_client_credentials(server_id: &str) -> Result<Registry, String> {
     let _mutation = acquire_auth_lock(server_id)?;
-    if crate::local_auth::owner(server_id)? != server_id { return Err("Edit the personal original to change the shared local sign-in configuration.".into()); }
+    if crate::local_auth::owner(server_id)? != server_id {
+        return Err(
+            "Edit the personal original to change the shared local sign-in configuration.".into(),
+        );
+    }
     crate::remote::reset_client_credentials(server_id)?;
     let (registry, ()) = registry::update(|registry| {
         let Some(server) = registry
@@ -1933,7 +1943,9 @@ pub fn apply_server_enabled(
     enabled: bool,
     reviewed: bool,
 ) -> Result<(), String> {
-    if reviewed { crate::local_auth::detach_changed(registry, server_id)?; }
+    if reviewed {
+        crate::local_auth::detach_changed(registry, server_id)?;
+    }
     if enabled {
         if let Some(server) = registry
             .servers
@@ -3138,4 +3150,13 @@ DOCS_TOKEN = "tok"
         assert!(read_registry_exact().unwrap().servers.is_empty());
         assert!(!fixture.move_record("claude-code").exists());
     }
+}
+
+/// Update the member's safety choice without changing releasable team policy.
+pub fn set_safety_level(level: registry::SafetyLevel) -> Result<Registry, String> {
+    let (registry, _) = registry::update(|registry| {
+        registry.set_safety_level(level);
+        Ok(())
+    })?;
+    Ok(registry)
 }
