@@ -5869,7 +5869,7 @@ mod tests {
 
     #[test]
     fn load_and_save_resolved_honor_registry_override() {
-        let _guard = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _guard = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Resolves the data dir indirectly through save/load/update, so it owes
         // the same lock every other resolver takes. Without it this ran beside a
         // test holding a DataDirOverride and each saw the other's path.
@@ -5908,7 +5908,7 @@ mod tests {
 
     #[test]
     fn update_saves_to_the_same_resolved_path_it_locked() {
-        let _guard = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _guard = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Resolves the data dir indirectly through save/load/update, so it owes
         // the same lock every other resolver takes. Without it this ran beside a
         // test holding a DataDirOverride and each saw the other's path.
@@ -6277,6 +6277,8 @@ mod tests {
 
     #[test]
     fn recovery_waits_for_the_registry_lock_before_rewriting_primary() {
+        let _data = data_dir_test_lock();
+        let (_notice_dir, _notice_override) = scratch_data_dir("reg-lock-notice");
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -6638,6 +6640,8 @@ mod tests {
 
     #[test]
     fn corrupt_primary_is_quarantined_before_selfheal() {
+        let _data = data_dir_test_lock();
+        let (_notice_dir, _notice_override) = scratch_data_dir("reg-quarantine-notice");
         let dir = std::env::temp_dir();
         let path = dir.join(format!("conduit-reg-quar-{}.json", std::process::id()));
         let bak = backup_path(&path);
@@ -6691,12 +6695,36 @@ mod tests {
         }
     }
 
+    /// A scratch data directory with the process-global [`DataDirOverride`] installed.
+    ///
+    /// A `load_from` that recovers from a backup writes `registry-recovery.json`
+    /// through [`conduit_dir`], not next to the registry file. A test that triggers
+    /// that recovery must hold [`data_dir_test_lock`] first, or its atomic-write temp
+    /// can land in a concurrent test's override directory and look like a partial
+    /// file left behind. Returns the directory and the override guard; the caller
+    /// must have already taken [`data_dir_test_lock`].
+    fn scratch_data_dir(label: &str) -> (PathBuf, DataDirOverride) {
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let guard = DataDirOverride::set(&dir);
+        (dir, guard)
+    }
+
     /// SBS-900: `load_from` answers `Ok` to three different questions, and the
     /// gateway reads a security decision out of an EMPTY field (an empty
     /// `http_clients` is what lets `--insecure-loopback` serve an open listener).
     /// The source has to say which `Ok` this was.
     #[test]
     fn load_source_separates_a_real_read_from_a_recovery() {
+        let _data = data_dir_test_lock();
+        let (_notice_dir, _notice_override) = scratch_data_dir("reg-source-notice");
         let path =
             std::env::temp_dir().join(format!("conduit-reg-source-{}.json", std::process::id()));
         clear_registry_files(&path);
@@ -6958,6 +6986,8 @@ mod tests {
 
     #[test]
     fn save_keeps_backup_and_load_recovers_from_it() {
+        let _data = data_dir_test_lock();
+        let (_notice_dir, _notice_override) = scratch_data_dir("reg-bak-notice");
         let dir = std::env::temp_dir();
         let path = dir.join(format!("conduit-reg-bak-{}.json", std::process::id()));
         let bak = backup_path(&path);
@@ -7035,6 +7065,8 @@ mod tests {
 
     #[test]
     fn recovery_uses_the_journal_when_bak_is_gone() {
+        let _data = data_dir_test_lock();
+        let (_notice_dir, _notice_override) = scratch_data_dir("reg-journal-notice");
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
             "conduit-reg-recover-journal-{}.json",
@@ -7076,6 +7108,8 @@ mod tests {
 
     #[test]
     fn recovery_prefers_a_fresher_journal_over_a_stale_parseable_bak() {
+        let _data = data_dir_test_lock();
+        let (_notice_dir, _notice_override) = scratch_data_dir("reg-fresh-notice");
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
             "conduit-reg-recover-freshest-{}.json",
@@ -7119,6 +7153,8 @@ mod tests {
 
     #[test]
     fn recovery_uses_backup_sequence_when_mtimes_tie() {
+        let _data = data_dir_test_lock();
+        let (_notice_dir, _notice_override) = scratch_data_dir("reg-sequence-notice");
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
             "conduit-reg-recover-sequence-{}.json",
@@ -7590,7 +7626,7 @@ mod registry_version_tests {
 
     #[test]
     fn missing_version_loads_as_v1() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _env = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("missing-version");
         let _override = DataDirOverride::set(&dir);
@@ -7608,7 +7644,7 @@ mod registry_version_tests {
 
     #[test]
     fn current_version_loads_unchanged() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _env = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("current-version");
         let _override = DataDirOverride::set(&dir);
@@ -7633,7 +7669,7 @@ mod registry_version_tests {
 
     #[test]
     fn future_version_is_refused_and_the_file_is_untouched() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _env = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("future-version");
         let _override = DataDirOverride::set(&dir);
@@ -7672,7 +7708,7 @@ mod registry_version_tests {
 
     #[test]
     fn save_over_a_newer_on_disk_version_is_refused() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _env = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("save-over-newer");
         let _override = DataDirOverride::set(&dir);
@@ -7699,7 +7735,7 @@ mod registry_version_tests {
 
     #[test]
     fn test_only_migration_runs_writes_a_backup_and_saves_the_new_version() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _env = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("test-migration");
         let _override = DataDirOverride::set(&dir);
@@ -7739,7 +7775,7 @@ mod registry_version_tests {
 
     #[test]
     fn failing_migration_leaves_the_original_and_no_partial_file() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _env = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("failing-migration");
         let _override = DataDirOverride::set(&dir);
@@ -7800,7 +7836,7 @@ mod registry_version_tests {
 
     #[test]
     fn historical_registry_shapes_still_load() {
-        let _env = REGISTRY_ENV_LOCK.lock().unwrap();
+        let _env = REGISTRY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _data = data_dir_test_lock();
         let dir = scratch_dir("historical-shapes");
         let _override = DataDirOverride::set(&dir);
