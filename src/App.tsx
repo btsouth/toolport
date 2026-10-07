@@ -1102,7 +1102,7 @@ function App() {
         open={confirmDisableAll}
         onOpenChange={setConfirmDisableAll}
         title="Disable all servers?"
-        description={`This turns off all ${servers.length} servers for this profile. Clients will lose their tools until you re-enable them.`}
+        description={`This turns off all ${servers.length} servers for every client. Clients will lose their tools until you re-enable them.`}
         confirmLabel="Disable all"
         destructive
         onConfirm={handleToggleAll}
@@ -1233,7 +1233,7 @@ export function serverPostureCopy({
         : `Last known: ${connected} reachable. Status may be out of date.`
       : "The last health check did not complete."
     : enabled === 0
-      ? `${disabled} server${disabled === 1 ? "" : "s"} disabled in this profile.`
+      ? `${disabled} server${disabled === 1 ? "" : "s"} turned off.`
       : probing
         ? `${checked} of ${enabled} checked so far.`
         : checked < enabled
@@ -1241,8 +1241,8 @@ export function serverPostureCopy({
           : attention > 0
             ? `${attention} need${attention === 1 ? "s" : ""} a quick check.`
             : disabled > 0
-              ? `${disabled} disabled in this profile.`
-              : "Everything enabled in this profile is ready.";
+              ? `${disabled} turned off.`
+              : "Every enabled server is ready.";
   return { healthy, title, detail };
 }
 
