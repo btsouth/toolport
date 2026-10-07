@@ -33846,8 +33846,26 @@ mod tests {
         );
         assert_eq!(
             effective_quarantine(&registry, profile, &AtomicBool::new(false)),
-            Some(set_of(&["srv__read"]))
+            None,
+            "a corrupt pin root keeps the watcher behind the integrity gate"
         );
+        assert_eq!(
+            integrity::mandatory_quarantined(profile).unwrap(),
+            set_of(&["srv__read"])
+        );
+        let built = build_router(
+            &registry.lock().unwrap(),
+            profile,
+            false,
+            false,
+            &Arc::new(AtomicU8::new(0)),
+            Arc::new(|_| None),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(built.quarantined().contains("srv__read"));
         assert!(integrity::read_recent(20)
             .unwrap()
             .iter()
@@ -33921,7 +33939,18 @@ mod tests {
             vec![json!({"name": "srv__read", "description": "Read records.", "inputSchema": {}})];
         let registry = Arc::new(Mutex::new(Registry::default()));
         assert!(maybe_check_integrity(&registry, &tools, profile).is_err());
-        let mut built = Router::new();
+        let mut built = build_router(
+            &registry.lock().unwrap(),
+            profile,
+            false,
+            false,
+            &Arc::new(AtomicU8::new(0)),
+            Arc::new(|_| None),
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(requarantine_if_needed(&registry, &mut built, tools.clone(), profile).is_empty());
         assert!(built.catalog_fail_closed());
         assert_eq!(
@@ -33937,7 +33966,18 @@ mod tests {
             maybe_check_integrity(&registry, &tools, profile).unwrap(),
             None
         );
-        let mut built = Router::new();
+        let mut built = build_router(
+            &registry.lock().unwrap(),
+            profile,
+            false,
+            false,
+            &Arc::new(AtomicU8::new(0)),
+            Arc::new(|_| None),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             requarantine_if_needed(&registry, &mut built, tools.clone(), profile),
             tools
