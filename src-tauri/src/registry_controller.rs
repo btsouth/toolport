@@ -2018,12 +2018,17 @@ mod tests {
     }
 
     #[test]
-    fn access_review_renderer_add_starts_disabled_and_names_are_reserved() {
+    fn access_review_renderer_add_starts_disabled() {
         let mut reg = Registry::default();
         let mut entry = server("one");
         entry.enabled = true;
         let id = apply_add_entry(&mut reg, entry);
         assert!(!reg.server_enabled(&id));
+    }
+
+    #[test]
+    fn access_review_creation_rejects_reserved_names() {
+        let mut reg = Registry::default();
         for name in ["@all-enabled", " @default-access:default"] {
             assert!(apply_create_profile(&mut reg, name).is_err());
         }
