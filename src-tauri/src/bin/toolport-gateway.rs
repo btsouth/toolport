@@ -19291,7 +19291,7 @@ mod tests {
             let mut pool = state.root_launch_pool.lock().unwrap();
             pool.views.insert(keys.clone(), Arc::clone(&cached));
             pool.root_scopes
-                .insert(keys.clone(), "root:test-publish".into());
+                .insert(keys.clone(), format!("root:{}", registry::sha256_hex("/project")));
         }
         let host = Arc::clone(&state.host);
         let hook_keys = keys.clone();

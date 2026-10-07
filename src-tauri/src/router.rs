@@ -712,7 +712,7 @@ impl ServerSlot {
             let mut state = supervisor
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !(demand && state.state == SupervisorState::Stopped
+            if state.publishing || !(demand && state.state == SupervisorState::Stopped
                 || state.state == SupervisorState::Backoff
                     && (now >= state.next_attempt
                         || demand
@@ -792,14 +792,16 @@ impl ServerSlot {
             if !continuation && cancel.is_some_and(CancelContext::is_cancelled) {
                 return Err("request cancelled while the server was starting".to_string());
             }
-            let state = supervisor
+            let mut state = supervisor
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .state;
-            if state == SupervisorState::Ready {
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.state == SupervisorState::Ready {
+                state.last_use = Instant::now();
                 return Ok(());
             }
-            if state != SupervisorState::Starting || Instant::now() >= deadline {
+            let starting = state.state == SupervisorState::Starting;
+            drop(state);
+            if !starting || Instant::now() >= deadline {
                 return Err(self.unavailable());
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -1903,7 +1905,7 @@ impl Router {
         })
     }
 
-    /// A first or post-idle use may wait for startup; recovery remains fail-fast.
+    /// Demand starts a stopped server or a recovery whose retry is due.
     pub fn prepare_lazy_use(&self, id: &str) -> bool {
         if !self.policy.allows_server(id) {
             return false;
@@ -2217,12 +2219,12 @@ impl Router {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = server;
-        slot.supervisor
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .publishing = true;
+        {
+            let mut state = slot.supervisor.as_ref().unwrap().lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.publishing = true;
+            state.state = SupervisorState::Starting;
+        }
         if let Some(index) = view.by_id.get(&id) {
             view.servers[*index] = Arc::new(slot);
         } else {
@@ -6851,9 +6853,7 @@ mod tests {
             Router::attempt(&worker_slot, SlotAccess::Shared, None, &mut |_| Ok(()))
         });
         assert!(wait_until(|| slot.handle_calls.load(Ordering::Acquire) == 1));
-        let lifecycle = slot.supervisor.as_ref().unwrap().try_lock();
-        let free = lifecycle.is_ok();
-        drop(lifecycle);
+        let free = wait_until(|| slot.supervisor.as_ref().unwrap().try_lock().is_ok());
         drop(inner);
         worker.join().unwrap().0.unwrap();
         assert!(free, "queued call held the supervisor behind inner");
