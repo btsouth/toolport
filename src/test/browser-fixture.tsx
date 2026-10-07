@@ -118,6 +118,8 @@ mockIPC(
       }
       case "plugin:process|exit":
         return null;
+      case "export_config":
+        return JSON.stringify({ servers });
       case "get_registry":
         return registry;
       case "detect_clients":
