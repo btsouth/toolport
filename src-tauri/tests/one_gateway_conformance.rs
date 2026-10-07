@@ -1790,7 +1790,8 @@ fn matrix_retired_legacy_registry_uses_shared_daemon() {
     assert_eq!(transcript_initialize_count(&transcript), 1);
     let migrated: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(migrated["version"], 2);
+    assert_eq!(migrated["version"], registry::REGISTRY_VERSION);
+    assert_eq!(migrated["servers"][0]["enabled"], true);
     assert!(migrated.get("gatewayTopology").is_none());
 }
 
