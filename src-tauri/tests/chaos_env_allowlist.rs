@@ -41,7 +41,7 @@ fn a_spawned_server_does_not_inherit_ambient_credentials() {
         "source": "manual",
         "disabledTools": []
     });
-    write_registry(scratch.path(), &[server], &["wrapped"], false);
+    write_registry(scratch.path(), &[server], &["wrapped"]);
 
     // The launching gateway itself carries an ambient credential.
     let _daemon = start_daemon_with_env(scratch.path(), &[("AMBIENT_SECRET", "leak")]);

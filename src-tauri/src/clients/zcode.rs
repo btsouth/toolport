@@ -481,7 +481,6 @@ mod tests {
         assert_eq!(definition.name, "ZCode");
         assert!(matches!(definition.format, Format::JsonZCodeMcp));
         assert!(!definition.uses_connectors);
-        assert!(!client_uses_mcp_remote_bridge("zcode"));
         for platform in Platform::ALL {
             let home = PathBuf::from("user-home");
             assert_eq!(
@@ -584,35 +583,6 @@ mod tests {
         );
         edit_gateway(&fixture.native(), None).unwrap();
         assert_eq!(read_root(&fixture.native()).unwrap().0, before);
-    }
-
-    #[test]
-    fn zcode_shared_http_is_native_and_keeps_authorization_in_headers() {
-        let fixture = Fixture::new();
-        let entry = gateway_entry_shared_http(
-            "zcode",
-            None,
-            &SharedHttpSpec {
-                url: "https://example.test/mcp".into(),
-                token: "test-token".into(),
-            },
-        );
-        edit_gateway(&fixture.native(), Some(&entry)).unwrap();
-        let (root, _) = read_root(&fixture.native()).unwrap();
-        assert_eq!(root["mcp"]["servers"]["toolport"]["type"], "http");
-        assert_eq!(
-            root["mcp"]["servers"]["toolport"]["url"],
-            "https://example.test/mcp"
-        );
-        assert_eq!(
-            root["mcp"]["servers"]["toolport"]["headers"]["Authorization"],
-            "Bearer test-token"
-        );
-        let servers = detect(&fixture.native()).unwrap().0;
-        assert_eq!(
-            resolve_entry_state(&servers, Some(&ManagedEntry::from_gateway_entry(&entry))),
-            GatewayEntryState::Managed
-        );
     }
 
     #[test]

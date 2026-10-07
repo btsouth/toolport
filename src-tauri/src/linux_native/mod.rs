@@ -298,7 +298,7 @@ fn build_window(
     let (content, server_page, approval_page) = build_content(app, broker.clone());
     let bridge_for_reap = bridge.clone();
     let server_page_for_reap = server_page.clone();
-    let client_page = ClientPage::new(app, bridge.clone());
+    let client_page = ClientPage::new(app);
     let activity_page = ActivityPage::new(app);
     let catalog_page = CatalogPage::new(server_page.clone());
     let playground_page = PlaygroundPage::new(app);
@@ -1781,7 +1781,6 @@ impl ServerPage {
 #[derive(Clone)]
 struct ClientPage {
     app: adw::Application,
-    bridge: http_bridge::BridgeController,
     root: gtk::Box,
     list: gtk::Box,
     feedback: gtk::Label,
@@ -1797,7 +1796,7 @@ struct ClientPage {
 }
 
 impl ClientPage {
-    fn new(app: &adw::Application, bridge: http_bridge::BridgeController) -> Self {
+    fn new(app: &adw::Application) -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("toolport-content");
         let header = adw::HeaderBar::new();
@@ -1881,7 +1880,6 @@ impl ClientPage {
 
         let client_page = Self {
             app: app.clone(),
-            bridge,
             root,
             list,
             feedback,
@@ -2439,14 +2437,12 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
                     &client_for_connect,
                     true,
                     false,
-                    false,
                     None,
                     button,
                     page_for_connect.clone(),
                 );
             });
             actions.append(&connect);
-            actions.append(&shared_http_menu(client.clone(), false, page));
         }
         state::ClientGatewayState::Customized => {
             let reset = gtk::Button::with_label("Reset");
@@ -2457,7 +2453,6 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
                 confirm_client_reset(&client_for_reset, button.clone(), page_for_reset.clone());
             });
             actions.append(&reset);
-            actions.append(&shared_http_menu(client.clone(), true, page));
         }
         state::ClientGatewayState::Connected => {
             if page.profiles.borrow().len() > 1 {
@@ -2521,30 +2516,11 @@ fn confirm_client_migrate(client: &state::ClientView, button: gtk::Button, page:
             let client_id = client.id.clone();
             let client_name = client.name.clone();
             let scope = client.scope_id.clone();
-            let shared_http = client.shared_http;
-            let bridge = page.bridge.clone();
             let page = page.clone();
             let button = button.clone();
             gtk::glib::spawn_future_local(async move {
                 let result = gtk::gio::spawn_blocking(move || {
-                    // A connected Shared HTTP client stays Shared HTTP; everyone
-                    // else migrates to the stdio gateway, matching the shipping
-                    // dialog's transport choice.
-                    let url = if shared_http {
-                        let status = bridge.start(None)?;
-                        let port = status
-                            .port
-                            .ok_or("The HTTP endpoint started without a port")?;
-                        Some(format!("http://127.0.0.1:{port}/mcp"))
-                    } else {
-                        None
-                    };
-                    crate::registry_controller::migrate_client(
-                        &client_id,
-                        scope.as_deref(),
-                        force,
-                        url.as_deref(),
-                    )
+                    crate::registry_controller::migrate_client(&client_id, scope.as_deref(), force)
                 })
                 .await;
                 button.set_sensitive(true);
@@ -2686,38 +2662,6 @@ fn connected_client_actions_menu(client: state::ClientView, page: ClientPage) ->
     menu
 }
 
-fn shared_http_menu(client: state::ClientView, force: bool, page: ClientPage) -> gtk::MenuButton {
-    let menu = gtk::MenuButton::builder()
-        .icon_name("view-more-symbolic")
-        .tooltip_text("Connection options")
-        .build();
-    menu.add_css_class("flat");
-    let popover = toolport_menu_popover();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    content.set_margin_top(6);
-    content.set_margin_bottom(6);
-    content.set_margin_start(6);
-    content.set_margin_end(6);
-    let shared = toolport_menu_button(if force {
-        "Reset with Shared HTTP"
-    } else {
-        "Connect with Shared HTTP"
-    });
-    let menu_for_click = menu.clone();
-    shared.connect_clicked(move |button| {
-        menu_for_click.popdown();
-        if force {
-            confirm_client_reset_shared(&client, button.clone(), page.clone());
-        } else {
-            run_client_mutation(&client, true, true, false, None, button, page.clone());
-        }
-    });
-    content.append(&shared);
-    popover.set_child(Some(&content));
-    menu.set_popover(Some(&popover));
-    menu
-}
-
 fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuButton {
     let label = client
         .scope_name
@@ -2745,7 +2689,6 @@ fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuBu
         run_client_mutation(
             &client_for_active,
             true,
-            client_for_active.shared_http,
             false,
             None,
             button,
@@ -2763,7 +2706,6 @@ fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuBu
             run_client_mutation(
                 &client,
                 true,
-                client.shared_http,
                 false,
                 Some(profile.id.clone()),
                 button,
@@ -2795,32 +2737,7 @@ fn confirm_client_reset(client: &state::ClientView, button: gtk::Button, page: C
     let client = client.clone();
     dialog.connect_response(None, move |dialog, response| {
         if response == "reset" {
-            run_client_mutation(&client, true, false, true, None, &button, page.clone());
-        }
-        dialog.close();
-    });
-    dialog.present();
-}
-
-fn confirm_client_reset_shared(client: &state::ClientView, button: gtk::Button, page: ClientPage) {
-    let Some(parent) = page.app.active_window() else {
-        return;
-    };
-    #[allow(deprecated)]
-    let dialog = adw::MessageDialog::new(
-        Some(&parent),
-        Some(&format!("Reset {} for Shared HTTP?", client.name)),
-        Some("This replaces only the customized Toolport gateway entry and starts Toolport's authenticated local HTTP endpoint."),
-    );
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("reset", "Reset and connect");
-    dialog.set_close_response("cancel");
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_response_appearance("reset", adw::ResponseAppearance::Suggested);
-    let client = client.clone();
-    dialog.connect_response(None, move |dialog, response| {
-        if response == "reset" {
-            run_client_mutation(&client, true, true, true, None, &button, page.clone());
+            run_client_mutation(&client, true, true, None, &button, page.clone());
         }
         dialog.close();
     });
@@ -2845,7 +2762,7 @@ fn confirm_client_disconnect(client: &state::ClientView, button: gtk::Button, pa
     let client = client.clone();
     dialog.connect_response(None, move |dialog, response| {
         if response == "disconnect" {
-            run_client_mutation(&client, false, false, false, None, &button, page.clone());
+            run_client_mutation(&client, false, false, None, &button, page.clone());
         }
         dialog.close();
     });
@@ -2855,7 +2772,6 @@ fn confirm_client_disconnect(client: &state::ClientView, button: gtk::Button, pa
 fn run_client_mutation(
     client: &state::ClientView,
     connect: bool,
-    shared_http: bool,
     force: bool,
     profile: Option<String>,
     button: &gtk::Button,
@@ -2869,29 +2785,15 @@ fn run_client_mutation(
     });
     let client_id = client.id.clone();
     let client_name = client.name.clone();
-    let bridge = page.bridge.clone();
     let button = button.clone();
     gtk::glib::spawn_future_local(async move {
         let result = gtk::gio::spawn_blocking(move || {
             if connect {
-                if shared_http {
-                    let status = bridge.start(None)?;
-                    let port = status
-                        .port
-                        .ok_or("The HTTP endpoint started without a port")?;
-                    crate::registry_controller::connect_client_shared_http(
-                        &client_id,
-                        profile.as_deref(),
-                        force,
-                        &format!("http://127.0.0.1:{port}/mcp"),
-                    )
-                } else {
-                    crate::registry_controller::connect_client_stdio(
-                        &client_id,
-                        profile.as_deref(),
-                        force,
-                    )
-                }
+                crate::registry_controller::connect_client_stdio(
+                    &client_id,
+                    profile.as_deref(),
+                    force,
+                )
             } else {
                 crate::registry_controller::disconnect_client(&client_id)
             }

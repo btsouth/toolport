@@ -8,7 +8,6 @@ import type { CatalogEntry, Registry, ServerEntry, Stack } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import { TransportPill } from "@/components/TransportPill";
 import { ServerDialog } from "@/components/ServerDialog";
 import { ServerLogo } from "@/components/ServerLogo";
 
@@ -600,9 +599,6 @@ function CatalogCard({
               <ExternalLink className="size-3" />
             </button>
           )}
-        </div>
-        <div className="flex shrink-0 items-center gap-1">
-          <TransportPill transport={entry.transport} />
         </div>
       </div>
       <p className="line-clamp-2 min-h-8 text-xs text-muted-foreground">

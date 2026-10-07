@@ -124,17 +124,14 @@ pub fn http_entry(id: &str, url: &str) -> Value {
 
 /// Write `registry.json` through a temp file and rename, so the gateway's
 /// watcher never reads a half-written document.
-pub fn write_registry(dir: &Path, servers: &[Value], enabled: &[&str], legacy: bool) {
-    let mut registry = json!({
+pub fn write_registry(dir: &Path, servers: &[Value], enabled: &[&str]) {
+    let registry = json!({
         "version": 1,
         "servers": servers,
         "profiles": [{ "id": "default", "name": "Default", "enabledServerIds": enabled }],
         "activeProfileId": "default",
         "lazyDiscovery": false
     });
-    if legacy {
-        registry["gatewayTopology"] = json!("legacy");
-    }
     let tmp = dir.join("registry.json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&registry).unwrap()).expect("write registry");
     std::fs::rename(&tmp, dir.join("registry.json")).expect("publish registry");

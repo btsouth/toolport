@@ -59,7 +59,6 @@ fn one_hundred_calls_spread_across_servers_all_succeed() {
             mock_entry("y", &[("MOCK_MCP_CALL_DELAY_MS", "100")]),
         ],
         &["x", "y"],
-        false,
     );
     let _daemon = start_daemon(scratch.path());
 
@@ -150,7 +149,6 @@ fn a_slow_call_does_not_block_a_fast_call_to_the_same_server() {
         scratch.path(),
         &[mock_entry("x", &[("MOCK_MCP_CONCURRENT", "1")])],
         &["x"],
-        false,
     );
     let _daemon = start_daemon(scratch.path());
     let mut client = Client::start(scratch.path(), "a");
@@ -188,7 +186,6 @@ fn one_hundred_parallel_calls_to_one_server_overlap() {
         scratch.path(),
         &[mock_entry("x", &[("MOCK_MCP_CONCURRENT", "1")])],
         &["x"],
-        false,
     );
     let _daemon = start_daemon(scratch.path());
 

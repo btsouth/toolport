@@ -414,220 +414,42 @@ fn write_to_client(
     clients::write_servers(&client_id, &servers)
 }
 
-/// Refuse to overwrite a hand-edited gateway entry unless `force` is true (SOU-406).
-fn refuse_if_customized(state: &RegistryState, client_id: &str, force: bool) -> Result<(), String> {
-    if force {
-        return Ok(());
-    }
-    let mut list = clients::detect_clients();
-    let managed = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .client_managed_entries
-        .clone();
-    clients::apply_entry_states(&mut list, &managed);
-    if list
-        .iter()
-        .find(|c| c.id == client_id)
-        .is_some_and(|c| c.entry_state == clients::GatewayEntryState::Customized)
-    {
-        return Err(
-            "This client's Toolport entry has a custom configuration. Confirm to \
-             reset it to the default gateway, or leave it as-is."
-                .into(),
-        );
-    }
-    Ok(())
-}
-
-/// Install the Toolport gateway into a client (one click "connect to Toolport").
-/// `profile` scopes that client to one profile (None = all enabled servers).
-/// `transport` is `"stdio"` (default) or `"sharedHttp"` (SOU-407).
-/// When the live entry is user-customized, pass `force: true` after the UI confirms
-/// overwrite (SOU-406); otherwise the install is refused.
-///
-/// Runs on the blocking pool, not the GTK main loop (SBS-818): the shared-HTTP
-/// path reaches the vault through `ensure_client_http_token`, and a Secret
-/// Service call is a synchronous D-Bus round trip that stalls window controls
-/// and the tray menu on a slow or locked keyring (SBS-813, SBS-812). Reading the
-/// client's config in `refuse_if_customized` and writing it in `clients::*` are
-/// blocking file IO for the same reason.
+/// Connect a client through the stdio adapter, optionally scoped to a profile.
+/// Pass force only after confirming replacement of a customized entry.
 #[tauri::command]
 async fn install_gateway(
     app: AppHandle,
     client_id: String,
     profile: Option<String>,
     force: Option<bool>,
-    transport: Option<String>,
 ) -> Result<clients::WriteOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<RegistryState>();
-        let bridge = app.state::<HttpBridgeState>();
-        let transport = transport
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .unwrap_or("stdio");
-        let shared_http = transport.eq_ignore_ascii_case("sharedHttp")
-            || transport.eq_ignore_ascii_case("shared_http");
-        if !shared_http {
-            let managed = state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .client_managed_entries
-                .clone();
-            return crate::registry_controller::connect_client_stdio_with(
-                &client_id,
-                profile.as_deref(),
-                force.unwrap_or(false),
-                &managed,
-                |managed_entry| {
-                    let (registry, ()) = write_registry(state.inner(), |registry| {
-                        match profile
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|profile| !profile.is_empty())
-                        {
-                            Some(profile) => registry.set_client_scope(&client_id, Some(profile)),
-                            None => registry.set_client_unscoped(&client_id),
-                        }
-                        if let Some(managed_entry) = managed_entry {
-                            registry.set_client_managed_entry(&client_id, managed_entry);
-                        }
-                        Ok(())
-                    })?;
-                    Ok(registry)
-                },
-            )
-            .map(|result| result.outcome);
-        }
-
-        refuse_if_customized(state.inner(), &client_id, force.unwrap_or(false))?;
-        // Ensure the supervised bridge is up, mint/reuse a per-client bearer, write
-        // native remote or mcp-remote into the client config (SOU-407).
-        let status = start_persisted_http_bridge(bridge.inner(), state.inner(), None)?;
-        let port = status.port.unwrap_or(8765);
-        let url = format!("http://127.0.0.1:{port}/mcp");
-        let token = ensure_client_http_token(state.inner(), &client_id, profile.as_deref())?;
-        let spec = clients::SharedHttpSpec { url, token };
-        let outcome = clients::install_gateway_shared_http(&client_id, profile.as_deref(), &spec)?;
-        // Record the scope we just wrote into the client's config, so the UI can show
-        // and re-apply this client's effective scope without re-reading the config.
-        // A concrete profile is stored by name; "no profile" is recorded as an
-        // explicit-unscoped marker (not a removal) so a running gateway drops its old
-        // scope live instead of falling back to its boot-time CONDUIT_PROFILE. The client
-        // config was already written above (outside the lock); only the registry record
-        // goes through the locked load-modify-save.
-        let scope: Option<String> = profile
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(str::to_string);
-        let managed = outcome.managed.clone();
-        write_registry(state.inner(), |reg| {
-            match scope.as_deref() {
-                Some(p) => reg.set_client_scope(&client_id, Some(p)),
-                None => reg.set_client_unscoped(&client_id),
-            }
-            if let Some(m) = managed {
-                reg.set_client_managed_entry(&client_id, m);
-            }
-            Ok(())
-        })?;
-        Ok(outcome)
+        let managed = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .client_managed_entries
+            .clone();
+        crate::registry_controller::connect_client_stdio_with(
+            &client_id,
+            profile.as_deref(),
+            force.unwrap_or(false),
+            &managed,
+            |managed_entry| {
+                write_registry(state.inner(), |registry| {
+                    Ok(crate::registry_controller::apply_client_stdio_update(
+                        registry,
+                        &client_id,
+                        profile.as_deref(),
+                        managed_entry,
+                    ))
+                })
+            },
+        )
+        .map(|result| result.outcome)
     })
     .await
     .map_err(|e| format!("install task join failed: {e}"))?
-}
-
-/// Mint or reuse a bearer token for a managed shared-HTTP client install.
-/// Plaintext lives in the OS keychain; only the hash is in `http_clients`.
-///
-/// When reusing a vaulted token, rewrite the row's `profile` if the caller asked
-/// for a different scope — Shared HTTP scope is derived solely from that row
-/// (WS3-5), not from `client_scopes` / TOOLPORT_PROFILE env.
-fn ensure_client_http_token(
-    state: &RegistryState,
-    client_id: &str,
-    profile: Option<&str>,
-) -> Result<String, String> {
-    ensure_client_http_token_with(state, client_id, profile, crate::secrets::get_secret_result)
-}
-
-/// [`ensure_client_http_token`] with the vault read injected.
-///
-/// The vault server id is fixed here, so the reserved-namespace trick the other
-/// fail-closed tests use cannot reach it. Injecting the read is how
-/// [`revoke_client_http_token_with`] solves the same problem in this file.
-fn ensure_client_http_token_with(
-    state: &RegistryState,
-    client_id: &str,
-    profile: Option<&str>,
-    read_vaulted_token: impl FnOnce(&str, &str) -> Result<Option<String>, String>,
-) -> Result<String, String> {
-    const VAULT_SERVER: &str = "__toolport_http_clients__";
-    let http_id = format!("client:{client_id}");
-    let desired_profile = profile.unwrap_or("").trim().to_string();
-    // Reuse vaulted token when we still have a matching http_clients row.
-    //
-    // A failed vault READ must not fall through to minting a replacement. `get_secret`
-    // collapses a read error into `None`, so a locked or flaky keychain looked exactly
-    // like "this client has no bearer yet": the mint path below then overwrites the
-    // vaulted copy AND `retain`s the client's `http_clients` row away for a new one.
-    // The bearer the client is already configured with now hashes to no row, so every
-    // request it makes 401s until the user reconnects that client by hand. Only a
-    // confirmed "nothing vaulted" may mint (SBS-840 class).
-    if let Some(existing) = read_vaulted_token(VAULT_SERVER, client_id)
-        // Complete sentence, capitalized: `install_gateway`'s caller renders this
-        // verbatim in a toast (`ClientDetail.tsx` `toastError(`${e}`)`), so a bare
-        // lowercase fragment would reach the user untethered.
-        .map_err(|e| format!("Could not read the saved token for {client_id}: {e}"))?
-    {
-        let hash = registry::sha256_hex(&existing);
-        let mut matched = false;
-        let mut profile_stale = false;
-        {
-            let reg = state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(row) = reg
-                .http_clients
-                .iter()
-                .find(|c| c.id == http_id && c.token_sha256 == hash)
-            {
-                matched = true;
-                profile_stale = row.profile != desired_profile;
-            }
-        }
-        if matched {
-            if profile_stale {
-                write_registry(state, |reg| {
-                    if let Some(row) = reg
-                        .http_clients
-                        .iter_mut()
-                        .find(|c| c.id == http_id && c.token_sha256 == hash)
-                    {
-                        row.profile = desired_profile;
-                    }
-                    Ok(())
-                })?;
-            }
-            return Ok(existing);
-        }
-    }
-    let token = random_hex()?;
-    crate::secrets::set_secret(VAULT_SERVER, client_id, &token)?;
-    write_registry(state, |reg| {
-        reg.http_clients.retain(|c| c.id != http_id);
-        reg.http_clients.push(registry::HttpClient {
-            id: http_id,
-            label: format!("Client: {client_id}"),
-            token_sha256: registry::sha256_hex(&token),
-            profile: desired_profile,
-        });
-        Ok(())
-    })?;
-    Ok(token)
 }
 
 /// Drop the managed shared-HTTP bearer for this client (registry row, then vault).
@@ -772,42 +594,19 @@ struct MigrateResult {
 /// gateway (optionally scoped to `profile`). The client is left managing nothing
 /// directly - everything routes through Toolport. Backs the config up first.
 ///
-/// The whole sequence lives in `registry_controller::migrate_client` so both
-/// desktop shells share it; this command only resolves the Shared HTTP URL
-/// (which needs the app-managed bridge) and refreshes the cached registry
-/// afterwards, since the controller writes through `registry::update`.
+/// Import directly configured servers and connect through the stdio adapter.
 #[tauri::command]
 async fn migrate_client(
     state: State<'_, RegistryState>,
-    bridge: State<'_, HttpBridgeState>,
     client_id: String,
     profile: Option<String>,
     force: Option<bool>,
-    transport: Option<String>,
 ) -> Result<MigrateResult, String> {
-    // Honor transport so migrate does not silently force stdio when the UI
-    // chose Shared HTTP (WS3-2).
-    let transport = transport
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .unwrap_or("stdio");
-    let url = if transport.eq_ignore_ascii_case("sharedHttp")
-        || transport.eq_ignore_ascii_case("shared_http")
-    {
-        let status = start_persisted_http_bridge(bridge.inner(), state.inner(), None)?;
-        let port = status.port.unwrap_or(8765);
-        Some(format!("http://127.0.0.1:{port}/mcp"))
-    } else {
-        None
-    };
-
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         crate::registry_controller::migrate_client(
             &client_id,
             profile.as_deref(),
             force.unwrap_or(false),
-            url.as_deref(),
         )
     })
     .await
@@ -6800,77 +6599,6 @@ mod tests {
             let on_disk = registry::load().expect("scratch registry loads");
             on_disk.http_clients.iter().any(|c| c.id == self.http_id)
         }
-    }
-
-    /// SBS-840 class, the instance left behind by that sweep. A failed vault READ
-    /// must not fall through to minting a replacement bearer. `get_secret` collapsed
-    /// a read error into `None`, which looks exactly like "this client has no bearer
-    /// yet", so the mint path overwrote the vaulted copy and `retain`ed the client's
-    /// `http_clients` row away for a new one. The bearer the client was already
-    /// configured with then hashed to no row, so every request it made 401'd until
-    /// the user reconnected that client by hand.
-    #[test]
-    fn ensure_client_http_token_propagates_a_failed_vault_read_instead_of_minting() {
-        let fixture = RevokeFixture::new("sbs-840-ensure-read");
-
-        let err = ensure_client_http_token_with(
-            &fixture.state,
-            &fixture.client_id,
-            None,
-            |_server, _client| Err("the keychain is locked".into()),
-        )
-        .expect_err("a failed vault read must not mint a replacement bearer");
-
-        assert!(
-            err.starts_with("Could not read the saved token"),
-            "the vault read failure must reach the caller as a complete sentence \
-             (the frontend renders it verbatim), got: {err}"
-        );
-        assert!(
-            err.contains("the keychain is locked"),
-            "the underlying cause must survive, got: {err}"
-        );
-        // The `expect_err` above is what pins the reported bug; today's mint path
-        // returns `Ok`, so execution never reaches here under it.
-        //
-        // This guards the ORDERING invariant instead: nothing may error out after
-        // already replacing the row. Assert the HASH rather than the id, because the
-        // mint path `retain`s the old row away and pushes a new one under the SAME
-        // id, so an id-only check cannot tell a surviving bearer from a replaced one.
-        // `http_client_for_token` matches on `token_sha256`, so that is what decides
-        // whether the client's configured token still authenticates.
-        let on_disk = registry::load().expect("scratch registry loads");
-        let row = on_disk
-            .http_clients
-            .iter()
-            .find(|c| c.id == fixture.http_id)
-            .expect("a failed vault read must not drop the client's http_clients row");
-        assert_eq!(
-            row.token_sha256,
-            registry::sha256_hex("leftover-bearer"),
-            "the row must still carry the ORIGINAL bearer's hash; a new hash means a \
-             replacement was minted and the client's configured token is now dead"
-        );
-    }
-
-    /// The reuse path is unchanged by the fix: a confirmed vaulted token that still
-    /// matches a registered row is handed back as-is, with nothing minted. Guards
-    /// against over-correcting the above into "never reuse".
-    #[test]
-    fn ensure_client_http_token_reuses_a_vaulted_token_that_matches_its_row() {
-        let fixture = RevokeFixture::new("sbs-840-ensure-reuse");
-
-        let token = ensure_client_http_token_with(
-            &fixture.state,
-            &fixture.client_id,
-            None,
-            // The fixture's row is registered against this exact token.
-            |_server, _client| Ok(Some("leftover-bearer".to_string())),
-        )
-        .expect("a matching vaulted token must be reused");
-
-        assert_eq!(token, "leftover-bearer");
-        assert!(fixture.http_row_present());
     }
 
     #[test]

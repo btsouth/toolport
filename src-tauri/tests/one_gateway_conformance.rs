@@ -1639,7 +1639,7 @@ fn matrix_desktop_http_proxy_shares_daemon_and_releases_lease() {
 }
 
 #[test]
-fn matrix_rollout_legacy_override_keeps_the_standalone_role() {
+fn matrix_retired_legacy_override_uses_shared_daemon() {
     let _guard = CASE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1667,12 +1667,18 @@ fn matrix_rollout_legacy_override_keeps_the_standalone_role() {
     let tool_b = b.wait_for_tool("__echo", Duration::from_secs(30));
     assert_eq!(text_of(&a.call_tool(&tool_a, json!({ "text": "a" }))), "a");
     assert_eq!(text_of(&b.call_tool(&tool_b, json!({ "text": "b" }))), "b");
-    assert!(descriptor_files(&dir).is_empty(), "legacy started a daemon");
-    assert_eq!(transcript_initialize_count(&transcript), 2);
+    assert_eq!(
+        descriptor_files(&dir).len(),
+        1,
+        "retired legacy must use the daemon"
+    );
+    assert_eq!(transcript_initialize_count(&transcript), 1);
+    let log = std::fs::read_to_string(dir.join("gateway.log")).unwrap();
+    assert!(log.contains("Legacy gateway topology was retired in 2.0"));
 }
 
 #[test]
-fn matrix_rollout_explicit_legacy_registry_keeps_the_standalone_role() {
+fn matrix_retired_legacy_registry_uses_shared_daemon() {
     let _guard = CASE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1697,9 +1703,18 @@ fn matrix_rollout_explicit_legacy_registry_keeps_the_standalone_role() {
     );
     client.initialize("matrix-registry-legacy");
     let tool = client.wait_for_tool("__echo", Duration::from_secs(30));
-    assert_eq!(text_of(&client.call_tool(&tool, json!({ "text": "legacy" }))), "legacy");
-    assert!(descriptor_files(&dir).is_empty(), "legacy started a daemon");
+    assert_eq!(
+        text_of(&client.call_tool(&tool, json!({ "text": "legacy" }))),
+        "legacy"
+    );
+    assert_eq!(
+        descriptor_files(&dir).len(),
+        1,
+        "retired legacy must use the daemon"
+    );
     assert_eq!(transcript_initialize_count(&transcript), 1);
+    let log = std::fs::read_to_string(dir.join("gateway.log")).unwrap();
+    assert!(log.contains("Legacy gateway topology was retired in 2.0"));
 }
 
 #[test]

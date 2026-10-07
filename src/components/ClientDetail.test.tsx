@@ -137,18 +137,11 @@ describe("ClientDetail customized entry (SOU-406)", () => {
     await userEvent.click(confirms[confirms.length - 1]!);
 
     await waitFor(() =>
-      expect(installGateway).toHaveBeenCalledWith(
-        "claude-desktop",
-        undefined,
-        true,
-        "stdio",
-      ),
+      expect(installGateway).toHaveBeenCalledWith("claude-desktop", undefined, true),
     );
   });
 
-  it("passes live sharedHttp transport when applying scope (WS3-2)", async () => {
-    // Regression: installGateway defaults missing transport to stdio and would
-    // silently rewrite a Shared HTTP client as a stdio spawn.
+  it("keeps sharedHttp untouched on mount and uses stdio on explicit reconnect", async () => {
     installGateway.mockResolvedValue({ backup: false });
     const reg = emptyRegistry();
     // Profile picker only renders when profiles.length > 1.
@@ -181,6 +174,9 @@ describe("ClientDetail customized entry (SOU-406)", () => {
       />,
     );
 
+    expect(installGateway).not.toHaveBeenCalled();
+    expect(migrateClient).not.toHaveBeenCalled();
+
     // Change scope so Apply scope is enabled (profile !== currentScope).
     // Scope select is the first combobox in the header (w-52); discovery is lower.
     const scopeSelect = screen.getAllByRole("combobox")[0]!;
@@ -192,12 +188,7 @@ describe("ClientDetail customized entry (SOU-406)", () => {
     await userEvent.click(apply);
 
     await waitFor(() =>
-      expect(installGateway).toHaveBeenCalledWith(
-        "claude-desktop",
-        "p2",
-        false,
-        "sharedHttp",
-      ),
+      expect(installGateway).toHaveBeenCalledWith("claude-desktop", "p2", false),
     );
   });
 
@@ -260,12 +251,7 @@ describe("ClientDetail customized entry (SOU-406)", () => {
     await userEvent.click(screen.getByRole("button", { name: /move 1 into toolport/i }));
 
     await waitFor(() =>
-      expect(migrateClient).toHaveBeenCalledWith(
-        "claude-desktop",
-        "p2",
-        undefined,
-        "stdio",
-      ),
+      expect(migrateClient).toHaveBeenCalledWith("claude-desktop", "p2", undefined),
     );
   });
 });
@@ -287,12 +273,7 @@ describe("ClientDetail connect toast (SOU-317)", () => {
     await userEvent.click(screen.getByRole("button", { name: /connect to toolport/i }));
 
     await waitFor(() =>
-      expect(installGateway).toHaveBeenCalledWith(
-        "claude-desktop",
-        undefined,
-        false,
-        "stdio",
-      ),
+      expect(installGateway).toHaveBeenCalledWith("claude-desktop", undefined, false),
     );
     expect(toastSuccess).toHaveBeenCalledWith(
       "Connected Toolport to Claude Desktop",
@@ -323,7 +304,7 @@ describe("ClientDetail connect toast (SOU-317)", () => {
     await userEvent.click(screen.getByRole("button", { name: /connect to toolport/i }));
 
     await waitFor(() =>
-      expect(installGateway).toHaveBeenCalledWith("claude-desktop", "p1", false, "stdio"),
+      expect(installGateway).toHaveBeenCalledWith("claude-desktop", "p1", false),
     );
     expect(toastSuccess).toHaveBeenCalledWith(
       "Connected Toolport to Claude Desktop",

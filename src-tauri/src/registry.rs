@@ -1112,8 +1112,7 @@ pub struct Registry {
     pub profiles: Vec<Profile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_profile_id: Option<String>,
-    /// An absent value selects the release default (`daemon`). `legacy` keeps
-    /// an explicit rollback choice for client-spawned stdio gateways.
+    // 2.0: unused, dropped by the v2 migration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_topology: Option<GatewayTopology>,
     /// Global safety switch: when true, the gateway hides and blocks any tool a
@@ -2031,7 +2030,7 @@ pub(crate) fn unique_id(base: &str, existing: &[String]) -> String {
 
 impl Registry {
     pub fn gateway_topology_effective(&self) -> GatewayTopology {
-        self.gateway_topology.unwrap_or(DEFAULT_GATEWAY_TOPOLOGY)
+        DEFAULT_GATEWAY_TOPOLOGY
     }
 
     fn profile_id_for_ref(&self, profile_ref: &str) -> Option<String> {
@@ -4737,7 +4736,7 @@ mod tests {
     static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn gateway_topology_absence_follows_default_and_explicit_choice_round_trips() {
+    fn legacy_gateway_topology_is_retired_without_changing_v1_bytes() {
         let mut reg = Registry::default();
         assert_eq!(reg.gateway_topology_effective(), GatewayTopology::Daemon);
         let absent = serde_json::to_value(&reg).unwrap();
@@ -4748,10 +4747,11 @@ mod tests {
         let loaded: Registry = serde_json::from_value(opted_in).unwrap();
         assert_eq!(loaded.gateway_topology_effective(), GatewayTopology::Daemon);
         reg.gateway_topology = Some(GatewayTopology::Legacy);
+        assert_eq!(reg.gateway_topology_effective(), GatewayTopology::Daemon);
         assert_eq!(
             serde_json::to_value(&reg).unwrap()["gatewayTopology"],
             "legacy",
-            "an explicit rollback must survive a future release default change"
+            "the v2 migration owns removal of the stored field"
         );
     }
 
