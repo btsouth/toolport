@@ -17985,6 +17985,8 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
             let mut bytes = [0u8; 64];
             while stdin.read(&mut bytes).unwrap_or(0) > 0 {}
             glog("private gateway: adapter closed its pipe, exiting");
+            // Land any queued telemetry before the process exits.
+            conduit_lib::telemetry::flush();
             std::process::exit(0);
         });
         glog(&format!(
@@ -17999,6 +18001,7 @@ fn serve_daemon(state: GatewayState, private: bool) -> ! {
             false,
             Arc::new(AtomicUsize::new(0)),
         );
+        conduit_lib::telemetry::flush();
         std::process::exit(0);
     }
     // Set the mode before publishing, so the first adapter to probe the
